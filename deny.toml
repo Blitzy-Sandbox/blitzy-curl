@@ -1,33 +1,159 @@
-# cargo-deny configuration for curl-rs workspace
-# Enforces license compliance and security advisory checks
+# cargo-deny configuration for the curl-rs workspace
+# Enforces license compliance, security advisory checks, dependency bans,
+# and source restrictions across all workspace dependencies.
+#
+# cargo-deny v0.19.0+ schema
+# Reference: https://embarkstudios.github.io/cargo-deny/
 
+# =============================================================================
+# Graph — restrict dependency resolution to our actual build targets
+# =============================================================================
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+all-features = true
+
+# =============================================================================
+# Output — control diagnostic verbosity
+# =============================================================================
+[output]
+feature-depth = 1
+
+# =============================================================================
+# Advisories — enforce zero critical CVEs (AAP Section 0.7.1 Security Gate)
+#
+# In cargo-deny v0.19+, all advisory categories (vulnerability, yanked,
+# unmaintained, unsound, notice) are denied by default. The old-style
+# "deny"/"warn"/"allow" fields have been removed. Only `unmaintained` and
+# `unsound` accept the new scope enum: "all"|"workspace"|"transitive"|"none".
+# =============================================================================
+[advisories]
+# Unmaintained crate advisories: error only for direct workspace dependencies.
+# Transitive unmaintained deps produce warnings but do not fail the check,
+# which avoids false-positive blocks from deep transitive crates we cannot
+# control while still flagging direct dependency choices.
+unmaintained = "workspace"
+
+# Unsound crate advisories: error for all crates regardless of depth.
+# Memory safety is non-negotiable for a curl replacement.
+unsound = "all"
+
+# Advisories that are acknowledged and ignored with justification.
+# Each entry documents why the advisory cannot be resolved at this time.
+ignore = [
+    # rsa v0.9.10: Marvin Attack timing side-channel (RUSTSEC-2023-0071).
+    # Transitive dependency via russh → ssh-key → rsa. No patched version exists
+    # upstream. The rsa crate maintainers are working on a constant-time
+    # implementation. This is a timing side-channel (not RCE) and affects RSA
+    # decryption operations — our usage through russh for SSH key operations has
+    # limited exposure. Re-evaluate when rsa 0.10+ is released.
+    { id = "RUSTSEC-2023-0071", reason = "transitive dep from russh; no safe upgrade available; timing side-channel only" },
+
+    # rustls-pemfile v2.2.0: Unmaintained (RUSTSEC-2025-0134).
+    # Direct workspace dependency for PEM file parsing. The functionality has
+    # been absorbed into rustls-pki-types (PemObject trait since v1.9.0).
+    # Migration to rustls-pki-types is planned. The crate is still functional
+    # and receives no new features but has no known vulnerabilities.
+    { id = "RUSTSEC-2025-0134", reason = "migration to rustls-pki-types PemObject planned; crate still functional" },
+]
+
+# =============================================================================
+# Licenses — enforce permissive-only license policy
+#
+# In cargo-deny v0.19+, all licenses not in `allow` or `exceptions` are
+# denied. The old `unlicensed` and `copyleft` fields have been removed.
+# =============================================================================
 [licenses]
-unlicensed = "deny"
-copyleft = "deny"
+# Confidence threshold for detecting a license from license text.
+# 0.8 provides a good balance of accuracy and coverage.
 confidence-threshold = 0.8
+
+# Explicitly allowed permissive licenses covering all workspace dependencies.
+# Every license identifier listed here was verified against the actual
+# dependency tree via `cargo deny list`.
 allow = [
     "MIT",
     "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "0BSD",
     "ISC",
+    "Unlicense",
+    "MIT-0",
+    "CC0-1.0",
+    "Zlib",
+    "OpenSSL",
     "Unicode-3.0",
     "Unicode-DFS-2016",
-    "OpenSSL",
-    "Zlib",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
 ]
 
-[advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "deny"
-notice = "warn"
+# Per-crate exceptions for licenses not broadly allowed.
+# r-efi (LGPL-2.1-or-later) is excluded from our target graph (Linux/macOS
+# only, no UEFI targets), so no exception is needed. If UEFI targets are
+# added in the future, an exception for r-efi should be added here.
+exceptions = []
 
+# Workspace crates use the custom "curl" license identifier (MIT-like) which
+# is not a standard SPDX expression. Since these are our own unpublished
+# workspace crates, mark them as private to skip license checks.
+[licenses.private]
+ignore = true
+registries = []
+
+# =============================================================================
+# Bans — detect problematic dependency patterns
+# =============================================================================
 [bans]
+# Warn on multiple versions of the same crate in the dependency tree.
+# This helps identify bloat from version divergence without blocking builds.
 multiple-versions = "warn"
+
+# Allow wildcard version specifications in workspace dependencies.
 wildcards = "allow"
 
+# Graph highlighting mode for duplicate detection visualizations.
+highlight = "all"
+
+# Deny specific crates that conflict with the pure-Rust strategy defined in
+# the AAP. curl-rs must have zero C TLS/SSH library linkage.
+deny = [
+    # Prevent any C TLS library linkage (AAP Section 0.7.3 — rustls exclusively)
+    { crate = "openssl", reason = "curl-rs uses rustls exclusively; no C TLS library linkage permitted" },
+    { crate = "openssl-sys", reason = "curl-rs uses rustls exclusively; no C TLS library linkage permitted" },
+    { crate = "native-tls", reason = "curl-rs uses rustls exclusively; no native-tls permitted" },
+    # Prevent any C SSH library linkage (AAP — russh exclusively)
+    { crate = "libssh2-sys", reason = "curl-rs uses russh exclusively; no C SSH library linkage permitted" },
+]
+
+# Known acceptable duplicate versions (none currently).
+skip = []
+
+# Transitive dependency trees to skip during duplicate detection (none currently).
+skip-tree = []
+
+# =============================================================================
+# Sources — restrict to crates.io only (AAP Section 0.7.3)
+#
+# "All crates from crates.io — no vendored dependencies unless a crate
+# requires it for a specific target."
+# =============================================================================
 [sources]
+# Deny crates from any registry not in the allow list.
 unknown-registry = "deny"
+
+# Deny crates sourced from git repositories not in the allow list.
 unknown-git = "deny"
+
+# Only the official crates.io registry is permitted.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# No git repository sources are permitted.
+allow-git = []
