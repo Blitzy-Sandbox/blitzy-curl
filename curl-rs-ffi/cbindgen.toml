@@ -1,0 +1,4 @@
+# cbindgen configuration for curl-rs-ffi
+# This is a stub that will be replaced by the implementation agent.
+language = "C"
+include_guard = "CURLINC_CURL_H"
