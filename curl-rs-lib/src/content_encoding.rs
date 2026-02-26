@@ -1100,3 +1100,233 @@ fn decompress_deflate_complete(data: &[u8]) -> CurlResult<Vec<u8>> {
         .map_err(|_| CurlError::BadContentEncoding)?;
     Ok(output)
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- Helper: gzip-compress a byte slice ---------------------------------
+
+    fn gzip_compress(data: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    // -- Helper: deflate-compress a byte slice ------------------------------
+
+    fn deflate_compress(data: &[u8]) -> Vec<u8> {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    // -- GzipDecoder --------------------------------------------------------
+
+    #[test]
+    fn gzip_decode_small_payload() {
+        let original = b"Hello, gzip world!";
+        let compressed = gzip_compress(original);
+
+        let mut decoder = GzipDecoder::new();
+        let mut output = decoder.decode(&compressed).unwrap();
+        output.extend(decoder.finish().unwrap());
+        assert_eq!(output, original);
+    }
+
+    #[test]
+    fn gzip_decode_empty_payload() {
+        let compressed = gzip_compress(b"");
+
+        let mut decoder = GzipDecoder::new();
+        let mut output = decoder.decode(&compressed).unwrap();
+        output.extend(decoder.finish().unwrap());
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn gzip_decode_chunked_input() {
+        let original = b"The quick brown fox jumps over the lazy dog";
+        let compressed = gzip_compress(original);
+
+        let mut decoder = GzipDecoder::new();
+        let mut output = Vec::new();
+        // Feed in small chunks to exercise the streaming logic.
+        for chunk in compressed.chunks(4) {
+            output.extend(decoder.decode(chunk).unwrap());
+        }
+        output.extend(decoder.finish().unwrap());
+        assert_eq!(output, original);
+    }
+
+    #[test]
+    fn gzip_decode_invalid_data() {
+        let mut decoder = GzipDecoder::new();
+        // Provide >= 10 bytes so the header parser can inspect the magic
+        // number (first two bytes). 0x00 0x01 is not the gzip magic 0x1f 0x8b,
+        // so `parse_gzip_header` should return `BadContentEncoding`.
+        let result = decoder.decode(b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a");
+        assert!(result.is_err());
+    }
+
+    // -- DeflateDecoder -----------------------------------------------------
+
+    #[test]
+    fn deflate_decode_small_payload() {
+        let original = b"Hello, deflate world!";
+        let compressed = deflate_compress(original);
+
+        let mut decoder = DeflateDecoder::new();
+        let mut output = decoder.decode(&compressed).unwrap();
+        output.extend(decoder.finish().unwrap());
+        assert_eq!(output, original);
+    }
+
+    #[test]
+    fn deflate_decode_empty_payload() {
+        let compressed = deflate_compress(b"");
+
+        let mut decoder = DeflateDecoder::new();
+        let mut output = decoder.decode(&compressed).unwrap();
+        output.extend(decoder.finish().unwrap());
+        assert!(output.is_empty());
+    }
+
+    // -- IdentityDecoder ----------------------------------------------------
+
+    #[test]
+    fn identity_decode_passthrough() {
+        let data = b"pass through unchanged";
+        let mut decoder = IdentityDecoder::new();
+        let output = decoder.decode(data).unwrap();
+        assert_eq!(output, data);
+    }
+
+    #[test]
+    fn identity_finish_empty() {
+        let mut decoder = IdentityDecoder::new();
+        let trailing = decoder.finish().unwrap();
+        assert!(trailing.is_empty());
+    }
+
+    // -- DecoderChain -------------------------------------------------------
+
+    #[test]
+    fn decoder_chain_single_gzip() {
+        let original = b"chain test data";
+        let compressed = gzip_compress(original);
+
+        let mut chain = DecoderChain::new();
+        chain.push(Box::new(GzipDecoder::new())).unwrap();
+
+        let mut output = chain.decode(&compressed).unwrap();
+        output.extend(chain.finish().unwrap());
+        assert_eq!(output, original);
+    }
+
+    #[test]
+    fn decoder_chain_max_stack_exceeded() {
+        let mut chain = DecoderChain::new();
+        for _ in 0..MAX_ENCODE_STACK {
+            chain
+                .push(Box::new(IdentityDecoder::new()))
+                .unwrap();
+        }
+        // Adding one more should fail.
+        let result = chain.push(Box::new(IdentityDecoder::new()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decoder_chain_empty_decode() {
+        let mut chain = DecoderChain::new();
+        let output = chain.decode(b"no decoders").unwrap();
+        assert_eq!(output, b"no decoders");
+    }
+
+    // -- create_decoder -----------------------------------------------------
+
+    #[test]
+    fn create_decoder_gzip() {
+        let decoder = create_decoder("gzip");
+        assert!(decoder.is_ok());
+    }
+
+    #[test]
+    fn create_decoder_deflate() {
+        let decoder = create_decoder("deflate");
+        assert!(decoder.is_ok());
+    }
+
+    #[test]
+    fn create_decoder_identity() {
+        let decoder = create_decoder("identity");
+        assert!(decoder.is_ok());
+    }
+
+    #[test]
+    fn create_decoder_none() {
+        let decoder = create_decoder("none");
+        assert!(decoder.is_ok());
+    }
+
+    #[test]
+    fn create_decoder_x_gzip() {
+        let decoder = create_decoder("x-gzip");
+        assert!(decoder.is_ok());
+    }
+
+    #[test]
+    fn create_decoder_unknown() {
+        let decoder = create_decoder("unknown-encoding");
+        assert!(decoder.is_err());
+    }
+
+    // -- supported_encodings ------------------------------------------------
+
+    #[test]
+    fn supported_encodings_contains_gzip() {
+        let s = supported_encodings();
+        assert!(s.contains("gzip"), "missing gzip in: {s}");
+    }
+
+    #[test]
+    fn supported_encodings_contains_deflate() {
+        let s = supported_encodings();
+        assert!(s.contains("deflate"), "missing deflate in: {s}");
+    }
+
+    // -- decompress_gzip_complete helper ------------------------------------
+
+    #[test]
+    fn decompress_gzip_complete_works() {
+        let original = b"complete decompress";
+        let compressed = gzip_compress(original);
+        let output = decompress_gzip_complete(&compressed).unwrap();
+        assert_eq!(output, original);
+    }
+
+    // -- Constants ----------------------------------------------------------
+
+    #[test]
+    fn max_encode_stack_value() {
+        assert_eq!(MAX_ENCODE_STACK, 5);
+    }
+
+    #[test]
+    fn decompress_buffer_size_value() {
+        assert_eq!(DECOMPRESS_BUFFER_SIZE, 16384);
+    }
+}

@@ -410,3 +410,192 @@ const _: [(); 0] = [(); {
     // (curl_easytype is defined as c_int in types.rs)
     (std::mem::size_of::<curl_easytype>() == std::mem::size_of::<c_int>()) as usize - 1
 }];
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- CURLOT_* constant values -------------------------------------------
+
+    #[test]
+    fn curlot_long_is_zero() {
+        assert_eq!(CURLOT_LONG, 0);
+    }
+
+    #[test]
+    fn curlot_values_is_one() {
+        assert_eq!(CURLOT_VALUES, 1);
+    }
+
+    #[test]
+    fn curlot_off_t_is_two() {
+        assert_eq!(CURLOT_OFF_T, 2);
+    }
+
+    #[test]
+    fn curlot_object_is_three() {
+        assert_eq!(CURLOT_OBJECT, 3);
+    }
+
+    #[test]
+    fn curlot_string_is_four() {
+        assert_eq!(CURLOT_STRING, 4);
+    }
+
+    #[test]
+    fn curlot_slist_is_five() {
+        assert_eq!(CURLOT_SLIST, 5);
+    }
+
+    #[test]
+    fn curlot_cbptr_is_six() {
+        assert_eq!(CURLOT_CBPTR, 6);
+    }
+
+    #[test]
+    fn curlot_blob_is_seven() {
+        assert_eq!(CURLOT_BLOB, 7);
+    }
+
+    #[test]
+    fn curlot_function_is_eight() {
+        assert_eq!(CURLOT_FUNCTION, 8);
+    }
+
+    // -- option_type_to_ffi mapping -----------------------------------------
+
+    #[test]
+    fn option_type_long_maps_to_curlot_long() {
+        assert_eq!(option_type_to_ffi(OptionType::Long), CURLOT_LONG);
+    }
+
+    #[test]
+    fn option_type_values_maps_to_curlot_values() {
+        assert_eq!(option_type_to_ffi(OptionType::Values), CURLOT_VALUES);
+    }
+
+    #[test]
+    fn option_type_string_point_maps_to_curlot_string() {
+        assert_eq!(option_type_to_ffi(OptionType::StringPoint), CURLOT_STRING);
+    }
+
+    #[test]
+    fn option_type_object_point_maps_to_curlot_object() {
+        assert_eq!(option_type_to_ffi(OptionType::ObjectPoint), CURLOT_OBJECT);
+    }
+
+    #[test]
+    fn option_type_function_point_maps_to_curlot_function() {
+        assert_eq!(option_type_to_ffi(OptionType::FunctionPoint), CURLOT_FUNCTION);
+    }
+
+    // -- FFI table initialisation -------------------------------------------
+
+    #[test]
+    fn ffi_table_non_empty() {
+        let table = get_ffi_table();
+        assert!(!table.entries.is_empty());
+    }
+
+    #[test]
+    fn ffi_table_entries_have_names() {
+        let table = get_ffi_table();
+        for entry in table.entries.iter() {
+            assert!(!entry.name.is_null(), "entry name should not be null");
+        }
+    }
+
+    // -- curl_easy_option_by_name -------------------------------------------
+
+    #[test]
+    fn option_by_name_verbose() {
+        // "verbose" is one of the most commonly used curl options.
+        let name = CString::new("verbose").unwrap();
+        // SAFETY: We pass a valid CString pointer; the function reads from
+        // a static table and does not write through the pointer.
+        let ptr = unsafe { curl_easy_option_by_name(name.as_ptr()) };
+        assert!(!ptr.is_null(), "curl_easy_option_by_name('verbose') should not be null");
+        // SAFETY: We verified the pointer is non-null; the returned struct
+        // lives in a process-lifetime static table.
+        let entry = unsafe { &*ptr };
+        let returned_name = unsafe { CStr::from_ptr(entry.name) };
+        // The options table stores canonical uppercase names per C curl convention.
+        assert_eq!(returned_name.to_str().unwrap(), "VERBOSE");
+    }
+
+    #[test]
+    fn option_by_name_null_returns_null() {
+        // SAFETY: Passing a null pointer; the function is documented to
+        // handle this by returning null.
+        let ptr = unsafe { curl_easy_option_by_name(ptr::null()) };
+        assert!(ptr.is_null());
+    }
+
+    #[test]
+    fn option_by_name_unknown_returns_null() {
+        let name = CString::new("this_option_does_not_exist").unwrap();
+        // SAFETY: Valid CString pointer, function only reads.
+        let ptr = unsafe { curl_easy_option_by_name(name.as_ptr()) };
+        assert!(ptr.is_null());
+    }
+
+    // -- curl_easy_option_by_id ---------------------------------------------
+
+    #[test]
+    fn option_by_id_verbose() {
+        // CURLoption for CURLOPT_VERBOSE is 41 (CURLOPTTYPE_LONG + 41 = 41).
+        let verbose_id: CURLoption = 41;
+        // SAFETY: We pass a valid option id; function reads from static table.
+        let ptr = unsafe { curl_easy_option_by_id(verbose_id) };
+        assert!(!ptr.is_null(), "curl_easy_option_by_id(41) should not be null");
+        let entry = unsafe { &*ptr };
+        assert_eq!(entry.id, verbose_id);
+    }
+
+    #[test]
+    fn option_by_id_unknown_returns_null() {
+        // A very high id should not match any option.
+        // SAFETY: Function handles unknown ids by returning null.
+        let ptr = unsafe { curl_easy_option_by_id(999999) };
+        assert!(ptr.is_null());
+    }
+
+    // -- curl_easy_option_next (iteration) ----------------------------------
+
+    #[test]
+    fn option_next_starts_from_null() {
+        // Passing null to option_next returns the first entry.
+        // SAFETY: Null pointer is the documented start-of-iteration sentinel.
+        let first = unsafe { curl_easy_option_next(ptr::null()) };
+        assert!(!first.is_null(), "first entry should not be null");
+    }
+
+    #[test]
+    fn option_next_iterates_entire_table() {
+        let mut count = 0usize;
+        // SAFETY: We iterate through the static table by pointer; each
+        // returned pointer is either non-null (valid entry) or null (end).
+        let mut current = unsafe { curl_easy_option_next(ptr::null()) };
+        while !current.is_null() {
+            count += 1;
+            current = unsafe { curl_easy_option_next(current) };
+            if count > 10_000 {
+                panic!("iteration did not terminate");
+            }
+        }
+        // There should be at least several dozen options.
+        assert!(count > 10, "expected >10 options, got {count}");
+    }
+
+    // -- convert_flags ------------------------------------------------------
+
+    #[test]
+    fn convert_flags_zero() {
+        let flags = convert_flags(0);
+        assert_eq!(flags, 0);
+    }
+}

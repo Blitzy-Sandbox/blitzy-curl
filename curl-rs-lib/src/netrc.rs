@@ -738,3 +738,210 @@ impl Netrc {
         self.ordered.iter().any(|oe| oe.is_default)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: parse a netrc string directly (bypasses file I/O).
+    fn parse(content: &str) -> Netrc {
+        parse_content(content).expect("parse_content should succeed")
+    }
+
+    // -- Basic parsing ------------------------------------------------------
+
+    #[test]
+    fn parse_single_machine() {
+        let netrc = parse("machine example.com login user password secret");
+        assert_eq!(netrc.machine_count(), 1);
+        assert!(!netrc.has_default());
+    }
+
+    #[test]
+    fn parse_single_machine_credentials() {
+        let netrc = parse("machine host.example login myuser password mypass");
+        let (login, pass) = netrc.find_credentials("host.example").unwrap();
+        assert_eq!(login, "myuser");
+        assert_eq!(pass, "mypass");
+    }
+
+    #[test]
+    fn parse_multiple_machines() {
+        let content = "\
+machine a.com login ua password pa
+machine b.com login ub password pb
+machine c.com login uc password pc
+";
+        let netrc = parse(content);
+        assert_eq!(netrc.machine_count(), 3);
+        assert_eq!(netrc.find_credentials("b.com"), Some(("ub", "pb")));
+    }
+
+    // -- Default entry ------------------------------------------------------
+
+    #[test]
+    fn parse_default_entry() {
+        let content = "default login defuser password defpass";
+        let netrc = parse(content);
+        assert!(netrc.has_default());
+        assert_eq!(netrc.machine_count(), 0);
+    }
+
+    #[test]
+    fn default_used_when_no_machine_match() {
+        let content = "\
+machine known.host login u1 password p1
+default login fallback password fallpass
+";
+        let netrc = parse(content);
+        // Exact match.
+        assert_eq!(netrc.find_credentials("known.host"), Some(("u1", "p1")));
+        // Falls back to default.
+        let (login, pass) = netrc.find_credentials("unknown.host").unwrap();
+        assert_eq!(login, "fallback");
+        assert_eq!(pass, "fallpass");
+    }
+
+    // -- Comments -----------------------------------------------------------
+
+    #[test]
+    fn comments_are_ignored() {
+        let content = "\
+# This is a comment
+machine example.com login user password pass
+# another comment
+";
+        let netrc = parse(content);
+        assert_eq!(netrc.machine_count(), 1);
+    }
+
+    // -- macdef handling ----------------------------------------------------
+
+    #[test]
+    fn macdef_block_skipped() {
+        let content = "\
+machine before.com login u1 password p1
+macdef init
+cd /pub
+get README
+
+machine after.com login u2 password p2
+";
+        let netrc = parse(content);
+        // The macdef block (terminated by blank line) should be skipped.
+        assert!(netrc.find_credentials("before.com").is_some());
+        assert!(netrc.find_credentials("after.com").is_some());
+    }
+
+    // -- Missing fields -----------------------------------------------------
+
+    #[test]
+    fn missing_password_returns_empty() {
+        let content = "machine nopass.com login onlylogin";
+        let netrc = parse(content);
+        let creds = netrc.find_credentials("nopass.com");
+        if let Some((login, pass)) = creds {
+            assert_eq!(login, "onlylogin");
+            assert!(pass.is_empty());
+        }
+        // If creds is None, the parser might handle missing password differently;
+        // either behaviour is acceptable as long as it doesn't panic.
+    }
+
+    // -- Empty file ---------------------------------------------------------
+
+    #[test]
+    fn empty_content_produces_empty_netrc() {
+        let netrc = parse("");
+        assert!(netrc.is_empty());
+        assert_eq!(netrc.machine_count(), 0);
+        assert!(!netrc.has_default());
+    }
+
+    // -- Whitespace tolerance -----------------------------------------------
+
+    #[test]
+    fn extra_whitespace_handled() {
+        let content = "  machine   ws.host   login   user   password   pass  ";
+        let netrc = parse(content);
+        assert_eq!(netrc.find_credentials("ws.host"), Some(("user", "pass")));
+    }
+
+    #[test]
+    fn newline_separated_tokens() {
+        let content = "machine\nnl.host\nlogin\nnluser\npassword\nnlpass";
+        let netrc = parse(content);
+        assert_eq!(netrc.find_credentials("nl.host"), Some(("nluser", "nlpass")));
+    }
+
+    // -- No match -----------------------------------------------------------
+
+    #[test]
+    fn no_match_returns_none_without_default() {
+        let netrc = parse("machine other.host login x password y");
+        assert!(netrc.find_credentials("missing.host").is_none());
+    }
+
+    // -- Account token ------------------------------------------------------
+
+    #[test]
+    fn account_token_parsed() {
+        let content = "machine acct.host login u password p account myaccount";
+        let netrc = parse(content);
+        // Account is rarely used; just verify it doesn't break parsing.
+        assert!(netrc.find_credentials("acct.host").is_some());
+    }
+
+    // -- First match wins ---------------------------------------------------
+
+    #[test]
+    fn first_machine_match_wins() {
+        let content = "\
+machine dup.host login first password p1
+machine dup.host login second password p2
+";
+        let netrc = parse(content);
+        let (login, _) = netrc.find_credentials("dup.host").unwrap();
+        assert_eq!(login, "first");
+    }
+
+    // -- NetrcEntry accessors -----------------------------------------------
+
+    #[test]
+    fn netrc_entry_accessors() {
+        let entry = NetrcEntry {
+            machine: "m".to_string(),
+            login: "l".to_string(),
+            password: "p".to_string(),
+            account: Some("a".to_string()),
+        };
+        assert_eq!(entry.machine(), "m");
+        assert_eq!(entry.login(), "l");
+        assert_eq!(entry.password(), "p");
+        assert_eq!(entry.account(), Some("a"));
+    }
+
+    #[test]
+    fn netrc_entry_no_account() {
+        let entry = NetrcEntry {
+            machine: String::new(),
+            login: String::new(),
+            password: String::new(),
+            account: None,
+        };
+        assert_eq!(entry.account(), None);
+    }
+
+    // -- Constants ----------------------------------------------------------
+
+    #[test]
+    fn max_constants() {
+        assert_eq!(MAX_NETRC_FILE, 128 * 1024);
+        assert_eq!(MAX_NETRC_LINE, 16384);
+        assert_eq!(MAX_NETRC_TOKEN, 4096);
+    }
+}

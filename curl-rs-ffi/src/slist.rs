@@ -187,3 +187,188 @@ pub unsafe extern "C" fn curl_slist_free_all(list: *mut curl_slist) {
         current = next;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    /// Helper: create a CString and return its raw pointer. The CString is
+    /// returned so the caller can keep it alive (preventing dangling).
+    fn c_str(s: &str) -> CString {
+        CString::new(s).unwrap()
+    }
+
+    /// Helper: count the number of nodes in a curl_slist chain.
+    unsafe fn list_len(mut head: *const curl_slist) -> usize {
+        let mut count = 0;
+        while !head.is_null() {
+            count += 1;
+            head = (*head).next;
+        }
+        count
+    }
+
+    /// Helper: collect all string values in a curl_slist chain.
+    unsafe fn list_values(mut head: *const curl_slist) -> Vec<String> {
+        let mut values = Vec::new();
+        while !head.is_null() {
+            let cstr = std::ffi::CStr::from_ptr((*head).data);
+            values.push(cstr.to_str().unwrap().to_owned());
+            head = (*head).next;
+        }
+        values
+    }
+
+    // -- curl_slist_append: create from NULL --------------------------------
+
+    #[test]
+    fn append_to_null_creates_single_element_list() {
+        let s = c_str("first");
+        // SAFETY: Passing NULL head and a valid C string pointer.
+        let head = unsafe { curl_slist_append(ptr::null_mut(), s.as_ptr()) };
+        assert!(!head.is_null());
+        assert_eq!(unsafe { list_len(head) }, 1);
+        assert_eq!(unsafe { list_values(head) }, vec!["first"]);
+        // SAFETY: head is a valid list returned by curl_slist_append.
+        unsafe { curl_slist_free_all(head) };
+    }
+
+    // -- curl_slist_append: append to existing ------------------------------
+
+    #[test]
+    fn append_multiple_elements() {
+        let s1 = c_str("alpha");
+        let s2 = c_str("beta");
+        let s3 = c_str("gamma");
+
+        // SAFETY: Building a list from valid C strings and NULL initial head.
+        let mut head = unsafe { curl_slist_append(ptr::null_mut(), s1.as_ptr()) };
+        head = unsafe { curl_slist_append(head, s2.as_ptr()) };
+        head = unsafe { curl_slist_append(head, s3.as_ptr()) };
+
+        assert!(!head.is_null());
+        assert_eq!(unsafe { list_len(head) }, 3);
+        assert_eq!(
+            unsafe { list_values(head) },
+            vec!["alpha", "beta", "gamma"]
+        );
+        // SAFETY: head is a valid list.
+        unsafe { curl_slist_free_all(head) };
+    }
+
+    // -- curl_slist_append: data is copied ----------------------------------
+
+    #[test]
+    fn append_copies_data() {
+        let s = c_str("original");
+        // SAFETY: Valid C string pointer.
+        let head = unsafe { curl_slist_append(ptr::null_mut(), s.as_ptr()) };
+        assert!(!head.is_null());
+
+        // The node's data pointer should NOT be the same as our CString —
+        // it should be a fresh copy.
+        let node_data = unsafe { (*head).data };
+        assert_ne!(node_data as *const c_char, s.as_ptr());
+
+        // But the content should be identical.
+        let content = unsafe { std::ffi::CStr::from_ptr(node_data) };
+        assert_eq!(content.to_str().unwrap(), "original");
+
+        unsafe { curl_slist_free_all(head) };
+    }
+
+    // -- curl_slist_free_all: NULL is no-op ---------------------------------
+
+    #[test]
+    fn free_all_null_is_noop() {
+        // SAFETY: Passing NULL is documented as a no-op.
+        unsafe { curl_slist_free_all(ptr::null_mut()) };
+        // If we get here without crashing, the test passes.
+    }
+
+    // -- curl_slist_free_all: single element --------------------------------
+
+    #[test]
+    fn free_all_single_element() {
+        let s = c_str("only");
+        // SAFETY: Valid inputs.
+        let head = unsafe { curl_slist_append(ptr::null_mut(), s.as_ptr()) };
+        assert!(!head.is_null());
+        // SAFETY: head is a valid list.
+        unsafe { curl_slist_free_all(head) };
+        // No crash = success; we cannot verify the memory is actually freed
+        // without an allocator hook, but the code path is exercised.
+    }
+
+    // -- curl_slist_append: empty string ------------------------------------
+
+    #[test]
+    fn append_empty_string() {
+        let s = c_str("");
+        // SAFETY: An empty C string is valid (just a NUL byte).
+        let head = unsafe { curl_slist_append(ptr::null_mut(), s.as_ptr()) };
+        assert!(!head.is_null());
+        assert_eq!(unsafe { list_values(head) }, vec![""]);
+        unsafe { curl_slist_free_all(head) };
+    }
+
+    // -- curl_slist_append: long string -------------------------------------
+
+    #[test]
+    fn append_long_string() {
+        let long = "A".repeat(8192);
+        let s = c_str(&long);
+        // SAFETY: Valid long C string.
+        let head = unsafe { curl_slist_append(ptr::null_mut(), s.as_ptr()) };
+        assert!(!head.is_null());
+        let values = unsafe { list_values(head) };
+        assert_eq!(values[0], long);
+        unsafe { curl_slist_free_all(head) };
+    }
+
+    // -- curl_slist_append: tail pointer is null ----------------------------
+
+    #[test]
+    fn last_node_next_is_null() {
+        let s1 = c_str("a");
+        let s2 = c_str("b");
+        // SAFETY: Building a 2-element list.
+        let mut head = unsafe { curl_slist_append(ptr::null_mut(), s1.as_ptr()) };
+        head = unsafe { curl_slist_append(head, s2.as_ptr()) };
+
+        // Walk to last node.
+        let mut last = head;
+        unsafe {
+            while !(*last).next.is_null() {
+                last = (*last).next;
+            }
+            assert!((*last).next.is_null());
+        }
+        unsafe { curl_slist_free_all(head) };
+    }
+
+    // -- Multi-element free_all --------------------------------------------
+
+    #[test]
+    fn free_all_multi_element() {
+        let s1 = c_str("one");
+        let s2 = c_str("two");
+        let s3 = c_str("three");
+        let s4 = c_str("four");
+
+        let mut head = unsafe { curl_slist_append(ptr::null_mut(), s1.as_ptr()) };
+        head = unsafe { curl_slist_append(head, s2.as_ptr()) };
+        head = unsafe { curl_slist_append(head, s3.as_ptr()) };
+        head = unsafe { curl_slist_append(head, s4.as_ptr()) };
+
+        assert_eq!(unsafe { list_len(head) }, 4);
+        // SAFETY: head is a valid 4-element list.
+        unsafe { curl_slist_free_all(head) };
+        // No crash = success.
+    }
+}

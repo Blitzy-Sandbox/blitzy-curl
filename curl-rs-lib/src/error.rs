@@ -1202,3 +1202,300 @@ impl From<i32> for CurlUrlError {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // CurlError — discriminant values match C CURLcode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn curl_error_ok_is_zero() {
+        assert_eq!(CurlError::Ok as i32, 0);
+    }
+
+    #[test]
+    fn curl_error_unsupported_protocol_is_one() {
+        assert_eq!(CurlError::UnsupportedProtocol as i32, 1);
+    }
+
+    #[test]
+    fn curl_error_failed_init_is_two() {
+        assert_eq!(CurlError::FailedInit as i32, 2);
+    }
+
+    #[test]
+    fn curl_error_url_malformat_is_three() {
+        assert_eq!(CurlError::UrlMalformat as i32, 3);
+    }
+
+    #[test]
+    fn curl_error_not_built_in_is_four() {
+        assert_eq!(CurlError::NotBuiltIn as i32, 4);
+    }
+
+    #[test]
+    fn curl_error_couldnt_resolve_proxy_is_five() {
+        assert_eq!(CurlError::CouldntResolveProxy as i32, 5);
+    }
+
+    #[test]
+    fn curl_error_couldnt_resolve_host_is_six() {
+        assert_eq!(CurlError::CouldntResolveHost as i32, 6);
+    }
+
+    #[test]
+    fn curl_error_couldnt_connect_is_seven() {
+        assert_eq!(CurlError::CouldntConnect as i32, 7);
+    }
+
+    #[test]
+    fn curl_error_operation_timed_out_is_28() {
+        assert_eq!(CurlError::OperationTimedOut as i32, 28);
+    }
+
+    #[test]
+    fn curl_error_ssl_connect_is_35() {
+        assert_eq!(CurlError::SslConnectError as i32, 35);
+    }
+
+    #[test]
+    fn curl_error_got_nothing_is_52() {
+        assert_eq!(CurlError::GotNothing as i32, 52);
+    }
+
+    #[test]
+    fn curl_error_again_is_81() {
+        assert_eq!(CurlError::Again as i32, 81);
+    }
+
+    // -- Round-trip i32 conversions -----------------------------------------
+
+    #[test]
+    fn curl_error_from_i32_round_trip_ok() {
+        let code = 0i32;
+        let err = CurlError::from(code);
+        assert_eq!(err, CurlError::Ok);
+        assert_eq!(i32::from(err), code);
+    }
+
+    #[test]
+    fn curl_error_from_i32_round_trip_unsupported_protocol() {
+        let code = 1i32;
+        let err = CurlError::from(code);
+        assert_eq!(err, CurlError::UnsupportedProtocol);
+        assert_eq!(i32::from(err), code);
+    }
+
+    #[test]
+    fn curl_error_from_i32_round_trip_operation_timeout() {
+        let code = 28i32;
+        let err = CurlError::from(code);
+        assert_eq!(err, CurlError::OperationTimedOut);
+        assert_eq!(i32::from(err), code);
+    }
+
+    #[test]
+    fn curl_error_from_i32_round_trip_again() {
+        let code = 81i32;
+        let err = CurlError::from(code);
+        assert_eq!(err, CurlError::Again);
+        assert_eq!(i32::from(err), code);
+    }
+
+    #[test]
+    fn curl_error_from_i32_unknown_maps_to_unknown_option() {
+        let err = CurlError::from(9999i32);
+        assert_eq!(err, CurlError::UnknownOption);
+    }
+
+    // -- strerror -----------------------------------------------------------
+
+    #[test]
+    fn curl_error_strerror_ok() {
+        assert_eq!(CurlError::Ok.strerror(), "No error");
+    }
+
+    #[test]
+    fn curl_error_strerror_non_empty() {
+        assert!(!CurlError::UnsupportedProtocol.strerror().is_empty());
+        assert!(!CurlError::CouldntConnect.strerror().is_empty());
+        assert!(!CurlError::OperationTimedOut.strerror().is_empty());
+    }
+
+    // -- From<io::Error> ---------------------------------------------------
+
+    #[test]
+    fn curl_error_from_io_error_connection_refused() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test");
+        let curl_err = CurlError::from(io_err);
+        assert_eq!(curl_err, CurlError::CouldntConnect);
+    }
+
+    #[test]
+    fn curl_error_from_io_error_timed_out() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "test");
+        let curl_err = CurlError::from(io_err);
+        assert_eq!(curl_err, CurlError::OperationTimedOut);
+    }
+
+    #[test]
+    fn curl_error_from_io_error_other() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let curl_err = CurlError::from(io_err);
+        assert_ne!(curl_err, CurlError::Ok);
+    }
+
+    // -- Display ------------------------------------------------------------
+
+    #[test]
+    fn curl_error_display_format() {
+        let err = CurlError::OperationTimedOut;
+        let s = format!("{err}");
+        assert!(!s.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // CurlMcode — discriminant values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn curl_mcode_ok_is_zero() {
+        assert_eq!(CurlMcode::Ok as i32, 0);
+    }
+
+    #[test]
+    fn curl_mcode_bad_handle_is_one() {
+        assert_eq!(CurlMcode::BadHandle as i32, 1);
+    }
+
+    #[test]
+    fn curl_mcode_bad_easy_handle_is_two() {
+        assert_eq!(CurlMcode::BadEasyHandle as i32, 2);
+    }
+
+    #[test]
+    fn curl_mcode_out_of_memory_is_three() {
+        assert_eq!(CurlMcode::OutOfMemory as i32, 3);
+    }
+
+    #[test]
+    fn curl_mcode_bad_socket_is_five() {
+        assert_eq!(CurlMcode::BadSocket as i32, 5);
+    }
+
+    #[test]
+    fn curl_mcode_added_already_is_seven() {
+        assert_eq!(CurlMcode::AddedAlready as i32, 7);
+    }
+
+    #[test]
+    fn curl_mcode_round_trip_i32() {
+        for code in 0..=7 {
+            let m = CurlMcode::from(code);
+            let _ = i32::from(m);
+        }
+    }
+
+    #[test]
+    fn curl_mcode_strerror_ok() {
+        assert_eq!(CurlMcode::Ok.strerror(), "No error");
+    }
+
+    // -----------------------------------------------------------------------
+    // CurlSHcode — discriminant values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn curl_shcode_ok_is_zero() {
+        assert_eq!(CurlSHcode::Ok as i32, 0);
+    }
+
+    #[test]
+    fn curl_shcode_bad_option_is_one() {
+        assert_eq!(CurlSHcode::BadOption as i32, 1);
+    }
+
+    #[test]
+    fn curl_shcode_not_built_in_is_five() {
+        assert_eq!(CurlSHcode::NotBuiltIn as i32, 5);
+    }
+
+    #[test]
+    fn curl_shcode_round_trip_i32() {
+        for code in 0..=5 {
+            let sh = CurlSHcode::from(code);
+            let _ = i32::from(sh);
+        }
+    }
+
+    #[test]
+    fn curl_shcode_strerror_ok() {
+        assert_eq!(CurlSHcode::Ok.strerror(), "No error");
+    }
+
+    // -----------------------------------------------------------------------
+    // CurlUrlError — discriminant values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn curl_url_error_ok_is_zero() {
+        assert_eq!(CurlUrlError::Ok as i32, 0);
+    }
+
+    #[test]
+    fn curl_url_error_bad_handle_is_one() {
+        assert_eq!(CurlUrlError::BadHandle as i32, 1);
+    }
+
+    #[test]
+    fn curl_url_error_bad_port_is_four() {
+        assert_eq!(CurlUrlError::BadPortNumber as i32, 4);
+    }
+
+    #[test]
+    fn curl_url_error_out_of_memory_is_seven() {
+        assert_eq!(CurlUrlError::OutOfMemory as i32, 7);
+    }
+
+    #[test]
+    fn curl_url_error_round_trip_i32() {
+        for code in 0..=31 {
+            let ue = CurlUrlError::from(code);
+            let _ = i32::from(ue);
+        }
+    }
+
+    #[test]
+    fn curl_url_error_strerror_ok() {
+        assert_eq!(CurlUrlError::Ok.strerror(), "No error");
+    }
+
+    #[test]
+    fn curl_url_error_unknown_maps_to_bad_handle() {
+        let ue = CurlUrlError::from(9999);
+        assert_eq!(ue, CurlUrlError::BadHandle);
+    }
+
+    // -----------------------------------------------------------------------
+    // CurlResult type alias
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn curl_result_ok() {
+        let r: CurlResult<u32> = Ok(42);
+        assert_eq!(r.unwrap(), 42);
+    }
+
+    #[test]
+    fn curl_result_err() {
+        let r: CurlResult<u32> = Err(CurlError::Again);
+        assert_eq!(r.unwrap_err(), CurlError::Again);
+    }
+}
