@@ -11,6 +11,8 @@ pub mod h1_proxy;
 pub mod h2_proxy;
 pub mod happy_eyeballs;
 pub mod haproxy;
+#[cfg(feature = "http")]
+pub mod https_connect;
 pub mod shutdown;
 pub mod socket;
 
@@ -29,3 +31,5 @@ pub use socket::{
     apply_tcp_options, check_alive, parse_interface, SocketConfig, SocketType, TcpSocketFilter,
     UdpSocketFilter,
 };
+#[cfg(feature = "http")]
+pub use https_connect::{HttpsConnectFilter, HttpVersionMask, https_setup};
