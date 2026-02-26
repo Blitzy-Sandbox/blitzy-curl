@@ -310,3 +310,30 @@ conn[curl.se] --> HTTPS-CONNECT --> NULL
 conn[curl.se] --> HTTPS-CONNECT --> SETUP[QUIC] --> HAPPY-EYEBALLS --> HTTP/3[151.101.1.91]:443
 * transfer
 ```
+
+## curl-rs Rust Workspace — Connection Filters
+
+In the curl-rs Rust workspace, the connection filter chain described above is
+reimplemented as a **trait-based filter chain** in the `curl-rs-lib/src/conn/`
+module. Instead of the C `Curl_cftype` function pointer tables, Rust traits
+define the filter interface with methods for connect, read, write, close, and
+query operations. The composable, tower-like middleware pattern preserves the
+same stacking and chaining semantics described in this document — filters wrap
+an inner transport and delegate to the next filter in the chain.
+
+The Rust connection filter modules are:
+
+* `conn/filters.rs` — filter trait definition and chain composition (replaces `cfilters.c`)
+* `conn/socket.rs` — socket-level filter (replaces `cf-socket.c`)
+* `conn/connect.rs` — async TCP connection via Tokio (replaces `connect.c`)
+* `conn/cache.rs` — connection pool with async-aware locking (replaces `conncache.c`)
+* `conn/h1_proxy.rs` — HTTP/1 CONNECT proxy tunnel (replaces `cf-h1-proxy.c`)
+* `conn/h2_proxy.rs` — HTTP/2 CONNECT proxy tunnel (replaces `cf-h2-proxy.c`)
+* `conn/haproxy.rs` — HAProxy protocol filter (replaces `cf-haproxy.c`)
+* `conn/https_connect.rs` — HTTPS-connect method filter (replaces `cf-https-connect.c`)
+* `conn/happy_eyeballs.rs` — Happy Eyeballs v2 algorithm (replaces `cf-ip-happy.c`)
+* `conn/shutdown.rs` — graceful connection shutdown (replaces `cshutdn.c`)
+
+TLS is provided exclusively by rustls (replacing all 7 C TLS backends) and is
+integrated as a filter via the `tls/` module, fitting into the same filter
+chain position as the C `SSL` filter type described above.
