@@ -379,3 +379,39 @@ being used.
 You can change the hard-coded response to something more useful by replacing
 `respond` with `reverse_proxy` or `file_server`, for example: `reverse_proxy
 localhost:80`
+
+# curl-rs Rust Workspace — HTTP/3
+
+In the **curl-rs** Rust workspace, HTTP/3 and QUIC support is provided entirely
+by pure-Rust crates. No C QUIC or TLS libraries are linked.
+
+## Crates
+
+| Crate | Version | Role |
+|-------|---------|------|
+| [quinn](https://crates.io/crates/quinn) | 0.11.9 | QUIC transport layer |
+| [h3](https://crates.io/crates/h3) | 0.0.7 | HTTP/3 protocol implementation |
+| [h3-quinn](https://crates.io/crates/h3-quinn) | 0.0.10 | Integration adapter between quinn and h3 |
+| [rustls](https://crates.io/crates/rustls) | 0.23.36 | TLS 1.2/1.3 for QUIC — no C TLS library linkage |
+
+## Building
+
+HTTP/3 is enabled **by default** in the Rust workspace. No separate library
+build steps are required — all dependencies are fetched from
+[crates.io](https://crates.io) via Cargo.
+
+     % cargo build --release --workspace
+
+This single command produces a `curl-rs` binary with full HTTP/3 support.
+
+## Relationship to the C backends
+
+The pure-Rust stack (`quinn` + `h3` + `h3-quinn`) replaces the following C
+QUIC backends entirely in the Rust build:
+
+- **ngtcp2** + **nghttp3**
+- **quiche** (+ BoringSSL)
+- **OpenSSL 3.2+ QUIC**
+
+The C build instructions elsewhere in this document remain valid for the
+original C codebase.
