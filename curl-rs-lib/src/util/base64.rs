@@ -34,6 +34,15 @@ static STANDARD_INDIFFERENT: GeneralPurpose = GeneralPurpose::new(
     GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
 
+/// A decode-only engine that accepts both padded and un-padded URL-safe
+/// Base64 input. The pre-built `URL_SAFE_NO_PAD` engine uses
+/// `RequireNone` which rejects padded input; this engine is `Indifferent`
+/// so it tolerates both forms.
+static URL_SAFE_INDIFFERENT: GeneralPurpose = GeneralPurpose::new(
+    &alphabet::URL_SAFE,
+    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -119,6 +128,10 @@ pub fn decode(input: &str) -> Result<Vec<u8>, CurlError> {
         .filter(|&c| c != ' ' && c != '\t' && c != '\r' && c != '\n')
         .collect();
 
+    if clean.is_empty() {
+        return Ok(Vec::new());
+    }
+
     STANDARD_INDIFFERENT
         .decode(&clean)
         .map_err(|_| CurlError::BadContentEncoding)
@@ -126,7 +139,11 @@ pub fn decode(input: &str) -> Result<Vec<u8>, CurlError> {
 
 /// URL-safe Base64-decode `input`.
 ///
-/// Strips whitespace and uses the URL-safe alphabet.
+/// Accepts both padded and un-padded input using the URL-safe alphabet
+/// (`-` for `+`, `_` for `/`). Whitespace characters are silently
+/// stripped before decoding, matching standard decode behaviour.
+///
+/// Returns [`CurlError::BadContentEncoding`] on invalid characters.
 pub fn decode_url_safe(input: &str) -> Result<Vec<u8>, CurlError> {
     if input.is_empty() {
         return Ok(Vec::new());
@@ -136,7 +153,11 @@ pub fn decode_url_safe(input: &str) -> Result<Vec<u8>, CurlError> {
         .filter(|&c| c != ' ' && c != '\t' && c != '\r' && c != '\n')
         .collect();
 
-    URL_SAFE_NO_PAD
+    if clean.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    URL_SAFE_INDIFFERENT
         .decode(&clean)
         .map_err(|_| CurlError::BadContentEncoding)
 }
@@ -169,14 +190,32 @@ pub fn decoded_len_estimate(encoded_len: usize) -> usize {
 /// Encode `input` directly into a [`DynBuf`], avoiding an intermediate
 /// [`String`] allocation for large payloads.
 ///
+/// Uses [`Engine::encode_slice`] to write Base64 bytes into a temporary
+/// buffer, then appends them to the [`DynBuf`] via [`DynBuf::add`].
+///
 /// Used by authentication modules (Basic, NTLM, Digest, SASL) that build
 /// authorisation headers containing Base64-encoded credentials.
+///
+/// Returns [`CurlError::TooLarge`] if `input` exceeds [`MAX_BASE64_INPUT`].
+/// Returns [`CurlError::OutOfMemory`] if the DynBuf allocation fails.
 pub fn encode_to_buf(input: &[u8], buf: &mut DynBuf) -> Result<(), CurlError> {
+    if input.is_empty() {
+        return Ok(());
+    }
     if input.len() > MAX_BASE64_INPUT {
         return Err(CurlError::TooLarge);
     }
-    let encoded = encode(input);
-    buf.add_str(&encoded)
+
+    // Calculate the exact encoded length and encode directly into a byte
+    // buffer, bypassing the String allocation that Engine::encode() performs.
+    let enc_len = encoded_len(input.len());
+    let mut temp = vec![0u8; enc_len];
+    let written = STANDARD
+        .encode_slice(input, &mut temp)
+        .map_err(|_| CurlError::OutOfMemory)?;
+
+    // Append raw encoded bytes to the DynBuf.
+    buf.add(&temp[..written])
 }
 
 /// Decode Base64 `input` into a freshly allocated [`Vec<u8>`].
