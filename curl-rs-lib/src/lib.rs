@@ -8,6 +8,7 @@ pub mod idn;
 pub mod options;
 pub mod proxy;
 pub mod psl;
+pub mod ratelimit;
 pub mod slist;
 pub mod tls;
 pub mod util;
