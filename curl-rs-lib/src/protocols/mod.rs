@@ -5,3 +5,6 @@
 //! used by text-based command/response protocols.
 
 pub mod pingpong;
+
+#[cfg(feature = "ftp")]
+pub mod ftp_list;
