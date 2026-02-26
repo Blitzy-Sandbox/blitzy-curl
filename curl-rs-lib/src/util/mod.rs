@@ -11,6 +11,7 @@ pub mod llist;
 pub mod md5;
 pub mod nonblock;
 pub mod parsedate;
+pub mod rand;
 pub mod sha256;
 pub mod strparse;
 pub mod timeval;
