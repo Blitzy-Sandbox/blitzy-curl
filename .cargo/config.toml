@@ -1,5 +1,48 @@
-# Cargo configuration for curl-rs workspace
-# Cross-compilation target settings
+# -----------------------------------------------------------------------
+# Cargo configuration for the curl-rs workspace
+#
+# Provides cross-compilation settings for the 4-target CI matrix defined
+# in AAP Sections 0.4.1 and 0.7.3:
+#
+#   1. x86_64-unknown-linux-gnu   — native on ubuntu-latest (x86_64)
+#   2. aarch64-unknown-linux-gnu  — cross-compiled from x86_64 host
+#   3. x86_64-apple-darwin        — native on macOS Intel runners
+#   4. aarch64-apple-darwin       — native on macOS Apple Silicon runners
+#
+# Only the aarch64-unknown-linux-gnu target requires explicit linker
+# configuration because it is cross-compiled from an x86_64 CI host.
+# All other targets build natively on their respective runners.
+#
+# No default build target is set — the workspace builds for the host
+# triple by default, which is the correct behavior for both local
+# development and per-runner CI jobs.
+#
+# SPDX-License-Identifier: curl
+# -----------------------------------------------------------------------
 
+# --- Cross-compilation: Linux aarch64 from x86_64 host -----------------
+#
+# The CI matrix runs ubuntu-latest (x86_64) and cross-compiles to
+# aarch64 using the gcc-aarch64-linux-gnu cross toolchain. The linker
+# must be explicitly specified because Cargo defaults to `cc` which
+# targets the host architecture.
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
+
+# --- Network resilience for CI builds ----------------------------------
+#
+# Retry transient network failures when fetching crate registries or
+# git dependencies, and prefer the git CLI for fetches (more robust
+# behind corporate proxies and in constrained CI environments).
+[net]
+retry = 3
+git-fetch-with-cli = true
+
+# --- Registry protocol --------------------------------------------------
+#
+# Use the sparse protocol for crates.io index fetches. This is the
+# default since Cargo 1.70 (Rust 1.70), but setting it explicitly
+# ensures deterministic behavior across all supported toolchain versions
+# down to MSRV 1.75.
+[registries.crates-io]
+protocol = "sparse"
