@@ -5,4 +5,5 @@
 //! with a single rustls-based implementation.
 
 pub mod hostname;
+pub mod keylog;
 pub mod session_cache;
