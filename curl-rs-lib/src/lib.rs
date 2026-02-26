@@ -4,6 +4,7 @@
 pub mod error;
 pub mod escape;
 pub mod headers;
+pub mod idn;
 pub mod options;
 pub mod proxy;
 pub mod slist;
