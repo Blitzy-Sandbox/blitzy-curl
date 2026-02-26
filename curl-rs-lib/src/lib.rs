@@ -4,4 +4,5 @@
 pub mod error;
 pub mod options;
 pub mod slist;
+pub mod tls;
 pub mod util;
