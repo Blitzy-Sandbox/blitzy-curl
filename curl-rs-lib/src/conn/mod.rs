@@ -11,6 +11,7 @@ pub mod h1_proxy;
 pub mod h2_proxy;
 pub mod happy_eyeballs;
 pub mod haproxy;
+pub mod shutdown;
 pub mod socket;
 
 // Re-export primary types for convenient access.
@@ -23,6 +24,7 @@ pub use connect::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_SHUTDOWN_TIMEOUT_MS,
 };
 pub use happy_eyeballs::{HappyEyeballsFilter, DEFAULT_HAPPY_EYEBALLS_DELAY_MS};
+pub use shutdown::{ShutdownEntry, ShutdownManager, ShutdownState};
 pub use socket::{
     apply_tcp_options, check_alive, parse_interface, SocketConfig, SocketType, TcpSocketFilter,
     UdpSocketFilter,
