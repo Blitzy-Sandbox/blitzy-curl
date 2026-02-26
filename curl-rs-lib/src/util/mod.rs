@@ -16,5 +16,6 @@ pub mod rand;
 pub mod sha256;
 pub mod strparse;
 pub mod timeval;
+pub mod select;
 pub mod splay;
 pub mod warnless;
