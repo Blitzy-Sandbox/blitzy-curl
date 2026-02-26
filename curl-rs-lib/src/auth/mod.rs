@@ -6,5 +6,6 @@
 pub mod basic;
 pub mod bearer;
 pub mod kerberos;
+pub mod negotiate;
 pub mod ntlm;
 pub mod scram;
