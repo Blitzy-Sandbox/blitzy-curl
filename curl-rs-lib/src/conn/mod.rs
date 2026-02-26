@@ -6,6 +6,7 @@
 //! [`ConnectionFilter`] trait and compose into a [`FilterChain`].
 
 pub mod filters;
+pub mod h2_proxy;
 pub mod haproxy;
 pub mod socket;
 
