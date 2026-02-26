@@ -10,4 +10,5 @@ pub mod llist;
 pub mod md5;
 pub mod sha256;
 pub mod strparse;
+pub mod timeval;
 pub mod warnless;
