@@ -732,6 +732,7 @@ name = "curl-rs-lib"
 version = "8.19.0"
 dependencies = [
  "assert_cmd",
+ "async-trait",
  "base64",
  "brotli",
  "bytes",

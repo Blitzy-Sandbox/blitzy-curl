@@ -2,6 +2,7 @@
 // This is a stub file that will be replaced by the implementation agent.
 
 pub mod altsvc;
+pub mod conn;
 pub mod content_encoding;
 pub mod error;
 pub mod escape;
