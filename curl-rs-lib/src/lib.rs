@@ -8,6 +8,7 @@ pub mod content_encoding;
 pub mod dns;
 pub mod error;
 pub mod escape;
+pub mod getinfo;
 pub mod hsts;
 pub mod netrc;
 pub mod headers;
