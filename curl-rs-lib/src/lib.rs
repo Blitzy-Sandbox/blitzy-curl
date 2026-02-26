@@ -13,6 +13,7 @@ pub mod hsts;
 pub mod netrc;
 pub mod headers;
 pub mod idn;
+pub mod mime;
 pub mod options;
 pub mod progress;
 pub mod protocols;
