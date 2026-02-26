@@ -165,15 +165,42 @@ pub fn remaining_ms(deadline: Instant, now: Instant) -> i64 {
 
 /// Calculate the remaining milliseconds using [`CurlTime`] instances.
 ///
-/// Thin wrapper that delegates to [`CurlTime::diff_ms`], clamping negative
-/// results (deadline in the past) to zero.
+/// Uses [`CurlTime::to_duration_since`] to compute the gap between `deadline`
+/// and `now`. When the deadline has already passed (`now >= deadline`),
+/// `to_duration_since` returns [`Duration::ZERO`] and this function returns
+/// `0`.
 pub fn remaining_ms_curl(deadline: CurlTime, now: CurlTime) -> i64 {
-    let diff = CurlTime::diff_ms(deadline, now);
-    if diff <= 0 {
-        0
-    } else {
-        diff
-    }
+    duration_to_ms(deadline.to_duration_since(now))
+}
+
+/// Compute how many milliseconds have elapsed since `start`.
+///
+/// Convenience wrapper around [`CurlTime::elapsed`] that converts the
+/// resulting [`Duration`] to an `i64` millisecond count. Clamped to
+/// [`i64::MAX`] on overflow (should never occur in practice given that
+/// monotonic clocks start at process launch).
+///
+/// # Examples
+///
+/// ```no_run
+/// use curl_rs_lib::util::timeval::CurlTime;
+/// use curl_rs_lib::util::timediff::elapsed_ms;
+///
+/// let start = CurlTime::now();
+/// // … perform some work …
+/// let ms = elapsed_ms(start);
+/// assert!(ms >= 0);
+/// ```
+pub fn elapsed_ms(start: CurlTime) -> i64 {
+    duration_to_ms(start.elapsed())
+}
+
+/// Convenience: remaining milliseconds from [`Instant::now`] until `deadline`.
+///
+/// Equivalent to `remaining_ms(deadline, Instant::now())`.
+#[inline]
+pub fn remaining_ms_now(deadline: Instant) -> i64 {
+    remaining_ms(deadline, Instant::now())
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +218,46 @@ pub struct CurlTimeval {
     pub tv_sec: i64,
     /// Microseconds component (0 ..= 999_999).
     pub tv_usec: i64,
+}
+
+impl CurlTimeval {
+    /// Convert this timeval into a [`Duration`] with full microsecond
+    /// precision.
+    ///
+    /// Negative field values are treated as zero. This mirrors converting a
+    /// C `struct timeval` into a Rust-native time span.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use curl_rs_lib::util::timediff::CurlTimeval;
+    /// use std::time::Duration;
+    ///
+    /// let tv = CurlTimeval { tv_sec: 2, tv_usec: 500_000 };
+    /// assert_eq!(tv.to_duration(), Duration::from_millis(2500));
+    /// ```
+    pub fn to_duration(&self) -> Duration {
+        let sec_part = if self.tv_sec > 0 {
+            Duration::from_secs(self.tv_sec as u64)
+        } else {
+            Duration::ZERO
+        };
+        let usec_part = if self.tv_usec > 0 {
+            Duration::from_micros(self.tv_usec as u64)
+        } else {
+            Duration::ZERO
+        };
+        sec_part + usec_part
+    }
+
+    /// Create a new [`CurlTimeval`] from separate seconds and microseconds.
+    ///
+    /// No validation is performed; callers are expected to keep `tv_usec` in
+    /// the `0 ..= 999_999` range.
+    #[inline]
+    pub fn new(tv_sec: i64, tv_usec: i64) -> Self {
+        Self { tv_sec, tv_usec }
+    }
 }
 
 /// Convert milliseconds to a [`CurlTimeval`].
@@ -414,6 +481,71 @@ mod tests {
             tv_usec: 999_999,
         };
         assert_eq!(timeval_to_ms(&tv), i64::MAX);
+    }
+
+    // -- remaining_ms_curl (CurlTime) ---------------------------------------
+
+    #[test]
+    fn remaining_ms_curl_deadline_in_future() {
+        let now = CurlTime::now();
+        let deadline = now.add_ms(200);
+        let rem = remaining_ms_curl(deadline, now);
+        // Should be approximately 200; allow jitter.
+        assert!(rem >= 150 && rem <= 300, "remaining was {rem}");
+    }
+
+    #[test]
+    fn remaining_ms_curl_deadline_passed() {
+        let deadline = CurlTime::now();
+        std::thread::sleep(Duration::from_millis(10));
+        let now = CurlTime::now();
+        assert_eq!(remaining_ms_curl(deadline, now), 0);
+    }
+
+    // -- elapsed_ms ---------------------------------------------------------
+
+    #[test]
+    fn elapsed_ms_non_negative() {
+        let start = CurlTime::now();
+        std::thread::sleep(Duration::from_millis(10));
+        let ms = elapsed_ms(start);
+        assert!(ms >= 5, "elapsed should be >= 5 ms, got {ms}");
+    }
+
+    // -- remaining_ms_now ---------------------------------------------------
+
+    #[test]
+    fn remaining_ms_now_future_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let rem = remaining_ms_now(deadline);
+        assert!(rem > 0, "remaining should be > 0, got {rem}");
+    }
+
+    // -- CurlTimeval::to_duration -------------------------------------------
+
+    #[test]
+    fn timeval_to_duration_basic() {
+        let tv = CurlTimeval { tv_sec: 2, tv_usec: 500_000 };
+        assert_eq!(tv.to_duration(), Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn timeval_to_duration_zero() {
+        let tv = CurlTimeval::default();
+        assert_eq!(tv.to_duration(), Duration::ZERO);
+    }
+
+    #[test]
+    fn timeval_to_duration_negative_clamped() {
+        let tv = CurlTimeval { tv_sec: -1, tv_usec: -500 };
+        assert_eq!(tv.to_duration(), Duration::ZERO);
+    }
+
+    #[test]
+    fn timeval_new_constructor() {
+        let tv = CurlTimeval::new(3, 250_000);
+        assert_eq!(tv.tv_sec, 3);
+        assert_eq!(tv.tv_usec, 250_000);
     }
 
     // -- Constants ----------------------------------------------------------
