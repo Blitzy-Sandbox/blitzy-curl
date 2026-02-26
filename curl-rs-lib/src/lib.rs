@@ -5,6 +5,7 @@ pub mod altsvc;
 pub mod auth;
 pub mod conn;
 pub mod content_encoding;
+pub mod cookie;
 pub mod dns;
 pub mod error;
 pub mod escape;
