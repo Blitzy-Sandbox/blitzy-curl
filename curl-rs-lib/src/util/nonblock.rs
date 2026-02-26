@@ -329,20 +329,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_closed_fd_returns_error() {
-        use std::os::unix::io::IntoRawFd;
+        // Use an fd number that is guaranteed to never be a valid open fd.
+        // On Linux, fd values are non-negative integers allocated sequentially
+        // from 0. A very high fd number (close to the typical ulimit) is
+        // extremely unlikely to be open in a test environment.
+        let bad_fd: RawFd = 999_999;
 
-        // Create and immediately close a socket to get a closed fd
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let fd = listener.into_raw_fd();
-        // Close the fd manually using libc-free approach: wrap in a TcpListener
-        // which will close on drop
-        let _ = unsafe { std::net::TcpListener::from_raw_fd(fd) };
-        // fd is now closed
-
-        let result = set_nonblocking(fd, true);
+        let result = set_nonblocking(bad_fd, true);
         assert!(
             result.is_err(),
-            "closed fd should produce an error, got Ok"
+            "invalid fd should produce an error, got Ok"
         );
         assert_eq!(
             result.unwrap_err(),
@@ -351,18 +347,14 @@ mod tests {
         );
     }
 
-    /// Verify that querying a closed fd returns an error.
+    /// Verify that querying an invalid fd returns an error.
     #[cfg(unix)]
     #[test]
     fn test_is_nonblocking_closed_fd() {
-        use std::os::unix::io::IntoRawFd;
+        // Use an fd number that is guaranteed to never be valid.
+        let bad_fd: RawFd = 999_999;
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let fd = listener.into_raw_fd();
-        let _ = unsafe { std::net::TcpListener::from_raw_fd(fd) };
-        // fd is now closed
-
-        let result = is_nonblocking(fd);
+        let result = is_nonblocking(bad_fd);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), CurlError::CouldntConnect);
     }
