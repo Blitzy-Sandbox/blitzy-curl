@@ -18,6 +18,7 @@ pub mod protocols;
 pub mod proxy;
 pub mod psl;
 pub mod ratelimit;
+pub mod setopt;
 pub mod slist;
 pub mod tls;
 pub mod util;
