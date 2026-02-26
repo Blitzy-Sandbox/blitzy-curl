@@ -1,3 +1,24 @@
+# -----------------------------------------------------------------------
+# curl-rs-ffi crate manifest
+#
+# Produces the FFI compatibility layer that exposes all 106 CURL_EXTERN
+# symbols as `extern "C"` functions.  The resulting artefacts —
+# `libcurl_rs_ffi.so` (cdylib), `libcurl_rs_ffi.a` (staticlib) — are
+# drop-in replacements for libcurl: downstream C programs can swap
+# `libcurl.so` with the Rust-backed library without recompilation.
+#
+# Source reference: this is a new file — no C-side Cargo.toml equivalent
+# exists.  The closest C ancestor is the lib/CMakeLists.txt build target
+# that produces libcurl.so/.a from the 179 C source files in lib/.
+#
+# All dependency versions are inherited from the workspace root
+# Cargo.toml via `workspace = true`, except for the in-workspace path
+# dependency on curl-rs-lib and the cbindgen build-dependency which
+# uses a direct version pin.
+#
+# SPDX-License-Identifier: curl
+# -----------------------------------------------------------------------
+
 [package]
 name = "curl-rs-ffi"
 version = "8.19.0"
@@ -8,18 +29,82 @@ description = "FFI crate providing libcurl C ABI compatibility — exposes all C
 repository.workspace = true
 publish = false
 
+# -----------------------------------------------------------------------
+# Library Configuration
+#
+# Three crate-types are produced:
+#   cdylib   — `libcurl_rs_ffi.so` / `.dylib` / `.dll` for C consumers
+#   staticlib — `libcurl_rs_ffi.a` / `.lib` for static linking into C apps
+#   rlib     — standard Rust library artefact, needed for `cargo test`
+#              and Rust-side integration tests in tests/**/*.rs
+#
+# Per AAP Section 0.7.1: "nm/objdump symbol export list of libcurl-rs.so
+# MUST match curl 8.x libcurl.so symbol export list".  All 106 symbols
+# are exposed via `#[no_mangle] pub extern "C" fn` in the source files.
+# -----------------------------------------------------------------------
 [lib]
 name = "curl_rs_ffi"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+# -----------------------------------------------------------------------
+# Runtime Dependencies
+#
+# The FFI crate is intentionally thin — it delegates ALL protocol, TLS,
+# transfer, auth, and DNS logic to curl-rs-lib.  Direct dependencies
+# here are limited to:
+#   - curl-rs-lib  (the Rust core library with all actual functionality)
+#   - libc         (C-compatible type definitions for extern "C" sigs)
+#   - tokio        (Runtime::block_on() to bridge sync C → async Rust)
+#
+# Per AAP Section 0.4.4: "The FFI layer bridges synchronous C callers
+# to async Rust internals using tokio::runtime::Runtime::block_on()
+# within a thread-local runtime instance, preserving the synchronous
+# curl_easy_perform semantics expected by C consumers."
+# -----------------------------------------------------------------------
 [dependencies]
+
+# Core library — all protocols, TLS, transfer engine, auth, DNS,
+# cookies, HSTS, alt-svc, proxy, connection pooling
 curl-rs-lib = { path = "../curl-rs-lib" }
+
+# Raw FFI bindings for C types used in extern "C" function signatures:
+# c_void, c_char, c_int, c_long, c_uint, size_t, time_t, FILE, etc.
+# (AAP Section 0.6.1: libc 0.2.x)
 libc = { workspace = true }
+
+# Async runtime — needed for the sync→async bridge.  The FFI layer
+# creates a thread-local tokio Runtime and calls block_on() to execute
+# async operations from synchronous extern "C" entry points.
+# (AAP Section 0.4.4)
 tokio = { workspace = true }
 
+# -----------------------------------------------------------------------
+# Build Dependencies
+#
+# cbindgen generates include/curl/curl.h from the Rust FFI definitions,
+# invoked by build.rs.  The generated header is a drop-in replacement
+# for the hand-authored C header.
+# (AAP Section 0.6.1: cbindgen 0.29.2, AAP Section 0.7.3: FFI header
+# generation via cbindgen in build.rs → include/curl/curl.h)
+# -----------------------------------------------------------------------
 [build-dependencies]
 cbindgen = "0.29.2"
 
+# -----------------------------------------------------------------------
+# Development / Test Dependencies
+#
+# Used for FFI boundary integration tests that verify:
+#   - All 106 symbols are accessible from Rust test harness
+#   - Sync→async bridge works correctly under load
+#   - AddressSanitizer-instrumented builds report zero violations
+#
+# (AAP Section 0.3.1: "curl-rs-ffi/tests/**/*.rs — FFI boundary
+# integration tests for AddressSanitizer validation")
+# -----------------------------------------------------------------------
 [dev-dependencies]
+
+# Async test utilities for validating the tokio Runtime bridge
 tokio-test = { workspace = true }
+
+# Temporary file/directory creation for integration test fixtures
 tempfile = { workspace = true }
