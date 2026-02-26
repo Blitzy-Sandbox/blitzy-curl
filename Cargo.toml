@@ -31,7 +31,7 @@ tokio-util = { version = "0.7", features = ["codec", "compat", "io"] }
 bytes = "1"
 futures-util = "0.3"
 pin-project-lite = "0.2"
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 
 # HTTP/1.1 + HTTP/2
 hyper = { version = "1.7.0", features = ["client", "http1", "http2"] }
