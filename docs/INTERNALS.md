@@ -66,3 +66,52 @@ used in more than a single file. Single-file symbols must be made static.
 Public ("exported") symbols must use a `curl_` prefix. Public API functions
 are marked with `CURL_EXTERN` in the public header files so that all others
 can be hidden on platforms where this is possible.
+
+## curl-rs Rust Workspace
+
+The curl-rs Rust workspace is a complete rewrite of the curl C codebase into
+idiomatic Rust. It produces a functionally equivalent CLI binary (`curl-rs`),
+core library (`curl-rs-lib`), and an FFI compatibility layer (`curl-rs-ffi`)
+that preserves the libcurl C ABI.
+
+### Rust Toolchain
+
+- Edition: 2021
+- MSRV: 1.75
+- Build system: Cargo (workspace with 3 member crates: `curl-rs-lib`,
+  `curl-rs`, `curl-rs-ffi`)
+- Linting: `cargo clippy --workspace -- -D warnings`
+- Testing: `cargo test --workspace`
+
+### Key Rust Dependencies
+
+The Rust workspace replaces all C library dependencies with pure-Rust crate
+equivalents. Primary crates and their minimum versions:
+
+- `rustls` 0.23.36 — TLS 1.2/1.3 (replaces OpenSSL, GnuTLS, mbedTLS,
+  wolfSSL, Schannel, Secure Transport)
+- `hyper` 1.7.0 — HTTP/1.1 + HTTP/2 client (replaces nghttp2)
+- `quinn` 0.11.9 — QUIC transport (replaces ngtcp2, quiche)
+- `h3` 0.0.7 — HTTP/3 protocol
+- `russh` 0.54.6 — SSH client (replaces libssh, libssh2)
+- `hickory-resolver` 0.25.2 — DNS resolver (replaces c-ares, optional
+  via feature flag)
+- `tokio` 1.49.0 — async runtime
+- `clap` 4.5.54 — CLI argument parsing
+- `flate2` / `brotli` / `zstd` — compression (same role as zlib, brotli,
+  and zstd C libraries)
+
+The full dependency list with exact versions is in the workspace root
+`Cargo.toml` under `[workspace.dependencies]`.
+
+### Rust Module Conventions
+
+- Internal symbols use Rust module privacy (`pub(crate)`, `pub(super)`)
+  instead of the C `Curl_` prefix convention.
+- The public API surface is exposed through `curl-rs-lib` crate public
+  modules.
+- FFI symbols in `curl-rs-ffi` use `#[no_mangle] pub extern "C"` to
+  maintain ABI compatibility with the C libcurl interface.
+- All 106 `CURL_EXTERN` symbols from the C headers are exposed through
+  the FFI crate with identical function signatures, parameter types,
+  return types, and error code integer values.
