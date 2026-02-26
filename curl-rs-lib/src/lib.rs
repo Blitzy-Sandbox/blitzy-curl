@@ -1,2 +1,4 @@
 // curl-rs-lib: Core library crate for curl-rs
 // This is a stub file that will be replaced by the implementation agent.
+
+pub mod error;
