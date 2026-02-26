@@ -421,6 +421,24 @@ impl CurlUrl {
         code.strerror()
     }
 
+    // -------------------------------------------------------------------
+    // clear() — public clear API for FFI layer
+    // -------------------------------------------------------------------
+
+    /// Clear (reset to `None`) a single URL component.
+    ///
+    /// Equivalent to calling `curl_url_set(handle, what, NULL, 0)` in C —
+    /// removes the specified component from the URL handle.  For
+    /// [`CurlUrlPart::Url`], the entire handle is reset to its initial
+    /// (empty) state.
+    ///
+    /// This method is the public counterpart of the private `clear_part`
+    /// helper, exposed for the FFI crate to implement the NULL-content
+    /// semantics of `curl_url_set`.
+    pub fn clear(&mut self, what: CurlUrlPart) {
+        self.clear_part(what);
+    }
+
     // ===================================================================
     // Private: set helpers
     // ===================================================================
