@@ -2,6 +2,7 @@
 // This is a stub file that will be replaced by the implementation agent.
 
 pub mod error;
+pub mod headers;
 pub mod options;
 pub mod proxy;
 pub mod slist;
