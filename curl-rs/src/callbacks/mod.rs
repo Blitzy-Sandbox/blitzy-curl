@@ -9,4 +9,5 @@
 //
 // SPDX-License-Identifier: curl
 
+pub mod seek;
 pub mod socket;
