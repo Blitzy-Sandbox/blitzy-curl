@@ -8,6 +8,7 @@ pub mod bufq;
 pub mod dynbuf;
 pub mod fnmatch;
 pub mod hash;
+pub mod hmac;
 pub mod llist;
 pub mod md5;
 pub mod nonblock;
