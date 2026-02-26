@@ -3317,7 +3317,7 @@ CURL_EXTERN CURLcode curl_easy_ssls_export(CURL *handle,
 /* Sub-headers providing additional API surface.
    These headers are preserved for backward compatibility with curl 8.x
    consumers that include them directly. Together with this header, they
-   provide the complete set of 106 CURL_EXTERN API symbols. */
+   provide the complete set of 100 CURL_EXTERN API symbols. */
 #include "easy.h" /* nothing in curl is fun without the easy stuff */
 #include "multi.h"
 #include "urlapi.h"

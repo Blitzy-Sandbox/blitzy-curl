@@ -58,12 +58,13 @@ fn main() {
     // =========================================================================
     // Platform detection
     // =========================================================================
-    // Detect the target OS and architecture from Rust's built-in constants.
-    // These are emitted as environment variables so library code can query them
-    // at compile time for platform-specific behavior (e.g., default CA bundle
-    // paths, socket options, DNS resolver selection).
-    let target_os = env::consts::OS;
-    let target_arch = env::consts::ARCH;
+    // Detect the target OS and architecture from Cargo's target-specific
+    // environment variables. Unlike `env::consts::OS` / `env::consts::ARCH`
+    // (which return **host** platform values), `CARGO_CFG_TARGET_OS` and
+    // `CARGO_CFG_TARGET_ARCH` correctly reflect the **target** platform
+    // during cross-compilation (e.g., building on x86_64 for aarch64).
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
     println!("cargo:rustc-env=CURL_RS_TARGET_OS={}", target_os);
     println!("cargo:rustc-env=CURL_RS_TARGET_ARCH={}", target_arch);
@@ -71,7 +72,7 @@ fn main() {
     // Emit platform-specific cfg flags for conditional compilation.
     // These supplement the standard `cfg!(target_os = "...")` checks with
     // curl-specific platform groupings.
-    match target_os {
+    match target_os.as_str() {
         "linux" => println!("cargo:rustc-cfg=curl_unix"),
         "macos" => {
             println!("cargo:rustc-cfg=curl_unix");

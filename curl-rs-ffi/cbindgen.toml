@@ -10,7 +10,7 @@
 # Key requirements (from AAP):
 #   - Header MUST match curl 8.x public header structure (Section 0.7.3)
 #   - Symbol names, parameter types, return types MUST match exactly (Section 0.7.2)
-#   - All 106 CURL_EXTERN symbols must appear in the generated header
+#   - All 100 CURL_EXTERN symbols must appear in the generated header
 #   - Enum variant naming preserved exactly (CURLE_OK, CURLM_OK, etc.)
 #   - Include guard CURLINC_CURL_H to match curl 8.x
 #

@@ -19,7 +19,7 @@ artifacts:
 
 - **`curl-rs`** — CLI binary with all `--long-option` flags identical to curl 8.x
 - **`curl-rs-lib`** — Core library crate (protocols, TLS, transfer, DNS, authentication)
-- **`curl-rs-ffi`** — FFI compatibility layer exposing all 106 `CURL_EXTERN` symbols for drop-in C ABI compatibility
+- **`curl-rs-ffi`** — FFI compatibility layer exposing all 100 `CURL_EXTERN` symbols for drop-in C ABI compatibility
 
 ### Protocols
 

@@ -93,7 +93,7 @@ equivalents. Primary crates and their minimum versions:
 - `hyper` 1.7.0 — HTTP/1.1 + HTTP/2 client (replaces nghttp2)
 - `quinn` 0.11.9 — QUIC transport (replaces ngtcp2, quiche)
 - `h3` 0.0.7 — HTTP/3 protocol
-- `russh` 0.54.6 — SSH client (replaces libssh, libssh2)
+- `russh` 0.55.0 — SSH client (replaces libssh, libssh2)
 - `hickory-resolver` 0.25.2 — DNS resolver (replaces c-ares, optional
   via feature flag)
 - `tokio` 1.49.0 — async runtime
@@ -112,6 +112,6 @@ The full dependency list with exact versions is in the workspace root
   modules.
 - FFI symbols in `curl-rs-ffi` use `#[no_mangle] pub extern "C"` to
   maintain ABI compatibility with the C libcurl interface.
-- All 106 `CURL_EXTERN` symbols from the C headers are exposed through
+- All 100 `CURL_EXTERN` symbols from the C headers are exposed through
   the FFI crate with identical function signatures, parameter types,
   return types, and error code integer values.

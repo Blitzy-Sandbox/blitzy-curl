@@ -115,9 +115,16 @@ jobs:
         if: "!matrix.use_cross"
         run: cargo +nightly miri test -p curl-rs-lib
 
+      - name: 'AddressSanitizer (FFI boundary)'
+        if: "!matrix.use_cross && runner.os == 'Linux'"
+        run: cargo +nightly test -p curl-rs-ffi --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: '-Z sanitizer=address'
+          RUSTDOCFLAGS: '-Z sanitizer=address'
+
       - name: 'Coverage'
         if: "!matrix.use_cross"
-        run: cargo llvm-cov --workspace
+        run: cargo llvm-cov --workspace --fail-under-lines 80
 
       - name: 'Security audit'
         if: "!matrix.use_cross"

@@ -1,7 +1,7 @@
 # -----------------------------------------------------------------------
 # curl-rs-ffi crate manifest
 #
-# Produces the FFI compatibility layer that exposes all 106 CURL_EXTERN
+# Produces the FFI compatibility layer that exposes all 100 CURL_EXTERN
 # symbols as `extern "C"` functions.  The resulting artefacts —
 # `libcurl_rs_ffi.so` (cdylib), `libcurl_rs_ffi.a` (staticlib) — are
 # drop-in replacements for libcurl: downstream C programs can swap
@@ -39,7 +39,7 @@ publish = false
 #              and Rust-side integration tests in tests/**/*.rs
 #
 # Per AAP Section 0.7.1: "nm/objdump symbol export list of libcurl-rs.so
-# MUST match curl 8.x libcurl.so symbol export list".  All 106 symbols
+# MUST match curl 8.x libcurl.so symbol export list".  All 100 symbols
 # are exposed via `#[no_mangle] pub extern "C" fn` in the source files.
 # -----------------------------------------------------------------------
 [lib]
@@ -94,7 +94,7 @@ cbindgen = "0.29.2"
 # Development / Test Dependencies
 #
 # Used for FFI boundary integration tests that verify:
-#   - All 106 symbols are accessible from Rust test harness
+#   - All 100 symbols are accessible from Rust test harness
 #   - Sync→async bridge works correctly under load
 #   - AddressSanitizer-instrumented builds report zero violations
 #
