@@ -6,5 +6,8 @@
 
 pub mod pingpong;
 
+#[cfg(feature = "http")]
+pub mod http;
+
 #[cfg(feature = "ftp")]
 pub mod ftp_list;
