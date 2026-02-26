@@ -24,5 +24,6 @@ pub mod ratelimit;
 pub mod setopt;
 pub mod slist;
 pub mod tls;
+pub mod url;
 pub mod util;
 pub mod version;
