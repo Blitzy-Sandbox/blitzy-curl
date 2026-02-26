@@ -5,4 +5,5 @@
 //! one or more C source files with idiomatic Rust equivalents.
 
 pub mod hash;
+pub mod llist;
 pub mod warnless;
