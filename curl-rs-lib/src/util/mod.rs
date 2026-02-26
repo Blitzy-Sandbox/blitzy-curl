@@ -18,4 +18,5 @@ pub mod strparse;
 pub mod timeval;
 pub mod select;
 pub mod splay;
+pub mod strerror;
 pub mod warnless;
