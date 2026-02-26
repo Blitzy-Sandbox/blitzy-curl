@@ -5,6 +5,7 @@
 
 pub mod basic;
 pub mod bearer;
+pub mod digest;
 pub mod kerberos;
 pub mod negotiate;
 pub mod ntlm;
