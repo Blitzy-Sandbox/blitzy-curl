@@ -94,6 +94,10 @@ percent-encoding = { workspace = true }
 # Async stream utilities for transfer pipeline composition
 futures-util = { workspace = true }
 
+# Extended filesystem attributes for --xattr option
+# (src/tool_xattr.c → xattr.rs)
+xattr = { workspace = true }
+
 # ---------------------------------------------------------------------------
 # Development / Test Dependencies
 #

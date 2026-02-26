@@ -2,6 +2,7 @@
 // This is a stub file that will be replaced by the implementation agent.
 
 pub mod urlglob;
+pub mod xattr;
 
 fn main() {
     println!("curl-rs stub");
