@@ -5,6 +5,7 @@ pub mod altsvc;
 pub mod content_encoding;
 pub mod error;
 pub mod escape;
+pub mod hsts;
 pub mod netrc;
 pub mod headers;
 pub mod idn;
