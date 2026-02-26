@@ -7,6 +7,7 @@
 
 pub mod filters;
 pub mod h2_proxy;
+pub mod happy_eyeballs;
 pub mod haproxy;
 pub mod socket;
 
@@ -15,6 +16,7 @@ pub use filters::{
     ConnectionFilter, FilterChain, FilterTypeFlags, PollAction, PollEntry, PollSet, QueryResult,
     TransferData,
 };
+pub use happy_eyeballs::{HappyEyeballsFilter, DEFAULT_HAPPY_EYEBALLS_DELAY_MS};
 pub use socket::{
     apply_tcp_options, check_alive, parse_interface, SocketConfig, SocketType, TcpSocketFilter,
     UdpSocketFilter,
