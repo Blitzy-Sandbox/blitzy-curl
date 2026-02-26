@@ -100,6 +100,7 @@ thiserror = "2"
 anyhow = "1"
 xattr = "1"
 rpassword = "7.4.0"
+terminal_size = "0.4"
 
 # Dev Dependencies (shared across member crates)
 rcgen = "0.14"

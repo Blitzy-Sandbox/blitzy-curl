@@ -6,6 +6,7 @@ pub mod filetime;
 pub mod findfile;
 pub mod getpass;
 pub mod stderr;
+pub mod terminal;
 pub mod urlglob;
 pub mod xattr;
 

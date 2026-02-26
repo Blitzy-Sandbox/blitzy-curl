@@ -102,6 +102,10 @@ xattr = { workspace = true }
 # (src/tool_getpass.c → getpass.rs — secure terminal input)
 rpassword = { workspace = true }
 
+# Cross-platform terminal size detection
+# (src/terminal.c → terminal.rs — replaces ioctl(TIOCGWINSZ) / GetConsoleScreenBufferInfo)
+terminal_size = { workspace = true }
+
 # ---------------------------------------------------------------------------
 # Development / Test Dependencies
 #
