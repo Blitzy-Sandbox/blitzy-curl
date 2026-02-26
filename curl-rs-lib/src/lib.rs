@@ -2,3 +2,4 @@
 // This is a stub file that will be replaced by the implementation agent.
 
 pub mod error;
+pub mod slist;
