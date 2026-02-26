@@ -9,4 +9,5 @@ pub mod digest;
 pub mod kerberos;
 pub mod negotiate;
 pub mod ntlm;
+pub mod sasl;
 pub mod scram;
