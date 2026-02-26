@@ -4,6 +4,7 @@
 //! that pulled in all portability and utility helpers. Each submodule replaces
 //! one or more C source files with idiomatic Rust equivalents.
 
+pub mod bufq;
 pub mod dynbuf;
 pub mod fnmatch;
 pub mod hash;
