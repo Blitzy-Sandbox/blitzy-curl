@@ -7,6 +7,7 @@ pub mod escape;
 pub mod headers;
 pub mod idn;
 pub mod options;
+pub mod progress;
 pub mod proxy;
 pub mod psl;
 pub mod ratelimit;
