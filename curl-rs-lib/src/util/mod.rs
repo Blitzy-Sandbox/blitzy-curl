@@ -4,4 +4,5 @@
 //! that pulled in all portability and utility helpers. Each submodule replaces
 //! one or more C source files with idiomatic Rust equivalents.
 
+pub mod hash;
 pub mod warnless;
