@@ -36,6 +36,9 @@ zstd = ["dep:zstd"]
 # Optional DNS resolver
 hickory-dns = ["dep:hickory-resolver"]
 
+# Authentication features
+gssapi = []
+
 [dependencies]
 # Core Runtime & Networking
 tokio = { workspace = true }
