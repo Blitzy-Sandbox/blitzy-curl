@@ -6,9 +6,14 @@
 //! [`ConnectionFilter`] trait and compose into a [`FilterChain`].
 
 pub mod filters;
+pub mod socket;
 
 // Re-export primary types for convenient access.
 pub use filters::{
     ConnectionFilter, FilterChain, FilterTypeFlags, PollAction, PollEntry, PollSet, QueryResult,
     TransferData,
+};
+pub use socket::{
+    apply_tcp_options, check_alive, parse_interface, SocketConfig, SocketType, TcpSocketFilter,
+    UdpSocketFilter,
 };
