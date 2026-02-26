@@ -2,6 +2,7 @@
 // This is a stub file that will be replaced by the implementation agent.
 
 pub mod filetime;
+pub mod findfile;
 pub mod getpass;
 pub mod urlglob;
 pub mod xattr;
