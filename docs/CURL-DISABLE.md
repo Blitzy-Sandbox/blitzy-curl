@@ -195,3 +195,39 @@ Disable verbose strings and error messages.
 ## `CURL_DISABLE_WEBSOCKETS`
 
 Disable the WebSocket protocols.
+
+## Rust Workspace (curl-rs) — Cargo Feature Flags
+
+In the curl-rs Rust workspace, the equivalent of these C preprocessor defines is
+Cargo feature flags defined in `curl-rs-lib/Cargo.toml`. Instead of passing
+`-DCURL_DISABLE_<feature>=ON` at build time, you enable or disable Cargo
+features. All protocol and compression features listed below are **enabled by
+default**; disable them by using `--no-default-features` and selectively
+re-enabling only the ones you need.
+
+| C Define | Cargo Feature | Default |
+|---|---|---|
+| `CURL_DISABLE_HTTP` | `http` | enabled |
+| `CURL_DISABLE_FTP` | `ftp` | enabled |
+| `CURL_DISABLE_SMTP` | `smtp` | enabled |
+| `CURL_DISABLE_IMAP` | `imap` | enabled |
+| `CURL_DISABLE_POP3` | `pop3` | enabled |
+| `CURL_DISABLE_TFTP` | `tftp` | enabled |
+| `CURL_DISABLE_TELNET` | `telnet` | enabled |
+| `CURL_DISABLE_DICT` | `dict` | enabled |
+| `CURL_DISABLE_MQTT` | `mqtt` | enabled |
+| `CURL_DISABLE_RTSP` | `rtsp` | enabled |
+| `CURL_DISABLE_COOKIES` | `cookies` | enabled |
+| `USE_ARES` | `hickory-dns` | disabled |
+| `USE_BROTLI` | `brotli` | enabled |
+| `USE_ZSTD` | `zstd` | enabled |
+
+For example, to build with only HTTP and FTP support:
+
+~~~
+cargo build --release --no-default-features --features "http,ftp"
+~~~
+
+> **Note:** The C preprocessor defines documented above remain valid for
+> building the original C codebase. The Cargo feature flags apply only to the
+> Rust workspace (`curl-rs-lib`, `curl-rs`, `curl-rs-ffi`).
