@@ -5,6 +5,7 @@
 //! filters (socket, TLS, proxy, QUIC, HTTP/2) implement the
 //! [`ConnectionFilter`] trait and compose into a [`FilterChain`].
 
+pub mod connect;
 pub mod filters;
 pub mod h1_proxy;
 pub mod h2_proxy;
@@ -16,6 +17,10 @@ pub mod socket;
 pub use filters::{
     ConnectionFilter, FilterChain, FilterTypeFlags, PollAction, PollEntry, PollSet, QueryResult,
     TransferData,
+};
+pub use connect::{
+    AlpnId, ConnControl, ConnectionData, IpInfo, TransportType,
+    DEFAULT_CONNECT_TIMEOUT, DEFAULT_SHUTDOWN_TIMEOUT_MS,
 };
 pub use happy_eyeballs::{HappyEyeballsFilter, DEFAULT_HAPPY_EYEBALLS_DELAY_MS};
 pub use socket::{
