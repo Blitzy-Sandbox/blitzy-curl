@@ -12,6 +12,7 @@ pub mod headers;
 pub mod idn;
 pub mod options;
 pub mod progress;
+pub mod protocols;
 pub mod proxy;
 pub mod psl;
 pub mod ratelimit;
