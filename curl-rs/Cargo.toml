@@ -98,6 +98,10 @@ futures-util = { workspace = true }
 # (src/tool_xattr.c → xattr.rs)
 xattr = { workspace = true }
 
+# Cross-platform password reading with echo disabled
+# (src/tool_getpass.c → getpass.rs — secure terminal input)
+rpassword = { workspace = true }
+
 # ---------------------------------------------------------------------------
 # Development / Test Dependencies
 #
