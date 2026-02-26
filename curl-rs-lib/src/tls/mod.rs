@@ -4,6 +4,7 @@
 //! (OpenSSL, Schannel, GnuTLS, mbedTLS, wolfSSL, Rustls, Apple Security)
 //! with a single rustls-based implementation.
 
+pub mod config;
 pub mod hostname;
 pub mod keylog;
 pub mod session_cache;
