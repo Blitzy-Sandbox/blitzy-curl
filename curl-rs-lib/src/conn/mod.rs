@@ -6,6 +6,7 @@
 //! [`ConnectionFilter`] trait and compose into a [`FilterChain`].
 
 pub mod filters;
+pub mod haproxy;
 pub mod socket;
 
 // Re-export primary types for convenient access.
