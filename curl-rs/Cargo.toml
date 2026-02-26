@@ -94,6 +94,10 @@ percent-encoding = { workspace = true }
 # Async stream utilities for transfer pipeline composition
 futures-util = { workspace = true }
 
+# Low-level socket creation for MPTCP open-socket callback
+# (src/tool_cb_soc.c → callbacks/socket.rs — safe wrapper around socket())
+socket2 = { workspace = true }
+
 # Extended filesystem attributes for --xattr option
 # (src/tool_xattr.c → xattr.rs)
 xattr = { workspace = true }

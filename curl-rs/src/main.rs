@@ -1,6 +1,7 @@
 // curl-rs: CLI binary crate for curl-rs
 // This is a stub file that will be replaced by the implementation agent.
 
+pub mod callbacks;
 pub mod dirhier;
 pub mod filetime;
 pub mod findfile;
