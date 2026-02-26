@@ -17,6 +17,7 @@ pub mod mime;
 pub mod options;
 pub mod progress;
 pub mod protocols;
+pub mod request;
 pub mod proxy;
 pub mod psl;
 pub mod ratelimit;
