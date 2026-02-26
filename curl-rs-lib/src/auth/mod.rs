@@ -6,3 +6,4 @@
 pub mod basic;
 pub mod bearer;
 pub mod kerberos;
+pub mod scram;
