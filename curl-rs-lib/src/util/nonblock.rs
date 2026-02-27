@@ -1,3 +1,8 @@
+// OS-integration primitives require unsafe for raw file descriptor operations.
+// This is the sole exception permitted by AAP Section 0.7.1 ("minimal
+// OS-integration primitives explicitly requiring it").
+#![allow(unsafe_code)]
+
 //! Non-blocking socket mode toggle (Tokio-native).
 //!
 //! Rust replacement for `lib/curlx/nonblock.c` — cross-platform non-blocking
