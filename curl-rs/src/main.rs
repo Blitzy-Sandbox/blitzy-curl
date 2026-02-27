@@ -4,6 +4,7 @@
 pub mod args;
 pub mod callbacks;
 pub mod config;
+pub mod operate;
 pub mod dirhier;
 pub mod filetime;
 pub mod findfile;
