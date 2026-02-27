@@ -16,6 +16,7 @@ pub mod netrc;
 pub mod headers;
 pub mod idn;
 pub mod mime;
+pub mod multi;
 pub mod options;
 pub mod progress;
 pub mod protocols;

@@ -109,9 +109,10 @@ impl fmt::Display for SshProtocol {
 /// Authentication and session lifecycle states are defined directly here;
 /// SFTP and SCP operational states are delegated to their respective
 /// `SftpState` and `ScpState` enums via wrapping variants.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SshState {
     /// No state set (C: `SSH_NO_STATE = -1`)
+    #[default]
     NoState,
     /// Stopped / idle (C: `SSH_STOP = 0`)
     Stop,
@@ -159,12 +160,6 @@ pub enum SshState {
     SessionFree,
     /// Quit state (C: `SSH_QUIT`)
     Quit,
-}
-
-impl Default for SshState {
-    fn default() -> Self {
-        SshState::NoState
-    }
 }
 
 impl fmt::Display for SshState {
@@ -760,7 +755,7 @@ fn home_dir() -> Option<PathBuf> {
     env::var("HOME")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| {
+        .or({
             #[cfg(unix)]
             {
                 // Fallback to /etc/passwd entry if HOME not set
@@ -980,11 +975,11 @@ async fn try_keyboard_interactive_auth(
         KeyboardInteractiveAuthResponse::Success => {
             info!("SSH keyboard-interactive auth succeeded (no prompts)");
             session.authed = true;
-            return Ok(true);
+            Ok(true)
         }
         KeyboardInteractiveAuthResponse::Failure { .. } => {
             debug!("SSH keyboard-interactive auth rejected immediately");
-            return Ok(false);
+            Ok(false)
         }
         KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
             // Respond with the password for each prompt
@@ -998,20 +993,20 @@ async fn try_keyboard_interactive_auth(
                 Ok(KeyboardInteractiveAuthResponse::Success) => {
                     info!("SSH keyboard-interactive auth succeeded");
                     session.authed = true;
-                    return Ok(true);
+                    Ok(true)
                 }
                 Ok(KeyboardInteractiveAuthResponse::Failure { .. }) => {
                     debug!("SSH keyboard-interactive auth failed");
-                    return Ok(false);
+                    Ok(false)
                 }
                 Ok(KeyboardInteractiveAuthResponse::InfoRequest { .. }) => {
                     // Multiple rounds of prompts — respond with empty for subsequent
                     debug!("SSH keyboard-interactive auth requested additional info (unsupported)");
-                    return Ok(false);
+                    Ok(false)
                 }
                 Err(e) => {
                     debug!("SSH keyboard-interactive respond error: {}", e);
-                    return Ok(false);
+                    Ok(false)
                 }
             }
         }
@@ -1233,26 +1228,22 @@ pub fn get_working_path(
     match protocol {
         SshProtocol::Scp => {
             // For SCP: strip /~/ prefix for home-relative paths
-            if decoded.starts_with("/~/") {
+            if let Some(remainder) = decoded.strip_prefix("/~/") {
                 // Strip leading /~/ — remainder is relative to home
-                let remainder = &decoded[3..];
                 Ok(remainder.to_string())
             } else if decoded == "/~" {
                 // Just home directory
                 Ok(String::new())
+            } else if let Some(stripped) = decoded.strip_prefix('/') {
+                // Absolute path — strip leading / for relative
+                Ok(stripped.to_string())
             } else {
-                // Absolute path — use as-is (strip leading / for relative)
-                if decoded.starts_with('/') {
-                    Ok(decoded[1..].to_string())
-                } else {
-                    Ok(decoded)
-                }
+                Ok(decoded)
             }
         }
         SshProtocol::Sftp => {
             // For SFTP: replace /~/ with homedir prefix
-            if decoded.starts_with("/~/") {
-                let remainder = &decoded[3..];
+            if let Some(remainder) = decoded.strip_prefix("/~/") {
                 let mut result = DynBuf::with_max(MAX_SSHPATH_LEN);
                 result
                     .add_str(homedir)
@@ -1400,8 +1391,7 @@ pub fn get_pathname(input: &str, homedir: &str) -> CurlResult<(String, usize)> {
             }
 
             // Apply /~/ home-directory expansion for unquoted paths
-            let expanded = if word.starts_with("/~/") {
-                let remainder = &word[3..];
+            let expanded = if let Some(remainder) = word.strip_prefix("/~/") {
                 let mut buf = String::with_capacity(homedir.len() + 1 + remainder.len());
                 buf.push_str(homedir);
                 if !homedir.ends_with('/') && !remainder.is_empty() {
