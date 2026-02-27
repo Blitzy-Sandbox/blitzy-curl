@@ -661,6 +661,37 @@ impl SessionCache {
         self.peers.retain(|_, peer| !peer.is_empty());
     }
 
+    /// Export all non-expired sessions as `(peer_key, TlsSession)` pairs.
+    ///
+    /// Returns a snapshot of all sessions currently stored in the cache,
+    /// filtering out expired sessions. Each entry contains the peer key
+    /// string and a cloned copy of the `TlsSession`.
+    ///
+    /// This method is used by the CLI tool's SSL session persistence
+    /// module (`tool_ssls` / `ssls.rs`) to serialize the cache contents
+    /// to a file for later restoration via [`put()`].
+    ///
+    /// Matches the C `curl_easy_ssls_export()` iteration behavior from
+    /// `lib/easy.c`, which iterates all peers and sessions invoking a
+    /// user-provided callback for each one.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec` of `(String, TlsSession)` tuples where each tuple
+    /// contains the peer key and a cloned session. The order is
+    /// implementation-defined (HashMap iteration order).
+    pub fn export_all(&self) -> Vec<(String, TlsSession)> {
+        let mut result = Vec::new();
+        for (peer_key, entry) in &self.peers {
+            for session in &entry.sessions {
+                if !session.is_expired() {
+                    result.push((peer_key.clone(), session.clone()));
+                }
+            }
+        }
+        result
+    }
+
     /// Evict the least-recently-used peer to make room for a new entry.
     ///
     /// Matches C `cf_ssl_get_free_peer()` from vtls_scache.c lines 684-712.
