@@ -102,7 +102,7 @@ const FEATURE_TABLE: &[FeatureEntry] = &[
 /// | `version`           | `curlinfo->version`                    |
 /// | `ssl_version`       | `curlinfo->ssl_version`                |
 /// | `ssl_backends`      | (derived from `curlinfo->ssl_version`) |
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LibCurlInfo {
     // -- Feature availability booleans (from C `bool feature_*` globals) -----
 

@@ -28,10 +28,10 @@
 //!
 //! This module contains **zero** `unsafe` blocks.
 
-use std::io::Write;
+use std::io::{self, BufWriter, Write};
 
 use crate::libinfo::{get_libcurl_info, LibCurlInfo};
-use curl_rs_lib::error::CurlError;
+use curl_rs_lib::{CurlError, CurlResult, global_init, global_cleanup};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -45,7 +45,7 @@ pub const DEFAULT_MAXREDIRS: i64 = 50;
 /// Default maximum number of parallel transfers (`--parallel-max`).
 ///
 /// Matches the C constant `PARALLEL_DEFAULT` (50).
-pub const PARALLEL_DEFAULT: u16 = 50;
+pub const PARALLEL_DEFAULT: u32 = 50;
 
 /// Maximum size (in bytes) for file-to-memory reads (40 MiB).
 ///
@@ -66,7 +66,7 @@ pub const CURL_HET_DEFAULT: i64 = 200;
 ///
 /// Provides compatibility with previous versions of curl: `-o` and `-O`
 /// overwrite, while `-J` does not.
-pub const CLOBBER_DEFAULT: ClobberMode = ClobberMode::Default;
+pub const CLOBBER_DEFAULT: ClobberMode = ClobberMode::Always;
 
 /// Upload flag sentinel indicating `--upload-flags` has been processed.
 ///
@@ -89,12 +89,12 @@ pub const FAIL_WO_BODY: u8 = 2;
 /// Maps 1:1 to the C anonymous enum inside `struct OperationConfig`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClobberMode {
-    /// Default curl behaviour: `-o`/`-O` overwrite, `-J` does not.
-    Default,
+    /// Always overwrite existing files (default for `-o`/`-O`).
+    Always,
     /// Never overwrite — fail if the file already exists.
     Never,
-    /// Always overwrite existing files.
-    Always,
+    /// Rename the new file to avoid collision (e.g., append `.1`, `.2`).
+    Rename,
 }
 
 /// Trace/verbose output mode.
@@ -104,12 +104,12 @@ pub enum ClobberMode {
 pub enum TraceType {
     /// No trace or verbose output.
     None,
-    /// Binary (tcpdump-style) trace.
-    Bin,
-    /// ASCII trace (like Bin but without hex).
+    /// ASCII trace output (`--trace-ascii`).
     Ascii,
-    /// Plain verbose (`-v` / `--verbose`).
+    /// Plain binary/hex trace output (`--trace`).
     Plain,
+    /// Verbose mode (`-v` / `--verbose`).
+    Verbose,
 }
 
 /// HTTP request method selector.
@@ -349,6 +349,35 @@ impl Default for TransferState {
 }
 
 // ---------------------------------------------------------------------------
+// Terminal state (Windows terminal buffer abstraction)
+// ---------------------------------------------------------------------------
+
+/// Terminal output buffer state, primarily used for Windows console handling.
+///
+/// On Windows, this wraps a wide-character buffer for UTF-16 output. On
+/// non-Windows platforms it is an empty struct (zero-cost).
+#[derive(Debug, Clone, Default)]
+pub struct TerminalState {
+    /// Wide-character output buffer (used on Windows for console writes).
+    #[cfg(windows)]
+    pub buf: Vec<u16>,
+    /// Buffer length in characters (Windows only).
+    #[cfg(windows)]
+    pub len: u32,
+    /// Placeholder field so the struct is non-empty on all platforms.
+    /// This enables consistent handling across OS targets.
+    #[cfg(not(windows))]
+    _phantom: (),
+}
+
+impl TerminalState {
+    /// Creates a new, empty terminal state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // OperationConfig
 // ---------------------------------------------------------------------------
 
@@ -413,6 +442,10 @@ pub struct OperationConfig {
     pub max_filesize: i64,
 
     // -- Output --
+    /// Output file path (`-o`/`--output`). Per-URL output files also live
+    /// in [`GetOut::outfile`]; this field serves as a top-level shorthand
+    /// that consumers may set before URL list construction.
+    pub outfile: Option<String>,
     /// Output directory (`--output-dir`).
     pub output_dir: Option<String>,
     /// Header output file (`-D`/`--dump-header`).
@@ -680,9 +713,9 @@ pub struct OperationConfig {
     /// Authentication bitmask (`--anyauth`, `--basic`, etc.).
     pub authtype: u64,
     /// Timeout in milliseconds (`-m`/`--max-time`).
-    pub timeout_ms: i64,
+    pub timeout: i64,
     /// Connection timeout in milliseconds (`--connect-timeout`).
-    pub connecttimeout_ms: i64,
+    pub connect_timeout: i64,
     /// Maximum redirects (`--max-redirs`).
     pub maxredirs: i64,
     /// HTTP version preference (`--http1.1`, `--http2`, etc.).
@@ -690,11 +723,11 @@ pub struct OperationConfig {
     /// SOCKS5 authentication bitmask.
     pub socks5_auth: u64,
     /// Number of retries (`--retry`).
-    pub req_retry: i64,
+    pub retry: u32,
     /// Retry delay in milliseconds (`--retry-delay`).
-    pub retry_delay_ms: i64,
+    pub retry_delay: i64,
     /// Maximum retry time in milliseconds (`--retry-max-time`).
-    pub retry_max_time_ms: i64,
+    pub retry_max_time: i64,
     /// MIME option flags.
     pub mime_options: u64,
     /// TFTP block size (`--tftp-blksize`).
@@ -725,8 +758,8 @@ pub struct OperationConfig {
     pub ftp_filemethod: i64,
 
     // -- Clobber --
-    /// File overwrite policy.
-    pub file_clobber_mode: ClobberMode,
+    /// File overwrite policy (`-o` overwrite / `-J` rename / skip).
+    pub clobber: ClobberMode,
 
     // -- Upload flags --
     /// Upload flags bitmask.
@@ -745,6 +778,16 @@ pub struct OperationConfig {
     // -- Fail mode --
     /// Fail behaviour selector (FAIL_NONE / FAIL_WITH_BODY / FAIL_WO_BODY).
     pub fail: u8,
+
+    // -- Per-operation overrides (also accessible on GlobalConfig) --
+    /// Enable verbose output for this operation (`-v`/`--verbose`).
+    pub verbose: bool,
+    /// Suppress non-error output for this operation (`-s`/`--silent`).
+    pub silent: bool,
+    /// Enable parallel transfers for this operation block (`-Z`/`--parallel`).
+    pub parallel: bool,
+    /// Maximum parallel transfers for this block (`--parallel-max`).
+    pub parallel_max: u32,
 
     // -- Boolean flags --
     // These map 1:1 to the C `BIT(name)` fields in `struct OperationConfig`.
@@ -929,7 +972,7 @@ impl OperationConfig {
     /// - `ftp_skip_ip`: `true`
     /// - `maxredirs`: [`DEFAULT_MAXREDIRS`] (50)
     /// - `happy_eyeballs_timeout_ms`: [`CURL_HET_DEFAULT`] (200)
-    /// - `file_clobber_mode`: [`ClobberMode::Default`]
+    /// - `clobber`: [`CLOBBER_DEFAULT`] (`ClobberMode::Always`)
     /// - `upload_flags`: [`CURLULFLAG_SEEN`]
     pub fn new() -> Self {
         Self {
@@ -951,6 +994,7 @@ impl OperationConfig {
             referer: None,
             query: None,
             max_filesize: 0,
+            outfile: None,
             output_dir: None,
             headerfile: None,
             ftpport: None,
@@ -1052,13 +1096,13 @@ impl OperationConfig {
             localport: 0,
             localportrange: 0,
             authtype: 0,
-            timeout_ms: 0,
-            connecttimeout_ms: 0,
+            timeout: 0,
+            connect_timeout: 0,
             httpversion: 0,
             socks5_auth: 0,
-            req_retry: 0,
-            retry_delay_ms: 0,
-            retry_max_time_ms: 0,
+            retry: 0,
+            retry_delay: 0,
+            retry_max_time: 0,
             mime_options: 0,
             tftp_blksize: 0,
             alivetime: 0,
@@ -1080,9 +1124,15 @@ impl OperationConfig {
             // Non-zero defaults matching C config_alloc()
             maxredirs: DEFAULT_MAXREDIRS,
             happy_eyeballs_timeout_ms: CURL_HET_DEFAULT,
-            file_clobber_mode: CLOBBER_DEFAULT,
+            clobber: CLOBBER_DEFAULT,
             tcp_nodelay: true,
             ftp_skip_ip: true,
+
+            // Per-operation overrides (default to false/0)
+            verbose: false,
+            silent: false,
+            parallel: false,
+            parallel_max: 0,
 
             // All other booleans default to false
             remote_name_all: false,
@@ -1197,6 +1247,7 @@ pub fn free_config_fields(config: &mut OperationConfig) {
     config.postfields = None;
     config.referer = None;
     config.query = None;
+    config.outfile = None;
     config.output_dir = None;
     config.headerfile = None;
     config.ftpport = None;
@@ -1312,8 +1363,8 @@ pub struct GlobalConfig {
     /// Output file for `--libcurl` code generation.
     pub libcurl: Option<String>,
 
-    /// SSL session persistence file path.
-    pub ssl_sessions: Option<String>,
+    /// Cached SSL session data for session persistence across transfers.
+    pub ssl_sessions: Option<Vec<u8>>,
 
     /// User-defined variables (`--variable`).
     pub variables: Vec<ToolVar>,
@@ -1338,7 +1389,7 @@ pub struct GlobalConfig {
     pub parallel_host: u16,
 
     /// Maximum number of parallel transfers (`--parallel-max`).
-    pub parallel_max: u16,
+    pub parallel_max: u32,
 
     /// Verbosity level.
     pub verbosity: u8,
@@ -1380,7 +1431,13 @@ pub struct GlobalConfig {
     pub trace_set: bool,
 
     /// Cached library capability info (populated once during init).
-    pub libcurl_info: Option<LibCurlInfo>,
+    pub libcurl_info: LibCurlInfo,
+
+    /// Terminal output buffer state (primarily for Windows console).
+    pub term: TerminalState,
+
+    /// Cached libcurl version string (e.g., `"curl-rs/8.19.0-DEV"`).
+    pub libcurl_version: Option<String>,
 }
 
 impl std::fmt::Debug for GlobalConfig {
@@ -1420,6 +1477,8 @@ impl std::fmt::Debug for GlobalConfig {
             .field("isatty", &self.isatty)
             .field("trace_set", &self.trace_set)
             .field("libcurl_info", &self.libcurl_info)
+            .field("term", &self.term)
+            .field("libcurl_version", &self.libcurl_version)
             .finish()
     }
 }
@@ -1457,7 +1516,9 @@ impl GlobalConfig {
             noprogress: false,
             isatty: false,
             trace_set: false,
-            libcurl_info: None,
+            libcurl_info: LibCurlInfo::default(),
+            term: TerminalState::new(),
+            libcurl_version: None,
         }
     }
 
@@ -1500,6 +1561,37 @@ impl GlobalConfig {
         self.current = idx;
         &mut self.configs[idx]
     }
+
+    /// Opens a trace output file and sets it as the trace stream.
+    ///
+    /// The file is wrapped in a [`BufWriter`] for efficient I/O. Sets
+    /// `trace_fopened` to `true` so the stream is closed on cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the file cannot be created.
+    pub fn set_trace_file(&mut self, path: &str) -> io::Result<()> {
+        let file = std::fs::File::create(path)?;
+        self.trace_stream = Some(Box::new(BufWriter::new(file)));
+        self.trace_dump = Some(path.to_string());
+        self.trace_fopened = true;
+        Ok(())
+    }
+
+    /// Sets the trace stream to an arbitrary writer (e.g., stderr).
+    ///
+    /// Unlike [`set_trace_file`](Self::set_trace_file), this does NOT set
+    /// `trace_fopened` — the caller retains ownership of the stream's
+    /// lifecycle.
+    pub fn set_trace_stream(&mut self, writer: Box<dyn Write + Send>) {
+        self.trace_stream = Some(writer);
+        self.trace_fopened = false;
+    }
+
+    /// Returns the total number of operation configs in the chain.
+    pub fn config_count(&self) -> usize {
+        self.configs.len()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1521,12 +1613,18 @@ impl GlobalConfig {
 /// # Errors
 ///
 /// Returns `CurlError::FailedInit` if library initialization fails.
-pub fn globalconf_init() -> Result<GlobalConfig, CurlError> {
+pub fn globalconf_init() -> CurlResult<GlobalConfig> {
+    // Initialize the underlying library (TLS provider, tracing subscriber).
+    // This mirrors the C call to curl_global_init(CURL_GLOBAL_DEFAULT).
+    // CURL_GLOBAL_DEFAULT is 3 (CURL_GLOBAL_SSL | CURL_GLOBAL_WIN32).
+    global_init(3).map_err(|_| CurlError::FailedInit)?;
+
     let mut global = GlobalConfig::new_with_defaults();
 
     // Query library capabilities (replaces C get_libcurl_info())
     let info = get_libcurl_info();
-    global.libcurl_info = Some(info);
+    global.libcurl_version = Some(info.version.clone());
+    global.libcurl_info = info;
 
     Ok(global)
 }
@@ -1542,6 +1640,9 @@ pub fn globalconf_init() -> Result<GlobalConfig, CurlError> {
 ///
 /// After calling this, the `GlobalConfig` should not be used.
 pub fn globalconf_free(global: &mut GlobalConfig) {
+    // Perform global library cleanup (mirrors C curl_global_cleanup())
+    global_cleanup();
+
     // Close trace stream if we opened it
     if global.trace_fopened {
         global.trace_stream = None;
@@ -1551,11 +1652,14 @@ pub fn globalconf_free(global: &mut GlobalConfig) {
     // Clear trace dump path
     global.trace_dump = None;
 
-    // Clear SSL sessions path
+    // Clear SSL sessions data
     global.ssl_sessions = None;
 
     // Clear libcurl output path
     global.libcurl = None;
+
+    // Clear version string
+    global.libcurl_version = None;
 
     // Clear all variables
     global.variables.clear();
@@ -1584,20 +1688,26 @@ mod tests {
         assert!(config.ftp_skip_ip, "ftp_skip_ip should be true by default");
         assert_eq!(config.maxredirs, DEFAULT_MAXREDIRS);
         assert_eq!(config.happy_eyeballs_timeout_ms, CURL_HET_DEFAULT);
-        assert_eq!(config.file_clobber_mode, ClobberMode::Default);
+        assert_eq!(config.clobber, ClobberMode::Always);
         assert_eq!(config.upload_flags, CURLULFLAG_SEEN);
         assert_eq!(config.fail, FAIL_NONE);
 
         // Verify zero/false defaults
         assert!(!config.insecure_ok);
-        assert!(!config.verbose());
+        assert!(!config.verbose);
+        assert!(!config.silent);
         assert!(!config.encoding);
         assert!(!config.use_httpget);
+        assert!(!config.parallel);
+        assert_eq!(config.parallel_max, 0);
         assert_eq!(config.httpreq, HttpReq::Unspec);
-        assert_eq!(config.timeout_ms, 0);
-        assert_eq!(config.connecttimeout_ms, 0);
+        assert_eq!(config.timeout, 0);
+        assert_eq!(config.connect_timeout, 0);
+        assert_eq!(config.retry, 0);
+        assert_eq!(config.retry_delay, 0);
         assert!(config.userpwd.is_none());
         assert!(config.proxy.is_none());
+        assert!(config.outfile.is_none());
         assert!(config.headers.is_empty());
     }
 
@@ -1659,7 +1769,7 @@ mod tests {
     fn test_globalconf_free() {
         let mut global = GlobalConfig::new_with_defaults();
         global.trace_dump = Some("/tmp/trace".to_string());
-        global.ssl_sessions = Some("/tmp/sessions".to_string());
+        global.ssl_sessions = Some(b"session_data_bytes".to_vec());
         global.variables.push(ToolVar {
             name: "test".to_string(),
             content: b"value".to_vec(),
@@ -1675,14 +1785,16 @@ mod tests {
 
     #[test]
     fn test_clobber_mode_variants() {
-        assert_eq!(CLOBBER_DEFAULT, ClobberMode::Default);
+        assert_eq!(CLOBBER_DEFAULT, ClobberMode::Always);
         assert_ne!(ClobberMode::Never, ClobberMode::Always);
+        assert_ne!(ClobberMode::Rename, ClobberMode::Never);
     }
 
     #[test]
     fn test_trace_type_variants() {
-        assert_ne!(TraceType::None, TraceType::Bin);
+        assert_ne!(TraceType::None, TraceType::Verbose);
         assert_ne!(TraceType::Ascii, TraceType::Plain);
+        assert_ne!(TraceType::Verbose, TraceType::Plain);
     }
 
     #[test]
@@ -1720,12 +1832,196 @@ mod tests {
     #[test]
     fn test_constants() {
         assert_eq!(DEFAULT_MAXREDIRS, 50);
-        assert_eq!(PARALLEL_DEFAULT, 50);
+        assert_eq!(PARALLEL_DEFAULT, 50u32);
         assert_eq!(MAX_FILE2MEMORY, 40 * 1024 * 1024);
         assert_eq!(CURL_HET_DEFAULT, 200);
         assert_eq!(FAIL_NONE, 0);
         assert_eq!(FAIL_WITH_BODY, 1);
         assert_eq!(FAIL_WO_BODY, 2);
+    }
+
+    #[test]
+    fn test_globalconf_init_lifecycle() {
+        let result = globalconf_init();
+        assert!(result.is_ok(), "globalconf_init should succeed");
+
+        let mut global = result.unwrap();
+
+        // Verify libcurl_info is populated
+        assert!(!global.libcurl_info.version.is_empty());
+        assert!(global.libcurl_info.feature_ssl);
+
+        // Verify libcurl_version is populated
+        assert!(global.libcurl_version.is_some());
+
+        // Verify ssl_sessions type is Vec<u8>
+        assert!(global.ssl_sessions.is_none());
+        global.ssl_sessions = Some(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(global.ssl_sessions.as_ref().unwrap().len(), 4);
+
+        // Verify term field exists
+        let _t = &global.term;
+
+        // Verify first/last/current work
+        assert_eq!(global.first().maxredirs, DEFAULT_MAXREDIRS);
+        assert_eq!(global.last().maxredirs, DEFAULT_MAXREDIRS);
+        assert_eq!(global.current_config().maxredirs, DEFAULT_MAXREDIRS);
+
+        globalconf_free(&mut global);
+        assert!(global.configs.is_empty());
+        assert!(global.libcurl_version.is_none());
+    }
+
+    #[test]
+    fn test_http_method_custom_variant() {
+        let m = HttpMethod::Custom("PURGE".to_string());
+        if let HttpMethod::Custom(s) = &m {
+            assert_eq!(s, "PURGE");
+        } else {
+            panic!("Expected Custom variant");
+        }
+    }
+
+    #[test]
+    fn test_tool_mime_kind_all_variants() {
+        let kinds = [
+            ToolMimeKind::Parts,
+            ToolMimeKind::Data,
+            ToolMimeKind::FileData,
+            ToolMimeKind::File,
+            ToolMimeKind::Stdin,
+        ];
+        // All must be distinct
+        for (i, a) in kinds.iter().enumerate() {
+            for (j, b) in kinds.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_new_getout_inherits_remote_name_all() {
+        let mut config = OperationConfig::new();
+        config.remote_name_all = true;
+
+        let getout = config.new_getout();
+        assert!(getout.use_remote, "should inherit remote_name_all");
+        assert_eq!(getout.num, 0);
+
+        let getout2 = config.new_getout();
+        assert_eq!(getout2.num, 1);
+        assert_eq!(config.url_count(), 2);
+    }
+
+    #[test]
+    fn test_free_config_fields_clears_all_vecs() {
+        let mut config = OperationConfig::new();
+        config.cookies.push("a=b".into());
+        config.cookiefiles.push("f".into());
+        config.mail_rcpt.push("r@x.com".into());
+        config.quote.push("CWD /".into());
+        config.postquote.push("QUIT".into());
+        config.prequote.push("PWD".into());
+        config.headers.push("H: V".into());
+        config.proxyheaders.push("PH: PV".into());
+        config.telnet_options.push("O".into());
+        config.resolve.push("host:80:127.0.0.1".into());
+        config.connect_to.push("::localhost:".into());
+
+        free_config_fields(&mut config);
+
+        assert!(config.cookies.is_empty());
+        assert!(config.cookiefiles.is_empty());
+        assert!(config.mail_rcpt.is_empty());
+        assert!(config.quote.is_empty());
+        assert!(config.postquote.is_empty());
+        assert!(config.prequote.is_empty());
+        assert!(config.headers.is_empty());
+        assert!(config.proxyheaders.is_empty());
+        assert!(config.telnet_options.is_empty());
+        assert!(config.resolve.is_empty());
+        assert!(config.connect_to.is_empty());
+    }
+
+    #[test]
+    fn test_operation_config_default_trait() {
+        let config: OperationConfig = Default::default();
+        assert_eq!(config.maxredirs, DEFAULT_MAXREDIRS);
+        assert!(config.tcp_nodelay);
+    }
+
+    #[test]
+    fn test_getout_default_trait() {
+        let getout: GetOut = Default::default();
+        assert!(getout.url.is_none());
+        assert_eq!(getout.num, 0);
+    }
+
+    #[test]
+    fn test_transfer_state_default() {
+        let state = TransferState::new();
+        assert!(state.url_node_idx.is_none());
+        assert!(state.httpgetfields.is_none());
+        assert!(state.uploadfile.is_none());
+        assert_eq!(state.up_num, 0);
+        assert_eq!(state.url_num, 0);
+
+        let state2: TransferState = Default::default();
+        assert!(state2.url_node_idx.is_none());
+    }
+
+    #[test]
+    fn test_set_trace_file() {
+        let mut global = GlobalConfig::new_with_defaults();
+        let tmp = std::env::temp_dir().join("blitzy_test_trace.txt");
+        let path = tmp.to_str().unwrap();
+
+        let result = global.set_trace_file(path);
+        assert!(result.is_ok());
+        assert!(global.trace_fopened);
+        assert!(global.trace_stream.is_some());
+        assert_eq!(global.trace_dump.as_deref(), Some(path));
+
+        // Write to verify the stream works
+        if let Some(ref mut stream) = global.trace_stream {
+            stream.write_all(b"trace test\n").unwrap();
+            stream.flush().unwrap();
+        }
+
+        // Clean up
+        global.trace_stream = None;
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_set_trace_stream_no_fopened() {
+        let mut global = GlobalConfig::new_with_defaults();
+        let buf: Vec<u8> = Vec::new();
+        global.set_trace_stream(Box::new(buf));
+        assert!(!global.trace_fopened);
+        assert!(global.trace_stream.is_some());
+    }
+
+    #[test]
+    fn test_config_count() {
+        let mut global = GlobalConfig::new_with_defaults();
+        assert_eq!(global.config_count(), 1);
+        global.add_config();
+        assert_eq!(global.config_count(), 2);
+    }
+
+    #[test]
+    fn test_tool_var_binary_content() {
+        let var = ToolVar {
+            name: "bin_var".to_string(),
+            content: vec![0x00, 0xFF, 0x7F, 0x80],
+        };
+        assert_eq!(var.name, "bin_var");
+        assert_eq!(var.content.len(), 4);
+        assert_eq!(var.content[0], 0x00);
+        assert_eq!(var.content[3], 0x80);
     }
 }
 
@@ -1734,20 +2030,6 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 impl OperationConfig {
-    /// Returns `true` if verbose output is enabled at any level.
-    ///
-    /// This checks the trace type rather than a single boolean to account
-    /// for `--trace`, `--trace-ascii`, and `--verbose` all enabling verbose
-    /// output at different detail levels.
-    pub fn verbose(&self) -> bool {
-        // Verbose is a global setting; for per-config convenience, we
-        // check local fields that indicate verbose-like output is wanted.
-        // The actual verbose check is against GlobalConfig.tracetype in
-        // the C code, but having a per-config accessor is useful for
-        // operations that only have a config reference.
-        false // Default; overridden by the caller inspecting GlobalConfig
-    }
-
     /// Returns the number of URL entries in this config's transfer list.
     pub fn url_count(&self) -> usize {
         self.url_list.len()
