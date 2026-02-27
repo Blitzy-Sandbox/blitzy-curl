@@ -3,6 +3,7 @@
 
 pub mod types;
 pub mod error_codes;
+pub mod header;
 pub mod mime;
 pub mod mprintf;
 pub mod options;
