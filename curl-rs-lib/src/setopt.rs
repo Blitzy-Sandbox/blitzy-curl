@@ -48,96 +48,178 @@ pub const CURLOPTTYPE_VALUES: u32 = CURLOPTTYPE_LONG;
 pub const CURL_MAX_INPUT_LENGTH: usize = 8_000_000;
 
 // HTTP version constants
+
+/// No preferred HTTP version; let the library decide.
 pub const CURL_HTTP_VERSION_NONE: i64 = 0;
+/// Enforce HTTP/1.0 requests.
 pub const CURL_HTTP_VERSION_1_0: i64 = 1;
+/// Enforce HTTP/1.1 requests.
 pub const CURL_HTTP_VERSION_1_1: i64 = 2;
+/// Attempt HTTP/2 via Upgrade or ALPN negotiation, falling back to HTTP/1.1.
 pub const CURL_HTTP_VERSION_2_0: i64 = 3;
+/// Attempt HTTP/2 via ALPN on TLS connections only.
 pub const CURL_HTTP_VERSION_2TLS: i64 = 4;
+/// Use HTTP/2 without negotiation (prior knowledge).
 pub const CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE: i64 = 5;
+/// Attempt HTTP/3 via QUIC, falling back to earlier versions.
 pub const CURL_HTTP_VERSION_3: i64 = 30;
+/// Require HTTP/3 exclusively — fail if QUIC is unavailable.
 pub const CURL_HTTP_VERSION_3ONLY: i64 = 31;
 
 // SSL version constants
+
+/// Use the default TLS version negotiation.
 pub const CURL_SSLVERSION_DEFAULT: i64 = 0;
+/// Use TLS 1.x (library selects minor version).
 pub const CURL_SSLVERSION_TLSV1: i64 = 1;
+/// Use SSLv2 (obsolete, typically rejected by servers).
 pub const CURL_SSLVERSION_SSLV2: i64 = 2;
+/// Use SSLv3 (obsolete, typically rejected by servers).
 pub const CURL_SSLVERSION_SSLV3: i64 = 3;
+/// Use TLS 1.0 as the minimum version.
 pub const CURL_SSLVERSION_TLSV1_0: i64 = 4;
+/// Use TLS 1.1 as the minimum version.
 pub const CURL_SSLVERSION_TLSV1_1: i64 = 5;
+/// Use TLS 1.2 as the minimum version.
 pub const CURL_SSLVERSION_TLSV1_2: i64 = 6;
+/// Use TLS 1.3 as the minimum version.
 pub const CURL_SSLVERSION_TLSV1_3: i64 = 7;
+/// Sentinel value: number of defined SSL version entries.
 pub const CURL_SSLVERSION_LAST: i64 = 8;
+/// No maximum TLS version constraint.
 pub const CURL_SSLVERSION_MAX_NONE: i64 = 0;
+/// Sentinel for the maximum SSL version range.
 pub const CURL_SSLVERSION_MAX_LAST: i64 = CURL_SSLVERSION_LAST << 16;
 
 // Proxy type constants
+
+/// HTTP proxy (default).
 pub const CURLPROXY_HTTP: i64 = 0;
+/// HTTP/1.0 proxy.
 pub const CURLPROXY_HTTP_1_0: i64 = 1;
+/// HTTPS proxy (TLS connection to the proxy itself).
 pub const CURLPROXY_HTTPS: i64 = 2;
+/// HTTPS proxy with HTTP/2 to the proxy.
 pub const CURLPROXY_HTTPS2: i64 = 3;
+/// SOCKS4 proxy.
 pub const CURLPROXY_SOCKS4: i64 = 4;
+/// SOCKS5 proxy.
 pub const CURLPROXY_SOCKS5: i64 = 5;
+/// SOCKS4a proxy (hostname resolution on the proxy side).
 pub const CURLPROXY_SOCKS4A: i64 = 6;
+/// SOCKS5 proxy with hostname resolution on the proxy side.
 pub const CURLPROXY_SOCKS5_HOSTNAME: i64 = 7;
 
 // Auth bitmask constants
+
+/// No authentication.
 pub const CURLAUTH_NONE: u64 = 0;
+/// HTTP Basic authentication.
 pub const CURLAUTH_BASIC: u64 = 1 << 0;
+/// HTTP Digest authentication (RFC 2617 / RFC 7616).
 pub const CURLAUTH_DIGEST: u64 = 1 << 1;
+/// HTTP Negotiate (SPNEGO) authentication.
 pub const CURLAUTH_NEGOTIATE: u64 = 1 << 2;
+/// HTTP NTLM authentication.
 pub const CURLAUTH_NTLM: u64 = 1 << 3;
+/// HTTP Digest authentication with IE-compatible flavour.
 pub const CURLAUTH_DIGEST_IE: u64 = 1 << 4;
+/// HTTP Bearer token authentication (RFC 6750).
 pub const CURLAUTH_BEARER: u64 = 1 << 6;
+/// Used with another auth type to force that single type only.
 pub const CURLAUTH_ONLY: u64 = 1 << 31;
+/// Convenience bitmask: any authentication method (excluding Digest-IE).
 pub const CURLAUTH_ANY: u64 = !(CURLAUTH_DIGEST_IE);
 
 // IP resolve constants
+
+/// Resolve using whatever address family is available.
 pub const CURL_IPRESOLVE_WHATEVER: i64 = 0;
+/// Resolve to IPv4 addresses only.
 pub const CURL_IPRESOLVE_V4: i64 = 1;
+/// Resolve to IPv6 addresses only.
 pub const CURL_IPRESOLVE_V6: i64 = 2;
 
 // Netrc constants
+
+/// Ignore `.netrc` file completely.
 pub const CURL_NETRC_IGNORED: i64 = 0;
+/// Use `.netrc` file for missing credentials (default).
 pub const CURL_NETRC_OPTIONAL: i64 = 1;
+/// Require `.netrc` credentials; fail if not found.
 pub const CURL_NETRC_REQUIRED: i64 = 2;
 
 // Time condition constants
+
+/// No time condition.
 pub const CURL_TIMECOND_NONE: i64 = 0;
+/// Transfer only if modified since the given time.
 pub const CURL_TIMECOND_IFMODSINCE: i64 = 1;
+/// Transfer only if unmodified since the given time.
 pub const CURL_TIMECOND_IFUNMODSINCE: i64 = 2;
+/// Transfer only if last-modified matches the given time.
 pub const CURL_TIMECOND_LASTMOD: i64 = 3;
 
 // SSH auth type bitmask constants
+
+/// Allow any SSH authentication method.
 pub const CURLSSH_AUTH_ANY: i64 = !0;
+/// No SSH authentication.
 pub const CURLSSH_AUTH_NONE: i64 = 0;
+/// SSH public-key authentication.
 pub const CURLSSH_AUTH_PUBLICKEY: i64 = 1 << 0;
+/// SSH password authentication.
 pub const CURLSSH_AUTH_PASSWORD: i64 = 1 << 1;
+/// SSH host-based authentication.
 pub const CURLSSH_AUTH_HOST: i64 = 1 << 2;
+/// SSH keyboard-interactive authentication.
 pub const CURLSSH_AUTH_KEYBOARD: i64 = 1 << 3;
+/// SSH agent-based authentication.
 pub const CURLSSH_AUTH_AGENT: i64 = 1 << 4;
+/// Default SSH auth methods (equivalent to `CURLSSH_AUTH_ANY`).
 pub const CURLSSH_AUTH_DEFAULT: i64 = CURLSSH_AUTH_ANY;
 
 // USE_SSL constants
+
+/// Do not use SSL/TLS at all.
 pub const CURLUSESSL_NONE: i64 = 0;
+/// Try using SSL/TLS, but proceed without if unavailable.
 pub const CURLUSESSL_TRY: i64 = 1;
+/// Require SSL/TLS for the control connection.
 pub const CURLUSESSL_CONTROL: i64 = 2;
+/// Require SSL/TLS for both control and data connections.
 pub const CURLUSESSL_ALL: i64 = 3;
 
 // Header option constants
+
+/// Pass all headers in a single unified list.
 pub const CURLHEADER_UNIFIED: i64 = 0;
+/// Pass proxy and server headers in separate lists.
 pub const CURLHEADER_SEPARATE: i64 = 1 << 0;
 
 // Post redirect constants
+
+/// Convert POST to GET on all redirect types.
 pub const CURL_REDIR_GET_ALL: i64 = 0;
+/// Keep POST on 301 redirect.
 pub const CURL_REDIR_POST_301: i64 = 1;
+/// Keep POST on 302 redirect.
 pub const CURL_REDIR_POST_302: i64 = 2;
+/// Keep POST on 303 redirect.
 pub const CURL_REDIR_POST_303: i64 = 4;
+/// Keep POST on all redirect types (301, 302, 303).
 pub const CURL_REDIR_POST_ALL: i64 = CURL_REDIR_POST_301 | CURL_REDIR_POST_302 | CURL_REDIR_POST_303;
 
 /// All supported `CURLoption` identifiers (291 variants).
+///
+/// Each variant's discriminant matches the C `CURLoption` integer value
+/// defined in `include/curl/curl.h` exactly. The variant names are kept
+/// identical to the C macro names for FFI compatibility; refer to the
+/// [curl_easy_setopt(3)](https://curl.se/libcurl/c/curl_easy_setopt.html)
+/// man page for per-option documentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, missing_docs)]
 pub enum CurlOpt {
     // -- LONG/VALUES (base 0) --
     CURLOPT_PORT = 3,

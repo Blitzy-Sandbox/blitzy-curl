@@ -1585,3 +1585,366 @@ pub fn set_ssh_state(session: &mut SshSession, new_state: SshState) {
 fn _ensure_imports_used() {
     let _ = std::mem::size_of::<ConnectionData>();
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // SshProtocol tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ssh_protocol_display_sftp() {
+        assert_eq!(format!("{}", SshProtocol::Sftp), "SFTP");
+    }
+
+    #[test]
+    fn test_ssh_protocol_display_scp() {
+        assert_eq!(format!("{}", SshProtocol::Scp), "SCP");
+    }
+
+    // -----------------------------------------------------------------------
+    // SshState tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ssh_state_default_is_no_state() {
+        assert_eq!(SshState::default(), SshState::NoState);
+    }
+
+    #[test]
+    fn test_ssh_state_equality() {
+        assert_eq!(SshState::Init, SshState::Init);
+        assert_ne!(SshState::Init, SshState::Stop);
+    }
+
+    #[test]
+    fn test_ssh_state_name_no_state() {
+        assert_eq!(ssh_state_name(&SshState::NoState), "SSH_NO_STATE");
+    }
+
+    #[test]
+    fn test_ssh_state_name_stop() {
+        assert_eq!(ssh_state_name(&SshState::Stop), "SSH_STOP");
+    }
+
+    #[test]
+    fn test_ssh_state_name_auth_variants() {
+        assert_eq!(ssh_state_name(&SshState::AuthList), "SSH_AUTHLIST");
+        assert_eq!(ssh_state_name(&SshState::AuthPkeyInit), "SSH_AUTH_PKEY_INIT");
+        assert_eq!(ssh_state_name(&SshState::AuthPkey), "SSH_AUTH_PKEY");
+        assert_eq!(ssh_state_name(&SshState::AuthPassInit), "SSH_AUTH_PASS_INIT");
+        assert_eq!(ssh_state_name(&SshState::AuthPass), "SSH_AUTH_PASS");
+        assert_eq!(ssh_state_name(&SshState::AuthDone), "SSH_AUTH_DONE");
+    }
+
+    #[test]
+    fn test_ssh_state_name_lifecycle() {
+        assert_eq!(ssh_state_name(&SshState::Init), "SSH_INIT");
+        assert_eq!(ssh_state_name(&SshState::Startup), "SSH_S_STARTUP");
+        assert_eq!(ssh_state_name(&SshState::Hostkey), "SSH_HOSTKEY");
+        assert_eq!(ssh_state_name(&SshState::SessionDisconnect), "SSH_SESSION_DISCONNECT");
+        assert_eq!(ssh_state_name(&SshState::SessionFree), "SSH_SESSION_FREE");
+        assert_eq!(ssh_state_name(&SshState::Quit), "SSH_QUIT");
+    }
+
+    // -----------------------------------------------------------------------
+    // SshAuthMethod tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ssh_auth_method_empty() {
+        let m = SshAuthMethod::empty();
+        assert!(m.is_empty());
+        assert!(!m.contains(SshAuthMethod::PUBLICKEY));
+    }
+
+    #[test]
+    fn test_ssh_auth_method_all_contains_every_method() {
+        let all = SshAuthMethod::all();
+        assert!(all.contains(SshAuthMethod::PUBLICKEY));
+        assert!(all.contains(SshAuthMethod::PASSWORD));
+        assert!(all.contains(SshAuthMethod::HOST));
+        assert!(all.contains(SshAuthMethod::KEYBOARD_INTERACTIVE));
+        assert!(all.contains(SshAuthMethod::GSSAPI));
+        assert!(all.contains(SshAuthMethod::AGENT));
+        assert!(!all.is_empty());
+    }
+
+    #[test]
+    fn test_ssh_auth_method_bitor() {
+        let m = SshAuthMethod::PUBLICKEY | SshAuthMethod::PASSWORD;
+        assert!(m.contains(SshAuthMethod::PUBLICKEY));
+        assert!(m.contains(SshAuthMethod::PASSWORD));
+        assert!(!m.contains(SshAuthMethod::GSSAPI));
+    }
+
+    #[test]
+    fn test_ssh_auth_method_bitor_assign() {
+        let mut m = SshAuthMethod::PUBLICKEY;
+        m |= SshAuthMethod::AGENT;
+        assert!(m.contains(SshAuthMethod::PUBLICKEY));
+        assert!(m.contains(SshAuthMethod::AGENT));
+    }
+
+    #[test]
+    fn test_ssh_auth_method_bitand() {
+        let a = SshAuthMethod::PUBLICKEY | SshAuthMethod::PASSWORD;
+        let b = SshAuthMethod::PASSWORD | SshAuthMethod::GSSAPI;
+        let c = a & b;
+        assert!(c.contains(SshAuthMethod::PASSWORD));
+        assert!(!c.contains(SshAuthMethod::PUBLICKEY));
+        assert!(!c.contains(SshAuthMethod::GSSAPI));
+    }
+
+    // -----------------------------------------------------------------------
+    // SshAuthConfig tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ssh_auth_config_default() {
+        let cfg = SshAuthConfig::default();
+        assert!(cfg.username.is_empty());
+        assert!(cfg.password.is_none());
+        assert!(cfg.private_key_file.is_none());
+        assert!(cfg.public_key_file.is_none());
+        assert!(cfg.passphrase.is_none());
+        assert!(cfg.known_hosts_file.is_none());
+        assert!(cfg.host_public_key_sha256.is_none());
+        assert!(cfg.host_public_key_md5.is_none());
+        assert_eq!(cfg.allowed_methods, SshAuthMethod::all());
+        assert!(cfg.ssh_agent);
+    }
+
+    // -----------------------------------------------------------------------
+    // SshError tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ssh_error_display() {
+        let e = SshError::AuthFailed;
+        let msg = format!("{}", e);
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn test_ssh_error_into_curl_error() {
+        let ce: CurlError = SshError::AuthFailed.into();
+        assert!(matches!(ce, CurlError::LoginDenied));
+
+        let ce2: CurlError = SshError::HostKeyMismatch.into();
+        assert!(matches!(ce2, CurlError::PeerFailedVerification));
+
+        let ce3: CurlError = SshError::ChannelFailed.into();
+        assert!(matches!(ce3, CurlError::Ssh));
+    }
+
+    // -----------------------------------------------------------------------
+    // SshSession tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ssh_session_new() {
+        let s = SshSession::new();
+        assert!(s.handle.is_none());
+        assert_eq!(s.state, SshState::NoState);
+        assert!(!s.authed);
+        assert!(s.homedir.is_empty());
+        assert!(s.server_auth_methods.is_empty());
+        assert!(s.fingerprint.is_none());
+    }
+
+    #[test]
+    fn test_ssh_session_default_equals_new() {
+        let s1 = SshSession::new();
+        let s2 = SshSession::default();
+        assert_eq!(s1.state, s2.state);
+        assert_eq!(s1.authed, s2.authed);
+        assert_eq!(s1.homedir, s2.homedir);
+    }
+
+    // -----------------------------------------------------------------------
+    // set_ssh_state tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_ssh_state_changes_state() {
+        let mut session = SshSession::new();
+        assert_eq!(session.state, SshState::NoState);
+        set_ssh_state(&mut session, SshState::Init);
+        assert_eq!(session.state, SshState::Init);
+    }
+
+    #[test]
+    fn test_set_ssh_state_same_state_is_noop() {
+        let mut session = SshSession::new();
+        set_ssh_state(&mut session, SshState::Init);
+        set_ssh_state(&mut session, SshState::Init);
+        assert_eq!(session.state, SshState::Init);
+    }
+
+    // -----------------------------------------------------------------------
+    // ssh_version tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ssh_version_is_not_empty() {
+        let v = ssh_version();
+        assert!(!v.is_empty());
+        assert!(v.contains("russh"));
+    }
+
+    // -----------------------------------------------------------------------
+    // get_working_path tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_working_path_sftp_home_relative() {
+        let result = get_working_path("/~/Documents", "/home/user", SshProtocol::Sftp).unwrap();
+        assert_eq!(result, "/home/user/Documents");
+    }
+
+    #[test]
+    fn test_get_working_path_sftp_just_home() {
+        let result = get_working_path("/~", "/home/user", SshProtocol::Sftp).unwrap();
+        assert_eq!(result, "/home/user/");
+    }
+
+    #[test]
+    fn test_get_working_path_sftp_absolute() {
+        let result = get_working_path("/var/log/syslog", "/home/user", SshProtocol::Sftp).unwrap();
+        assert_eq!(result, "/var/log/syslog");
+    }
+
+    #[test]
+    fn test_get_working_path_scp_home_relative() {
+        let result = get_working_path("/~/file.txt", "/home/user", SshProtocol::Scp).unwrap();
+        assert_eq!(result, "file.txt");
+    }
+
+    #[test]
+    fn test_get_working_path_scp_just_home() {
+        let result = get_working_path("/~", "/home/user", SshProtocol::Scp).unwrap();
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_get_working_path_scp_absolute() {
+        let result = get_working_path("/etc/hosts", "/home/user", SshProtocol::Scp).unwrap();
+        assert_eq!(result, "etc/hosts");
+    }
+
+    #[test]
+    fn test_get_working_path_rejects_null_bytes() {
+        let result = get_working_path("/path%00evil", "/home/user", SshProtocol::Sftp);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // get_pathname tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_pathname_simple_word() {
+        let (path, consumed) = get_pathname("myfile.txt rest", "/home").unwrap();
+        assert_eq!(path, "myfile.txt");
+        assert_eq!(consumed, 10);
+    }
+
+    #[test]
+    fn test_get_pathname_quoted_string() {
+        let (path, consumed) = get_pathname("\"my file.txt\" rest", "/home").unwrap();
+        assert_eq!(path, "my file.txt");
+        assert!(consumed > 0);
+    }
+
+    #[test]
+    fn test_get_pathname_empty_input_fails() {
+        let result = get_pathname("", "/home");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_pathname_whitespace_only_fails() {
+        let result = get_pathname("   ", "/home");
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // ssh_range tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ssh_range_from_to() {
+        let (from, to) = ssh_range("10-20", 100).unwrap();
+        assert_eq!(from, 10);
+        assert_eq!(to, 20);
+    }
+
+    #[test]
+    fn test_ssh_range_from_end() {
+        let (from, to) = ssh_range("50-", 100).unwrap();
+        assert_eq!(from, 50);
+        assert_eq!(to, 99);
+    }
+
+    #[test]
+    fn test_ssh_range_last_n() {
+        let (from, to) = ssh_range("-10", 100).unwrap();
+        assert_eq!(from, 90);
+        assert_eq!(to, 99);
+    }
+
+    #[test]
+    fn test_ssh_range_to_clamped_to_file_size() {
+        let (from, to) = ssh_range("0-999", 50).unwrap();
+        assert_eq!(from, 0);
+        assert_eq!(to, 49);
+    }
+
+    #[test]
+    fn test_ssh_range_empty_is_error() {
+        assert!(ssh_range("", 100).is_err());
+    }
+
+    #[test]
+    fn test_ssh_range_last_n_exceeds_size_is_error() {
+        assert!(ssh_range("-200", 100).is_err());
+    }
+
+    #[test]
+    fn test_ssh_range_from_exceeds_size_is_error() {
+        assert!(ssh_range("100-", 100).is_err());
+    }
+
+    #[test]
+    fn test_ssh_range_inverted_is_error() {
+        assert!(ssh_range("50-10", 100).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Scheme constants tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sftp_scheme_constants() {
+        assert_eq!(SFTP_SCHEME.name, "SFTP");
+        assert_eq!(SFTP_SCHEME.default_port, 22);
+    }
+
+    #[test]
+    fn test_scp_scheme_constants() {
+        assert_eq!(SCP_SCHEME.name, "SCP");
+        assert_eq!(SCP_SCHEME.default_port, 22);
+    }
+
+    #[test]
+    fn test_port_ssh_constant() {
+        assert_eq!(PORT_SSH, 22);
+    }
+}

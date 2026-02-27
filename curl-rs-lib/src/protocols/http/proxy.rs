@@ -703,9 +703,7 @@ impl ConnectionFilter for HttpProxyFilter {
                     tracing::info!("CONNECT: no ALPN negotiated");
                 }
 
-                let httpversion: u8;
-
-                match alpn.as_deref() {
+                let httpversion: u8 = match alpn.as_deref() {
                     // C: if(alpn && !strcmp(alpn, "http/1.0"))
                     Some("http/1.0") => {
                         tracing::debug!("HTTP-PROXY: installing subfilter for HTTP/1.0");
@@ -714,7 +712,7 @@ impl ConnectionFilter for HttpProxyFilter {
                             self.proxy_port,
                         );
                         self.inner_chain.push_front(Box::new(h1_filter));
-                        httpversion = 10;
+                        10
                     }
                     // C: else if(!alpn || !strcmp(alpn, "http/1.1"))
                     None | Some("http/1.1") => {
@@ -725,7 +723,7 @@ impl ConnectionFilter for HttpProxyFilter {
                         );
                         self.inner_chain.push_front(Box::new(h1_filter));
                         // Without ALPN, assume HTTP/1.1 (ancient proxy).
-                        httpversion = 11;
+                        11
                     }
                     // C: #ifdef USE_NGHTTP2
                     //    else if(!strcmp(alpn, "h2"))
@@ -736,7 +734,7 @@ impl ConnectionFilter for HttpProxyFilter {
                             self.proxy_port,
                         );
                         self.inner_chain.push_front(Box::new(h2_filter));
-                        httpversion = 20;
+                        20
                     }
                     // C: else { failf(data, "CONNECT: negotiated ALPN '%s' not supported", alpn); }
                     Some(other) => {
@@ -747,7 +745,7 @@ impl ConnectionFilter for HttpProxyFilter {
                         );
                         return Err(CurlError::CouldntConnect);
                     }
-                }
+                };
 
                 self.ctx.sub_filter_installed = true;
                 self.ctx.httpversion = httpversion;

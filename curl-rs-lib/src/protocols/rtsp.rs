@@ -178,10 +178,11 @@ impl std::fmt::Display for RtspRequest {
 ///
 /// The state machine handles frames that may be split across multiple
 /// network read operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[allow(dead_code)]
 enum RtpParseState {
     /// Scanning for the '$' byte that starts an RTP interleaved frame.
+    #[default]
     Skip,
     /// '$' found; next byte is the channel number.
     Channel,
@@ -189,12 +190,6 @@ enum RtpParseState {
     Len,
     /// Length field complete; accumulating RTP payload data.
     Data,
-}
-
-impl Default for RtpParseState {
-    fn default() -> Self {
-        Self::Skip
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +447,12 @@ impl RtspState {
 pub struct RtspHandler {
     /// All RTSP handler state.
     state: RtspState,
+}
+
+impl Default for RtspHandler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RtspHandler {
@@ -768,19 +769,18 @@ impl RtspHandler {
                 if matches!(
                     rtspreq,
                     RtspRequest::SetParameter | RtspRequest::GetParameter
-                ) {
-                    if !self.state.check_header("Content-Type") {
-                        req_buffer
-                            .add_str("Content-Type: text/parameters\r\n")?;
-                    }
+                ) && !self.state.check_header("Content-Type")
+                {
+                    req_buffer
+                        .add_str("Content-Type: text/parameters\r\n")?;
                 }
 
                 // Content-Type for ANNOUNCE.
-                if rtspreq == RtspRequest::Announce {
-                    if !self.state.check_header("Content-Type") {
-                        req_buffer
-                            .add_str("Content-Type: application/sdp\r\n")?;
-                    }
+                if rtspreq == RtspRequest::Announce
+                    && !self.state.check_header("Content-Type")
+                {
+                    req_buffer
+                        .add_str("Content-Type: application/sdp\r\n")?;
                 }
             } else if rtspreq == RtspRequest::GetParameter {
                 // Empty GET_PARAMETER acts as a heartbeat (no body).
@@ -872,8 +872,7 @@ impl RtspHandler {
             && (state.bytecount < state.req_size as u64);
 
         let body_remain = if in_body {
-            let remain = state.req_size as u64 - state.bytecount;
-            remain
+            state.req_size as u64 - state.bytecount
         } else {
             0
         };
@@ -944,7 +943,7 @@ impl RtspHandler {
 
             match state.conn.state {
                 RtpParseState::Skip => {
-                    debug_assert!(state.conn.buf.len() == 0);
+                    debug_assert!(state.conn.buf.is_empty());
 
                     while pos < blen && buf[pos] != b'$' {
                         if !in_body
@@ -1036,7 +1035,7 @@ impl RtspHandler {
 
                 RtpParseState::Len => {
                     let rtp_buf_len = state.conn.buf.len();
-                    debug_assert!(rtp_buf_len >= 2 && rtp_buf_len < 4);
+                    debug_assert!((2..4).contains(&rtp_buf_len));
 
                     state.conn.buf.add(&buf[pos..pos + 1])?;
                     consumed += 1;

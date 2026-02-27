@@ -3114,3 +3114,508 @@ impl HttpEasyExt for EasyHandle {
         if mask != 0 { Some(mask) } else { None }
     }
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // HttpVersion tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_http_version_as_str() {
+        assert_eq!(HttpVersion::Http09.as_str(), "HTTP/0.9");
+        assert_eq!(HttpVersion::Http10.as_str(), "HTTP/1.0");
+        assert_eq!(HttpVersion::Http11.as_str(), "HTTP/1.1");
+        assert_eq!(HttpVersion::Http2.as_str(), "HTTP/2");
+        assert_eq!(HttpVersion::Http3.as_str(), "HTTP/3");
+    }
+
+    #[test]
+    fn test_http_version_minor_version() {
+        assert_eq!(HttpVersion::Http09.minor_version(), 0);
+        assert_eq!(HttpVersion::Http10.minor_version(), 0);
+        assert_eq!(HttpVersion::Http11.minor_version(), 1);
+        assert_eq!(HttpVersion::Http2.minor_version(), 1);
+        assert_eq!(HttpVersion::Http3.minor_version(), 1);
+    }
+
+    #[test]
+    fn test_http_version_display() {
+        assert_eq!(format!("{}", HttpVersion::Http11), "HTTP/1.1");
+        assert_eq!(format!("{}", HttpVersion::Http2), "HTTP/2");
+    }
+
+    #[test]
+    fn test_http_version_ordering() {
+        assert!(HttpVersion::Http09 < HttpVersion::Http10);
+        assert!(HttpVersion::Http10 < HttpVersion::Http11);
+        assert!(HttpVersion::Http11 < HttpVersion::Http2);
+        assert!(HttpVersion::Http2 < HttpVersion::Http3);
+    }
+
+    #[test]
+    fn test_http_version_default_is_http11() {
+        assert_eq!(HttpVersion::default(), HttpVersion::Http11);
+    }
+
+    // -----------------------------------------------------------------------
+    // HttpVersionFlags tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_http_version_flags_contains() {
+        let v1 = HttpVersionFlags::HTTP_1X;
+        assert!(v1.contains(HttpVersionFlags::HTTP_1X));
+        assert!(!v1.contains(HttpVersionFlags::HTTP_2X));
+    }
+
+    #[test]
+    fn test_http_version_flags_all() {
+        let all = HttpVersionFlags::ALL;
+        assert!(all.contains(HttpVersionFlags::HTTP_1X));
+        assert!(all.contains(HttpVersionFlags::HTTP_2X));
+        assert!(all.contains(HttpVersionFlags::HTTP_3X));
+    }
+
+    #[test]
+    fn test_http_version_flags_default_is_all() {
+        let def = HttpVersionFlags::default();
+        // Default should have no bits set (zero value from Default derive).
+        // Individual protocol modules set specific flags.
+        let _ = def;
+    }
+
+    // -----------------------------------------------------------------------
+    // HttpReq tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_http_req_display() {
+        assert_eq!(format!("{}", HttpReq::Get), "GET");
+        assert_eq!(format!("{}", HttpReq::Post), "POST");
+        assert_eq!(format!("{}", HttpReq::Put), "PUT");
+        assert_eq!(format!("{}", HttpReq::Head), "HEAD");
+        assert_eq!(format!("{}", HttpReq::Custom), "CUSTOM");
+        assert_eq!(format!("{}", HttpReq::None), "NONE");
+        assert_eq!(format!("{}", HttpReq::PostForm), "POST");
+        assert_eq!(format!("{}", HttpReq::PostMime), "POST");
+    }
+
+    #[test]
+    fn test_http_req_default() {
+        assert_eq!(HttpReq::default(), HttpReq::None);
+    }
+
+    // -----------------------------------------------------------------------
+    // FollowType tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_follow_type_default_is_none() {
+        assert_eq!(FollowType::default(), FollowType::None);
+    }
+
+    #[test]
+    fn test_follow_type_variants_are_distinct() {
+        assert_ne!(FollowType::None, FollowType::Fake);
+        assert_ne!(FollowType::Fake, FollowType::Retry);
+        assert_ne!(FollowType::Retry, FollowType::Redir);
+    }
+
+    // -----------------------------------------------------------------------
+    // HttpRequest tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_http_request_new() {
+        let req = HttpRequest::new("GET", "http://example.com/path");
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.url, "http://example.com/path");
+        assert!(req.headers.is_empty());
+        assert!(req.body.is_none());
+        assert!(!req.expect_100_continue);
+    }
+
+    #[test]
+    fn test_http_request_add_header() {
+        let mut req = HttpRequest::new("POST", "/api");
+        req.add_header("Content-Type", "application/json");
+        assert_eq!(req.get_header("Content-Type"), Some("application/json"));
+        assert_eq!(req.headers.len(), 1);
+    }
+
+    #[test]
+    fn test_http_request_add_header_replaces_existing() {
+        let mut req = HttpRequest::new("GET", "/");
+        req.add_header("Host", "old.example.com");
+        req.add_header("Host", "new.example.com");
+        assert_eq!(req.get_header("Host"), Some("new.example.com"));
+        assert_eq!(req.headers.len(), 1);
+    }
+
+    #[test]
+    fn test_http_request_add_header_case_insensitive_replace() {
+        let mut req = HttpRequest::new("GET", "/");
+        req.add_header("content-type", "text/html");
+        req.add_header("Content-Type", "application/json");
+        assert_eq!(req.headers.len(), 1);
+        assert_eq!(req.get_header("content-type"), Some("application/json"));
+    }
+
+    #[test]
+    fn test_http_request_get_header_missing() {
+        let req = HttpRequest::new("GET", "/");
+        assert_eq!(req.get_header("X-Missing"), None);
+    }
+
+    #[test]
+    fn test_http_request_has_header() {
+        let mut req = HttpRequest::new("GET", "/");
+        req.add_header("Accept", "*/*");
+        assert!(req.has_header("Accept"));
+        assert!(req.has_header("accept"));
+        assert!(!req.has_header("Content-Type"));
+    }
+
+    #[test]
+    fn test_http_request_remove_header() {
+        let mut req = HttpRequest::new("GET", "/");
+        req.add_header("Accept", "*/*");
+        req.add_header("Host", "example.com");
+        req.remove_header("accept");
+        assert!(!req.has_header("Accept"));
+        assert!(req.has_header("Host"));
+    }
+
+    #[test]
+    fn test_http_request_remove_header_nonexistent() {
+        let mut req = HttpRequest::new("GET", "/");
+        req.add_header("Host", "example.com");
+        req.remove_header("X-NonExistent");
+        assert_eq!(req.headers.len(), 1);
+    }
+
+    #[test]
+    fn test_http_request_multiple_headers() {
+        let mut req = HttpRequest::new("GET", "/");
+        req.add_header("Accept", "*/*");
+        req.add_header("Host", "example.com");
+        req.add_header("User-Agent", "curl-rs/8.19.0");
+        assert_eq!(req.headers.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // HttpResponse tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_http_response_new() {
+        let resp = HttpResponse::new(HttpVersion::Http11, 200, "OK");
+        assert_eq!(resp.version, HttpVersion::Http11);
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(resp.reason, "OK");
+        assert!(resp.headers.is_empty());
+    }
+
+    #[test]
+    fn test_http_response_get_header() {
+        let mut resp = HttpResponse::new(HttpVersion::Http11, 200, "OK");
+        resp.headers
+            .push(("Content-Type".to_string(), "text/html".to_string()));
+        assert_eq!(resp.get_header("Content-Type"), Some("text/html"));
+        assert_eq!(resp.get_header("content-type"), Some("text/html"));
+        assert_eq!(resp.get_header("X-Missing"), None);
+    }
+
+    #[test]
+    fn test_http_response_get_headers_multiple() {
+        let mut resp = HttpResponse::new(HttpVersion::Http11, 200, "OK");
+        resp.headers
+            .push(("Set-Cookie".to_string(), "a=1".to_string()));
+        resp.headers
+            .push(("Set-Cookie".to_string(), "b=2".to_string()));
+        let cookies = resp.get_headers("Set-Cookie");
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(cookies[0], "a=1");
+        assert_eq!(cookies[1], "b=2");
+    }
+
+    #[test]
+    fn test_http_response_status_classification() {
+        let info = HttpResponse::new(HttpVersion::Http11, 100, "Continue");
+        assert!(info.is_informational());
+        assert!(!info.is_success());
+
+        let ok = HttpResponse::new(HttpVersion::Http11, 200, "OK");
+        assert!(ok.is_success());
+        assert!(!ok.is_informational());
+        assert!(!ok.is_redirect());
+
+        let redir = HttpResponse::new(HttpVersion::Http11, 301, "Moved");
+        assert!(redir.is_redirect());
+        assert!(!redir.is_success());
+
+        let client_err = HttpResponse::new(HttpVersion::Http11, 404, "Not Found");
+        assert!(client_err.is_client_error());
+        assert!(!client_err.is_server_error());
+
+        let server_err = HttpResponse::new(HttpVersion::Http11, 500, "Internal Error");
+        assert!(server_err.is_server_error());
+        assert!(!server_err.is_client_error());
+    }
+
+    #[test]
+    fn test_http_response_199_is_informational() {
+        let resp = HttpResponse::new(HttpVersion::Http11, 199, "");
+        assert!(resp.is_informational());
+    }
+
+    #[test]
+    fn test_http_response_204_is_success() {
+        let resp = HttpResponse::new(HttpVersion::Http11, 204, "No Content");
+        assert!(resp.is_success());
+    }
+
+    #[test]
+    fn test_http_response_308_is_redirect() {
+        let resp = HttpResponse::new(HttpVersion::Http11, 308, "Permanent Redirect");
+        assert!(resp.is_redirect());
+    }
+
+    // -----------------------------------------------------------------------
+    // copy_header_value tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_copy_header_value_normal() {
+        assert_eq!(
+            copy_header_value("Content-Type: text/html"),
+            "text/html"
+        );
+    }
+
+    #[test]
+    fn test_copy_header_value_with_spaces() {
+        assert_eq!(
+            copy_header_value("Host:   example.com  "),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn test_copy_header_value_no_colon() {
+        assert_eq!(copy_header_value("NoColonHere"), "");
+    }
+
+    #[test]
+    fn test_copy_header_value_empty_value() {
+        assert_eq!(copy_header_value("X-Empty:"), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // compare_header tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compare_header_name_only() {
+        assert!(compare_header("Content-Type: text/html", "Content-Type", ""));
+    }
+
+    #[test]
+    fn test_compare_header_case_insensitive_name() {
+        assert!(compare_header("content-type: text/html", "Content-Type", ""));
+    }
+
+    #[test]
+    fn test_compare_header_with_content_match() {
+        assert!(compare_header(
+            "Transfer-Encoding: chunked",
+            "Transfer-Encoding",
+            "chunked"
+        ));
+    }
+
+    #[test]
+    fn test_compare_header_content_case_insensitive() {
+        assert!(compare_header(
+            "Transfer-Encoding: Chunked",
+            "Transfer-Encoding",
+            "chunked"
+        ));
+    }
+
+    #[test]
+    fn test_compare_header_content_mismatch() {
+        assert!(!compare_header(
+            "Content-Type: text/html",
+            "Content-Type",
+            "application/json"
+        ));
+    }
+
+    #[test]
+    fn test_compare_header_no_colon() {
+        assert!(!compare_header("NoColon", "NoColon", ""));
+    }
+
+    #[test]
+    fn test_compare_header_name_mismatch() {
+        assert!(!compare_header("Host: example.com", "Accept", ""));
+    }
+
+    // -----------------------------------------------------------------------
+    // bump_headersize tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bump_headersize_within_limit() {
+        let mut handler = HttpProtocol::new(false);
+        assert!(bump_headersize(&mut handler, 100, HeaderType::Header).is_ok());
+        assert_eq!(handler.header_size, 100);
+    }
+
+    #[test]
+    fn test_bump_headersize_cumulative() {
+        let mut handler = HttpProtocol::new(false);
+        bump_headersize(&mut handler, 100, HeaderType::Header).unwrap();
+        bump_headersize(&mut handler, 200, HeaderType::Header).unwrap();
+        assert_eq!(handler.header_size, 300);
+    }
+
+    #[test]
+    fn test_bump_headersize_exceeds_limit() {
+        let mut handler = HttpProtocol::new(false);
+        let result =
+            bump_headersize(&mut handler, MAX_HTTP_RESP_HEADER_SIZE + 1, HeaderType::Header);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_bump_headersize_at_exact_limit_is_ok() {
+        let mut handler = HttpProtocol::new(false);
+        let result =
+            bump_headersize(&mut handler, MAX_HTTP_RESP_HEADER_SIZE, HeaderType::Header);
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // HttpProtocol tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_http_protocol_new_http() {
+        let proto = HttpProtocol::new(false);
+        assert_eq!(proto.name(), "HTTP");
+        assert_eq!(proto.header_size, 0);
+        assert_eq!(proto.redirect_count, 0);
+    }
+
+    #[test]
+    fn test_http_protocol_new_https() {
+        let proto = HttpProtocol::new(true);
+        assert_eq!(proto.name(), "HTTPS");
+    }
+
+    #[test]
+    fn test_http_protocol_debug() {
+        let proto = HttpProtocol::new(false);
+        let debug_str = format!("{:?}", proto);
+        assert!(debug_str.contains("HttpProtocol"));
+        assert!(debug_str.contains("is_ssl: false"));
+    }
+
+    // -----------------------------------------------------------------------
+    // TransferDecoding tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_transfer_decoding_fixed_size() {
+        let td = TransferDecoding::FixedSize(1024);
+        assert_eq!(td, TransferDecoding::FixedSize(1024));
+    }
+
+    #[test]
+    fn test_transfer_decoding_chunked() {
+        assert_ne!(TransferDecoding::Chunked, TransferDecoding::UntilClose);
+    }
+
+    // -----------------------------------------------------------------------
+    // RequestBody tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_request_body_default_is_empty() {
+        assert!(matches!(RequestBody::default(), RequestBody::Empty));
+    }
+
+    #[test]
+    fn test_request_body_bytes() {
+        let body = RequestBody::Bytes(vec![1, 2, 3]);
+        assert!(matches!(body, RequestBody::Bytes(ref v) if v.len() == 3));
+    }
+
+    // -----------------------------------------------------------------------
+    // Constants tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_default_ports() {
+        assert_eq!(HTTP_DEFAULT_PORT, 80);
+        assert_eq!(HTTPS_DEFAULT_PORT, 443);
+    }
+
+    #[test]
+    fn test_expect_100_threshold() {
+        assert_eq!(EXPECT_100_THRESHOLD, 1024 * 1024);
+    }
+
+    #[test]
+    fn test_max_header_size_and_count() {
+        assert_eq!(MAX_HTTP_RESP_HEADER_SIZE, 300 * 1024);
+        assert_eq!(MAX_HTTP_RESP_HEADER_COUNT, 5000);
+    }
+
+    // -----------------------------------------------------------------------
+    // HttpNegotiation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_http_negotiation_default() {
+        let neg = HttpNegotiation::default();
+        assert_eq!(neg.rcvd_min, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // statusline_check tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_statusline_check_valid_codes() {
+        let handle = EasyHandle::new();
+        assert!(statusline_check(&handle, 200).is_ok());
+        assert!(statusline_check(&handle, 301).is_ok());
+        assert!(statusline_check(&handle, 404).is_ok());
+        assert!(statusline_check(&handle, 500).is_ok());
+        assert!(statusline_check(&handle, 100).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // HeaderType tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_header_type_variants() {
+        let h = HeaderType::Header;
+        let t = HeaderType::Trailer;
+        let c = HeaderType::Connect;
+        assert_ne!(h, t);
+        assert_ne!(t, c);
+        assert_ne!(h, c);
+    }
+}

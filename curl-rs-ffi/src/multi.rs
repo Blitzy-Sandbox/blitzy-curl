@@ -1392,3 +1392,1032 @@ fn bitmask_to_action(bitmask: c_int) -> CurlMAction {
         (false, false) => CurlMAction::None,
     }
 }
+
+// ===========================================================================
+// Unit tests — covers all 24 extern "C" functions + internal helpers
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // 1. curl_multi_init — Lifecycle
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_init` returns a non-null pointer.
+    #[test]
+    fn test_multi_init_returns_non_null() {
+        unsafe {
+            let m = curl_multi_init();
+            assert!(!m.is_null(), "curl_multi_init must return non-null");
+            curl_multi_cleanup(m);
+        }
+    }
+
+    /// Verify that multiple `curl_multi_init` calls return distinct handles.
+    #[test]
+    fn test_multi_init_returns_unique_handles() {
+        unsafe {
+            let m1 = curl_multi_init();
+            let m2 = curl_multi_init();
+            assert!(!m1.is_null());
+            assert!(!m2.is_null());
+            assert_ne!(m1, m2, "two init calls must return different pointers");
+            curl_multi_cleanup(m1);
+            curl_multi_cleanup(m2);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. curl_multi_cleanup — Lifecycle
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_cleanup` succeeds on a valid handle.
+    #[test]
+    fn test_multi_cleanup_valid() {
+        unsafe {
+            let m = curl_multi_init();
+            let code = curl_multi_cleanup(m);
+            assert_eq!(code, CURLM_OK);
+        }
+    }
+
+    /// Verify that `curl_multi_cleanup` with null returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_multi_cleanup_null_returns_bad_handle() {
+        unsafe {
+            let code = curl_multi_cleanup(ptr::null_mut());
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. curl_multi_add_handle — Lifecycle
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_add_handle` with null multi returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_add_handle_null_multi() {
+        unsafe {
+            let code = curl_multi_add_handle(ptr::null_mut(), ptr::null_mut());
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that `curl_multi_add_handle` with null easy returns `CURLM_BAD_EASY_HANDLE`.
+    #[test]
+    fn test_add_handle_null_easy() {
+        unsafe {
+            let m = curl_multi_init();
+            let code = curl_multi_add_handle(m, ptr::null_mut());
+            assert_eq!(code, CURLM_BAD_EASY_HANDLE);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    /// Verify that `curl_multi_add_handle` succeeds with valid handles.
+    #[test]
+    fn test_add_handle_valid() {
+        unsafe {
+            let m = curl_multi_init();
+            // Use a non-null sentinel as a fake easy handle.
+            let fake_easy = 0xDEAD_BEEFusize as *mut CURL;
+            let code = curl_multi_add_handle(m, fake_easy);
+            assert_eq!(code, CURLM_OK);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    /// Verify that adding the same easy handle twice returns `CURLM_ADDED_ALREADY`.
+    #[test]
+    fn test_add_handle_duplicate() {
+        unsafe {
+            let m = curl_multi_init();
+            let fake_easy = 0xDEAD_BEEFusize as *mut CURL;
+            assert_eq!(curl_multi_add_handle(m, fake_easy), CURLM_OK);
+            assert_eq!(curl_multi_add_handle(m, fake_easy), CURLM_ADDED_ALREADY);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. curl_multi_remove_handle — Lifecycle
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_remove_handle` with null multi returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_remove_handle_null_multi() {
+        unsafe {
+            let code = curl_multi_remove_handle(ptr::null_mut(), ptr::null_mut());
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that `curl_multi_remove_handle` with null easy returns `CURLM_BAD_EASY_HANDLE`.
+    #[test]
+    fn test_remove_handle_null_easy() {
+        unsafe {
+            let m = curl_multi_init();
+            let code = curl_multi_remove_handle(m, ptr::null_mut());
+            assert_eq!(code, CURLM_BAD_EASY_HANDLE);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    /// Verify that removing a handle that was never added returns `CURLM_BAD_EASY_HANDLE`.
+    #[test]
+    fn test_remove_handle_not_added() {
+        unsafe {
+            let m = curl_multi_init();
+            let fake_easy = 0xCAFEusize as *mut CURL;
+            let code = curl_multi_remove_handle(m, fake_easy);
+            assert_eq!(code, CURLM_BAD_EASY_HANDLE);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    /// Verify that `curl_multi_remove_handle` succeeds after a valid add.
+    #[test]
+    fn test_remove_handle_after_add() {
+        unsafe {
+            let m = curl_multi_init();
+            let fake_easy = 0xDEAD_BEEFusize as *mut CURL;
+            assert_eq!(curl_multi_add_handle(m, fake_easy), CURLM_OK);
+            let code = curl_multi_remove_handle(m, fake_easy);
+            assert_eq!(code, CURLM_OK);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. curl_multi_perform — Transfer Execution
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_perform` with null returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_perform_null_multi() {
+        unsafe {
+            let mut running: c_int = -1;
+            let code = curl_multi_perform(ptr::null_mut(), &mut running);
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that perform on an empty multi handle succeeds with 0 running.
+    #[test]
+    fn test_perform_empty() {
+        unsafe {
+            let m = curl_multi_init();
+            let mut running: c_int = -1;
+            let code = curl_multi_perform(m, &mut running);
+            assert_eq!(code, CURLM_OK);
+            assert_eq!(running, 0);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    /// Verify that perform with a null running_handles pointer still succeeds.
+    #[test]
+    fn test_perform_null_running_handles() {
+        unsafe {
+            let m = curl_multi_init();
+            let code = curl_multi_perform(m, ptr::null_mut());
+            assert_eq!(code, CURLM_OK);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. curl_multi_poll — Transfer Execution
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_poll` with null multi returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_poll_null_multi() {
+        unsafe {
+            let mut numfds: c_int = -1;
+            let code = curl_multi_poll(ptr::null_mut(), ptr::null_mut(), 0, 0, &mut numfds);
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that poll on an empty multi handle succeeds with zero timeout.
+    #[test]
+    fn test_poll_empty_zero_timeout() {
+        unsafe {
+            let m = curl_multi_init();
+            let mut numfds: c_int = -1;
+            let code = curl_multi_poll(m, ptr::null_mut(), 0, 0, &mut numfds);
+            assert_eq!(code, CURLM_OK);
+            assert!(numfds >= 0);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    /// Verify that poll with null ret pointer still succeeds.
+    #[test]
+    fn test_poll_null_ret() {
+        unsafe {
+            let m = curl_multi_init();
+            let code = curl_multi_poll(m, ptr::null_mut(), 0, 0, ptr::null_mut());
+            assert_eq!(code, CURLM_OK);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. curl_multi_wait — Transfer Execution
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_wait` with null multi returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_wait_null_multi() {
+        unsafe {
+            let mut numfds: c_int = -1;
+            let code = curl_multi_wait(ptr::null_mut(), ptr::null_mut(), 0, 0, &mut numfds);
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that wait on an empty multi handle succeeds with zero timeout.
+    #[test]
+    fn test_wait_empty_zero_timeout() {
+        unsafe {
+            let m = curl_multi_init();
+            let mut numfds: c_int = -1;
+            let code = curl_multi_wait(m, ptr::null_mut(), 0, 0, &mut numfds);
+            assert_eq!(code, CURLM_OK);
+            assert!(numfds >= 0);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    /// Verify that wait with null ret pointer still succeeds.
+    #[test]
+    fn test_wait_null_ret() {
+        unsafe {
+            let m = curl_multi_init();
+            let code = curl_multi_wait(m, ptr::null_mut(), 0, 0, ptr::null_mut());
+            assert_eq!(code, CURLM_OK);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 8. curl_multi_wakeup — Transfer Execution
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_wakeup` with null returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_wakeup_null_multi() {
+        unsafe {
+            let code = curl_multi_wakeup(ptr::null_mut());
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that wakeup on a valid multi handle does not panic.
+    #[test]
+    fn test_wakeup_valid() {
+        unsafe {
+            let m = curl_multi_init();
+            // Wakeup may return OK or WAKEUP_FAILURE depending on whether
+            // a poll is currently blocking. Both are valid outcomes here.
+            let code = curl_multi_wakeup(m);
+            assert!(code == CURLM_OK || code == CURLM_WAKEUP_FAILURE);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 9. curl_multi_socket — Socket-Based (Deprecated)
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_socket` with null returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_socket_null_multi() {
+        unsafe {
+            let mut running: c_int = -1;
+            let code = curl_multi_socket(ptr::null_mut(), 0, &mut running);
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that `curl_multi_socket` delegates to `socket_action` on valid handle.
+    #[test]
+    fn test_socket_valid() {
+        unsafe {
+            let m = curl_multi_init();
+            let mut running: c_int = -1;
+            let code = curl_multi_socket(m, CURL_SOCKET_TIMEOUT, &mut running);
+            assert_eq!(code, CURLM_OK);
+            assert_eq!(running, 0);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 10. curl_multi_socket_action — Socket-Based
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_socket_action` with null returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_socket_action_null_multi() {
+        unsafe {
+            let mut running: c_int = -1;
+            let code = curl_multi_socket_action(ptr::null_mut(), 0, 0, &mut running);
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that `socket_action` with `CURL_SOCKET_TIMEOUT` on empty handle succeeds.
+    #[test]
+    fn test_socket_action_timeout_empty() {
+        unsafe {
+            let m = curl_multi_init();
+            let mut running: c_int = -1;
+            let code = curl_multi_socket_action(m, CURL_SOCKET_TIMEOUT, 0, &mut running);
+            assert_eq!(code, CURLM_OK);
+            assert_eq!(running, 0);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    /// Verify that `socket_action` with null `running_handles` still succeeds.
+    #[test]
+    fn test_socket_action_null_running_handles() {
+        unsafe {
+            let m = curl_multi_init();
+            let code = curl_multi_socket_action(m, CURL_SOCKET_TIMEOUT, 0, ptr::null_mut());
+            assert_eq!(code, CURLM_OK);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 11. curl_multi_socket_all — Socket-Based (Deprecated)
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_socket_all` with null returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_socket_all_null_multi() {
+        unsafe {
+            let mut running: c_int = -1;
+            let code = curl_multi_socket_all(ptr::null_mut(), &mut running);
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that `socket_all` on an empty valid handle returns OK with 0 running.
+    #[test]
+    fn test_socket_all_empty() {
+        unsafe {
+            let m = curl_multi_init();
+            let mut running: c_int = -1;
+            let code = curl_multi_socket_all(m, &mut running);
+            assert_eq!(code, CURLM_OK);
+            assert_eq!(running, 0);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 12. curl_multi_fdset — Socket-Based
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_fdset` with null multi returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_fdset_null_multi() {
+        unsafe {
+            let code = curl_multi_fdset(
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that `curl_multi_fdset` on an empty handle succeeds and sets max_fd.
+    #[test]
+    fn test_fdset_empty_with_max_fd() {
+        unsafe {
+            let m = curl_multi_init();
+            let mut max_fd: c_int = 999;
+            let code = curl_multi_fdset(
+                m,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut max_fd,
+            );
+            assert_eq!(code, CURLM_OK);
+            // On an empty multi, max_fd should be -1 or 0 (no sockets).
+            assert!(max_fd <= 0, "max_fd for empty handle should be <= 0, got {}", max_fd);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    /// Verify that `curl_multi_fdset` with all null fd_set pointers succeeds.
+    #[test]
+    fn test_fdset_all_null_fdsets() {
+        unsafe {
+            let m = curl_multi_init();
+            let code = curl_multi_fdset(
+                m,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(code, CURLM_OK);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 13. curl_multi_info_read — Information & Configuration
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_info_read` with null multi returns null.
+    #[test]
+    fn test_info_read_null_multi() {
+        unsafe {
+            let mut msgs: c_int = -1;
+            let msg = curl_multi_info_read(ptr::null_mut(), &mut msgs);
+            assert!(msg.is_null());
+            assert_eq!(msgs, 0);
+        }
+    }
+
+    /// Verify that `curl_multi_info_read` with null msgs_in_queue doesn't crash.
+    #[test]
+    fn test_info_read_null_msgs_in_queue() {
+        unsafe {
+            let msg = curl_multi_info_read(ptr::null_mut(), ptr::null_mut());
+            assert!(msg.is_null());
+        }
+    }
+
+    /// Verify that `info_read` on an empty multi handle returns null (no messages).
+    #[test]
+    fn test_info_read_empty_multi() {
+        unsafe {
+            let m = curl_multi_init();
+            let mut msgs: c_int = -1;
+            let msg = curl_multi_info_read(m, &mut msgs);
+            assert!(msg.is_null());
+            assert_eq!(msgs, 0);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 14. curl_multi_setopt — Information & Configuration
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_setopt` with null multi returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_setopt_null_multi() {
+        unsafe {
+            let code = curl_multi_setopt(ptr::null_mut(), 0, ptr::null_mut());
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that `curl_multi_setopt` with an unknown option returns `CURLM_UNKNOWN_OPTION`.
+    #[test]
+    fn test_setopt_unknown_option() {
+        unsafe {
+            let m = curl_multi_init();
+            // Use a very large option number that is unlikely to be a valid option.
+            let code = curl_multi_setopt(m, 9999, ptr::null_mut());
+            assert_eq!(code, CURLM_UNKNOWN_OPTION);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    /// Verify that `curl_multi_setopt` with `CURLMOPT_MAXCONNECTS` (long option) succeeds.
+    #[test]
+    fn test_setopt_maxconnects() {
+        unsafe {
+            let m = curl_multi_init();
+            // CURLMOPT_MAXCONNECTS = CURLOPTTYPE_LONG + 6 = 6
+            let maxconn_opt: CURLMoption = 6;
+            let code = curl_multi_setopt(m, maxconn_opt, 10 as *mut c_void);
+            assert_eq!(code, CURLM_OK);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 15. curl_multi_timeout — Information & Configuration
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_timeout` with null multi returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_timeout_null_multi() {
+        unsafe {
+            let mut ms: c_long = 0;
+            let code = curl_multi_timeout(ptr::null_mut(), &mut ms);
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that `timeout` on an empty multi handle returns OK with -1 (no timeout).
+    #[test]
+    fn test_timeout_empty() {
+        unsafe {
+            let m = curl_multi_init();
+            let mut ms: c_long = 0;
+            let code = curl_multi_timeout(m, &mut ms);
+            assert_eq!(code, CURLM_OK);
+            assert_eq!(ms, -1, "empty multi handle should return timeout -1");
+            curl_multi_cleanup(m);
+        }
+    }
+
+    /// Verify that `timeout` with null milliseconds pointer still succeeds.
+    #[test]
+    fn test_timeout_null_milliseconds() {
+        unsafe {
+            let m = curl_multi_init();
+            let code = curl_multi_timeout(m, ptr::null_mut());
+            assert_eq!(code, CURLM_OK);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 16. curl_multi_assign — Information & Configuration
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_assign` with null multi returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_assign_null_multi() {
+        unsafe {
+            let code = curl_multi_assign(ptr::null_mut(), 0, ptr::null_mut());
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that `curl_multi_assign` on a valid handle does not panic.
+    #[test]
+    fn test_assign_valid() {
+        unsafe {
+            let m = curl_multi_init();
+            let code = curl_multi_assign(m, 42, ptr::null_mut());
+            assert_eq!(code, CURLM_OK);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 17. curl_multi_strerror — Information & Configuration
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_strerror(CURLM_OK)` returns "No error".
+    #[test]
+    fn test_strerror_ok() {
+        unsafe {
+            let msg = curl_multi_strerror(CURLM_OK);
+            assert!(!msg.is_null());
+            let s = CStr::from_ptr(msg).to_str().unwrap();
+            assert_eq!(s, "No error");
+        }
+    }
+
+    /// Verify that `curl_multi_strerror` returns non-null for all known codes.
+    #[test]
+    fn test_strerror_all_known_codes() {
+        unsafe {
+            for code in [
+                CURLM_CALL_MULTI_PERFORM,
+                CURLM_OK,
+                CURLM_BAD_HANDLE,
+                CURLM_BAD_EASY_HANDLE,
+                CURLM_OUT_OF_MEMORY,
+                CURLM_INTERNAL_ERROR,
+                CURLM_BAD_SOCKET,
+                CURLM_UNKNOWN_OPTION,
+                CURLM_ADDED_ALREADY,
+                CURLM_RECURSIVE_API_CALL,
+                CURLM_WAKEUP_FAILURE,
+                CURLM_BAD_FUNCTION_ARGUMENT,
+                CURLM_ABORTED_BY_CALLBACK,
+                CURLM_UNRECOVERABLE_POLL,
+            ] {
+                let msg = curl_multi_strerror(code);
+                assert!(!msg.is_null(), "strerror({}) returned null", code);
+                // Verify it is a valid UTF-8 C string.
+                let s = CStr::from_ptr(msg).to_str().unwrap();
+                assert!(!s.is_empty(), "strerror({}) returned empty string", code);
+            }
+        }
+    }
+
+    /// Verify that `curl_multi_strerror` returns "Unknown error" for unrecognized codes.
+    #[test]
+    fn test_strerror_unknown_code() {
+        unsafe {
+            let msg = curl_multi_strerror(9999);
+            assert!(!msg.is_null());
+            let s = CStr::from_ptr(msg).to_str().unwrap();
+            assert_eq!(s, "Unknown error");
+        }
+    }
+
+    /// Verify specific error messages for key CURLMcode values.
+    #[test]
+    fn test_strerror_specific_messages() {
+        unsafe {
+            let msg = curl_multi_strerror(CURLM_BAD_HANDLE);
+            let s = CStr::from_ptr(msg).to_str().unwrap();
+            assert_eq!(s, "Invalid multi handle");
+
+            let msg = curl_multi_strerror(CURLM_BAD_EASY_HANDLE);
+            let s = CStr::from_ptr(msg).to_str().unwrap();
+            assert_eq!(s, "Invalid easy handle");
+
+            let msg = curl_multi_strerror(CURLM_OUT_OF_MEMORY);
+            let s = CStr::from_ptr(msg).to_str().unwrap();
+            assert_eq!(s, "Out of memory");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 18. curl_multi_get_handles — Extended
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_get_handles` with null returns null.
+    #[test]
+    fn test_get_handles_null_multi() {
+        unsafe {
+            let result = curl_multi_get_handles(ptr::null_mut());
+            assert!(result.is_null());
+        }
+    }
+
+    /// Verify that `get_handles` on an empty multi returns a null-terminated empty list.
+    #[test]
+    fn test_get_handles_empty() {
+        unsafe {
+            let m = curl_multi_init();
+            let result = curl_multi_get_handles(m);
+            assert!(!result.is_null());
+            // First element should be the null terminator.
+            assert!((*result).is_null(), "empty handle list should start with null terminator");
+            curl_multi_cleanup(m);
+        }
+    }
+
+    /// Verify that `get_handles` returns added handles in order.
+    #[test]
+    fn test_get_handles_after_add() {
+        unsafe {
+            let m = curl_multi_init();
+            let fake1 = 0xAAAAusize as *mut CURL;
+            let fake2 = 0xBBBBusize as *mut CURL;
+            assert_eq!(curl_multi_add_handle(m, fake1), CURLM_OK);
+            assert_eq!(curl_multi_add_handle(m, fake2), CURLM_OK);
+
+            let result = curl_multi_get_handles(m);
+            assert!(!result.is_null());
+            assert_eq!(*result.add(0), fake1);
+            assert_eq!(*result.add(1), fake2);
+            assert!((*result.add(2)).is_null(), "list must be null-terminated");
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 19. curl_multi_get_offt — Extended
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_get_offt` with null multi returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_get_offt_null_multi() {
+        unsafe {
+            let mut val: curl_off_t = 0;
+            let code = curl_multi_get_offt(ptr::null_mut(), 0, &mut val);
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that `get_offt` with null pvalue pointer still succeeds for a valid info.
+    #[test]
+    fn test_get_offt_null_pvalue() {
+        unsafe {
+            let m = curl_multi_init();
+            // info value 0 should be a valid info enum ordinal.
+            let code = curl_multi_get_offt(m, 0, ptr::null_mut());
+            assert!(code == CURLM_OK || code == CURLM_UNKNOWN_OPTION);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 20. curl_multi_waitfds — Extended
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_waitfds` with null multi returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_waitfds_null_multi() {
+        unsafe {
+            let mut fd_count: c_uint = 0;
+            let code = curl_multi_waitfds(ptr::null_mut(), ptr::null_mut(), 0, &mut fd_count);
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that `waitfds` on an empty multi handle reports 0 fds.
+    #[test]
+    fn test_waitfds_empty() {
+        unsafe {
+            let m = curl_multi_init();
+            let mut fd_count: c_uint = 999;
+            let code = curl_multi_waitfds(m, ptr::null_mut(), 0, &mut fd_count);
+            assert_eq!(code, CURLM_OK);
+            assert_eq!(fd_count, 0);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    /// Verify that `waitfds` with null fd_count pointer still succeeds.
+    #[test]
+    fn test_waitfds_null_fd_count() {
+        unsafe {
+            let m = curl_multi_init();
+            let code = curl_multi_waitfds(m, ptr::null_mut(), 0, ptr::null_mut());
+            assert_eq!(code, CURLM_OK);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 21. curl_multi_notify_enable — Notification
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_notify_enable` with null returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_notify_enable_null_multi() {
+        unsafe {
+            let code = curl_multi_notify_enable(ptr::null_mut(), 0);
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that `notify_enable` on a valid handle does not panic.
+    #[test]
+    fn test_notify_enable_valid() {
+        unsafe {
+            let m = curl_multi_init();
+            let code = curl_multi_notify_enable(m, 1);
+            assert_eq!(code, CURLM_OK);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 22. curl_multi_notify_disable — Notification
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_multi_notify_disable` with null returns `CURLM_BAD_HANDLE`.
+    #[test]
+    fn test_notify_disable_null_multi() {
+        unsafe {
+            let code = curl_multi_notify_disable(ptr::null_mut(), 0);
+            assert_eq!(code, CURLM_BAD_HANDLE);
+        }
+    }
+
+    /// Verify that `notify_disable` on a valid handle does not panic.
+    #[test]
+    fn test_notify_disable_valid() {
+        unsafe {
+            let m = curl_multi_init();
+            let code = curl_multi_notify_disable(m, 1);
+            assert_eq!(code, CURLM_OK);
+            curl_multi_cleanup(m);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 23. curl_pushheader_bynum — Push Header Helpers
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_pushheader_bynum` with null returns null.
+    #[test]
+    fn test_pushheader_bynum_null() {
+        unsafe {
+            let result = curl_pushheader_bynum(ptr::null_mut(), 0);
+            assert!(result.is_null());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 24. curl_pushheader_byname — Push Header Helpers
+    // -----------------------------------------------------------------------
+
+    /// Verify that `curl_pushheader_byname` with null h returns null.
+    #[test]
+    fn test_pushheader_byname_null_h() {
+        unsafe {
+            let name = b"Content-Type\0".as_ptr() as *const c_char;
+            let result = curl_pushheader_byname(ptr::null_mut(), name);
+            assert!(result.is_null());
+        }
+    }
+
+    /// Verify that `curl_pushheader_byname` with null name returns null.
+    #[test]
+    fn test_pushheader_byname_null_name() {
+        unsafe {
+            let fake_h = 0xBEEFusize as *mut curl_pushheaders;
+            let result = curl_pushheader_byname(fake_h, ptr::null());
+            assert!(result.is_null());
+        }
+    }
+
+    /// Verify that `curl_pushheader_byname` with both null returns null.
+    #[test]
+    fn test_pushheader_byname_both_null() {
+        unsafe {
+            let result = curl_pushheader_byname(ptr::null_mut(), ptr::null());
+            assert!(result.is_null());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    /// Verify `bitmask_to_action` correctly maps bitmask values.
+    #[test]
+    fn test_bitmask_to_action_none() {
+        assert!(matches!(bitmask_to_action(0), CurlMAction::None));
+    }
+
+    /// Verify `bitmask_to_action` with CURL_CSELECT_IN.
+    #[test]
+    fn test_bitmask_to_action_in() {
+        assert!(matches!(bitmask_to_action(CURL_CSELECT_IN), CurlMAction::In));
+    }
+
+    /// Verify `bitmask_to_action` with CURL_CSELECT_OUT.
+    #[test]
+    fn test_bitmask_to_action_out() {
+        assert!(matches!(bitmask_to_action(CURL_CSELECT_OUT), CurlMAction::Out));
+    }
+
+    /// Verify `bitmask_to_action` with both IN and OUT.
+    #[test]
+    fn test_bitmask_to_action_in_out() {
+        assert!(matches!(
+            bitmask_to_action(CURL_CSELECT_IN | CURL_CSELECT_OUT),
+            CurlMAction::InOut
+        ));
+    }
+
+    /// Verify `result_to_mcode` returns CURLM_OK for Ok values.
+    #[test]
+    fn test_result_to_mcode_ok() {
+        let result: Result<(), curl_rs_lib::error::CurlError> = Ok(());
+        assert_eq!(result_to_mcode(result), CURLM_OK);
+    }
+
+    /// Verify `result_to_mcode` returns CURLM_OUT_OF_MEMORY for OutOfMemory.
+    #[test]
+    fn test_result_to_mcode_out_of_memory() {
+        let result: Result<(), curl_rs_lib::error::CurlError> =
+            Err(curl_rs_lib::error::CurlError::OutOfMemory);
+        assert_eq!(result_to_mcode(result), CURLM_OUT_OF_MEMORY);
+    }
+
+    /// Verify `result_to_mcode` returns CURLM_BAD_FUNCTION_ARGUMENT for BadFunctionArgument.
+    #[test]
+    fn test_result_to_mcode_bad_function_argument() {
+        let result: Result<(), curl_rs_lib::error::CurlError> =
+            Err(curl_rs_lib::error::CurlError::BadFunctionArgument);
+        assert_eq!(result_to_mcode(result), CURLM_BAD_FUNCTION_ARGUMENT);
+    }
+
+    /// Verify `result_to_mcode` maps unknown errors to CURLM_INTERNAL_ERROR.
+    #[test]
+    fn test_result_to_mcode_other() {
+        let result: Result<(), curl_rs_lib::error::CurlError> =
+            Err(curl_rs_lib::error::CurlError::FailedInit);
+        assert_eq!(result_to_mcode(result), CURLM_INTERNAL_ERROR);
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration-style lifecycle tests
+    // -----------------------------------------------------------------------
+
+    /// Full lifecycle: init → add → perform → remove → cleanup.
+    #[test]
+    fn test_full_lifecycle() {
+        unsafe {
+            let m = curl_multi_init();
+            assert!(!m.is_null());
+
+            let fake_easy = 0xDEAD_BEEFusize as *mut CURL;
+            assert_eq!(curl_multi_add_handle(m, fake_easy), CURLM_OK);
+
+            let mut running: c_int = -1;
+            assert_eq!(curl_multi_perform(m, &mut running), CURLM_OK);
+
+            assert_eq!(curl_multi_remove_handle(m, fake_easy), CURLM_OK);
+            assert_eq!(curl_multi_cleanup(m), CURLM_OK);
+        }
+    }
+
+    /// Multiple handles lifecycle: add two, remove one, cleanup.
+    #[test]
+    fn test_multiple_handles_lifecycle() {
+        unsafe {
+            let m = curl_multi_init();
+            let fake1 = 0xAAAAusize as *mut CURL;
+            let fake2 = 0xBBBBusize as *mut CURL;
+
+            assert_eq!(curl_multi_add_handle(m, fake1), CURLM_OK);
+            assert_eq!(curl_multi_add_handle(m, fake2), CURLM_OK);
+
+            // Get handles should list both.
+            let handles = curl_multi_get_handles(m);
+            assert!(!handles.is_null());
+            assert_eq!(*handles.add(0), fake1);
+            assert_eq!(*handles.add(1), fake2);
+            assert!((*handles.add(2)).is_null());
+
+            // Remove first, verify second remains.
+            assert_eq!(curl_multi_remove_handle(m, fake1), CURLM_OK);
+            let handles = curl_multi_get_handles(m);
+            assert_eq!(*handles.add(0), fake2);
+            assert!((*handles.add(1)).is_null());
+
+            assert_eq!(curl_multi_cleanup(m), CURLM_OK);
+        }
+    }
+
+    /// Verify that `perform` and `info_read` work together correctly.
+    #[test]
+    fn test_perform_then_info_read() {
+        unsafe {
+            let m = curl_multi_init();
+            let mut running: c_int = -1;
+            assert_eq!(curl_multi_perform(m, &mut running), CURLM_OK);
+
+            let mut msgs: c_int = -1;
+            let msg = curl_multi_info_read(m, &mut msgs);
+            assert!(msg.is_null(), "empty multi should have no messages");
+            assert_eq!(msgs, 0);
+
+            curl_multi_cleanup(m);
+        }
+    }
+
+    /// Verify that socket_action and timeout work together.
+    #[test]
+    fn test_socket_timeout_cycle() {
+        unsafe {
+            let m = curl_multi_init();
+
+            // Get timeout.
+            let mut ms: c_long = 0;
+            assert_eq!(curl_multi_timeout(m, &mut ms), CURLM_OK);
+
+            // Drive with socket_action using CURL_SOCKET_TIMEOUT.
+            let mut running: c_int = -1;
+            assert_eq!(
+                curl_multi_socket_action(m, CURL_SOCKET_TIMEOUT, 0, &mut running),
+                CURLM_OK
+            );
+            assert_eq!(running, 0);
+
+            curl_multi_cleanup(m);
+        }
+    }
+
+    /// Verify `convert_waitfds_in` with null and zero count returns empty.
+    #[test]
+    fn test_convert_waitfds_in_null() {
+        unsafe {
+            let result = convert_waitfds_in(ptr::null_mut(), 0);
+            assert!(result.is_empty());
+        }
+    }
+
+    /// Verify `write_back_waitfds` with null does not panic.
+    #[test]
+    fn test_write_back_waitfds_null() {
+        unsafe {
+            let src: Vec<WaitFd> = vec![];
+            write_back_waitfds(ptr::null_mut(), 0, &src);
+            // Should not panic — this is the success criterion.
+        }
+    }
+}
