@@ -203,13 +203,14 @@ extra_bindings = ["curl-rs-ffi"]
 # Parse — Expand Configuration
 ############################################################################
 [parse.expand]
-# Crates to expand macros for.  Expanding curl-rs-ffi ensures that any
-# procedural macros (e.g., derive macros generating #[repr(C)] types)
-# are fully visible to cbindgen.
-crates = ["curl-rs-ffi"]
-
-# Use all features when expanding to capture every conditional symbol.
-all_features = true
+# Macro expansion is DISABLED.  The `-Zunpretty=expanded` flag that cbindgen
+# uses internally requires the nightly Rust compiler and fails on stable.
+# When expansion fails, cbindgen falls back to source parsing which does not
+# respect the `language = "C"` setting, producing C++ output instead.
+# Since the FFI crate does not use procedural macros that generate #[repr(C)]
+# types, expansion is unnecessary and we leave the crates list empty.
+crates = []
+all_features = false
 
 ############################################################################
 # Export Configuration
@@ -291,13 +292,6 @@ derive_gte = false
 
 # Do not generate constructors in C output.
 derive_constructor = false
-
-############################################################################
-# Union Configuration
-############################################################################
-[union]
-# Preserve exact field names in unions.
-rename_fields = "None"
 
 ############################################################################
 # Constant Configuration
