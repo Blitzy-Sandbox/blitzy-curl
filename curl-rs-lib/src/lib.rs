@@ -26,6 +26,7 @@ pub mod setopt;
 pub mod share;
 pub mod slist;
 pub mod tls;
+pub mod transfer;
 pub mod url;
 pub mod util;
 pub mod version;
