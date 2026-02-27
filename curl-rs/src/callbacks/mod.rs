@@ -9,6 +9,7 @@
 //
 // SPDX-License-Identifier: curl
 
+pub mod debug;
 pub mod header;
 pub mod progress;
 pub mod read;
@@ -17,3 +18,6 @@ pub mod socket;
 
 // Re-export header callback types and functions for convenient access.
 pub use header::{tool_header_cb, HdrCbData, tool_write_headers};
+
+// Re-export debug callback types and functions for convenient access.
+pub use debug::{tool_debug_cb, InfoType};
