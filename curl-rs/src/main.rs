@@ -14,6 +14,7 @@ pub mod ipfs;
 pub mod libinfo;
 pub mod msgs;
 pub mod operhlp;
+pub mod parsecfg;
 pub mod paramhelp;
 pub mod progress_display;
 pub mod stderr;
