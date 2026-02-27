@@ -7,6 +7,7 @@ pub mod dirhier;
 pub mod filetime;
 pub mod findfile;
 pub mod getpass;
+pub mod ipfs;
 pub mod libinfo;
 pub mod msgs;
 pub mod paramhelp;
@@ -22,3 +23,4 @@ pub mod xattr;
 fn main() {
     println!("curl-rs stub");
 }
+
