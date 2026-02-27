@@ -15,9 +15,13 @@ pub mod progress;
 pub mod read;
 pub mod seek;
 pub mod socket;
+pub mod write;
 
 // Re-export header callback types and functions for convenient access.
 pub use header::{tool_header_cb, HdrCbData, tool_write_headers};
 
 // Re-export debug callback types and functions for convenient access.
 pub use debug::{tool_debug_cb, InfoType};
+
+// Re-export write callback types and functions for convenient access.
+pub use write::{tool_write_cb, tool_create_output_file, ClobberPolicy};
