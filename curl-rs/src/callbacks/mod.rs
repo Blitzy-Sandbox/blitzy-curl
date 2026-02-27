@@ -10,5 +10,6 @@
 // SPDX-License-Identifier: curl
 
 pub mod progress;
+pub mod read;
 pub mod seek;
 pub mod socket;
