@@ -3,6 +3,7 @@
 
 pub mod altsvc;
 pub mod auth;
+pub mod easy;
 pub mod conn;
 pub mod content_encoding;
 pub mod cookie;
