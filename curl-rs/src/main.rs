@@ -11,6 +11,7 @@ pub mod getpass;
 pub mod ipfs;
 pub mod libinfo;
 pub mod msgs;
+pub mod operhlp;
 pub mod paramhelp;
 pub mod progress_display;
 pub mod stderr;
