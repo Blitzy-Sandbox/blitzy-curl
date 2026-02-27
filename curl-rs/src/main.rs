@@ -6,6 +6,7 @@ pub mod config;
 pub mod dirhier;
 pub mod filetime;
 pub mod findfile;
+pub mod formparse;
 pub mod getpass;
 pub mod ipfs;
 pub mod libinfo;
