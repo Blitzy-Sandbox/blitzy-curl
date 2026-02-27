@@ -813,7 +813,7 @@ pub fn parse_cert_parameter(param: &str) -> (String, Option<String>) {
 }
 
 // ---------------------------------------------------------------------------
-// GetSizeParameter
+// get_size_parameter — parse a human-readable size string
 // ---------------------------------------------------------------------------
 
 struct SizeUnit { suffix: char, multiplier: u64 }
@@ -826,8 +826,7 @@ const SIZE_UNITS: &[SizeUnit] = &[
     SizeUnit { suffix: 'k', multiplier: 1000 },
 ];
 
-#[allow(non_snake_case)]
-pub fn GetSizeParameter(param: &str) -> Result<u64, ParameterError> {
+pub fn get_size_parameter(param: &str) -> Result<u64, ParameterError> {
     let trimmed = param.trim();
     if trimmed.is_empty() { return Err(ParameterError::BadNumeric); }
     let mut num_end = 0;
@@ -1209,7 +1208,7 @@ fn opt_strg(cmd: CmdlineOption, param: &str, config: &mut OperationConfig, globa
         CmdlineOption::KeyType => { config.key_type = Some(param.to_string()); }
         CmdlineOption::Libcurl => { global.libcurl = Some(param.to_string()); }
         CmdlineOption::LimitRate => {
-            match GetSizeParameter(param) { Ok(v) => { config.recvpersecond = v as i64; config.sendpersecond = v as i64; } Err(e) => return ParameterResult::Error(e) }
+            match get_size_parameter(param) { Ok(v) => { config.recvpersecond = v as i64; config.sendpersecond = v as i64; } Err(e) => return ParameterResult::Error(e) }
         }
         CmdlineOption::LocalPort => {
             if let Err(e) = parse_localport_helper(config, param) { return ParameterResult::Error(e); }
@@ -1219,7 +1218,7 @@ fn opt_strg(cmd: CmdlineOption, param: &str, config: &mut OperationConfig, globa
         CmdlineOption::MailFrom => { config.mail_from = Some(param.to_string()); }
         CmdlineOption::MailRcpt => { let _ = add2list(&mut config.mail_rcpt, param); }
         CmdlineOption::MaxFilesize => {
-            match GetSizeParameter(param) { Ok(v) => config.max_filesize = v as i64, Err(e) => return ParameterResult::Error(e) }
+            match get_size_parameter(param) { Ok(v) => config.max_filesize = v as i64, Err(e) => return ParameterResult::Error(e) }
         }
         CmdlineOption::MaxRedirs => {
             match str2num(param) { Ok(v) => config.maxredirs = v, Err(_) => return ParameterResult::Error(ParameterError::BadNumeric) }
@@ -1692,29 +1691,29 @@ mod tests {
 
     #[test]
     fn getsize_bytes() {
-        assert_eq!(GetSizeParameter("1024").unwrap(), 1024);
+        assert_eq!(get_size_parameter("1024").unwrap(), 1024);
     }
 
     #[test]
     fn getsize_kilobytes() {
         // lowercase k = 1000, uppercase K = 1024 (curl convention)
-        assert_eq!(GetSizeParameter("10k").unwrap(), 10 * 1000);
-        assert_eq!(GetSizeParameter("10K").unwrap(), 10 * 1024);
+        assert_eq!(get_size_parameter("10k").unwrap(), 10 * 1000);
+        assert_eq!(get_size_parameter("10K").unwrap(), 10 * 1024);
     }
 
     #[test]
     fn getsize_megabytes() {
-        assert_eq!(GetSizeParameter("5M").unwrap(), 5 * 1024 * 1024);
+        assert_eq!(get_size_parameter("5M").unwrap(), 5 * 1024 * 1024);
     }
 
     #[test]
     fn getsize_gigabytes() {
-        assert_eq!(GetSizeParameter("2G").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(get_size_parameter("2G").unwrap(), 2 * 1024 * 1024 * 1024);
     }
 
     #[test]
     fn getsize_invalid() {
-        assert!(GetSizeParameter("abc").is_err());
+        assert!(get_size_parameter("abc").is_err());
     }
 
     #[test]

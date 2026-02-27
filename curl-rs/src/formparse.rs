@@ -198,6 +198,12 @@ fn get_param_word(cursor: &mut &str, endchar: u8, global: &GlobalConfig) -> (Str
 /// - Trailing CR/LF/whitespace is stripped from each line.
 /// - Empty lines (after stripping) are skipped.
 fn read_field_headers(path: &str, global: &GlobalConfig) -> Result<Vec<String>> {
+    // Note: The file path is used as-is without additional path traversal
+    // protection. This matches the C curl behavior where file path validation
+    // is the responsibility of the caller (the user who supplies the `-F`
+    // argument) and the operating system's file access controls. The OS
+    // enforces permission checks and path resolution, including symlink
+    // traversal, access control lists, and sandboxing policies.
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(e) => {
@@ -942,6 +948,11 @@ fn tool2curlparts(
                 // rather than set_file (which would auto-set filename).
                 // This matches the C pattern of calling
                 // `curl_mime_filedata` + `curl_mime_filename(part, NULL)`.
+                //
+                // Note: The file path (`data`) originates from user-supplied
+                // `-F` arguments and is read as-is. Path traversal protection
+                // is delegated to the OS (matching C curl behavior). See the
+                // comment in `read_field_headers` for the rationale.
                 if let Some(ref data) = child.data {
                     let content =
                         fs::read(data).map_err(|_| CurlError::ReadError)?;

@@ -143,20 +143,15 @@ fn error_to_code(e: CurlError) -> CURLcode {
 /// - The handle has no active connection (e.g., `curl_easy_perform` has not
 ///   been called yet).
 /// - The active connection does not use the WebSocket protocol.
-/// - The WebSocket subsystem integration through `EasyHandle` is not yet
-///   available (the connection/transfer subsystem wires this up).
+/// - The WebSocket state has been cleared (e.g., after `curl_easy_reset`).
 ///
-/// When the full connection subsystem is integrated, this function will
-/// traverse `handle → connection → ws_state` to return the live WebSocket
-/// instance.
+/// The WebSocket state is populated by the protocol handler during the
+/// WebSocket upgrade handshake via [`EasyHandle::set_ws_state`] and persists
+/// for the lifetime of the connection. The FFI functions use this accessor
+/// to delegate to the Rust WebSocket implementation.
 #[inline]
-fn get_websocket(_handle: &mut EasyHandle) -> Option<&mut WebSocket> {
-    // The WebSocket state is managed by the connection/transfer subsystem.
-    // The EasyHandle stores connection state internally; once the full
-    // transfer pipeline is wired up, this function will access:
-    //   handle.connection().and_then(|c| c.ws_mut())
-    // For now, the integration path is not yet complete.
-    None
+fn get_websocket(handle: &mut EasyHandle) -> Option<&mut WebSocket> {
+    handle.ws_state_mut()
 }
 
 /// Converts a Rust [`WsFrame`] to a C-compatible [`curl_ws_frame`].

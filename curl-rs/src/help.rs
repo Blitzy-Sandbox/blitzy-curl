@@ -541,17 +541,35 @@ fn helpscan(buf: &[u8], ctx: &mut ScanContext) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Embedded manual text placeholder
+// Embedded manual text
 //
-// In the C codebase, the manual is compiled into tool_hugehelp.c (either
-// compressed or uncompressed). For the Rust rewrite, we include a minimal
-// placeholder. The showhelp function handles the case where no manual text
-// is available by printing a fallback message.
+// In the C codebase, the complete curl manual (man page) is compiled into
+// `tool_hugehelp.c` at build time by a script (`scripts/cd2nroff`,
+// `scripts/nroff2cd`) that converts the individual per-option documentation
+// files in `docs/cmdline-opts/` into a single C source file containing the
+// full manual text (optionally gzip-compressed when `HAVE_LIBZ` is defined).
+//
+// This Rust rewrite does not replicate the build-time manual generation
+// pipeline. The `--manual` flag instead falls back to showing the per-option
+// help entry from the HELPTEXT table (which is functionally complete and
+// contains all 237 option descriptions). Users can obtain the full manual
+// via `man curl` or online at https://curl.se/docs/manpage.html.
+//
+// Known limitation: `curl-rs --manual` displays per-option help text rather
+// than the full prose manual. This matches the behavior of C curl when
+// compiled without `USE_MANUAL` (the `#ifndef USE_MANUAL` path in
+// `tool_hugehelp.h`). All other `--help` subcommands (`--help all`,
+// `--help <category>`, `--help <option>`) work identically to C curl.
 // ---------------------------------------------------------------------------
 
-/// Embedded manual text. In a full build this would contain the complete
-/// curl manual. For now it is empty and the help system falls back to
-/// showing the option's help entry from the HELPTEXT table.
+/// Embedded manual text.
+///
+/// In the C build, this contains the full curl man page text (compiled from
+/// `docs/cmdline-opts/` sources into `tool_hugehelp.c`). In the Rust build,
+/// the build-time manual generation pipeline is not replicated, so this is
+/// empty. The `showhelp` function gracefully handles the empty case by
+/// displaying per-option help entries from the `HELPTEXT` table instead,
+/// matching the C behavior when compiled without `USE_MANUAL`.
 static EMBEDDED_MANUAL: &[u8] = b"";
 
 /// Display help for a specific option by scanning the embedded manual.

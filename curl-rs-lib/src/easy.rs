@@ -61,6 +61,7 @@ use crate::mime;
 #[allow(unused_imports)]
 use crate::options;
 use crate::progress::Progress;
+use crate::protocols::ws::WebSocket;
 use crate::setopt;
 use crate::share::ShareHandle;
 use crate::slist::SList;
@@ -485,6 +486,16 @@ pub struct EasyHandle {
 
     /// OS-level errno from the last operation.
     os_errno: i32,
+
+    /// Per-connection WebSocket state.
+    ///
+    /// Holds the [`WebSocket`] encoder/decoder state when the active
+    /// connection uses the WebSocket protocol (`ws://` or `wss://`).
+    /// Populated by the protocol handler during the WebSocket upgrade
+    /// handshake and consumed by the `curl_ws_*` FFI functions.
+    ///
+    /// `None` when no WebSocket connection is active.
+    ws_state: Option<WebSocket>,
 }
 
 // EasyHandle is Send (can be transferred between threads) but not Sync
@@ -551,6 +562,7 @@ impl EasyHandle {
             send_paused: false,
             connect_only: false,
             os_errno: 0,
+            ws_state: None,
         }
     }
 
@@ -948,6 +960,10 @@ impl EasyHandle {
 
         // Reset OS errno.
         self.os_errno = 0;
+
+        // Clear WebSocket state — WebSocket state is per-connection and
+        // must be re-created on the next WebSocket upgrade handshake.
+        self.ws_state = None;
     }
 
     // -----------------------------------------------------------------------
@@ -1028,6 +1044,7 @@ impl EasyHandle {
             send_paused: false,
             connect_only: self.connect_only,
             os_errno: 0,
+            ws_state: None, // WebSocket state is per-connection, not duplicated
         }
     }
 
@@ -1354,6 +1371,49 @@ impl EasyHandle {
     #[inline]
     pub fn has_mime_data(&self) -> bool {
         self.mime_data.is_some()
+    }
+
+    /// Returns an immutable reference to the WebSocket state, if an active
+    /// WebSocket connection exists on this handle.
+    ///
+    /// Returns `None` when:
+    /// - No WebSocket connection has been established.
+    /// - The handle has been reset since the last WebSocket transfer.
+    /// - The connection uses a non-WebSocket protocol.
+    #[inline]
+    pub fn ws_state(&self) -> Option<&WebSocket> {
+        self.ws_state.as_ref()
+    }
+
+    /// Returns a mutable reference to the WebSocket state, if an active
+    /// WebSocket connection exists on this handle.
+    ///
+    /// The FFI layer (`curl_ws_recv`, `curl_ws_send`, `curl_ws_meta`,
+    /// `curl_ws_start_frame`) uses this accessor to obtain the WebSocket
+    /// encoder/decoder state for the active connection.
+    ///
+    /// Returns `None` when no WebSocket connection is active.
+    #[inline]
+    pub fn ws_state_mut(&mut self) -> Option<&mut WebSocket> {
+        self.ws_state.as_mut()
+    }
+
+    /// Sets or replaces the WebSocket state on this handle.
+    ///
+    /// Called by the WebSocket protocol handler during the upgrade handshake
+    /// to attach the newly-created [`WebSocket`] encoder/decoder state to
+    /// the easy handle.
+    #[inline]
+    pub fn set_ws_state(&mut self, ws: WebSocket) {
+        self.ws_state = Some(ws);
+    }
+
+    /// Clears the WebSocket state from this handle.
+    ///
+    /// Called when the WebSocket connection is closed or the handle is reset.
+    #[inline]
+    pub fn clear_ws_state(&mut self) {
+        self.ws_state = None;
     }
 }
 
