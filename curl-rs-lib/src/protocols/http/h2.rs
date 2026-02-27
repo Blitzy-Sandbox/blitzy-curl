@@ -1086,6 +1086,12 @@ impl fmt::Debug for Http2Filter {
     }
 }
 
+// NOTE: `#[async_trait]` is required here because `ConnectionFilter` uses
+// `dyn ConnectionFilter` in `FilterChain` (Vec<Box<dyn ConnectionFilter>>),
+// making object safety mandatory. Native async fn in trait (`async fn` without
+// the macro) is not object-safe in Rust 1.75. The `Protocol` trait in
+// `protocols/mod.rs` uses native RPITIT because it dispatches via enum, not
+// trait objects. This architectural difference justifies the two approaches.
 #[async_trait]
 impl ConnectionFilter for Http2Filter {
     fn name(&self) -> &str {
@@ -1311,9 +1317,8 @@ fn map_hyper_error(err: &hyper::Error) -> CurlError {
         CurlError::RecvError
     } else if err.is_canceled() || err.is_body_write_aborted() {
         CurlError::SendError
-    } else if err.is_parse() {
-        CurlError::Http2
     } else {
+        // Parse errors and all other hyper errors map to Http2.
         CurlError::Http2
     }
 }

@@ -930,18 +930,61 @@ pub fn can_recv_in_state(state: &TransferState) -> bool {
     )
 }
 
-/// Reference the [`TransferEngine`] type for integration with the broader
-/// transfer lifecycle. The HTTP/1.x module coordinates with the engine
-/// during Expect:100-continue handling and keep-alive decisions.
+/// Execute an operation within the context of the [`TransferEngine`],
+/// coordinating HTTP/1.x transfer lifecycle with the broader engine.
 ///
-/// This function is a placeholder that returns the engine reference
-/// unchanged, serving as a type-witness that `h1.rs` is aware of the
-/// transfer engine API.
+/// The HTTP/1.x module interacts with the transfer engine during:
+/// - **Expect:100-continue handling**: The engine pauses body sending until
+///   either a `100 Continue` response is received or the expect-timeout
+///   expires. This function provides the entry point for that coordination.
+/// - **Keep-alive decisions**: After a response is fully received, the engine
+///   decides whether to reuse the connection based on `Connection: keep-alive`
+///   or `Connection: close` headers.
+/// - **Chunked transfer reads/writes**: The engine's read/write callbacks
+///   flow data through the H1 framing layer.
+///
+/// The closure `f` receives a mutable reference to the engine and should
+/// perform a single logical transfer operation (e.g., send request headers,
+/// read a response chunk, or finalize the transfer). The engine's internal
+/// state is updated accordingly.
+///
+/// # Arguments
+///
+/// * `engine` — Mutable reference to the active transfer engine.
+/// * `f` — Closure performing the transfer operation.
+///
+/// # Errors
+///
+/// Returns any [`CurlError`](crate::error::CurlError) produced by the
+/// closure or by engine state validation.
 pub fn with_transfer_engine<F, T>(engine: &mut TransferEngine, f: F) -> CurlResult<T>
 where
     F: FnOnce(&mut TransferEngine) -> CurlResult<T>,
 {
+    // Validate that the engine is in a state where H1 operations are valid.
+    // The engine must be in Sending or Receiving state for data to flow
+    // through the HTTP/1.x framing layer.
+    let state = engine.state();
+    if !matches!(
+        state,
+        TransferState::Sending | TransferState::Receiving | TransferState::Idle
+    ) {
+        return Err(crate::error::CurlError::BadFunctionArgument);
+    }
     f(engine)
+}
+
+/// Check whether the transfer engine is in a state suitable for initiating
+/// a new HTTP/1.x request (i.e., idle or ready for the next pipelined
+/// request on a keep-alive connection).
+pub fn is_engine_ready_for_request(state: &TransferState) -> bool {
+    matches!(state, TransferState::Idle)
+}
+
+/// Check whether the transfer is fully complete (response fully received,
+/// connection either closed or returned to pool).
+pub fn is_transfer_complete(state: &TransferState) -> bool {
+    matches!(state, TransferState::Done)
 }
 
 // ---------------------------------------------------------------------------

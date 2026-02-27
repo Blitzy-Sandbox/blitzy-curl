@@ -1338,10 +1338,22 @@ impl EasyHandle {
         self.altsvc_cache.as_ref()
     }
 
+    /// Returns a mutable reference to the Alt-Svc cache, if initialized.
+    #[inline]
+    pub fn altsvc_cache_mut(&mut self) -> Option<&mut altsvc::AltSvcCache> {
+        self.altsvc_cache.as_mut()
+    }
+
     /// Returns the HSTS cache, if initialized.
     #[inline]
     pub fn hsts_cache(&self) -> Option<&hsts::HstsCache> {
         self.hsts_cache.as_ref()
+    }
+
+    /// Returns whether MIME data is attached to this handle.
+    #[inline]
+    pub fn has_mime_data(&self) -> bool {
+        self.mime_data.is_some()
     }
 }
 

@@ -534,6 +534,92 @@ impl ConnectionData {
     pub fn touch(&mut self) {
         self.last_used = Instant::now();
     }
+
+    /// Sends request data through the connection's filter chain.
+    ///
+    /// Forwards the raw header block and body data from the assembled
+    /// [`HttpRequest`] through the filter chain for transmission. The
+    /// filter chain handles TLS encryption, proxy tunneling, and
+    /// version-specific framing (HTTP/1.x raw, HTTP/2 binary frames,
+    /// HTTP/3 QUIC streams).
+    ///
+    /// # Arguments
+    ///
+    /// * `header_data` — Serialized request-line and headers (with trailing CRLF CRLF).
+    /// * `_request` — Structured request for version-specific handlers that
+    ///   need typed access to headers and body.
+    ///
+    /// # C Equivalent
+    ///
+    /// `Curl_req_send` / filter chain `cft->do_send` from `lib/request.c`.
+    pub async fn send_request_data(
+        &mut self,
+        header_data: &[u8],
+        _request: &crate::protocols::http::HttpRequest,
+    ) -> Result<(), CurlError> {
+        if !self.connected || self.filter_chain.is_empty() {
+            return Err(CurlError::CouldntConnect);
+        }
+
+        // Send the header block through the filter chain.
+        let mut sent = 0;
+        while sent < header_data.len() {
+            let is_last_chunk = sent + header_data[sent..].len() == header_data.len();
+            let n = self.filter_chain.send(&header_data[sent..], is_last_chunk && _request.body.is_none()).await?;
+            if n == 0 {
+                return Err(CurlError::SendError);
+            }
+            sent += n;
+        }
+
+        // If the request has a body, send it after the headers.
+        // Body data is extracted from the HttpRequest and sent through the
+        // same filter chain. Streamed and MIME bodies are handled by the
+        // transfer engine's read callback loop.
+        if let Some(ref body) = _request.body {
+            match body {
+                crate::protocols::http::RequestBody::Bytes(data) => {
+                    let mut body_sent = 0;
+                    while body_sent < data.len() {
+                        let n = self.filter_chain.send(
+                            &data[body_sent..],
+                            true, // EOS after body
+                        ).await?;
+                        if n == 0 {
+                            return Err(CurlError::SendError);
+                        }
+                        body_sent += n;
+                    }
+                }
+                crate::protocols::http::RequestBody::Form(pairs) => {
+                    // URL-encode form data and send.
+                    let encoded = pairs
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect::<Vec<_>>()
+                        .join("&");
+                    let form_bytes = encoded.as_bytes();
+                    let mut body_sent = 0;
+                    while body_sent < form_bytes.len() {
+                        let n = self.filter_chain.send(
+                            &form_bytes[body_sent..],
+                            true,
+                        ).await?;
+                        if n == 0 {
+                            return Err(CurlError::SendError);
+                        }
+                        body_sent += n;
+                    }
+                }
+                crate::protocols::http::RequestBody::Empty => {}
+                // Stream and Mime bodies are driven by the transfer engine's
+                // read callback loop rather than being sent inline here.
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // ===========================================================================

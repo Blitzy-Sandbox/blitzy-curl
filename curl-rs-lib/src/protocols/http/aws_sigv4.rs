@@ -269,7 +269,7 @@ fn is_reserved_char(c: u8) -> bool {
 
 /// Lowercase all header names, trim whitespace, and collapse internal
 /// whitespace to single spaces — matching the C `trim_headers` function.
-fn trim_headers(headers: &mut Vec<(String, String)>) {
+fn trim_headers(headers: &mut [(String, String)]) {
     for (name, value) in headers.iter_mut() {
         // Lowercase the header name.
         *name = name.to_ascii_lowercase();
@@ -434,17 +434,14 @@ fn make_headers(
     // Check if user already has a date header.
     let date_header_value = find_date_header(user_headers, &date_hdr_key);
 
-    let date_header_for_request: Option<String>;
-
-    if date_header_value.is_none() {
+    let date_header_for_request: Option<String> = if date_header_value.is_none() {
         // User didn't supply a date header → add one.
         headers.push((date_full_hdr_name.clone(), timestamp.to_string()));
-        date_header_for_request =
-            Some(format!("{}: {}\r\n", date_hdr_key, timestamp));
+        Some(format!("{}: {}\r\n", date_hdr_key, timestamp))
     } else {
         // User supplied date header → use their timestamp, no extra header.
-        date_header_for_request = None;
-    }
+        None
+    };
 
     // --- Sort alphabetically by lowercase name ---
     headers.sort_by(compare_header_names);
@@ -810,6 +807,7 @@ fn derive_signing_key(
 ///
 /// Returns `Ok(())` silently if an `Authorization` header is already set
 /// (user-supplied), per curl 8.x behavior.
+#[allow(clippy::too_many_arguments)]
 pub fn output_aws_sigv4(
     aws_sigv4_param: Option<&str>,
     path_as_is: bool,
@@ -915,7 +913,10 @@ pub fn output_aws_sigv4(
         payload_hash
     );
 
-    tracing::info!(
+        // Log canonical request at trace level only — it contains the full
+    // request path, query parameters, and all signed headers which may
+    // include sensitive values. Never log at info level (CWE-532).
+    tracing::trace!(
         "aws_sigv4: Canonical request (enclosed in []) - [{}]",
         canonical_request
     );
@@ -939,7 +940,10 @@ pub fn output_aws_sigv4(
         algorithm, timestamp, credential_scope, canonical_request_hash
     );
 
-    tracing::info!(
+    // Log string-to-sign at trace level only — it contains the credential
+    // scope (AWS region, service) and canonical request hash. Exposing this
+    // at info level is a security risk (CWE-532).
+    tracing::trace!(
         "aws_sigv4: String to sign (enclosed in []) - [{}]",
         string_to_sign
     );
@@ -958,7 +962,12 @@ pub fn output_aws_sigv4(
         curl_hmac::hmac_sha256(&signing_key, string_to_sign.as_bytes());
     let signature_hex = bytes_to_hex(&signature_bytes);
 
-    tracing::info!("aws_sigv4: Signature - {}", signature_hex);
+    // Log computed signature at trace level only — the signature itself is
+    // cryptographic signing material that could be used to forge authenticated
+    // requests within the validity window. Only log that signing was performed
+    // at info level, never the actual value (CWE-532).
+    tracing::trace!("aws_sigv4: Signature - {}", signature_hex);
+    tracing::info!("aws_sigv4: Request signed with {}", algorithm);
 
     // --- Format the Authorization header ---
     let auth_header = format!(

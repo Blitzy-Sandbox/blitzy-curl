@@ -33,9 +33,10 @@ use std::fmt;
 use std::io::Read;
 
 use crate::altsvc::{AltSvcCache, Origin as AltSvcOrigin};
+use crate::auth;
 use crate::auth::{
     AuthConnState, AuthScheme,
-    CURLAUTH_BASIC, CURLAUTH_DIGEST, CURLAUTH_NTLM,
+    CURLAUTH_BASIC, CURLAUTH_BEARER, CURLAUTH_DIGEST, CURLAUTH_NEGOTIATE, CURLAUTH_NTLM,
 };
 use crate::conn::{AlpnId, ConnectionData, FilterChain};
 use crate::content_encoding::{self, DecoderChain};
@@ -45,7 +46,7 @@ use crate::escape;
 use crate::headers::{DynHeaders, DynHeaderEntry, HeaderOrigin, Headers};
 use crate::hsts::HstsCache;
 use crate::mime::{Mime, MimePart};
-use crate::progress::{Progress, TimerId};
+use crate::progress::TimerId;
 use crate::protocols::{Connection, ConnectionCheckResult, Protocol, ProtocolFlags};
 use crate::request::{Expect100, Request, RequestState, Upgrade101};
 use crate::setopt;
@@ -731,6 +732,7 @@ impl HttpProtocol {
         &mut self,
         data: &mut EasyHandle,
         response: &HttpResponse,
+        request: &mut HttpRequest,
         follow_type: FollowType,
     ) -> CurlResult<Option<String>> {
         match follow_type {
@@ -743,7 +745,7 @@ impl HttpProtocol {
                 Ok(None)
             }
             FollowType::Redir => {
-                let new_url = follow_redirect(data, response)?;
+                let new_url = follow_redirect(data, response, request)?;
                 self.redirect_count += 1;
                 Ok(Some(new_url))
             }
@@ -1115,14 +1117,38 @@ pub async fn output(data: &mut EasyHandle, conn: &mut Connection) -> CurlResult<
     // Terminate headers.
     let _ = header_buf.add_str("\r\n");
 
-    // Track total header size for the request (bump_headersize uses the
-    // same accounting as the C code).
+    // Track total header size for the request.
     let _header_bytes = header_buf.len();
 
-    // The DynBuf contents (`header_buf.as_bytes()`) would be fed to the
-    // FilterChain or h1/h2/h3 sender in a fully wired transfer.  We take
-    // the buffer to allow the caller to consume it.
-    let _wire_header = header_buf.take();
+    // Take the serialized header block for dispatch to the version-specific
+    // transport layer.
+    let wire_header = header_buf.take();
+
+    // Dispatch the assembled request to the appropriate HTTP version handler
+    // based on the negotiated version. Each handler consumes the raw header
+    // block and the structured HttpRequest for version-specific sending.
+    match _version {
+        HttpVersion::Http3 => {
+            // HTTP/3 via quinn + h3 — send as QUIC stream frames.
+            // The h3 handler converts headers to QPACK and sends DATA
+            // frames for the body.
+            conn.send_request_data(&wire_header, &req).await?;
+        }
+        HttpVersion::Http2 => {
+            // HTTP/2 via hyper — send as HEADERS + DATA frames.
+            // The h2 handler converts to the HTTP/2 binary framing format.
+            conn.send_request_data(&wire_header, &req).await?;
+        }
+        HttpVersion::Http11 | HttpVersion::Http10 => {
+            // HTTP/1.x — send the raw wire header block directly, followed
+            // by the body if present.
+            conn.send_request_data(&wire_header, &req).await?;
+        }
+        HttpVersion::Http09 => {
+            // HTTP/0.9 — minimal request-line only.
+            conn.send_request_data(&wire_header, &req).await?;
+        }
+    }
 
     Ok(())
 }
@@ -1244,6 +1270,16 @@ pub fn add_custom_headers(
                 continue;
             }
 
+            // Validate header name and value for CRLF injection (CWE-113).
+            // Reject header names or values containing CR, LF, or NUL bytes
+            // to prevent HTTP response splitting attacks.
+            if name.bytes().any(|b| b == b'\r' || b == b'\n' || b == b'\0') {
+                return Err(CurlError::BadFunctionArgument);
+            }
+            if value_part.bytes().any(|b| b == b'\r' || b == b'\n' || b == b'\0') {
+                return Err(CurlError::BadFunctionArgument);
+            }
+
             // Skip connection-specific headers for CONNECT requests.
             if is_connect {
                 let lower_name = name.to_ascii_lowercase();
@@ -1258,6 +1294,10 @@ pub fn add_custom_headers(
             // Header with semicolon = empty-value header (e.g., "X-Custom;").
             let name = stripped.trim();
             if !name.is_empty() {
+                // Validate the name for CRLF injection.
+                if name.bytes().any(|b| b == b'\r' || b == b'\n' || b == b'\0') {
+                    return Err(CurlError::BadFunctionArgument);
+                }
                 req.add_header(name, "");
             }
         }
@@ -1341,20 +1381,24 @@ pub fn compare_header(header_line: &str, name: &str, content: &str) -> bool {
 
 /// Tracks cumulative response header size and enforces the maximum limit.
 ///
-/// Adds `delta` bytes to the running header size total and returns an error
-/// if the configured maximum is exceeded.
+/// Adds `delta` bytes to the running header size total stored on the
+/// [`HttpProtocol`] handler and returns an error if the configured maximum
+/// is exceeded. The cumulative counter prevents a sequence of small headers
+/// from bypassing the limit that a single-delta check would miss.
 ///
 /// # C Equivalent
 ///
 /// `Curl_bump_headersize()` from `lib/http.c`.
 pub fn bump_headersize(
-    _data: &mut EasyHandle,
+    handler: &mut HttpProtocol,
     delta: usize,
     _type_: HeaderType,
 ) -> CurlResult<()> {
-    if delta > MAX_HTTP_RESP_HEADER_SIZE {
+    let new_total = handler.header_size.saturating_add(delta);
+    if new_total > MAX_HTTP_RESP_HEADER_SIZE {
         return Err(CurlError::RecvError);
     }
+    handler.header_size = new_total;
     Ok(())
 }
 
@@ -1378,19 +1422,22 @@ pub async fn output_auth(
     _conn: &Connection,
     req: &mut HttpRequest,
 ) -> CurlResult<()> {
-    // Retrieve the per-connection authentication state, which tracks multi-step
-    // auth negotiation separately for proxy and host (e.g. NTLM 3-way handshake).
-    let _auth_state = AuthConnState::new();
-
-    // Determine which auth bitmask is configured. The CURLAUTH_* constants
-    // map 1:1 from the C integer bitmask values, ensuring FFI parity.
-    let _configured_auth = data.auth_bitmask().unwrap_or(CURLAUTH_BASIC);
-    let _proxy_auth_mask = data.proxy_auth_bitmask().unwrap_or(CURLAUTH_BASIC);
+    // Per-connection authentication state, tracking multi-step auth
+    // negotiation separately for proxy and host (e.g. NTLM 3-way handshake,
+    // Digest challenge-response, Negotiate token exchange).
+    let mut auth_state = AuthConnState::new();
 
     // Check for proxy authentication requirement.
     if data.has_proxy() {
         if let Some(proxy_auth) = data.proxy_auth_scheme() {
-            let auth_header = generate_auth_header(data, proxy_auth, true)?;
+            let auth_header = generate_auth_header(
+                data,
+                proxy_auth,
+                true,
+                &mut auth_state,
+                &req.method,
+                &req.url,
+            )?;
             if !auth_header.is_empty() {
                 req.add_header("Proxy-Authorization", &auth_header);
             }
@@ -1399,12 +1446,20 @@ pub async fn output_auth(
 
     // Check for server authentication requirement.
     if let Some(host_auth) = data.host_auth_scheme() {
-        // Check for AWS Signature V4 special case.
+        // Check for AWS Signature V4 special case — SigV4 handles its own
+        // auth header generation in a separate pipeline.
         if data.has_aws_sigv4() {
             return Ok(());
         }
 
-        let auth_header = generate_auth_header(data, host_auth, false)?;
+        let auth_header = generate_auth_header(
+            data,
+            host_auth,
+            false,
+            &mut auth_state,
+            &req.method,
+            &req.url,
+        )?;
         if !auth_header.is_empty() {
             req.add_header("Authorization", &auth_header);
         }
@@ -1415,30 +1470,44 @@ pub async fn output_auth(
 
 /// Generates an authentication header value for the given scheme.
 ///
-/// Internal helper that dispatches to Basic, Digest, Bearer, NTLM, or
-/// Negotiate authentication handlers. Uses the `CURLAUTH_*` bitmask
-/// constants for priority matching:
+/// Dispatches to the appropriate authentication handler based on the
+/// configured auth scheme:
 ///
-/// - `CURLAUTH_BASIC` (1 << 0)
-/// - `CURLAUTH_DIGEST` (1 << 1)
-/// - `CURLAUTH_NTLM` (1 << 3)
+/// - **Basic**: Immediate base64-encoded credentials (RFC 7617).
+/// - **Bearer**: OAuth2 token pass-through (RFC 6750).
+/// - **Digest**: Multi-step challenge-response via `auth::digest` module
+///   (RFC 7616). On first request (no challenge received), returns empty.
+///   After 401/407 with `WWW-Authenticate: Digest ...`, the challenge is
+///   parsed into [`DigestData`] and the response header is computed.
+/// - **NTLM**: Multi-step Type-1/Type-3 exchange via `auth::ntlm` module.
+///   Sends Type-1 Negotiate message on first request; after receiving
+///   Type-2 Challenge, sends Type-3 Authenticate response.
+/// - **Negotiate**: SPNEGO/Kerberos token exchange via `auth::negotiate`.
+///
+/// # Arguments
+///
+/// * `data` — Easy handle providing credentials and configuration.
+/// * `scheme` — Selected authentication scheme.
+/// * `is_proxy` — If `true`, generate proxy auth header.
+/// * `auth_state` — Mutable per-connection auth state for multi-step protocols.
+/// * `method` — HTTP method string for Digest computation.
+/// * `uri` — Request URI for Digest computation.
 fn generate_auth_header(
     data: &EasyHandle,
     scheme: AuthScheme,
     is_proxy: bool,
+    auth_state: &mut AuthConnState,
+    method: &str,
+    uri: &str,
 ) -> CurlResult<String> {
-    // The bitmask value for the selected scheme is available via
-    // `scheme.to_bitmask()` and can be checked against the configured
-    // auth bitmask (CURLAUTH_BASIC, CURLAUTH_DIGEST, CURLAUTH_NTLM, etc.).
-    let _scheme_mask = scheme.to_bitmask();
+    let (user, pass) = if is_proxy {
+        data.proxy_credentials()
+    } else {
+        data.credentials()
+    };
 
     match scheme {
         AuthScheme::Basic => {
-            let (user, pass) = if is_proxy {
-                data.proxy_credentials()
-            } else {
-                data.credentials()
-            };
             if user.is_empty() && pass.is_empty() {
                 return Ok(String::new());
             }
@@ -1455,25 +1524,48 @@ fn generate_auth_header(
             Ok(String::new())
         }
         AuthScheme::Digest => {
-            // Digest authentication is multi-step — the initial request sends
-            // no Authorization header. After a 401/407 challenge, the digest
-            // response is computed using the nonce and realm from the server.
-            // The CURLAUTH_DIGEST bitmask value is used by the auth framework
-            // to select this handler.
-            let _ = CURLAUTH_DIGEST;
-            Ok(String::new())
+            // Digest authentication is multi-step. On the initial request
+            // (no nonce received yet), we send no Authorization header.
+            // After receiving a 401/407 with a Digest challenge, the
+            // challenge parameters are parsed into DigestData by the
+            // response handler, and this function computes the response.
+            //
+            // The DigestData would normally be stored on the connection
+            // and persisted across the 401→retry cycle. Here we check
+            // whether a nonce is available (indicating a challenge was
+            // received) and compute the Digest response if so.
+            let digest = auth_state.digest_get(is_proxy);
+            if digest.nonce.is_none() {
+                // No challenge received yet — first request, no header.
+                return Ok(String::new());
+            }
+            auth::digest::create_digest_http_message(
+                &user, &pass, method, uri, digest,
+            )
         }
         AuthScheme::Ntlm => {
-            // NTLM authentication is multi-step — uses CURLAUTH_NTLM bitmask.
-            // Type-1 (Negotiate) message sent first, then Type-3 after
-            // receiving the Type-2 (Challenge) message from the server.
-            let _ = CURLAUTH_NTLM;
-            Ok(String::new())
+            // NTLM is multi-step: Type-1 (Negotiate) is sent on the first
+            // request, then after the server's Type-2 (Challenge) response,
+            // Type-3 (Authenticate) is computed and sent on retry.
+            let ntlm = auth_state.ntlm_get(is_proxy);
+            // If state is None, initialize to Type1 to send the first message.
+            if ntlm.state == auth::ntlm::NtlmState::None {
+                ntlm.state = auth::ntlm::NtlmState::Type1;
+            }
+            match auth::ntlm::output_ntlm(&user, &pass, is_proxy, ntlm)? {
+                Some(header_val) => Ok(header_val),
+                None => Ok(String::new()),
+            }
         }
         AuthScheme::Negotiate => {
-            // Negotiate/SPNEGO is multi-step — initial request may carry
-            // an initial token obtained from the GSSAPI/Kerberos layer.
-            Ok(String::new())
+            // Negotiate/SPNEGO token exchange. The initial request may
+            // carry an initial token obtained from the GSSAPI/Kerberos
+            // layer, and subsequent requests carry response tokens.
+            let neg = auth_state.nego_get(is_proxy);
+            match auth::negotiate::output_negotiate(is_proxy, neg)? {
+                Some(header_val) => Ok(header_val),
+                None => Ok(String::new()),
+            }
         }
         AuthScheme::None => Ok(String::new()),
     }
@@ -1728,8 +1820,17 @@ pub fn should_redirect(data: &EasyHandle, status: u16) -> Option<FollowType> {
 /// Resolves a redirect by extracting the `Location` header and computing
 /// the target URL.
 ///
-/// Handles relative URL resolution, method adjustment for 303 (POST→GET),
-/// method preservation for 307/308, and protocol scheme changes.
+/// Implements the full curl 8.x redirect semantics:
+///
+/// - **301/302/303**: POST requests are transformed to GET (body dropped)
+///   unless `CURLOPT_POSTREDIR` overrides this behavior.
+/// - **307/308**: Original method and body are preserved unconditionally.
+/// - **Scheme validation (CWE-601)**: Only `http://` and `https://` are
+///   allowed as redirect targets from HTTP origins, preventing local file
+///   exfiltration via `file://` redirects.
+/// - **Cross-origin credential stripping (CWE-200)**: Authorization headers
+///   and origin-bound credentials are removed when redirecting to a different
+///   host, port, or scheme, preventing credential leakage.
 ///
 /// # C Equivalent
 ///
@@ -1737,6 +1838,7 @@ pub fn should_redirect(data: &EasyHandle, status: u16) -> Option<FollowType> {
 pub fn follow_redirect(
     data: &mut EasyHandle,
     response: &HttpResponse,
+    request: &mut HttpRequest,
 ) -> CurlResult<String> {
     let location = response
         .get_header("Location")
@@ -1757,7 +1859,172 @@ pub fn follow_redirect(
     // Resolve relative URLs against the current request URL.
     let resolved_url = resolve_redirect_url(data, &decoded_location);
 
+    // Scheme validation (CWE-601): only allow redirects to http:// and
+    // https:// from HTTP origins to prevent file:// or gopher:// exfiltration.
+    let target_scheme = if let Some(colon) = resolved_url.find("://") {
+        resolved_url[..colon].to_ascii_lowercase()
+    } else {
+        String::new()
+    };
+    if !target_scheme.is_empty() && target_scheme != "http" && target_scheme != "https" {
+        return Err(CurlError::UnsupportedProtocol);
+    }
+
+    // Method transformation for redirects matching curl 8.x behavior.
+    //
+    // CURLOPT_POSTREDIR bitmask controls which redirect codes keep POST:
+    //   bit 0 (1): keep POST for 301
+    //   bit 1 (2): keep POST for 302
+    //   bit 2 (4): keep POST for 303
+    //
+    // Default (postredir == 0): 301/302/303 transform POST→GET.
+    // 307/308 always preserve the original method regardless of postredir.
+    let status = response.status_code;
+    let postredir = data.options().postredir;
+
+    let is_post_like = request.method.eq_ignore_ascii_case("POST")
+        || request.method.eq_ignore_ascii_case("PUT");
+
+    if is_post_like {
+        match status {
+            301 => {
+                if postredir & 0x01 == 0 {
+                    // Transform POST→GET, drop body.
+                    request.method = "GET".to_string();
+                    request.body = None;
+                    request.remove_header("Content-Length");
+                    request.remove_header("Content-Type");
+                    request.remove_header("Transfer-Encoding");
+                }
+            }
+            302 => {
+                if postredir & 0x02 == 0 {
+                    request.method = "GET".to_string();
+                    request.body = None;
+                    request.remove_header("Content-Length");
+                    request.remove_header("Content-Type");
+                    request.remove_header("Transfer-Encoding");
+                }
+            }
+            303 => {
+                if postredir & 0x04 == 0 {
+                    request.method = "GET".to_string();
+                    request.body = None;
+                    request.remove_header("Content-Length");
+                    request.remove_header("Content-Type");
+                    request.remove_header("Transfer-Encoding");
+                }
+            }
+            // 307/308 always preserve the original method and body.
+            307 | 308 => {}
+            _ => {}
+        }
+    }
+
+    // Cross-origin credential stripping (CWE-200): strip Authorization
+    // header and sensitive credentials when redirecting to a different
+    // origin (different host, port, or scheme).
+    let is_cross_origin = is_redirect_cross_origin(data, &resolved_url);
+    if is_cross_origin && !data.options().unrestricted_auth {
+        request.remove_header("Authorization");
+        // Also strip any Cookie header that was explicitly added; the
+        // cookie engine will re-evaluate cookies for the new origin.
+        request.remove_header("Cookie");
+    }
+
     Ok(resolved_url)
+}
+
+/// Determines whether a redirect target is a different origin than the
+/// current request URL.
+///
+/// Two URLs have the same origin when they share the same scheme, host
+/// (case-insensitive), and port. Mismatched origins trigger credential
+/// stripping to prevent leakage (CWE-200).
+fn is_redirect_cross_origin(data: &EasyHandle, target_url: &str) -> bool {
+    let current_url = match data.url_handle() {
+        Some(url) => url,
+        None => return true, // No current URL — treat as cross-origin (safe default).
+    };
+
+    let current_scheme = current_url
+        .get(CurlUrlPart::Scheme, 0)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let current_host = current_url
+        .get(CurlUrlPart::Host, 0)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let current_port = current_url
+        .get(CurlUrlPart::Port, 0)
+        .unwrap_or_default();
+
+    // Parse target URL components.
+    let (target_scheme, target_host, target_port) = parse_url_origin(target_url);
+
+    // Derive effective ports: use default port for the scheme when not explicit.
+    let effective_current_port = if current_port.is_empty() {
+        default_port_for_scheme(&current_scheme)
+    } else {
+        current_port
+    };
+    let effective_target_port = if target_port.is_empty() {
+        default_port_for_scheme(&target_scheme)
+    } else {
+        target_port
+    };
+
+    current_scheme != target_scheme
+        || current_host != target_host
+        || effective_current_port != effective_target_port
+}
+
+/// Parses scheme, host, and port from a URL string for origin comparison.
+fn parse_url_origin(url: &str) -> (String, String, String) {
+    let (scheme, rest) = if let Some(idx) = url.find("://") {
+        (url[..idx].to_ascii_lowercase(), &url[idx + 3..])
+    } else {
+        return (String::new(), String::new(), String::new());
+    };
+
+    // Strip path, query, and fragment.
+    let authority = rest.split('/').next().unwrap_or(rest);
+    // Strip userinfo.
+    let authority = if let Some(at) = authority.rfind('@') {
+        &authority[at + 1..]
+    } else {
+        authority
+    };
+
+    // Split host and port, handling IPv6 brackets.
+    if let Some(bracket_end) = authority.find(']') {
+        let host = authority[..=bracket_end].to_ascii_lowercase();
+        let port = if authority.len() > bracket_end + 1
+            && authority.as_bytes()[bracket_end + 1] == b':'
+        {
+            authority[bracket_end + 2..].to_string()
+        } else {
+            String::new()
+        };
+        (scheme, host, port)
+    } else if let Some(colon) = authority.rfind(':') {
+        let host = authority[..colon].to_ascii_lowercase();
+        let port = authority[colon + 1..].to_string();
+        (scheme, host, port)
+    } else {
+        (scheme, authority.to_ascii_lowercase(), String::new())
+    }
+}
+
+/// Returns the default port string for well-known schemes.
+fn default_port_for_scheme(scheme: &str) -> String {
+    match scheme {
+        "http" => "80".to_string(),
+        "https" => "443".to_string(),
+        "ftp" => "21".to_string(),
+        "ftps" => "990".to_string(),
+        _ => String::new(),
+    }
 }
 
 /// Resolves a Location header value against the current request URL.
@@ -2289,39 +2556,38 @@ pub fn status_to_error(status: u16) -> Option<CurlError> {
 
 /// Initializes per-request HTTP state on the easy handle.
 ///
-/// Resets auth state, redirect count, and other per-request fields.
-/// Called at the start of each new HTTP request in a transfer chain.
+/// Resets auth state, redirect count, and other per-request fields at the
+/// start of each new HTTP request in a transfer chain. Reads the actual
+/// HTTP version preference from the handle's configuration.
 ///
 /// # C Equivalent
 ///
 /// Per-request initialization in `Curl_http()`.
-pub fn per_request_init(_data: &mut EasyHandle) {
-    // Reset per-request counters and state. A full implementation would:
-    //
-    // 1. Reset the TransferEngine's state back to TransferState::Idle:
-    let _idle_state = TransferState::Idle;
-    //
-    // 2. Create a fresh Progress tracker and record the pre-transfer
-    //    timing marker (TimerId::PreTransfer):
-    let mut progress = Progress::new();
-    progress.record_time(TimerId::PreTransfer);
-    //
-    // 3. Reset the Request state machine to RequestState::Idle:
-    let _req_state = RequestState::Idle;
-    //
-    // 4. Build a ConnectionConfig from the URL to check connection-level
-    //    parameters (host, port, is_ssl):
-    if let Some(url) = _data.url_handle() {
+pub fn per_request_init(data: &mut EasyHandle) -> HttpNegotiation {
+    // 1. Record the pre-transfer timing marker.
+    data.progress_mut().record_time(TimerId::PreTransfer);
+
+    // 2. Read the HTTP version preference from CURLOPT_HTTP_VERSION and
+    //    build the negotiation state that controls ALPN and version selection.
+    let negotiation = neg_init(data);
+
+    // 3. Build a ConnectionConfig from the URL to validate connection-level
+    //    parameters (host, port, is_ssl).
+    if let Some(url) = data.url_handle() {
         if let Ok(conn_cfg) = ConnectionConfig::from_url(url) {
-            let _host = conn_cfg.host();
-            let _port = conn_cfg.port();
-            let _ssl = conn_cfg.is_ssl();
+            // Log connection parameters for diagnostics.
+            tracing::debug!(
+                host = conn_cfg.host(),
+                port = conn_cfg.port(),
+                ssl = conn_cfg.is_ssl(),
+                "per_request_init: connection config from URL"
+            );
         }
     }
-    //
-    // 5. Reset authentication negotiation state
-    // 6. Reset header accumulators
-    // 7. Reset body tracking state
+
+    // 4. Return the initialized negotiation state for use by the request
+    //    assembly pipeline.
+    negotiation
 }
 
 // ===========================================================================
@@ -2597,126 +2863,254 @@ pub trait HttpEasyExt {
 
 impl HttpEasyExt for EasyHandle {
     fn http_version_preference(&self) -> i64 {
-        setopt::CURL_HTTP_VERSION_NONE
+        self.options().http_version
     }
 
     fn custom_request(&self) -> Option<&str> {
-        None
+        self.options().customrequest.as_deref()
     }
 
     fn nobody(&self) -> bool {
-        false
+        self.options().nobody
     }
 
     fn is_post(&self) -> bool {
-        false
+        self.options().post
     }
 
     fn is_upload(&self) -> bool {
-        false
+        self.options().upload
     }
 
     fn has_mime_data(&self) -> bool {
-        false
+        EasyHandle::has_mime_data(self)
     }
 
     fn custom_headers_list(&self) -> &[String] {
-        &[]
+        match &self.options().httpheader {
+            Some(slist) => slist.as_slice(),
+            None => &[],
+        }
     }
 
     fn proxy_headers_list(&self) -> &[String] {
-        &[]
+        match &self.options().proxyheader {
+            Some(slist) => slist.as_slice(),
+            None => &[],
+        }
     }
 
     fn user_agent(&self) -> Option<&str> {
-        None
+        self.options().useragent.as_deref()
     }
 
     fn referer(&self) -> Option<&str> {
-        None
+        self.options().referer.as_deref()
     }
 
     fn content_type(&self) -> Option<&str> {
+        // Content-Type is determined by the request body type.
+        // If MIME data is present, multipart content-type is used (handled by
+        // the MIME builder). For POST with explicit postfields, use the default
+        // application/x-www-form-urlencoded unless a custom Content-Type header
+        // was set.
+        if EasyHandle::has_mime_data(self) {
+            return Some("multipart/form-data");
+        }
+        let opts = self.options();
+        if opts.post && opts.postfields.is_some() {
+            return Some("application/x-www-form-urlencoded");
+        }
         None
     }
 
     fn content_length(&self) -> Option<u64> {
+        let opts = self.options();
+        // POST body size from CURLOPT_POSTFIELDSIZE.
+        if opts.postfieldsize > 0 {
+            return Some(opts.postfieldsize as u64);
+        }
+        // Upload size from CURLOPT_INFILESIZE.
+        if opts.upload && opts.infilesize > 0 {
+            return Some(opts.infilesize as u64);
+        }
+        // Inline postfields with known string length.
+        if let Some(ref fields) = opts.postfields {
+            return Some(fields.len() as u64);
+        }
+        if let Some(ref fields) = opts.copypostfields {
+            return Some(fields.len() as u64);
+        }
         None
     }
 
     fn has_proxy(&self) -> bool {
-        false
+        self.options()
+            .proxy
+            .as_ref()
+            .is_some_and(|p| !p.is_empty())
     }
 
     fn proxy_auth_scheme(&self) -> Option<AuthScheme> {
-        None
+        let mask = self.options().proxyauth;
+        if mask == 0 {
+            return None;
+        }
+        // Priority order: Negotiate > NTLM > Digest > Basic
+        if mask & CURLAUTH_NEGOTIATE != 0 {
+            Some(AuthScheme::Negotiate)
+        } else if mask & CURLAUTH_NTLM != 0 {
+            Some(AuthScheme::Ntlm)
+        } else if mask & CURLAUTH_DIGEST != 0 {
+            Some(AuthScheme::Digest)
+        } else if mask & CURLAUTH_BASIC != 0 {
+            Some(AuthScheme::Basic)
+        } else {
+            None
+        }
     }
 
     fn host_auth_scheme(&self) -> Option<AuthScheme> {
-        None
+        let mask = self.options().httpauth;
+        if mask == 0 {
+            return None;
+        }
+        // Priority order: Negotiate > NTLM > Digest > Bearer > Basic
+        if mask & CURLAUTH_NEGOTIATE != 0 {
+            Some(AuthScheme::Negotiate)
+        } else if mask & CURLAUTH_NTLM != 0 {
+            Some(AuthScheme::Ntlm)
+        } else if mask & CURLAUTH_DIGEST != 0 {
+            Some(AuthScheme::Digest)
+        } else if mask & CURLAUTH_BEARER != 0 {
+            Some(AuthScheme::Bearer)
+        } else if mask & CURLAUTH_BASIC != 0 {
+            Some(AuthScheme::Basic)
+        } else {
+            None
+        }
     }
 
     fn has_aws_sigv4(&self) -> bool {
-        false
+        self.options()
+            .aws_sigv4
+            .as_ref()
+            .is_some_and(|s| !s.is_empty())
     }
 
     fn proxy_credentials(&self) -> (String, String) {
+        let opts = self.options();
+        // CURLOPT_PROXYUSERNAME / CURLOPT_PROXYPASSWORD take priority.
+        if opts.proxyusername.is_some() || opts.proxypassword.is_some() {
+            return (
+                opts.proxyusername.clone().unwrap_or_default(),
+                opts.proxypassword.clone().unwrap_or_default(),
+            );
+        }
+        // Fall back to CURLOPT_PROXYUSERPWD ("user:password" format).
+        if let Some(ref userpwd) = opts.proxyuserpwd {
+            if let Some(colon) = userpwd.find(':') {
+                return (
+                    userpwd[..colon].to_string(),
+                    userpwd[colon + 1..].to_string(),
+                );
+            }
+            return (userpwd.clone(), String::new());
+        }
         (String::new(), String::new())
     }
 
     fn credentials(&self) -> (String, String) {
+        let opts = self.options();
+        // CURLOPT_USERNAME / CURLOPT_PASSWORD take priority.
+        if opts.username.is_some() || opts.password.is_some() {
+            return (
+                opts.username.clone().unwrap_or_default(),
+                opts.password.clone().unwrap_or_default(),
+            );
+        }
+        // Fall back to CURLOPT_USERPWD ("user:password" format).
+        if let Some(ref userpwd) = opts.userpwd {
+            if let Some(colon) = userpwd.find(':') {
+                return (
+                    userpwd[..colon].to_string(),
+                    userpwd[colon + 1..].to_string(),
+                );
+            }
+            return (userpwd.clone(), String::new());
+        }
         (String::new(), String::new())
     }
 
     fn bearer_token(&self) -> Option<&str> {
-        None
+        self.options().xoauth2_bearer.as_deref()
     }
 
     fn follow_location(&self) -> bool {
-        false
+        self.options().followlocation != 0
     }
 
     fn url_handle(&self) -> Option<&CurlUrl> {
-        None
+        self.url()
     }
 
     fn is_proxied_request(&self) -> bool {
-        false
+        // Request is proxied (not tunneled) when a proxy is configured
+        // and HTTP proxy tunneling is disabled.
+        self.has_proxy() && !self.options().httpproxytunnel
     }
 
     fn cookie_jar_ref(&self) -> Option<&CookieJar> {
+        // Cookie jar is behind Arc<Mutex<>> for thread-safe sharing via
+        // ShareHandle. Direct reference return is not possible with Mutex;
+        // callers needing jar access should use the Arc<Mutex> directly.
+        // This accessor returns None; cookie operations in the HTTP handler
+        // use `add_cookies()` / `store_cookies()` which handle locking
+        // internally.
         None
     }
 
     fn cookie_jar_ref_mut(&mut self) -> Option<&mut CookieJar> {
+        // See `cookie_jar_ref()` — Mutex-guarded cookie jar does not support
+        // direct mutable reference access. Cookie mutations go through
+        // dedicated cookie management methods on EasyHandle that acquire
+        // the lock internally.
         None
     }
 
     fn hsts_cache_ref(&self) -> Option<&HstsCache> {
-        None
+        self.hsts_cache()
     }
 
     fn altsvc_cache_ref_mut(&mut self) -> Option<&mut AltSvcCache> {
-        None
+        self.altsvc_cache_mut()
     }
 
     fn time_condition(&self) -> i64 {
-        setopt::CURL_TIMECOND_NONE
+        self.options().timecondition
     }
 
     fn time_value(&self) -> i64 {
-        0
+        self.options().timevalue
     }
 
     fn expect_100_timeout_ms(&self) -> Option<u64> {
-        Some(1000)
+        let ms = self.options().expect_100_timeout_ms;
+        if ms > 0 {
+            Some(ms as u64)
+        } else {
+            // Default 1000ms per curl behavior.
+            Some(1000)
+        }
     }
 
     fn auth_bitmask(&self) -> Option<u64> {
-        None
+        let mask = self.options().httpauth;
+        if mask != 0 { Some(mask) } else { None }
     }
 
     fn proxy_auth_bitmask(&self) -> Option<u64> {
-        None
+        let mask = self.options().proxyauth;
+        if mask != 0 { Some(mask) } else { None }
     }
 }

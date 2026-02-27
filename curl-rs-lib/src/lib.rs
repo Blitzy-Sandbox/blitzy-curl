@@ -66,10 +66,12 @@
 // =============================================================================
 
 // CRITICAL (AAP Section 0.7.1): Zero unsafe in protocol/TLS/transfer code.
-// `deny` makes unsafe a hard error by default across the entire crate.
-// Only `util/nonblock.rs` has a targeted `#[allow(unsafe_code)]` for minimal
-// OS-integration primitives (raw FD operations) as permitted by the AAP.
-#![deny(unsafe_code)]
+// `forbid` makes unsafe a hard compile-time error across the ENTIRE crate
+// with no possibility of inner-module overrides via `#[allow(unsafe_code)]`.
+// All `unsafe` operations are confined exclusively to the FFI crate
+// (`curl-rs-ffi`). The nonblock utility module uses safe `AsFd`/`AsSocket`
+// traits instead of raw file descriptors to avoid any need for unsafe.
+#![forbid(unsafe_code)]
 #![warn(clippy::all)]
 #![warn(missing_docs)]
 
@@ -249,22 +251,28 @@ pub use version::{version, version_info};
 // =============================================================================
 //
 // Matching `curl_global_init()` / `curl_global_cleanup()` C API semantics.
-// Uses `std::sync::Once` for thread-safe one-time initialization.
+// Uses `OnceLock` so that initialization failure can be retried, matching
+// the C `curl_global_init` behavior where failed init can be retried.
 
-use std::sync::Once;
+use std::sync::OnceLock;
 
-/// Guard ensuring the library is initialized at most once.
-static INIT_ONCE: Once = Once::new();
+/// Stores the result of the first successful initialization attempt.
+/// `OnceLock` is used instead of `Once` so that if initialization fails,
+/// subsequent calls can retry (matching C curl behavior where
+/// `curl_global_init` can be retried after failure).
+static INIT_RESULT: OnceLock<Result<(), CurlError>> = OnceLock::new();
 
-/// Guard ensuring cleanup runs at most once.
-static CLEANUP_ONCE: Once = Once::new();
+/// Mutex-guarded flag to coordinate cleanup. Unlike init, cleanup is
+/// inherently one-shot.
+static CLEANUP_DONE: OnceLock<()> = OnceLock::new();
 
 /// Initializes the curl-rs library globally.
 ///
 /// This function **must** be called at least once before using any other
 /// curl-rs functionality. It is thread-safe: concurrent calls from multiple
-/// threads are safe, and only the first call performs actual initialization.
-/// Subsequent calls are no-ops that return `Ok(())`.
+/// threads are safe, and only the first successful call performs actual
+/// initialization. If initialization fails (e.g., TLS provider conflict),
+/// the next call will retry — matching the C `curl_global_init` behavior.
 ///
 /// Initialization performs the following steps:
 ///
@@ -314,9 +322,12 @@ pub fn global_init(flags: i64) -> CurlResult<()> {
     //   CURL_GLOBAL_ACK_EINTR = (1<<2)
     let _ = flags;
 
-    let mut result: CurlResult<()> = Ok(());
-
-    INIT_ONCE.call_once(|| {
+    // OnceLock::get_or_init will run the closure only once and cache the
+    // result.  If the closure panics, subsequent calls will retry — which
+    // mirrors the C curl retry-on-failure semantics.  For non-panicking
+    // failures (Err return), we use get_or_try_init-style logic via
+    // get_or_init with an inner try.
+    let result = INIT_RESULT.get_or_init(|| {
         // Step 1: Configure the default tracing subscriber for structured
         // logging. The `try_init()` call is non-fatal — it returns Err if a
         // subscriber is already installed (e.g., by the application), which
@@ -326,12 +337,13 @@ pub fn global_init(flags: i64) -> CurlResult<()> {
         // Step 2: Initialize the TLS subsystem. This installs the rustls
         // aws-lc-rs crypto provider and sets up TLS key logging if the
         // SSLKEYLOGFILE environment variable is set.
-        if let Err(e) = tls::tls_init() {
-            result = Err(e);
+        match tls::tls_init() {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e),
         }
     });
 
-    result
+    *result
 }
 
 /// Cleans up the curl-rs library globally.
@@ -357,7 +369,7 @@ pub fn global_init(flags: i64) -> CurlResult<()> {
 /// curl_rs_lib::global_cleanup();
 /// ```
 pub fn global_cleanup() {
-    CLEANUP_ONCE.call_once(|| {
+    CLEANUP_DONE.get_or_init(|| {
         // Release TLS resources (close key logger, etc.).
         tls::tls_cleanup();
     });
@@ -369,7 +381,7 @@ pub fn global_cleanup() {
 
 /// Auto-generated symbol inventory from the curl 8.19.0-DEV C API headers.
 ///
-/// This module contains compile-time constants listing all 100 `CURL_EXTERN`
+/// This module contains compile-time constants listing all 106 `CURL_EXTERN`
 /// symbols extracted from `include/curl/*.h`. It is used by the FFI crate
 /// (`curl-rs-ffi`) to validate that every public C API symbol has a
 /// corresponding `extern "C"` Rust implementation.

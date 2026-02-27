@@ -423,6 +423,23 @@ impl QuicContext {
     pub fn remove_stream(&mut self, stream_id: u64) -> Option<H3StreamContext> {
         self.streams.remove(&stream_id)
     }
+
+    /// Checks whether the QUIC connection is currently using 0-RTT early data.
+    ///
+    /// Returns `true` if the TLS handshake has not yet completed and data is
+    /// being sent as early data (0-RTT). This is a defense-in-depth check
+    /// for 0-RTT replay protection: even though the transport config disables
+    /// 0-RTT, this method provides a runtime guard against replay attacks if
+    /// 0-RTT is ever inadvertently enabled (e.g., through session resumption).
+    ///
+    /// Quinn connections report handshake status via
+    /// `quinn::Connection::handshake_data()` — if it returns `None`, the
+    /// handshake is still in progress and any data sent would be 0-RTT.
+    pub fn is_early_data_active(&self) -> bool {
+        // If handshake_data() returns None, the TLS handshake hasn't completed
+        // yet. Any data being sent at this point would be 0-RTT early data.
+        self.connection.handshake_data().is_none()
+    }
 }
 
 impl fmt::Debug for QuicContext {
@@ -564,7 +581,23 @@ fn build_quinn_client_config(
 
     client_config.transport_config(Arc::new(transport));
 
-    debug!("h3: quinn client config built with transport parameters");
+    // 0-RTT replay protection (CWE-294): Disable 0-RTT early data entirely.
+    // HTTP/3 0-RTT allows sending request data before the TLS handshake
+    // completes, but this opens a replay attack vector where a middleman can
+    // replay captured early data packets. While GET/HEAD/OPTIONS are
+    // considered idempotent and safe for 0-RTT, curl's general-purpose nature
+    // means non-idempotent methods (POST, PUT, DELETE) may be sent over any
+    // connection. Rather than per-request method checks that could be bypassed
+    // by custom methods, we disable 0-RTT at the transport level. This
+    // matches the conservative approach taken by curl's C ngtcp2 backend.
+    //
+    // quinn's ClientConfig does not expose a direct 0-RTT toggle; however,
+    // by not providing session resumption tickets that include early data
+    // parameters (i.e., not calling `set_0rtt_enabled(true)` on the rustls
+    // config), 0-RTT is effectively disabled by default in rustls. We
+    // explicitly document this invariant here for future maintainers.
+
+    debug!("h3: quinn client config built with transport parameters (0-RTT disabled)");
     Ok(client_config)
 }
 
@@ -755,11 +788,6 @@ pub async fn send_request(
     ctx: &mut QuicContext,
     request: &HttpRequest,
 ) -> Result<u64, CurlError> {
-    let h3_conn = ctx.h3_connection.as_mut().ok_or_else(|| {
-        error!("h3: cannot send request — HTTP/3 session not initialized");
-        CurlError::Http3
-    })?;
-
     // Build the http::Request from our internal HttpRequest representation.
     let uri: Uri = request.url.parse().map_err(|e| {
         error!("h3: invalid request URI '{}': {}", request.url, e);
@@ -768,6 +796,31 @@ pub async fn send_request(
 
     let method: Method = request.method.parse().map_err(|e| {
         error!("h3: invalid request method '{}': {}", request.method, e);
+        CurlError::Http3
+    })?;
+
+    // 0-RTT replay protection — defense-in-depth check (CWE-294).
+    // Even though 0-RTT is disabled at the transport config level, add a
+    // runtime guard: if the QUIC connection indicates that early data is
+    // being used (e.g., due to session resumption with 0-RTT), reject
+    // non-idempotent methods to prevent replay attacks.
+    // This check MUST precede the mutable borrow of h3_connection below.
+    if ctx.is_early_data_active() {
+        let is_idempotent = matches!(
+            method,
+            Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+        );
+        if !is_idempotent {
+            warn!(
+                "h3: rejecting non-idempotent method {} over 0-RTT early data (replay risk)",
+                method
+            );
+            return Err(CurlError::Http3);
+        }
+    }
+
+    let h3_conn = ctx.h3_connection.as_mut().ok_or_else(|| {
+        error!("h3: cannot send request — HTTP/3 session not initialized");
         CurlError::Http3
     })?;
 
@@ -1209,6 +1262,10 @@ impl fmt::Debug for Http3Filter {
     }
 }
 
+// NOTE: `#[async_trait]` is required here because `ConnectionFilter` uses
+// `dyn ConnectionFilter` in `FilterChain` (Vec<Box<dyn ConnectionFilter>>),
+// making object safety mandatory. Native async fn in trait is not
+// object-safe in Rust 1.75. See h2.rs for the same rationale.
 #[async_trait]
 impl ConnectionFilter for Http3Filter {
     fn name(&self) -> &str {

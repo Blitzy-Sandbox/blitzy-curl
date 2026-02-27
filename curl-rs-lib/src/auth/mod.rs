@@ -284,6 +284,16 @@ impl std::fmt::Display for AuthScheme {
 /// assert!(state.ntlm.is_some());
 /// ```
 pub struct AuthConnState {
+    /// Digest authentication state for the host (non-proxy) connection.
+    /// Lazily initialised by [`digest_get`](AuthConnState::digest_get) with
+    /// `proxy = false`.
+    pub digest: Option<digest::DigestData>,
+
+    /// Digest authentication state for the proxy connection.
+    /// Lazily initialised by [`digest_get`](AuthConnState::digest_get) with
+    /// `proxy = true`.
+    pub digest_proxy: Option<digest::DigestData>,
+
     /// NTLM authentication state for the host (non-proxy) connection.
     /// Lazily initialised by [`ntlm_get`](AuthConnState::ntlm_get) with
     /// `proxy = false`.
@@ -324,6 +334,8 @@ impl AuthConnState {
     /// use curl_rs_lib::auth::AuthConnState;
     ///
     /// let state = AuthConnState::new();
+    /// assert!(state.digest.is_none());
+    /// assert!(state.digest_proxy.is_none());
     /// assert!(state.ntlm.is_none());
     /// assert!(state.ntlm_proxy.is_none());
     /// assert!(state.kerberos.is_none());
@@ -333,6 +345,8 @@ impl AuthConnState {
     /// ```
     pub fn new() -> Self {
         AuthConnState {
+            digest: None,
+            digest_proxy: None,
             ntlm: None,
             ntlm_proxy: None,
             kerberos: None,
@@ -340,6 +354,23 @@ impl AuthConnState {
             negotiate_proxy: None,
             scram: None,
         }
+    }
+
+    /// Get a mutable reference to the Digest authentication data, creating it
+    /// on first access.
+    ///
+    /// When `proxy` is `true`, returns the proxy Digest state; otherwise
+    /// returns the host Digest state.
+    ///
+    /// Corresponds to C per-connection digest state (`struct digestdata`)
+    /// stored on `connectdata`.
+    pub fn digest_get(&mut self, proxy: bool) -> &mut digest::DigestData {
+        let slot = if proxy {
+            &mut self.digest_proxy
+        } else {
+            &mut self.digest
+        };
+        slot.get_or_insert_with(digest::DigestData::new)
     }
 
     /// Get a mutable reference to the NTLM authentication data, creating it

@@ -714,15 +714,10 @@ impl ConnectionFilter for TcpSocketFilter {
             let sock_addr = SockAddr::from(addr);
             let _connect_result = raw_socket.connect(&sock_addr);
 
-            // Convert socket2::Socket → tokio::net::TcpStream via
-            // make_tokio_socket (RawFd path). Ownership of the fd transfers
-            // to the TcpStream.
-            #[cfg(unix)]
-            let tokio_stream = {
-                use std::os::unix::io::IntoRawFd;
-                let fd = raw_socket.into_raw_fd();
-                make_tokio_socket(fd)?
-            };
+            // Convert socket2::Socket → std::net::TcpStream → tokio::net::TcpStream
+            // via make_tokio_socket. socket2::Socket implements Into<TcpStream>.
+            let std_stream: std::net::TcpStream = raw_socket.into();
+            let tokio_stream = make_tokio_socket(std_stream)?;
 
             // Wait for the connection to complete (socket becomes writable)
             // with the configured timeout.

@@ -96,14 +96,16 @@ const CONN_MAX_RETRIES: u32 = 5;
 const DEFAULT_MAX_REDIRECTS: u32 = 50;
 
 // ===========================================================================
-// TransferState
+// TransferState — Runtime enum (internal use)
 // ===========================================================================
 
-/// Lifecycle state of the transfer engine.
+/// Lifecycle state of the transfer engine (runtime enum).
 ///
 /// Mirrors the implicit state encoded by the C `SingleRequest.keepon` bitmask
-/// and the `data->req.done` flag.  Explicit states replace the bitfield
-/// approach for clarity and compile-time safety.
+/// and the `data->req.done` flag. This runtime enum is used internally by
+/// `TransferEngine` for state tracking. External consumers should prefer the
+/// type-state API (see [`TypedTransfer`]) which enforces valid state
+/// transitions at compile time per AAP §0.4.3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TransferState {
     /// Transfer has been created but not yet started.
@@ -128,6 +130,161 @@ impl std::fmt::Display for TransferState {
             Self::Receiving => write!(f, "Receiving"),
             Self::Done => write!(f, "Done"),
         }
+    }
+}
+
+// ===========================================================================
+// Type-State Pattern — Compile-time state machine (AAP §0.4.3)
+// ===========================================================================
+
+/// Marker type for a transfer that has not yet started.
+/// Methods available: `connect()` → `TypedTransfer<Connected>`.
+#[derive(Debug)]
+pub struct Idle;
+
+/// Marker type for a transfer with an established connection.
+/// Methods available: `start_sending()` → `TypedTransfer<Transferring>`.
+#[derive(Debug)]
+pub struct Connected;
+
+/// Marker type for a transfer actively sending/receiving data.
+/// Methods available: `complete()` → `TypedTransfer<Complete>`.
+#[derive(Debug)]
+pub struct Transferring;
+
+/// Marker type for a completed transfer.
+/// Methods available: `reset()` → `TypedTransfer<Idle>`.
+#[derive(Debug)]
+pub struct Complete;
+
+/// Compile-time enforced transfer state machine wrapper.
+///
+/// Implements the type-state pattern specified in AAP §0.4.3:
+///
+/// ```text
+/// TypedTransfer<Idle> → TypedTransfer<Connected>
+///     → TypedTransfer<Transferring> → TypedTransfer<Complete>
+/// ```
+///
+/// Invalid state transitions are **compile-time errors** — for example,
+/// calling `start_sending()` on a `TypedTransfer<Idle>` is impossible because
+/// that method only exists on `TypedTransfer<Connected>`.
+///
+/// The inner [`TransferEngine`] is consumed and returned on each transition,
+/// ensuring exclusive ownership semantics.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// let transfer = TypedTransfer::<Idle>::new(engine);
+/// let transfer = transfer.connect().await?;      // Idle → Connected
+/// let transfer = transfer.start_sending()?;       // Connected → Transferring
+/// let transfer = transfer.complete()?;             // Transferring → Complete
+/// let (engine, _) = transfer.reset();              // Complete → Idle (reclaim engine)
+/// ```
+pub struct TypedTransfer<State> {
+    engine: TransferEngine,
+    _state: std::marker::PhantomData<State>,
+}
+
+impl TypedTransfer<Idle> {
+    /// Creates a new typed transfer in the `Idle` state.
+    pub fn new(engine: TransferEngine) -> Self {
+        Self {
+            engine,
+            _state: std::marker::PhantomData,
+        }
+    }
+
+    /// Transition from `Idle` → `Connected` by establishing the connection.
+    ///
+    /// The underlying engine's `pretransfer()` is called to initialize the
+    /// connection state. Returns the transfer in the `Connected` state.
+    pub fn connect(mut self) -> CurlResult<TypedTransfer<Connected>> {
+        self.engine.pretransfer()?;
+        Ok(TypedTransfer {
+            engine: self.engine,
+            _state: std::marker::PhantomData,
+        })
+    }
+
+    /// Access the underlying engine (read-only) in Idle state.
+    pub fn engine(&self) -> &TransferEngine {
+        &self.engine
+    }
+
+    /// Access the underlying engine (mutable) in Idle state.
+    pub fn engine_mut(&mut self) -> &mut TransferEngine {
+        &mut self.engine
+    }
+}
+
+impl TypedTransfer<Connected> {
+    /// Transition from `Connected` → `Transferring` by starting data flow.
+    ///
+    /// This initiates the request send phase. The engine's state is set to
+    /// `Sending`.
+    pub fn start_sending(mut self) -> CurlResult<TypedTransfer<Transferring>> {
+        self.engine.begin_send();
+        Ok(TypedTransfer {
+            engine: self.engine,
+            _state: std::marker::PhantomData,
+        })
+    }
+
+    /// Access the underlying engine in Connected state.
+    pub fn engine(&self) -> &TransferEngine {
+        &self.engine
+    }
+
+    /// Access the underlying engine (mutable) in Connected state.
+    pub fn engine_mut(&mut self) -> &mut TransferEngine {
+        &mut self.engine
+    }
+}
+
+impl TypedTransfer<Transferring> {
+    /// Transition from `Transferring` → `Complete` when the transfer finishes.
+    pub fn complete(mut self) -> CurlResult<TypedTransfer<Complete>> {
+        self.engine.mark_done();
+        Ok(TypedTransfer {
+            engine: self.engine,
+            _state: std::marker::PhantomData,
+        })
+    }
+
+    /// Access the underlying engine in Transferring state.
+    pub fn engine(&self) -> &TransferEngine {
+        &self.engine
+    }
+
+    /// Access the underlying engine (mutable) in Transferring state.
+    pub fn engine_mut(&mut self) -> &mut TransferEngine {
+        &mut self.engine
+    }
+}
+
+impl TypedTransfer<Complete> {
+    /// Transition from `Complete` → `Idle` by resetting the engine.
+    ///
+    /// Returns the engine and the typed transfer in Idle state, ready for
+    /// reuse on a keep-alive connection.
+    pub fn reset(mut self) -> TypedTransfer<Idle> {
+        self.engine.reset();
+        TypedTransfer {
+            engine: self.engine,
+            _state: std::marker::PhantomData,
+        }
+    }
+
+    /// Consume the completed transfer and reclaim the engine.
+    pub fn into_engine(self) -> TransferEngine {
+        self.engine
+    }
+
+    /// Access the underlying engine in Complete state.
+    pub fn engine(&self) -> &TransferEngine {
+        &self.engine
     }
 }
 
@@ -607,6 +764,30 @@ impl TransferEngine {
     /// Returns a mutable reference to the progress tracker.
     pub fn progress_mut(&mut self) -> &mut Progress {
         &mut self.progress
+    }
+
+    /// Transition the engine to the `Sending` state.
+    ///
+    /// Used by the type-state API ([`TypedTransfer`]) for the
+    /// `Connected → Transferring` transition.
+    pub fn begin_send(&mut self) {
+        self.state = TransferState::Sending;
+    }
+
+    /// Mark the transfer as complete.
+    ///
+    /// Used by the type-state API ([`TypedTransfer`]) for the
+    /// `Transferring → Complete` transition.
+    pub fn mark_done(&mut self) {
+        self.state = TransferState::Done;
+    }
+
+    /// Reset the engine to the `Idle` state for reuse.
+    ///
+    /// Used by the type-state API ([`TypedTransfer`]) for the
+    /// `Complete → Idle` transition.
+    pub fn reset(&mut self) {
+        self.state = TransferState::Idle;
     }
 
     /// Sets the user write callback for response body data.

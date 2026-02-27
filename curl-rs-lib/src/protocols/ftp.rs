@@ -982,6 +982,17 @@ impl FtpHandler {
                 return Ok(());
             }
 
+            // Sanitize FTP server responses to prevent control character
+            // injection (CWE-117). Malicious FTP servers can embed CR, LF, NUL,
+            // or other control characters in response lines to exploit terminal
+            // emulators or log injection when responses are displayed or logged.
+            // Strip all control characters (bytes < 0x20) except horizontal tab
+            // (0x09) from the response before any further processing.
+            let response: String = response
+                .chars()
+                .filter(|&c| c == '\t' || !c.is_control())
+                .collect();
+
             trace!(code = code, state = %self.ftpc.state, "FTP response received");
 
             // Dispatch response based on current state
