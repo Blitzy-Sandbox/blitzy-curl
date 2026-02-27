@@ -12,6 +12,7 @@ pub mod stderr;
 pub mod terminal;
 pub mod urlglob;
 pub mod util;
+pub mod writeout_json;
 pub mod xattr;
 
 fn main() {
