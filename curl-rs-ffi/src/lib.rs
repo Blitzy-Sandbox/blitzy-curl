@@ -6,5 +6,6 @@ pub mod error_codes;
 pub mod mime;
 pub mod mprintf;
 pub mod options;
+pub mod share;
 pub mod slist;
 pub mod url;
