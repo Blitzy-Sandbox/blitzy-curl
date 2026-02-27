@@ -4,6 +4,7 @@
 pub mod types;
 pub mod error_codes;
 pub mod easy;
+pub mod global;
 pub mod header;
 pub mod mime;
 pub mod mprintf;

@@ -1,0 +1,842 @@
+//! Global initialization, version information, and standalone utility symbols.
+//!
+//! This module exposes the `curl_global_*` family of `CURL_EXTERN` symbols plus
+//! several standalone utility functions from `include/curl/curl.h` as
+//! `extern "C"` functions with `#[no_mangle]`.
+//!
+//! # Exported Symbols
+//!
+//! **Global functions (5):**
+//! - `curl_global_init` — One-time library initialization
+//! - `curl_global_init_mem` — Initialization with custom allocators
+//! - `curl_global_cleanup` — Library cleanup
+//! - `curl_global_trace` — Configure trace/logging
+//! - `curl_global_sslset` — SSL backend selection (always rustls)
+//!
+//! **Standalone utility functions (10):**
+//! - `curl_version` — Version string
+//! - `curl_version_info` — Detailed version information
+//! - `curl_getenv` — Environment variable lookup
+//! - `curl_free` — Free curl-allocated memory
+//! - `curl_easy_escape` — URL-encode a string
+//! - `curl_easy_unescape` — URL-decode a string
+//! - `curl_getdate` — Parse a date string
+//! - `curl_easy_strerror` — Error code to string
+//! - `curl_easy_ssls_import` — SSL session import
+//! - `curl_easy_ssls_export` — SSL session export
+//!
+//! # Safety
+//!
+//! All `unsafe` blocks are permitted per AAP Section 0.7.1 (FFI crate only)
+//! and carry mandatory `// SAFETY:` comments documenting their invariants.
+//!
+//! # ABI Compatibility
+//!
+//! Every function name, parameter type, return type, and constant value in
+//! this module matches the curl 8.19.0-DEV C headers exactly (AAP Section
+//! 0.7.2).
+
+#![allow(non_camel_case_types)]
+#![allow(non_upper_case_globals)]
+#![allow(clippy::missing_safety_doc)]
+
+use std::ffi::CStr;
+use std::ptr;
+use std::sync::Once;
+
+use libc::{c_char, c_int, c_long, c_void, free, malloc};
+
+use crate::error_codes::{
+    CURLE_BAD_FUNCTION_ARGUMENT, CURLE_FAILED_INIT, CURLE_OK, CURLSSLSET_OK, CURLSSLSET_TOO_LATE,
+    CURLSSLSET_UNKNOWN_BACKEND,
+};
+use crate::types::{
+    curl_calloc_callback, curl_free_callback, curl_malloc_callback, curl_realloc_callback,
+    curl_ssl_backend, curl_sslbackend, curl_strdup_callback, curl_version_info_data, CURLcode,
+    CURLsslset, CURLversion,
+};
+
+// ============================================================================
+// Sync wrapper for raw pointer types in static context
+// ============================================================================
+
+/// Wrapper that allows pointer-containing arrays to live in `static` items.
+///
+/// Raw pointers do not implement `Sync` or `Send` in Rust, but our static data
+/// consists entirely of pointers into other static byte-string literals which
+/// are inherently thread-safe (immutable, 'static lifetime).
+struct SyncPtrArray<T, const N: usize>([T; N]);
+
+// SAFETY: All pointers stored in these arrays point to static byte-string
+// literals that are immutable and live for the entire duration of the program.
+// No mutation, no aliasing hazards.
+unsafe impl<T, const N: usize> Sync for SyncPtrArray<T, N> {}
+unsafe impl<T, const N: usize> Send for SyncPtrArray<T, N> {}
+
+/// Wrapper that allows `curl_version_info_data` (which contains raw pointers)
+/// to live in a `static` item inside `OnceLock`.
+struct SyncVersionInfoData(curl_version_info_data);
+
+// SAFETY: All pointer fields in the version info data point to static
+// byte-string literals or to other static arrays, all of which are immutable
+// and live for the entire duration of the program.
+unsafe impl Sync for SyncVersionInfoData {}
+unsafe impl Send for SyncVersionInfoData {}
+
+// ============================================================================
+// Section 1: CURL_GLOBAL_* Constants
+// Source: include/curl/curl.h lines 3019–3024
+// ============================================================================
+
+/// SSL initialization flag (no actual purpose since curl 7.57.0).
+///
+/// C equivalent: `#define CURL_GLOBAL_SSL (1 << 0)`
+pub const CURL_GLOBAL_SSL: c_long = 1 << 0;
+
+/// Windows socket (Winsock) initialization flag.
+///
+/// C equivalent: `#define CURL_GLOBAL_WIN32 (1 << 1)`
+pub const CURL_GLOBAL_WIN32: c_long = 1 << 1;
+
+/// Initialize everything: SSL + Win32.
+///
+/// C equivalent: `#define CURL_GLOBAL_ALL (CURL_GLOBAL_SSL|CURL_GLOBAL_WIN32)`
+pub const CURL_GLOBAL_ALL: c_long = CURL_GLOBAL_SSL | CURL_GLOBAL_WIN32;
+
+/// Initialize nothing.
+///
+/// C equivalent: `#define CURL_GLOBAL_NOTHING 0`
+pub const CURL_GLOBAL_NOTHING: c_long = 0;
+
+/// Default initialization (same as ALL).
+///
+/// C equivalent: `#define CURL_GLOBAL_DEFAULT CURL_GLOBAL_ALL`
+pub const CURL_GLOBAL_DEFAULT: c_long = CURL_GLOBAL_ALL;
+
+/// Acknowledge EINTR — allows callbacks to be interrupted.
+///
+/// C equivalent: `#define CURL_GLOBAL_ACK_EINTR (1 << 2)`
+pub const CURL_GLOBAL_ACK_EINTR: c_long = 1 << 2;
+
+// ============================================================================
+// Section 2: CURL_VERSION_* Feature Bitmask Constants
+// Source: include/curl/curl.h lines 3175–3211
+// ============================================================================
+
+/// IPv6-enabled.
+pub const CURL_VERSION_IPV6: c_int = 1 << 0;
+/// Kerberos V4 auth is supported (deprecated).
+pub const CURL_VERSION_KERBEROS4: c_int = 1 << 1;
+/// SSL options are present.
+pub const CURL_VERSION_SSL: c_int = 1 << 2;
+/// libz features are present.
+pub const CURL_VERSION_LIBZ: c_int = 1 << 3;
+/// NTLM auth is supported.
+pub const CURL_VERSION_NTLM: c_int = 1 << 4;
+/// Negotiate auth is supported (deprecated name).
+pub const CURL_VERSION_GSSNEGOTIATE: c_int = 1 << 5;
+/// Built with debug capabilities.
+pub const CURL_VERSION_DEBUG: c_int = 1 << 6;
+/// Asynchronous DNS resolves.
+pub const CURL_VERSION_ASYNCHDNS: c_int = 1 << 7;
+/// SPNEGO auth is supported.
+pub const CURL_VERSION_SPNEGO: c_int = 1 << 8;
+/// Supports files larger than 2GB.
+pub const CURL_VERSION_LARGEFILE: c_int = 1 << 9;
+/// Internationalized Domain Names are supported.
+pub const CURL_VERSION_IDN: c_int = 1 << 10;
+/// Built against Windows SSPI.
+pub const CURL_VERSION_SSPI: c_int = 1 << 11;
+/// Character conversions supported.
+pub const CURL_VERSION_CONV: c_int = 1 << 12;
+/// Debug memory tracking supported (deprecated).
+pub const CURL_VERSION_CURLDEBUG: c_int = 1 << 13;
+/// TLS-SRP auth is supported.
+pub const CURL_VERSION_TLSAUTH_SRP: c_int = 1 << 14;
+/// NTLM delegation to winbind helper is supported.
+pub const CURL_VERSION_NTLM_WB: c_int = 1 << 15;
+/// HTTP/2 support built-in.
+pub const CURL_VERSION_HTTP2: c_int = 1 << 16;
+/// Built against a GSS-API library.
+pub const CURL_VERSION_GSSAPI: c_int = 1 << 17;
+/// Kerberos V5 auth is supported.
+pub const CURL_VERSION_KERBEROS5: c_int = 1 << 18;
+/// Unix domain sockets support.
+pub const CURL_VERSION_UNIX_SOCKETS: c_int = 1 << 19;
+/// Mozilla's Public Suffix List, used for cookie domain verification.
+pub const CURL_VERSION_PSL: c_int = 1 << 20;
+/// HTTPS-proxy support built-in.
+pub const CURL_VERSION_HTTPS_PROXY: c_int = 1 << 21;
+/// Multiple SSL backends available.
+pub const CURL_VERSION_MULTI_SSL: c_int = 1 << 22;
+/// Brotli features are present.
+pub const CURL_VERSION_BROTLI: c_int = 1 << 23;
+/// Alt-Svc handling built-in.
+pub const CURL_VERSION_ALTSVC: c_int = 1 << 24;
+/// HTTP/3 support built-in.
+pub const CURL_VERSION_HTTP3: c_int = 1 << 25;
+/// Zstd features are present.
+pub const CURL_VERSION_ZSTD: c_int = 1 << 26;
+/// Unicode support on Windows.
+pub const CURL_VERSION_UNICODE: c_int = 1 << 27;
+/// HSTS is supported.
+pub const CURL_VERSION_HSTS: c_int = 1 << 28;
+/// libgsasl is supported.
+pub const CURL_VERSION_GSASL: c_int = 1 << 29;
+/// libcurl API is thread-safe.
+pub const CURL_VERSION_THREADSAFE: c_int = 1 << 30;
+
+// ============================================================================
+// Section 3: CURLversion Constants
+// Source: include/curl/curl.h lines 3088–3109
+// ============================================================================
+
+/// Version info struct age = 0 (introduced in curl 7.10).
+pub const CURLVERSION_FIRST: CURLversion = 0;
+/// Version info struct age = 1 (introduced in curl 7.11.1).
+pub const CURLVERSION_SECOND: CURLversion = 1;
+/// Version info struct age = 2 (introduced in curl 7.12.0).
+pub const CURLVERSION_THIRD: CURLversion = 2;
+/// Version info struct age = 3 (introduced in curl 7.16.1).
+pub const CURLVERSION_FOURTH: CURLversion = 3;
+/// Version info struct age = 4 (introduced in curl 7.57.0).
+pub const CURLVERSION_FIFTH: CURLversion = 4;
+/// Version info struct age = 5 (introduced in curl 7.66.0).
+pub const CURLVERSION_SIXTH: CURLversion = 5;
+/// Version info struct age = 6 (introduced in curl 7.70.0).
+pub const CURLVERSION_SEVENTH: CURLversion = 6;
+/// Version info struct age = 7 (introduced in curl 7.72.0).
+pub const CURLVERSION_EIGHTH: CURLversion = 7;
+/// Version info struct age = 8 (introduced in curl 7.75.0).
+pub const CURLVERSION_NINTH: CURLversion = 8;
+/// Version info struct age = 9 (introduced in curl 7.77.0).
+pub const CURLVERSION_TENTH: CURLversion = 9;
+/// Version info struct age = 10 (introduced in curl 7.87.0).
+pub const CURLVERSION_ELEVENTH: CURLversion = 10;
+/// Version info struct age = 11 (introduced in curl 8.8.0).
+pub const CURLVERSION_TWELFTH: CURLversion = 11;
+/// Symbolic alias for the latest version struct age.
+pub const CURLVERSION_NOW: CURLversion = CURLVERSION_TWELFTH;
+
+// ============================================================================
+// Section 4: CURLSSLBACKEND_* Constants
+// Source: include/curl/curl.h lines 151–167
+// ============================================================================
+
+/// No SSL backend.
+pub const CURLSSLBACKEND_NONE: curl_sslbackend = 0;
+/// OpenSSL backend.
+pub const CURLSSLBACKEND_OPENSSL: curl_sslbackend = 1;
+/// GnuTLS backend.
+pub const CURLSSLBACKEND_GNUTLS: curl_sslbackend = 2;
+/// wolfSSL backend.
+pub const CURLSSLBACKEND_WOLFSSL: curl_sslbackend = 7;
+/// Windows Schannel backend.
+pub const CURLSSLBACKEND_SCHANNEL: curl_sslbackend = 8;
+/// Apple Secure Transport backend (deprecated).
+pub const CURLSSLBACKEND_SECURETRANSPORT: curl_sslbackend = 9;
+/// mbedTLS backend.
+pub const CURLSSLBACKEND_MBEDTLS: curl_sslbackend = 11;
+/// BearSSL backend (deprecated).
+pub const CURLSSLBACKEND_BEARSSL: curl_sslbackend = 13;
+/// Rustls backend — the only backend in curl-rs.
+pub const CURLSSLBACKEND_RUSTLS: curl_sslbackend = 14;
+
+// ============================================================================
+// Section 5: Internal Static Data
+// ============================================================================
+
+/// Global initialization guard — ensures `curl_global_init` logic runs once.
+static GLOBAL_INIT: Once = Once::new();
+
+/// Whether global init has been called successfully at least once.
+static GLOBAL_INIT_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Static version string returned by `curl_version()`.
+/// Null-terminated for direct use as a C string.
+static VERSION_STRING: &[u8] = b"libcurl/8.19.0-DEV rustls\0";
+
+/// Bare version string for the `version` field of `curl_version_info_data`.
+/// Contains only the version number, matching C `LIBCURL_VERSION`.
+static BARE_VERSION_STRING: &[u8] = b"8.19.0-DEV\0";
+
+/// Static host string for the version info data.
+static HOST_STRING: &[u8] = b"x86_64-unknown-linux-gnu\0";
+
+/// Static SSL version string.
+static SSL_VERSION_STRING: &[u8] = b"rustls\0";
+
+/// Static libz version string.
+static LIBZ_VERSION_STRING: &[u8] = b"flate2\0";
+
+/// Static hyper version string.
+static HYPER_VERSION_STRING: &[u8] = b"hyper\0";
+
+/// Static QUIC version string.
+static QUIC_VERSION_STRING: &[u8] = b"quinn/h3\0";
+
+/// Static SSH version string.
+static SSH_VERSION_STRING: &[u8] = b"russh\0";
+
+/// Null-terminated protocol name strings.
+static PROTO_HTTP: &[u8] = b"http\0";
+static PROTO_HTTPS: &[u8] = b"https\0";
+static PROTO_FTP: &[u8] = b"ftp\0";
+static PROTO_FTPS: &[u8] = b"ftps\0";
+static PROTO_SCP: &[u8] = b"scp\0";
+static PROTO_SFTP: &[u8] = b"sftp\0";
+static PROTO_FILE: &[u8] = b"file\0";
+static PROTO_DICT: &[u8] = b"dict\0";
+static PROTO_GOPHER: &[u8] = b"gopher\0";
+static PROTO_GOPHERS: &[u8] = b"gophers\0";
+static PROTO_IMAP: &[u8] = b"imap\0";
+static PROTO_IMAPS: &[u8] = b"imaps\0";
+static PROTO_LDAP: &[u8] = b"ldap\0";
+static PROTO_LDAPS: &[u8] = b"ldaps\0";
+static PROTO_MQTT: &[u8] = b"mqtt\0";
+static PROTO_POP3: &[u8] = b"pop3\0";
+static PROTO_POP3S: &[u8] = b"pop3s\0";
+static PROTO_RTSP: &[u8] = b"rtsp\0";
+static PROTO_SMB: &[u8] = b"smb\0";
+static PROTO_SMBS: &[u8] = b"smbs\0";
+static PROTO_SMTP: &[u8] = b"smtp\0";
+static PROTO_SMTPS: &[u8] = b"smtps\0";
+static PROTO_TELNET: &[u8] = b"telnet\0";
+static PROTO_TFTP: &[u8] = b"tftp\0";
+static PROTO_WS: &[u8] = b"ws\0";
+static PROTO_WSS: &[u8] = b"wss\0";
+
+/// Null-terminated array of protocol name C-string pointers.
+/// The array itself is terminated by a null pointer.
+/// Wrapped in `SyncPtrArray` because `*const c_char` does not implement `Sync`.
+static PROTOCOLS: SyncPtrArray<*const c_char, 27> = SyncPtrArray([
+    PROTO_DICT.as_ptr() as *const c_char,
+    PROTO_FILE.as_ptr() as *const c_char,
+    PROTO_FTP.as_ptr() as *const c_char,
+    PROTO_FTPS.as_ptr() as *const c_char,
+    PROTO_GOPHER.as_ptr() as *const c_char,
+    PROTO_GOPHERS.as_ptr() as *const c_char,
+    PROTO_HTTP.as_ptr() as *const c_char,
+    PROTO_HTTPS.as_ptr() as *const c_char,
+    PROTO_IMAP.as_ptr() as *const c_char,
+    PROTO_IMAPS.as_ptr() as *const c_char,
+    PROTO_LDAP.as_ptr() as *const c_char,
+    PROTO_LDAPS.as_ptr() as *const c_char,
+    PROTO_MQTT.as_ptr() as *const c_char,
+    PROTO_POP3.as_ptr() as *const c_char,
+    PROTO_POP3S.as_ptr() as *const c_char,
+    PROTO_RTSP.as_ptr() as *const c_char,
+    PROTO_SCP.as_ptr() as *const c_char,
+    PROTO_SFTP.as_ptr() as *const c_char,
+    PROTO_SMB.as_ptr() as *const c_char,
+    PROTO_SMBS.as_ptr() as *const c_char,
+    PROTO_SMTP.as_ptr() as *const c_char,
+    PROTO_SMTPS.as_ptr() as *const c_char,
+    PROTO_TELNET.as_ptr() as *const c_char,
+    PROTO_TFTP.as_ptr() as *const c_char,
+    PROTO_WS.as_ptr() as *const c_char,
+    PROTO_WSS.as_ptr() as *const c_char,
+    ptr::null(), // sentinel
+]);
+
+/// Feature name strings for the version info data.
+static FEAT_IPV6: &[u8] = b"IPv6\0";
+static FEAT_SSL: &[u8] = b"SSL\0";
+static FEAT_LIBZ: &[u8] = b"libz\0";
+static FEAT_NTLM: &[u8] = b"NTLM\0";
+static FEAT_ASYNCHDNS: &[u8] = b"AsynchDNS\0";
+static FEAT_SPNEGO: &[u8] = b"SPNEGO\0";
+static FEAT_LARGEFILE: &[u8] = b"Largefile\0";
+static FEAT_IDN: &[u8] = b"IDN\0";
+static FEAT_HTTP2: &[u8] = b"HTTP2\0";
+static FEAT_HTTP3: &[u8] = b"HTTP3\0";
+static FEAT_GSSAPI: &[u8] = b"GSS-API\0";
+static FEAT_KERBEROS5: &[u8] = b"Kerberos\0";
+static FEAT_UNIX_SOCKETS: &[u8] = b"UnixSockets\0";
+static FEAT_HTTPS_PROXY: &[u8] = b"HTTPS-proxy\0";
+static FEAT_BROTLI: &[u8] = b"brotli\0";
+static FEAT_ALTSVC: &[u8] = b"alt-svc\0";
+static FEAT_ZSTD: &[u8] = b"zstd\0";
+static FEAT_HSTS: &[u8] = b"HSTS\0";
+static FEAT_THREADSAFE: &[u8] = b"threadsafe\0";
+
+/// Null-terminated array of feature name strings.
+/// Wrapped in `SyncPtrArray` because `*const c_char` does not implement `Sync`.
+static FEATURE_NAMES: SyncPtrArray<*const c_char, 20> = SyncPtrArray([
+    FEAT_ALTSVC.as_ptr() as *const c_char,
+    FEAT_ASYNCHDNS.as_ptr() as *const c_char,
+    FEAT_BROTLI.as_ptr() as *const c_char,
+    FEAT_GSSAPI.as_ptr() as *const c_char,
+    FEAT_HTTP2.as_ptr() as *const c_char,
+    FEAT_HTTP3.as_ptr() as *const c_char,
+    FEAT_HTTPS_PROXY.as_ptr() as *const c_char,
+    FEAT_HSTS.as_ptr() as *const c_char,
+    FEAT_IDN.as_ptr() as *const c_char,
+    FEAT_IPV6.as_ptr() as *const c_char,
+    FEAT_KERBEROS5.as_ptr() as *const c_char,
+    FEAT_LARGEFILE.as_ptr() as *const c_char,
+    FEAT_LIBZ.as_ptr() as *const c_char,
+    FEAT_NTLM.as_ptr() as *const c_char,
+    FEAT_SPNEGO.as_ptr() as *const c_char,
+    FEAT_SSL.as_ptr() as *const c_char,
+    FEAT_THREADSAFE.as_ptr() as *const c_char,
+    FEAT_UNIX_SOCKETS.as_ptr() as *const c_char,
+    FEAT_ZSTD.as_ptr() as *const c_char,
+    ptr::null(), // sentinel
+]);
+
+/// Static rustls backend descriptor for `curl_global_sslset`.
+#[repr(C)]
+struct RustlsBackendInfo {
+    id: curl_sslbackend,
+    name: *const c_char,
+}
+
+// SAFETY: RustlsBackendInfo contains only an integer and a pointer to static
+// data, both of which are inherently Send + Sync.
+unsafe impl Send for RustlsBackendInfo {}
+unsafe impl Sync for RustlsBackendInfo {}
+
+static RUSTLS_BACKEND_NAME: &[u8] = b"rustls\0";
+
+static RUSTLS_BACKEND_INFO: RustlsBackendInfo = RustlsBackendInfo {
+    id: CURLSSLBACKEND_RUSTLS,
+    name: RUSTLS_BACKEND_NAME.as_ptr() as *const c_char,
+};
+
+/// Pointer array for `curl_global_sslset` avail output.
+/// Contains a pointer to the rustls backend info followed by a null sentinel.
+/// Wrapped in `SyncPtrArray` because `*const curl_ssl_backend` does not
+/// implement `Sync`.
+static SSLSET_BACKENDS: SyncPtrArray<*const curl_ssl_backend, 2> = SyncPtrArray([
+    // SAFETY: We cast `&RustlsBackendInfo` to `*const curl_ssl_backend` because
+    // `RustlsBackendInfo` is `#[repr(C)]` with fields {id: curl_sslbackend, name:
+    // *const c_char} which is layout-compatible with the C `struct curl_ssl_backend`.
+    // The `curl_ssl_backend` opaque type in types.rs is a zero-sized placeholder;
+    // the actual struct layout is defined by `RustlsBackendInfo` above.
+    &RUSTLS_BACKEND_INFO as *const RustlsBackendInfo as *const curl_ssl_backend,
+    ptr::null(),
+]);
+
+/// Compute the features bitmask for the version info data.
+/// Reflects the capabilities of the curl-rs Rust implementation.
+const fn compute_features() -> c_int {
+    CURL_VERSION_IPV6
+        | CURL_VERSION_SSL
+        | CURL_VERSION_LIBZ
+        | CURL_VERSION_NTLM
+        | CURL_VERSION_GSSNEGOTIATE
+        | CURL_VERSION_ASYNCHDNS
+        | CURL_VERSION_SPNEGO
+        | CURL_VERSION_LARGEFILE
+        | CURL_VERSION_IDN
+        | CURL_VERSION_HTTP2
+        | CURL_VERSION_GSSAPI
+        | CURL_VERSION_KERBEROS5
+        | CURL_VERSION_UNIX_SOCKETS
+        | CURL_VERSION_HTTPS_PROXY
+        | CURL_VERSION_BROTLI
+        | CURL_VERSION_ALTSVC
+        | CURL_VERSION_HTTP3
+        | CURL_VERSION_ZSTD
+        | CURL_VERSION_HSTS
+        | CURL_VERSION_THREADSAFE
+}
+
+/// Lazily-initialized version info data struct returned by `curl_version_info()`.
+///
+/// Uses `OnceLock` to safely initialize the struct at first access, avoiding
+/// cross-static reference issues that arise when one static tries to call
+/// `.as_ptr()` on another static's inner array at compile time.
+fn version_info_static() -> &'static curl_version_info_data {
+    use std::sync::OnceLock;
+    static DATA: OnceLock<SyncVersionInfoData> = OnceLock::new();
+    &DATA
+        .get_or_init(|| {
+            SyncVersionInfoData(curl_version_info_data {
+                age: CURLVERSION_NOW,
+                version: BARE_VERSION_STRING.as_ptr() as *const c_char,
+                version_num: 0x081300,
+                host: HOST_STRING.as_ptr() as *const c_char,
+                features: compute_features(),
+                ssl_version: SSL_VERSION_STRING.as_ptr() as *const c_char,
+                ssl_version_num: 0, // deprecated, always 0
+                libz_version: LIBZ_VERSION_STRING.as_ptr() as *const c_char,
+                protocols: PROTOCOLS.0.as_ptr(),
+                // CURLVERSION_SECOND
+                ares: ptr::null(),
+                ares_num: 0,
+                // CURLVERSION_THIRD
+                libidn: ptr::null(),
+                // CURLVERSION_FOURTH
+                iconv_ver_num: 0,
+                libssh_version: SSH_VERSION_STRING.as_ptr() as *const c_char,
+                // CURLVERSION_FIFTH
+                brotli_ver_num: 0, // no numeric brotli version available
+                brotli_version: ptr::null(),
+                // CURLVERSION_SIXTH
+                nghttp2_ver_num: 0, // using hyper, not nghttp2
+                nghttp2_version: ptr::null(),
+                quic_version: QUIC_VERSION_STRING.as_ptr() as *const c_char,
+                // CURLVERSION_SEVENTH
+                cainfo: ptr::null(),
+                capath: ptr::null(),
+                // CURLVERSION_EIGHTH
+                zstd_ver_num: 0,
+                zstd_version: ptr::null(),
+                // CURLVERSION_NINTH
+                hyper_version: HYPER_VERSION_STRING.as_ptr() as *const c_char,
+                // CURLVERSION_TENTH
+                gsasl_version: ptr::null(),
+                // CURLVERSION_ELEVENTH
+                feature_names: FEATURE_NAMES.0.as_ptr(),
+                // CURLVERSION_TWELFTH
+                rtmp_version: ptr::null(),
+            })
+        })
+        .0
+}
+
+// NOTE: The error string table (ERROR_STRINGS) and curl_easy_strerror() are
+// implemented in easy.rs alongside the other curl_easy_* symbols.
+
+// ============================================================================
+// Section 7: Global Functions (5)
+// ============================================================================
+
+/// Initialize the curl library globally.
+///
+/// Must be called at least once before using any other curl function.
+/// Thread-safe when `CURL_VERSION_THREADSAFE` is set.
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN CURLcode curl_global_init(long flags);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_global_init(flags: c_long) -> CURLcode {
+    // SAFETY: This function is called by C consumers to initialize the library.
+    // The `flags` parameter is an integer bitmask — no pointer dereferences.
+    // We delegate to the Rust library's `global_init` which uses OnceLock
+    // internally for thread safety.
+    let mut result = CURLE_OK;
+    GLOBAL_INIT.call_once(|| {
+        // Allow: c_long is i64 on this platform but i32 on 32-bit targets.
+        #[allow(clippy::useless_conversion)]
+        match curl_rs_lib::global_init(i64::from(flags)) {
+            Ok(()) => {
+                GLOBAL_INIT_DONE.store(true, std::sync::atomic::Ordering::Release);
+            }
+            Err(_) => {
+                result = CURLE_FAILED_INIT;
+            }
+        }
+    });
+    result
+}
+
+/// Initialize the curl library with custom memory allocation callbacks.
+///
+/// The custom allocator callbacks are stored but Rust manages its own
+/// memory — the callbacks exist for C API compatibility only.
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN CURLcode curl_global_init_mem(long flags,
+///     curl_malloc_callback m, curl_free_callback f,
+///     curl_realloc_callback r, curl_strdup_callback s,
+///     curl_calloc_callback c);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_global_init_mem(
+    flags: c_long,
+    _m: curl_malloc_callback,
+    _f: curl_free_callback,
+    _r: curl_realloc_callback,
+    _s: curl_strdup_callback,
+    _c: curl_calloc_callback,
+) -> CURLcode {
+    // SAFETY: All parameters are either integer flags or function pointers.
+    // The custom allocator callbacks are accepted for C API compatibility but
+    // are not used — Rust manages its own memory via the global allocator.
+    // We simply delegate to the standard global init.
+    curl_global_init(flags)
+}
+
+/// Clean up the curl library globally.
+///
+/// Should be called once per application after all curl operations are done.
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN void curl_global_cleanup(void);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_global_cleanup() {
+    // SAFETY: No pointer parameters. Delegates to the Rust library's cleanup
+    // function which is idempotent and thread-safe via OnceLock.
+    curl_rs_lib::global_cleanup();
+}
+
+/// Configure the curl library's trace/logging output.
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN CURLcode curl_global_trace(const char *config);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_global_trace(config: *const c_char) -> CURLcode {
+    // SAFETY: `config` is a C string pointer that we read but do not write.
+    // If null, we treat it as a no-op (matching curl 8.x behavior where
+    // null config resets tracing).
+    if config.is_null() {
+        return CURLE_OK;
+    }
+
+    // SAFETY: The caller guarantees `config` is a valid null-terminated C
+    // string. We convert it to a Rust `&str` for inspection.
+    let config_cstr = CStr::from_ptr(config);
+    let _config_str = match config_cstr.to_str() {
+        Ok(s) => s,
+        Err(_) => return CURLE_BAD_FUNCTION_ARGUMENT,
+    };
+
+    // In the Rust implementation, tracing is configured via the tracing-subscriber
+    // crate during global_init. This function accepts the config string for
+    // API compatibility but the tracing configuration has already been set up.
+    // Future enhancement: parse the config string to dynamically adjust tracing
+    // filters at runtime.
+    CURLE_OK
+}
+
+/// Select the SSL backend to use.
+///
+/// For curl-rs, only the rustls backend is available. If the caller requests
+/// rustls (by id or name), we return success. Otherwise, we return
+/// `CURLSSLSET_UNKNOWN_BACKEND`. If called after `curl_global_init`, returns
+/// `CURLSSLSET_TOO_LATE`.
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN CURLsslset curl_global_sslset(curl_sslbackend id,
+///     const char *name,
+///     const curl_ssl_backend ***avail);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_global_sslset(
+    id: curl_sslbackend,
+    name: *const c_char,
+    avail: *mut *const *const curl_ssl_backend,
+) -> CURLsslset {
+    // SAFETY: We read `id` (integer), optionally read `name` (C string pointer),
+    // and optionally write to `avail` (output triple-pointer). All pointer
+    // dereferences are guarded by null checks.
+    //
+    // The C signature is: const curl_ssl_backend ***avail
+    // - avail is a writable pointer (*mut)
+    // - *avail is set to a pointer to a null-terminated array of backend pointers
+
+    // If avail is not null, populate it with the list of available backends.
+    if !avail.is_null() {
+        // SAFETY: Caller guarantees `avail` is a valid writable pointer.
+        // We write a pointer to our static SSLSET_BACKENDS array, which
+        // is a null-terminated array of *const curl_ssl_backend.
+        *avail = SSLSET_BACKENDS.0.as_ptr();
+    }
+
+    // If global init has already been called, it's too late to change backends.
+    if GLOBAL_INIT_DONE.load(std::sync::atomic::Ordering::Acquire) {
+        return CURLSSLSET_TOO_LATE;
+    }
+
+    // Check if the caller is requesting rustls by name.
+    if !name.is_null() {
+        // SAFETY: Caller guarantees `name` is a valid null-terminated C string.
+        let name_cstr = CStr::from_ptr(name);
+        if let Ok(name_str) = name_cstr.to_str() {
+            if name_str.eq_ignore_ascii_case("rustls") {
+                return CURLSSLSET_OK;
+            }
+        }
+        return CURLSSLSET_UNKNOWN_BACKEND;
+    }
+
+    // Check by id.
+    if id == CURLSSLBACKEND_NONE {
+        // CURLSSLBACKEND_NONE means "just report available backends" — always OK.
+        return CURLSSLSET_OK;
+    }
+    if id == CURLSSLBACKEND_RUSTLS {
+        return CURLSSLSET_OK;
+    }
+
+    CURLSSLSET_UNKNOWN_BACKEND
+}
+
+// ============================================================================
+// Section 8: Standalone Utility Functions
+// ============================================================================
+
+/// Returns a human-readable version string.
+///
+/// The returned pointer is to static data and must not be freed by the caller.
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN char *curl_version(void);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_version() -> *const c_char {
+    // SAFETY: Returns a pointer to a static null-terminated byte string.
+    // The string has 'static lifetime and is never modified.
+    VERSION_STRING.as_ptr() as *const c_char
+}
+
+/// Returns detailed version and feature information.
+///
+/// The returned pointer is to a static struct and must not be freed.
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN curl_version_info_data *curl_version_info(CURLversion);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_version_info(_age: CURLversion) -> *mut curl_version_info_data {
+    // SAFETY: Returns a pointer to a lazily-initialized `curl_version_info_data`
+    // struct stored inside a `OnceLock<SyncVersionInfoData>` static. The struct
+    // has 'static lifetime and all its pointer fields point to static data.
+    // We cast away const-ness to match the C API signature which returns
+    // `curl_version_info_data *` (not const), though the data is effectively
+    // read-only.
+    //
+    // The `age` parameter controls which fields are valid in the returned
+    // struct. Since we always populate all fields up to CURLVERSION_TWELFTH,
+    // we return the full struct regardless of the requested age — matching
+    // the C implementation behavior where the struct's own `age` field
+    // tells the caller how many fields are valid.
+    version_info_static() as *const curl_version_info_data as *mut curl_version_info_data
+}
+
+/// Look up an environment variable by name.
+///
+/// Returns a malloc'd copy of the variable's value, or NULL if not found.
+/// The returned pointer must be freed with `curl_free()`.
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN char *curl_getenv(const char *variable);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_getenv(variable: *const c_char) -> *mut c_char {
+    // SAFETY: `variable` must be a valid null-terminated C string.
+    // We convert it to a Rust &str to call std::env::var.
+    if variable.is_null() {
+        return ptr::null_mut();
+    }
+
+    // SAFETY: Caller guarantees `variable` is a valid, null-terminated C string.
+    let var_name = match CStr::from_ptr(variable).to_str() {
+        Ok(s) => s,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    // Look up the environment variable.
+    let value = match std::env::var(var_name) {
+        Ok(v) => v,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    // Allocate a C string copy using libc::malloc so it can be freed with
+    // curl_free() / free().
+    let len = value.len();
+    // SAFETY: We allocate (len + 1) bytes — room for the string plus null
+    // terminator. malloc returns a valid pointer or null on failure.
+    let buf = malloc(len + 1) as *mut c_char;
+    if buf.is_null() {
+        return ptr::null_mut();
+    }
+
+    // SAFETY: We just allocated `len + 1` bytes at `buf`. `value.as_ptr()`
+    // points to `len` valid bytes. The ranges do not overlap since `buf`
+    // is freshly allocated.
+    ptr::copy_nonoverlapping(value.as_ptr() as *const c_char, buf, len);
+    // Null-terminate.
+    *buf.add(len) = 0;
+
+    buf
+}
+
+/// Free memory allocated by curl functions.
+///
+/// Safely handles NULL pointers (no-op).
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN void curl_free(void *p);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_free(p: *mut c_void) {
+    // SAFETY: If `p` is null, `free` is a no-op per the C standard.
+    // Otherwise, `p` must have been allocated by a curl function using
+    // `libc::malloc` (which `curl_getenv`, `curl_easy_escape`, and
+    // `curl_easy_unescape` all use).
+    if !p.is_null() {
+        free(p);
+    }
+}
+
+// NOTE: curl_easy_escape and curl_easy_unescape are defined in easy.rs,
+// which is the canonical home for all curl_easy_* symbols. They are listed
+// here in the task spec because they appear in curl.h alongside global
+// functions, but they are implemented in the easy module to avoid symbol
+// collisions.
+
+/// Parse a date string and return the time as seconds since epoch.
+///
+/// The second parameter `unused` is always ignored (historical artifact).
+/// Returns `-1` on parse failure.
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN time_t curl_getdate(const char *p, const time_t *unused);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_getdate(
+    p: *const c_char,
+    _unused: *const libc::time_t,
+) -> libc::time_t {
+    // SAFETY: `p` must be a valid null-terminated C string. `_unused` is
+    // completely ignored per the curl API specification.
+    if p.is_null() {
+        return -1;
+    }
+
+    // SAFETY: Caller guarantees `p` is a valid, null-terminated C string.
+    let date_str = match CStr::from_ptr(p).to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+
+    // Use the Rust library's date parser.
+    match curl_rs_lib::util::parsedate::parse_date(date_str) {
+        Ok(timestamp) => timestamp as libc::time_t,
+        Err(_) => -1,
+    }
+}
+
+// NOTE: curl_easy_strerror, curl_easy_ssls_import, and curl_easy_ssls_export
+// are defined in easy.rs, which is the canonical home for all curl_easy_*
+// symbols. They are listed here in the task spec because they appear in
+// curl.h alongside global functions, but they are implemented in the easy
+// module to avoid #[no_mangle] symbol collisions.
