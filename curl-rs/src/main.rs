@@ -9,6 +9,7 @@ pub mod findfile;
 pub mod getpass;
 pub mod libinfo;
 pub mod msgs;
+pub mod paramhelp;
 pub mod progress_display;
 pub mod stderr;
 pub mod terminal;

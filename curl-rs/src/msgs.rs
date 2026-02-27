@@ -441,6 +441,12 @@ mod tests {
     use crate::libinfo::LibCurlInfo;
     use crate::stderr::{tool_init_stderr, tool_set_stderr, tool_stderr_close};
     use std::fs;
+    use std::sync::Mutex;
+
+    /// Global mutex to serialise tests that redirect the shared stderr
+    /// stream.  Without this, parallel test threads race on the global
+    /// stderr state causing non-deterministic capture results.
+    static STDERR_LOCK: Mutex<()> = Mutex::new(());
 
     /// Construct a `GlobalConfig` for testing without calling
     /// `globalconf_init()` (which depends on the library being
@@ -547,6 +553,7 @@ mod tests {
     /// warnf with silent=false should not panic.
     #[test]
     fn warnf_not_silent_does_not_panic() {
+        let _guard = STDERR_LOCK.lock().unwrap();
         tool_init_stderr();
         let global = make_test_global();
         warnf(&global, "test warning");
@@ -555,6 +562,7 @@ mod tests {
     /// warnf with silent=true should silently do nothing.
     #[test]
     fn warnf_silent_suppresses() {
+        let _guard = STDERR_LOCK.lock().unwrap();
         tool_init_stderr();
         let mut global = make_test_global();
         global.silent = true;
@@ -564,6 +572,7 @@ mod tests {
     /// notef with TraceType::None should suppress output.
     #[test]
     fn notef_none_suppresses() {
+        let _guard = STDERR_LOCK.lock().unwrap();
         tool_init_stderr();
         let global = make_test_global(); // tracetype defaults to None
         notef(&global, "suppressed note");
@@ -572,6 +581,7 @@ mod tests {
     /// notef with any non-None TraceType should output.
     #[test]
     fn notef_verbose_outputs() {
+        let _guard = STDERR_LOCK.lock().unwrap();
         tool_init_stderr();
         let mut global = make_test_global();
         global.tracetype = TraceType::Verbose;
@@ -581,6 +591,7 @@ mod tests {
     /// notef with TraceType::Ascii should output.
     #[test]
     fn notef_ascii_outputs() {
+        let _guard = STDERR_LOCK.lock().unwrap();
         tool_init_stderr();
         let mut global = make_test_global();
         global.tracetype = TraceType::Ascii;
@@ -590,6 +601,7 @@ mod tests {
     /// notef with TraceType::Plain should output.
     #[test]
     fn notef_plain_outputs() {
+        let _guard = STDERR_LOCK.lock().unwrap();
         tool_init_stderr();
         let mut global = make_test_global();
         global.tracetype = TraceType::Plain;
@@ -599,6 +611,7 @@ mod tests {
     /// errorf with !silent should output.
     #[test]
     fn errorf_not_silent_outputs() {
+        let _guard = STDERR_LOCK.lock().unwrap();
         tool_init_stderr();
         let global = make_test_global();
         errorf(&global, "error msg");
@@ -607,6 +620,7 @@ mod tests {
     /// errorf with silent=true and showerror=false should suppress.
     #[test]
     fn errorf_silent_no_showerror_suppresses() {
+        let _guard = STDERR_LOCK.lock().unwrap();
         tool_init_stderr();
         let mut global = make_test_global();
         global.silent = true;
@@ -617,6 +631,7 @@ mod tests {
     /// errorf with silent=true and showerror=true should still output.
     #[test]
     fn errorf_silent_with_showerror_outputs() {
+        let _guard = STDERR_LOCK.lock().unwrap();
         tool_init_stderr();
         let mut global = make_test_global();
         global.silent = true;
@@ -627,6 +642,7 @@ mod tests {
     /// helpf with Some message should not panic.
     #[test]
     fn helpf_with_message() {
+        let _guard = STDERR_LOCK.lock().unwrap();
         tool_init_stderr();
         helpf(Some("unknown option"));
     }
@@ -634,6 +650,7 @@ mod tests {
     /// helpf with None should not panic.
     #[test]
     fn helpf_without_message() {
+        let _guard = STDERR_LOCK.lock().unwrap();
         tool_init_stderr();
         helpf(None);
     }
@@ -641,6 +658,7 @@ mod tests {
     /// Empty messages must not crash any function.
     #[test]
     fn empty_messages_are_safe() {
+        let _guard = STDERR_LOCK.lock().unwrap();
         tool_init_stderr();
         let global = make_test_global();
         warnf(&global, "");
@@ -656,6 +674,10 @@ mod tests {
     /// Helper: redirect stderr to a temp file, run a closure, then
     /// read the file content.  Restores stderr after capture.
     fn capture_stderr<F: FnOnce()>(f: F) -> String {
+        // Acquire the global lock so that only one test at a time can
+        // redirect the shared stderr stream.
+        let _guard = STDERR_LOCK.lock().unwrap();
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("capture.txt");
         let path_str = path.to_str().unwrap();
@@ -768,6 +790,11 @@ mod tests {
     /// (9 chars prefix) is 31 characters.
     #[test]
     fn voutf_wraps_at_word_boundary() {
+        // Acquire the global lock first, then set COLUMNS while
+        // holding the lock so that no other test can race on the
+        // shared environment variable.
+        let _guard = STDERR_LOCK.lock().unwrap();
+
         // Save original env
         let orig = std::env::var("COLUMNS").ok();
 
@@ -775,18 +802,26 @@ mod tests {
         // so available text width is 31.
         std::env::set_var("COLUMNS", "40");
 
-        let output = capture_stderr(|| {
-            let global = make_test_global();
-            // 41 chars total = "This is a long warning message that wrap"
-            // but with available width 31, it should wrap.
-            warnf(&global, "This is a long warning message that wraps around");
-        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture_wrap.txt");
+        let path_str = path.to_str().unwrap();
 
-        // Restore env
+        tool_init_stderr();
+        tool_set_stderr(path_str).unwrap();
+
+        let global = make_test_global();
+        warnf(&global, "This is a long warning message that wraps around");
+
+        tool_stderr_close();
+        tool_init_stderr();
+
+        // Restore env before assertions (still under the lock)
         match orig {
             Some(v) => std::env::set_var("COLUMNS", v),
             None => std::env::remove_var("COLUMNS"),
         }
+
+        let output = fs::read_to_string(&path).unwrap();
 
         // The output should contain multiple "Warning: " prefixed lines.
         let lines: Vec<&str> = output.lines().collect();
@@ -809,19 +844,30 @@ mod tests {
     /// Verify that short messages are NOT wrapped.
     #[test]
     fn voutf_no_wrap_for_short_message() {
+        let _guard = STDERR_LOCK.lock().unwrap();
+
         let orig = std::env::var("COLUMNS").ok();
         std::env::set_var("COLUMNS", "80");
 
-        let output = capture_stderr(|| {
-            let global = make_test_global();
-            warnf(&global, "short");
-        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture_nowrap.txt");
+        let path_str = path.to_str().unwrap();
+
+        tool_init_stderr();
+        tool_set_stderr(path_str).unwrap();
+
+        let global = make_test_global();
+        warnf(&global, "short");
+
+        tool_stderr_close();
+        tool_init_stderr();
 
         match orig {
             Some(v) => std::env::set_var("COLUMNS", v),
             None => std::env::remove_var("COLUMNS"),
         }
 
+        let output = fs::read_to_string(&path).unwrap();
         assert_eq!(output, "Warning: short\n");
     }
 
