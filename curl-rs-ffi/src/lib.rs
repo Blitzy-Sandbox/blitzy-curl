@@ -7,6 +7,7 @@ pub mod easy;
 pub mod header;
 pub mod mime;
 pub mod mprintf;
+pub mod multi;
 pub mod options;
 pub mod share;
 pub mod slist;
