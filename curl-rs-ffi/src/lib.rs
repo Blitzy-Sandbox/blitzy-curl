@@ -13,3 +13,4 @@ pub mod options;
 pub mod share;
 pub mod slist;
 pub mod url;
+pub mod ws;
