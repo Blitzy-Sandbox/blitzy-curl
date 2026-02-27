@@ -17,6 +17,7 @@ pub mod operhlp;
 pub mod parsecfg;
 pub mod paramhelp;
 pub mod progress_display;
+pub mod setopt;
 pub mod stderr;
 pub mod terminal;
 pub mod urlglob;
