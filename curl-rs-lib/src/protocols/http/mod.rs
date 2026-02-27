@@ -5,3 +5,4 @@
 //! AWS Signature V4 request signing.
 
 pub mod chunks;
+pub mod h1;
