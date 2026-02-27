@@ -9,6 +9,7 @@ pub mod filetime;
 pub mod findfile;
 pub mod formparse;
 pub mod getpass;
+pub mod help;
 pub mod ipfs;
 pub mod libinfo;
 pub mod msgs;
