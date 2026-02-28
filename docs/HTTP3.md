@@ -390,7 +390,7 @@ by pure-Rust crates. No C QUIC or TLS libraries are linked.
 | Crate | Version | Role |
 |-------|---------|------|
 | [quinn](https://crates.io/crates/quinn) | 0.11.9 | QUIC transport layer |
-| [h3](https://crates.io/crates/h3) | 0.0.7 | HTTP/3 protocol implementation |
+| [h3](https://crates.io/crates/h3) | 0.0.8 | HTTP/3 protocol implementation |
 | [h3-quinn](https://crates.io/crates/h3-quinn) | 0.0.10 | Integration adapter between quinn and h3 |
 | [rustls](https://crates.io/crates/rustls) | 0.23.36 | TLS 1.2/1.3 for QUIC — no C TLS library linkage |
 
