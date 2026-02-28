@@ -842,6 +842,243 @@ pub unsafe extern "C" fn curl_getdate(
 // module to avoid #[no_mangle] symbol collisions.
 
 // ============================================================================
+// Deprecated symbols — required for ABI parity with curl 8.x
+//
+// Per AAP Section 0.7.1: "nm symbol export list of libcurl-rs.so MUST match
+// curl 8.x libcurl.so symbol export list."
+//
+// These 7 symbols are deprecated in curl 8.x but still present in the export
+// table.  They delegate to their non-deprecated equivalents where possible,
+// or return an error code indicating the function is obsolete.
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// curl_escape — DEPRECATED: use curl_easy_escape instead
+// ---------------------------------------------------------------------------
+
+/// Deprecated URL-encoding function.
+///
+/// This is the pre-7.x interface.  It delegates to `curl_easy_escape` with
+/// a null handle, which is valid per the curl 8.x implementation.
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN CURL_DEPRECATED(7.15.4, "Use curl_easy_escape")
+/// char *curl_escape(const char *string, int length);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_escape(
+    string: *const c_char,
+    length: c_int,
+) -> *mut c_char {
+    // SAFETY: Delegates to curl_easy_escape which handles null checks
+    // internally.  Passing a null handle is explicitly supported for this
+    // deprecated wrapper — curl_easy_escape only uses the handle for
+    // connection encoding which defaults to UTF-8 when handle is null.
+    crate::easy::curl_easy_escape(std::ptr::null_mut(), string, length)
+}
+
+// ---------------------------------------------------------------------------
+// curl_unescape — DEPRECATED: use curl_easy_unescape instead
+// ---------------------------------------------------------------------------
+
+/// Deprecated URL-decoding function.
+///
+/// Delegates to `curl_easy_unescape` with a null handle and ignoring the
+/// output length parameter.
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN CURL_DEPRECATED(7.15.4, "Use curl_easy_unescape")
+/// char *curl_unescape(const char *string, int length);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_unescape(
+    string: *const c_char,
+    length: c_int,
+) -> *mut c_char {
+    // SAFETY: Delegates to curl_easy_unescape which handles null checks.
+    // The output length is written to a stack variable which is discarded.
+    let mut outlength: c_int = 0;
+    crate::easy::curl_easy_unescape(
+        std::ptr::null_mut(),
+        string,
+        length,
+        &mut outlength as *mut c_int,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// curl_formadd — DEPRECATED: use curl_mime_* API instead
+// ---------------------------------------------------------------------------
+
+/// Deprecated multipart form-data builder.
+///
+/// This function was superseded by the MIME API (`curl_mime_*`) in curl 7.56.0.
+/// The Rust implementation returns `CURL_FORMADD_DISABLED` to indicate the
+/// function is not supported, matching the behavior of curl builds compiled
+/// with `CURL_DISABLE_FORM_API`.
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN CURL_DEPRECATED(7.56.0, "Use curl_mime_init")
+/// CURLFORMcode curl_formadd(struct curl_httppost **httppost,
+///                           struct curl_httppost **last_post, ...);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_formadd(
+    _httppost: *mut *mut c_void,
+    _last_post: *mut *mut c_void,
+    // Variadic args are not directly supported in stable Rust extern "C" —
+    // this stub accepts the minimum required parameters.  In practice,
+    // callers of curl_formadd always pass at least the two pointer-to-pointer
+    // arguments.  Additional variadic args are harmless to ignore since we
+    // return the disabled error code unconditionally.
+) -> c_int {
+    // SAFETY: No memory is accessed through the pointers. We return the
+    // CURL_FORMADD_DISABLED constant (6) to signal this API is disabled.
+    6 // CURL_FORMADD_DISABLED
+}
+
+// ---------------------------------------------------------------------------
+// curl_formfree — DEPRECATED: use curl_mime_free instead
+// ---------------------------------------------------------------------------
+
+/// Deprecated function to free a curl_httppost chain.
+///
+/// Since `curl_formadd` returns DISABLED, no valid httppost chains can exist.
+/// This function is a no-op that accepts and ignores the pointer.
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN CURL_DEPRECATED(7.56.0, "Use curl_mime_free")
+/// void curl_formfree(struct curl_httppost *form);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_formfree(_form: *mut c_void) {
+    // SAFETY: No-op. Since curl_formadd always returns DISABLED, no
+    // valid form chains exist to free.
+}
+
+// ---------------------------------------------------------------------------
+// curl_formget — DEPRECATED: use curl_mime_data_cb instead
+// ---------------------------------------------------------------------------
+
+/// Deprecated function to serialize a multipart form.
+///
+/// Since `curl_formadd` returns DISABLED and no valid form chains exist,
+/// this function always returns -1 (error).
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN CURL_DEPRECATED(7.56.0, "")
+/// int curl_formget(struct curl_httppost *form, void *arg,
+///                  curl_formget_callback append);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_formget(
+    _form: *mut c_void,
+    _arg: *mut c_void,
+    _append: Option<unsafe extern "C" fn(*mut c_void, *const c_char, usize) -> usize>,
+) -> c_int {
+    // SAFETY: No pointers are dereferenced. Returns -1 to indicate error
+    // since no valid form data exists.
+    -1
+}
+
+// ---------------------------------------------------------------------------
+// curl_strequal — DEPRECATED: use strcmp from platform libc
+// ---------------------------------------------------------------------------
+
+/// Deprecated case-insensitive string comparison.
+///
+/// Returns non-zero if the strings match (case-insensitive), zero otherwise.
+/// This matches the curl 8.x behavior where `curl_strequal` performs a
+/// locale-independent ASCII case-insensitive comparison.
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN CURL_DEPRECATED(7.17.0, "")
+/// int curl_strequal(const char *s1, const char *s2);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_strequal(
+    s1: *const c_char,
+    s2: *const c_char,
+) -> c_int {
+    // SAFETY: Both pointers must be valid null-terminated C strings.
+    // This is the caller's responsibility per the curl API contract.
+    // We perform a byte-by-byte ASCII case-insensitive comparison.
+    if s1.is_null() || s2.is_null() {
+        return if s1 == s2 { 1 } else { 0 };
+    }
+    let c1 = std::ffi::CStr::from_ptr(s1);
+    let c2 = std::ffi::CStr::from_ptr(s2);
+    if c1.to_bytes().len() != c2.to_bytes().len() {
+        return 0;
+    }
+    let eq = c1
+        .to_bytes()
+        .iter()
+        .zip(c2.to_bytes().iter())
+        .all(|(a, b)| a.eq_ignore_ascii_case(b));
+    if eq { 1 } else { 0 }
+}
+
+// ---------------------------------------------------------------------------
+// curl_strnequal — DEPRECATED: use strncasecmp from platform libc
+// ---------------------------------------------------------------------------
+
+/// Deprecated case-insensitive string comparison with length limit.
+///
+/// Compares at most `n` characters.  Returns non-zero if the compared
+/// portions match, zero otherwise.
+///
+/// # C Signature
+///
+/// ```c
+/// CURL_EXTERN CURL_DEPRECATED(7.17.0, "")
+/// int curl_strnequal(const char *s1, const char *s2, size_t n);
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn curl_strnequal(
+    s1: *const c_char,
+    s2: *const c_char,
+    n: usize,
+) -> c_int {
+    // SAFETY: Both pointers must be valid C strings or at least point to
+    // n readable bytes.  The caller guarantees this per the curl API contract.
+    if s1.is_null() || s2.is_null() {
+        return if s1 == s2 { 1 } else { 0 };
+    }
+    if n == 0 {
+        return 1;
+    }
+    let c1 = std::ffi::CStr::from_ptr(s1);
+    let c2 = std::ffi::CStr::from_ptr(s2);
+    let b1 = c1.to_bytes();
+    let b2 = c2.to_bytes();
+    let len = n.min(b1.len()).min(b2.len());
+    if b1.len() < n && b1.len() != b2.len().min(n) {
+        return 0;
+    }
+    if b2.len() < n && b2.len() != b1.len().min(n) {
+        return 0;
+    }
+    let eq = b1[..len]
+        .iter()
+        .zip(b2[..len].iter())
+        .all(|(a, b)| a.eq_ignore_ascii_case(b));
+    if eq { 1 } else { 0 }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

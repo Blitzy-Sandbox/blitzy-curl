@@ -329,10 +329,14 @@ pub fn global_init(flags: i64) -> CurlResult<()> {
     // get_or_init with an inner try.
     let result = INIT_RESULT.get_or_init(|| {
         // Step 1: Configure the default tracing subscriber for structured
-        // logging. The `try_init()` call is non-fatal — it returns Err if a
-        // subscriber is already installed (e.g., by the application), which
-        // we silently ignore.
-        let _ = tracing_subscriber::fmt::try_init();
+        // logging. Output is directed to stderr to match curl 8.x behavior
+        // where all diagnostic/tracing output goes to stderr, keeping stdout
+        // reserved for transfer data. The `try_init()` call is non-fatal —
+        // it returns Err if a subscriber is already installed (e.g., by the
+        // application), which we silently ignore.
+        let _ = tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .try_init();
 
         // Step 2: Initialize the TLS subsystem. This installs the rustls
         // aws-lc-rs crypto provider and sets up TLS key logging if the

@@ -26,7 +26,6 @@
 use std::io::Write;
 
 use anyhow::{Context, Result};
-use serde_json;
 
 use curl_rs_lib::getinfo::{CurlInfo, InfoValue};
 use curl_rs_lib::headers::{Header, Headers, CURLH_HEADER};

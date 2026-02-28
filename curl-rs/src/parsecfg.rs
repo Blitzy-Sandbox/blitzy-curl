@@ -723,7 +723,7 @@ fn parseconfig_inner(
                 }
             }
 
-            ParameterResult::Help
+            ParameterResult::Help(_)
             | ParameterResult::Manual
             | ParameterResult::Version
             | ParameterResult::EngineList

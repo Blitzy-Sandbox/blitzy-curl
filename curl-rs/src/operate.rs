@@ -549,7 +549,7 @@ fn post_check_result(
         };
         errorf(
             global,
-            &format!("curl: ({}) {}", result as i32, msg),
+            &format!("({}) {}", result as i32, msg),
         );
         if result == CurlError::PeerFailedVerification {
             errorf(global, CURL_CA_CERT_ERRORMSG);
@@ -561,7 +561,7 @@ fn post_check_result(
                 errorf(
                     global,
                     &format!(
-                        "curl: ({}) The requested URL returned \
+                        "({}) The requested URL returned \
                          error: {}",
                         CurlError::HttpReturnedError as i32,
                         code,
@@ -1202,7 +1202,7 @@ async fn serial_transfers(
                 }
             }
             tokio::task::yield_now().await;
-            result = match transfers[idx].easy.perform() {
+            result = match transfers[idx].easy.perform_transfer().await {
                 Ok(()) => CurlError::Ok,
                 Err(e) => e,
             };
@@ -1535,7 +1535,7 @@ pub async fn operate(
                 .first()
                 .map_or(true, |c| c.url_list.is_empty())
         {
-            helpf(Some(""));
+            helpf(Some("no URL specified!"));
             return CurlError::FailedInit;
         }
     }
@@ -1544,8 +1544,8 @@ pub async fn operate(
 
     match parse_result {
         ParameterResult::Ok => {}
-        ParameterResult::Help => {
-            tool_help(None);
+        ParameterResult::Help(subject) => {
+            tool_help(subject.as_deref());
             return CurlError::Ok;
         }
         ParameterResult::Manual => {

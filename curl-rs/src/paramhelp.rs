@@ -99,6 +99,7 @@ const READ_BUFFER_SIZE: usize = 4096;
 /// - `CURLFTPMETHOD_SINGLECWD` → [`FtpFileMethod::SingleCwd`] (2)
 /// - `CURLFTPMETHOD_NOCWD`     → [`FtpFileMethod::NoCwd`] (3)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum FtpFileMethod {
     /// Multiple CWD commands (default).
     MultiCwd = 1,

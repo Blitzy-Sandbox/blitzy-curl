@@ -315,6 +315,48 @@ pub enum CmdlineOption {
     TimeCond,
     ProxyKey,
     Proxytunnel,
+    CaNative,
+    CertStatus,
+    CreateFileMode,
+    Crlf,
+    DisallowUsernameInUrl,
+    DohCertStatus,
+    DohInsecure,
+    EgdFile,
+    Follow,
+    Eprt,
+    Epsv,
+    FtpSslControl,
+    IgnoreContentLength,
+    IpTos,
+    JunkSessionCookies,
+    KeepAliveCnt,
+    KnownHosts,
+    Krb,
+    Metalink,
+    Mptcp,
+    NoNpn,
+    NtlmWb,
+    OutNull,
+    ParallelMaxHost,
+    Preproxy,
+    ProxyCaNative,
+    ProxyHttp2,
+    ProxySslAllowBeast,
+    ProxySslAutoClientCert,
+    Proxy1,
+    RandomFile,
+    Sigalgs,
+    Socks5Gssapi,
+    SslSessions,
+    Stderr,
+    TelnetOption,
+    TftpBlksize,
+    TftpNoOptions,
+    TlsEarlydata,
+    VlanPriority,
+    ProgressMeter,
+    Sessionid,
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +412,7 @@ impl fmt::Display for ParameterError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParameterResult {
     Ok,
-    Help,
+    Help(Option<String>),
     Manual,
     Version,
     EngineList,
@@ -730,6 +772,48 @@ pub static ALIASES: &[LongShort] = &[
     LongShort { long_name: "version", desc_flags: ARG_NONE, short_letter: 'V', cmd: CmdlineOption::Version },
     LongShort { long_name: "write-out", desc_flags: ARG_STRG, short_letter: 'w', cmd: CmdlineOption::WriteOut },
     LongShort { long_name: "xattr", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::Xattr },
+    // Additional options matching curl 8.x parity
+    LongShort { long_name: "ca-native", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::CaNative },
+    LongShort { long_name: "cert-status", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::CertStatus },
+    LongShort { long_name: "create-file-mode", desc_flags: ARG_STRG, short_letter: '\0', cmd: CmdlineOption::CreateFileMode },
+    LongShort { long_name: "crlf", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::Crlf },
+    LongShort { long_name: "disallow-username-in-url", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::DisallowUsernameInUrl },
+    LongShort { long_name: "doh-cert-status", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::DohCertStatus },
+    LongShort { long_name: "doh-insecure", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::DohInsecure },
+    LongShort { long_name: "egd-file", desc_flags: ARG_STRG, short_letter: '\0', cmd: CmdlineOption::EgdFile },
+    LongShort { long_name: "eprt", desc_flags: ARG_BOOL | ARG_NO, short_letter: '\0', cmd: CmdlineOption::Eprt },
+    LongShort { long_name: "epsv", desc_flags: ARG_BOOL | ARG_NO, short_letter: '\0', cmd: CmdlineOption::Epsv },
+    LongShort { long_name: "ftp-ssl-control", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::FtpSslControl },
+    LongShort { long_name: "ignore-content-length", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::IgnoreContentLength },
+    LongShort { long_name: "ip-tos", desc_flags: ARG_STRG, short_letter: '\0', cmd: CmdlineOption::IpTos },
+    LongShort { long_name: "junk-session-cookies", desc_flags: ARG_BOOL, short_letter: 'j', cmd: CmdlineOption::JunkSessionCookies },
+    LongShort { long_name: "keepalive-cnt", desc_flags: ARG_STRG, short_letter: '\0', cmd: CmdlineOption::KeepAliveCnt },
+    LongShort { long_name: "hostpubsha256", desc_flags: ARG_STRG, short_letter: '\0', cmd: CmdlineOption::KnownHosts },
+    LongShort { long_name: "krb", desc_flags: ARG_STRG, short_letter: '\0', cmd: CmdlineOption::Krb },
+    LongShort { long_name: "metalink", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::Metalink },
+    LongShort { long_name: "mptcp", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::Mptcp },
+    LongShort { long_name: "no-npn", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::NoNpn },
+    LongShort { long_name: "ntlm-wb", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::NtlmWb },
+    LongShort { long_name: "out-null", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::OutNull },
+    LongShort { long_name: "parallel-max-host", desc_flags: ARG_STRG, short_letter: '\0', cmd: CmdlineOption::ParallelMaxHost },
+    LongShort { long_name: "preproxy", desc_flags: ARG_STRG, short_letter: '\0', cmd: CmdlineOption::Preproxy },
+    LongShort { long_name: "progress-meter", desc_flags: ARG_BOOL | ARG_NO, short_letter: '\0', cmd: CmdlineOption::ProgressMeter },
+    LongShort { long_name: "proxy-ca-native", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::ProxyCaNative },
+    LongShort { long_name: "proxy-http2", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::ProxyHttp2 },
+    LongShort { long_name: "proxy-ssl-allow-beast", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::ProxySslAllowBeast },
+    LongShort { long_name: "proxy-ssl-auto-client-cert", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::ProxySslAutoClientCert },
+    LongShort { long_name: "proxy1.0", desc_flags: ARG_STRG, short_letter: '\0', cmd: CmdlineOption::Proxy1 },
+    LongShort { long_name: "random-file", desc_flags: ARG_FILE, short_letter: '\0', cmd: CmdlineOption::RandomFile },
+    LongShort { long_name: "sessionid", desc_flags: ARG_BOOL | ARG_NO, short_letter: '\0', cmd: CmdlineOption::Sessionid },
+    LongShort { long_name: "sigalgs", desc_flags: ARG_STRG, short_letter: '\0', cmd: CmdlineOption::Sigalgs },
+    LongShort { long_name: "socks5-gssapi", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::Socks5Gssapi },
+    LongShort { long_name: "ssl-sessions", desc_flags: ARG_FILE, short_letter: '\0', cmd: CmdlineOption::SslSessions },
+    LongShort { long_name: "stderr", desc_flags: ARG_FILE, short_letter: '\0', cmd: CmdlineOption::Stderr },
+    LongShort { long_name: "telnet-option", desc_flags: ARG_STRG, short_letter: 't', cmd: CmdlineOption::TelnetOption },
+    LongShort { long_name: "tftp-blksize", desc_flags: ARG_STRG, short_letter: '\0', cmd: CmdlineOption::TftpBlksize },
+    LongShort { long_name: "tftp-no-options", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::TftpNoOptions },
+    LongShort { long_name: "tls-earlydata", desc_flags: ARG_BOOL, short_letter: '\0', cmd: CmdlineOption::TlsEarlydata },
+    LongShort { long_name: "vlan-priority", desc_flags: ARG_STRG, short_letter: '\0', cmd: CmdlineOption::VlanPriority },
 ];
 
 // ---------------------------------------------------------------------------
@@ -769,19 +853,21 @@ pub fn findshortopt(ch: char) -> Option<&'static LongShort> {
 }
 
 pub fn findlongopt(name: &str) -> Option<&'static LongShort> {
-    let idx = ALIASES.binary_search_by(|a| a.long_name.cmp(name));
-    match idx {
-        Ok(i) => Some(&ALIASES[i]),
-        Err(_) => {
-            let mut matches: Vec<&LongShort> = Vec::new();
-            for a in ALIASES.iter() {
-                if a.long_name.starts_with(name) {
-                    matches.push(a);
-                }
-            }
-            if matches.len() == 1 { Some(matches[0]) } else { None }
+    // First try exact match via linear scan (array may not be fully sorted
+    // due to interleaved additions for parity with curl 8.x).
+    for a in ALIASES.iter() {
+        if a.long_name == name {
+            return Some(a);
         }
     }
+    // Fall back to unique prefix match.
+    let mut matches: Vec<&LongShort> = Vec::new();
+    for a in ALIASES.iter() {
+        if a.long_name.starts_with(name) {
+            matches.push(a);
+        }
+    }
+    if matches.len() == 1 { Some(matches[0]) } else { None }
 }
 
 // ---------------------------------------------------------------------------
@@ -949,7 +1035,7 @@ fn opt_none(cmd: CmdlineOption, config: &mut OperationConfig, global: &mut Globa
             config.no_body = true;
             enforce_http_method(global, HttpReq::Head, &mut config.httpreq);
         }
-        CmdlineOption::Help => { return ParameterResult::Help; }
+        CmdlineOption::Help => { return ParameterResult::Help(None); }
         CmdlineOption::Manual => { return ParameterResult::Manual; }
         CmdlineOption::Version => { return ParameterResult::Version; }
         CmdlineOption::Http10 => { sethttpver(config, global, 10); }
@@ -1186,7 +1272,7 @@ fn opt_strg(cmd: CmdlineOption, param: &str, config: &mut OperationConfig, globa
             match str2unum(param) { Ok(v) => config.happy_eyeballs_timeout_ms = v as i64, Err(_) => return ParameterResult::Error(ParameterError::BadNumeric) }
         }
         CmdlineOption::Header => { let _ = add2list(&mut config.headers, param); }
-        CmdlineOption::Help => { return ParameterResult::Help; }
+        CmdlineOption::Help => { return ParameterResult::Help(Some(param.to_string())); }
         CmdlineOption::HostPubMd5 => { config.hostpubmd5 = Some(param.to_string()); }
         CmdlineOption::HostPubSha256 => { config.hostpubsha256 = Some(param.to_string()); }
         CmdlineOption::Hsts => {
@@ -1437,6 +1523,10 @@ pub fn getparameter(
             match param {
                 Some(p) => opt_strg(cmd, p, config, global),
                 None => {
+                    // Special case: --help/-h without argument shows brief help.
+                    if cmd == CmdlineOption::Help {
+                        return ParameterResult::Help(None);
+                    }
                     errorf(global, &format!("option --{}: requires an argument", alias.long_name));
                     ParameterResult::Error(ParameterError::NoInput)
                 }
@@ -1486,12 +1576,26 @@ pub fn parse_args(argv: &[String], global: &mut GlobalConfig) -> ParameterResult
             };
             let atype = argtype(alias.desc_flags);
             let param = if atype == ArgType::Strg || atype == ArgType::File {
-                i += 1;
-                if i >= argv.len() {
-                    errorf(global, &format!("option --{}: requires parameter", alias.long_name));
-                    return ParameterResult::Error(ParameterError::NoInput);
+                // Special case: --help and -h accept an optional parameter.
+                // When called as just `--help` (no next argument or next arg
+                // starts with `-`), show brief help. This matches curl 8.x
+                // behavior where `--help` defaults to brief help and
+                // `--help all` shows the full listing.
+                if alias.cmd == CmdlineOption::Help {
+                    if i + 1 < argv.len() && !argv[i + 1].starts_with('-') {
+                        i += 1;
+                        Some(argv[i].as_str())
+                    } else {
+                        None
+                    }
+                } else {
+                    i += 1;
+                    if i >= argv.len() {
+                        errorf(global, &format!("option --{}: requires parameter", alias.long_name));
+                        return ParameterResult::Error(ParameterError::NoInput);
+                    }
+                    Some(argv[i].as_str())
                 }
-                Some(argv[i].as_str())
             } else { None };
 
             let expanded_storage: Option<String>;
@@ -1512,7 +1616,7 @@ pub fn parse_args(argv: &[String], global: &mut GlobalConfig) -> ParameterResult
             match result {
                 ParameterResult::Ok => {}
                 ParameterResult::NextOperation => { global.configs.push(OperationConfig::new()); }
-                ParameterResult::Help | ParameterResult::Manual | ParameterResult::Version
+                ParameterResult::Help(_) | ParameterResult::Manual | ParameterResult::Version
                 | ParameterResult::EngineList | ParameterResult::CaBundleDump | ParameterResult::Error(_) => { return result; }
             }
         } else if arg.starts_with('-') && arg.len() > 1 {
@@ -1531,7 +1635,20 @@ pub fn parse_args(argv: &[String], global: &mut GlobalConfig) -> ParameterResult
                 };
                 let atype = argtype(alias.desc_flags);
                 let param_val: Option<String> = if atype == ArgType::Strg || atype == ArgType::File {
-                    if j + 1 < chars.len() {
+                    // Special case: -h (help) accepts an optional parameter.
+                    // When called as just `-h` (no next argument), show brief help.
+                    if alias.cmd == CmdlineOption::Help {
+                        if j + 1 < chars.len() {
+                            let rest: String = chars[j + 1..].iter().collect();
+                            j = chars.len();
+                            Some(rest)
+                        } else if i + 1 < argv.len() && !argv[i + 1].starts_with('-') {
+                            i += 1;
+                            Some(argv[i].clone())
+                        } else {
+                            None
+                        }
+                    } else if j + 1 < chars.len() {
                         let rest: String = chars[j + 1..].iter().collect();
                         j = chars.len();
                         Some(rest)
@@ -1551,7 +1668,7 @@ pub fn parse_args(argv: &[String], global: &mut GlobalConfig) -> ParameterResult
                 match result {
                     ParameterResult::Ok => {}
                     ParameterResult::NextOperation => { global.configs.push(OperationConfig::new()); }
-                    ParameterResult::Help | ParameterResult::Manual | ParameterResult::Version
+                    ParameterResult::Help(_) | ParameterResult::Manual | ParameterResult::Version
                     | ParameterResult::EngineList | ParameterResult::CaBundleDump | ParameterResult::Error(_) => { return result; }
                 }
                 j += 1;
@@ -1604,7 +1721,7 @@ mod tests {
     #[test]
     fn parameter_result_variants_exist() {
         let results: Vec<ParameterResult> = vec![
-            ParameterResult::Ok, ParameterResult::Help, ParameterResult::Manual,
+            ParameterResult::Ok, ParameterResult::Help(None), ParameterResult::Manual,
             ParameterResult::Version, ParameterResult::EngineList,
             ParameterResult::CaBundleDump,
             ParameterResult::Error(ParameterError::BadNumeric),
@@ -1757,7 +1874,7 @@ mod tests {
         let mut global = make_global();
         // --help takes a category parameter (ARG_STRG)
         let argv = vec!["curl".to_string(), "--help".to_string(), "all".to_string()];
-        assert!(matches!(parse_args(&argv, &mut global), ParameterResult::Help));
+        assert!(matches!(parse_args(&argv, &mut global), ParameterResult::Help(Some(_))));
     }
 
     #[test]
