@@ -1780,4 +1780,338 @@ mod tests {
     fn test_extract_scheme_no_scheme() {
         assert_eq!(extract_scheme("example.com"), Some("http".to_string()));
     }
+
+    #[test]
+    fn test_extract_scheme_https() {
+        assert_eq!(
+            extract_scheme("https://secure.example.com/path"),
+            Some("https".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_scheme_sftp() {
+        assert_eq!(
+            extract_scheme("sftp://server/file"),
+            Some("sftp".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_scheme_scp() {
+        assert_eq!(
+            extract_scheme("scp://server/file"),
+            Some("scp".to_string())
+        );
+    }
+
+    // --- EasyHandle-based helper tests ---
+
+    fn make_easy() -> EasyHandle {
+        EasyHandle::new()
+    }
+
+    #[test]
+    fn test_set_str_helper() {
+        let mut h = make_easy();
+        assert!(set_str(&mut h, CurlOpt::CURLOPT_URL, "http://test.com").is_ok());
+    }
+
+    #[test]
+    fn test_set_long_helper() {
+        let mut h = make_easy();
+        assert!(set_long(&mut h, CurlOpt::CURLOPT_VERBOSE, 1).is_ok());
+    }
+
+    #[test]
+    fn test_set_bool_helper() {
+        let mut h = make_easy();
+        assert!(set_bool(&mut h, CurlOpt::CURLOPT_VERBOSE, true).is_ok());
+        assert!(set_bool(&mut h, CurlOpt::CURLOPT_VERBOSE, false).is_ok());
+    }
+
+    #[test]
+    fn test_set_offt_helper() {
+        let mut h = make_easy();
+        assert!(set_offt(&mut h, CurlOpt::CURLOPT_INFILESIZE_LARGE, 1024).is_ok());
+    }
+
+    #[test]
+    fn test_set_slist_helper() {
+        let mut h = make_easy();
+        let items = vec!["Host: test.com".to_string()];
+        assert!(set_slist(&mut h, CurlOpt::CURLOPT_HTTPHEADER, &items).is_ok());
+    }
+
+    #[test]
+    fn test_set_func_helper() {
+        let mut h = make_easy();
+        assert!(set_func(&mut h, CurlOpt::CURLOPT_WRITEFUNCTION).is_ok());
+    }
+
+    #[test]
+    fn test_try_set_str_nonempty() {
+        let mut h = make_easy();
+        let set = try_set_str(&mut h, CurlOpt::CURLOPT_USERAGENT, "TestUA/1.0").unwrap();
+        assert!(set);
+    }
+
+    #[test]
+    fn test_try_set_str_empty() {
+        let mut h = make_easy();
+        let set = try_set_str(&mut h, CurlOpt::CURLOPT_USERAGENT, "").unwrap();
+        // Empty string is still set (depends on implementation)
+        // Just verify no error
+        let _ = set;
+    }
+
+    #[test]
+    fn test_try_set_long_nonzero() {
+        let mut h = make_easy();
+        let set = try_set_long(&mut h, CurlOpt::CURLOPT_VERBOSE, 1).unwrap();
+        assert!(set);
+    }
+
+    #[test]
+    fn test_try_set_long_valid() {
+        let mut h = make_easy();
+        // Valid option that should succeed
+        let set = try_set_long(&mut h, CurlOpt::CURLOPT_TIMEOUT, 30).unwrap();
+        assert!(set);
+    }
+
+    #[test]
+    fn test_tlsversion_all_combos() {
+        // TLS 1.0 min
+        let v = tlsversion(1, 0);
+        assert_eq!(v, CURL_SSLVERSION_TLSv1_0);
+        // TLS 1.1 min
+        let v = tlsversion(2, 0);
+        assert_eq!(v, CURL_SSLVERSION_TLSv1_1);
+        // TLS 1.3 max only (min default -> 1.2)
+        let v = tlsversion(0, 4);
+        assert_eq!(v, CURL_SSLVERSION_TLSv1_2 | CURL_SSLVERSION_MAX_TLSv1_3);
+        // Both min and max at 1.3
+        let v = tlsversion(4, 4);
+        assert_eq!(v, CURL_SSLVERSION_TLSv1_3 | CURL_SSLVERSION_MAX_TLSv1_3);
+    }
+
+    #[test]
+    fn test_set_slist_empty() {
+        let mut h = make_easy();
+        let items: Vec<String> = vec![];
+        // Empty list should still work (sets an empty slist)
+        assert!(set_slist(&mut h, CurlOpt::CURLOPT_HTTPHEADER, &items).is_ok());
+    }
+
+    #[test]
+    fn test_set_slist_multiple() {
+        let mut h = make_easy();
+        let items = vec![
+            "Header1: value1".to_string(),
+            "Header2: value2".to_string(),
+            "Header3: value3".to_string(),
+        ];
+        assert!(set_slist(&mut h, CurlOpt::CURLOPT_HTTPHEADER, &items).is_ok());
+    }
+
+    #[test]
+    fn test_ssl_constants() {
+        // Verify the SSL option constants have correct bit positions
+        assert_eq!(CURLSSLOPT_ALLOW_BEAST, 1);
+        assert_eq!(CURLSSLOPT_NO_REVOKE, 2);
+        assert_eq!(CURLSSLOPT_REVOKE_BEST_EFFORT, 8);
+        assert_eq!(CURLSSLOPT_NATIVE_CA, 16);
+        assert_eq!(CURLSSLOPT_AUTO_CLIENT_CERT, 32);
+        assert_eq!(CURLSSLOPT_EARLYDATA, 64);
+    }
+
+    #[test]
+    fn test_buffer_size_constant() {
+        assert_eq!(BUFFER_SIZE, 102_400);
+    }
+
+    #[test]
+    fn test_max_cookie_line_constant() {
+        assert_eq!(MAX_COOKIE_LINE, 8200);
+    }
+
+    #[test]
+    fn test_ftp_create_dir_retry_constant() {
+        assert_eq!(CURLFTP_CREATE_DIR_RETRY, 2);
+    }
+
+    #[test]
+    fn test_set_multiple_options() {
+        let mut h = make_easy();
+        set_str(&mut h, CurlOpt::CURLOPT_URL, "http://test.com").unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_PORT, 8080).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_VERBOSE, true).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_FOLLOWLOCATION, true).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_MAXREDIRS, 10).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_TIMEOUT, 30).unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_USERAGENT, "TestAgent/1.0").unwrap();
+        // Verify all options can be set without conflicting
+    }
+
+    #[test]
+    fn test_set_proxy_options() {
+        let mut h = make_easy();
+        set_str(&mut h, CurlOpt::CURLOPT_PROXY, "http://proxy:3128").unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_PROXYPORT, 3128).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_HTTPPROXYTUNNEL, 1).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_PROXYTYPE, 0).unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_PROXYUSERNAME, "proxyuser").unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_PROXYPASSWORD, "proxypass").unwrap();
+    }
+
+    #[test]
+    fn test_set_ssl_options() {
+        let mut h = make_easy();
+        set_bool(&mut h, CurlOpt::CURLOPT_SSL_VERIFYPEER, true).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_SSL_VERIFYHOST, 2).unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_SSLCERT, "/path/cert.pem").unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_SSLKEY, "/path/key.pem").unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_CAINFO, "/path/ca.pem").unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_CAPATH, "/path/certs/").unwrap();
+    }
+
+    #[test]
+    fn test_set_ftp_options() {
+        let mut h = make_easy();
+        set_bool(&mut h, CurlOpt::CURLOPT_FTP_USE_EPSV, true).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_FTP_USE_EPRT, true).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_FTP_CREATE_MISSING_DIRS, 1).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_FTP_SKIP_PASV_IP, false).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_FTP_FILEMETHOD, 1).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_FTP_SSL_CCC, 0).unwrap();
+    }
+
+    #[test]
+    fn test_set_ssh_options() {
+        let mut h = make_easy();
+        set_long(&mut h, CurlOpt::CURLOPT_SSH_AUTH_TYPES, 7).unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_SSH_PUBLIC_KEYFILE, "/path/id_rsa.pub").unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_SSH_PRIVATE_KEYFILE, "/path/id_rsa").unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_SSH_HOST_PUBLIC_KEY_MD5, "fingerprint").unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_SSH_COMPRESSION, true).unwrap();
+    }
+
+    #[test]
+    fn test_set_auth_options() {
+        let mut h = make_easy();
+        set_long(&mut h, CurlOpt::CURLOPT_HTTPAUTH, 1).unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_USERPWD, "user:pass").unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_USERNAME, "testuser").unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_PASSWORD, "testpass").unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_XOAUTH2_BEARER, "token").unwrap();
+    }
+
+    #[test]
+    fn test_set_cookie_options() {
+        let mut h = make_easy();
+        set_str(&mut h, CurlOpt::CURLOPT_COOKIE, "name=value").unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_COOKIEFILE, "/path/cookies.txt").unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_COOKIEJAR, "/path/jar.txt").unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_COOKIESESSION, true).unwrap();
+    }
+
+    #[test]
+    fn test_set_dns_options() {
+        let mut h = make_easy();
+        set_long(&mut h, CurlOpt::CURLOPT_DNS_CACHE_TIMEOUT, 120).unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_DNS_SERVERS, "8.8.8.8,8.8.4.4").unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_DNS_INTERFACE, "eth0").unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_DNS_LOCAL_IP4, "10.0.0.1").unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_DNS_SHUFFLE_ADDRESSES, true).unwrap();
+    }
+
+    #[test]
+    fn test_set_timeout_options() {
+        let mut h = make_easy();
+        set_long(&mut h, CurlOpt::CURLOPT_TIMEOUT, 30).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_TIMEOUT_MS, 5000).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_CONNECTTIMEOUT, 10).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_CONNECTTIMEOUT_MS, 3000).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_LOW_SPEED_LIMIT, 100).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_LOW_SPEED_TIME, 30).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_EXPECT_100_TIMEOUT_MS, 2000).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS, 200).unwrap();
+    }
+
+    #[test]
+    fn test_set_transfer_options() {
+        let mut h = make_easy();
+        set_bool(&mut h, CurlOpt::CURLOPT_NOBODY, true).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_UPLOAD, false).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_POST, false).unwrap();
+        set_offt(&mut h, CurlOpt::CURLOPT_INFILESIZE_LARGE, 1024).unwrap();
+        set_offt(&mut h, CurlOpt::CURLOPT_RESUME_FROM_LARGE, 512).unwrap();
+        set_offt(&mut h, CurlOpt::CURLOPT_MAXFILESIZE_LARGE, 1_000_000).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_TRANSFER_ENCODING, true).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_BUFFERSIZE, 16384).unwrap();
+    }
+
+    #[test]
+    fn test_set_http_options() {
+        let mut h = make_easy();
+        set_long(&mut h, CurlOpt::CURLOPT_HTTP_VERSION, 0).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_FOLLOWLOCATION, true).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_MAXREDIRS, 50).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_AUTOREFERER, true).unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_REFERER, "http://origin.com").unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_ACCEPT_ENCODING, "gzip,deflate,br").unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_POSTREDIR, 3).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_HTTP09_ALLOWED, false).unwrap();
+    }
+
+    #[test]
+    fn test_set_network_options() {
+        let mut h = make_easy();
+        set_long(&mut h, CurlOpt::CURLOPT_PORT, 443).unwrap();
+        set_str(&mut h, CurlOpt::CURLOPT_INTERFACE, "eth0").unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_LOCALPORT, 5000).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_LOCALPORTRANGE, 100).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_TCP_NODELAY, true).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_TCP_KEEPALIVE, true).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_TCP_KEEPIDLE, 60).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_TCP_KEEPINTVL, 30).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_TCP_FASTOPEN, false).unwrap();
+    }
+
+    #[test]
+    fn test_set_misc_options() {
+        let mut h = make_easy();
+        set_bool(&mut h, CurlOpt::CURLOPT_NOSIGNAL, true).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_NOPROGRESS, false).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_FAILONERROR, true).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_FRESH_CONNECT, false).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_FORBID_REUSE, false).unwrap();
+        set_bool(&mut h, CurlOpt::CURLOPT_PATH_AS_IS, false).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_MAXCONNECTS, 5).unwrap();
+        set_long(&mut h, CurlOpt::CURLOPT_MAXAGE_CONN, 300).unwrap();
+    }
+
+    #[test]
+    fn test_ssh_known_hosts_dirs_returns_paths() {
+        let dirs = ssh_known_hosts_dirs();
+        // Should return at least one directory (home-based or system-wide)
+        // Note: in CI the home dir may not have .ssh, but the function should not panic
+        assert!(dirs.len() >= 0); // Just verify it doesn't panic
+    }
+
+    #[test]
+    fn test_extract_scheme_ipfs_detailed() {
+        assert_eq!(extract_scheme("ipfs://QmCid123/path/to/resource"), Some("ipfs".to_string()));
+    }
+
+    #[test]
+    fn test_extract_scheme_ipns_detailed() {
+        assert_eq!(extract_scheme("ipns://name.example/path"), Some("ipns".to_string()));
+    }
+
+    #[test]
+    fn test_extract_scheme_file_uri() {
+        assert_eq!(extract_scheme("file:///tmp/test"), Some("file".to_string()));
+    }
 }

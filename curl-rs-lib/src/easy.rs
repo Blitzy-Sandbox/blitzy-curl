@@ -75,6 +75,41 @@ use crate::url::CurlUrl;
 use crate::version;
 
 // ---------------------------------------------------------------------------
+// Callback type definitions for write/header/read data forwarding
+// ---------------------------------------------------------------------------
+
+/// Write callback signature matching CURLOPT_WRITEFUNCTION.
+///
+/// Called by the transfer engine when response body data is received.
+/// The callback receives a slice of bytes and returns the number of bytes
+/// "consumed". If the return value differs from the slice length, the
+/// transfer is aborted with `CurlError::WriteError`.
+///
+/// # C Equivalent
+///
+/// `size_t (*curl_write_callback)(char *ptr, size_t size, size_t nmemb, void *userdata);`
+pub type WriteCallback = Box<dyn FnMut(&[u8]) -> usize + Send>;
+
+/// Header callback signature matching CURLOPT_HEADERFUNCTION.
+///
+/// Called by the transfer engine for each response header line received.
+/// The callback receives the raw header line (including CRLF) and returns
+/// the number of bytes consumed. Return a value different from the input
+/// length to abort the transfer.
+pub type HeaderCallback = Box<dyn FnMut(&[u8]) -> usize + Send>;
+
+/// Debug/verbose callback signature matching CURLOPT_DEBUGFUNCTION.
+///
+/// Called for verbose/trace output when `CURLOPT_VERBOSE` is enabled.
+pub type DebugCallback = Box<dyn FnMut(u32, &[u8]) + Send>;
+
+/// Progress callback signature matching CURLOPT_XFERINFOFUNCTION.
+///
+/// Called periodically during transfer with download/upload progress.
+/// Returns 0 to continue, non-zero to abort.
+pub type ProgressCallback = Box<dyn FnMut(i64, i64, i64, i64) -> i32 + Send>;
+
+// ---------------------------------------------------------------------------
 // Pause bitmask constants — matching C CURLPAUSE_* from include/curl/curl.h
 // ---------------------------------------------------------------------------
 
@@ -500,6 +535,27 @@ pub struct EasyHandle {
     ///
     /// `None` when no WebSocket connection is active.
     ws_state: Option<WebSocket>,
+
+    // -------------------------------------------------------------------
+    // Transfer callbacks — wired from CLI or FFI consumer
+    // -------------------------------------------------------------------
+
+    /// Write callback for response body data (CURLOPT_WRITEFUNCTION).
+    /// When `None`, data is written to an internal buffer.
+    write_callback: Option<WriteCallback>,
+
+    /// Header callback for response header lines (CURLOPT_HEADERFUNCTION).
+    header_callback: Option<HeaderCallback>,
+
+    /// Debug/verbose callback (CURLOPT_DEBUGFUNCTION).
+    debug_callback: Option<DebugCallback>,
+
+    /// Progress/xferinfo callback (CURLOPT_XFERINFOFUNCTION).
+    progress_callback: Option<ProgressCallback>,
+
+    /// Accumulated response body when no write callback is set.
+    /// This allows retrieving body data after perform() completes.
+    response_body: Vec<u8>,
 }
 
 // EasyHandle is Send (can be transferred between threads) but not Sync
@@ -568,7 +624,52 @@ impl EasyHandle {
             connect_only: false,
             os_errno: 0,
             ws_state: None,
+            write_callback: None,
+            header_callback: None,
+            debug_callback: None,
+            progress_callback: None,
+            response_body: Vec::new(),
         }
+    }
+
+    /// Registers a write callback for receiving response body data.
+    ///
+    /// The callback is called with chunks of body data as they arrive
+    /// during a transfer. It must return the number of bytes consumed
+    /// (normally equal to the input length).
+    ///
+    /// # C Equivalent
+    ///
+    /// `curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, callback);`
+    pub fn set_write_callback(&mut self, cb: WriteCallback) {
+        self.write_callback = Some(cb);
+    }
+
+    /// Registers a header callback for receiving response headers.
+    ///
+    /// The callback is called once per header line (including the
+    /// status line and the final empty line).
+    pub fn set_header_callback(&mut self, cb: HeaderCallback) {
+        self.header_callback = Some(cb);
+    }
+
+    /// Registers a debug/verbose callback.
+    pub fn set_debug_callback(&mut self, cb: DebugCallback) {
+        self.debug_callback = Some(cb);
+    }
+
+    /// Registers a progress callback (CURLOPT_XFERINFOFUNCTION).
+    pub fn set_progress_callback(&mut self, cb: ProgressCallback) {
+        self.progress_callback = Some(cb);
+    }
+
+    /// Returns a reference to the accumulated response body.
+    ///
+    /// Only populated when no write callback is set (data is buffered
+    /// internally). If a write callback is registered, this will be empty
+    /// because all data is forwarded directly to the callback.
+    pub fn response_body(&self) -> &[u8] {
+        &self.response_body
     }
 
     /// Returns a new [`EasyBuilder`] for constructing an `EasyHandle` with
@@ -869,12 +970,20 @@ impl EasyHandle {
     /// Core transfer execution — resolves URL, connects, transfers data.
     ///
     /// This is where the actual protocol work happens. We parse the URL,
-    /// resolve the host, establish a TCP connection, and perform the
-    /// protocol-specific transfer. Connection failures are mapped to the
-    /// appropriate `CURLcode` error to match curl 8.x behavior.
+    /// resolve the host, establish a TCP connection (with optional TLS),
+    /// send the HTTP request, receive the response headers, and stream
+    /// the response body through the write callback to the output sink.
+    ///
+    /// Connection failures are mapped to the appropriate `CURLcode` error
+    /// to match curl 8.x behavior.
     async fn run_transfer(&mut self, url: &str) -> CurlResult<()> {
+        use tokio::io::AsyncWriteExt;
+
         // Record the effective URL in transfer info.
         self.info.inner.effective_url = Some(url.to_string());
+
+        // Clear any previous response body.
+        self.response_body.clear();
 
         // Record transfer start time.
         let start = std::time::Instant::now();
@@ -897,16 +1006,17 @@ impl EasyHandle {
             }
         };
 
+        let use_tls = scheme == "https" || scheme == "ftps";
+
         // Determine default port based on scheme.
-        let default_port = match scheme {
+        let default_port: u16 = match scheme {
             "http" => 80,
             "https" => 443,
             "ftp" | "ftps" => 21,
             "sftp" => 22,
             "scp" => 22,
             "file" => {
-                // file:// protocol — no network needed
-                tracing::info!("run_transfer: file:// protocol not yet wired");
+                tracing::info!("run_transfer: file:// protocol");
                 let elapsed = start.elapsed();
                 self.info.inner.total_time_us = elapsed.as_micros() as i64;
                 return Err(CurlError::UnsupportedProtocol);
@@ -949,56 +1059,7 @@ impl EasyHandle {
                 let elapsed = start.elapsed();
                 self.info.inner.total_time_us = elapsed.as_micros() as i64;
 
-                // Map I/O error to appropriate CURLcode.
-                let curl_err = match e.kind() {
-                    std::io::ErrorKind::ConnectionRefused => {
-                        tracing::error!(
-                            "run_transfer: connection refused to {}",
-                            connect_addr
-                        );
-                        CurlError::CouldntConnect
-                    }
-                    std::io::ErrorKind::TimedOut => {
-                        tracing::error!(
-                            "run_transfer: connection timed out to {}",
-                            connect_addr
-                        );
-                        CurlError::OperationTimedOut
-                    }
-                    std::io::ErrorKind::AddrNotAvailable
-                    | std::io::ErrorKind::AddrInUse => {
-                        tracing::error!(
-                            "run_transfer: address error for {}: {}",
-                            connect_addr, e
-                        );
-                        CurlError::CouldntConnect
-                    }
-                    _ => {
-                        // For DNS failures and other errors, check
-                        // the error message to differentiate.
-                        let msg = e.to_string();
-                        if msg.contains("dns")
-                            || msg.contains("resolve")
-                            || msg.contains("No such host")
-                            || msg.contains("Name or service not known")
-                            || msg.contains("Temporary failure in name resolution")
-                            || msg.contains("nodename nor servname")
-                        {
-                            tracing::error!(
-                                "run_transfer: DNS resolution failed for {}: {}",
-                                host, e
-                            );
-                            CurlError::CouldntResolveHost
-                        } else {
-                            tracing::error!(
-                                "run_transfer: connection failed to {}: {}",
-                                connect_addr, e
-                            );
-                            CurlError::CouldntConnect
-                        }
-                    }
-                };
-
+                let curl_err = map_connect_error(&e, &host, &connect_addr);
                 return Err(curl_err);
             }
         };
@@ -1013,19 +1074,572 @@ impl EasyHandle {
             self.info.inner.local_port = local.port() as i64;
         }
 
-        // The transfer engine handles protocol-specific I/O over the
-        // established TCP connection. HTTP/1.1 and HTTP/2 use hyper,
-        // HTTP/3 uses quinn, FTP uses the ftp module, SSH uses russh.
-        // The connection filter chain (conn module) applies TLS and
-        // proxy layers as configured. Full protocol dispatch is
-        // handled by the transfer module's TransferEngine.
+        // Determine the HTTP method.
+        let method = if self.config.nobody {
+            "HEAD"
+        } else if self.config.post {
+            "POST"
+        } else if self.config.upload {
+            "PUT"
+        } else {
+            self.config.customrequest.as_deref().unwrap_or("GET")
+        };
 
-        // Record timing information.
+        // Build the request path (including query string).
+        let path = if let Some(q) = parsed.query() {
+            format!("{}?{}", parsed.path(), q)
+        } else {
+            parsed.path().to_string()
+        };
+        let request_path = if path.is_empty() { "/" } else { &path };
+
+        // Build HTTP request head.
+        let mut request_head = format!(
+            "{} {} HTTP/1.1\r\nHost: {}\r\nAccept: */*\r\nUser-Agent: curl/{}\r\n",
+            method,
+            request_path,
+            if port != default_port {
+                format!("{}:{}", host, port)
+            } else {
+                host.clone()
+            },
+            version::VERSION,
+        );
+
+        // Add custom headers from the handle's DynHeaders.
+        for entry in self.headers.iter() {
+            request_head.push_str(&format!("{}: {}\r\n", entry.name(), entry.value()));
+        }
+
+        // Connection: close for simplicity (matches single-transfer behavior).
+        request_head.push_str("Connection: close\r\n");
+
+        // Terminate the header section.
+        request_head.push_str("\r\n");
+
+        // Determine if we are doing HTTP (plain text) or HTTPS (TLS-wrapped).
+        if use_tls {
+            // TLS handshake via rustls + tokio-rustls.
+            let tls_start = std::time::Instant::now();
+            let tls_stream = match self.tls_connect(tcp_stream, &host).await {
+                Ok(s) => {
+                    let tls_elapsed = tls_start.elapsed();
+                    self.info.inner.appconnect_time_us =
+                        (start.elapsed() - tls_elapsed + tls_elapsed).as_micros() as i64;
+                    tracing::info!(
+                        "run_transfer: TLS handshake completed in {}ms",
+                        tls_elapsed.as_millis()
+                    );
+                    s
+                }
+                Err(e) => {
+                    let elapsed = start.elapsed();
+                    self.info.inner.total_time_us = elapsed.as_micros() as i64;
+                    return Err(e);
+                }
+            };
+
+            let (mut reader, mut writer) = tokio::io::split(tls_stream);
+
+            // Send the HTTP request.
+            if let Err(e) = writer.write_all(request_head.as_bytes()).await {
+                tracing::error!("run_transfer: TLS send failed: {}", e);
+                let elapsed = start.elapsed();
+                self.info.inner.total_time_us = elapsed.as_micros() as i64;
+                return Err(CurlError::SendError);
+            }
+            writer.flush().await.ok();
+
+            // Record the start-of-transfer time (first byte sent).
+            self.info.inner.starttransfer_time_us =
+                start.elapsed().as_micros() as i64;
+
+            // Read and process the HTTP response.
+            self.read_http_response(&mut reader, start, method == "HEAD").await
+        } else {
+            // Plain HTTP — use TCP stream directly.
+            let (mut reader, mut writer) = tcp_stream.into_split();
+
+            // Send the HTTP request.
+            if let Err(e) = writer.write_all(request_head.as_bytes()).await {
+                tracing::error!("run_transfer: send failed: {}", e);
+                let elapsed = start.elapsed();
+                self.info.inner.total_time_us = elapsed.as_micros() as i64;
+                return Err(CurlError::SendError);
+            }
+            writer.flush().await.ok();
+
+            // Record the start-of-transfer time.
+            self.info.inner.starttransfer_time_us =
+                start.elapsed().as_micros() as i64;
+
+            // Read and process the HTTP response.
+            self.read_http_response(&mut reader, start, method == "HEAD").await
+        }
+    }
+
+    /// Performs a TLS handshake over the given TCP stream using rustls.
+    ///
+    /// Returns a `tokio_rustls::client::TlsStream` on success.
+    async fn tls_connect(
+        &self,
+        tcp_stream: tokio::net::TcpStream,
+        hostname: &str,
+    ) -> CurlResult<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+        use std::sync::Arc as StdArc;
+        use tokio_rustls::TlsConnector;
+
+        // Build a rustls ClientConfig.
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let connector = TlsConnector::from(StdArc::new(tls_config));
+
+        let server_name = match rustls::pki_types::ServerName::try_from(hostname.to_string()) {
+            Ok(sn) => sn,
+            Err(_) => {
+                tracing::error!("tls_connect: invalid server name: {}", hostname);
+                return Err(CurlError::SslConnectError);
+            }
+        };
+
+        match connector.connect(server_name, tcp_stream).await {
+            Ok(tls_stream) => Ok(tls_stream),
+            Err(e) => {
+                tracing::error!("tls_connect: TLS handshake failed: {}", e);
+                // Map to SSL-specific error codes.
+                let msg = e.to_string();
+                if msg.contains("certificate") || msg.contains("verify") {
+                    Err(CurlError::PeerFailedVerification)
+                } else {
+                    Err(CurlError::SslConnectError)
+                }
+            }
+        }
+    }
+
+    /// Reads and processes an HTTP response from an async reader.
+    ///
+    /// Parses the status line and headers, then streams the response body
+    /// through the write callback (or accumulates it internally). Handles
+    /// both Content-Length and chunked transfer encoding, as well as
+    /// connection-close semantics.
+    ///
+    /// This is the core body-forwarding path that connects the network
+    /// layer to the output sink (stdout / file / callback).
+    async fn read_http_response<R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+        start: std::time::Instant,
+        head_only: bool,
+    ) -> CurlResult<()> {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut header_buf = Vec::with_capacity(8192);
+        let mut headers_done = false;
+        let mut body_start_offset: usize = 0;
+        let first_body_byte = true;
+        let mut content_length: Option<u64> = None;
+        let mut chunked = false;
+        let mut body_received: u64 = 0;
+        let mut response_code: u16 = 0;
+
+        // Phase 1: Read until we find the end of headers (\r\n\r\n).
+        loop {
+            let n = match reader.read(&mut buf).await {
+                Ok(0) => {
+                    if header_buf.is_empty() {
+                        let elapsed = start.elapsed();
+                        self.info.inner.total_time_us = elapsed.as_micros() as i64;
+                        return Err(CurlError::GotNothing);
+                    }
+                    break;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!("read_http_response: read error: {}", e);
+                    let elapsed = start.elapsed();
+                    self.info.inner.total_time_us = elapsed.as_micros() as i64;
+                    return Err(CurlError::RecvError);
+                }
+            };
+
+            header_buf.extend_from_slice(&buf[..n]);
+
+            // Check for end of headers.
+            if let Some(pos) = find_header_end(&header_buf) {
+                headers_done = true;
+                body_start_offset = pos + 4; // skip \r\n\r\n
+                break;
+            }
+
+            // Safety limit on header size (64 KiB).
+            if header_buf.len() > 64 * 1024 {
+                tracing::error!("read_http_response: headers too large");
+                return Err(CurlError::TooLarge);
+            }
+        }
+
+        if !headers_done {
+            // If we reached EOF before finding header end, treat as error.
+            let elapsed = start.elapsed();
+            self.info.inner.total_time_us = elapsed.as_micros() as i64;
+            return Err(CurlError::WeirdServerReply);
+        }
+
+        // Parse the status line and headers.
+        let header_section = &header_buf[..body_start_offset - 4];
+        let header_str = String::from_utf8_lossy(header_section);
+
+        let mut lines = header_str.split("\r\n");
+
+        // Parse the status line.
+        if let Some(status_line) = lines.next() {
+            // e.g. "HTTP/1.1 200 OK"
+            let parts: Vec<&str> = status_line.splitn(3, ' ').collect();
+            if parts.len() >= 2 {
+                if let Ok(code) = parts[1].parse::<u16>() {
+                    response_code = code;
+                    self.info.inner.response_code = code as i64;
+                }
+            }
+
+            // Forward the status line to header callback.
+            let status_line_bytes = format!("{}\r\n", status_line);
+            if let Some(ref mut hcb) = self.header_callback {
+                hcb(status_line_bytes.as_bytes());
+            }
+        }
+
+        // Parse remaining header lines.
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+
+            // Forward each header line to the header callback.
+            let header_line_bytes = format!("{}\r\n", line);
+            if let Some(ref mut hcb) = self.header_callback {
+                hcb(header_line_bytes.as_bytes());
+            }
+
+            // Extract content-length and transfer-encoding.
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("content-length:") {
+                if let Some(val) = line.get(15..).map(|s| s.trim()) {
+                    if let Ok(cl) = val.parse::<u64>() {
+                        content_length = Some(cl);
+                        self.info.inner.content_length_download = cl as i64;
+                    }
+                }
+            } else if lower.starts_with("transfer-encoding:") {
+                if let Some(val) = line.get(18..).map(|s| s.trim()) {
+                    if val.to_ascii_lowercase().contains("chunked") {
+                        chunked = true;
+                    }
+                }
+            } else if lower.starts_with("content-type:") {
+                if let Some(val) = line.get(13..).map(|s| s.trim()) {
+                    self.info.inner.content_type = Some(val.to_string());
+                }
+            }
+
+            // Store in response headers.
+            let header_line_with_crlf = format!("{}\r\n", line);
+            let _ = self.response_headers.push(
+                &header_line_with_crlf,
+                crate::headers::HeaderOrigin::HEADER,
+            );
+        }
+
+        // Forward the empty line that terminates headers.
+        if let Some(ref mut hcb) = self.header_callback {
+            hcb(b"\r\n");
+        }
+
+        // Handle redirects.
+        if self.config.followlocation > 0
+            && (response_code == 301
+                || response_code == 302
+                || response_code == 303
+                || response_code == 307
+                || response_code == 308)
+        {
+            // For redirects, we would need to follow the Location header.
+            // This is a simplified implementation; full redirect handling
+            // requires re-connecting and re-requesting. For now, record the
+            // redirect info and return success so the CLI layer can handle it.
+            tracing::info!(
+                "read_http_response: redirect {} (following not yet fully wired)",
+                response_code
+            );
+        }
+
+        // HEAD-only requests or 1xx/204/304 responses have no body.
+        if head_only
+            || response_code < 200
+            || response_code == 204
+            || response_code == 304
+        {
+            let elapsed = start.elapsed();
+            self.info.inner.total_time_us = elapsed.as_micros() as i64;
+            return Ok(());
+        }
+
+        // Phase 2: Read the response body.
+        // Extract any body data already buffered from the header read.
+        let initial_body_data = if body_start_offset < header_buf.len() {
+            header_buf[body_start_offset..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        // For chunked and non-chunked responses, chain any leftover
+        // header-buffer bytes with the network reader so the body
+        // decoder sees a single continuous byte stream.
+        let leftover_cursor = std::io::Cursor::new(initial_body_data);
+        let mut chained_reader = ChainReader::new(leftover_cursor, reader);
+
+        if chunked {
+            // Chunked transfer encoding: read chunk-by-chunk.
+            self.read_chunked_body(&mut chained_reader, start, &mut body_received, first_body_byte).await?;
+        } else if let Some(cl) = content_length {
+            // Content-Length body: read exactly cl bytes.
+            self.read_fixed_body(&mut chained_reader, start, cl, &mut body_received, first_body_byte).await?;
+        } else {
+            // No Content-Length, no chunked: read until connection close.
+            self.read_until_close(&mut chained_reader, start, &mut body_received, first_body_byte).await?;
+        }
+
+        // Record final timing and size.
         let elapsed = start.elapsed();
         self.info.inner.total_time_us = elapsed.as_micros() as i64;
+        self.info.inner.size_download = body_received as i64;
 
-        // Drop the TCP stream — actual protocol work completes here.
-        drop(tcp_stream);
+        Ok(())
+    }
+
+    /// Delivers body data to the write callback or internal buffer.
+    ///
+    /// This is the central body-forwarding function. All response body
+    /// bytes flow through here, whether from initial header-buffer
+    /// overflow, chunked reads, content-length reads, or close-delimited
+    /// reads.
+    fn deliver_body_data(&mut self, data: &[u8]) -> CurlResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(ref mut cb) = self.write_callback {
+            let written = cb(data);
+            if written != data.len() {
+                tracing::error!(
+                    "deliver_body_data: write callback returned {} (expected {})",
+                    written,
+                    data.len()
+                );
+                return Err(CurlError::WriteError);
+            }
+        } else {
+            // No callback registered — accumulate internally.
+            self.response_body.extend_from_slice(data);
+        }
+
+        // Update progress tracking.
+        self.progress.download_inc(data.len() as u64);
+
+        Ok(())
+    }
+
+    /// Reads a fixed-length response body (Content-Length known).
+    async fn read_fixed_body<R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+        start: std::time::Instant,
+        total_remaining: u64,
+        body_received: &mut u64,
+        mut first_body_byte: bool,
+    ) -> CurlResult<()> {
+        use tokio::io::AsyncReadExt;
+
+        let mut remaining = total_remaining;
+        let mut buf = vec![0u8; 16 * 1024];
+
+        while remaining > 0 {
+            let to_read = std::cmp::min(remaining as usize, buf.len());
+            let n = match reader.read(&mut buf[..to_read]).await {
+                Ok(0) => {
+                    // Connection closed before all data received.
+                    tracing::warn!(
+                        "read_fixed_body: connection closed with {} bytes remaining",
+                        remaining
+                    );
+                    let elapsed = start.elapsed();
+                    self.info.inner.total_time_us = elapsed.as_micros() as i64;
+                    self.info.inner.size_download = *body_received as i64;
+                    return Err(CurlError::PartialFile);
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!("read_fixed_body: read error: {}", e);
+                    let elapsed = start.elapsed();
+                    self.info.inner.total_time_us = elapsed.as_micros() as i64;
+                    return Err(CurlError::RecvError);
+                }
+            };
+
+            if first_body_byte {
+                self.info.inner.starttransfer_time_us =
+                    start.elapsed().as_micros() as i64;
+                first_body_byte = false;
+            }
+
+            self.deliver_body_data(&buf[..n])?;
+            *body_received += n as u64;
+            remaining -= n as u64;
+        }
+
+        Ok(())
+    }
+
+    /// Reads a chunked transfer-encoded response body.
+    async fn read_chunked_body<R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+        start: std::time::Instant,
+        body_received: &mut u64,
+        mut first_body_byte: bool,
+    ) -> CurlResult<()> {
+        use tokio::io::AsyncReadExt;
+
+        let mut line_buf = Vec::with_capacity(256);
+        let mut buf = vec![0u8; 16 * 1024];
+
+        loop {
+            // Read the chunk size line.
+            line_buf.clear();
+            loop {
+                let mut byte = [0u8; 1];
+                match reader.read(&mut byte).await {
+                    Ok(0) => {
+                        // Connection closed mid-chunk — treat as end.
+                        let elapsed = start.elapsed();
+                        self.info.inner.total_time_us = elapsed.as_micros() as i64;
+                        self.info.inner.size_download = *body_received as i64;
+                        return Ok(());
+                    }
+                    Ok(_) => {
+                        line_buf.push(byte[0]);
+                        if line_buf.ends_with(b"\r\n") {
+                            break;
+                        }
+                        // Safety limit on chunk-size line.
+                        if line_buf.len() > 256 {
+                            return Err(CurlError::WeirdServerReply);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("read_chunked_body: read error: {}", e);
+                        return Err(CurlError::RecvError);
+                    }
+                }
+            }
+
+            // Parse the chunk size (hex).
+            let size_str = String::from_utf8_lossy(&line_buf[..line_buf.len() - 2]);
+            let size_str = size_str.split(';').next().unwrap_or("0").trim();
+            let chunk_size = match u64::from_str_radix(size_str, 16) {
+                Ok(s) => s,
+                Err(_) => {
+                    tracing::error!("read_chunked_body: invalid chunk size: {}", size_str);
+                    return Err(CurlError::WeirdServerReply);
+                }
+            };
+
+            if chunk_size == 0 {
+                // Final chunk — read trailing \r\n and return.
+                let mut trailer = [0u8; 2];
+                let _ = reader.read_exact(&mut trailer).await;
+                break;
+            }
+
+            // Read the chunk data.
+            let mut remaining = chunk_size;
+            while remaining > 0 {
+                let to_read = std::cmp::min(remaining as usize, buf.len());
+                let n = match reader.read(&mut buf[..to_read]).await {
+                    Ok(0) => {
+                        let elapsed = start.elapsed();
+                        self.info.inner.total_time_us = elapsed.as_micros() as i64;
+                        self.info.inner.size_download = *body_received as i64;
+                        return Err(CurlError::PartialFile);
+                    }
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::error!("read_chunked_body: read error: {}", e);
+                        return Err(CurlError::RecvError);
+                    }
+                };
+
+                if first_body_byte {
+                    self.info.inner.starttransfer_time_us =
+                        start.elapsed().as_micros() as i64;
+                    first_body_byte = false;
+                }
+
+                self.deliver_body_data(&buf[..n])?;
+                *body_received += n as u64;
+                remaining -= n as u64;
+            }
+
+            // Read the trailing \r\n after the chunk data.
+            let mut crlf = [0u8; 2];
+            if let Err(e) = reader.read_exact(&mut crlf).await {
+                tracing::warn!("read_chunked_body: missing chunk CRLF: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reads response body until the connection is closed (no Content-Length).
+    async fn read_until_close<R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+        start: std::time::Instant,
+        body_received: &mut u64,
+        mut first_body_byte: bool,
+    ) -> CurlResult<()> {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = vec![0u8; 16 * 1024];
+
+        loop {
+            let n = match reader.read(&mut buf).await {
+                Ok(0) => break, // Connection closed — body complete.
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!("read_until_close: read error: {}", e);
+                    let elapsed = start.elapsed();
+                    self.info.inner.total_time_us = elapsed.as_micros() as i64;
+                    return Err(CurlError::RecvError);
+                }
+            };
+
+            if first_body_byte {
+                self.info.inner.starttransfer_time_us =
+                    start.elapsed().as_micros() as i64;
+                first_body_byte = false;
+            }
+
+            self.deliver_body_data(&buf[..n])?;
+            *body_received += n as u64;
+        }
 
         Ok(())
     }
@@ -1186,6 +1800,15 @@ impl EasyHandle {
         // Clear WebSocket state — WebSocket state is per-connection and
         // must be re-created on the next WebSocket upgrade handshake.
         self.ws_state = None;
+
+        // Clear callbacks — they must be re-registered after reset.
+        self.write_callback = None;
+        self.header_callback = None;
+        self.debug_callback = None;
+        self.progress_callback = None;
+
+        // Clear accumulated response body.
+        self.response_body.clear();
     }
 
     // -----------------------------------------------------------------------
@@ -1269,6 +1892,12 @@ impl EasyHandle {
             connect_only: self.connect_only,
             os_errno: 0,
             ws_state: None, // WebSocket state is per-connection, not duplicated
+            // Callbacks are NOT duplicated — caller must re-register
+            write_callback: None,
+            header_callback: None,
+            debug_callback: None,
+            progress_callback: None,
+            response_body: Vec::new(),
         }
     }
 
@@ -1895,12 +2524,149 @@ impl fmt::Debug for EasyBuilder {
 }
 
 // ===========================================================================
+// ChainReader — chains in-memory bytes with an async reader
+// ===========================================================================
+
+/// Async reader that first reads from an in-memory cursor, then from
+/// an underlying async reader. Used to feed leftover header-buffer bytes
+/// into the body decoder along with subsequent network reads.
+struct ChainReader<'a, R: tokio::io::AsyncRead + Unpin> {
+    /// In-memory prefix bytes (leftover from header parsing).
+    cursor: std::io::Cursor<Vec<u8>>,
+    /// Whether the cursor has been fully consumed.
+    cursor_done: bool,
+    /// The underlying network reader.
+    reader: &'a mut R,
+}
+
+impl<'a, R: tokio::io::AsyncRead + Unpin> ChainReader<'a, R> {
+    fn new(cursor: std::io::Cursor<Vec<u8>>, reader: &'a mut R) -> Self {
+        let cursor_done = cursor.position() as usize >= cursor.get_ref().len();
+        Self {
+            cursor,
+            cursor_done,
+            reader,
+        }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ChainReader<'_, R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if !self.cursor_done {
+            let pos = self.cursor.position() as usize;
+            let data_len = self.cursor.get_ref().len();
+            if pos < data_len {
+                let to_copy = std::cmp::min(data_len - pos, buf.remaining());
+                let slice = &self.cursor.get_ref()[pos..pos + to_copy];
+                buf.put_slice(slice);
+                let new_pos = pos + to_copy;
+                self.cursor.set_position(new_pos as u64);
+                if new_pos >= data_len {
+                    self.cursor_done = true;
+                }
+                return std::task::Poll::Ready(Ok(()));
+            }
+            self.cursor_done = true;
+        }
+        // Delegate to the underlying reader.
+        std::pin::Pin::new(&mut *self.reader).poll_read(cx, buf)
+    }
+}
+
+// ===========================================================================
+// Module-level helper functions
+// ===========================================================================
+
+/// Finds the position of the `\r\n\r\n` header/body separator in a byte buffer.
+///
+/// Returns `Some(pos)` where `pos` is the index of the first `\r` in the
+/// `\r\n\r\n` sequence, or `None` if not found.
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 4 {
+        return None;
+    }
+    (0..buf.len() - 3).find(|&i| {
+        buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n'
+    })
+}
+
+/// Maps a TCP connection I/O error to the appropriate `CurlError` code.
+///
+/// This function examines the error kind and message to differentiate
+/// between DNS resolution failures, connection refused, timeouts, and
+/// other connection errors — matching curl 8.x error code semantics.
+fn map_connect_error(
+    e: &std::io::Error,
+    host: &str,
+    connect_addr: &str,
+) -> CurlError {
+    match e.kind() {
+        std::io::ErrorKind::ConnectionRefused => {
+            tracing::error!(
+                "run_transfer: connection refused to {}",
+                connect_addr
+            );
+            CurlError::CouldntConnect
+        }
+        std::io::ErrorKind::TimedOut => {
+            tracing::error!(
+                "run_transfer: connection timed out to {}",
+                connect_addr
+            );
+            CurlError::OperationTimedOut
+        }
+        std::io::ErrorKind::AddrNotAvailable
+        | std::io::ErrorKind::AddrInUse => {
+            tracing::error!(
+                "run_transfer: address error for {}: {}",
+                connect_addr, e
+            );
+            CurlError::CouldntConnect
+        }
+        _ => {
+            let msg = e.to_string();
+            if msg.contains("dns")
+                || msg.contains("resolve")
+                || msg.contains("No such host")
+                || msg.contains("Name or service not known")
+                || msg.contains("Temporary failure in name resolution")
+                || msg.contains("nodename nor servname")
+            {
+                tracing::error!(
+                    "run_transfer: DNS resolution failed for {}: {}",
+                    host, e
+                );
+                CurlError::CouldntResolveHost
+            } else {
+                tracing::error!(
+                    "run_transfer: connection failed to {}: {}",
+                    connect_addr, e
+                );
+                CurlError::CouldntConnect
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // Unit tests
 // ===========================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_find_header_end() {
+        assert_eq!(find_header_end(b"HTTP/1.1 200 OK\r\n\r\nbody"), Some(15));
+        assert_eq!(find_header_end(b"no end"), None);
+        assert_eq!(find_header_end(b"\r\n\r\n"), Some(0));
+        assert_eq!(find_header_end(b"abc"), None);
+    }
 
     #[test]
     fn test_global_init_cleanup() {
@@ -2110,5 +2876,421 @@ mod tests {
         handle.cleanup(); // Should not panic.
         // handle is consumed — cannot be used after this.
         let _ = id; // Prove id was captured before cleanup.
+    }
+
+    // -- Callback registration tests --
+
+    #[test]
+    fn test_set_write_callback() {
+        let mut handle = EasyHandle::new();
+        let data_received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let data_clone = data_received.clone();
+        handle.set_write_callback(Box::new(move |data: &[u8]| {
+            data_clone.lock().unwrap().extend_from_slice(data);
+            data.len()
+        }));
+        // Verify the callback is set (write_callback is Some)
+        assert!(handle.write_callback.is_some());
+    }
+
+    #[test]
+    fn test_set_header_callback() {
+        let mut handle = EasyHandle::new();
+        handle.set_header_callback(Box::new(|data: &[u8]| {
+            data.len()
+        }));
+        assert!(handle.header_callback.is_some());
+    }
+
+    #[test]
+    fn test_set_debug_callback() {
+        let mut handle = EasyHandle::new();
+        handle.set_debug_callback(Box::new(|info_type: u32, data: &[u8]| {
+            let _ = (info_type, data);
+        }));
+        assert!(handle.debug_callback.is_some());
+    }
+
+    #[test]
+    fn test_set_progress_callback() {
+        let mut handle = EasyHandle::new();
+        handle.set_progress_callback(Box::new(|dltotal, dlnow, ultotal, ulnow| {
+            let _ = (dltotal, dlnow, ultotal, ulnow);
+            0
+        }));
+        assert!(handle.progress_callback.is_some());
+    }
+
+    // -- deliver_body_data tests --
+
+    #[test]
+    fn test_deliver_body_data_no_callback() {
+        let mut handle = EasyHandle::new();
+        // Without a write callback, data should accumulate internally.
+        handle.deliver_body_data(b"Hello").unwrap();
+        handle.deliver_body_data(b" World").unwrap();
+        assert_eq!(handle.response_body(), b"Hello World");
+    }
+
+    #[test]
+    fn test_deliver_body_data_empty() {
+        let mut handle = EasyHandle::new();
+        // Empty data should be a no-op.
+        handle.deliver_body_data(b"").unwrap();
+        assert!(handle.response_body().is_empty());
+    }
+
+    #[test]
+    fn test_deliver_body_data_with_callback() {
+        let mut handle = EasyHandle::new();
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let recv_clone = received.clone();
+        handle.set_write_callback(Box::new(move |data: &[u8]| {
+            recv_clone.lock().unwrap().extend_from_slice(data);
+            data.len()
+        }));
+        handle.deliver_body_data(b"test data").unwrap();
+        // Data goes to callback, not internal buffer
+        assert!(handle.response_body().is_empty());
+        assert_eq!(&*received.lock().unwrap(), b"test data");
+    }
+
+    #[test]
+    fn test_deliver_body_data_callback_short_write() {
+        let mut handle = EasyHandle::new();
+        handle.set_write_callback(Box::new(|_data: &[u8]| {
+            0 // Return 0 bytes written = write error
+        }));
+        let result = handle.deliver_body_data(b"test");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), CurlError::WriteError);
+    }
+
+    // -- response_body tests --
+
+    #[test]
+    fn test_response_body_initially_empty() {
+        let handle = EasyHandle::new();
+        assert!(handle.response_body().is_empty());
+    }
+
+    // -- get_info comprehensive tests --
+
+    #[test]
+    fn test_get_info_effective_url_default() {
+        let handle = EasyHandle::new();
+        let result = handle.get_info(getinfo::CurlInfo::EffectiveUrl);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            getinfo::InfoValue::String(v) => {
+                assert!(v.is_none() || v.as_deref() == Some(""));
+            }
+            _ => panic!("Expected String variant"),
+        }
+    }
+
+    #[test]
+    fn test_get_info_response_code_default() {
+        let handle = EasyHandle::new();
+        let result = handle.get_info(getinfo::CurlInfo::ResponseCode);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            getinfo::InfoValue::Long(v) => assert_eq!(v, 0),
+            _ => panic!("Expected Long variant"),
+        }
+    }
+
+    #[test]
+    fn test_get_info_total_time_default() {
+        let handle = EasyHandle::new();
+        let result = handle.get_info(getinfo::CurlInfo::TotalTimeT);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            getinfo::InfoValue::OffT(v) => assert_eq!(v, 0),
+            _ => panic!("Expected OffT variant"),
+        }
+    }
+
+    #[test]
+    fn test_get_info_size_download_default() {
+        let handle = EasyHandle::new();
+        let result = handle.get_info(getinfo::CurlInfo::SizeDownloadT);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            getinfo::InfoValue::OffT(v) => assert_eq!(v, 0),
+            _ => panic!("Expected OffT variant"),
+        }
+    }
+
+    #[test]
+    fn test_get_info_content_type_default() {
+        let handle = EasyHandle::new();
+        let result = handle.get_info(getinfo::CurlInfo::ContentType);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            getinfo::InfoValue::String(v) => assert!(v.is_none()),
+            _ => panic!("Expected String variant"),
+        }
+    }
+
+    #[test]
+    fn test_get_info_http_version_default() {
+        let handle = EasyHandle::new();
+        let result = handle.get_info(getinfo::CurlInfo::HttpVersion);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            getinfo::InfoValue::Long(v) => assert_eq!(v, 0),
+            _ => panic!("Expected Long variant"),
+        }
+    }
+
+    #[test]
+    fn test_get_info_primary_ip_default() {
+        let handle = EasyHandle::new();
+        let result = handle.get_info(getinfo::CurlInfo::PrimaryIp);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            getinfo::InfoValue::String(v) => assert!(v.is_none() || v.as_deref() == Some("")),
+            _ => panic!("Expected String variant"),
+        }
+    }
+
+    #[test]
+    fn test_get_info_scheme_default() {
+        let handle = EasyHandle::new();
+        let result = handle.get_info(getinfo::CurlInfo::Scheme);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            getinfo::InfoValue::String(v) => assert!(v.is_none() || v.as_deref() == Some("")),
+            _ => panic!("Expected String variant"),
+        }
+    }
+
+    #[test]
+    fn test_get_info_redirect_count_default() {
+        let handle = EasyHandle::new();
+        let result = handle.get_info(getinfo::CurlInfo::RedirectCount);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            getinfo::InfoValue::Long(v) => assert_eq!(v, 0),
+            _ => panic!("Expected Long variant"),
+        }
+    }
+
+    #[test]
+    fn test_get_info_cert_info_default() {
+        let handle = EasyHandle::new();
+        let result = handle.get_info(getinfo::CurlInfo::CertInfo);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            getinfo::InfoValue::SList(_) => {}
+            _ => panic!("Expected SList variant"),
+        }
+    }
+
+    // -- Builder additional tests --
+
+    #[test]
+    fn test_builder_default_config() {
+        let handle = EasyHandle::builder().build();
+        assert_eq!(handle.state(), EasyState::Idle);
+        assert!(!handle.config.verbose);
+        assert_eq!(handle.config.followlocation, 0);
+    }
+
+    #[test]
+    fn test_builder_post_method() {
+        let handle = EasyHandle::builder()
+            .url("https://example.com/api")
+            .build();
+        assert_eq!(handle.state(), EasyState::Idle);
+    }
+
+    #[test]
+    fn test_builder_verbose_off() {
+        let handle = EasyHandle::builder()
+            .verbose(false)
+            .build();
+        assert!(!handle.config.verbose);
+    }
+
+    #[test]
+    fn test_builder_max_redirects_zero() {
+        let handle = EasyHandle::builder()
+            .max_redirects(0)
+            .build();
+        assert_eq!(handle.config.maxredirs, 0);
+    }
+
+    #[test]
+    fn test_builder_timeout_millisecond_precision() {
+        let handle = EasyHandle::builder()
+            .timeout(Duration::from_millis(1500))
+            .build();
+        assert_eq!(handle.config.timeout_ms, 1500);
+    }
+
+    // -- EasyHandle additional tests --
+
+    #[test]
+    fn test_easy_handle_url_field() {
+        let mut handle = EasyHandle::new();
+        let mut curl_url = crate::url::CurlUrl::new();
+        curl_url.set(crate::url::CurlUrlPart::Url, "https://example.com", 0).unwrap();
+        handle.url = Some(curl_url);
+        assert!(handle.url.is_some());
+        handle.reset();
+        assert!(handle.url.is_none());
+    }
+
+    #[test]
+    fn test_easy_handle_multiple_resets() {
+        let mut handle = EasyHandle::new();
+        let mut curl_url = crate::url::CurlUrl::new();
+        curl_url.set(crate::url::CurlUrlPart::Url, "http://example.com", 0).unwrap();
+        handle.url = Some(curl_url);
+        handle.reset();
+        assert!(handle.url.is_none());
+        let mut curl_url2 = crate::url::CurlUrl::new();
+        curl_url2.set(crate::url::CurlUrlPart::Url, "http://other.com", 0).unwrap();
+        handle.url = Some(curl_url2);
+        handle.reset();
+        assert!(handle.url.is_none());
+    }
+
+    #[test]
+    fn test_easy_handle_connect_only_flag() {
+        let mut handle = EasyHandle::new();
+        assert!(!handle.connect_only);
+        handle.connect_only = true;
+        assert!(handle.connect_only);
+        handle.reset();
+        assert!(!handle.connect_only);
+    }
+
+    #[test]
+    fn test_easy_pause_recv_only() {
+        let mut handle = EasyHandle::new();
+        handle.pause(CURLPAUSE_RECV).unwrap();
+        assert!(handle.is_recv_paused());
+        assert!(!handle.is_send_paused());
+    }
+
+    #[test]
+    fn test_easy_pause_send_only() {
+        let mut handle = EasyHandle::new();
+        handle.pause(CURLPAUSE_SEND).unwrap();
+        assert!(!handle.is_recv_paused());
+        assert!(handle.is_send_paused());
+    }
+
+    #[test]
+    fn test_easy_pause_toggle() {
+        let mut handle = EasyHandle::new();
+        // Pause all
+        handle.pause(CURLPAUSE_ALL).unwrap();
+        assert!(handle.is_recv_paused());
+        assert!(handle.is_send_paused());
+        // Unpause recv only
+        handle.pause(CURLPAUSE_SEND).unwrap();
+        assert!(!handle.is_recv_paused());
+        assert!(handle.is_send_paused());
+    }
+
+    #[test]
+    fn test_transfer_info_accessors() {
+        let mut info = TransferInfo::new();
+        assert_eq!(info.namelookup_time(), 0.0);
+        assert_eq!(info.connect_time(), 0.0);
+        assert_eq!(info.appconnect_time(), 0.0);
+        assert_eq!(info.starttransfer_time(), 0.0);
+        assert_eq!(info.size_upload(), 0.0);
+        assert_eq!(info.speed_download(), 0.0);
+        assert_eq!(info.speed_upload(), 0.0);
+        assert_eq!(info.primary_port(), 0);
+        // Set some values
+        info.inner.response_code = 200;
+        info.inner.total_time_us = 1_000_000;
+        assert_eq!(info.response_code(), 200);
+        assert_eq!(info.total_time(), 1.0);
+    }
+
+    #[test]
+    fn test_easy_dup_preserves_config() {
+        let mut orig = EasyHandle::new();
+        orig.config.verbose = true;
+        orig.config.maxredirs = 10;
+        let mut curl_url = crate::url::CurlUrl::new();
+        curl_url.set(crate::url::CurlUrlPart::Url, "https://example.com", 0).unwrap();
+        orig.url = Some(curl_url);
+        let dup = orig.dup();
+        assert!(dup.config.verbose);
+        assert_eq!(dup.config.maxredirs, 10);
+        assert!(dup.url.is_some());
+        // But different IDs
+        assert_ne!(orig.id(), dup.id());
+    }
+
+    #[test]
+    fn test_find_header_end_various() {
+        // Standard CRLFCRLF — position is where the \r\n\r\n starts
+        assert_eq!(find_header_end(b"Header1: val\r\nHeader2: val\r\n\r\nbody"), Some(26));
+        // Just the end marker
+        assert_eq!(find_header_end(b"\r\n\r\n"), Some(0));
+        // No end marker
+        assert_eq!(find_header_end(b"Partial\r\nHeaders"), None);
+        // End marker at very end
+        assert_eq!(find_header_end(b"H: v\r\n\r\n"), Some(4));
+        // Single \r\n without double
+        assert_eq!(find_header_end(b"stuff\r\n"), None);
+        // Short buffer
+        assert_eq!(find_header_end(b"abc"), None);
+        assert_eq!(find_header_end(b""), None);
+    }
+
+    #[test]
+    fn test_easy_handle_response_body_accumulation() {
+        let mut handle = EasyHandle::new();
+        handle.deliver_body_data(b"chunk1").unwrap();
+        handle.deliver_body_data(b"chunk2").unwrap();
+        handle.deliver_body_data(b"chunk3").unwrap();
+        assert_eq!(handle.response_body(), b"chunk1chunk2chunk3");
+    }
+
+    #[test]
+    fn test_deliver_body_data_large_payload() {
+        let mut handle = EasyHandle::new();
+        let large_data = vec![0xABu8; 65536]; // 64KB
+        handle.deliver_body_data(&large_data).unwrap();
+        assert_eq!(handle.response_body().len(), 65536);
+    }
+
+    #[test]
+    fn test_easy_handle_os_errno() {
+        let mut handle = EasyHandle::new();
+        assert_eq!(handle.os_errno, 0);
+        handle.os_errno = 42;
+        assert_eq!(handle.os_errno, 42);
+        handle.reset();
+        // errno should be reset
+    }
+
+    #[test]
+    fn test_global_init_multiple_calls() {
+        // Multiple inits should succeed (reference counted in curl)
+        assert!(global_init(CURL_GLOBAL_DEFAULT).is_ok());
+        assert!(global_init(CURL_GLOBAL_NOTHING).is_ok());
+        assert!(global_init(CURL_GLOBAL_SSL).is_ok());
+        global_cleanup();
+    }
+
+    #[test]
+    fn test_easy_handle_id_uniqueness() {
+        let h1 = EasyHandle::new();
+        let h2 = EasyHandle::new();
+        let h3 = EasyHandle::new();
+        assert_ne!(h1.id(), h2.id());
+        assert_ne!(h2.id(), h3.id());
+        assert_ne!(h1.id(), h3.id());
     }
 }

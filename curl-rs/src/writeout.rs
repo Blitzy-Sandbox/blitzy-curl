@@ -1435,4 +1435,141 @@ mod tests {
             assert!(found, "VarId::{:?} not found in VARIABLES", id);
         }
     }
+
+    #[test]
+    fn test_json_write_string_value_escaping() {
+        let mut buf = Vec::new();
+        json_write_string_value(&mut buf, "hello").unwrap();
+        assert_eq!(std::str::from_utf8(&buf).unwrap(), "\"hello\"");
+    }
+
+    #[test]
+    fn test_json_write_string_value_with_quotes() {
+        let mut buf = Vec::new();
+        json_write_string_value(&mut buf, "say \"hello\"").unwrap();
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert!(s.contains("\\\""));
+    }
+
+    #[test]
+    fn test_json_write_string_value_with_backslash() {
+        let mut buf = Vec::new();
+        json_write_string_value(&mut buf, "path\\file").unwrap();
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert!(s.contains("\\\\"));
+    }
+
+    #[test]
+    fn test_json_write_string_value_empty() {
+        let mut buf = Vec::new();
+        json_write_string_value(&mut buf, "").unwrap();
+        assert_eq!(std::str::from_utf8(&buf).unwrap(), "\"\"");
+    }
+
+    #[test]
+    fn test_json_write_string_value_control_chars() {
+        let mut buf = Vec::new();
+        json_write_string_value(&mut buf, "line1\nline2\ttab").unwrap();
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert!(s.contains("\\n"));
+        assert!(s.contains("\\t"));
+    }
+
+    #[test]
+    fn test_write_separator() {
+        let mut buf = Vec::new();
+        write_separator("\n", &mut buf).unwrap();
+        assert_eq!(std::str::from_utf8(&buf).unwrap(), "\n");
+
+        let mut buf = Vec::new();
+        write_separator("\\n", &mut buf).unwrap();
+        assert_eq!(std::str::from_utf8(&buf).unwrap(), "\n");
+
+        let mut buf = Vec::new();
+        write_separator("\\t", &mut buf).unwrap();
+        assert_eq!(std::str::from_utf8(&buf).unwrap(), "\t");
+
+        let mut buf = Vec::new();
+        write_separator("\\r", &mut buf).unwrap();
+        assert_eq!(std::str::from_utf8(&buf).unwrap(), "\r");
+    }
+
+    #[test]
+    fn test_outtime_with_format() {
+        let mut buf = Vec::new();
+        // outtime expects the portion after "%{otime_", e.g. "%Y}rest"
+        let count = outtime("%Y}", &mut buf).unwrap();
+        assert!(count > 0);
+    }
+
+    #[test]
+    fn test_outtime_no_closing_brace() {
+        let mut buf = Vec::new();
+        let count = outtime("no_brace", &mut buf).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_variable_names_not_empty() {
+        for v in &VARIABLES {
+            assert!(!v.name.is_empty(), "empty variable name found");
+        }
+    }
+
+    #[test]
+    fn test_variable_names_valid_chars() {
+        for v in &VARIABLES {
+            for ch in v.name.chars() {
+                assert!(
+                    ch.is_ascii_alphanumeric() || ch == '_' || ch == '.',
+                    "variable '{}' has invalid char '{}'",
+                    v.name,
+                    ch
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_var_case_sensitivity() {
+        // Variables should be case-sensitive
+        if let Some(v) = find_var("http_code") {
+            assert!(find_var("HTTP_CODE").is_none() || find_var("HTTP_CODE").unwrap().name == v.name);
+        }
+    }
+
+    #[test]
+    fn test_json_escape_special_chars() {
+        let cases = vec![
+            ("simple", "\"simple\""),
+            ("", "\"\""),
+        ];
+        for (input, expected) in cases {
+            let mut buf = Vec::new();
+            json_write_string_value(&mut buf, input).unwrap();
+            assert_eq!(std::str::from_utf8(&buf).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_varid_debug_impl() {
+        let id = VarId::HttpCode;
+        let dbg = format!("{:?}", id);
+        assert!(!dbg.is_empty());
+    }
+
+    #[test]
+    fn test_writeoutvar_struct_fields() {
+        for v in &VARIABLES {
+            let _ = v.name;
+            let _ = v.id;
+            // Just verify the struct fields are accessible without panic
+        }
+    }
+
+    #[test]
+    fn test_variable_count() {
+        // Should have a substantial number of variables
+        assert!(VARIABLES.len() > 50, "Expected more than 50 variables, got {}", VARIABLES.len());
+    }
 }

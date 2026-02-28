@@ -2657,4 +2657,649 @@ mod tests {
         assert_eq!(count, 291, "variant count mismatch");
     }
 
+    // ---------------------------------------------------------------------------
+    // Comprehensive set_option() tests covering all match arms by category
+    // ---------------------------------------------------------------------------
+
+    /// Helper to create a fresh HandleOptions and set a long option.
+    fn set_long(opt: CurlOpt, val: i64) -> CurlResult<HandleOptions> {
+        let mut opts = HandleOptions::new();
+        set_option(&mut opts, opt as u32, CurlOptValue::Long(val))?;
+        Ok(opts)
+    }
+
+    /// Helper to create a fresh HandleOptions and set a string option.
+    fn set_str(opt: CurlOpt, val: &str) -> CurlResult<HandleOptions> {
+        let mut opts = HandleOptions::new();
+        set_option(&mut opts, opt as u32, CurlOptValue::ObjectPoint(val.to_string()))?;
+        Ok(opts)
+    }
+
+    #[test]
+    fn test_set_option_long_basic_network() {
+        // PORT
+        let o = set_long(CurlOpt::CURLOPT_PORT, 8080).unwrap();
+        assert_eq!(o.port, 8080);
+        // TIMEOUT
+        let o = set_long(CurlOpt::CURLOPT_TIMEOUT, 30).unwrap();
+        assert_eq!(o.timeout_ms, 30000);
+        // INFILESIZE
+        let o = set_long(CurlOpt::CURLOPT_INFILESIZE, 1024).unwrap();
+        assert_eq!(o.infilesize, 1024);
+        // LOW_SPEED_LIMIT
+        let o = set_long(CurlOpt::CURLOPT_LOW_SPEED_LIMIT, 100).unwrap();
+        assert_eq!(o.low_speed_limit, 100);
+        // LOW_SPEED_TIME
+        let o = set_long(CurlOpt::CURLOPT_LOW_SPEED_TIME, 60).unwrap();
+        assert_eq!(o.low_speed_time, 60);
+        // RESUME_FROM
+        let o = set_long(CurlOpt::CURLOPT_RESUME_FROM, 500).unwrap();
+        assert_eq!(o.resume_from, 500);
+    }
+
+    #[test]
+    fn test_set_option_long_boolean_flags() {
+        let o = set_long(CurlOpt::CURLOPT_CRLF, 1).unwrap();
+        assert!(o.crlf);
+        let o = set_long(CurlOpt::CURLOPT_VERBOSE, 1).unwrap();
+        assert!(o.verbose);
+        let o = set_long(CurlOpt::CURLOPT_HEADER, 1).unwrap();
+        assert!(o.header);
+        let o = set_long(CurlOpt::CURLOPT_NOPROGRESS, 1).unwrap();
+        assert!(o.noprogress);
+        let o = set_long(CurlOpt::CURLOPT_NOBODY, 1).unwrap();
+        assert!(o.nobody);
+        let o = set_long(CurlOpt::CURLOPT_FAILONERROR, 1).unwrap();
+        assert!(o.failonerror);
+        let o = set_long(CurlOpt::CURLOPT_DIRLISTONLY, 1).unwrap();
+        assert!(o.dirlistonly);
+        let o = set_long(CurlOpt::CURLOPT_APPEND, 1).unwrap();
+        assert!(o.append);
+        let o = set_long(CurlOpt::CURLOPT_TRANSFERTEXT, 1).unwrap();
+        assert!(o.transfertext);
+        let o = set_long(CurlOpt::CURLOPT_AUTOREFERER, 1).unwrap();
+        assert!(o.autoreferer);
+    }
+
+    #[test]
+    fn test_set_option_long_boolean_flags_2() {
+        let o = set_long(CurlOpt::CURLOPT_HTTPPROXYTUNNEL, 1).unwrap();
+        assert!(o.httpproxytunnel);
+        let o = set_long(CurlOpt::CURLOPT_FILETIME, 1).unwrap();
+        assert!(o.filetime);
+        let o = set_long(CurlOpt::CURLOPT_FRESH_CONNECT, 1).unwrap();
+        assert!(o.fresh_connect);
+        let o = set_long(CurlOpt::CURLOPT_FORBID_REUSE, 1).unwrap();
+        assert!(o.forbid_reuse);
+        let o = set_long(CurlOpt::CURLOPT_FTP_USE_EPSV, 1).unwrap();
+        assert!(o.ftp_use_epsv);
+        let o = set_long(CurlOpt::CURLOPT_SSLENGINE_DEFAULT, 1).unwrap();
+        assert!(o.sslengine_default);
+        let o = set_long(CurlOpt::CURLOPT_COOKIESESSION, 1).unwrap();
+        assert!(o.cookiesession);
+        let o = set_long(CurlOpt::CURLOPT_NOSIGNAL, 1).unwrap();
+        assert!(o.nosignal);
+        let o = set_long(CurlOpt::CURLOPT_UNRESTRICTED_AUTH, 1).unwrap();
+        assert!(o.unrestricted_auth);
+        let o = set_long(CurlOpt::CURLOPT_FTP_USE_EPRT, 1).unwrap();
+        assert!(o.ftp_use_eprt);
+    }
+
+    #[test]
+    fn test_set_option_long_boolean_flags_3() {
+        let o = set_long(CurlOpt::CURLOPT_IGNORE_CONTENT_LENGTH, 1).unwrap();
+        assert!(o.ignore_content_length);
+        let o = set_long(CurlOpt::CURLOPT_FTP_SKIP_PASV_IP, 1).unwrap();
+        assert!(o.ftp_skip_pasv_ip);
+        let o = set_long(CurlOpt::CURLOPT_SSL_SESSIONID_CACHE, 1).unwrap();
+        assert!(o.ssl_sessionid_cache);
+        let o = set_long(CurlOpt::CURLOPT_HTTP_TRANSFER_DECODING, 1).unwrap();
+        assert!(o.http_transfer_decoding);
+        let o = set_long(CurlOpt::CURLOPT_HTTP_CONTENT_DECODING, 1).unwrap();
+        assert!(o.http_content_decoding);
+        let o = set_long(CurlOpt::CURLOPT_PROXY_TRANSFER_MODE, 1).unwrap();
+        assert!(o.proxy_transfer_mode);
+        let o = set_long(CurlOpt::CURLOPT_CERTINFO, 1).unwrap();
+        assert!(o.certinfo);
+        let o = set_long(CurlOpt::CURLOPT_SOCKS5_GSSAPI_NEC, 1).unwrap();
+        assert!(o.socks5_gssapi_nec);
+        let o = set_long(CurlOpt::CURLOPT_FTP_USE_PRET, 1).unwrap();
+        assert!(o.ftp_use_pret);
+        let o = set_long(CurlOpt::CURLOPT_WILDCARDMATCH, 1).unwrap();
+        assert!(o.wildcardmatch);
+    }
+
+    #[test]
+    fn test_set_option_long_boolean_flags_4() {
+        let o = set_long(CurlOpt::CURLOPT_TRANSFER_ENCODING, 1).unwrap();
+        assert!(o.transfer_encoding);
+        let o = set_long(CurlOpt::CURLOPT_TCP_KEEPALIVE, 1).unwrap();
+        assert!(o.tcp_keepalive);
+        let o = set_long(CurlOpt::CURLOPT_SASL_IR, 1).unwrap();
+        assert!(o.sasl_ir);
+        let o = set_long(CurlOpt::CURLOPT_SSL_ENABLE_ALPN, 1).unwrap();
+        assert!(o.ssl_enable_alpn);
+        let o = set_long(CurlOpt::CURLOPT_PATH_AS_IS, 1).unwrap();
+        assert!(o.path_as_is);
+        let o = set_long(CurlOpt::CURLOPT_PIPEWAIT, 0).unwrap();
+        assert!(!o.pipewait);
+        let o = set_long(CurlOpt::CURLOPT_PIPEWAIT, 1).unwrap();
+        assert!(o.pipewait);
+        let o = set_long(CurlOpt::CURLOPT_SUPPRESS_CONNECT_HEADERS, 1).unwrap();
+        assert!(o.suppress_connect_headers);
+        let o = set_long(CurlOpt::CURLOPT_TCP_FASTOPEN, 1).unwrap();
+        assert!(o.tcp_fastopen);
+        let o = set_long(CurlOpt::CURLOPT_DISALLOW_USERNAME_IN_URL, 1).unwrap();
+        assert!(o.disallow_username_in_url);
+    }
+
+    #[test]
+    fn test_set_option_long_boolean_flags_5() {
+        let o = set_long(CurlOpt::CURLOPT_HAPROXYPROTOCOL, 1).unwrap();
+        assert!(o.haproxyprotocol);
+        let o = set_long(CurlOpt::CURLOPT_HTTP09_ALLOWED, 1).unwrap();
+        assert!(o.http09_allowed);
+        let o = set_long(CurlOpt::CURLOPT_MAIL_RCPT_ALLOWFAILS, 1).unwrap();
+        assert!(o.mail_rcpt_allowfails);
+        let o = set_long(CurlOpt::CURLOPT_SSL_OPTIONS, 1).unwrap();
+        assert_eq!(o.ssl_options, 1);
+        let o = set_long(CurlOpt::CURLOPT_PROXY_SSL_OPTIONS, 1).unwrap();
+        assert_eq!(o.proxy_ssl_options, 1);
+        let o = set_long(CurlOpt::CURLOPT_TCP_NODELAY, 1).unwrap();
+        assert!(o.tcp_nodelay);
+    }
+
+    #[test]
+    fn test_set_option_long_integer_fields() {
+        let o = set_long(CurlOpt::CURLOPT_TIMECONDITION, 2).unwrap();
+        assert_eq!(o.timecondition, 2);
+        let o = set_long(CurlOpt::CURLOPT_TIMEVALUE, 1234567890).unwrap();
+        assert_eq!(o.timevalue, 1234567890);
+        let o = set_long(CurlOpt::CURLOPT_NETRC, 1).unwrap();
+        assert_eq!(o.netrc, 1);
+        let o = set_long(CurlOpt::CURLOPT_PROXYPORT, 3128).unwrap();
+        assert_eq!(o.proxyport, 3128);
+        let o = set_long(CurlOpt::CURLOPT_POSTFIELDSIZE, 512).unwrap();
+        assert_eq!(o.postfieldsize, 512);
+        let o = set_long(CurlOpt::CURLOPT_SSL_VERIFYHOST, 2).unwrap();
+        assert_eq!(o.ssl_verifyhost, 2);
+        let o = set_long(CurlOpt::CURLOPT_DNS_CACHE_TIMEOUT, 120).unwrap();
+        assert_eq!(o.dns_cache_timeout, 120);
+        let o = set_long(CurlOpt::CURLOPT_BUFFERSIZE, 16384).unwrap();
+        assert_eq!(o.buffersize, 16384);
+        let o = set_long(CurlOpt::CURLOPT_IPRESOLVE, 1).unwrap();
+        assert_eq!(o.ipresolve, 1);
+        let o = set_long(CurlOpt::CURLOPT_USE_SSL, 3).unwrap();
+        assert_eq!(o.use_ssl, 3);
+    }
+
+    #[test]
+    fn test_set_option_long_integer_fields_2() {
+        let o = set_long(CurlOpt::CURLOPT_FTPSSLAUTH, 2).unwrap();
+        assert_eq!(o.ftpsslauth, 2);
+        let o = set_long(CurlOpt::CURLOPT_FTP_FILEMETHOD, 1).unwrap();
+        assert_eq!(o.ftp_filemethod, 1);
+        let o = set_long(CurlOpt::CURLOPT_LOCALPORT, 5000).unwrap();
+        assert_eq!(o.localport, 5000);
+        let o = set_long(CurlOpt::CURLOPT_LOCALPORTRANGE, 100).unwrap();
+        assert_eq!(o.localportrange, 100);
+        let o = set_long(CurlOpt::CURLOPT_CONNECT_ONLY, 1).unwrap();
+        assert_eq!(o.connect_only, 1);
+        let o = set_long(CurlOpt::CURLOPT_SSH_AUTH_TYPES, 7).unwrap();
+        assert_eq!(o.ssh_auth_types, 7);
+        let o = set_long(CurlOpt::CURLOPT_FTP_SSL_CCC, 1).unwrap();
+        assert_eq!(o.ftp_ssl_ccc, 1);
+        let o = set_long(CurlOpt::CURLOPT_TIMEOUT_MS, 5000).unwrap();
+        assert_eq!(o.timeout_ms, 5000);
+        let o = set_long(CurlOpt::CURLOPT_CONNECTTIMEOUT_MS, 3000).unwrap();
+        assert_eq!(o.connecttimeout_ms, 3000);
+        let o = set_long(CurlOpt::CURLOPT_POSTREDIR, 3).unwrap();
+        assert_eq!(o.postredir, 3);
+    }
+
+    #[test]
+    fn test_set_option_long_integer_fields_3() {
+        let o = set_long(CurlOpt::CURLOPT_ADDRESS_SCOPE, 5).unwrap();
+        assert_eq!(o.address_scope, 5);
+        let o = set_long(CurlOpt::CURLOPT_TFTP_BLKSIZE, 512).unwrap();
+        assert_eq!(o.tftp_blksize, 512);
+        let o = set_long(CurlOpt::CURLOPT_RTSP_REQUEST, 1).unwrap();
+        assert_eq!(o.rtsp_request, 1);
+        let o = set_long(CurlOpt::CURLOPT_RTSP_CLIENT_CSEQ, 10).unwrap();
+        assert_eq!(o.rtsp_client_cseq, 10);
+        let o = set_long(CurlOpt::CURLOPT_RTSP_SERVER_CSEQ, 20).unwrap();
+        assert_eq!(o.rtsp_server_cseq, 20);
+        let o = set_long(CurlOpt::CURLOPT_TCP_KEEPIDLE, 60).unwrap();
+        assert_eq!(o.tcp_keepidle, 60);
+        let o = set_long(CurlOpt::CURLOPT_TCP_KEEPINTVL, 30).unwrap();
+        assert_eq!(o.tcp_keepintvl, 30);
+        let o = set_long(CurlOpt::CURLOPT_HEADEROPT, 1).unwrap();
+        assert_eq!(o.headeropt, 1);
+        let o = set_long(CurlOpt::CURLOPT_EXPECT_100_TIMEOUT_MS, 2000).unwrap();
+        assert_eq!(o.expect_100_timeout_ms, 2000);
+        let o = set_long(CurlOpt::CURLOPT_STREAM_WEIGHT, 128).unwrap();
+        assert_eq!(o.stream_weight, 128);
+    }
+
+    #[test]
+    fn test_set_option_long_integer_fields_4() {
+        let o = set_long(CurlOpt::CURLOPT_SOCKS5_AUTH, 3).unwrap();
+        assert_eq!(o.socks5_auth, 3);
+        let o = set_long(CurlOpt::CURLOPT_SSH_COMPRESSION, 1).unwrap();
+        assert!(o.ssh_compression);
+        let o = set_long(CurlOpt::CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS, 300).unwrap();
+        assert_eq!(o.happy_eyeballs_timeout_ms, 300);
+        let o = set_long(CurlOpt::CURLOPT_DNS_SHUFFLE_ADDRESSES, 1).unwrap();
+        assert!(o.dns_shuffle_addresses);
+        let o = set_long(CurlOpt::CURLOPT_UPLOAD_BUFFERSIZE, 65536).unwrap();
+        assert_eq!(o.upload_buffersize, 65536);
+        let o = set_long(CurlOpt::CURLOPT_UPKEEP_INTERVAL_MS, 60000).unwrap();
+        assert_eq!(o.upkeep_interval_ms, 60000);
+        let o = set_long(CurlOpt::CURLOPT_MAXAGE_CONN, 300).unwrap();
+        assert_eq!(o.maxage_conn, 300);
+        let o = set_long(CurlOpt::CURLOPT_MAXLIFETIME_CONN, 600).unwrap();
+        assert_eq!(o.maxlifetime_conn, 600);
+    }
+
+    #[test]
+    fn test_set_option_string_fields() {
+        let o = set_str(CurlOpt::CURLOPT_URL, "https://example.com").unwrap();
+        assert_eq!(o.url.as_deref(), Some("https://example.com"));
+        let o = set_str(CurlOpt::CURLOPT_PROXY, "http://proxy:8080").unwrap();
+        assert_eq!(o.proxy.as_deref(), Some("http://proxy:8080"));
+        let o = set_str(CurlOpt::CURLOPT_USERPWD, "user:pass").unwrap();
+        assert_eq!(o.userpwd.as_deref(), Some("user:pass"));
+        let o = set_str(CurlOpt::CURLOPT_RANGE, "0-100").unwrap();
+        assert_eq!(o.range.as_deref(), Some("0-100"));
+        let o = set_str(CurlOpt::CURLOPT_POSTFIELDS, "data=test").unwrap();
+        assert_eq!(o.postfields.as_deref(), Some("data=test"));
+        let o = set_str(CurlOpt::CURLOPT_REFERER, "https://origin.com").unwrap();
+        assert_eq!(o.referer.as_deref(), Some("https://origin.com"));
+        let o = set_str(CurlOpt::CURLOPT_USERAGENT, "MyAgent/1.0").unwrap();
+        assert_eq!(o.useragent.as_deref(), Some("MyAgent/1.0"));
+        let o = set_str(CurlOpt::CURLOPT_COOKIE, "name=value").unwrap();
+        assert_eq!(o.cookie.as_deref(), Some("name=value"));
+        let o = set_str(CurlOpt::CURLOPT_COOKIEFILE, "/tmp/cookies").unwrap();
+        assert_eq!(o.cookiefile.as_deref(), Some("/tmp/cookies"));
+    }
+
+    #[test]
+    fn test_set_option_string_fields_2() {
+        let o = set_str(CurlOpt::CURLOPT_SSLCERT, "/path/cert.pem").unwrap();
+        assert_eq!(o.sslcert.as_deref(), Some("/path/cert.pem"));
+        let o = set_str(CurlOpt::CURLOPT_SSLCERTTYPE, "PEM").unwrap();
+        assert_eq!(o.sslcerttype.as_deref(), Some("PEM"));
+        let o = set_str(CurlOpt::CURLOPT_SSLKEY, "/path/key.pem").unwrap();
+        assert_eq!(o.sslkey.as_deref(), Some("/path/key.pem"));
+        let o = set_str(CurlOpt::CURLOPT_SSLKEYTYPE, "PEM").unwrap();
+        assert_eq!(o.sslkeytype.as_deref(), Some("PEM"));
+        let o = set_str(CurlOpt::CURLOPT_KEYPASSWD, "secret").unwrap();
+        assert_eq!(o.keypasswd.as_deref(), Some("secret"));
+        let o = set_str(CurlOpt::CURLOPT_SSLENGINE, "engine").unwrap();
+        assert_eq!(o.sslengine.as_deref(), Some("engine"));
+        let o = set_str(CurlOpt::CURLOPT_COOKIEJAR, "/tmp/jar").unwrap();
+        assert_eq!(o.cookiejar.as_deref(), Some("/tmp/jar"));
+        let o = set_str(CurlOpt::CURLOPT_CUSTOMREQUEST, "PATCH").unwrap();
+        assert_eq!(o.customrequest.as_deref(), Some("PATCH"));
+        let o = set_str(CurlOpt::CURLOPT_INTERFACE, "eth0").unwrap();
+        assert_eq!(o.interface.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn test_set_option_string_fields_3() {
+        let o = set_str(CurlOpt::CURLOPT_CAINFO, "/path/ca.pem").unwrap();
+        assert_eq!(o.cainfo.as_deref(), Some("/path/ca.pem"));
+        let o = set_str(CurlOpt::CURLOPT_CAPATH, "/path/certs").unwrap();
+        assert_eq!(o.capath.as_deref(), Some("/path/certs"));
+        let o = set_str(CurlOpt::CURLOPT_FTP_ACCOUNT, "acct").unwrap();
+        assert_eq!(o.ftp_account.as_deref(), Some("acct"));
+        let o = set_str(CurlOpt::CURLOPT_COOKIELIST, "ALL").unwrap();
+        assert_eq!(o.cookielist.as_deref(), Some("ALL"));
+        let o = set_str(CurlOpt::CURLOPT_FTP_ALTERNATIVE_TO_USER, "alt").unwrap();
+        assert_eq!(o.ftp_alternative_to_user.as_deref(), Some("alt"));
+        let o = set_str(CurlOpt::CURLOPT_SSH_PUBLIC_KEYFILE, "/path/id_rsa.pub").unwrap();
+        assert_eq!(o.ssh_public_keyfile.as_deref(), Some("/path/id_rsa.pub"));
+        let o = set_str(CurlOpt::CURLOPT_SSH_PRIVATE_KEYFILE, "/path/id_rsa").unwrap();
+        assert_eq!(o.ssh_private_keyfile.as_deref(), Some("/path/id_rsa"));
+        let o = set_str(CurlOpt::CURLOPT_SSH_HOST_PUBLIC_KEY_MD5, "d41d8cd98f").unwrap();
+        assert_eq!(o.ssh_host_public_key_md5.as_deref(), Some("d41d8cd98f"));
+    }
+
+    #[test]
+    fn test_set_option_string_fields_4() {
+        let o = set_str(CurlOpt::CURLOPT_NOPROXY, "localhost").unwrap();
+        assert_eq!(o.noproxy.as_deref(), Some("localhost"));
+        let o = set_str(CurlOpt::CURLOPT_MAIL_FROM, "sender@test.com").unwrap();
+        assert_eq!(o.mail_from.as_deref(), Some("sender@test.com"));
+        let o = set_str(CurlOpt::CURLOPT_RTSP_SESSION_ID, "sess123").unwrap();
+        assert_eq!(o.rtsp_session_id.as_deref(), Some("sess123"));
+        let o = set_str(CurlOpt::CURLOPT_RTSP_STREAM_URI, "rtsp://test").unwrap();
+        assert_eq!(o.rtsp_stream_uri.as_deref(), Some("rtsp://test"));
+        let o = set_str(CurlOpt::CURLOPT_RTSP_TRANSPORT, "RTP/AVP").unwrap();
+        assert_eq!(o.rtsp_transport.as_deref(), Some("RTP/AVP"));
+        let o = set_str(CurlOpt::CURLOPT_ACCEPT_ENCODING, "gzip").unwrap();
+        assert_eq!(o.accept_encoding.as_deref(), Some("gzip"));
+        let o = set_str(CurlOpt::CURLOPT_DNS_SERVERS, "8.8.8.8").unwrap();
+        assert_eq!(o.dns_servers.as_deref(), Some("8.8.8.8"));
+        let o = set_str(CurlOpt::CURLOPT_DNS_INTERFACE, "eth0").unwrap();
+        assert_eq!(o.dns_interface.as_deref(), Some("eth0"));
+        let o = set_str(CurlOpt::CURLOPT_DNS_LOCAL_IP4, "10.0.0.1").unwrap();
+        assert_eq!(o.dns_local_ip4.as_deref(), Some("10.0.0.1"));
+        let o = set_str(CurlOpt::CURLOPT_DNS_LOCAL_IP6, "::1").unwrap();
+        assert_eq!(o.dns_local_ip6.as_deref(), Some("::1"));
+    }
+
+    #[test]
+    fn test_set_option_string_fields_5() {
+        let o = set_str(CurlOpt::CURLOPT_LOGIN_OPTIONS, "AUTH=PLAIN").unwrap();
+        assert_eq!(o.login_options.as_deref(), Some("AUTH=PLAIN"));
+        let o = set_str(CurlOpt::CURLOPT_PINNEDPUBLICKEY, "sha256//abc").unwrap();
+        assert_eq!(o.pinnedpublickey.as_deref(), Some("sha256//abc"));
+        let o = set_str(CurlOpt::CURLOPT_UNIX_SOCKET_PATH, "/tmp/sock").unwrap();
+        assert_eq!(o.unix_socket_path.as_deref(), Some("/tmp/sock"));
+        let o = set_str(CurlOpt::CURLOPT_PROXY_CAINFO, "/path/proxy_ca.pem").unwrap();
+        assert_eq!(o.proxy_cainfo.as_deref(), Some("/path/proxy_ca.pem"));
+        let o = set_str(CurlOpt::CURLOPT_PROXY_CAPATH, "/path/proxy_certs").unwrap();
+        assert_eq!(o.proxy_capath.as_deref(), Some("/path/proxy_certs"));
+        let o = set_str(CurlOpt::CURLOPT_PROXY_SSLCERT, "/proxy/cert").unwrap();
+        assert_eq!(o.proxy_sslcert.as_deref(), Some("/proxy/cert"));
+        let o = set_str(CurlOpt::CURLOPT_PROXY_SSLCERTTYPE, "PEM").unwrap();
+        assert_eq!(o.proxy_sslcerttype.as_deref(), Some("PEM"));
+        let o = set_str(CurlOpt::CURLOPT_PROXY_SSLKEY, "/proxy/key").unwrap();
+        assert_eq!(o.proxy_sslkey.as_deref(), Some("/proxy/key"));
+        let o = set_str(CurlOpt::CURLOPT_PROXY_SSLKEYTYPE, "PEM").unwrap();
+        assert_eq!(o.proxy_sslkeytype.as_deref(), Some("PEM"));
+    }
+
+    #[test]
+    fn test_set_option_string_fields_6() {
+        let o = set_str(CurlOpt::CURLOPT_PROXY_KEYPASSWD, "secret").unwrap();
+        assert_eq!(o.proxy_keypasswd.as_deref(), Some("secret"));
+        let o = set_str(CurlOpt::CURLOPT_PROXY_PINNEDPUBLICKEY, "sha256//xyz").unwrap();
+        assert_eq!(o.proxy_pinnedpublickey.as_deref(), Some("sha256//xyz"));
+        let o = set_str(CurlOpt::CURLOPT_ABSTRACT_UNIX_SOCKET, "/abstract").unwrap();
+        assert_eq!(o.abstract_unix_socket.as_deref(), Some("/abstract"));
+        let o = set_str(CurlOpt::CURLOPT_REQUEST_TARGET, "/api/v1").unwrap();
+        assert_eq!(o.request_target.as_deref(), Some("/api/v1"));
+        let o = set_str(CurlOpt::CURLOPT_TLS13_CIPHERS, "TLS_AES_128_GCM_SHA256").unwrap();
+        assert_eq!(o.tls13_ciphers.as_deref(), Some("TLS_AES_128_GCM_SHA256"));
+        let o = set_str(CurlOpt::CURLOPT_PROXY_TLS13_CIPHERS, "TLS_AES_256_GCM_SHA384").unwrap();
+        assert_eq!(o.proxy_tls13_ciphers.as_deref(), Some("TLS_AES_256_GCM_SHA384"));
+        let o = set_str(CurlOpt::CURLOPT_SASL_AUTHZID, "authzid").unwrap();
+        assert_eq!(o.sasl_authzid.as_deref(), Some("authzid"));
+        let o = set_str(CurlOpt::CURLOPT_PROXYUSERNAME, "proxyuser").unwrap();
+        assert_eq!(o.proxyusername.as_deref(), Some("proxyuser"));
+        let o = set_str(CurlOpt::CURLOPT_PROXYPASSWORD, "proxypass").unwrap();
+        assert_eq!(o.proxypassword.as_deref(), Some("proxypass"));
+    }
+
+    #[test]
+    fn test_set_option_string_fields_7() {
+        let o = set_str(CurlOpt::CURLOPT_SSL_CIPHER_LIST, "HIGH:!aNULL").unwrap();
+        assert_eq!(o.ssl_cipher_list.as_deref(), Some("HIGH:!aNULL"));
+        let o = set_str(CurlOpt::CURLOPT_PROXY_SSL_CIPHER_LIST, "DEFAULT").unwrap();
+        assert_eq!(o.proxy_ssl_cipher_list.as_deref(), Some("DEFAULT"));
+        let o = set_str(CurlOpt::CURLOPT_USERNAME, "testuser").unwrap();
+        assert_eq!(o.username.as_deref(), Some("testuser"));
+        let o = set_str(CurlOpt::CURLOPT_PASSWORD, "testpass").unwrap();
+        assert_eq!(o.password.as_deref(), Some("testpass"));
+        let o = set_str(CurlOpt::CURLOPT_CRLFILE, "/path/crl.pem").unwrap();
+        assert_eq!(o.crlfile.as_deref(), Some("/path/crl.pem"));
+        let o = set_str(CurlOpt::CURLOPT_ISSUERCERT, "/path/issuer.pem").unwrap();
+        assert_eq!(o.issuercert.as_deref(), Some("/path/issuer.pem"));
+        let o = set_str(CurlOpt::CURLOPT_XOAUTH2_BEARER, "token123").unwrap();
+        assert_eq!(o.xoauth2_bearer.as_deref(), Some("token123"));
+        let o = set_str(CurlOpt::CURLOPT_MAIL_AUTH, "auth@test.com").unwrap();
+        assert_eq!(o.mail_auth.as_deref(), Some("auth@test.com"));
+        let o = set_str(CurlOpt::CURLOPT_DEFAULT_PROTOCOL, "https").unwrap();
+        assert_eq!(o.default_protocol.as_deref(), Some("https"));
+        let o = set_str(CurlOpt::CURLOPT_PRE_PROXY, "socks5://proxy").unwrap();
+        assert_eq!(o.pre_proxy.as_deref(), Some("socks5://proxy"));
+    }
+
+    #[test]
+    fn test_set_option_special_interactions() {
+        // UPLOAD clears NOBODY
+        let mut opts = HandleOptions::new();
+        opts.nobody = true;
+        set_option(&mut opts, CurlOpt::CURLOPT_UPLOAD as u32, CurlOptValue::Long(1)).unwrap();
+        assert!(opts.upload);
+        assert!(!opts.nobody);
+
+        // POST clears NOBODY
+        let mut opts = HandleOptions::new();
+        opts.nobody = true;
+        set_option(&mut opts, CurlOpt::CURLOPT_POST as u32, CurlOptValue::Long(1)).unwrap();
+        assert!(opts.post);
+        assert!(!opts.nobody);
+
+        // HTTPGET clears POST, UPLOAD, NOBODY
+        let mut opts = HandleOptions::new();
+        opts.post = true;
+        opts.upload = true;
+        opts.nobody = true;
+        set_option(&mut opts, CurlOpt::CURLOPT_HTTPGET as u32, CurlOptValue::Long(1)).unwrap();
+        assert!(opts.httpget);
+        assert!(!opts.post);
+        assert!(!opts.upload);
+        assert!(!opts.nobody);
+    }
+
+    #[test]
+    fn test_set_option_validation_errors() {
+        // Negative port
+        assert!(set_long(CurlOpt::CURLOPT_PORT, -1).is_err());
+        // Negative infilesize
+        assert!(set_long(CurlOpt::CURLOPT_INFILESIZE, -1).is_err());
+        // Negative low speed limit
+        assert!(set_long(CurlOpt::CURLOPT_LOW_SPEED_LIMIT, -1).is_err());
+        // Negative low speed time
+        assert!(set_long(CurlOpt::CURLOPT_LOW_SPEED_TIME, -1).is_err());
+        // Negative maxconnects
+        assert!(set_long(CurlOpt::CURLOPT_MAXCONNECTS, -1).is_err());
+        // Unknown option
+        let mut opts = HandleOptions::new();
+        assert!(set_option(&mut opts, 99999, CurlOptValue::Long(0)).is_err());
+    }
+
+    #[test]
+    fn test_set_option_offt_fields() {
+        let mut opts = HandleOptions::new();
+        set_option(&mut opts, CurlOpt::CURLOPT_INFILESIZE_LARGE as u32, CurlOptValue::OffT(1_000_000)).unwrap();
+        assert_eq!(opts.infilesize_large, 1_000_000);
+
+        set_option(&mut opts, CurlOpt::CURLOPT_RESUME_FROM_LARGE as u32, CurlOptValue::OffT(500_000)).unwrap();
+        assert_eq!(opts.resume_from_large, 500_000);
+
+        set_option(&mut opts, CurlOpt::CURLOPT_MAXFILESIZE_LARGE as u32, CurlOptValue::OffT(2_000_000)).unwrap();
+        assert_eq!(opts.maxfilesize_large, 2_000_000);
+
+        set_option(&mut opts, CurlOpt::CURLOPT_POSTFIELDSIZE_LARGE as u32, CurlOptValue::OffT(4096)).unwrap();
+        assert_eq!(opts.postfieldsize_large, 4096);
+
+        set_option(&mut opts, CurlOpt::CURLOPT_MAX_SEND_SPEED_LARGE as u32, CurlOptValue::OffT(1_048_576)).unwrap();
+        assert_eq!(opts.max_send_speed_large, 1_048_576);
+
+        set_option(&mut opts, CurlOpt::CURLOPT_MAX_RECV_SPEED_LARGE as u32, CurlOptValue::OffT(2_097_152)).unwrap();
+        assert_eq!(opts.max_recv_speed_large, 2_097_152);
+
+        set_option(&mut opts, CurlOpt::CURLOPT_TIMEVALUE_LARGE as u32, CurlOptValue::OffT(9999)).unwrap();
+        assert_eq!(opts.timevalue_large, 9999);
+    }
+
+    #[test]
+    fn test_set_option_function_pointers() {
+        let mut opts = HandleOptions::new();
+        set_option(&mut opts, CurlOpt::CURLOPT_WRITEFUNCTION as u32, CurlOptValue::FunctionPoint).unwrap();
+        assert!(opts.has_writefunction);
+        set_option(&mut opts, CurlOpt::CURLOPT_READFUNCTION as u32, CurlOptValue::FunctionPoint).unwrap();
+        assert!(opts.has_readfunction);
+        set_option(&mut opts, CurlOpt::CURLOPT_HEADERFUNCTION as u32, CurlOptValue::FunctionPoint).unwrap();
+        assert!(opts.has_headerfunction);
+        set_option(&mut opts, CurlOpt::CURLOPT_INTERLEAVEFUNCTION as u32, CurlOptValue::FunctionPoint).unwrap();
+        assert!(opts.has_interleavefunction);
+        set_option(&mut opts, CurlOpt::CURLOPT_XFERINFOFUNCTION as u32, CurlOptValue::FunctionPoint).unwrap();
+        assert!(opts.has_xferinfofunction);
+        set_option(&mut opts, CurlOpt::CURLOPT_SEEKFUNCTION as u32, CurlOptValue::FunctionPoint).unwrap();
+        assert!(opts.has_seekfunction);
+        set_option(&mut opts, CurlOpt::CURLOPT_SOCKOPTFUNCTION as u32, CurlOptValue::FunctionPoint).unwrap();
+        assert!(opts.has_sockoptfunction);
+        set_option(&mut opts, CurlOpt::CURLOPT_OPENSOCKETFUNCTION as u32, CurlOptValue::FunctionPoint).unwrap();
+        assert!(opts.has_opensocketfunction);
+        set_option(&mut opts, CurlOpt::CURLOPT_CLOSESOCKETFUNCTION as u32, CurlOptValue::FunctionPoint).unwrap();
+        assert!(opts.has_closesocketfunction);
+        set_option(&mut opts, CurlOpt::CURLOPT_DEBUGFUNCTION as u32, CurlOptValue::FunctionPoint).unwrap();
+        assert!(opts.has_debugfunction);
+    }
+
+    #[test]
+    fn test_set_option_slist_fields() {
+        let mut opts = HandleOptions::new();
+        let mut sl = SList::new();
+        sl.append("Host: example.com");
+        set_option(&mut opts, CurlOpt::CURLOPT_HTTPHEADER as u32, CurlOptValue::SList(sl)).unwrap();
+        assert!(opts.httpheader.is_some());
+
+        let mut sl2 = SList::new();
+        sl2.append("recipient@test.com");
+        set_option(&mut opts, CurlOpt::CURLOPT_MAIL_RCPT as u32, CurlOptValue::SList(sl2)).unwrap();
+        assert!(opts.mail_rcpt.is_some());
+
+        let mut sl3 = SList::new();
+        sl3.append("FTP command");
+        set_option(&mut opts, CurlOpt::CURLOPT_QUOTE as u32, CurlOptValue::SList(sl3)).unwrap();
+        assert!(opts.quote.is_some());
+
+        let mut sl4 = SList::new();
+        sl4.append("POSTQUOTE cmd");
+        set_option(&mut opts, CurlOpt::CURLOPT_POSTQUOTE as u32, CurlOptValue::SList(sl4)).unwrap();
+        assert!(opts.postquote.is_some());
+
+        let mut sl5 = SList::new();
+        sl5.append("PREQUOTE cmd");
+        set_option(&mut opts, CurlOpt::CURLOPT_PREQUOTE as u32, CurlOptValue::SList(sl5)).unwrap();
+        assert!(opts.prequote.is_some());
+
+        let mut sl6 = SList::new();
+        sl6.append("resolve");
+        set_option(&mut opts, CurlOpt::CURLOPT_RESOLVE as u32, CurlOptValue::SList(sl6)).unwrap();
+        assert!(opts.resolve.is_some());
+
+        let mut sl7 = SList::new();
+        sl7.append("200 /test");
+        set_option(&mut opts, CurlOpt::CURLOPT_CONNECT_TO as u32, CurlOptValue::SList(sl7)).unwrap();
+        assert!(opts.connect_to.is_some());
+
+        let mut sl8 = SList::new();
+        sl8.append("Proxy-Header: test");
+        set_option(&mut opts, CurlOpt::CURLOPT_PROXYHEADER as u32, CurlOptValue::SList(sl8)).unwrap();
+        assert!(opts.proxyheader.is_some());
+
+        let mut sl10 = SList::new();
+        sl10.append("telnet opt");
+        set_option(&mut opts, CurlOpt::CURLOPT_TELNETOPTIONS as u32, CurlOptValue::SList(sl10)).unwrap();
+        assert!(opts.telnetoptions.is_some());
+
+        let mut sl11 = SList::new();
+        sl11.append("http200");
+        set_option(&mut opts, CurlOpt::CURLOPT_HTTP200ALIASES as u32, CurlOptValue::SList(sl11)).unwrap();
+        assert!(opts.http200aliases.is_some());
+    }
+
+    #[test]
+    fn test_set_option_blob_fields() {
+        let mut opts = HandleOptions::new();
+        let data = vec![1, 2, 3, 4, 5];
+        set_option(&mut opts, CurlOpt::CURLOPT_SSLCERT_BLOB as u32, CurlOptValue::Blob(data.clone())).unwrap();
+        assert_eq!(opts.sslcert_blob, Some(data.clone()));
+
+        set_option(&mut opts, CurlOpt::CURLOPT_SSLKEY_BLOB as u32, CurlOptValue::Blob(data.clone())).unwrap();
+        assert_eq!(opts.sslkey_blob, Some(data.clone()));
+
+        set_option(&mut opts, CurlOpt::CURLOPT_ISSUERCERT_BLOB as u32, CurlOptValue::Blob(data.clone())).unwrap();
+        assert_eq!(opts.issuercert_blob, Some(data.clone()));
+
+        set_option(&mut opts, CurlOpt::CURLOPT_PROXY_SSLCERT_BLOB as u32, CurlOptValue::Blob(data.clone())).unwrap();
+        assert_eq!(opts.proxy_sslcert_blob, Some(data.clone()));
+
+        set_option(&mut opts, CurlOpt::CURLOPT_PROXY_SSLKEY_BLOB as u32, CurlOptValue::Blob(data.clone())).unwrap();
+        assert_eq!(opts.proxy_sslkey_blob, Some(data.clone()));
+
+        set_option(&mut opts, CurlOpt::CURLOPT_PROXY_ISSUERCERT_BLOB as u32, CurlOptValue::Blob(data.clone())).unwrap();
+        assert_eq!(opts.proxy_issuercert_blob, Some(data.clone()));
+
+        set_option(&mut opts, CurlOpt::CURLOPT_CAINFO_BLOB as u32, CurlOptValue::Blob(data.clone())).unwrap();
+        assert_eq!(opts.cainfo_blob, Some(data));
+    }
+
+    #[test]
+    fn test_set_option_additional_string_fields() {
+        let o = set_str(CurlOpt::CURLOPT_PROTOCOLS_STR, "http,https,ftp").unwrap();
+        assert_eq!(o.protocols_str.as_deref(), Some("http,https,ftp"));
+        let o = set_str(CurlOpt::CURLOPT_REDIR_PROTOCOLS_STR, "https").unwrap();
+        assert_eq!(o.redir_protocols_str.as_deref(), Some("https"));
+        let o = set_str(CurlOpt::CURLOPT_HSTS, "/path/hsts").unwrap();
+        assert_eq!(o.hsts.as_deref(), Some("/path/hsts"));
+        let o = set_str(CurlOpt::CURLOPT_ALTSVC, "/path/altsvc").unwrap();
+        assert_eq!(o.altsvc.as_deref(), Some("/path/altsvc"));
+        let o = set_str(CurlOpt::CURLOPT_SSH_HOST_PUBLIC_KEY_SHA256, "sha256_key").unwrap();
+        assert_eq!(o.ssh_host_public_key_sha256.as_deref(), Some("sha256_key"));
+        let o = set_str(CurlOpt::CURLOPT_ECH, "ech_config").unwrap();
+        assert_eq!(o.ech.as_deref(), Some("ech_config"));
+    }
+
+    #[test]
+    fn test_set_option_proxy_ssl_fields() {
+        let o = set_long(CurlOpt::CURLOPT_PROXY_SSL_VERIFYPEER, 1).unwrap();
+        assert!(o.proxy_ssl_verifypeer);
+        let o = set_long(CurlOpt::CURLOPT_PROXY_SSL_VERIFYHOST, 2).unwrap();
+        assert_eq!(o.proxy_ssl_verifyhost, 2);
+        // SSLVERSION_DEFAULT (0) gets remapped to TLSv1.2 (6)
+        let o = set_long(CurlOpt::CURLOPT_PROXY_SSLVERSION, 0).unwrap();
+        assert_eq!(o.proxy_sslversion, 6);
+    }
+
+    #[test]
+    fn test_set_option_additional_long_flags() {
+        let o = set_long(CurlOpt::CURLOPT_HSTS_CTRL, 1).unwrap();
+        assert_eq!(o.hsts_ctrl, 1);
+        let o = set_long(CurlOpt::CURLOPT_ALTSVC_CTRL, 1).unwrap();
+        assert_eq!(o.altsvc_ctrl, 1);
+        let o = set_long(CurlOpt::CURLOPT_DOH_SSL_VERIFYPEER, 1).unwrap();
+        assert!(o.doh_ssl_verifypeer);
+        let o = set_long(CurlOpt::CURLOPT_DOH_SSL_VERIFYHOST, 2).unwrap();
+        assert!(o.doh_ssl_verifyhost);
+        let o = set_long(CurlOpt::CURLOPT_DOH_SSL_VERIFYSTATUS, 1).unwrap();
+        assert!(o.doh_ssl_verifystatus);
+        let o = set_long(CurlOpt::CURLOPT_MIME_OPTIONS, 1).unwrap();
+        assert_eq!(o.mime_options, 1);
+        let o = set_long(CurlOpt::CURLOPT_WS_OPTIONS, 1).unwrap();
+        assert_eq!(o.ws_options, 1);
+        let o = set_long(CurlOpt::CURLOPT_CA_CACHE_TIMEOUT, 600).unwrap();
+        assert_eq!(o.ca_cache_timeout, 600);
+        let o = set_long(CurlOpt::CURLOPT_QUICK_EXIT, 1).unwrap();
+        assert!(o.quick_exit);
+    }
+
+    #[test]
+    fn test_set_option_doh_url() {
+        let o = set_str(CurlOpt::CURLOPT_DOH_URL, "https://dns.google/dns-query").unwrap();
+        assert_eq!(o.doh_url.as_deref(), Some("https://dns.google/dns-query"));
+    }
+
+    #[test]
+    fn test_handle_options_new_defaults() {
+        let o = HandleOptions::new();
+        assert!(o.url.is_none());
+        assert!(!o.verbose);
+        assert!(!o.header);
+        assert!(!o.nobody);
+        assert!(!o.post);
+        assert!(!o.upload);
+        assert!(o.ssl_verifypeer);
+        assert_eq!(o.ssl_verifyhost, 2);
+        assert!(o.tcp_nodelay);
+        assert_eq!(o.http_version, 0);
+    }
+
 }

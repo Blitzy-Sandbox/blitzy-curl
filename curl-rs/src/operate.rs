@@ -552,7 +552,17 @@ fn post_check_result(
             &format!("({}) {}", result as i32, msg),
         );
         if result == CurlError::PeerFailedVerification {
-            errorf(global, CURL_CA_CERT_ERRORMSG);
+            // The CA cert error message is multi-line, so we print
+            // each line separately to avoid triggering the debug
+            // assertion in errorf() that disallows embedded newlines.
+            // Matches C behavior where the message is printed via
+            // fputs() directly to stderr, not through the errorf()
+            // word-wrapping path.
+            for line in CURL_CA_CERT_ERRORMSG.lines() {
+                if !line.is_empty() {
+                    errorf(global, line);
+                }
+            }
         }
     } else if config.fail == FAIL_WITH_BODY {
         let code = easy_get_response_code(&per.easy);
@@ -1046,6 +1056,50 @@ fn create_single(
         has_upload,
     );
     from_progress_per(&setopt_per, &mut per);
+
+    // Register the write callback to forward response body data to the
+    // output sink (stdout or output file). This wires the transfer layer
+    // end-to-end from network connection through to CLI output.
+    //
+    // The callback writes body bytes directly to the appropriate output
+    // destination, matching the C CURLOPT_WRITEFUNCTION behavior.
+    if !per.outs.out_null {
+        if per.outs.fopened {
+            // Output to file: use a shared file handle via Arc<Mutex<>>.
+            // The file is already open in per.outs.stream.
+            let file_ref = match &per.outs.stream {
+                OutputStream::File(f) => f.try_clone().ok(),
+                _ => None,
+            };
+            if let Some(mut file) = file_ref {
+                per.easy.set_write_callback(Box::new(move |data: &[u8]| {
+                    use std::io::Write;
+                    match file.write_all(data) {
+                        Ok(()) => data.len(),
+                        Err(_) => 0,
+                    }
+                }));
+            } else {
+                // Fallback to stdout if file clone failed.
+                per.easy.set_write_callback(Box::new(|data: &[u8]| {
+                    use std::io::Write;
+                    match std::io::stdout().write_all(data) {
+                        Ok(()) => data.len(),
+                        Err(_) => 0,
+                    }
+                }));
+            }
+        } else {
+            // Default output: stdout (no output file specified, or "-").
+            per.easy.set_write_callback(Box::new(|data: &[u8]| {
+                use std::io::Write;
+                match std::io::stdout().write_all(data) {
+                    Ok(()) => data.len(),
+                    Err(_) => 0,
+                }
+            }));
+        }
+    }
 
     // Initialize retry state.
     per.retry_sleep_default = config.retry_delay;

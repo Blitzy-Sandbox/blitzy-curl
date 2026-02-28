@@ -696,4 +696,325 @@ mod tests {
         let parsed: serde_json::Result<serde_json::Value> = serde_json::from_str(&full_json);
         assert!(parsed.is_ok(), "Output is not valid JSON: {}", full_json);
     }
+
+    #[test]
+    fn test_write_json_long_zero_value() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_json_long("code", 0, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "\"code\":0");
+    }
+
+    #[test]
+    fn test_write_json_long_million() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_json_long("size", 1_000_000, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "\"size\":1000000");
+    }
+
+    #[test]
+    fn test_write_json_offset_zero_val() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_json_offset("offset", 0, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "\"offset\":0");
+    }
+
+    #[test]
+    fn test_write_json_offset_very_large() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_json_offset("size", 9_876_543_210, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "\"size\":9876543210");
+    }
+
+    #[test]
+    fn test_write_json_time_zero_microsec() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_json_time("dns", 0, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "\"dns\":0.000000");
+    }
+
+    #[test]
+    fn test_write_json_time_one_and_half_sec() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_json_time("connect", 1_500_000, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "\"connect\":1.500000");
+    }
+
+    #[test]
+    fn test_write_json_time_fractional_sec() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_json_time("t", 123_456, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "\"t\":0.123456");
+    }
+
+    #[test]
+    fn test_write_json_string_none_explicit() {
+        let mut buf: Vec<u8> = Vec::new();
+        json_write_string("empty", None, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "\"empty\":null");
+    }
+
+    #[test]
+    fn test_write_json_string_unicode_chars() {
+        let mut buf: Vec<u8> = Vec::new();
+        json_write_string("msg", Some("héllo wörld"), &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        let full = format!("{{{}}}", s);
+        let parsed: serde_json::Result<serde_json::Value> = serde_json::from_str(&full);
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn test_json_quoted_mixed_case() {
+        let upper = json_quoted("Hello World", false);
+        let lower = json_quoted("Hello World", true);
+        assert_eq!(upper, "Hello World");
+        assert_eq!(lower, "hello world");
+    }
+
+    #[test]
+    fn test_json_quoted_with_escapes() {
+        let result = json_quoted("line1\nline2", false);
+        assert_eq!(result, "line1\\nline2");
+    }
+
+    #[test]
+    fn test_manual_json_escape_basic() {
+        let result = manual_json_escape("simple text");
+        assert_eq!(result, "simple text");
+    }
+
+    #[test]
+    fn test_manual_json_escape_quotes() {
+        let result = manual_json_escape("say \"hello\"");
+        assert_eq!(result, "say \\\"hello\\\"");
+    }
+
+    #[test]
+    fn test_manual_json_escape_backslash() {
+        let result = manual_json_escape("path\\file");
+        assert_eq!(result, "path\\\\file");
+    }
+
+    #[test]
+    fn test_manual_json_escape_control_chars() {
+        let result = manual_json_escape("tab\there\nnew");
+        assert!(result.contains("\\t"));
+        assert!(result.contains("\\n"));
+    }
+
+    #[test]
+    fn test_manual_json_escape_carriage_return() {
+        let result = manual_json_escape("line\r\nend");
+        assert!(result.contains("\\r"));
+        assert!(result.contains("\\n"));
+    }
+
+    #[test]
+    fn test_manual_json_escape_backspace() {
+        let result = manual_json_escape("a\u{0008}b");
+        assert!(result.contains("\\b"));
+    }
+
+    #[test]
+    fn test_manual_json_escape_formfeed() {
+        let result = manual_json_escape("a\u{000C}b");
+        assert!(result.contains("\\f"));
+    }
+
+    #[test]
+    fn test_manual_json_escape_low_control() {
+        // \x01 should be escaped as \u0001
+        let result = manual_json_escape("\u{0001}");
+        assert_eq!(result, "\\u0001");
+    }
+
+    #[test]
+    fn test_manual_json_escape_nul() {
+        let result = manual_json_escape("\u{0000}");
+        assert_eq!(result, "\\u0000");
+    }
+
+    #[test]
+    fn test_header_json_empty_headers() {
+        let mut buf: Vec<u8> = Vec::new();
+        let hdrs = Headers::new();
+        header_json(&hdrs, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        // Empty headers should produce {"headers":{}}
+        assert_eq!(s, "{\"headers\":{}}");
+    }
+
+    #[test]
+    fn test_write_json_long_neg_one() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_json_long("code", -1, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "\"code\":-1");
+    }
+
+    #[test]
+    fn test_write_json_string_newlines_in_body() {
+        let mut buf: Vec<u8> = Vec::new();
+        json_write_string("body", Some("line1\nline2\nline3"), &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        let full = format!("{{{}}}", s);
+        let parsed: serde_json::Result<serde_json::Value> = serde_json::from_str(&full);
+        assert!(parsed.is_ok(), "Invalid JSON: {}", full);
+    }
+
+    #[test]
+    fn test_our_write_out_json_basic() {
+        // Test the full JSON write-out against a fresh EasyHandle.
+        // This exercises all the get_info_* helpers and the complete
+        // output structure, covering ~190 lines of our_write_out_json.
+        let easy = EasyHandle::new();
+        let mut buf: Vec<u8> = Vec::new();
+        our_write_out_json(&easy, None, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        // Must start and end with braces
+        assert!(s.starts_with('{'));
+        assert!(s.ends_with('}'));
+        // Parse as JSON to verify structural correctness
+        let parsed: serde_json::Result<serde_json::Value> = serde_json::from_str(&s);
+        assert!(parsed.is_ok(), "our_write_out_json produced invalid JSON: {}", s);
+        let obj = parsed.unwrap();
+        // Check that expected fields exist
+        assert!(obj.get("url_effective").is_some());
+        assert!(obj.get("http_code").is_some());
+        assert!(obj.get("http_version").is_some());
+        assert!(obj.get("time_total").is_some());
+        assert!(obj.get("time_namelookup").is_some());
+        assert!(obj.get("time_connect").is_some());
+        assert!(obj.get("size_download").is_some());
+        assert!(obj.get("speed_download").is_some());
+        assert!(obj.get("curl_version").is_some());
+        assert!(obj.get("certs").is_some());
+        assert!(obj.get("xfer_id").is_some());
+        assert!(obj.get("conn_id").is_some());
+        assert!(obj.get("used_proxy").is_some());
+    }
+
+    #[test]
+    fn test_our_write_out_json_with_empty_headers() {
+        let easy = EasyHandle::new();
+        let hdrs = Headers::new();
+        let mut buf: Vec<u8> = Vec::new();
+        our_write_out_json(&easy, Some(&hdrs), &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        let parsed: serde_json::Result<serde_json::Value> = serde_json::from_str(&s);
+        assert!(parsed.is_ok(), "Invalid JSON: {}", s);
+        let obj = parsed.unwrap();
+        assert!(obj.get("headers").is_some());
+        assert!(obj.get("curl_version").is_some());
+    }
+
+    #[test]
+    fn test_our_write_out_json_default_values() {
+        // Verify default values for a fresh handle
+        let easy = EasyHandle::new();
+        let mut buf: Vec<u8> = Vec::new();
+        our_write_out_json(&easy, None, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        let obj: serde_json::Value = serde_json::from_str(&s).unwrap();
+        // Fresh handle should have code 0, no redirects, etc.
+        assert_eq!(obj["http_code"], 0);
+        assert_eq!(obj["num_connects"], 0);
+        assert_eq!(obj["num_redirects"], 0);
+        assert_eq!(obj["size_download"], 0);
+        assert_eq!(obj["size_upload"], 0);
+    }
+
+    #[test]
+    fn test_get_info_string_helper() {
+        let easy = EasyHandle::new();
+        // EffectiveUrl on fresh handle should be None or empty
+        let result = get_info_string(&easy, CurlInfo::EffectiveUrl);
+        // Might be None or Some("") depending on implementation
+        assert!(result.is_none() || result.as_deref() == Some(""));
+    }
+
+    #[test]
+    fn test_get_info_long_helper() {
+        let easy = EasyHandle::new();
+        let result = get_info_long(&easy, CurlInfo::ResponseCode);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_get_info_off_t_helper() {
+        let easy = EasyHandle::new();
+        let result = get_info_off_t(&easy, CurlInfo::SizeDownloadT);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_write_json_long_i64_max() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_json_long("big", i64::MAX, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains(&i64::MAX.to_string()));
+    }
+
+    #[test]
+    fn test_write_json_offset_negative() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_json_offset("off", -42, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "\"off\":-42");
+    }
+
+    #[test]
+    fn test_json_write_string_empty_value() {
+        let mut buf: Vec<u8> = Vec::new();
+        json_write_string("k", Some(""), &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "\"k\":\"\"");
+    }
+
+    #[test]
+    fn test_json_quoted_all_control_chars() {
+        // Test all control characters below 0x20
+        for code in 0u32..0x20 {
+            let ch = char::from_u32(code).unwrap();
+            let input = format!("a{}b", ch);
+            let result = json_quoted(&input, false);
+            // None of the control chars should appear raw
+            assert!(!result.contains(ch) || ch == '\\',
+                "Control char 0x{:02x} not escaped", code);
+        }
+    }
+
+    #[test]
+    fn test_manual_json_escape_truncation() {
+        // Create an input that would produce > MAX_JSON_STRING chars when escaped
+        let long_input: String = "\"".repeat(MAX_JSON_STRING + 100);
+        let result = manual_json_escape(&long_input);
+        // Each " becomes \" (2 chars), so output should be truncated
+        assert!(result.len() <= MAX_JSON_STRING * 2 + 10);
+    }
+
+    #[test]
+    fn test_write_json_time_large_value() {
+        let mut buf: Vec<u8> = Vec::new();
+        // 1 hour in microseconds
+        write_json_time("dur", 3_600_000_000, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "\"dur\":3600.000000");
+    }
+
+    #[test]
+    fn test_write_json_time_one_microsecond() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_json_time("t", 1, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "\"t\":0.000001");
+    }
 }
