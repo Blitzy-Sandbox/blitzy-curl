@@ -40,6 +40,7 @@ use crate::auth::{
 };
 use crate::conn::{AlpnId, ConnectionData, FilterChain};
 use crate::content_encoding::{self, DecoderChain};
+#[cfg(feature = "cookies")]
 use crate::cookie::{Cookie, CookieJar};
 use crate::error::{CurlError, CurlResult};
 use crate::escape;
@@ -1050,9 +1051,12 @@ pub async fn output(data: &mut EasyHandle, conn: &mut Connection) -> CurlResult<
     // Step 9: Add time condition headers (If-Modified-Since, etc.).
     add_timecondition(data, &mut req)?;
 
-    // Step 10: Add cookies.
-    let url_str = req.url.clone();
-    add_cookies(data, &mut req, &url_str)?;
+    // Step 10: Add cookies (only when cookies feature is enabled).
+    #[cfg(feature = "cookies")]
+    {
+        let url_str = req.url.clone();
+        add_cookies(data, &mut req, &url_str)?;
+    }
 
     // Step 11: Add Accept header if not present.
     if !req.has_header("Accept") {
@@ -2183,6 +2187,9 @@ pub async fn wait_for_100(
 /// # C Equivalent
 ///
 /// Cookie header construction in `Curl_http()`.
+///
+/// Only available when the `cookies` Cargo feature is enabled.
+#[cfg(feature = "cookies")]
 pub fn add_cookies(
     data: &EasyHandle,
     req: &mut HttpRequest,
@@ -2216,6 +2223,9 @@ pub fn add_cookies(
 /// # C Equivalent
 ///
 /// `Set-Cookie` processing in `Curl_http_readwrite_headers()`.
+///
+/// Only available when the `cookies` Cargo feature is enabled.
+#[cfg(feature = "cookies")]
 pub fn store_cookies(
     data: &mut EasyHandle,
     response: &HttpResponse,
@@ -2842,8 +2852,14 @@ pub trait HttpEasyExt {
     /// Returns whether this is a proxied (non-tunneled) request.
     fn is_proxied_request(&self) -> bool;
     /// Returns a reference to the cookie jar.
+    ///
+    /// Only available when the `cookies` Cargo feature is enabled.
+    #[cfg(feature = "cookies")]
     fn cookie_jar_ref(&self) -> Option<&CookieJar>;
     /// Returns a mutable reference to the cookie jar.
+    ///
+    /// Only available when the `cookies` Cargo feature is enabled.
+    #[cfg(feature = "cookies")]
     fn cookie_jar_ref_mut(&mut self) -> Option<&mut CookieJar>;
     /// Returns a reference to the HSTS cache.
     fn hsts_cache_ref(&self) -> Option<&HstsCache>;
@@ -3060,6 +3076,7 @@ impl HttpEasyExt for EasyHandle {
         self.has_proxy() && !self.options().httpproxytunnel
     }
 
+    #[cfg(feature = "cookies")]
     fn cookie_jar_ref(&self) -> Option<&CookieJar> {
         // Cookie jar is behind Arc<Mutex<>> for thread-safe sharing via
         // ShareHandle. Direct reference return is not possible with Mutex;
@@ -3070,6 +3087,7 @@ impl HttpEasyExt for EasyHandle {
         None
     }
 
+    #[cfg(feature = "cookies")]
     fn cookie_jar_ref_mut(&mut self) -> Option<&mut CookieJar> {
         // See `cookie_jar_ref()` — Mutex-guarded cookie jar does not support
         // direct mutable reference access. Cookie mutations go through
@@ -6009,6 +6027,7 @@ mod tests {
         let host = get_host_header(&easy, &conn);
         let _ = host;
     }
+    #[cfg(feature = "cookies")]
     #[test]
     fn r11_add_cookies_basic() {
         let easy = EasyHandle::new();
@@ -6016,6 +6035,7 @@ mod tests {
         let result = add_cookies(&easy, &mut req, "http://example.com/path");
         let _ = result;
     }
+    #[cfg(feature = "cookies")]
     #[test]
     fn r11_store_cookies_basic() {
         let mut easy = EasyHandle::new();
@@ -6023,6 +6043,7 @@ mod tests {
         let result = store_cookies(&mut easy, &resp, "example.com", "/path", false);
         let _ = result;
     }
+    #[cfg(feature = "cookies")]
     #[test]
     fn r11_store_cookies_with_set_cookie() {
         let mut easy = EasyHandle::new();

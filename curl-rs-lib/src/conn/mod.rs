@@ -71,6 +71,9 @@ pub mod filters;
 pub mod cache;
 pub mod connect;
 pub mod socket;
+/// HTTP/1 CONNECT proxy tunnel filter — only available when the `http`
+/// feature is enabled (guards `crate::protocols::http::chunks::Chunker`).
+#[cfg(feature = "http")]
 pub mod h1_proxy;
 pub mod h2_proxy;
 pub mod haproxy;
@@ -163,6 +166,7 @@ pub use socket::{
 // Re-exports from proxy tunnel filters
 // ===========================================================================
 
+#[cfg(feature = "http")]
 pub use h1_proxy::H1ProxyFilter;
 pub use h2_proxy::H2ProxyFilter;
 pub use haproxy::HaproxyFilter;

@@ -44,7 +44,9 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, Once};
+#[cfg(feature = "cookies")]
+use std::sync::{Arc, Mutex};
+use std::sync::Once;
 use std::time::Duration;
 
 use tracing;
@@ -52,6 +54,7 @@ use tracing;
 use crate::altsvc;
 #[allow(unused_imports)]
 use crate::conn;
+#[cfg(feature = "cookies")]
 use crate::cookie::CookieJar;
 use crate::error::{CurlError, CurlResult};
 use crate::getinfo;
@@ -445,6 +448,7 @@ pub struct EasyHandle {
     /// Cookie jar for HTTP cookie management. Behind `Arc<Mutex<>>` for
     /// thread-safe sharing between handles via `ShareHandle`.
     /// Feature-gated behind the `cookies` Cargo feature.
+    #[cfg(feature = "cookies")]
     cookie_jar: Option<Arc<Mutex<CookieJar>>>,
 
     /// Transfer progress tracking (speeds, timing, counters).
@@ -548,6 +552,7 @@ impl EasyHandle {
             url: None,
             headers: DynHeaders::new(),
             response_headers: Headers::new(),
+            #[cfg(feature = "cookies")]
             cookie_jar: None,
             progress: Progress::new(),
             info: TransferInfo::new(),
@@ -1138,7 +1143,10 @@ impl EasyHandle {
         // Reset cookie jar (clear session cookies but keep persistent ones).
         // Note: The cookie jar itself is not dropped — if shared, other
         // handles still reference it.
-        self.cookie_jar = None;
+        #[cfg(feature = "cookies")]
+        {
+            self.cookie_jar = None;
+        }
 
         // Reset progress tracking.
         self.progress = Progress::new();
@@ -1209,6 +1217,7 @@ impl EasyHandle {
         let url = self.url.as_ref().map(|u| u.dup());
 
         // Deep-copy the cookie jar.
+        #[cfg(feature = "cookies")]
         let cookie_jar = self.cookie_jar.as_ref().map(|jar| {
             let locked = jar.lock().unwrap_or_else(|e| e.into_inner());
             Arc::new(Mutex::new(locked.clone()))
@@ -1244,6 +1253,7 @@ impl EasyHandle {
             url,
             headers,
             response_headers: Headers::new(), // Fresh — not copied
+            #[cfg(feature = "cookies")]
             cookie_jar,
             progress: Progress::new(), // Fresh — not copied
             info: TransferInfo::new(), // Fresh — not copied
@@ -1522,6 +1532,9 @@ impl EasyHandle {
     }
 
     /// Returns a reference to the cookie jar, if cookies are enabled.
+    ///
+    /// Only available when the `cookies` Cargo feature is enabled.
+    #[cfg(feature = "cookies")]
     #[inline]
     pub fn cookie_jar(&self) -> Option<&Arc<Mutex<CookieJar>>> {
         self.cookie_jar.as_ref()
@@ -1705,6 +1718,7 @@ pub struct EasyBuilder {
     headers: SList,
 
     /// Whether to enable the cookie engine.
+    #[cfg(feature = "cookies")]
     cookie_jar: bool,
 
     /// Whether to enable verbose debug output.
@@ -1722,6 +1736,7 @@ impl EasyBuilder {
             proxy: None,
             user_agent: None,
             headers: SList::new(),
+            #[cfg(feature = "cookies")]
             cookie_jar: false,
             verbose: false,
         }
@@ -1794,6 +1809,9 @@ impl EasyBuilder {
     ///
     /// When enabled, a `CookieJar` is created and HTTP cookies are
     /// automatically managed during transfers.
+    ///
+    /// Only available when the `cookies` Cargo feature is enabled.
+    #[cfg(feature = "cookies")]
     pub fn cookie_jar(mut self, enable: bool) -> Self {
         self.cookie_jar = enable;
         self
@@ -1855,6 +1873,7 @@ impl EasyBuilder {
         }
 
         // Enable cookie engine if requested.
+        #[cfg(feature = "cookies")]
         if self.cookie_jar {
             handle.cookie_jar = Some(Arc::new(Mutex::new(CookieJar::new())));
         }
@@ -2023,6 +2042,7 @@ mod tests {
         assert_eq!(handle.state(), EasyState::Idle);
     }
 
+    #[cfg(feature = "cookies")]
     #[test]
     fn test_builder_with_cookie_jar() {
         let handle = EasyHandle::builder()

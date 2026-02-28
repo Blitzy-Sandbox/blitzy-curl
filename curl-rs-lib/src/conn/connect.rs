@@ -37,6 +37,7 @@ use crate::conn::filters::{
     CF_TYPE_IP_CONNECT, CF_TYPE_MULTIPLEX, CF_TYPE_SSL,
     CURL_CF_SSL_DEFAULT, CURL_CF_SSL_DISABLE, CURL_CF_SSL_ENABLE,
 };
+#[cfg(feature = "http")]
 use crate::conn::h1_proxy::H1ProxyFilter;
 use crate::conn::h2_proxy::H2ProxyFilter;
 use crate::conn::haproxy::HaproxyFilter;
@@ -552,6 +553,12 @@ impl ConnectionData {
     /// # C Equivalent
     ///
     /// `Curl_req_send` / filter chain `cft->do_send` from `lib/request.c`.
+    ///
+    /// # Feature Gate
+    ///
+    /// Only available when the `http` feature is enabled (parameter type
+    /// `HttpRequest` lives in the feature-gated `protocols::http` module).
+    #[cfg(feature = "http")]
     pub async fn send_request_data(
         &mut self,
         header_data: &[u8],
@@ -761,10 +768,25 @@ pub fn build_filter_chain(conn: &ConnectionData) -> Result<FilterChain, CurlErro
             chain.push_front(Box::new(h2_filter));
             debug!(conn_id = conn.conn_id, "filter chain: +H2Proxy tunnel (HTTPS proxy)");
         } else {
-            // Plain HTTP/1 CONNECT proxy tunnel.
-            let proxy_filter = H1ProxyFilter::new(proxy_host, proxy_port);
-            chain.push_front(Box::new(proxy_filter));
-            debug!(conn_id = conn.conn_id, "filter chain: +H1Proxy tunnel");
+            // Plain HTTP/1 CONNECT proxy tunnel — requires the `http` feature
+            // because H1ProxyFilter depends on `protocols::http::chunks::Chunker`.
+            #[cfg(feature = "http")]
+            {
+                let proxy_filter = H1ProxyFilter::new(proxy_host, proxy_port);
+                chain.push_front(Box::new(proxy_filter));
+                debug!(conn_id = conn.conn_id, "filter chain: +H1Proxy tunnel");
+            }
+            #[cfg(not(feature = "http"))]
+            {
+                warn!(
+                    conn_id = conn.conn_id,
+                    "HTTP/1 proxy tunnel requires the `http` feature; \
+                     falling back to H2 proxy tunnel"
+                );
+                let h2_filter = H2ProxyFilter::new(proxy_host, proxy_port);
+                chain.push_front(Box::new(h2_filter));
+                debug!(conn_id = conn.conn_id, "filter chain: +H2Proxy tunnel (HTTP feature disabled, fallback)");
+            }
         }
     }
 

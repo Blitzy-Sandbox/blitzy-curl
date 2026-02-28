@@ -51,6 +51,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::conn::ConnectionPool;
+#[cfg(feature = "cookies")]
 use crate::cookie::CookieJar;
 use crate::dns::DnsCache;
 use crate::error::CurlSHcode;
@@ -299,6 +300,7 @@ pub struct ShareData {
     ///
     /// Initialized when `set_option(Share, Cookie)` is called, matching the
     /// C `Curl_cookie_init()` call in `curl_share_setopt()`.
+    #[cfg(feature = "cookies")]
     pub cookies: Option<Arc<Mutex<CookieJar>>>,
 
     /// Shared DNS resolution cache.
@@ -366,6 +368,7 @@ impl ShareData {
     /// `share->specifier |= (1 << CURL_LOCK_DATA_SHARE)`.
     fn new() -> Self {
         Self {
+            #[cfg(feature = "cookies")]
             cookies: None,
             dns_cache: None,
             connections: None,
@@ -387,6 +390,7 @@ impl ShareData {
     fn share(&mut self, lock: CurlShareLock) -> Result<(), CurlSHcode> {
         match lock {
             CurlShareLock::Cookie => {
+                #[cfg(feature = "cookies")]
                 if self.cookies.is_none() {
                     self.cookies = Some(Arc::new(Mutex::new(CookieJar::new())));
                 }
@@ -442,12 +446,15 @@ impl ShareData {
 
         match lock {
             CurlShareLock::Cookie => {
-                if let Some(ref jar) = self.cookies {
-                    if let Ok(mut c) = jar.lock() {
-                        c.clear_all();
+                #[cfg(feature = "cookies")]
+                {
+                    if let Some(ref jar) = self.cookies {
+                        if let Ok(mut c) = jar.lock() {
+                            c.clear_all();
+                        }
                     }
+                    self.cookies = None;
                 }
-                self.cookies = None;
             }
             CurlShareLock::Dns => {
                 // DNS cache clear — no explicit destroy needed; dropping the
@@ -513,12 +520,15 @@ impl ShareData {
         self.dns_cache = None;
 
         // Cookie jar — cleanup (matches C `Curl_cookie_cleanup`).
-        if let Some(ref jar) = self.cookies {
-            if let Ok(mut c) = jar.lock() {
-                c.clear_all();
+        #[cfg(feature = "cookies")]
+        {
+            if let Some(ref jar) = self.cookies {
+                if let Ok(mut c) = jar.lock() {
+                    c.clear_all();
+                }
             }
+            self.cookies = None;
         }
-        self.cookies = None;
 
         // HSTS cache — cleanup (matches C `Curl_hsts_cleanup`).
         if let Some(ref cache) = self.hsts {
@@ -543,9 +553,10 @@ impl ShareData {
 
 impl fmt::Debug for ShareData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ShareData")
-            .field("cookies", &self.cookies.is_some())
-            .field("dns_cache", &self.dns_cache.is_some())
+        let mut s = f.debug_struct("ShareData");
+        #[cfg(feature = "cookies")]
+        s.field("cookies", &self.cookies.is_some());
+        s.field("dns_cache", &self.dns_cache.is_some())
             .field("connections", &self.connections.is_some())
             .field("ssl_session", &self.ssl_session.is_some())
             .field("psl", &self.psl.is_some())
@@ -739,6 +750,9 @@ impl ShareHandle {
     ///
     /// The caller can hold this `Arc<Mutex<CookieJar>>` independently
     /// of the share handle and lock/unlock the cookie jar as needed.
+    ///
+    /// Only available when the `cookies` Cargo feature is enabled.
+    #[cfg(feature = "cookies")]
     pub fn get_cookies(&self) -> Option<Arc<Mutex<CookieJar>>> {
         self.inner
             .lock()
@@ -1078,6 +1092,7 @@ mod tests {
     #[test]
     fn new_share_has_no_resources() {
         let share = ShareHandle::new();
+        #[cfg(feature = "cookies")]
         assert!(share.get_cookies().is_none());
         assert!(share.get_dns_cache().is_none());
         assert!(share.get_connection_pool().is_none());
@@ -1088,6 +1103,7 @@ mod tests {
 
     // -- set_option: Share --------------------------------------------------
 
+    #[cfg(feature = "cookies")]
     #[test]
     fn share_cookie_creates_jar() {
         let share = ShareHandle::new();
@@ -1138,6 +1154,7 @@ mod tests {
 
     // -- set_option: Unshare ------------------------------------------------
 
+    #[cfg(feature = "cookies")]
     #[test]
     fn unshare_removes_resource() {
         let share = ShareHandle::new();
@@ -1305,6 +1322,7 @@ mod tests {
 
     // -- Idempotent sharing -------------------------------------------------
 
+    #[cfg(feature = "cookies")]
     #[test]
     fn share_same_type_twice_is_idempotent() {
         let share = ShareHandle::new();
@@ -1352,6 +1370,7 @@ mod tests {
         assert!(share.is_sharing(CurlShareLock::Psl));
         assert!(share.is_sharing(CurlShareLock::Hsts));
 
+        #[cfg(feature = "cookies")]
         assert!(share.get_cookies().is_some());
         assert!(share.get_dns_cache().is_some());
         assert!(share.get_session_cache().is_some());
