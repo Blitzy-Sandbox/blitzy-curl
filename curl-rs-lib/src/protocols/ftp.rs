@@ -2815,4 +2815,1627 @@ mod tests {
         let result = handler.parse_url_path("/path/to/dir/", true, false);
         assert!(result.is_err());
     }
+
+    // Additional coverage tests
+
+    #[test]
+    fn test_ftp_state_all_variants_display() {
+        let variants = [
+            (FtpState::Stop, "STOP"),
+            (FtpState::Wait220, "WAIT220"),
+            (FtpState::Auth, "AUTH"),
+            (FtpState::User, "USER"),
+            (FtpState::Pass, "PASS"),
+            (FtpState::Acct, "ACCT"),
+            (FtpState::Pbsz, "PBSZ"),
+            (FtpState::Prot, "PROT"),
+            (FtpState::Ccc, "CCC"),
+            (FtpState::Pwd, "PWD"),
+            (FtpState::Syst, "SYST"),
+            (FtpState::NameFmt, "NAMEFMT"),
+            (FtpState::Quote, "QUOTE"),
+            (FtpState::RetrPreQuote, "RETR_PREQUOTE"),
+            (FtpState::StorPreQuote, "STOR_PREQUOTE"),
+            (FtpState::ListPreQuote, "LIST_PREQUOTE"),
+            (FtpState::PostQuote, "POSTQUOTE"),
+            (FtpState::Cwd, "CWD"),
+            (FtpState::Mkd, "MKD"),
+            (FtpState::Mdtm, "MDTM"),
+            (FtpState::Type, "TYPE"),
+            (FtpState::ListType, "LIST_TYPE"),
+            (FtpState::RetrListType, "RETR_LIST_TYPE"),
+            (FtpState::RetrType, "RETR_TYPE"),
+            (FtpState::StorType, "STOR_TYPE"),
+            (FtpState::Size, "SIZE"),
+            (FtpState::RetrSize, "RETR_SIZE"),
+            (FtpState::StorSize, "STOR_SIZE"),
+            (FtpState::Rest, "REST"),
+            (FtpState::RetrRest, "RETR_REST"),
+            (FtpState::Port, "PORT"),
+            (FtpState::Pret, "PRET"),
+            (FtpState::Pasv, "PASV"),
+            (FtpState::List, "LIST"),
+            (FtpState::Retr, "RETR"),
+            (FtpState::Stor, "STOR"),
+            (FtpState::Quit, "QUIT"),
+        ];
+        for (state, expected) in variants {
+            assert_eq!(format!("{}", state), expected, "FtpState::{:?}", state);
+        }
+    }
+
+    #[test]
+    fn test_ftp_state_clone_copy_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(FtpState::Auth);
+        set.insert(FtpState::User);
+        set.insert(FtpState::Pass);
+        assert_eq!(set.len(), 3);
+        let s = FtpState::Retr;
+        let cloned = s;
+        assert_eq!(s, cloned);
+    }
+
+    #[test]
+    fn test_ftp_file_method_all_variants() {
+        let methods = [FtpFileMethod::MultiCwd, FtpFileMethod::NoCwd, FtpFileMethod::SingleCwd];
+        for m in &methods {
+            let _ = format!("{:?}", m);
+        }
+        assert_ne!(FtpFileMethod::MultiCwd, FtpFileMethod::NoCwd);
+    }
+
+    #[test]
+    fn test_ftp_ssl_level_all_variants() {
+        let levels = [FtpSslLevel::None, FtpSslLevel::Try, FtpSslLevel::Control, FtpSslLevel::All];
+        for l in &levels {
+            let _ = format!("{:?}", l);
+        }
+        assert_eq!(FtpSslLevel::default(), FtpSslLevel::None);
+    }
+
+    #[test]
+    fn test_path_comp_new() {
+        let pc = PathComp { start: 0, len: 4 };
+        assert_eq!(pc.start, 0);
+        assert_eq!(pc.len, 4);
+    }
+
+    #[test]
+    fn test_ftp_default_struct() {
+        let ftp = Ftp::default();
+        assert!(ftp.path.is_empty());
+        assert_eq!(ftp.transfer, PpTransfer::Body);
+        assert_eq!(ftp.downloadsize, -1);
+    }
+
+    #[test]
+    fn test_ftp_handler_pollset() {
+        let handler = FtpHandler::new();
+        let _ = handler.pollset();
+        let _ = handler.domore_pollset();
+    }
+
+    #[test]
+    fn test_ftp_handler_connection_check_dead() {
+        let handler = FtpHandler::new();
+        let conn = ConnectionData::new(1, "ftp.example.com".to_string(), 21, "ftp".to_string());
+        // ctl_valid is false by default, so connection is considered dead
+        let result = handler.connection_check(&conn);
+        assert_eq!(result, ConnectionCheckResult::Dead);
+    }
+
+    #[test]
+    fn test_ftp_handler_connection_check_alive() {
+        let mut handler = FtpHandler::new();
+        handler.ftpc.ctl_valid = true;
+        let conn = ConnectionData::new(1, "ftp.example.com".to_string(), 21, "ftp".to_string());
+        let result = handler.connection_check(&conn);
+        assert_eq!(result, ConnectionCheckResult::Ok);
+    }
+
+    #[test]
+    fn test_ftp_scheme_constants() {
+        assert_eq!(FTP_SCHEME.name, "ftp");
+        assert_eq!(FTP_SCHEME.default_port, 21);
+        assert_eq!(FTPS_SCHEME.name, "ftps");
+        assert_eq!(FTPS_SCHEME.default_port, 990);
+    }
+
+    #[test]
+    fn test_ftp_handler_protocol_trait_ftp() {
+        let h = FtpHandler::new();
+        assert_eq!(h.name(), "FTP");
+        assert_eq!(h.default_port(), 21);
+        let flags = h.flags();
+        assert!(flags.contains(ProtocolFlags::CLOSEACTION));
+        assert!(flags.contains(ProtocolFlags::DUAL));
+        assert!(flags.contains(ProtocolFlags::PROXY_AS_HTTP));
+        assert!(flags.contains(ProtocolFlags::WILDCARD));
+        assert!(!flags.contains(ProtocolFlags::SSL));
+    }
+
+    #[test]
+    fn test_ftp_handler_protocol_trait_ftps() {
+        let h = FtpHandler::new_ftps();
+        assert_eq!(h.name(), "FTPS");
+        assert_eq!(h.default_port(), 990);
+        let flags = h.flags();
+        assert!(flags.contains(ProtocolFlags::SSL));
+        assert!(flags.contains(ProtocolFlags::CLOSEACTION));
+    }
+
+    #[test]
+    fn test_convert_lineends_only_cr() {
+        assert_eq!(convert_lineends(b"\r\r\r"), b"\n\n\n");
+    }
+
+    #[test]
+    fn test_convert_lineends_mixed() {
+        assert_eq!(convert_lineends(b"a\r\nb\rc\nd"), b"a\nb\nc\nd");
+    }
+
+    #[test]
+    fn test_parse_epsv_invalid_port_range() {
+        assert!(FtpHandler::parse_epsv_response("229 (|||99999|)").is_err());
+    }
+
+    #[test]
+    fn test_parse_pasv_227_large_port() {
+        let (ip, port) = FtpHandler::parse_pasv_227(
+            "227 Entering Passive Mode (127,0,0,1,255,255)",
+        ).unwrap();
+        assert_eq!(ip, Ipv4Addr::new(127, 0, 0, 1));
+        assert_eq!(port, 65535);
+    }
+
+    #[test]
+    fn test_parse_mdtm_date_valid_format() {
+        let ts = parse_mdtm_date("20230615143022").unwrap();
+        assert!(ts > 0);
+    }
+
+    #[test]
+    fn test_parse_mdtm_date_all_zeros() {
+        assert!(parse_mdtm_date("00000000000000").is_err());
+    }
+
+    #[test]
+    fn test_count_slashes_only_slashes() {
+        assert_eq!(count_slashes("///"), 3);
+    }
+
+    #[test]
+    fn test_count_slashes_trailing() {
+        assert_eq!(count_slashes("/a/b/"), 3);
+    }
+
+    #[test]
+    fn test_ftp_conns_match_different_paths() {
+        assert!(!ftp_conns_match("/home/user1", "/home/user2", None, None));
+    }
+
+    #[test]
+    fn test_ftp_conns_match_same_path_different_case_users() {
+        assert!(!ftp_conns_match("/", "/", Some("UserA"), Some("userA")));
+    }
+
+    #[test]
+    fn test_ftp_transfer_type_clone() {
+        let t = FtpTransferType::Ascii;
+        let cloned = t;
+        assert_eq!(t.as_char(), cloned.as_char());
+    }
+
+    #[test]
+    fn test_ftp_handler_setup_connection_download() {
+        let mut handler = FtpHandler::new();
+        handler.setup_connection("/path/file.txt", false, false, false, FtpFileMethod::MultiCwd, false).unwrap();
+        assert_eq!(handler.ftp.transfer, PpTransfer::Body);
+    }
+
+    #[test]
+    fn test_ftp_handler_setup_connection_list() {
+        let mut handler = FtpHandler::new();
+        handler.setup_connection("/dir/", false, true, false, FtpFileMethod::MultiCwd, false).unwrap();
+        assert_eq!(handler.ftp.transfer, PpTransfer::Info);
+    }
+
+    #[test]
+    fn test_ftp_handler_setup_connection_nobody() {
+        let mut handler = FtpHandler::new();
+        handler.setup_connection("/path/file.txt", false, false, true, FtpFileMethod::NoCwd, false).unwrap();
+        assert_eq!(handler.ftp.transfer, PpTransfer::Info);
+    }
+
+    #[test]
+    fn test_ftp_handler_process_list_data_empty() {
+        let mut handler = FtpHandler::new();
+        let result = handler.process_list_data(b"").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_ftp_handler_setup_wildcard() {
+        let mut handler = FtpHandler::new();
+        handler.setup_wildcard("*.txt".to_string(), "/home".to_string());
+    }
+
+    #[test]
+    fn test_ftp_handler_debug() {
+        let handler = FtpHandler::new();
+        let dbg = format!("{:?}", handler);
+        assert!(dbg.contains("FtpHandler"));
+    }
+
+    #[test]
+    fn test_ftp_parse_url_path_empty() {
+        let mut handler = FtpHandler::new();
+        handler.ftpc.file_method = FtpFileMethod::MultiCwd;
+        handler.ftp.transfer = PpTransfer::Body;
+        handler.parse_url_path("", false, false).unwrap();
+    }
+
+    #[test]
+    fn test_ftp_parse_url_path_root() {
+        let mut handler = FtpHandler::new();
+        handler.ftpc.file_method = FtpFileMethod::MultiCwd;
+        handler.ftp.transfer = PpTransfer::Body;
+        handler.parse_url_path("/", false, false).unwrap();
+    }
+
+    #[test]
+    fn test_default_accept_timeout() {
+        assert_eq!(DEFAULT_ACCEPT_TIMEOUT, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_ftp_max_dir_depth() {
+        assert_eq!(FTP_MAX_DIR_DEPTH, 1000);
+    }
+
+    #[test]
+    fn test_ftp_parse_url_path_deep_nesting() {
+        let mut handler = FtpHandler::new();
+        handler.ftpc.file_method = FtpFileMethod::MultiCwd;
+        handler.ftp.transfer = PpTransfer::Body;
+        handler.parse_url_path("/a/b/c/d/e/f/g/h/file.txt", false, false).unwrap();
+        assert!(handler.ftpc.dirdepth >= 8);
+    }
+
+    #[test]
+    fn test_ftp_parse_url_path_reuse_flag() {
+        let mut handler = FtpHandler::new();
+        handler.ftpc.file_method = FtpFileMethod::MultiCwd;
+        handler.ftp.transfer = PpTransfer::Body;
+        handler.parse_url_path("/path/file.txt", false, true).unwrap();
+    }
+
+    // ===================================================================
+    // handle_user tests
+    // ===================================================================
+    #[test]
+    fn test_handle_user_230_logged_in() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::User;
+        h.handle_user(230, "230 User logged in").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Pwd);
+    }
+
+    #[test]
+    fn test_handle_user_331_password_needed() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::User;
+        h.handle_user(331, "331 Password required").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Pass);
+    }
+
+    #[test]
+    fn test_handle_user_332_account_needed() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::User;
+        h.handle_user(332, "332 Account required").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Acct);
+    }
+
+    #[test]
+    fn test_handle_user_530_denied() {
+        let mut h = FtpHandler::new();
+        let err = h.handle_user(530, "530 Access denied").unwrap_err();
+        assert_eq!(err, CurlError::LoginDenied);
+    }
+
+    #[test]
+    fn test_handle_user_421_weird() {
+        let mut h = FtpHandler::new();
+        let err = h.handle_user(421, "421 Service unavailable").unwrap_err();
+        assert_eq!(err, CurlError::WeirdServerReply);
+    }
+
+    // ===================================================================
+    // handle_pass tests
+    // ===================================================================
+    #[test]
+    fn test_handle_pass_230_success() {
+        let mut h = FtpHandler::new();
+        h.handle_pass(230, "230 Logged in").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Pwd);
+    }
+
+    #[test]
+    fn test_handle_pass_332_account_needed() {
+        let mut h = FtpHandler::new();
+        h.handle_pass(332, "332 Need account").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Acct);
+    }
+
+    #[test]
+    fn test_handle_pass_530_denied() {
+        let mut h = FtpHandler::new();
+        let err = h.handle_pass(530, "530 Login denied").unwrap_err();
+        assert_eq!(err, CurlError::LoginDenied);
+    }
+
+    #[test]
+    fn test_handle_pass_530_alt_user() {
+        let mut h = FtpHandler::new();
+        h.ftpc.alternative_to_user = Some("alt".into());
+        h.handle_pass(530, "530 Denied").unwrap();
+        assert!(h.ftpc.ftp_trying_alternative);
+        assert_eq!(h.ftpc.state, FtpState::User);
+    }
+
+    #[test]
+    fn test_handle_pass_530_alt_already_tried() {
+        let mut h = FtpHandler::new();
+        h.ftpc.ftp_trying_alternative = true;
+        let err = h.handle_pass(530, "530 Denied").unwrap_err();
+        assert_eq!(err, CurlError::LoginDenied);
+    }
+
+    #[test]
+    fn test_handle_pass_300_weird() {
+        let mut h = FtpHandler::new();
+        let err = h.handle_pass(300, "300 weird").unwrap_err();
+        assert_eq!(err, CurlError::FtpWeirdPassReply);
+    }
+
+    // ===================================================================
+    // handle_acct tests
+    // ===================================================================
+    #[test]
+    fn test_handle_acct_success() {
+        let mut h = FtpHandler::new();
+        h.handle_acct(230).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Pwd);
+    }
+
+    #[test]
+    fn test_handle_acct_failure() {
+        let mut h = FtpHandler::new();
+        let err = h.handle_acct(530).unwrap_err();
+        assert_eq!(err, CurlError::LoginDenied);
+    }
+
+    // ===================================================================
+    // handle_auth tests
+    // ===================================================================
+    #[test]
+    fn test_handle_auth_234_accepted() {
+        let mut h = FtpHandler::new();
+        h.handle_auth(234, "234 AUTH TLS OK").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Pbsz);
+    }
+
+    #[test]
+    fn test_handle_auth_334_accepted() {
+        let mut h = FtpHandler::new();
+        h.handle_auth(334, "334 OK").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Pbsz);
+    }
+
+    #[test]
+    fn test_handle_auth_rejected_ssl_required() {
+        let mut h = FtpHandler::new();
+        h.ftpc.use_ssl = FtpSslLevel::Control;
+        let err = h.handle_auth(530, "530 Not supported").unwrap_err();
+        assert_eq!(err, CurlError::UseSslFailed);
+    }
+
+    #[test]
+    fn test_handle_auth_rejected_ssl_optional() {
+        let mut h = FtpHandler::new();
+        h.ftpc.use_ssl = FtpSslLevel::Try;
+        h.handle_auth(500, "500 Unknown").unwrap();
+        assert_eq!(h.ftpc.use_ssl, FtpSslLevel::None);
+        assert_eq!(h.ftpc.state, FtpState::User);
+    }
+
+    // ===================================================================
+    // handle_pbsz / handle_prot / handle_ccc / handle_namefmt
+    // ===================================================================
+    #[test]
+    fn test_handle_pbsz_success() {
+        let mut h = FtpHandler::new();
+        h.handle_pbsz(200).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Prot);
+    }
+
+    #[test]
+    fn test_handle_pbsz_failure_continues() {
+        let mut h = FtpHandler::new();
+        h.handle_pbsz(500).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Prot);
+    }
+
+    #[test]
+    fn test_handle_prot_success() {
+        let mut h = FtpHandler::new();
+        h.handle_prot(200).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::User);
+    }
+
+    #[test]
+    fn test_handle_prot_failure_ssl_required() {
+        let mut h = FtpHandler::new();
+        h.ftpc.use_ssl = FtpSslLevel::All;
+        let err = h.handle_prot(530).unwrap_err();
+        assert_eq!(err, CurlError::UseSslFailed);
+    }
+
+    #[test]
+    fn test_handle_prot_failure_ssl_optional() {
+        let mut h = FtpHandler::new();
+        h.ftpc.use_ssl = FtpSslLevel::Try;
+        h.handle_prot(530).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::User);
+    }
+
+    #[test]
+    fn test_handle_ccc_success() {
+        let mut h = FtpHandler::new();
+        h.handle_ccc(200).unwrap();
+        assert!(h.ftpc.ccc);
+        assert_eq!(h.ftpc.state, FtpState::User);
+    }
+
+    #[test]
+    fn test_handle_ccc_failure() {
+        let mut h = FtpHandler::new();
+        h.handle_ccc(500).unwrap();
+        assert!(!h.ftpc.ccc);
+        assert_eq!(h.ftpc.state, FtpState::User);
+    }
+
+    #[test]
+    fn test_handle_namefmt_success() {
+        let mut h = FtpHandler::new();
+        h.handle_namefmt(200).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Stop);
+    }
+
+    #[test]
+    fn test_handle_namefmt_failure() {
+        let mut h = FtpHandler::new();
+        h.handle_namefmt(500).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Stop);
+    }
+
+    // ===================================================================
+    // handle_pwd tests
+    // ===================================================================
+    #[test]
+    fn test_handle_pwd_257_path() {
+        let mut h = FtpHandler::new();
+        h.handle_pwd(257, r#"257 "/home/user""#).unwrap();
+        assert_eq!(h.ftpc.entrypath, "/home/user");
+        assert_eq!(h.ftpc.state, FtpState::Syst);
+    }
+
+    #[test]
+    fn test_handle_pwd_257_no_quote() {
+        let mut h = FtpHandler::new();
+        h.handle_pwd(257, "257 /home").unwrap();
+        assert_eq!(h.ftpc.entrypath, "/");
+        assert_eq!(h.ftpc.state, FtpState::Syst);
+    }
+
+    #[test]
+    fn test_handle_pwd_257_unclosed_quote() {
+        let mut h = FtpHandler::new();
+        h.handle_pwd(257, "257 \"home/").unwrap();
+        assert_eq!(h.ftpc.entrypath, "/");
+    }
+
+    #[test]
+    fn test_handle_pwd_failure() {
+        let mut h = FtpHandler::new();
+        h.handle_pwd(550, "550 Not allowed").unwrap();
+        assert_eq!(h.ftpc.entrypath, "/");
+        assert_eq!(h.ftpc.state, FtpState::Syst);
+    }
+
+    // ===================================================================
+    // handle_syst tests
+    // ===================================================================
+    #[test]
+    fn test_handle_syst_215_unix() {
+        let mut h = FtpHandler::new();
+        h.handle_syst(215, "215 UNIX Type: L8").unwrap();
+        assert_eq!(h.ftpc.server_os.as_deref(), Some("UNIX Type: L8"));
+        assert_eq!(h.ftpc.state, FtpState::Stop);
+    }
+
+    #[test]
+    fn test_handle_syst_215_os400() {
+        let mut h = FtpHandler::new();
+        h.handle_syst(215, "215 OS/400 is the OS").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::NameFmt);
+    }
+
+    #[test]
+    fn test_handle_syst_not_supported() {
+        let mut h = FtpHandler::new();
+        h.handle_syst(500, "500 Unknown").unwrap();
+        assert!(h.ftpc.server_os.is_none());
+        assert_eq!(h.ftpc.state, FtpState::Stop);
+    }
+
+    // ===================================================================
+    // handle_cwd / handle_mkd tests
+    // ===================================================================
+    #[test]
+    fn test_handle_cwd_success_more_dirs() {
+        let mut h = FtpHandler::new();
+        h.ftpc.dirdepth = 3;
+        h.ftpc.cwdcount = 0;
+        h.handle_cwd(250).unwrap();
+        assert_eq!(h.ftpc.cwdcount, 1);
+        assert_eq!(h.ftpc.state, FtpState::Cwd);
+    }
+
+    #[test]
+    fn test_handle_cwd_success_last_dir() {
+        let mut h = FtpHandler::new();
+        h.ftpc.dirdepth = 1;
+        h.ftpc.cwdcount = 0;
+        h.ftpc.is_nobody = true;
+        h.handle_cwd(250).unwrap();
+        assert_eq!(h.ftpc.cwdcount, 1);
+        assert!(h.ftpc.cwddone);
+    }
+
+    #[test]
+    fn test_handle_cwd_fail_create_dirs() {
+        let mut h = FtpHandler::new();
+        h.ftpc.create_missing_dirs = true;
+        h.handle_cwd(550).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Mkd);
+    }
+
+    #[test]
+    fn test_handle_cwd_fail_no_create() {
+        let mut h = FtpHandler::new();
+        h.ftpc.dirdepth = 2;
+        h.ftpc.cwdcount = 0;
+        let err = h.handle_cwd(550).unwrap_err();
+        assert_eq!(err, CurlError::RemoteAccessDenied);
+    }
+
+    #[test]
+    fn test_handle_cwd_fail_last_dir() {
+        let mut h = FtpHandler::new();
+        // cwdcount must be >= dirdepth so that the failure doesn't error out
+        h.ftpc.dirdepth = 0;
+        h.ftpc.cwdcount = 0;
+        h.ftpc.is_nobody = true;
+        h.handle_cwd(550).unwrap();
+        assert!(h.ftpc.cwdfail);
+    }
+
+    #[test]
+    fn test_handle_mkd_success() {
+        let mut h = FtpHandler::new();
+        h.handle_mkd(257).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Cwd);
+    }
+
+    #[test]
+    fn test_handle_mkd_550_already_exists() {
+        let mut h = FtpHandler::new();
+        h.handle_mkd(550).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Cwd);
+    }
+
+    #[test]
+    fn test_handle_mkd_failure() {
+        let mut h = FtpHandler::new();
+        let err = h.handle_mkd(500).unwrap_err();
+        assert_eq!(err, CurlError::RemoteAccessDenied);
+    }
+
+    // ===================================================================
+    // handle_mdtm tests
+    // ===================================================================
+    #[test]
+    fn test_handle_mdtm_213_valid() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::Mdtm;
+        h.handle_mdtm(213, "213 20230615120000").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Size);
+    }
+
+    #[test]
+    fn test_handle_mdtm_failure_code() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::Mdtm;
+        h.handle_mdtm(550, "550 Not supported").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Size);
+    }
+
+    // ===================================================================
+    // handle_type tests (various state transitions)
+    // ===================================================================
+    #[test]
+    fn test_handle_type_success_list_type() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::ListType;
+        h.handle_type(200).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::ListPreQuote);
+    }
+
+    #[test]
+    fn test_handle_type_success_retr_type() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::RetrType;
+        h.handle_type(200).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::RetrPreQuote);
+    }
+
+    #[test]
+    fn test_handle_type_success_stor_type() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::StorType;
+        h.handle_type(200).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::StorPreQuote);
+    }
+
+    #[test]
+    fn test_handle_type_success_head() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::Type;
+        h.ftpc.get_filetime = true;
+        h.handle_type(200).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Mdtm);
+    }
+
+    #[test]
+    fn test_handle_type_success_head_no_filetime() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::Type;
+        h.ftpc.get_filetime = false;
+        h.handle_type(200).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Size);
+    }
+
+    #[test]
+    fn test_handle_type_success_retr_list_type() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::RetrListType;
+        h.handle_type(200).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::RetrPreQuote);
+    }
+
+    #[test]
+    fn test_handle_type_failure() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::ListType;
+        let err = h.handle_type(500).unwrap_err();
+        assert_eq!(err, CurlError::FtpCouldntSetType);
+    }
+
+    #[test]
+    fn test_handle_type_unknown_state() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::Stop;
+        h.handle_type(200).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Stop);
+    }
+
+    // ===================================================================
+    // handle_size tests
+    // ===================================================================
+    #[test]
+    fn test_handle_size_213_success_size_state() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::Size;
+        h.handle_size(213, "213 1024").unwrap();
+        assert_eq!(h.ftp.downloadsize, 1024);
+        assert_eq!(h.ftpc.known_filesize, 1024);
+        assert_eq!(h.ftpc.state, FtpState::Rest);
+    }
+
+    #[test]
+    fn test_handle_size_213_success_retr_size() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::RetrSize;
+        h.ftpc.resume_from = 100;
+        h.handle_size(213, "213 2048").unwrap();
+        assert_eq!(h.ftp.downloadsize, 2048);
+        assert_eq!(h.ftpc.state, FtpState::RetrRest);
+    }
+
+    #[test]
+    fn test_handle_size_213_retr_size_no_resume() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::RetrSize;
+        h.handle_size(213, "213 512").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Retr);
+    }
+
+    #[test]
+    fn test_handle_size_213_stor_size() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::StorSize;
+        h.handle_size(213, "213 256").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Stor);
+    }
+
+    #[test]
+    fn test_handle_size_failure() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::Size;
+        h.handle_size(550, "550 Not available").unwrap();
+        assert_eq!(h.ftp.downloadsize, -1);
+        assert_eq!(h.ftpc.state, FtpState::Rest);
+    }
+
+    // ===================================================================
+    // handle_rest tests
+    // ===================================================================
+    #[test]
+    fn test_handle_rest_head_like() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::Rest;
+        h.handle_rest(350).unwrap();
+        assert_eq!(h.ftp.transfer, PpTransfer::None);
+        assert_eq!(h.ftpc.state, FtpState::Stop);
+    }
+
+    #[test]
+    fn test_handle_rest_head_not_supported() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::Rest;
+        h.handle_rest(500).unwrap();
+        assert_eq!(h.ftp.transfer, PpTransfer::None);
+        assert_eq!(h.ftpc.state, FtpState::Stop);
+    }
+
+    #[test]
+    fn test_handle_rest_retr_rest_ok() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::RetrRest;
+        h.handle_rest(350).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Retr);
+    }
+
+    #[test]
+    fn test_handle_rest_retr_rest_fail() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::RetrRest;
+        let err = h.handle_rest(500).unwrap_err();
+        assert_eq!(err, CurlError::FtpCouldntUseRest);
+    }
+
+    // ===================================================================
+    // handle_pret tests
+    // ===================================================================
+    #[test]
+    fn test_handle_pret_success() {
+        let mut h = FtpHandler::new();
+        h.handle_pret(200).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Pasv);
+    }
+
+    #[test]
+    fn test_handle_pret_failure() {
+        let mut h = FtpHandler::new();
+        let err = h.handle_pret(500).unwrap_err();
+        assert_eq!(err, CurlError::FtpPretFailed);
+    }
+
+    // ===================================================================
+    // handle_port tests
+    // ===================================================================
+    #[test]
+    fn test_handle_port_success() {
+        let mut h = FtpHandler::new();
+        h.ftp.transfer = PpTransfer::Body;
+        h.ftpc.is_upload = true;
+        h.handle_port(200).unwrap();
+        assert!(h.ftpc.wait_data_conn);
+        assert_eq!(h.ftpc.state, FtpState::Stor);
+    }
+
+    #[test]
+    fn test_handle_port_eprt_fallback() {
+        let mut h = FtpHandler::new();
+        h.ftpc.count1 = 1;
+        h.handle_port(500).unwrap();
+        assert!(!h.ftpc.use_eprt);
+        assert_eq!(h.ftpc.count1, 2);
+        assert_eq!(h.ftpc.state, FtpState::Port);
+    }
+
+    #[test]
+    fn test_handle_port_failure() {
+        let mut h = FtpHandler::new();
+        h.ftpc.count1 = 2;
+        let err = h.handle_port(500).unwrap_err();
+        assert_eq!(err, CurlError::FtpPortFailed);
+    }
+
+    #[test]
+    fn test_handle_port_download_with_resume() {
+        let mut h = FtpHandler::new();
+        h.ftp.transfer = PpTransfer::Body;
+        h.ftpc.resume_from = 100;
+        h.handle_port(200).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::RetrSize);
+    }
+
+    #[test]
+    fn test_handle_port_download_no_resume() {
+        let mut h = FtpHandler::new();
+        h.ftp.transfer = PpTransfer::Body;
+        h.handle_port(200).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Retr);
+    }
+
+    #[test]
+    fn test_handle_port_info_transfer() {
+        let mut h = FtpHandler::new();
+        h.ftp.transfer = PpTransfer::Info;
+        h.handle_port(200).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::List);
+    }
+
+    #[test]
+    fn test_handle_port_none_transfer() {
+        let mut h = FtpHandler::new();
+        h.ftp.transfer = PpTransfer::None;
+        h.handle_port(200).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Stop);
+    }
+
+    // ===================================================================
+    // handle_stor tests
+    // ===================================================================
+    #[test]
+    fn test_handle_stor_success() {
+        let mut h = FtpHandler::new();
+        h.handle_stor(150).unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Stop);
+    }
+
+    #[test]
+    fn test_handle_stor_file_exists() {
+        let mut h = FtpHandler::new();
+        let err = h.handle_stor(552).unwrap_err();
+        assert_eq!(err, CurlError::RemoteFileExists);
+    }
+
+    #[test]
+    fn test_handle_stor_failure() {
+        let mut h = FtpHandler::new();
+        let err = h.handle_stor(550).unwrap_err();
+        assert_eq!(err, CurlError::UploadFailed);
+    }
+
+    // ===================================================================
+    // handle_quit tests
+    // ===================================================================
+    #[test]
+    fn test_handle_quit_success() {
+        let mut h = FtpHandler::new();
+        h.ftpc.ctl_valid = true;
+        h.handle_quit(221).unwrap();
+        assert!(!h.ftpc.ctl_valid);
+        assert!(!h.ftpc.shutdown);
+        assert_eq!(h.ftpc.state, FtpState::Stop);
+    }
+
+    #[test]
+    fn test_handle_quit_non_success() {
+        let mut h = FtpHandler::new();
+        h.ftpc.ctl_valid = true;
+        h.handle_quit(500).unwrap();
+        assert!(!h.ftpc.ctl_valid);
+        assert_eq!(h.ftpc.state, FtpState::Stop);
+    }
+
+    // ===================================================================
+    // handle_quote tests
+    // ===================================================================
+    #[test]
+    fn test_handle_quote_none_phase() {
+        let mut h = FtpHandler::new();
+        h.ftpc.quote_phase = QuotePhase::None;
+        h.handle_quote(200, "").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Stop);
+    }
+
+    #[test]
+    fn test_handle_quote_failure() {
+        let mut h = FtpHandler::new();
+        h.ftpc.quote_phase = QuotePhase::Quote;
+        h.ftpc.quote_cmds = vec!["SITE CHMOD 755 /tmp".to_string()];
+        h.ftpc.quote_idx = 1;
+        let err = h.handle_quote(500, "500 Error").unwrap_err();
+        assert_eq!(err, CurlError::QuoteError);
+    }
+
+    #[test]
+    fn test_handle_quote_allow_fail() {
+        let mut h = FtpHandler::new();
+        h.ftpc.quote_phase = QuotePhase::Quote;
+        h.ftpc.quote_cmds = vec!["*SITE CHMOD 755 /tmp".to_string()];
+        h.ftpc.quote_idx = 1;
+        h.ftpc.is_nobody = true;
+        h.handle_quote(500, "500 Error").unwrap();
+    }
+
+    #[test]
+    fn test_handle_quote_more_cmds() {
+        let mut h = FtpHandler::new();
+        h.ftpc.quote_phase = QuotePhase::Quote;
+        h.ftpc.quote_cmds = vec!["CMD1".into(), "CMD2".into()];
+        h.ftpc.quote_idx = 0;
+        h.handle_quote(200, "200 OK").unwrap();
+        assert_eq!(h.ftpc.quote_idx, 1);
+    }
+
+    #[test]
+    fn test_handle_quote_done_retr_prequote() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::RetrPreQuote;
+        h.ftpc.quote_phase = QuotePhase::PreQuote;
+        h.ftpc.prequote_cmds = vec![];
+        h.ftpc.quote_idx = 0;
+        h.handle_quote(200, "200 OK").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Pasv);
+    }
+
+    #[test]
+    fn test_handle_quote_done_stor_prequote() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::StorPreQuote;
+        h.ftpc.quote_phase = QuotePhase::PreQuote;
+        h.ftpc.prequote_cmds = vec![];
+        h.ftpc.quote_idx = 0;
+        h.handle_quote(200, "200 OK").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Pasv);
+    }
+
+    #[test]
+    fn test_handle_quote_done_list_prequote() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::ListPreQuote;
+        h.ftpc.quote_phase = QuotePhase::PreQuote;
+        h.ftpc.prequote_cmds = vec![];
+        h.ftpc.quote_idx = 0;
+        h.handle_quote(200, "200 OK").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Pasv);
+    }
+
+    #[test]
+    fn test_handle_quote_done_postquote() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::PostQuote;
+        h.ftpc.quote_phase = QuotePhase::PostQuote;
+        h.ftpc.postquote_cmds = vec![];
+        h.ftpc.quote_idx = 0;
+        h.handle_quote(200, "200 OK").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Stop);
+    }
+
+    // ===================================================================
+    // handle_retr_list + handle_mdtm edge
+    // ===================================================================
+    #[test]
+    fn test_handle_retr_list_success() {
+        let mut h = FtpHandler::new();
+        h.handle_retr_list(150, "150 Opening data conn").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Stop);
+    }
+
+    #[test]
+    fn test_handle_retr_list_550() {
+        let mut h = FtpHandler::new();
+        let err = h.handle_retr_list(550, "550 Not found").unwrap_err();
+        assert_eq!(err, CurlError::FtpCouldntRetrFile);
+    }
+
+    // ===================================================================
+    // FtpConn internal method tests
+    // ===================================================================
+    #[test]
+    fn test_ftpconn_freedirs() {
+        let mut h = FtpHandler::new();
+        h.ftpc.rawpath = "/home/user/file.txt".to_string();
+        h.ftpc.dirs.push(PathComp { start: 0, len: 5 });
+        h.ftpc.dirdepth = 1;
+        h.ftpc.file = Some("file.txt".to_string());
+        h.ftpc.freedirs();
+        assert!(h.ftpc.dirs.is_empty());
+        assert_eq!(h.ftpc.dirdepth, 0);
+        assert!(h.ftpc.rawpath.is_empty());
+        assert!(h.ftpc.file.is_none());
+    }
+
+    #[test]
+    fn test_ftpconn_close_data_channel() {
+        let mut h = FtpHandler::new();
+        h.ftpc.close_data_channel();
+        assert!(h.ftpc.data_listener.is_none());
+        assert!(h.ftpc.data_stream.is_none());
+    }
+
+    #[test]
+    fn test_ftpconn_need_type_switch() {
+        let mut h = FtpHandler::new();
+        h.ftpc.transfertype = 'I';
+        assert!(h.ftpc.need_type(true));
+        assert!(!h.ftpc.need_type(false));
+    }
+
+    #[test]
+    fn test_ftpconn_need_type_ascii() {
+        let mut h = FtpHandler::new();
+        h.ftpc.transfertype = 'A';
+        assert!(!h.ftpc.need_type(true));
+        assert!(h.ftpc.need_type(false));
+    }
+
+    #[test]
+    fn test_ftpconn_dir_segment() {
+        let mut h = FtpHandler::new();
+        h.ftpc.rawpath = "home/user/file.txt".to_string();
+        h.ftpc.dirs.push(PathComp { start: 0, len: 4 });
+        h.ftpc.dirs.push(PathComp { start: 5, len: 4 });
+        assert_eq!(h.ftpc.dir_segment(0), "home");
+        assert_eq!(h.ftpc.dir_segment(1), "user");
+        assert_eq!(h.ftpc.dir_segment(5), "");
+    }
+
+    #[test]
+    fn test_ftpconn_debug() {
+        let h = FtpHandler::new();
+        let dbg = format!("{:?}", h.ftpc);
+        assert!(dbg.contains("FtpConn"));
+        assert!(dbg.contains("state"));
+    }
+
+    // ===================================================================
+    // wildcard_matches tests
+    // ===================================================================
+    #[test]
+    fn test_wildcard_matches_exact() {
+        assert!(wildcard_matches("hello.txt", "hello.txt"));
+        assert!(!wildcard_matches("hello.txt", "world.txt"));
+    }
+
+    #[test]
+    fn test_wildcard_matches_star() {
+        assert!(wildcard_matches("*.txt", "hello.txt"));
+        assert!(wildcard_matches("*.txt", ".txt"));
+        assert!(!wildcard_matches("*.txt", "hello.csv"));
+    }
+
+    #[test]
+    fn test_wildcard_matches_question() {
+        assert!(wildcard_matches("file?.txt", "file1.txt"));
+        assert!(!wildcard_matches("file?.txt", "file.txt"));
+        assert!(!wildcard_matches("file?.txt", "file12.txt"));
+    }
+
+    #[test]
+    fn test_wildcard_matches_complex() {
+        assert!(wildcard_matches("*.*", "hello.txt"));
+        assert!(wildcard_matches("a*b*c", "axbxc"));
+        assert!(wildcard_matches("a*b*c", "abc"));
+        assert!(!wildcard_matches("a*b*c", "ac"));
+    }
+
+    #[test]
+    fn test_wildcard_matches_empty() {
+        assert!(wildcard_matches("", ""));
+        assert!(!wildcard_matches("", "a"));
+        assert!(wildcard_matches("*", ""));
+        assert!(wildcard_matches("*", "anything"));
+    }
+
+    #[test]
+    fn test_wildcard_matches_multi_star() {
+        assert!(wildcard_matches("**", "hello"));
+        assert!(wildcard_matches("***", ""));
+    }
+
+    // ===================================================================
+    // state_after_cwd tests (triggers init_* methods)
+    // ===================================================================
+    #[test]
+    fn test_state_after_cwd_list() {
+        let mut h = FtpHandler::new();
+        h.ftpc.is_list = true;
+        h.ftpc.transfertype = 'I';
+        h.state_after_cwd().unwrap();
+        assert_eq!(h.ftpc.state, FtpState::ListType);
+    }
+
+    #[test]
+    fn test_state_after_cwd_list_no_type_change() {
+        let mut h = FtpHandler::new();
+        h.ftpc.is_list = true;
+        h.ftpc.transfertype = 'A';
+        h.state_after_cwd().unwrap();
+        assert_eq!(h.ftpc.state, FtpState::ListPreQuote);
+    }
+
+    #[test]
+    fn test_state_after_cwd_upload() {
+        let mut h = FtpHandler::new();
+        h.ftpc.is_upload = true;
+        h.ftpc.desired_type = FtpTransferType::Binary;
+        h.ftpc.transfertype = 'A';
+        h.state_after_cwd().unwrap();
+        assert_eq!(h.ftpc.state, FtpState::StorType);
+    }
+
+    #[test]
+    fn test_state_after_cwd_upload_type_ok() {
+        let mut h = FtpHandler::new();
+        h.ftpc.is_upload = true;
+        h.ftpc.desired_type = FtpTransferType::Binary;
+        h.ftpc.transfertype = 'I';
+        h.state_after_cwd().unwrap();
+        assert_eq!(h.ftpc.state, FtpState::StorPreQuote);
+    }
+
+    #[test]
+    fn test_state_after_cwd_nobody() {
+        let mut h = FtpHandler::new();
+        h.ftpc.is_nobody = true;
+        h.ftpc.desired_type = FtpTransferType::Binary;
+        h.ftpc.transfertype = 'A';
+        h.state_after_cwd().unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Type);
+    }
+
+    #[test]
+    fn test_state_after_cwd_nobody_no_type_with_filetime() {
+        let mut h = FtpHandler::new();
+        h.ftpc.is_nobody = true;
+        h.ftpc.desired_type = FtpTransferType::Binary;
+        h.ftpc.transfertype = 'I';
+        h.ftpc.get_filetime = true;
+        h.state_after_cwd().unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Mdtm);
+    }
+
+    #[test]
+    fn test_state_after_cwd_nobody_no_type_no_filetime() {
+        let mut h = FtpHandler::new();
+        h.ftpc.is_nobody = true;
+        h.ftpc.desired_type = FtpTransferType::Binary;
+        h.ftpc.transfertype = 'I';
+        h.state_after_cwd().unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Size);
+    }
+
+    #[test]
+    fn test_state_after_cwd_download() {
+        let mut h = FtpHandler::new();
+        h.ftpc.desired_type = FtpTransferType::Binary;
+        h.ftpc.transfertype = 'A';
+        h.state_after_cwd().unwrap();
+        assert_eq!(h.ftpc.state, FtpState::RetrType);
+    }
+
+    #[test]
+    fn test_state_after_cwd_download_type_ok() {
+        let mut h = FtpHandler::new();
+        h.ftpc.desired_type = FtpTransferType::Binary;
+        h.ftpc.transfertype = 'I';
+        h.state_after_cwd().unwrap();
+        assert_eq!(h.ftpc.state, FtpState::RetrPreQuote);
+    }
+
+    // ===================================================================
+    // setup_connection extended tests
+    // ===================================================================
+    #[test]
+    fn test_setup_connection_upload_sets_body() {
+        let mut h = FtpHandler::new();
+        h.setup_connection("/path/file.txt", true, false, false, FtpFileMethod::MultiCwd, false).unwrap();
+        assert_eq!(h.ftp.transfer, PpTransfer::Body);
+        assert!(h.ftpc.is_upload);
+    }
+
+    #[test]
+    fn test_setup_connection_list_sets_info() {
+        let mut h = FtpHandler::new();
+        h.setup_connection("/path/", false, true, false, FtpFileMethod::MultiCwd, false).unwrap();
+        assert_eq!(h.ftp.transfer, PpTransfer::Info);
+        assert!(h.ftpc.is_list);
+    }
+
+    #[test]
+    fn test_setup_connection_nobody_sets_info() {
+        let mut h = FtpHandler::new();
+        h.setup_connection("/path/file.txt", false, false, true, FtpFileMethod::MultiCwd, false).unwrap();
+        assert_eq!(h.ftp.transfer, PpTransfer::Info);
+        assert!(h.ftpc.is_nobody);
+    }
+
+    // ===================================================================
+    // parse_url_path (extended edge cases)
+    // ===================================================================
+    #[test]
+    fn test_parse_url_path_upload_no_file_error() {
+        let mut h = FtpHandler::new();
+        h.ftpc.file_method = FtpFileMethod::MultiCwd;
+        h.ftp.transfer = PpTransfer::Body;
+        let err = h.parse_url_path("/dir/", true, false).unwrap_err();
+        assert_eq!(err, CurlError::UrlMalformat);
+    }
+
+    #[test]
+    fn test_parse_url_path_nocwd_absolute() {
+        let mut h = FtpHandler::new();
+        h.ftpc.file_method = FtpFileMethod::NoCwd;
+        h.ftp.transfer = PpTransfer::Body;
+        h.parse_url_path("/dir/file.txt", false, false).unwrap();
+        assert_eq!(h.ftpc.file.as_deref(), Some("/dir/file.txt"));
+        assert!(h.ftpc.cwddone);
+    }
+
+    #[test]
+    fn test_parse_url_path_nocwd_trailing_slash() {
+        let mut h = FtpHandler::new();
+        h.ftpc.file_method = FtpFileMethod::NoCwd;
+        h.ftp.transfer = PpTransfer::Info;
+        h.parse_url_path("/dir/", false, false).unwrap();
+        assert!(h.ftpc.file.is_none());
+    }
+
+    #[test]
+    fn test_parse_url_path_singlecwd_no_slash() {
+        let mut h = FtpHandler::new();
+        h.ftpc.file_method = FtpFileMethod::SingleCwd;
+        h.ftp.transfer = PpTransfer::Body;
+        h.parse_url_path("filename", false, false).unwrap();
+        assert_eq!(h.ftpc.file.as_deref(), Some("filename"));
+        assert_eq!(h.ftpc.dirdepth, 0);
+    }
+
+    #[test]
+    fn test_parse_url_path_singlecwd_trailing_slash() {
+        let mut h = FtpHandler::new();
+        h.ftpc.file_method = FtpFileMethod::SingleCwd;
+        h.ftp.transfer = PpTransfer::Info;
+        h.parse_url_path("/dir/", false, false).unwrap();
+        assert!(h.ftpc.file.is_none());
+        assert_eq!(h.ftpc.dirdepth, 1);
+    }
+
+    #[test]
+    fn test_parse_url_path_singlecwd_root_file() {
+        let mut h = FtpHandler::new();
+        h.ftpc.file_method = FtpFileMethod::SingleCwd;
+        h.ftp.transfer = PpTransfer::Body;
+        h.parse_url_path("/file.txt", false, false).unwrap();
+        assert_eq!(h.ftpc.file.as_deref(), Some("file.txt"));
+        assert_eq!(h.ftpc.dirdepth, 1);
+    }
+
+    #[test]
+    fn test_parse_url_path_multicwd_too_deep() {
+        let mut h = FtpHandler::new();
+        h.ftpc.file_method = FtpFileMethod::MultiCwd;
+        h.ftp.transfer = PpTransfer::Body;
+        let deep = "/".repeat(FTP_MAX_DIR_DEPTH + 1);
+        let err = h.parse_url_path(&deep, false, false).unwrap_err();
+        assert_eq!(err, CurlError::UrlMalformat);
+    }
+
+    #[test]
+    fn test_parse_url_path_multicwd_no_slash_file() {
+        let mut h = FtpHandler::new();
+        h.ftpc.file_method = FtpFileMethod::MultiCwd;
+        h.ftp.transfer = PpTransfer::Body;
+        h.parse_url_path("onlyfile", false, false).unwrap();
+        assert_eq!(h.ftpc.file.as_deref(), Some("onlyfile"));
+        assert_eq!(h.ftpc.dirdepth, 0);
+    }
+
+    #[test]
+    fn test_parse_url_path_cwd_skip_optimization() {
+        let mut h = FtpHandler::new();
+        h.ftpc.file_method = FtpFileMethod::MultiCwd;
+        h.ftp.transfer = PpTransfer::Body;
+        // prevpath must match the dir portion: "/dir/" (5 chars)
+        // rawpath "/dir/file.txt" = 13 chars, file "file.txt" = 8 chars
+        // dir portion = rawpath[..13-8] = "/dir/" = 5 chars
+        h.ftpc.prevpath = Some("/dir/".to_string());
+        h.parse_url_path("/dir/file.txt", false, true).unwrap();
+        assert!(h.ftpc.cwddone);
+    }
+
+    // ===================================================================
+    // set_state test
+    // ===================================================================
+    #[test]
+    fn test_set_state_transitions() {
+        let mut h = FtpHandler::new();
+        assert_eq!(h.ftpc.state, FtpState::Stop);
+        h.set_state(FtpState::Wait220);
+        assert_eq!(h.ftpc.state, FtpState::Wait220);
+        h.set_state(FtpState::Auth);
+        assert_eq!(h.ftpc.state, FtpState::Auth);
+        h.set_state(FtpState::Auth); // same state
+        assert_eq!(h.ftpc.state, FtpState::Auth);
+    }
+
+    // ===================================================================
+    // FtpHandler debug formatting
+    // ===================================================================
+    #[test]
+    fn test_ftp_handler_debug_format() {
+        let h = FtpHandler::new();
+        let dbg = format!("{:?}", h);
+        assert!(dbg.contains("FtpHandler"));
+        assert!(dbg.contains("is_ftps"));
+    }
+
+    // ===================================================================
+    // process_list_data tests
+    // ===================================================================
+    #[test]
+    fn test_process_list_data_with_wildcard() {
+        let mut h = FtpHandler::new();
+        h.setup_wildcard("*.txt".to_string(), "/dir/".to_string());
+        let result = h.process_list_data(b"");
+        assert!(result.is_ok());
+    }
+
+    // ===================================================================
+    // FtpTransferType as_char / display
+    // ===================================================================
+    #[test]
+    fn test_ftp_transfer_type_as_char() {
+        assert_eq!(FtpTransferType::Ascii.as_char(), 'A');
+        assert_eq!(FtpTransferType::Binary.as_char(), 'I');
+    }
+
+    // ===================================================================
+    // FtpSslLevel ordering + all values
+    // ===================================================================
+    #[test]
+    fn test_ftp_ssl_level_full_ordering() {
+        assert!(FtpSslLevel::None < FtpSslLevel::Try);
+        assert!(FtpSslLevel::Try < FtpSslLevel::Control);
+        assert!(FtpSslLevel::Control < FtpSslLevel::All);
+    }
+
+    // ===================================================================
+    // MDTM parsing edge cases
+    // ===================================================================
+    #[test]
+    fn test_parse_mdtm_date_invalid_month() {
+        assert!(parse_mdtm_date("20230015120000").is_err());
+    }
+
+    #[test]
+    fn test_parse_mdtm_date_invalid_day() {
+        assert!(parse_mdtm_date("20230632120000").is_err());
+    }
+
+    #[test]
+    fn test_parse_mdtm_date_invalid_hour() {
+        assert!(parse_mdtm_date("20230615250000").is_err());
+    }
+
+    #[test]
+    fn test_parse_mdtm_date_invalid_minute() {
+        assert!(parse_mdtm_date("20230615126000").is_err());
+    }
+
+    #[test]
+    fn test_parse_mdtm_date_too_short() {
+        assert!(parse_mdtm_date("2023061512").is_err());
+    }
+
+    #[test]
+    fn test_parse_mdtm_date_non_digit() {
+        assert!(parse_mdtm_date("2023a615120000").is_err());
+    }
+
+    #[test]
+    fn test_parse_mdtm_date_epoch() {
+        let ts = parse_mdtm_date("19700101000000").unwrap();
+        assert_eq!(ts, 0);
+    }
+
+    #[test]
+    fn test_parse_mdtm_date_known_value() {
+        // 2000-01-01 00:00:00 UTC = 946684800
+        let ts = parse_mdtm_date("20000101000000").unwrap();
+        assert_eq!(ts, 946684800);
+    }
+
+    #[test]
+    fn test_parse_mdtm_date_leap_second() {
+        // second=60 is allowed (leap second)
+        let result = parse_mdtm_date("20230615125960");
+        assert!(result.is_ok());
+    }
+
+    // ===================================================================
+    // convert_lineends extended tests
+    // ===================================================================
+    #[test]
+    fn test_convert_lineends_no_cr() {
+        let data = b"hello\nworld\n";
+        let result = convert_lineends(data);
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_convert_lineends_crlf() {
+        let data = b"hello\r\nworld\r\n";
+        let result = convert_lineends(data);
+        assert_eq!(result, b"hello\nworld\n");
+    }
+
+    #[test]
+    fn test_convert_lineends_standalone_cr() {
+        // Lonely \r without following \n becomes \n per convert_lineends impl
+        let data = b"hello\rworld";
+        let result = convert_lineends(data);
+        assert_eq!(result, b"hello\nworld");
+    }
+
+    #[test]
+    fn test_convert_lineends_empty() {
+        assert!(convert_lineends(b"").is_empty());
+    }
+
+    // ===================================================================
+    // count_slashes extended tests
+    // ===================================================================
+    #[test]
+    fn test_count_slashes_none() {
+        assert_eq!(count_slashes("hello"), 0);
+    }
+
+    #[test]
+    fn test_count_slashes_root() {
+        assert_eq!(count_slashes("/"), 1);
+    }
+
+    #[test]
+    fn test_count_slashes_deep() {
+        assert_eq!(count_slashes("/a/b/c/d/"), 5);
+    }
+
+    // ===================================================================
+    // FtpHandler new_ftps tests
+    // ===================================================================
+    #[test]
+    fn test_ftp_handler_new_ftps_properties() {
+        let h = FtpHandler::new_ftps();
+        assert!(h.is_ftps);
+        assert_eq!(h.ftpc.implicit_ftps, true);
+        assert_eq!(Protocol::name(&h), "FTPS");
+        assert_eq!(Protocol::default_port(&h), 990);
+        assert!(Protocol::flags(&h).contains(ProtocolFlags::SSL));
+    }
+
+    // ===================================================================
+    // Ftp struct field access
+    // ===================================================================
+    #[test]
+    fn test_ftp_struct_fields() {
+        let f = Ftp::default();
+        assert_eq!(f.downloadsize, -1);
+        assert!(f.path.is_empty());
+        assert_eq!(f.transfer, PpTransfer::Body);
+    }
+
+    // ===================================================================
+    // FtpState remaining display checks
+    // ===================================================================
+    #[test]
+    fn test_ftp_state_display_comprehensive() {
+        assert_eq!(format!("{}", FtpState::Pbsz), "PBSZ");
+        assert_eq!(format!("{}", FtpState::Prot), "PROT");
+        assert_eq!(format!("{}", FtpState::Ccc), "CCC");
+        assert_eq!(format!("{}", FtpState::NameFmt), "NAMEFMT");
+        assert_eq!(format!("{}", FtpState::Quote), "QUOTE");
+        assert_eq!(format!("{}", FtpState::RetrPreQuote), "RETR_PREQUOTE");
+        assert_eq!(format!("{}", FtpState::StorPreQuote), "STOR_PREQUOTE");
+        assert_eq!(format!("{}", FtpState::PostQuote), "POSTQUOTE");
+        assert_eq!(format!("{}", FtpState::Mdtm), "MDTM");
+        assert_eq!(format!("{}", FtpState::Type), "TYPE");
+        assert_eq!(format!("{}", FtpState::ListType), "LIST_TYPE");
+        assert_eq!(format!("{}", FtpState::RetrType), "RETR_TYPE");
+        assert_eq!(format!("{}", FtpState::RetrListType), "RETR_LIST_TYPE");
+        assert_eq!(format!("{}", FtpState::StorType), "STOR_TYPE");
+        assert_eq!(format!("{}", FtpState::Size), "SIZE");
+        assert_eq!(format!("{}", FtpState::RetrSize), "RETR_SIZE");
+        assert_eq!(format!("{}", FtpState::StorSize), "STOR_SIZE");
+        assert_eq!(format!("{}", FtpState::Rest), "REST");
+        assert_eq!(format!("{}", FtpState::RetrRest), "RETR_REST");
+        assert_eq!(format!("{}", FtpState::Pret), "PRET");
+        assert_eq!(format!("{}", FtpState::Pasv), "PASV");
+        assert_eq!(format!("{}", FtpState::Port), "PORT");
+        assert_eq!(format!("{}", FtpState::Retr), "RETR");
+        assert_eq!(format!("{}", FtpState::List), "LIST");
+        assert_eq!(format!("{}", FtpState::ListPreQuote), "LIST_PREQUOTE");
+        assert_eq!(format!("{}", FtpState::Stor), "STOR");
+        assert_eq!(format!("{}", FtpState::Quit), "QUIT");
+    }
+
+    // ===================================================================
+    // ftp_conns_match extended
+    // ===================================================================
+    #[test]
+    fn test_ftp_conns_match_both_none_users() {
+        assert!(ftp_conns_match("/home", "/home", None, None));
+    }
+
+    #[test]
+    fn test_ftp_conns_match_one_none_user() {
+        assert!(!ftp_conns_match("/home", "/home", Some("user"), None));
+        assert!(!ftp_conns_match("/home", "/home", None, Some("user")));
+    }
+
+    #[test]
+    fn test_ftp_conns_match_different_entries() {
+        assert!(!ftp_conns_match("/home", "/other", Some("u"), Some("u")));
+    }
+
+    // ===================================================================
+    // handle_quote done_quote (cwddone already set)
+    // ===================================================================
+    #[test]
+    fn test_handle_quote_done_quote_cwddone() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::Quote;
+        h.ftpc.quote_phase = QuotePhase::Quote;
+        h.ftpc.quote_cmds = vec![];
+        h.ftpc.quote_idx = 0;
+        h.ftpc.cwddone = true;
+        h.ftpc.is_nobody = true;
+        h.ftpc.desired_type = FtpTransferType::Binary;
+        h.ftpc.transfertype = 'I';
+        h.handle_quote(200, "200 OK").unwrap();
+        // After CWD done + is_nobody + type matches → Size state
+        assert_eq!(h.ftpc.state, FtpState::Size);
+    }
+
+    #[test]
+    fn test_handle_quote_done_quote_needs_cwd() {
+        let mut h = FtpHandler::new();
+        h.ftpc.state = FtpState::Quote;
+        h.ftpc.quote_phase = QuotePhase::Quote;
+        h.ftpc.quote_cmds = vec![];
+        h.ftpc.quote_idx = 0;
+        h.ftpc.cwddone = false;
+        h.ftpc.dirdepth = 2;
+        h.handle_quote(200, "200 OK").unwrap();
+        assert_eq!(h.ftpc.state, FtpState::Cwd);
+    }
 }

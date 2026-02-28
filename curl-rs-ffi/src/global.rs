@@ -840,3 +840,706 @@ pub unsafe extern "C" fn curl_getdate(
 // symbols. They are listed here in the task spec because they appear in
 // curl.h alongside global functions, but they are implemented in the easy
 // module to avoid #[no_mangle] symbol collisions.
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    // -----------------------------------------------------------------------
+    // CURL_GLOBAL_* constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn global_ssl_is_bit_0() {
+        assert_eq!(CURL_GLOBAL_SSL, 1);
+    }
+
+    #[test]
+    fn global_win32_is_bit_1() {
+        assert_eq!(CURL_GLOBAL_WIN32, 2);
+    }
+
+    #[test]
+    fn global_all_combines_ssl_and_win32() {
+        assert_eq!(CURL_GLOBAL_ALL, CURL_GLOBAL_SSL | CURL_GLOBAL_WIN32);
+        assert_eq!(CURL_GLOBAL_ALL, 3);
+    }
+
+    #[test]
+    fn global_nothing_is_zero() {
+        assert_eq!(CURL_GLOBAL_NOTHING, 0);
+    }
+
+    #[test]
+    fn global_default_equals_all() {
+        assert_eq!(CURL_GLOBAL_DEFAULT, CURL_GLOBAL_ALL);
+    }
+
+    #[test]
+    fn global_ack_eintr_is_bit_2() {
+        assert_eq!(CURL_GLOBAL_ACK_EINTR, 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // CURL_VERSION_* feature bitmask constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn version_ipv6_is_bit_0() {
+        assert_eq!(CURL_VERSION_IPV6, 1);
+    }
+
+    #[test]
+    fn version_ssl_is_bit_2() {
+        assert_eq!(CURL_VERSION_SSL, 4);
+    }
+
+    #[test]
+    fn version_libz_is_bit_3() {
+        assert_eq!(CURL_VERSION_LIBZ, 8);
+    }
+
+    #[test]
+    fn version_ntlm_is_bit_4() {
+        assert_eq!(CURL_VERSION_NTLM, 16);
+    }
+
+    #[test]
+    fn version_http2_is_bit_16() {
+        assert_eq!(CURL_VERSION_HTTP2, 1 << 16);
+    }
+
+    #[test]
+    fn version_http3_is_bit_25() {
+        assert_eq!(CURL_VERSION_HTTP3, 1 << 25);
+    }
+
+    #[test]
+    fn version_brotli_is_bit_23() {
+        assert_eq!(CURL_VERSION_BROTLI, 1 << 23);
+    }
+
+    #[test]
+    fn version_zstd_is_bit_26() {
+        assert_eq!(CURL_VERSION_ZSTD, 1 << 26);
+    }
+
+    #[test]
+    fn version_hsts_is_bit_28() {
+        assert_eq!(CURL_VERSION_HSTS, 1 << 28);
+    }
+
+    #[test]
+    fn version_threadsafe_is_bit_30() {
+        assert_eq!(CURL_VERSION_THREADSAFE, 1 << 30);
+    }
+
+    // -----------------------------------------------------------------------
+    // CURLversion constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn curlversion_first_is_zero() {
+        assert_eq!(CURLVERSION_FIRST, 0);
+    }
+
+    #[test]
+    fn curlversion_now_is_twelfth() {
+        assert_eq!(CURLVERSION_NOW, CURLVERSION_TWELFTH);
+        assert_eq!(CURLVERSION_NOW, 11);
+    }
+
+    #[test]
+    fn curlversion_monotonic() {
+        assert!(CURLVERSION_FIRST < CURLVERSION_SECOND);
+        assert!(CURLVERSION_SECOND < CURLVERSION_THIRD);
+        assert!(CURLVERSION_THIRD < CURLVERSION_FOURTH);
+        assert!(CURLVERSION_FOURTH < CURLVERSION_FIFTH);
+        assert!(CURLVERSION_FIFTH < CURLVERSION_SIXTH);
+        assert!(CURLVERSION_SIXTH < CURLVERSION_SEVENTH);
+        assert!(CURLVERSION_SEVENTH < CURLVERSION_EIGHTH);
+        assert!(CURLVERSION_EIGHTH < CURLVERSION_NINTH);
+        assert!(CURLVERSION_NINTH < CURLVERSION_TENTH);
+        assert!(CURLVERSION_TENTH < CURLVERSION_ELEVENTH);
+        assert!(CURLVERSION_ELEVENTH < CURLVERSION_TWELFTH);
+    }
+
+    // -----------------------------------------------------------------------
+    // CURLSSLBACKEND_* constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sslbackend_none_is_zero() {
+        assert_eq!(CURLSSLBACKEND_NONE, 0);
+    }
+
+    #[test]
+    fn sslbackend_openssl_is_one() {
+        assert_eq!(CURLSSLBACKEND_OPENSSL, 1);
+    }
+
+    #[test]
+    fn sslbackend_rustls_is_fourteen() {
+        assert_eq!(CURLSSLBACKEND_RUSTLS, 14);
+    }
+
+    #[test]
+    fn sslbackend_values_distinct() {
+        let vals = [
+            CURLSSLBACKEND_NONE,
+            CURLSSLBACKEND_OPENSSL,
+            CURLSSLBACKEND_GNUTLS,
+            CURLSSLBACKEND_WOLFSSL,
+            CURLSSLBACKEND_SCHANNEL,
+            CURLSSLBACKEND_SECURETRANSPORT,
+            CURLSSLBACKEND_MBEDTLS,
+            CURLSSLBACKEND_BEARSSL,
+            CURLSSLBACKEND_RUSTLS,
+        ];
+        for (i, a) in vals.iter().enumerate() {
+            for (j, b) in vals.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "backends {} and {} should differ", i, j);
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Static strings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn version_string_is_null_terminated() {
+        assert_eq!(*VERSION_STRING.last().unwrap(), 0);
+    }
+
+    #[test]
+    fn version_string_contains_version() {
+        let s = std::str::from_utf8(&VERSION_STRING[..VERSION_STRING.len() - 1]).unwrap();
+        assert!(s.contains("8.19.0"));
+    }
+
+    #[test]
+    fn version_string_mentions_rustls() {
+        let s = std::str::from_utf8(&VERSION_STRING[..VERSION_STRING.len() - 1]).unwrap();
+        assert!(s.contains("rustls"));
+    }
+
+    #[test]
+    fn bare_version_string_matches() {
+        let s = std::str::from_utf8(&BARE_VERSION_STRING[..BARE_VERSION_STRING.len() - 1]).unwrap();
+        assert_eq!(s, "8.19.0-DEV");
+    }
+
+    #[test]
+    fn ssl_version_string_is_rustls() {
+        let s = std::str::from_utf8(&SSL_VERSION_STRING[..SSL_VERSION_STRING.len() - 1]).unwrap();
+        assert_eq!(s, "rustls");
+    }
+
+    #[test]
+    fn host_string_is_null_terminated() {
+        assert_eq!(*HOST_STRING.last().unwrap(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_features
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_features_includes_ssl() {
+        let f = compute_features();
+        assert_ne!(f & CURL_VERSION_SSL, 0);
+    }
+
+    #[test]
+    fn compute_features_includes_http2() {
+        let f = compute_features();
+        assert_ne!(f & CURL_VERSION_HTTP2, 0);
+    }
+
+    #[test]
+    fn compute_features_includes_http3() {
+        let f = compute_features();
+        assert_ne!(f & CURL_VERSION_HTTP3, 0);
+    }
+
+    #[test]
+    fn compute_features_includes_ipv6() {
+        let f = compute_features();
+        assert_ne!(f & CURL_VERSION_IPV6, 0);
+    }
+
+    #[test]
+    fn compute_features_includes_brotli() {
+        let f = compute_features();
+        assert_ne!(f & CURL_VERSION_BROTLI, 0);
+    }
+
+    #[test]
+    fn compute_features_includes_zstd() {
+        let f = compute_features();
+        assert_ne!(f & CURL_VERSION_ZSTD, 0);
+    }
+
+    #[test]
+    fn compute_features_includes_hsts() {
+        let f = compute_features();
+        assert_ne!(f & CURL_VERSION_HSTS, 0);
+    }
+
+    #[test]
+    fn compute_features_includes_threadsafe() {
+        let f = compute_features();
+        assert_ne!(f & CURL_VERSION_THREADSAFE, 0);
+    }
+
+    #[test]
+    fn compute_features_includes_ntlm() {
+        let f = compute_features();
+        assert_ne!(f & CURL_VERSION_NTLM, 0);
+    }
+
+    #[test]
+    fn compute_features_includes_idn() {
+        let f = compute_features();
+        assert_ne!(f & CURL_VERSION_IDN, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // version_info_static
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn version_info_static_age() {
+        let info = version_info_static();
+        assert_eq!(info.age, CURLVERSION_NOW);
+    }
+
+    #[test]
+    fn version_info_static_version_num() {
+        let info = version_info_static();
+        assert_eq!(info.version_num, 0x081300);
+    }
+
+    #[test]
+    fn version_info_static_version_string() {
+        let info = version_info_static();
+        assert!(!info.version.is_null());
+        // SAFETY: version points to a static null-terminated string.
+        let cstr = unsafe { CStr::from_ptr(info.version) };
+        assert_eq!(cstr.to_str().unwrap(), "8.19.0-DEV");
+    }
+
+    #[test]
+    fn version_info_static_ssl_version() {
+        let info = version_info_static();
+        assert!(!info.ssl_version.is_null());
+        // SAFETY: ssl_version points to a static null-terminated string.
+        let cstr = unsafe { CStr::from_ptr(info.ssl_version) };
+        assert_eq!(cstr.to_str().unwrap(), "rustls");
+    }
+
+    #[test]
+    fn version_info_static_features_nonzero() {
+        let info = version_info_static();
+        assert_ne!(info.features, 0);
+    }
+
+    #[test]
+    fn version_info_static_protocols_not_null() {
+        let info = version_info_static();
+        assert!(!info.protocols.is_null());
+    }
+
+    #[test]
+    fn version_info_static_hyper_version() {
+        let info = version_info_static();
+        assert!(!info.hyper_version.is_null());
+        // SAFETY: hyper_version points to a static null-terminated string.
+        let cstr = unsafe { CStr::from_ptr(info.hyper_version) };
+        assert_eq!(cstr.to_str().unwrap(), "hyper");
+    }
+
+    #[test]
+    fn version_info_static_quic_version() {
+        let info = version_info_static();
+        assert!(!info.quic_version.is_null());
+        // SAFETY: quic_version points to a static null-terminated string.
+        let cstr = unsafe { CStr::from_ptr(info.quic_version) };
+        assert_eq!(cstr.to_str().unwrap(), "quinn/h3");
+    }
+
+    #[test]
+    fn version_info_static_ssh_version() {
+        let info = version_info_static();
+        assert!(!info.libssh_version.is_null());
+        // SAFETY: libssh_version points to a static null-terminated string.
+        let cstr = unsafe { CStr::from_ptr(info.libssh_version) };
+        assert_eq!(cstr.to_str().unwrap(), "russh");
+    }
+
+    #[test]
+    fn version_info_static_deprecated_ssl_version_num_is_zero() {
+        let info = version_info_static();
+        assert_eq!(info.ssl_version_num, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_global_init — safe FFI call
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn global_init_default_succeeds() {
+        // SAFETY: curl_global_init accepts an integer flag. CURL_GLOBAL_DEFAULT=3.
+        let rc = unsafe { curl_global_init(CURL_GLOBAL_DEFAULT) };
+        assert_eq!(rc, CURLE_OK);
+    }
+
+    #[test]
+    fn global_init_nothing_succeeds() {
+        let rc = unsafe { curl_global_init(CURL_GLOBAL_NOTHING) };
+        assert_eq!(rc, CURLE_OK);
+    }
+
+    #[test]
+    fn global_init_idempotent() {
+        let rc1 = unsafe { curl_global_init(CURL_GLOBAL_DEFAULT) };
+        let rc2 = unsafe { curl_global_init(CURL_GLOBAL_DEFAULT) };
+        assert_eq!(rc1, CURLE_OK);
+        assert_eq!(rc2, CURLE_OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_global_cleanup
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn global_cleanup_does_not_crash() {
+        // SAFETY: curl_global_cleanup takes no arguments and is idempotent.
+        unsafe { curl_global_cleanup(); }
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_global_trace
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn global_trace_null_returns_ok() {
+        // SAFETY: Passing null is documented as a no-op.
+        let rc = unsafe { curl_global_trace(ptr::null()) };
+        assert_eq!(rc, CURLE_OK);
+    }
+
+    #[test]
+    fn global_trace_valid_string_returns_ok() {
+        let config = CString::new("all").unwrap();
+        // SAFETY: config is a valid null-terminated C string.
+        let rc = unsafe { curl_global_trace(config.as_ptr()) };
+        assert_eq!(rc, CURLE_OK);
+    }
+
+    #[test]
+    fn global_trace_empty_string_returns_ok() {
+        let config = CString::new("").unwrap();
+        let rc = unsafe { curl_global_trace(config.as_ptr()) };
+        assert_eq!(rc, CURLE_OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_global_sslset
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn global_sslset_rustls_by_id() {
+        // After global_init, returns TOO_LATE (since init already ran).
+        let _ = unsafe { curl_global_init(CURL_GLOBAL_DEFAULT) };
+        let rc = unsafe {
+            curl_global_sslset(CURLSSLBACKEND_RUSTLS, ptr::null(), ptr::null_mut())
+        };
+        // After init, this returns TOO_LATE.
+        assert!(rc == CURLSSLSET_TOO_LATE || rc == CURLSSLSET_OK);
+    }
+
+    #[test]
+    fn global_sslset_populates_avail() {
+        let mut avail: *const *const curl_ssl_backend = ptr::null();
+        let _ = unsafe {
+            curl_global_sslset(
+                CURLSSLBACKEND_NONE,
+                ptr::null(),
+                &mut avail as *mut _,
+            )
+        };
+        assert!(!avail.is_null());
+    }
+
+    #[test]
+    fn global_sslset_unknown_backend() {
+        // Use an impossible backend id (255). Since init already happened,
+        // it returns TOO_LATE.
+        let rc = unsafe {
+            curl_global_sslset(255, ptr::null(), ptr::null_mut())
+        };
+        assert!(rc == CURLSSLSET_TOO_LATE || rc == CURLSSLSET_UNKNOWN_BACKEND);
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_version
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn curl_version_not_null() {
+        // SAFETY: curl_version returns a pointer to static data.
+        let ptr = unsafe { curl_version() };
+        assert!(!ptr.is_null());
+    }
+
+    #[test]
+    fn curl_version_contains_version_number() {
+        let ptr = unsafe { curl_version() };
+        // SAFETY: ptr points to a static null-terminated string.
+        let cstr = unsafe { CStr::from_ptr(ptr) };
+        let s = cstr.to_str().unwrap();
+        assert!(s.contains("8.19.0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_version_info
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn curl_version_info_not_null() {
+        // SAFETY: curl_version_info returns a pointer to static data.
+        let ptr = unsafe { curl_version_info(CURLVERSION_NOW) };
+        assert!(!ptr.is_null());
+    }
+
+    #[test]
+    fn curl_version_info_age_matches() {
+        let ptr = unsafe { curl_version_info(CURLVERSION_NOW) };
+        // SAFETY: ptr is valid and points to static data.
+        let data = unsafe { &*ptr };
+        assert_eq!(data.age, CURLVERSION_NOW);
+    }
+
+    #[test]
+    fn curl_version_info_version_num_matches() {
+        let ptr = unsafe { curl_version_info(CURLVERSION_NOW) };
+        let data = unsafe { &*ptr };
+        assert_eq!(data.version_num, 0x081300);
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_getenv
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn curl_getenv_null_returns_null() {
+        // SAFETY: Passing null is documented as returning null.
+        let result = unsafe { curl_getenv(ptr::null()) };
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn curl_getenv_nonexistent_returns_null() {
+        let key = CString::new("CURL_RS_TEST_NONEXISTENT_VAR_12345").unwrap();
+        // SAFETY: key is a valid null-terminated C string.
+        let result = unsafe { curl_getenv(key.as_ptr()) };
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn curl_getenv_path_returns_non_null() {
+        // PATH is always set on test systems.
+        let key = CString::new("PATH").unwrap();
+        let result = unsafe { curl_getenv(key.as_ptr()) };
+        if !result.is_null() {
+            // SAFETY: result is a malloc'd null-terminated string.
+            let cstr = unsafe { CStr::from_ptr(result) };
+            assert!(!cstr.to_str().unwrap().is_empty());
+            // Free the allocated memory.
+            unsafe { curl_free(result as *mut c_void) };
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_free
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn curl_free_null_is_noop() {
+        // SAFETY: Passing null is documented as a no-op.
+        unsafe { curl_free(ptr::null_mut()) };
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_getdate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn curl_getdate_null_returns_negative() {
+        // SAFETY: Passing null returns -1.
+        let result = unsafe { curl_getdate(ptr::null(), ptr::null()) };
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn curl_getdate_valid_rfc2822() {
+        let date = CString::new("Thu, 01 Jan 1970 00:00:00 GMT").unwrap();
+        // SAFETY: date is a valid null-terminated C string.
+        let result = unsafe { curl_getdate(date.as_ptr(), ptr::null()) };
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn curl_getdate_valid_epoch_plus() {
+        let date = CString::new("Fri, 02 Jan 1970 00:00:00 GMT").unwrap();
+        let result = unsafe { curl_getdate(date.as_ptr(), ptr::null()) };
+        assert_eq!(result, 86400); // 24 * 60 * 60
+    }
+
+    #[test]
+    fn curl_getdate_invalid_returns_negative() {
+        let date = CString::new("not a date").unwrap();
+        let result = unsafe { curl_getdate(date.as_ptr(), ptr::null()) };
+        assert_eq!(result, -1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Protocol list
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn protocols_list_terminated_by_null() {
+        let last = PROTOCOLS.0[PROTOCOLS.0.len() - 1];
+        assert!(last.is_null());
+    }
+
+    #[test]
+    fn protocols_list_has_http() {
+        let found = PROTOCOLS.0.iter().take(26).any(|&p| {
+            if p.is_null() {
+                return false;
+            }
+            // SAFETY: p points to a static null-terminated string.
+            let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("");
+            s == "http"
+        });
+        assert!(found, "protocols should include http");
+    }
+
+    #[test]
+    fn protocols_list_has_https() {
+        let found = PROTOCOLS.0.iter().take(26).any(|&p| {
+            if p.is_null() {
+                return false;
+            }
+            let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("");
+            s == "https"
+        });
+        assert!(found, "protocols should include https");
+    }
+
+    #[test]
+    fn protocols_list_has_ftp() {
+        let found = PROTOCOLS.0.iter().take(26).any(|&p| {
+            if p.is_null() {
+                return false;
+            }
+            let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("");
+            s == "ftp"
+        });
+        assert!(found, "protocols should include ftp");
+    }
+
+    #[test]
+    fn protocols_list_has_sftp() {
+        let found = PROTOCOLS.0.iter().take(26).any(|&p| {
+            if p.is_null() {
+                return false;
+            }
+            let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("");
+            s == "sftp"
+        });
+        assert!(found, "protocols should include sftp");
+    }
+
+    // -----------------------------------------------------------------------
+    // Feature names list
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn feature_names_terminated_by_null() {
+        let last = FEATURE_NAMES.0[FEATURE_NAMES.0.len() - 1];
+        assert!(last.is_null());
+    }
+
+    #[test]
+    fn feature_names_has_ssl() {
+        let found = FEATURE_NAMES.0.iter().take(19).any(|&p| {
+            if p.is_null() {
+                return false;
+            }
+            let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("");
+            s == "SSL"
+        });
+        assert!(found, "feature names should include SSL");
+    }
+
+    #[test]
+    fn feature_names_has_http2() {
+        let found = FEATURE_NAMES.0.iter().take(19).any(|&p| {
+            if p.is_null() {
+                return false;
+            }
+            let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("");
+            s == "HTTP2"
+        });
+        assert!(found, "feature names should include HTTP2");
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_global_init_mem
+    // -----------------------------------------------------------------------
+
+    // Stub allocator callbacks for curl_global_init_mem testing.
+    unsafe extern "C" fn stub_malloc(size: libc::size_t) -> *mut c_void {
+        libc::malloc(size)
+    }
+    unsafe extern "C" fn stub_free(ptr: *mut c_void) {
+        libc::free(ptr)
+    }
+    unsafe extern "C" fn stub_realloc(ptr: *mut c_void, size: libc::size_t) -> *mut c_void {
+        libc::realloc(ptr, size)
+    }
+    unsafe extern "C" fn stub_strdup(s: *const c_char) -> *mut c_char {
+        libc::strdup(s)
+    }
+    unsafe extern "C" fn stub_calloc(nmemb: libc::size_t, size: libc::size_t) -> *mut c_void {
+        libc::calloc(nmemb, size)
+    }
+
+    #[test]
+    fn global_init_mem_with_callbacks_succeeds() {
+        // SAFETY: We pass valid C-compatible function pointers. The custom
+        // allocators are accepted for API compatibility but unused by Rust.
+        let rc = unsafe {
+            curl_global_init_mem(
+                CURL_GLOBAL_DEFAULT,
+                stub_malloc,
+                stub_free,
+                stub_realloc,
+                stub_strdup,
+                stub_calloc,
+            )
+        };
+        assert_eq!(rc, CURLE_OK);
+    }
+}

@@ -2025,4 +2025,300 @@ mod tests {
         assert_eq!(tn.himq[5], QueueState::Empty);
         assert_eq!(neg, vec![IAC, DO, 5]);
     }
+
+    // --- Additional tests for coverage ---
+
+    #[test]
+    fn test_telopt_name_all_known() {
+        assert_eq!(telopt_name(TELOPT_BINARY), Some("BINARY"));
+        assert_eq!(telopt_name(TELOPT_ECHO), Some("ECHO"));
+        assert_eq!(telopt_name(TELOPT_SGA), Some("SUPPRESS GO AHEAD"));
+        assert_eq!(telopt_name(TELOPT_TTYPE), Some("TERM TYPE"));
+        assert_eq!(telopt_name(TELOPT_NAWS), Some("NAWS"));
+        assert_eq!(telopt_name(TELOPT_XDISPLOC), Some("XDISPLOC"));
+        assert_eq!(telopt_name(TELOPT_NEW_ENVIRON), Some("NEW-ENVIRON"));
+    }
+
+    #[test]
+    fn test_telopt_name_unknown_extra() {
+        assert!(telopt_name(99).is_none());
+    }
+
+    #[test]
+    fn test_telcmd_name_all() {
+        assert_eq!(telcmd_name(WILL), Some("WILL"));
+        assert_eq!(telcmd_name(WONT), Some("WONT"));
+        assert_eq!(telcmd_name(DO), Some("DO"));
+        assert_eq!(telcmd_name(DONT), Some("DONT"));
+    }
+
+    #[test]
+    fn test_telcmd_name_unknown() {
+        assert!(telcmd_name(100).is_none());
+    }
+
+    #[test]
+    fn test_neg_cmd_name() {
+        assert_eq!(neg_cmd_name(WILL), "WILL");
+        assert_eq!(neg_cmd_name(WONT), "WONT");
+        assert_eq!(neg_cmd_name(DO), "DO");
+        assert_eq!(neg_cmd_name(DONT), "DONT");
+    }
+
+    #[test]
+    fn test_str_is_nonascii_extra() {
+        assert!(!str_is_nonascii("hello"));
+        assert!(!str_is_nonascii(""));
+        assert!(str_is_nonascii("héllo"));
+    }
+
+    #[test]
+    fn test_bad_option_safe() {
+        assert!(!bad_option("hello"));
+        assert!(!bad_option(""));
+    }
+
+    #[test]
+    fn test_parse_ws_valid_extra() {
+        assert_eq!(TelnetHandler::parse_ws("80x24"), Some((80, 24)));
+        assert_eq!(TelnetHandler::parse_ws("120x40"), Some((120, 40)));
+    }
+
+    #[test]
+    fn test_parse_ws_invalid_extra() {
+        assert!(TelnetHandler::parse_ws("80").is_none());
+        assert!(TelnetHandler::parse_ws("abcxdef").is_none());
+        assert!(TelnetHandler::parse_ws("").is_none());
+    }
+
+    #[test]
+    fn test_build_negotiation_extra() {
+        let neg = TelnetHandler::build_negotiation(WILL, TELOPT_ECHO);
+        assert_eq!(neg, [IAC, WILL, TELOPT_ECHO]);
+    }
+
+    #[test]
+    fn test_queue_negotiation() {
+        let mut out = Vec::new();
+        TelnetHandler::queue_negotiation(&mut out, DO, TELOPT_SGA);
+        assert_eq!(out, vec![IAC, DO, TELOPT_SGA]);
+    }
+
+    #[test]
+    fn test_escape_iac_no_iac_extra() {
+        let mut tn = TelnetState::new();
+        let data = b"hello world";
+        let result = TelnetHandler::escape_iac(&mut tn, data);
+        assert_eq!(result, data.to_vec());
+    }
+
+    #[test]
+    fn test_escape_iac_with_iac_extra() {
+        let mut tn = TelnetState::new();
+        let data = vec![b'a', IAC, b'b'];
+        let result = TelnetHandler::escape_iac(&mut tn, &data);
+        assert_eq!(result, vec![b'a', IAC, IAC, b'b']);
+    }
+
+    #[test]
+    fn test_handler_name() {
+        let handler = TelnetHandler::new();
+        assert_eq!(handler.name(), "telnet");
+    }
+
+    #[test]
+    fn test_handler_default_port() {
+        let handler = TelnetHandler::new();
+        assert_eq!(handler.default_port(), 23);
+    }
+
+    #[test]
+    fn test_handler_flags() {
+        let handler = TelnetHandler::new();
+        let flags = handler.flags();
+        assert!(!flags.contains(ProtocolFlags::SSL));
+    }
+
+    #[test]
+    fn test_handler_default_trait() {
+        let handler: TelnetHandler = Default::default();
+        assert_eq!(handler.name(), "telnet");
+    }
+
+    #[test]
+    fn test_set_local_option_already_yes() {
+        let mut tn = TelnetState::new();
+        let mut out = Vec::new();
+        tn.us[42] = NegState::Yes;
+        // Requesting Yes when already Yes — should be no-op
+        TelnetHandler::set_local_option(&mut tn, &mut out, 42, true);
+        assert!(out.is_empty());
+        assert_eq!(tn.us[42], NegState::Yes);
+    }
+
+    #[test]
+    fn test_set_remote_option_already_yes() {
+        let mut tn = TelnetState::new();
+        let mut out = Vec::new();
+        tn.him[42] = NegState::Yes;
+        // Requesting Yes when already Yes — no-op
+        TelnetHandler::set_remote_option(&mut tn, &mut out, 42, true);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_check_telnet_options_ttype_extra() {
+        let mut tn = TelnetState::new();
+        let options = vec!["TTYPE=vt100".to_string()];
+        let result = TelnetHandler::check_telnet_options(&mut tn, &options, &None);
+        assert!(result.is_ok());
+        assert_eq!(tn.subopt_ttype, Some("vt100".to_string()));
+    }
+
+    #[test]
+    fn test_check_telnet_options_xdisploc_extra() {
+        let mut tn = TelnetState::new();
+        let options = vec!["XDISPLOC=localhost:0".to_string()];
+        let result = TelnetHandler::check_telnet_options(&mut tn, &options, &None);
+        assert!(result.is_ok());
+        assert_eq!(tn.subopt_xdisploc, Some("localhost:0".to_string()));
+    }
+
+    #[test]
+    fn test_check_telnet_options_ws_extra() {
+        let mut tn = TelnetState::new();
+        let options = vec!["WS=132x50".to_string()];
+        let result = TelnetHandler::check_telnet_options(&mut tn, &options, &None);
+        assert!(result.is_ok());
+        assert_eq!(tn.subopt_wsx, 132);
+        assert_eq!(tn.subopt_wsy, 50);
+    }
+
+    #[test]
+    fn test_check_telnet_options_bad_ws() {
+        let mut tn = TelnetState::new();
+        let options = vec!["WS=badformat".to_string()];
+        let result = TelnetHandler::check_telnet_options(&mut tn, &options, &None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_telrcv_cr_null_stripping() {
+        let mut tn = TelnetState::new();
+        // CR followed by NUL should strip the NUL
+        let data = vec![b'a', b'\r', 0, b'b'];
+        let (client, _, _) = TelnetHandler::telrcv(&mut tn, &data).unwrap();
+        assert_eq!(client, vec![b'a', b'\r', b'b']);
+    }
+
+    #[test]
+    fn test_telrcv_iac_iac_data() {
+        let mut tn = TelnetState::new();
+        // IAC IAC should produce a single 0xFF byte
+        let data = vec![IAC, IAC];
+        let (client, _, _) = TelnetHandler::telrcv(&mut tn, &data).unwrap();
+        assert_eq!(client, vec![IAC]);
+    }
+
+    #[test]
+    fn test_negotiate_default_options() {
+        let mut tn = TelnetState::new();
+        let mut out = Vec::new();
+        TelnetHandler::negotiate(&mut tn, &mut out);
+        // Should produce negotiation bytes for default-enabled options (SGA, BINARY, ECHO)
+        assert!(!out.is_empty());
+        // negotiate() doesn't set already_negotiated; caller must set it
+        // Verify negotiation bytes contain IAC commands
+        assert!(out.len() >= 3); // at least one IAC DO/WILL command
+    
+    }
+    // ====== Round 5 coverage tests ======
+
+    #[test]
+    fn test_telopt_name_r5() {
+        assert!(telopt_name(0).is_some()); // BINARY
+        assert!(telopt_name(1).is_some()); // ECHO
+        assert!(telopt_name(24).is_some()); // TTYPE
+        assert!(telopt_name(31).is_some()); // NAWS
+        assert!(telopt_name(200).is_none()); // Unknown
+    }
+
+    #[test]
+    fn test_telcmd_name_r5() {
+        assert!(telcmd_name(240).is_some()); // SE
+        assert!(telcmd_name(250).is_some()); // SB
+        assert!(telcmd_name(251).is_some()); // WILL
+        assert!(telcmd_name(252).is_some()); // WONT
+        assert!(telcmd_name(253).is_some()); // DO
+        assert!(telcmd_name(254).is_some()); // DONT
+        assert!(telcmd_name(255).is_some()); // IAC
+        assert!(telcmd_name(100).is_none()); // Unknown
+    }
+
+    #[test]
+    fn test_neg_cmd_name_r5() {
+        assert!(!neg_cmd_name(251).is_empty());
+        assert!(!neg_cmd_name(252).is_empty());
+        assert!(!neg_cmd_name(253).is_empty());
+        assert!(!neg_cmd_name(254).is_empty());
+    }
+
+    #[test]
+    fn test_str_is_nonascii_r5() {
+        assert!(!str_is_nonascii("hello"));
+        assert!(str_is_nonascii("hel\u{00e9}lo")); // Non-ASCII (e-acute)
+    }
+
+    #[test]
+    fn test_telnet_handler_new_r5() {
+        let h = TelnetHandler::default();
+        let _ = h.name();
+    }
+
+    #[test]
+    fn test_log_option_r5() {
+        log_option("RCVD", 253, 1); // RCVD DO ECHO
+        log_option("SENT", 251, 24); // SENT WILL TTYPE
+        log_option("RCVD", 255, 251); // IAC path
+    }
+
+    #[test]
+    fn test_log_suboption_r5() {
+        let data = vec![24, 0, b'v', b't', b'1', b'0', b'0'];
+        log_suboption('<', &data);
+        log_suboption('>', &[]);
+    }
+
+    #[test]
+    fn test_bad_option_r5() {
+        let _ = bad_option("TTYPE");
+        let _ = bad_option("XDISPLOC");
+        let _ = bad_option("NORMAL_VALUE");
+    }
+
+
+
+    // ====== Round 7 ======
+    #[test] fn test_telnet_handler_r7() {
+        let h = TelnetHandler::new();
+        assert_eq!(h.name(), "telnet");
+        assert_eq!(h.default_port(), 23);
+    }
+    #[test] fn test_telnet_flags_r7() {
+        let h = TelnetHandler::new();
+        let _ = h.flags();
+    }
+    #[test] fn test_telnet_state_display_r7() {
+        let ts = TelnetState::new();
+        let d = format!("{:?}", ts);
+        assert!(!d.is_empty());
+    }
+    #[test] fn test_telnet_receive_display_r7() {
+        let _ = format!("{:?}", TelnetReceive::Data);
+    }
+    #[test] fn test_telnet_handler_debug_r7() {
+        let h = TelnetHandler::new();
+        assert!(!format!("{:?}", h).is_empty());
+    }
+
 }

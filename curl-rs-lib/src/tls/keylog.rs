@@ -486,3 +486,369 @@ pub fn init_keylogger() -> Option<Arc<dyn rustls::KeyLog>> {
     let logger = KeyLogger::with_file(BufWriter::new(file));
     Some(Arc::new(logger))
 }
+
+// ===========================================================================
+// Unit Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::NamedTempFile;
+
+    // -----------------------------------------------------------------------
+    // Constants tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_keylog_label_maxlen() {
+        assert_eq!(KEYLOG_LABEL_MAXLEN, 31);
+        // "CLIENT_HANDSHAKE_TRAFFIC_SECRET" is exactly 31 chars
+        assert_eq!("CLIENT_HANDSHAKE_TRAFFIC_SECRET".len(), 31);
+    }
+
+    #[test]
+    fn test_client_random_size() {
+        assert_eq!(CLIENT_RANDOM_SIZE, 32);
+    }
+
+    #[test]
+    fn test_secret_maxlen() {
+        assert_eq!(SECRET_MAXLEN, 48);
+    }
+
+    #[test]
+    fn test_max_line_len() {
+        assert_eq!(MAX_LINE_LEN, 256);
+    }
+
+    // -----------------------------------------------------------------------
+    // KeyLogger construction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_keylogger_with_file() {
+        let tmpfile = NamedTempFile::new().unwrap();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(tmpfile.path())
+            .unwrap();
+        let logger = KeyLogger::with_file(BufWriter::new(file));
+        assert!(logger.enabled());
+    }
+
+    #[test]
+    fn test_keylogger_debug() {
+        let tmpfile = NamedTempFile::new().unwrap();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(tmpfile.path())
+            .unwrap();
+        let logger = KeyLogger::with_file(BufWriter::new(file));
+        let dbg = format!("{:?}", logger);
+        assert!(dbg.contains("KeyLogger"));
+        assert!(dbg.contains("active"));
+    }
+
+    #[test]
+    fn test_keylogger_debug_inactive() {
+        let logger = KeyLogger {
+            inner: Mutex::new(KeyLoggerInner { file: None }),
+        };
+        let dbg = format!("{:?}", logger);
+        assert!(dbg.contains("false"));
+    }
+
+    // -----------------------------------------------------------------------
+    // KeyLogger open/close/enabled tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_keylogger_open_no_env() {
+        // Ensure SSLKEYLOGFILE is not set for this test
+        let logger = KeyLogger {
+            inner: Mutex::new(KeyLoggerInner { file: None }),
+        };
+        // With no env var set, open should be a no-op
+        env::remove_var("SSLKEYLOGFILE");
+        logger.open();
+        assert!(!logger.enabled());
+    }
+
+    #[test]
+    fn test_keylogger_close_inactive() {
+        let logger = KeyLogger {
+            inner: Mutex::new(KeyLoggerInner { file: None }),
+        };
+        logger.close(); // Should not panic
+        assert!(!logger.enabled());
+    }
+
+    #[test]
+    fn test_keylogger_close_active() {
+        let tmpfile = NamedTempFile::new().unwrap();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(tmpfile.path())
+            .unwrap();
+        let logger = KeyLogger::with_file(BufWriter::new(file));
+        assert!(logger.enabled());
+        logger.close();
+        assert!(!logger.enabled());
+    }
+
+    #[test]
+    fn test_keylogger_close_twice() {
+        let tmpfile = NamedTempFile::new().unwrap();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(tmpfile.path())
+            .unwrap();
+        let logger = KeyLogger::with_file(BufWriter::new(file));
+        logger.close();
+        logger.close(); // Idempotent
+        assert!(!logger.enabled());
+    }
+
+    // -----------------------------------------------------------------------
+    // write_line tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_write_line_inactive() {
+        let logger = KeyLogger {
+            inner: Mutex::new(KeyLoggerInner { file: None }),
+        };
+        assert!(!logger.write_line("test line"));
+    }
+
+    #[test]
+    fn test_write_line_empty() {
+        let tmpfile = NamedTempFile::new().unwrap();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(tmpfile.path())
+            .unwrap();
+        let logger = KeyLogger::with_file(BufWriter::new(file));
+        assert!(!logger.write_line(""));
+    }
+
+    #[test]
+    fn test_write_line_too_long() {
+        let tmpfile = NamedTempFile::new().unwrap();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(tmpfile.path())
+            .unwrap();
+        let logger = KeyLogger::with_file(BufWriter::new(file));
+        let long_line = "x".repeat(255);
+        assert!(!logger.write_line(&long_line));
+    }
+
+    #[test]
+    fn test_write_line_max_valid_length() {
+        let tmpfile = NamedTempFile::new().unwrap();
+        let path = tmpfile.path().to_owned();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let logger = KeyLogger::with_file(BufWriter::new(file));
+        let line = "x".repeat(254); // MAX_LINE_LEN - 2 = 254
+        assert!(logger.write_line(&line));
+        logger.close();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with(&"x".repeat(254)));
+        assert!(content.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_write_line_with_newline() {
+        let tmpfile = NamedTempFile::new().unwrap();
+        let path = tmpfile.path().to_owned();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let logger = KeyLogger::with_file(BufWriter::new(file));
+        assert!(logger.write_line("hello\n"));
+        logger.close();
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "hello\n");
+    }
+
+    #[test]
+    fn test_write_line_without_newline() {
+        let tmpfile = NamedTempFile::new().unwrap();
+        let path = tmpfile.path().to_owned();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let logger = KeyLogger::with_file(BufWriter::new(file));
+        assert!(logger.write_line("hello"));
+        logger.close();
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "hello\n");
+    }
+
+    // -----------------------------------------------------------------------
+    // write (structured NSS format) tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_write_inactive() {
+        let logger = KeyLogger {
+            inner: Mutex::new(KeyLoggerInner { file: None }),
+        };
+        let cr = [0u8; CLIENT_RANDOM_SIZE];
+        assert!(!logger.write("CLIENT_RANDOM", &cr, &[1, 2, 3]));
+    }
+
+    #[test]
+    fn test_write_label_too_long() {
+        let tmpfile = NamedTempFile::new().unwrap();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(tmpfile.path())
+            .unwrap();
+        let logger = KeyLogger::with_file(BufWriter::new(file));
+        let cr = [0u8; CLIENT_RANDOM_SIZE];
+        let long_label = "x".repeat(32); // > KEYLOG_LABEL_MAXLEN
+        assert!(!logger.write(&long_label, &cr, &[1]));
+    }
+
+    #[test]
+    fn test_write_empty_secret() {
+        let tmpfile = NamedTempFile::new().unwrap();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(tmpfile.path())
+            .unwrap();
+        let logger = KeyLogger::with_file(BufWriter::new(file));
+        let cr = [0u8; CLIENT_RANDOM_SIZE];
+        assert!(!logger.write("CLIENT_RANDOM", &cr, &[]));
+    }
+
+    #[test]
+    fn test_write_secret_too_long() {
+        let tmpfile = NamedTempFile::new().unwrap();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(tmpfile.path())
+            .unwrap();
+        let logger = KeyLogger::with_file(BufWriter::new(file));
+        let cr = [0u8; CLIENT_RANDOM_SIZE];
+        let secret = vec![0xABu8; SECRET_MAXLEN + 1];
+        assert!(!logger.write("CLIENT_RANDOM", &cr, &secret));
+    }
+
+    #[test]
+    fn test_write_valid_entry() {
+        let tmpfile = NamedTempFile::new().unwrap();
+        let path = tmpfile.path().to_owned();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let logger = KeyLogger::with_file(BufWriter::new(file));
+        let cr = [0xAA; CLIENT_RANDOM_SIZE];
+        let secret = [0xBB; 48]; // TLS 1.2 master secret size
+        assert!(logger.write("CLIENT_RANDOM", &cr, &secret));
+        logger.close();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with("CLIENT_RANDOM "));
+        // client_random as hex: 32 bytes * 2 = 64 hex chars
+        assert!(content.contains(&"aa".repeat(32)));
+        // secret as hex: 48 bytes * 2 = 96 hex chars
+        assert!(content.contains(&"bb".repeat(48)));
+        assert!(content.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_write_short_secret() {
+        let tmpfile = NamedTempFile::new().unwrap();
+        let path = tmpfile.path().to_owned();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let logger = KeyLogger::with_file(BufWriter::new(file));
+        let cr = [0x01; CLIENT_RANDOM_SIZE];
+        let secret = [0xFF; 32]; // SHA-256 secret size
+        assert!(logger.write("CLIENT_HANDSHAKE_TRAFFIC_SECRET", &cr, &secret));
+        logger.close();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with("CLIENT_HANDSHAKE_TRAFFIC_SECRET "));
+    }
+
+    // -----------------------------------------------------------------------
+    // rustls::KeyLog trait implementation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_keylog_trait_inactive() {
+        let logger = KeyLogger {
+            inner: Mutex::new(KeyLoggerInner { file: None }),
+        };
+        // Should not panic
+        rustls::KeyLog::log(&logger, "CLIENT_RANDOM", &[0; 32], &[0; 48]);
+    }
+
+    #[test]
+    fn test_keylog_trait_writes_entry() {
+        let tmpfile = NamedTempFile::new().unwrap();
+        let path = tmpfile.path().to_owned();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let logger = KeyLogger::with_file(BufWriter::new(file));
+        rustls::KeyLog::log(&logger, "CLIENT_RANDOM", &[0xCC; 32], &[0xDD; 48]);
+        logger.close();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with("CLIENT_RANDOM "));
+        assert!(content.ends_with('\n'));
+    }
+
+    // -----------------------------------------------------------------------
+    // global_keylogger tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_global_keylogger_singleton() {
+        let k1 = global_keylogger();
+        let k2 = global_keylogger();
+        assert!(std::ptr::eq(k1, k2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multiple writes accumulate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_multiple_writes() {
+        let tmpfile = NamedTempFile::new().unwrap();
+        let path = tmpfile.path().to_owned();
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let logger = KeyLogger::with_file(BufWriter::new(file));
+        assert!(logger.write_line("# comment"));
+        let cr = [0x11; CLIENT_RANDOM_SIZE];
+        assert!(logger.write("LABEL1", &cr, &[0x22; 32]));
+        assert!(logger.write("LABEL2", &cr, &[0x33; 48]));
+        logger.close();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "# comment");
+        assert!(lines[1].starts_with("LABEL1 "));
+        assert!(lines[2].starts_with("LABEL2 "));
+    }
+}

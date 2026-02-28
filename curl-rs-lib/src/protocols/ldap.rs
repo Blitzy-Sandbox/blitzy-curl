@@ -2014,4 +2014,1305 @@ mod tests {
         let conn = ConnectionData::new(1, "localhost".into(), 389, "ldap".into());
         assert_eq!(handler.connection_check(&conn), ConnectionCheckResult::Ok);
     }
+
+    // ======================================================================
+    // Additional tests for coverage
+    // ======================================================================
+
+    #[test]
+    fn test_ldap_constants() {
+        assert_eq!(LDAP_DEFAULT_PORT, 389);
+        assert_eq!(LDAPS_DEFAULT_PORT, 636);
+        assert_eq!(LDAP_VERSION3, 3);
+        assert_eq!(LDAP_VERSION2, 2);
+        assert_eq!(LDAP_SUCCESS, 0);
+        assert_eq!(LDAP_SIZELIMIT_EXCEEDED, 4);
+        assert_eq!(LDAP_INVALID_CREDENTIALS, 49);
+        assert_eq!(LDAP_INSUFFICIENT_ACCESS, 50);
+        assert_eq!(LDAP_PROTOCOL_ERROR, 2);
+        assert_eq!(LDAP_NO_SUCH_OBJECT, 32);
+    }
+
+    #[test]
+    fn test_ber_tag_constants() {
+        assert_eq!(BER_TAG_SEQUENCE, 0x30);
+        assert_eq!(BER_TAG_INTEGER, 0x02);
+        assert_eq!(BER_TAG_OCTET_STRING, 0x04);
+        assert_eq!(BER_TAG_BOOLEAN, 0x01);
+        assert_eq!(BER_TAG_ENUMERATED, 0x0A);
+        assert_eq!(BER_TAG_SET, 0x31);
+    }
+
+    #[test]
+    fn test_ldap_tag_constants() {
+        assert_eq!(LDAP_TAG_BIND_REQUEST, 0x60);
+        assert_eq!(LDAP_TAG_BIND_RESPONSE, 0x61);
+        assert_eq!(LDAP_TAG_UNBIND_REQUEST, 0x42);
+        assert_eq!(LDAP_TAG_SEARCH_REQUEST, 0x63);
+        assert_eq!(LDAP_TAG_SEARCH_RESULT_ENTRY, 0x64);
+        assert_eq!(LDAP_TAG_SEARCH_RESULT_DONE, 0x65);
+        assert_eq!(LDAP_AUTH_SIMPLE, 0x80);
+        assert_eq!(LDAP_FILTER_AND, 0xA0);
+        assert_eq!(LDAP_FILTER_EQUALITY, 0xA3);
+        assert_eq!(LDAP_FILTER_PRESENT, 0x87);
+    }
+
+    #[test]
+    fn test_ldap_scope_from_str_ci_variants() {
+        assert_eq!(LdapScope::from_str_ci("base"), Some(LdapScope::Base));
+        assert_eq!(LdapScope::from_str_ci("one"), Some(LdapScope::OneLevel));
+        assert_eq!(LdapScope::from_str_ci("onetree"), Some(LdapScope::OneLevel));
+        assert_eq!(LdapScope::from_str_ci("sub"), Some(LdapScope::Subtree));
+        assert_eq!(LdapScope::from_str_ci("subtree"), Some(LdapScope::Subtree));
+        assert_eq!(LdapScope::from_str_ci("unknown"), None);
+        assert_eq!(LdapScope::from_str_ci(""), None);
+    }
+
+    #[test]
+    fn test_ldap_scope_as_u8_all() {
+        assert_eq!(LdapScope::Base.as_u8(), 0);
+        assert_eq!(LdapScope::OneLevel.as_u8(), 1);
+        assert_eq!(LdapScope::Subtree.as_u8(), 2);
+    }
+
+    #[test]
+    fn test_ldap_url_parse_full_4args() {
+        let url = LdapUrl::parse("host", 389, "/dc=example,dc=com", Some("cn,sn?sub?(objectClass=*)")).unwrap();
+        assert_eq!(url.host, "host");
+        assert_eq!(url.port, 389);
+        assert_eq!(url.dn, "dc=example,dc=com");
+        assert!(url.attributes.contains(&"cn".to_string()));
+        assert!(url.attributes.contains(&"sn".to_string()));
+        assert_eq!(url.scope, LdapScope::Subtree);
+        assert_eq!(url.filter, "(objectClass=*)");
+    }
+
+    #[test]
+    fn test_ldap_url_parse_minimal_4args() {
+        let url = LdapUrl::parse("host", LDAP_DEFAULT_PORT, "/", None).unwrap();
+        assert_eq!(url.host, "host");
+        assert_eq!(url.port, LDAP_DEFAULT_PORT);
+    }
+
+    #[test]
+    fn test_ldap_url_parse_empty_path() {
+        let url = LdapUrl::parse("host", LDAPS_DEFAULT_PORT, "", None).unwrap();
+        assert_eq!(url.host, "host");
+        assert!(url.dn.is_empty());
+    }
+
+    #[test]
+    fn test_ber_writer_integer_zero_extra() {
+        let mut w = BerWriter::new();
+        w.write_integer(0);
+        let bytes = w.into_bytes();
+        assert_eq!(bytes[0], BER_TAG_INTEGER);
+        assert_eq!(bytes[1], 1); // length
+        assert_eq!(bytes[2], 0); // value
+    }
+
+    #[test]
+    fn test_ber_writer_integer_large() {
+        let mut w = BerWriter::new();
+        w.write_integer(256);
+        let bytes = w.into_bytes();
+        assert_eq!(bytes[0], BER_TAG_INTEGER);
+        assert!(bytes.len() > 3); // multi-byte integer
+    }
+
+    #[test]
+    fn test_ber_writer_integer_negative_extra() {
+        let mut w = BerWriter::new();
+        w.write_integer(-128);
+        let bytes = w.into_bytes();
+        assert_eq!(bytes[0], BER_TAG_INTEGER);
+    }
+
+    #[test]
+    fn test_ber_writer_octet_string_empty() {
+        let mut w = BerWriter::new();
+        w.write_octet_string(b"");
+        let bytes = w.into_bytes();
+        assert_eq!(bytes[0], BER_TAG_OCTET_STRING);
+        assert_eq!(bytes[1], 0);
+    }
+
+    #[test]
+    fn test_ber_writer_boolean_true_extra() {
+        let mut w = BerWriter::new();
+        w.write_boolean(true);
+        let bytes = w.into_bytes();
+        assert_eq!(bytes[0], BER_TAG_BOOLEAN);
+        assert_eq!(bytes[1], 1);
+        assert_eq!(bytes[2], 0xFF);
+    }
+
+    #[test]
+    fn test_ber_writer_boolean_false_extra() {
+        let mut w = BerWriter::new();
+        w.write_boolean(false);
+        let bytes = w.into_bytes();
+        assert_eq!(bytes[2], 0x00);
+    }
+
+    #[test]
+    fn test_ber_writer_enumerated_extra() {
+        let mut w = BerWriter::new();
+        w.write_enumerated(0);
+        let bytes = w.into_bytes();
+        assert_eq!(bytes[0], BER_TAG_ENUMERATED);
+        assert_eq!(bytes[1], 1);
+        assert_eq!(bytes[2], 0);
+    }
+
+    #[test]
+    fn test_ber_writer_length_long() {
+        let mut w = BerWriter::new();
+        w.write_octet_string(&[0u8; 300]);
+        let bytes = w.into_bytes();
+        assert_eq!(bytes[1], 0x82); // long form
+    }
+
+    #[test]
+    fn test_ber_reader_integer_extra() {
+        let mut w = BerWriter::new();
+        w.write_integer(999);
+        let bytes = w.into_bytes();
+        let mut r = BerReader::new(&bytes);
+        assert_eq!(r.read_integer().unwrap(), 999);
+    }
+
+    #[test]
+    fn test_ber_reader_octet_string_extra() {
+        let mut w = BerWriter::new();
+        w.write_octet_string(b"");
+        let bytes = w.into_bytes();
+        let mut r = BerReader::new(&bytes);
+        assert_eq!(r.read_octet_string().unwrap(), b"");
+    }
+
+    #[test]
+    fn test_ber_reader_remaining_after_read() {
+        let mut w = BerWriter::new();
+        w.write_integer(5);
+        let bytes = w.into_bytes();
+        let mut r = BerReader::new(&bytes);
+        let _ = r.read_integer().unwrap();
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn test_ber_reader_peek_tag_extra() {
+        let r = BerReader::new(&[]);
+        assert_eq!(r.peek_tag(), None);
+    }
+
+    #[test]
+    fn test_ber_reader_eof_octet() {
+        let mut r = BerReader::new(&[]);
+        assert!(r.read_octet_string().is_err());
+    }
+
+    #[test]
+    fn test_ber_reader_invalid_tag_for_octet() {
+        let data = [BER_TAG_INTEGER, 0x01, 0x05];
+        let mut r = BerReader::new(&data);
+        assert!(r.read_octet_string().is_err());
+    }
+
+    #[test]
+    fn test_ldap_handler_new_ldaps() {
+        let h = LdapHandler::new(true);
+        assert_eq!(h.name(), "LDAPS");
+        assert_eq!(h.default_port(), LDAPS_DEFAULT_PORT);
+    }
+
+    #[test]
+    fn test_ldap_handler_flags_ssl() {
+        let h = LdapHandler::new(true);
+        let flags = h.flags();
+        assert!(flags.contains(ProtocolFlags::SSL));
+    }
+
+    #[test]
+    fn test_ldap_network_timeout() {
+        assert_eq!(LDAP_NETWORK_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_ldap_url_parse_with_extensions() {
+        let url = LdapUrl::parse("host", 389, "/dc=test", Some("cn?base?(cn=foo)?ext1,ext2"));
+        assert!(url.is_ok());
+        let url = url.unwrap();
+        assert_eq!(url.scope, LdapScope::Base);
+    }
+
+    #[test]
+    fn test_ldap_url_parse_bad_path() {
+        let url = LdapUrl::parse("host", 389, "no_slash", None);
+        assert!(url.is_err());
+    }
+
+    #[test]
+    fn test_ldap_scope_display_all() {
+        assert!(!format!("{}", LdapScope::Base).is_empty());
+        assert!(!format!("{}", LdapScope::OneLevel).is_empty());
+        assert!(!format!("{}", LdapScope::Subtree).is_empty());
+    }
+
+    // =====================================================================
+    // Round 4 tests — BER Writer
+    // =====================================================================
+
+    #[test]
+    fn test_r4_ber_writer_new() {
+        let w = BerWriter::new();
+        assert!(w.buf.is_empty());
+    }
+
+    #[test]
+    fn test_r4_ber_writer_write_length_short() {
+        let mut w = BerWriter::new();
+        w.write_length(0);
+        assert_eq!(w.buf, vec![0x00]);
+        let mut w2 = BerWriter::new();
+        w2.write_length(127);
+        assert_eq!(w2.buf, vec![127]);
+    }
+
+    #[test]
+    fn test_r4_ber_writer_write_length_one_byte() {
+        let mut w = BerWriter::new();
+        w.write_length(200);
+        assert_eq!(w.buf, vec![0x81, 200]);
+    }
+
+    #[test]
+    fn test_r4_ber_writer_write_length_two_byte() {
+        let mut w = BerWriter::new();
+        w.write_length(300);
+        assert_eq!(w.buf, vec![0x82, 0x01, 0x2C]);
+    }
+
+    #[test]
+    fn test_r4_ber_writer_write_length_three_byte() {
+        let mut w = BerWriter::new();
+        w.write_length(0x01_0000);
+        assert_eq!(w.buf, vec![0x83, 0x01, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_r4_ber_writer_write_length_four_byte() {
+        let mut w = BerWriter::new();
+        w.write_length(0x01_00_00_00);
+        assert_eq!(w.buf, vec![0x84, 0x01, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_r4_ber_writer_write_tlv() {
+        let mut w = BerWriter::new();
+        w.write_tlv(0x04, b"hello");
+        assert_eq!(w.buf[0], 0x04);
+        assert_eq!(w.buf[1], 5);
+        assert_eq!(&w.buf[2..], b"hello");
+    }
+
+    #[test]
+    fn test_r4_ber_writer_write_integer_zero() {
+        let mut w = BerWriter::new();
+        w.write_integer(0);
+        assert_eq!(w.buf, vec![BER_TAG_INTEGER, 1, 0]);
+    }
+
+    #[test]
+    fn test_r4_ber_writer_write_integer_positive() {
+        let mut w = BerWriter::new();
+        w.write_integer(1);
+        assert_eq!(w.buf, vec![BER_TAG_INTEGER, 1, 1]);
+    }
+
+    #[test]
+    fn test_r4_ber_writer_write_integer_128() {
+        // 128 needs leading zero byte since 0x80 has high bit set
+        let mut w = BerWriter::new();
+        w.write_integer(128);
+        assert_eq!(w.buf, vec![BER_TAG_INTEGER, 2, 0, 128]);
+    }
+
+    #[test]
+    fn test_r4_ber_writer_write_integer_negative() {
+        let mut w = BerWriter::new();
+        w.write_integer(-1);
+        assert_eq!(w.buf, vec![BER_TAG_INTEGER, 1, 0xFF]);
+    }
+
+    #[test]
+    fn test_r4_ber_writer_write_octet_string() {
+        let mut w = BerWriter::new();
+        w.write_octet_string(b"test");
+        assert_eq!(w.buf[0], BER_TAG_OCTET_STRING);
+        assert_eq!(w.buf[1], 4);
+        assert_eq!(&w.buf[2..], b"test");
+    }
+
+    #[test]
+    fn test_r4_ber_writer_write_boolean_true() {
+        let mut w = BerWriter::new();
+        w.write_boolean(true);
+        assert_eq!(w.buf, vec![BER_TAG_BOOLEAN, 1, 0xFF]);
+    }
+
+    #[test]
+    fn test_r4_ber_writer_write_boolean_false() {
+        let mut w = BerWriter::new();
+        w.write_boolean(false);
+        assert_eq!(w.buf, vec![BER_TAG_BOOLEAN, 1, 0x00]);
+    }
+
+    #[test]
+    fn test_r4_ber_writer_write_enumerated() {
+        let mut w = BerWriter::new();
+        w.write_enumerated(2);
+        assert_eq!(w.buf, vec![BER_TAG_ENUMERATED, 1, 2]);
+    }
+
+    #[test]
+    fn test_r4_ber_writer_constructed_short() {
+        let mut w = BerWriter::new();
+        let pos = w.begin_constructed(BER_TAG_SEQUENCE);
+        w.write_integer(1);
+        w.end_constructed(pos);
+        // SEQUENCE tag, length (3), INTEGER(02 01 01)
+        assert_eq!(w.buf[0], BER_TAG_SEQUENCE);
+        assert_eq!(w.buf[1], 3);
+    }
+
+    #[test]
+    fn test_r4_ber_writer_into_bytes() {
+        let mut w = BerWriter::new();
+        w.write_integer(42);
+        let bytes = w.into_bytes();
+        assert!(!bytes.is_empty());
+        assert_eq!(bytes[0], BER_TAG_INTEGER);
+    }
+
+    // =====================================================================
+    // Round 4 tests — BER Reader
+    // =====================================================================
+
+    #[test]
+    fn test_r4_ber_reader_read_tlv() {
+        // Write an OCTET STRING "hi" then read it back
+        let data = vec![BER_TAG_OCTET_STRING, 2, b'h', b'i'];
+        let mut reader = BerReader::new(&data);
+        assert_eq!(reader.remaining(), 4);
+        let (tag, value) = reader.read_tlv().unwrap();
+        assert_eq!(tag, BER_TAG_OCTET_STRING);
+        assert_eq!(value, b"hi");
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn test_r4_ber_reader_read_integer() {
+        let data = vec![BER_TAG_INTEGER, 1, 42];
+        let mut reader = BerReader::new(&data);
+        assert_eq!(reader.read_integer().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_r4_ber_reader_read_integer_negative() {
+        // -1 is 0xFF in BER
+        let data = vec![BER_TAG_INTEGER, 1, 0xFF];
+        let mut reader = BerReader::new(&data);
+        assert_eq!(reader.read_integer().unwrap(), -1);
+    }
+
+    #[test]
+    fn test_r4_ber_reader_read_integer_two_bytes() {
+        // 256 = 0x01 0x00
+        let data = vec![BER_TAG_INTEGER, 2, 0x01, 0x00];
+        let mut reader = BerReader::new(&data);
+        assert_eq!(reader.read_integer().unwrap(), 256);
+    }
+
+    #[test]
+    fn test_r4_ber_reader_read_octet_string() {
+        let data = vec![BER_TAG_OCTET_STRING, 3, b'a', b'b', b'c'];
+        let mut reader = BerReader::new(&data);
+        let val = reader.read_octet_string().unwrap();
+        assert_eq!(val, b"abc");
+    }
+
+    #[test]
+    fn test_r4_ber_reader_read_tlv_eof() {
+        let data = vec![];
+        let mut reader = BerReader::new(&data);
+        assert!(reader.read_tlv().is_err());
+    }
+
+    #[test]
+    fn test_r4_ber_reader_read_tlv_length_exceeds() {
+        let data = vec![0x04, 0x10, 0x00]; // length 16 but only 1 byte of data
+        let mut reader = BerReader::new(&data);
+        assert!(reader.read_tlv().is_err());
+    }
+
+    #[test]
+    fn test_r4_ber_reader_peek_tag() {
+        let data = vec![BER_TAG_INTEGER, 1, 5];
+        let reader = BerReader::new(&data);
+        assert_eq!(reader.peek_tag(), Some(BER_TAG_INTEGER));
+    }
+
+    #[test]
+    fn test_r4_ber_reader_peek_tag_empty() {
+        let data = vec![];
+        let reader = BerReader::new(&data);
+        assert_eq!(reader.peek_tag(), None);
+    }
+
+    #[test]
+    fn test_r4_ber_reader_enter_constructed() {
+        // Build a SEQUENCE containing an INTEGER(1)
+        let mut w = BerWriter::new();
+        let pos = w.begin_constructed(BER_TAG_SEQUENCE);
+        w.write_integer(1);
+        w.end_constructed(pos);
+        let bytes = w.into_bytes();
+
+        let mut reader = BerReader::new(&bytes);
+        let (tag, mut sub) = reader.enter_constructed().unwrap();
+        assert_eq!(tag, BER_TAG_SEQUENCE);
+        let val = sub.read_integer().unwrap();
+        assert_eq!(val, 1);
+    }
+
+    #[test]
+    fn test_r4_ber_reader_wrong_tag_for_integer() {
+        // Tag is OCTET STRING but we call read_integer
+        let data = vec![BER_TAG_OCTET_STRING, 1, 5];
+        let mut reader = BerReader::new(&data);
+        assert!(reader.read_integer().is_err());
+    }
+
+    #[test]
+    fn test_r4_ber_reader_wrong_tag_for_octet_string() {
+        let data = vec![BER_TAG_INTEGER, 1, 5];
+        let mut reader = BerReader::new(&data);
+        assert!(reader.read_octet_string().is_err());
+    }
+
+    #[test]
+    fn test_r4_ber_reader_long_length() {
+        // 0x81 0x80 = length 128 (one-byte extended)
+        let mut data = vec![BER_TAG_OCTET_STRING, 0x81, 128];
+        data.extend_from_slice(&[0xAA; 128]);
+        let mut reader = BerReader::new(&data);
+        let (tag, val) = reader.read_tlv().unwrap();
+        assert_eq!(tag, BER_TAG_OCTET_STRING);
+        assert_eq!(val.len(), 128);
+    }
+
+    #[test]
+    fn test_r4_ber_reader_length_unsupported_encoding() {
+        // 0x80 means indefinite length — unsupported
+        let data = vec![BER_TAG_OCTET_STRING, 0x80];
+        let mut reader = BerReader::new(&data);
+        assert!(reader.read_tlv().is_err());
+    }
+
+    #[test]
+    fn test_r4_ber_reader_length_too_many_bytes() {
+        // 0x85 means 5 bytes of length — unsupported (max 4)
+        let data = vec![BER_TAG_OCTET_STRING, 0x85, 0, 0, 0, 0, 1];
+        let mut reader = BerReader::new(&data);
+        assert!(reader.read_tlv().is_err());
+    }
+
+    // =====================================================================
+    // Round 4 tests — BER Writer/Reader roundtrip
+    // =====================================================================
+
+    #[test]
+    fn test_r4_ber_roundtrip_integer() {
+        for val in [-128, -1, 0, 1, 127, 128, 255, 256, 1000, -1000] {
+            let mut w = BerWriter::new();
+            w.write_integer(val);
+            let bytes = w.into_bytes();
+            let mut r = BerReader::new(&bytes);
+            assert_eq!(r.read_integer().unwrap(), val, "roundtrip failed for {}", val);
+        }
+    }
+
+    #[test]
+    fn test_r4_ber_roundtrip_octet_string() {
+        let test_data = b"Hello, LDAP World!";
+        let mut w = BerWriter::new();
+        w.write_octet_string(test_data);
+        let bytes = w.into_bytes();
+        let mut r = BerReader::new(&bytes);
+        let val = r.read_octet_string().unwrap();
+        assert_eq!(val, test_data);
+    }
+
+    #[test]
+    fn test_r4_ber_roundtrip_constructed() {
+        let mut w = BerWriter::new();
+        let pos = w.begin_constructed(BER_TAG_SEQUENCE);
+        w.write_integer(42);
+        w.write_octet_string(b"test");
+        w.write_boolean(true);
+        w.end_constructed(pos);
+        let bytes = w.into_bytes();
+
+        let mut r = BerReader::new(&bytes);
+        let (tag, mut sub) = r.enter_constructed().unwrap();
+        assert_eq!(tag, BER_TAG_SEQUENCE);
+        assert_eq!(sub.read_integer().unwrap(), 42);
+        assert_eq!(sub.read_octet_string().unwrap(), b"test");
+        // Boolean is TLV with tag 0x01
+        let (btag, bval) = sub.read_tlv().unwrap();
+        assert_eq!(btag, BER_TAG_BOOLEAN);
+        assert_eq!(bval, &[0xFF]);
+    }
+
+    // =====================================================================
+    // Round 4 tests — encode_ldap_filter
+    // =====================================================================
+
+    #[test]
+    fn test_r4_encode_filter_default() {
+        let bytes = encode_ldap_filter("");
+        // Present filter for objectClass
+        assert!(!bytes.is_empty());
+        assert_eq!(bytes[0], LDAP_FILTER_PRESENT);
+    }
+
+    #[test]
+    fn test_r4_encode_filter_objectclass_star() {
+        let bytes = encode_ldap_filter("(objectClass=*)");
+        assert!(!bytes.is_empty());
+        assert_eq!(bytes[0], LDAP_FILTER_PRESENT);
+    }
+
+    #[test]
+    fn test_r4_encode_filter_present() {
+        let bytes = encode_ldap_filter("(cn=*)");
+        assert!(!bytes.is_empty());
+        assert_eq!(bytes[0], LDAP_FILTER_PRESENT);
+        // Should contain "cn" in the value
+        assert!(bytes.windows(2).any(|w| w == b"cn"));
+    }
+
+    #[test]
+    fn test_r4_encode_filter_equality() {
+        let bytes = encode_ldap_filter("(cn=John)");
+        assert!(!bytes.is_empty());
+        assert_eq!(bytes[0], LDAP_FILTER_EQUALITY);
+    }
+
+    #[test]
+    fn test_r4_encode_filter_and() {
+        let bytes = encode_ldap_filter("(&(cn=John)(sn=Doe))");
+        assert!(!bytes.is_empty());
+        assert_eq!(bytes[0], LDAP_FILTER_AND);
+    }
+
+    #[test]
+    fn test_r4_encode_present_filter() {
+        let bytes = encode_present_filter("uid");
+        assert_eq!(bytes[0], LDAP_FILTER_PRESENT);
+        assert_eq!(&bytes[2..], b"uid");
+    }
+
+    #[test]
+    fn test_r4_encode_equality_filter() {
+        let bytes = encode_equality_filter("cn", "test");
+        assert_eq!(bytes[0], LDAP_FILTER_EQUALITY);
+        // Inner should have two OCTET STRING TLVs for "cn" and "test"
+        let mut r = BerReader::new(&bytes);
+        let (tag, inner) = r.read_tlv().unwrap();
+        assert_eq!(tag, LDAP_FILTER_EQUALITY);
+        let mut ir = BerReader::new(inner);
+        assert_eq!(ir.read_octet_string().unwrap(), b"cn");
+        assert_eq!(ir.read_octet_string().unwrap(), b"test");
+    }
+
+    // =====================================================================
+    // Round 4 tests — split_filter_components
+    // =====================================================================
+
+    #[test]
+    fn test_r4_split_filter_single() {
+        let comps = split_filter_components("(cn=foo)");
+        assert_eq!(comps, vec!["(cn=foo)"]);
+    }
+
+    #[test]
+    fn test_r4_split_filter_multiple() {
+        let comps = split_filter_components("(cn=foo)(sn=bar)");
+        assert_eq!(comps, vec!["(cn=foo)", "(sn=bar)"]);
+    }
+
+    #[test]
+    fn test_r4_split_filter_nested() {
+        let comps = split_filter_components("(|(cn=foo)(sn=bar))");
+        assert_eq!(comps, vec!["(|(cn=foo)(sn=bar))"]);
+    }
+
+    #[test]
+    fn test_r4_split_filter_no_parens() {
+        let comps = split_filter_components("cn=foo");
+        assert_eq!(comps, vec!["(cn=foo)"]);
+    }
+
+    #[test]
+    fn test_r4_split_filter_empty() {
+        let comps = split_filter_components("");
+        assert!(comps.is_empty());
+    }
+
+    // =====================================================================
+    // Round 4 tests — map_ldap_error
+    // =====================================================================
+
+    #[test]
+    fn test_r4_map_ldap_error_success() {
+        assert_eq!(map_ldap_error(LDAP_SUCCESS, CurlError::LdapCannotBind), CurlError::Ok);
+    }
+
+    #[test]
+    fn test_r4_map_ldap_error_sizelimit() {
+        assert_eq!(map_ldap_error(LDAP_SIZELIMIT_EXCEEDED, CurlError::LdapCannotBind), CurlError::Ok);
+    }
+
+    #[test]
+    fn test_r4_map_ldap_error_invalid_creds() {
+        assert_eq!(map_ldap_error(LDAP_INVALID_CREDENTIALS, CurlError::LdapCannotBind), CurlError::LoginDenied);
+    }
+
+    #[test]
+    fn test_r4_map_ldap_error_protocol_error() {
+        assert_eq!(map_ldap_error(LDAP_PROTOCOL_ERROR, CurlError::LdapCannotBind), CurlError::UnsupportedProtocol);
+    }
+
+    #[test]
+    fn test_r4_map_ldap_error_insufficient_access() {
+        assert_eq!(map_ldap_error(LDAP_INSUFFICIENT_ACCESS, CurlError::LdapCannotBind), CurlError::RemoteAccessDenied);
+    }
+
+    #[test]
+    fn test_r4_map_ldap_error_no_such_object() {
+        assert_eq!(map_ldap_error(LDAP_NO_SUCH_OBJECT, CurlError::LdapCannotBind), CurlError::RemoteAccessDenied);
+    }
+
+    #[test]
+    fn test_r4_map_ldap_error_unknown() {
+        assert_eq!(map_ldap_error(99, CurlError::LdapCannotBind), CurlError::LdapCannotBind);
+    }
+
+    #[test]
+    fn test_r4_map_ldap_error_default_varies() {
+        assert_eq!(map_ldap_error(99, CurlError::LdapSearchFailed), CurlError::LdapSearchFailed);
+    }
+
+    // =====================================================================
+    // Round 4 tests — format_entry
+    // =====================================================================
+
+    #[test]
+    fn test_r4_format_entry_basic() {
+        let entry = LdapEntry {
+            dn: "cn=test,dc=example,dc=com".to_string(),
+            attributes: vec![
+                ("cn".to_string(), vec![LdapAttributeValue { data: b"test".to_vec() }]),
+            ],
+        };
+        let mut output = String::new();
+        format_entry(&entry, &mut output);
+        assert!(output.starts_with("DN: cn=test,dc=example,dc=com\n"));
+        assert!(output.contains("\tcn: test\n"));
+        assert!(output.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn test_r4_format_entry_multiple_attrs() {
+        let entry = LdapEntry {
+            dn: "uid=alice".to_string(),
+            attributes: vec![
+                ("uid".to_string(), vec![LdapAttributeValue { data: b"alice".to_vec() }]),
+                ("mail".to_string(), vec![LdapAttributeValue { data: b"alice@example.com".to_vec() }]),
+            ],
+        };
+        let mut output = String::new();
+        format_entry(&entry, &mut output);
+        assert!(output.contains("\tuid: alice\n"));
+        assert!(output.contains("\tmail: alice@example.com\n"));
+    }
+
+    #[test]
+    fn test_r4_format_entry_binary_attribute() {
+        let entry = LdapEntry {
+            dn: "cn=cert".to_string(),
+            attributes: vec![
+                ("userCertificate;binary".to_string(), vec![LdapAttributeValue { data: vec![0x30, 0x82, 0x01] }]),
+            ],
+        };
+        let mut output = String::new();
+        format_entry(&entry, &mut output);
+        // Binary attrs should be base64 encoded
+        assert!(output.contains("userCertificate;binary: "));
+        // Should contain base64 of [0x30, 0x82, 0x01]
+        let b64 = base64::encode(&[0x30, 0x82, 0x01]);
+        assert!(output.contains(&b64));
+    }
+
+    #[test]
+    fn test_r4_format_entry_no_attributes() {
+        let entry = LdapEntry {
+            dn: "dc=empty".to_string(),
+            attributes: vec![],
+        };
+        let mut output = String::new();
+        format_entry(&entry, &mut output);
+        assert_eq!(output, "DN: dc=empty\n\n");
+    }
+
+    #[test]
+    fn test_r4_format_entry_multi_valued() {
+        let entry = LdapEntry {
+            dn: "cn=multi".to_string(),
+            attributes: vec![
+                ("cn".to_string(), vec![
+                    LdapAttributeValue { data: b"value1".to_vec() },
+                    LdapAttributeValue { data: b"value2".to_vec() },
+                ]),
+            ],
+        };
+        let mut output = String::new();
+        format_entry(&entry, &mut output);
+        assert!(output.contains("\tcn: value1\n"));
+        assert!(output.contains("\tcn: value2\n"));
+    }
+
+    // =====================================================================
+    // Round 4 tests — build_bind_request
+    // =====================================================================
+
+    #[test]
+    fn test_r4_build_bind_request_v3() {
+        let msg = build_bind_request(1, LDAP_VERSION3, "cn=admin", "secret");
+        assert!(!msg.is_empty());
+        // Should be a SEQUENCE
+        assert_eq!(msg[0], BER_TAG_SEQUENCE);
+        // Parse outer sequence
+        let mut r = BerReader::new(&msg);
+        let (_tag, mut sub) = r.enter_constructed().unwrap();
+        let msg_id = sub.read_integer().unwrap();
+        assert_eq!(msg_id, 1);
+        // Next TLV should be BindRequest tag
+        let (tag, _data) = sub.read_tlv().unwrap();
+        assert_eq!(tag, LDAP_TAG_BIND_REQUEST);
+    }
+
+    #[test]
+    fn test_r4_build_bind_request_v2() {
+        let msg = build_bind_request(2, LDAP_VERSION2, "", "");
+        assert!(!msg.is_empty());
+        let mut r = BerReader::new(&msg);
+        let (_tag, mut sub) = r.enter_constructed().unwrap();
+        let msg_id = sub.read_integer().unwrap();
+        assert_eq!(msg_id, 2);
+    }
+
+    #[test]
+    fn test_r4_build_bind_request_contains_dn() {
+        let msg = build_bind_request(1, 3, "cn=test,dc=example", "pass");
+        // The DN should appear somewhere in the message bytes
+        assert!(msg.windows(b"cn=test,dc=example".len()).any(|w| w == b"cn=test,dc=example"));
+    }
+
+    // =====================================================================
+    // Round 4 tests — build_search_request
+    // =====================================================================
+
+    #[test]
+    fn test_r4_build_search_request_basic() {
+        let msg = build_search_request(1, "dc=test", LdapScope::Subtree, "(cn=*)", &[]);
+        assert!(!msg.is_empty());
+        assert_eq!(msg[0], BER_TAG_SEQUENCE);
+    }
+
+    #[test]
+    fn test_r4_build_search_request_with_attrs() {
+        let attrs = vec!["cn".to_string(), "mail".to_string()];
+        let msg = build_search_request(3, "dc=example", LdapScope::Base, "(cn=foo)", &attrs);
+        assert!(!msg.is_empty());
+        // Attribute names should appear in the message
+        assert!(msg.windows(2).any(|w| w == b"cn"));
+        assert!(msg.windows(4).any(|w| w == b"mail"));
+    }
+
+    #[test]
+    fn test_r4_build_search_request_parseable() {
+        let msg = build_search_request(5, "dc=test", LdapScope::OneLevel, "(uid=*)", &[]);
+        let mut r = BerReader::new(&msg);
+        let (_tag, mut sub) = r.enter_constructed().unwrap();
+        let msg_id = sub.read_integer().unwrap();
+        assert_eq!(msg_id, 5);
+        let (tag, _data) = sub.read_tlv().unwrap();
+        assert_eq!(tag, LDAP_TAG_SEARCH_REQUEST);
+    }
+
+    // =====================================================================
+    // Round 4 tests — build_unbind_request
+    // =====================================================================
+
+    #[test]
+    fn test_r4_build_unbind_request() {
+        let msg = build_unbind_request(10);
+        assert!(!msg.is_empty());
+        assert_eq!(msg[0], BER_TAG_SEQUENCE);
+        let mut r = BerReader::new(&msg);
+        let (_tag, mut sub) = r.enter_constructed().unwrap();
+        let msg_id = sub.read_integer().unwrap();
+        assert_eq!(msg_id, 10);
+    }
+
+    #[test]
+    fn test_r4_build_unbind_request_contains_tag() {
+        let msg = build_unbind_request(1);
+        // Should contain the UNBIND tag (0x42) followed by 0x00 (zero length)
+        assert!(msg.windows(2).any(|w| w == [LDAP_TAG_UNBIND_REQUEST, 0x00]));
+    }
+
+    // =====================================================================
+    // Round 4 tests — parse_bind_response
+    // =====================================================================
+
+    #[test]
+    fn test_r4_parse_bind_response_success() {
+        // Build a valid BindResponse: SEQUENCE { INTEGER(1), BindResponse { INTEGER(0), OCTET(""), OCTET("") } }
+        let mut inner = BerWriter::new();
+        inner.write_enumerated(0); // resultCode = success
+        inner.write_octet_string(b""); // matchedDN
+        inner.write_octet_string(b""); // diagnosticMessage
+        let inner_bytes = inner.into_bytes();
+
+        let mut msg = BerWriter::new();
+        let pos = msg.begin_constructed(BER_TAG_SEQUENCE);
+        msg.write_integer(1);
+        msg.write_tlv(LDAP_TAG_BIND_RESPONSE, &inner_bytes);
+        msg.end_constructed(pos);
+        let bytes = msg.into_bytes();
+
+        let result = parse_bind_response(&bytes);
+        assert!(result.is_ok());
+        let r = result.unwrap();
+        assert_eq!(r.result_code, 0);
+    }
+
+    #[test]
+    fn test_r4_parse_bind_response_failure() {
+        let mut inner = BerWriter::new();
+        inner.write_enumerated(49); // invalidCredentials
+        inner.write_octet_string(b"");
+        inner.write_octet_string(b"bad password");
+        let inner_bytes = inner.into_bytes();
+
+        let mut msg = BerWriter::new();
+        let pos = msg.begin_constructed(BER_TAG_SEQUENCE);
+        msg.write_integer(1);
+        msg.write_tlv(LDAP_TAG_BIND_RESPONSE, &inner_bytes);
+        msg.end_constructed(pos);
+        let bytes = msg.into_bytes();
+
+        let result = parse_bind_response(&bytes);
+        assert!(result.is_ok());
+        let r = result.unwrap();
+        assert_eq!(r.result_code, 49);
+    }
+
+    #[test]
+    fn test_r4_parse_bind_response_wrong_tag() {
+        // Build response with wrong tag (SearchResultDone instead of BindResponse)
+        let mut inner = BerWriter::new();
+        inner.write_enumerated(0);
+        inner.write_octet_string(b"");
+        inner.write_octet_string(b"");
+        let inner_bytes = inner.into_bytes();
+
+        let mut msg = BerWriter::new();
+        let pos = msg.begin_constructed(BER_TAG_SEQUENCE);
+        msg.write_integer(1);
+        msg.write_tlv(LDAP_TAG_SEARCH_RESULT_DONE, &inner_bytes);
+        msg.end_constructed(pos);
+        let bytes = msg.into_bytes();
+
+        let result = parse_bind_response(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_r4_parse_bind_response_corrupt() {
+        let result = parse_bind_response(&[0x00, 0x01]);
+        assert!(result.is_err());
+    }
+
+    // =====================================================================
+    // Round 4 tests — LdapHandler
+    // =====================================================================
+
+    #[test]
+    fn test_r4_ldap_handler_new_ldap() {
+        let h = LdapHandler::new(false);
+        assert!(!h.is_ldaps);
+        assert_eq!(h.message_id, 0);
+        assert!(h.transport.is_none());
+        assert!(h.parsed_url.is_none());
+        assert_eq!(h.entry_count, 0);
+    }
+
+    #[test]
+    fn test_r4_ldap_handler_new_ldaps() {
+        let h = LdapHandler::new(true);
+        assert!(h.is_ldaps);
+    }
+
+    #[test]
+    fn test_r4_ldap_handler_protocol_name() {
+        let ldap = LdapHandler::new(false);
+        assert_eq!(ldap.name(), "LDAP");
+        let ldaps = LdapHandler::new(true);
+        assert_eq!(ldaps.name(), "LDAPS");
+    }
+
+    #[test]
+    fn test_r4_ldap_handler_default_port() {
+        let ldap = LdapHandler::new(false);
+        assert_eq!(ldap.default_port(), 389);
+        let ldaps = LdapHandler::new(true);
+        assert_eq!(ldaps.default_port(), 636);
+    }
+
+    #[test]
+    fn test_r4_ldap_handler_flags_ldap() {
+        let h = LdapHandler::new(false);
+        let flags = h.flags();
+        assert!(flags.contains(ProtocolFlags::CLOSEACTION));
+        assert!(flags.contains(ProtocolFlags::NEEDHOST));
+        assert!(!flags.contains(ProtocolFlags::SSL));
+    }
+
+    #[test]
+    fn test_r4_ldap_handler_flags_ldaps() {
+        let h = LdapHandler::new(true);
+        let flags = h.flags();
+        assert!(flags.contains(ProtocolFlags::CLOSEACTION));
+        assert!(flags.contains(ProtocolFlags::NEEDHOST));
+        assert!(flags.contains(ProtocolFlags::SSL));
+    }
+
+    #[test]
+    fn test_r4_ldap_handler_connection_check() {
+        let h = LdapHandler::new(false);
+        let conn = ConnectionData::new(1, "host".to_string(), 389, "ldap".to_string());
+        let result = Protocol::connection_check(&h, &conn);
+        // Default impl returns Ok
+        assert_eq!(result, ConnectionCheckResult::Ok);
+    }
+
+    // =====================================================================
+    // Round 4 tests — LdapUrl Display
+    // =====================================================================
+
+    #[test]
+    fn test_r4_ldap_url_display_basic() {
+        let url = LdapUrl {
+            host: "ldap.example.com".to_string(),
+            port: 389,
+            dn: "dc=example,dc=com".to_string(),
+            attributes: vec![],
+            scope: LdapScope::Base,
+            filter: "(objectClass=*)".to_string(),
+            extensions: vec![],
+        };
+        let s = format!("{}", url);
+        assert_eq!(s, "ldap://ldap.example.com:389/dc=example,dc=com");
+    }
+
+    #[test]
+    fn test_r4_ldap_url_display_with_attrs() {
+        let url = LdapUrl {
+            host: "host".to_string(),
+            port: 389,
+            dn: "dc=test".to_string(),
+            attributes: vec!["cn".to_string(), "mail".to_string()],
+            scope: LdapScope::Base,
+            filter: "(objectClass=*)".to_string(),
+            extensions: vec![],
+        };
+        let s = format!("{}", url);
+        assert!(s.contains("cn,mail"));
+    }
+
+    #[test]
+    fn test_r4_ldap_url_display_with_scope() {
+        let url = LdapUrl {
+            host: "host".to_string(),
+            port: 389,
+            dn: "dc=test".to_string(),
+            attributes: vec![],
+            scope: LdapScope::Subtree,
+            filter: "(objectClass=*)".to_string(),
+            extensions: vec![],
+        };
+        let s = format!("{}", url);
+        assert!(s.contains("?sub"));
+    }
+
+    #[test]
+    fn test_r4_ldap_url_display_with_custom_filter() {
+        let url = LdapUrl {
+            host: "host".to_string(),
+            port: 389,
+            dn: "dc=test".to_string(),
+            attributes: vec![],
+            scope: LdapScope::Subtree,
+            filter: "(cn=test)".to_string(),
+            extensions: vec![],
+        };
+        let s = format!("{}", url);
+        assert!(s.contains("(cn=test)"));
+    }
+
+    // =====================================================================
+    // Round 4 tests — LdapUrl::parse additional coverage
+    // =====================================================================
+
+    #[test]
+    fn test_r4_ldap_url_parse_empty_path() {
+        let url = LdapUrl::parse("host", 389, "", None).unwrap();
+        assert_eq!(url.dn, "");
+        assert_eq!(url.scope, LdapScope::Base);
+        assert_eq!(url.filter, "(objectClass=*)");
+    }
+
+    #[test]
+    fn test_r4_ldap_url_parse_root_path() {
+        let url = LdapUrl::parse("host", 389, "/", None).unwrap();
+        assert_eq!(url.dn, "");
+    }
+
+    #[test]
+    fn test_r4_ldap_url_parse_all_scopes() {
+        let url = LdapUrl::parse("h", 389, "/dc=t", Some("?base")).unwrap();
+        assert_eq!(url.scope, LdapScope::Base);
+
+        let url = LdapUrl::parse("h", 389, "/dc=t", Some("?one")).unwrap();
+        assert_eq!(url.scope, LdapScope::OneLevel);
+
+        let url = LdapUrl::parse("h", 389, "/dc=t", Some("?sub")).unwrap();
+        assert_eq!(url.scope, LdapScope::Subtree);
+
+        let url = LdapUrl::parse("h", 389, "/dc=t", Some("?subtree")).unwrap();
+        assert_eq!(url.scope, LdapScope::Subtree);
+
+        let url = LdapUrl::parse("h", 389, "/dc=t", Some("?onetree")).unwrap();
+        assert_eq!(url.scope, LdapScope::OneLevel);
+    }
+
+    #[test]
+    fn test_r4_ldap_url_parse_invalid_scope() {
+        let result = LdapUrl::parse("h", 389, "/dc=t", Some("?bogus_scope"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_r4_ldap_url_parse_full_query() {
+        let url = LdapUrl::parse(
+            "ldap.example.com",
+            389,
+            "/dc=example,dc=com",
+            Some("cn,mail?sub?(cn=John)?ext1,ext2"),
+        ).unwrap();
+        assert_eq!(url.host, "ldap.example.com");
+        assert_eq!(url.port, 389);
+        assert_eq!(url.dn, "dc=example,dc=com");
+        assert_eq!(url.attributes, vec!["cn", "mail"]);
+        assert_eq!(url.scope, LdapScope::Subtree);
+        assert_eq!(url.filter, "(cn=John)");
+        assert_eq!(url.extensions, vec!["ext1", "ext2"]);
+    }
+
+    #[test]
+    fn test_r4_ldap_url_parse_only_attrs() {
+        let url = LdapUrl::parse("h", 389, "/dc=t", Some("cn,sn")).unwrap();
+        assert_eq!(url.attributes, vec!["cn", "sn"]);
+        assert_eq!(url.scope, LdapScope::Base); // default
+    }
+
+    #[test]
+    fn test_r4_ldap_url_parse_empty_components() {
+        // Query "???(uid=test)" → attrs="", scope="", filter="", extensions="(uid=test)"
+        // Since filter component is empty, default "(objectClass=*)" is used
+        let url = LdapUrl::parse("h", 389, "/dc=t", Some("???(uid=test)")).unwrap();
+        assert!(url.attributes.is_empty());
+        assert_eq!(url.scope, LdapScope::Base);
+        assert_eq!(url.filter, "(objectClass=*)"); // default
+    }
+
+    #[test]
+    fn test_r4_ldap_url_clone() {
+        let url = LdapUrl::parse("h", 389, "/dc=t", None).unwrap();
+        let url2 = url.clone();
+        assert_eq!(url.host, url2.host);
+        assert_eq!(url.dn, url2.dn);
+    }
+
+    #[test]
+    fn test_r4_ldap_url_debug() {
+        let url = LdapUrl::parse("h", 389, "/dc=t", None).unwrap();
+        let dbg = format!("{:?}", url);
+        assert!(dbg.contains("LdapUrl"));
+    }
+
+    // =====================================================================
+    // Round 4 tests — LdapScope additional
+    // =====================================================================
+
+    #[test]
+    fn test_r4_ldap_scope_as_u8() {
+        assert_eq!(LdapScope::Base.as_u8(), 0);
+        assert_eq!(LdapScope::OneLevel.as_u8(), 1);
+        assert_eq!(LdapScope::Subtree.as_u8(), 2);
+    }
+
+    #[test]
+    fn test_r4_ldap_scope_from_str_ci() {
+        assert_eq!(LdapScope::from_str_ci("base"), Some(LdapScope::Base));
+        assert_eq!(LdapScope::from_str_ci("one"), Some(LdapScope::OneLevel));
+        assert_eq!(LdapScope::from_str_ci("onetree"), Some(LdapScope::OneLevel));
+        assert_eq!(LdapScope::from_str_ci("sub"), Some(LdapScope::Subtree));
+        assert_eq!(LdapScope::from_str_ci("subtree"), Some(LdapScope::Subtree));
+        assert_eq!(LdapScope::from_str_ci("BASE"), Some(LdapScope::Base));
+        assert_eq!(LdapScope::from_str_ci("SUB"), Some(LdapScope::Subtree));
+        assert_eq!(LdapScope::from_str_ci("invalid"), None);
+    }
+
+    #[test]
+    fn test_r4_ldap_scope_display() {
+        assert_eq!(format!("{}", LdapScope::Base), "base");
+        assert_eq!(format!("{}", LdapScope::OneLevel), "one");
+        assert_eq!(format!("{}", LdapScope::Subtree), "sub");
+    }
+
+    #[test]
+    fn test_r4_ldap_scope_default() {
+        assert_eq!(LdapScope::default(), LdapScope::Base);
+    }
+
+    #[test]
+    fn test_r4_ldap_scope_eq_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(LdapScope::Base);
+        set.insert(LdapScope::OneLevel);
+        set.insert(LdapScope::Subtree);
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&LdapScope::Base));
+    }
+
+    #[test]
+    fn test_r4_ldap_scope_clone_copy() {
+        let s = LdapScope::Subtree;
+        let s2 = s;
+        assert_eq!(s, s2);
+    }
+
+    // =====================================================================
+    // Round 4 tests — ldap_version
+    // =====================================================================
+
+    #[test]
+    fn test_r4_ldap_version_nonempty() {
+        let v = ldap_version();
+        assert!(!v.is_empty());
+    }
+
+    #[test]
+    fn test_r4_ldap_version_contains_curl_rs() {
+        let v = ldap_version();
+        assert!(v.contains("curl-rs"));
+    }
+
+    #[test]
+    fn test_r4_ldap_version_contains_rust() {
+        let v = ldap_version();
+        assert!(v.contains("Rust"));
+    }
+
+    // =====================================================================
+    // Round 4 tests — constants verification
+    // =====================================================================
+
+    #[test]
+    fn test_r4_ldap_constants() {
+        assert_eq!(LDAP_DEFAULT_PORT, 389);
+        assert_eq!(LDAPS_DEFAULT_PORT, 636);
+        assert_eq!(LDAP_VERSION3, 3);
+        assert_eq!(LDAP_VERSION2, 2);
+        assert_eq!(LDAP_SUCCESS, 0);
+        assert_eq!(LDAP_SIZELIMIT_EXCEEDED, 4);
+        assert_eq!(LDAP_INVALID_CREDENTIALS, 49);
+        assert_eq!(LDAP_INSUFFICIENT_ACCESS, 50);
+        assert_eq!(LDAP_PROTOCOL_ERROR, 2);
+        assert_eq!(LDAP_NO_SUCH_OBJECT, 32);
+    }
+
+    #[test]
+    fn test_r4_ber_tag_constants() {
+        assert_eq!(BER_TAG_SEQUENCE, 0x30);
+        assert_eq!(BER_TAG_INTEGER, 0x02);
+        assert_eq!(BER_TAG_OCTET_STRING, 0x04);
+        assert_eq!(BER_TAG_BOOLEAN, 0x01);
+        assert_eq!(BER_TAG_ENUMERATED, 0x0A);
+        assert_eq!(BER_TAG_SET, 0x31);
+    }
+
+    #[test]
+    fn test_r4_ldap_tag_constants() {
+        assert_eq!(LDAP_TAG_BIND_REQUEST, 0x60);
+        assert_eq!(LDAP_TAG_BIND_RESPONSE, 0x61);
+        assert_eq!(LDAP_TAG_UNBIND_REQUEST, 0x42);
+        assert_eq!(LDAP_TAG_SEARCH_REQUEST, 0x63);
+        assert_eq!(LDAP_TAG_SEARCH_RESULT_ENTRY, 0x64);
+        assert_eq!(LDAP_TAG_SEARCH_RESULT_DONE, 0x65);
+        assert_eq!(LDAP_AUTH_SIMPLE, 0x80);
+    }
+
+    #[test]
+    fn test_r4_ldap_filter_constants() {
+        assert_eq!(LDAP_FILTER_AND, 0xA0);
+        assert_eq!(LDAP_FILTER_EQUALITY, 0xA3);
+        assert_eq!(LDAP_FILTER_PRESENT, 0x87);
+    }
+
+
+    // ====== Round 7 ======
+    #[test] fn test_ldap_handler_r7() {
+        let h = LdapHandler::new(false);
+        assert_eq!(h.name(), "LDAP");
+        assert_eq!(h.default_port(), 389);
+    }
+    #[test] fn test_ldaps_handler_r7() {
+        let h = LdapHandler::new(true);
+        assert_eq!(h.name(), "LDAPS");
+        assert_eq!(h.default_port(), 636);
+    }
+    #[test] fn test_ldap_flags_r7() {
+        let h = LdapHandler::new(false);
+        let _ = h.flags();
+    }
+
 }

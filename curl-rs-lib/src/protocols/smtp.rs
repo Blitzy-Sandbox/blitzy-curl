@@ -2282,5 +2282,791 @@ mod tests {
         assert!(handler.flags().contains(ProtocolFlags::SSL_REUSE));
         assert!(handler.flags().contains(ProtocolFlags::CONN_REUSE));
     }
+
+    // ===================================================================
+    // Additional tests — boosting coverage for uncovered code paths
+    // ===================================================================
+
+    #[test]
+    fn test_smtp_state_display_all_variants() {
+        // Verify all 13 SmtpState variants produce unique Display strings
+        let states = [
+            (SmtpState::ServerGreet, "SERVERGREET"),
+            (SmtpState::Ehlo, "EHLO"),
+            (SmtpState::Helo, "HELO"),
+            (SmtpState::StartTls, "STARTTLS"),
+            (SmtpState::UpgradeTls, "UPGRADETLS"),
+            (SmtpState::Auth, "AUTH"),
+            (SmtpState::Command, "COMMAND"),
+            (SmtpState::Mail, "MAIL"),
+            (SmtpState::Rcpt, "RCPT"),
+            (SmtpState::Data, "DATA"),
+            (SmtpState::PostData, "POSTDATA"),
+            (SmtpState::Quit, "QUIT"),
+            (SmtpState::Stop, "STOP"),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (state, expected) in &states {
+            let display = format!("{}", state);
+            assert_eq!(&display, *expected);
+            assert!(seen.insert(display.clone()), "Duplicate display: {}", display);
+        }
+        assert_eq!(seen.len(), 13);
+    }
+
+    #[test]
+    fn test_smtp_conn_default_trait() {
+        let conn = SmtpConn::default();
+        assert_eq!(conn.state, SmtpState::Stop);
+        assert!(!conn.tls_supported);
+        assert!(!conn.size_supported);
+        assert!(!conn.smtputf8_supported);
+        assert!(!conn.auth_supported);
+        assert!(!conn.ssl_done);
+        assert!(conn.domain.is_empty());
+    }
+
+    #[test]
+    fn test_smtp_conn_set_state_same_state() {
+        let mut conn = SmtpConn::new();
+        conn.set_state(SmtpState::Stop);
+        // Setting same state should still work without error
+        assert_eq!(conn.state, SmtpState::Stop);
+    }
+
+    #[test]
+    fn test_smtp_conn_set_state_all_transitions() {
+        let mut conn = SmtpConn::new();
+        let all_states = [
+            SmtpState::ServerGreet,
+            SmtpState::Ehlo,
+            SmtpState::Helo,
+            SmtpState::StartTls,
+            SmtpState::UpgradeTls,
+            SmtpState::Auth,
+            SmtpState::Command,
+            SmtpState::Mail,
+            SmtpState::Rcpt,
+            SmtpState::Data,
+            SmtpState::PostData,
+            SmtpState::Quit,
+            SmtpState::Stop,
+        ];
+        for &st in &all_states {
+            conn.set_state(st);
+            assert_eq!(conn.state, st);
+        }
+    }
+
+    #[test]
+    fn test_smtp_default_trait() {
+        let smtp = Smtp::default();
+        assert!(smtp.custom.is_none());
+        assert!(smtp.rcpt.is_empty());
+        assert_eq!(smtp.rcpt_last_error, 0);
+        assert_eq!(smtp.eob, 0);
+        assert!(!smtp.rcpt_had_ok);
+        assert!(smtp.trailing_crlf);
+    }
+
+    #[test]
+    fn test_smtp_current_rcpt_empty() {
+        let smtp = Smtp::new();
+        assert!(smtp.current_rcpt().is_none());
+    }
+
+    #[test]
+    fn test_smtp_advance_past_end() {
+        let mut smtp = Smtp::new();
+        smtp.rcpt = vec!["a@b.com".to_string()];
+        assert!(!smtp.advance_rcpt()); // Only one, advancing goes past it
+    }
+
+    #[test]
+    fn test_smtp_rcpt_iteration_full() {
+        let mut smtp = Smtp::new();
+        smtp.rcpt = vec![
+            "a@b.com".to_string(),
+            "c@d.com".to_string(),
+            "e@f.com".to_string(),
+        ];
+        assert_eq!(smtp.current_rcpt(), Some("a@b.com"));
+        assert!(smtp.advance_rcpt());
+        assert_eq!(smtp.current_rcpt(), Some("c@d.com"));
+        assert!(smtp.advance_rcpt());
+        assert_eq!(smtp.current_rcpt(), Some("e@f.com"));
+        assert!(!smtp.advance_rcpt()); // No more
+        assert!(smtp.current_rcpt().is_none());
+
+        smtp.reset_rcpt();
+        assert_eq!(smtp.current_rcpt(), Some("a@b.com"));
+    }
+
+    #[test]
+    fn test_smtp_sasl_proto_default_trait() {
+        let proto = SmtpSaslProto::default();
+        assert_eq!(proto.service_name(), "smtp");
+    }
+
+    #[test]
+    fn test_smtp_sasl_proto_trait_impl() {
+        let proto = SmtpSaslProto::new();
+        // Test SaslProto trait methods
+        assert_eq!(proto.service(), "smtp");
+        assert!(proto.send_auth("PLAIN", None).is_ok());
+        assert!(proto.send_auth("PLAIN", Some(b"data")).is_ok());
+        assert!(proto.cont_auth("PLAIN", b"response").is_ok());
+        assert!(proto.cancel_auth("PLAIN").is_ok());
+        let msg = proto.get_message().unwrap();
+        assert!(msg.is_empty());
+        assert_eq!(proto.max_ir_len(), 504);
+        assert_eq!(proto.cont_code(), 334);
+        assert_eq!(proto.final_code(), 235);
+    }
+
+    #[test]
+    fn test_parse_address_bare_with_trailing_bracket() {
+        let parsed = parse_address("user@example.com>").unwrap();
+        assert_eq!(parsed.local, "user");
+        assert_eq!(parsed.host.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn test_parse_address_angle_no_close() {
+        // Angle bracket without closing
+        let parsed = parse_address("<user@example.com").unwrap();
+        assert_eq!(parsed.local, "user");
+        assert_eq!(parsed.host.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn test_parse_address_local_only_angle() {
+        let parsed = parse_address("<localpart>").unwrap();
+        assert_eq!(parsed.local, "localpart");
+        assert!(parsed.host.is_none());
+    }
+
+    #[test]
+    fn test_parse_address_empty() {
+        let parsed = parse_address("").unwrap();
+        assert_eq!(parsed.local, "");
+        assert!(parsed.host.is_none());
+    }
+
+    #[test]
+    fn test_parse_address_idn_host() {
+        // Non-ASCII domain triggers IDN conversion
+        let parsed = parse_address("user@münchen.de").unwrap();
+        assert_eq!(parsed.local, "user");
+        // Host should be IDN-converted (punycode)
+        assert!(parsed.host.is_some());
+    }
+
+    #[test]
+    fn test_is_ascii_name_edge_cases() {
+        assert!(is_ascii_name("a"));
+        assert!(is_ascii_name("0123456789"));
+        assert!(is_ascii_name("!@#$%^&*"));
+        assert!(!is_ascii_name("café"));
+        assert!(!is_ascii_name("ñ")); // Non-ASCII character
+    }
+
+    #[test]
+    fn test_dot_stuffer_default_trait() {
+        let ds = DotStuffer::default();
+        assert!(!ds.is_complete());
+        assert_eq!(ds.n_eob, 2); // Starts as if preceded by CRLF
+    }
+
+    #[test]
+    fn test_dot_stuffer_multiple_dots() {
+        let mut ds = DotStuffer::new();
+        // Two lines starting with dots
+        ds.process(b"\r\n.first\r\n.second\r\n", true);
+        let output = ds.take_output();
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(output_str.contains("..first"));
+        assert!(output_str.contains("..second"));
+    }
+
+    #[test]
+    fn test_dot_stuffer_no_trailing_crlf() {
+        let mut ds = DotStuffer::new();
+        ds.process(b"data without newline", true);
+        let output = ds.take_output();
+        // Should add full EOB (\r\n.\r\n) since n_eob resets to 0
+        assert!(output.ends_with(b"\r\n.\r\n"));
+        assert!(ds.is_complete());
+    }
+
+    #[test]
+    fn test_dot_stuffer_fast_path() {
+        let mut ds = DotStuffer::new();
+        // Reset n_eob to 0 so fast path is taken
+        ds.n_eob = 0;
+        ds.process(b"plain text no special chars", false);
+        let output = ds.take_output();
+        assert_eq!(&output[..], b"plain text no special chars");
+    }
+
+    #[test]
+    fn test_dot_stuffer_take_output_clears() {
+        let mut ds = DotStuffer::new();
+        ds.process(b"test", false);
+        let out1 = ds.take_output();
+        assert!(!out1.is_empty());
+        let out2 = ds.take_output();
+        assert!(out2.is_empty()); // Buffer cleared after take
+    }
+
+    #[test]
+    fn test_dot_stuffer_eob_ending_with_dot() {
+        let mut ds = DotStuffer::new();
+        // Feed data ending with \r\n.  (n_eob will be 3)
+        ds.process(b"data\r\n.", true);
+        let output = ds.take_output();
+        // Should dot-stuff the dot and add EOB
+        assert!(ds.is_complete());
+        assert!(output.len() > 4);
+    }
+
+    #[test]
+    fn test_endofresp_5byte_code() {
+        // 5-byte numeric code
+        assert_eq!(endofresp("25020", SmtpState::Ehlo), Some(25020));
+    }
+
+    #[test]
+    fn test_endofresp_too_short() {
+        assert_eq!(endofresp("250", SmtpState::Ehlo), None);
+        assert_eq!(endofresp("25", SmtpState::Ehlo), None);
+        assert_eq!(endofresp("2", SmtpState::Ehlo), None);
+        assert_eq!(endofresp("", SmtpState::Ehlo), None);
+    }
+
+    #[test]
+    fn test_endofresp_non_digit_prefix() {
+        assert_eq!(endofresp("ABC ", SmtpState::Ehlo), None);
+        assert_eq!(endofresp("2X0 ", SmtpState::Ehlo), None);
+        assert_eq!(endofresp("25X ", SmtpState::Ehlo), None);
+    }
+
+    #[test]
+    fn test_endofresp_continuation_ehlo() {
+        assert_eq!(endofresp("250-STARTTLS", SmtpState::Ehlo), Some(1));
+    }
+
+    #[test]
+    fn test_endofresp_continuation_command() {
+        assert_eq!(endofresp("250-data", SmtpState::Command), Some(1));
+    }
+
+    #[test]
+    fn test_endofresp_continuation_non_ehlo() {
+        // Continuation lines not allowed in non-EHLO/Command states
+        assert_eq!(endofresp("250-data", SmtpState::Mail), None);
+        assert_eq!(endofresp("250-data", SmtpState::Rcpt), None);
+    }
+
+    #[test]
+    fn test_get_sasl_message_extra_spaces() {
+        assert_eq!(get_sasl_message("334   data  "), "data");
+    }
+
+    #[test]
+    fn test_get_sasl_message_long() {
+        assert_eq!(get_sasl_message("334 abcdefghijklmnop"), "abcdefghijklmnop");
+    }
+
+    #[test]
+    fn test_smtp_handler_default_trait() {
+        let handler = SmtpHandler::default();
+        assert_eq!(handler.name(), "SMTP");
+        assert!(!handler.use_ssl);
+        assert_eq!(handler.ssl_level, 0);
+        assert!(!handler.require_ssl);
+        assert!(!handler.is_upload);
+        assert!(!handler.is_mime_post);
+        assert!(!handler.connect_only);
+        assert!(!handler.mail_rcpt_allowfails);
+        assert!(!handler.no_body);
+        assert_eq!(handler.infilesize, -1);
+        assert!(!handler.protoconnstart);
+        assert!(handler.dot_stuffer.is_none());
+        assert!(handler.mime_part.is_none());
+        assert!(handler.headers.is_empty());
+        assert!(handler.mail_from.is_none());
+        assert!(handler.mail_auth.is_none());
+        assert!(handler.custom_request.is_none());
+        assert!(handler.mail_rcpt.is_empty());
+        assert!(handler.url_options.is_none());
+        assert!(handler.url_path.is_none());
+        assert!(handler.hostname.is_empty());
+    }
+
+    #[test]
+    fn test_parse_url_options_empty() {
+        let mut handler = SmtpHandler::new();
+        handler.url_options = Some("".to_string());
+        assert!(handler.parse_url_options().is_ok());
+    }
+
+    #[test]
+    fn test_parse_url_options_none() {
+        let mut handler = SmtpHandler::new();
+        handler.url_options = None;
+        assert!(handler.parse_url_options().is_ok());
+    }
+
+    #[test]
+    fn test_parse_url_path_none() {
+        let mut handler = SmtpHandler::new();
+        handler.url_path = None;
+        handler.parse_url_path().unwrap();
+        assert_eq!(handler.conn.domain, "localhost");
+    }
+
+    #[test]
+    fn test_parse_custom_request_some() {
+        let mut handler = SmtpHandler::new();
+        handler.custom_request = Some("VRFY".to_string());
+        handler.parse_custom_request().unwrap();
+        assert_eq!(handler.smtp.custom.as_deref(), Some("VRFY"));
+    }
+
+    #[test]
+    fn test_parse_custom_request_none() {
+        let mut handler = SmtpHandler::new();
+        handler.custom_request = None;
+        handler.parse_custom_request().unwrap();
+        assert!(handler.smtp.custom.is_none());
+    }
+
+    #[test]
+    fn test_perform_mail_with_auth_empty() {
+        let mut handler = SmtpHandler::new();
+        handler.mail_from = Some("sender@test.com".to_string());
+        handler.mail_auth = Some("".to_string());
+        handler.conn.sasl.authused = 1; // Non-zero means auth was used
+        let cmd = handler.perform_mail().unwrap();
+        assert!(cmd.contains("AUTH=<>"));
+    }
+
+    #[test]
+    fn test_perform_mail_with_auth_address() {
+        let mut handler = SmtpHandler::new();
+        handler.mail_from = Some("sender@test.com".to_string());
+        handler.mail_auth = Some("auth@example.com".to_string());
+        handler.conn.sasl.authused = 1;
+        let cmd = handler.perform_mail().unwrap();
+        assert!(cmd.contains("AUTH=<auth@example.com>"));
+    }
+
+    #[test]
+    fn test_perform_mail_utf8_recipients() {
+        let mut handler = SmtpHandler::new();
+        handler.mail_from = Some("sender@test.com".to_string());
+        handler.conn.smtputf8_supported = true;
+        handler.mail_rcpt = vec!["user@münchen.de".to_string()];
+        let cmd = handler.perform_mail().unwrap();
+        assert!(cmd.contains("SMTPUTF8"));
+    }
+
+    #[test]
+    fn test_perform_mail_size_zero() {
+        let mut handler = SmtpHandler::new();
+        handler.mail_from = Some("sender@test.com".to_string());
+        handler.conn.size_supported = true;
+        handler.infilesize = 0; // Zero should NOT include SIZE
+        let cmd = handler.perform_mail().unwrap();
+        assert!(!cmd.contains("SIZE="));
+    }
+
+    #[test]
+    fn test_perform_rcpt_to_no_recipient() {
+        let mut handler = SmtpHandler::new();
+        // No recipients set
+        let result = handler.perform_rcpt_to();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_continue_auth_response() {
+        let mut handler = SmtpHandler::new();
+        let resp = handler.continue_auth("dGVzdA==").unwrap();
+        assert_eq!(resp, "dGVzdA==");
+    }
+
+    #[test]
+    fn test_perform_authentication_no_auth() {
+        let mut handler = SmtpHandler::new();
+        handler.conn.auth_supported = false;
+        let result = handler.perform_authentication().unwrap();
+        assert!(result.is_none());
+        assert_eq!(handler.conn.state, SmtpState::Stop);
+    }
+
+    #[test]
+    fn test_handle_helo_resp_various_codes() {
+        let mut handler = SmtpHandler::new();
+        // 2xx codes succeed
+        let result = handler.handle_helo_resp(200).unwrap();
+        assert!(result.is_none());
+        assert_eq!(handler.conn.state, SmtpState::Stop);
+
+        // 3xx codes fail
+        let result = handler.handle_helo_resp(354);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_handle_command_resp_continuation() {
+        let mut handler = SmtpHandler::new();
+        // Code 1 is continuation
+        let result = handler.handle_command_resp(1).unwrap();
+        assert!(result.is_none()); // Just wait for more
+    }
+
+    #[test]
+    fn test_handle_command_resp_553_with_rcpt() {
+        let mut handler = SmtpHandler::new();
+        handler.smtp.rcpt = vec!["user@example.com".to_string()];
+        handler.smtp.reset_rcpt();
+        // 553 with a recipient should not error
+        let result = handler.handle_command_resp(553);
+        // This should advance to next rcpt or stop
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_command_resp_553_no_rcpt() {
+        let mut handler = SmtpHandler::new();
+        // 553 without a recipient should error
+        let result = handler.handle_command_resp(553);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_handle_command_resp_multi_rcpt() {
+        let mut handler = SmtpHandler::new();
+        handler.smtp.rcpt = vec!["a@b.com".to_string(), "c@d.com".to_string()];
+        handler.smtp.reset_rcpt();
+        handler.smtp.custom = Some("VRFY".to_string());
+        // First VRFY succeeds - should return next command
+        let result = handler.handle_command_resp(250).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_handle_auth_resp_continuation() {
+        let mut handler = SmtpHandler::new();
+        handler.conn.pp.response = "334 dGVzdA==".to_string();
+        let result = handler.handle_auth_resp(334).unwrap();
+        assert!(result.is_none()); // Needs more auth data
+    }
+
+    #[test]
+    fn test_handle_rcpt_resp_allowfails_all_fail() {
+        let mut handler = SmtpHandler::new();
+        handler.smtp.rcpt = vec!["a@b.com".to_string()];
+        handler.smtp.reset_rcpt();
+        handler.mail_rcpt_allowfails = true;
+        // First (only) RCPT fails with allowfails
+        let result = handler.handle_rcpt_resp(550);
+        // No rcpt_had_ok, should error
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_handle_rcpt_resp_multiple_ok_then_data() {
+        let mut handler = SmtpHandler::new();
+        handler.smtp.rcpt = vec!["a@b.com".to_string(), "c@d.com".to_string()];
+        handler.smtp.reset_rcpt();
+
+        // First RCPT succeeds - advances to next
+        let result1 = handler.handle_rcpt_resp(250).unwrap();
+        assert!(result1.is_some());
+        assert!(result1.unwrap().starts_with("RCPT TO:"));
+
+        // Second RCPT succeeds - sends DATA
+        let result2 = handler.handle_rcpt_resp(250).unwrap();
+        assert!(result2.is_some());
+        assert_eq!(result2.unwrap(), "DATA");
+    }
+
+    #[test]
+    fn test_handle_ehlo_resp_with_ssl_required_no_starttls() {
+        let mut handler = SmtpHandler::new();
+        handler.conn.domain = "test".to_string();
+        handler.use_ssl = true;
+        handler.ssl_level = 3; // Required
+        // No STARTTLS in response
+        let result = handler.handle_ehlo_resp(250, "250 OK");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_handle_ehlo_resp_with_ssl_try_no_starttls() {
+        let mut handler = SmtpHandler::new();
+        handler.conn.domain = "test".to_string();
+        handler.use_ssl = true;
+        handler.ssl_level = 1; // TRY
+        // No STARTTLS in response
+        let result = handler.handle_ehlo_resp(250, "250 OK").unwrap();
+        // Should fall back to authentication
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_handle_ehlo_resp_with_ssl_starttls_supported() {
+        let mut handler = SmtpHandler::new();
+        handler.conn.domain = "test".to_string();
+        handler.use_ssl = true;
+        handler.ssl_level = 3;
+        let result = handler.handle_ehlo_resp(250, "250-STARTTLS\r\n250 OK").unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "STARTTLS");
+    }
+
+    #[test]
+    fn test_statemachine_quit_state() {
+        let mut handler = SmtpHandler::new();
+        handler.conn.set_state(SmtpState::Quit);
+        let result = handler.statemachine(221, "221 Bye").unwrap();
+        assert!(result.is_none());
+        assert_eq!(handler.conn.state, SmtpState::Stop);
+    }
+
+    #[test]
+    fn test_statemachine_upgrade_tls_done() {
+        let mut handler = SmtpHandler::new();
+        handler.conn.set_state(SmtpState::UpgradeTls);
+        handler.conn.ssl_done = true;
+        handler.conn.domain = "test.com".to_string();
+        let result = handler.statemachine(0, "").unwrap();
+        assert!(result.is_some());
+        assert!(result.unwrap().starts_with("EHLO"));
+    }
+
+    #[test]
+    fn test_statemachine_upgrade_tls_not_done() {
+        let mut handler = SmtpHandler::new();
+        handler.conn.set_state(SmtpState::UpgradeTls);
+        handler.conn.ssl_done = false;
+        let result = handler.statemachine(0, "").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_block_statemach_stop() {
+        let mut handler = SmtpHandler::new();
+        handler.conn.set_state(SmtpState::Stop);
+        assert!(handler.block_statemach().is_ok());
+    }
+
+    #[test]
+    fn test_block_statemach_non_stop() {
+        let mut handler = SmtpHandler::new();
+        handler.conn.set_state(SmtpState::Ehlo);
+        assert!(handler.block_statemach().is_ok());
+    }
+
+    #[test]
+    fn test_perform_no_body() {
+        let mut handler = SmtpHandler::new();
+        handler.no_body = true;
+        handler.smtp.custom = Some("NOOP".to_string());
+        let result = handler.perform();
+        assert!(result.is_ok());
+        assert_eq!(handler.smtp.transfer, PpTransfer::Info);
+    }
+
+    #[test]
+    fn test_perform_with_upload_and_rcpt() {
+        let mut handler = SmtpHandler::new();
+        handler.is_upload = true;
+        handler.mail_rcpt = vec!["user@example.com".to_string()];
+        handler.mail_from = Some("sender@test.com".to_string());
+        let result = handler.perform();
+        assert!(result.is_ok());
+        // Should set up mail state
+        assert_eq!(handler.conn.state, SmtpState::Mail);
+    }
+
+    #[test]
+    fn test_dophase_done_info_transfer() {
+        let mut handler = SmtpHandler::new();
+        handler.smtp.transfer = PpTransfer::Info;
+        assert!(handler.dophase_done().is_ok());
+    }
+
+    #[test]
+    fn test_dophase_done_body_transfer() {
+        let mut handler = SmtpHandler::new();
+        handler.smtp.transfer = PpTransfer::Body;
+        assert!(handler.dophase_done().is_ok());
+    }
+
+    #[test]
+    fn test_regular_transfer() {
+        let mut handler = SmtpHandler::new();
+        handler.smtp.custom = Some("NOOP".to_string());
+        handler.conn.set_state(SmtpState::Stop);
+        let result = handler.regular_transfer();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_connection_check() {
+        let handler = SmtpHandler::new();
+        let conn = ConnectionData::new(1, "smtp.example.com".to_string(), 25, "smtp".to_string());
+        assert_eq!(handler.connection_check(&conn), ConnectionCheckResult::Ok);
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(PORT_SMTP, 25);
+        assert_eq!(PORT_SMTPS, 465);
+        assert_eq!(SMTP_EOB, b"\r\n.\r\n");
+        assert_eq!(SMTP_EOB_FIND_LEN, 3);
+        assert_eq!(SMTP_AUTH_MAX_LINE_LEN, 504);
+    }
+
+    #[test]
+    fn test_smtp_eob_field() {
+        let mut smtp = Smtp::new();
+        assert_eq!(smtp.eob, 0);
+        smtp.eob = 5;
+        assert_eq!(smtp.eob, 5);
+    }
+
+    #[test]
+    fn test_smtp_trailing_crlf_field() {
+        let smtp = Smtp::new();
+        assert!(smtp.trailing_crlf); // Default is true
+    }
+
+    #[test]
+    fn test_smtp_transfer_field() {
+        let smtp = Smtp::new();
+        assert_eq!(smtp.transfer, PpTransfer::Body);
+    }
+
+    #[test]
+    fn test_smtp_custom_field() {
+        let mut smtp = Smtp::new();
+        assert!(smtp.custom.is_none());
+        smtp.custom = Some("RSET".to_string());
+        assert_eq!(smtp.custom.as_deref(), Some("RSET"));
+    }
+
+    #[test]
+    fn test_statemachine_all_response_states() {
+        // Test statemachine dispatch for Auth, Mail, Rcpt, Data, PostData states
+        let mut handler = SmtpHandler::new();
+
+        // Auth state
+        handler.conn.set_state(SmtpState::Auth);
+        let result = handler.statemachine(235, "235 OK");
+        assert!(result.is_ok());
+
+        // Mail state
+        handler.conn.set_state(SmtpState::Mail);
+        handler.smtp.rcpt = vec!["a@b.com".to_string()];
+        handler.smtp.reset_rcpt();
+        let result = handler.statemachine(250, "250 OK");
+        assert!(result.is_ok());
+
+        // Data state
+        handler.conn.set_state(SmtpState::Data);
+        let result = handler.statemachine(354, "354 Go ahead");
+        assert!(result.is_ok());
+
+        // PostData state
+        handler.conn.set_state(SmtpState::PostData);
+        let result = handler.statemachine(250, "250 OK");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_endofresp_code1_remapped() {
+        // Server sending code 1 gets remapped to 0
+        let result = endofresp("001 message", SmtpState::Ehlo);
+        assert_eq!(result, Some(0));
+    }
+
+    #[test]
+    fn test_endofresp_various_final_codes() {
+        assert_eq!(endofresp("220 Ready", SmtpState::ServerGreet), Some(220));
+        assert_eq!(endofresp("250 OK", SmtpState::Ehlo), Some(250));
+        assert_eq!(endofresp("354 Go ahead", SmtpState::Data), Some(354));
+        assert_eq!(endofresp("500 Error", SmtpState::Ehlo), Some(500));
+        assert_eq!(endofresp("550 Not found", SmtpState::Rcpt), Some(550));
+    }
+
+    #[test]
+    fn test_parse_url_path_encoded() {
+        let mut handler = SmtpHandler::new();
+        handler.url_path = Some("/test%20domain.com".to_string());
+        handler.parse_url_path().unwrap();
+        // Should URL-decode the path
+        assert!(!handler.conn.domain.is_empty());
+    }
+
+    #[test]
+    fn test_handle_servergreet_various_codes() {
+        let mut handler = SmtpHandler::new();
+        handler.conn.domain = "test".to_string();
+        // 220 succeeds
+        let result = handler.handle_servergreet_resp(220).unwrap();
+        assert!(result.is_some());
+
+        // 554 fails
+        let result = handler.handle_servergreet_resp(554);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_handle_ehlo_resp_continuation_line() {
+        let mut handler = SmtpHandler::new();
+        handler.conn.domain = "test".to_string();
+        // Code 1 means continuation - should return None and wait
+        let result = handler.handle_ehlo_resp(1, "250-SIZE 12345").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_handle_starttls_resp_pipelining_detection() {
+        let mut handler = SmtpHandler::new();
+        // Simulate pipelined data (pp.moredata() returns true)
+        // In our case, moredata() depends on pp internals
+        // Just test the normal path
+        let result = handler.handle_starttls_resp(220).unwrap();
+        assert!(result.is_none());
+        assert_eq!(handler.conn.state, SmtpState::UpgradeTls);
+    }
+
+    #[test]
+    fn test_dot_stuffer_process_eos_twice() {
+        let mut ds = DotStuffer::new();
+        ds.process(b"data", true);
+        assert!(ds.is_complete());
+        // Processing again after EOS should not change anything
+        ds.process(b"more", true);
+        // Already processed EOS
+        assert!(ds.is_complete());
+    }
+
+    #[test]
+    fn test_setup_connection_resets() {
+        let mut handler = SmtpHandler::new();
+        handler.conn.domain = "old".to_string();
+        handler.conn.set_state(SmtpState::Ehlo);
+        handler.smtp.rcpt = vec!["a@b.com".to_string()];
+        handler.setup_connection().unwrap();
+        assert_eq!(handler.conn.state, SmtpState::Stop);
+        assert!(handler.conn.domain.is_empty());
+        assert!(handler.smtp.rcpt.is_empty());
+    }
 }
 

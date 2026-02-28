@@ -1234,4 +1234,466 @@ mod tests {
         assert_eq!(hex_val(b'A'), 10);
         assert_eq!(hex_val(b'F'), 15);
     }
+
+    // --- Additional tests for coverage ---
+
+    #[test]
+    fn test_parse_sigv4_param_three_parts() {
+        let config = parse_sigv4_param("goog:goog:us-central1").unwrap();
+        assert_eq!(config.provider0(), "goog");
+        assert_eq!(config.provider1(), "goog");
+        assert_eq!(config.region(), "us-central1");
+        assert!(config.service().is_empty());
+    }
+
+    #[test]
+    fn test_parse_sigv4_param_whitespace_trimmed() {
+        let config = parse_sigv4_param("  aws : amz : eu-west-1 : s3 ").unwrap();
+        assert_eq!(config.provider0(), "aws");
+        assert_eq!(config.provider1(), "amz");
+        assert_eq!(config.region(), "eu-west-1");
+        assert_eq!(config.service(), "s3");
+    }
+
+    #[test]
+    fn test_derive_from_hostname_no_dots() {
+        let mut config = AwsSigV4Config {
+            provider0: "aws".to_string(),
+            provider1: "amz".to_string(),
+            region: String::new(),
+            service: String::new(),
+        };
+        // hostname with no region part → error because region can't be derived
+        let result = derive_from_hostname(&mut config, "singlehost");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_derive_from_hostname_already_set() {
+        let mut config = AwsSigV4Config {
+            provider0: "aws".to_string(),
+            provider1: "amz".to_string(),
+            region: "us-east-1".to_string(),
+            service: "s3".to_string(),
+        };
+        // Should not change anything — service already set
+        derive_from_hostname(&mut config, "iam.eu-west-1.amazonaws.com").unwrap();
+        assert_eq!(config.service(), "s3");
+        assert_eq!(config.region(), "us-east-1");
+    }
+
+    #[test]
+    fn test_compare_header_names() {
+        let a = ("accept".to_string(), "text/html".to_string());
+        let b = ("host".to_string(), "example.com".to_string());
+        assert_eq!(compare_header_names(&a, &b), std::cmp::Ordering::Less);
+        assert_eq!(compare_header_names(&b, &a), std::cmp::Ordering::Greater);
+        assert_eq!(compare_header_names(&a, &a), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_merge_duplicate_headers_single() {
+        let mut headers = vec![("host".to_string(), "example.com".to_string())];
+        merge_duplicate_headers(&mut headers);
+        assert_eq!(headers.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_duplicate_headers_empty() {
+        let mut headers: Vec<(String, String)> = vec![];
+        merge_duplicate_headers(&mut headers);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn test_merge_duplicate_headers_triple() {
+        let mut headers = vec![
+            ("accept".to_string(), "text/html".to_string()),
+            ("accept".to_string(), "application/json".to_string()),
+            ("accept".to_string(), "text/plain".to_string()),
+        ];
+        merge_duplicate_headers(&mut headers);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].1, "text/html,application/json,text/plain");
+    }
+
+    #[test]
+    fn test_trim_headers_empty() {
+        let mut headers: Vec<(String, String)> = vec![];
+        trim_headers(&mut headers);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn test_trim_headers_tab_collapse() {
+        let mut headers = vec![
+            ("Content-Type".to_string(), "text/html;\t charset=utf-8".to_string()),
+        ];
+        trim_headers(&mut headers);
+        assert_eq!(headers[0].0, "content-type");
+        assert_eq!(headers[0].1, "text/html; charset=utf-8");
+    }
+
+    #[test]
+    fn test_canon_query_key_no_value() {
+        let result = canon_query("key").unwrap();
+        assert_eq!(result, "key=");
+    }
+
+    #[test]
+    fn test_canon_query_empty_segments() {
+        let result = canon_query("a=1&&b=2").unwrap();
+        assert_eq!(result, "a=1&b=2");
+    }
+
+    #[test]
+    fn test_canon_query_special_chars() {
+        let result = canon_query("key=hello%20world&foo=bar").unwrap();
+        assert!(result.contains("foo=bar"));
+        assert!(result.contains("key=hello%20world"));
+    }
+
+    #[test]
+    fn test_canon_path_encoded_slash() {
+        let result = canon_path("/a/b/c", true).unwrap();
+        assert_eq!(result, "/a/b/c");
+    }
+
+    #[test]
+    fn test_canon_path_spaces_encoded() {
+        let result = canon_path("/my path", true).unwrap();
+        assert!(result.contains("%20"));
+    }
+
+    #[test]
+    fn test_uri_encode_path_basic() {
+        let result = uri_encode_path("/bucket/key");
+        assert_eq!(result, "/bucket/key");
+    }
+
+    #[test]
+    fn test_uri_encode_path_with_special() {
+        let result = uri_encode_path("/bucket/my file.txt");
+        assert!(result.contains("%20"));
+        assert!(result.contains("/bucket/"));
+    }
+
+    #[test]
+    fn test_calc_payload_hash_with_size() {
+        let hash = calc_payload_hash(Some("hello world"), 5);
+        let expected = curl_sha256::sha256_hex(b"hello");
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn test_calc_payload_hash_size_larger_than_data() {
+        let hash = calc_payload_hash(Some("hi"), 100);
+        let expected = curl_sha256::sha256_hex(b"hi");
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn test_calc_s3_payload_hash_get() {
+        let (hash, header) = calc_s3_payload_hash(None, -1, 0, HttpReq::Get, "amz");
+        // GET with no body = hash of empty string
+        assert_eq!(hash, curl_sha256::sha256_hex(b""));
+        assert!(header.contains("x-amz-content-sha256"));
+    }
+
+    #[test]
+    fn test_calc_s3_payload_hash_post() {
+        let (hash, header) = calc_s3_payload_hash(Some("body"), -1, -1, HttpReq::Post, "amz");
+        let expected = curl_sha256::sha256_hex(b"body");
+        assert_eq!(hash, expected);
+        assert!(header.contains(&expected));
+    }
+
+    #[test]
+    fn test_calc_s3_payload_hash_put_unsigned() {
+        let (hash, header) = calc_s3_payload_hash(None, -1, 100, HttpReq::Put, "amz");
+        assert_eq!(hash, S3_UNSIGNED_PAYLOAD);
+        assert!(header.contains(S3_UNSIGNED_PAYLOAD));
+    }
+
+    #[test]
+    fn test_calc_s3_payload_hash_head() {
+        let (hash, _header) = calc_s3_payload_hash(None, -1, 0, HttpReq::Head, "amz");
+        assert_eq!(hash, curl_sha256::sha256_hex(b""));
+    }
+
+    #[test]
+    fn test_is_hex_digit_valid() {
+        for b in b"0123456789abcdefABCDEF".iter() {
+            assert!(is_hex_digit(*b), "expected {} to be hex", *b as char);
+        }
+    }
+
+    #[test]
+    fn test_is_hex_digit_invalid() {
+        assert!(!is_hex_digit(b'g'));
+        assert!(!is_hex_digit(b'G'));
+        assert!(!is_hex_digit(b'z'));
+        assert!(!is_hex_digit(b' '));
+    }
+
+    #[test]
+    fn test_normalize_query_component_encoded_reserved() {
+        // %41 is 'A' which is reserved — should decode to 'A'
+        let result = normalize_query_component("%41BC");
+        assert_eq!(result, "ABC");
+    }
+
+    #[test]
+    fn test_normalize_query_component_already_encoded() {
+        // Already properly encoded non-reserved char
+        let result = normalize_query_component("%20");
+        assert_eq!(result, "%20");
+    }
+
+    #[test]
+    fn test_should_urlencode_s3_express() {
+        assert!(!should_urlencode("s3-express"));
+        assert!(!should_urlencode("S3-EXPRESS"));
+    }
+
+    #[test]
+    fn test_should_urlencode_s3_outposts() {
+        assert!(!should_urlencode("s3-outposts"));
+        assert!(!should_urlencode("S3-OUTPOSTS"));
+    }
+
+    #[test]
+    fn test_output_aws_sigv4_path_as_is_error() {
+        let headers = DynHeaders::new();
+        let result = output_aws_sigv4(
+            Some("aws:amz:us-east-1:s3"),
+            true, // path_as_is
+            "s3.us-east-1.amazonaws.com",
+            "AKID",
+            "secret",
+            "GET",
+            HttpReq::Get,
+            "/bucket/key",
+            None,
+            None,
+            -1,
+            -1,
+            &headers,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_output_aws_sigv4_authorization_already_set() {
+        let mut headers = DynHeaders::new();
+        headers.add("Authorization", "Bearer token").unwrap();
+        let result = output_aws_sigv4(
+            Some("aws:amz:us-east-1:s3"),
+            false,
+            "s3.us-east-1.amazonaws.com",
+            "AKID",
+            "secret",
+            "GET",
+            HttpReq::Get,
+            "/",
+            None,
+            None,
+            -1,
+            -1,
+            &headers,
+            None,
+        );
+        let (auth, date, sha) = result.unwrap();
+        assert!(auth.is_empty());
+        assert!(date.is_none());
+        assert!(sha.is_none());
+    }
+
+    #[test]
+    fn test_output_aws_sigv4_full_signing() {
+        let headers = DynHeaders::new();
+        let result = output_aws_sigv4(
+            Some("aws:amz:us-east-1:s3"),
+            false,
+            "s3.us-east-1.amazonaws.com",
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "GET",
+            HttpReq::Get,
+            "/test-bucket/test-key",
+            None,
+            None,
+            -1,
+            -1,
+            &headers,
+            Some("20130524T000000Z"),
+        );
+        let (auth, date, sha) = result.unwrap();
+        assert!(auth.contains("AWS4-HMAC-SHA256"));
+        assert!(auth.contains("Credential=AKIAIOSFODNN7EXAMPLE"));
+        assert!(auth.contains("us-east-1/s3/aws4_request"));
+        assert!(auth.contains("SignedHeaders="));
+        assert!(auth.contains("Signature="));
+        assert!(date.is_some()); // date header auto-generated
+        assert!(sha.is_some()); // S3 content-sha256 header
+    }
+
+    #[test]
+    fn test_output_aws_sigv4_non_s3_service() {
+        let headers = DynHeaders::new();
+        let result = output_aws_sigv4(
+            Some("aws:amz:us-east-1:iam"),
+            false,
+            "iam.us-east-1.amazonaws.com",
+            "AKID",
+            "secret",
+            "GET",
+            HttpReq::Get,
+            "/",
+            None,
+            None,
+            -1,
+            -1,
+            &headers,
+            Some("20130524T000000Z"),
+        );
+        let (auth, _date, sha) = result.unwrap();
+        assert!(auth.contains("AWS4-HMAC-SHA256"));
+        // Non-S3 service should NOT have content-sha256 header
+        assert!(sha.is_none());
+    }
+
+    #[test]
+    fn test_output_aws_sigv4_with_query() {
+        let headers = DynHeaders::new();
+        let result = output_aws_sigv4(
+            Some("aws:amz:us-east-1:s3"),
+            false,
+            "s3.us-east-1.amazonaws.com",
+            "AKID",
+            "secret",
+            "GET",
+            HttpReq::Get,
+            "/bucket",
+            Some("list-type=2&prefix=foo"),
+            None,
+            -1,
+            -1,
+            &headers,
+            Some("20130524T000000Z"),
+        );
+        assert!(result.is_ok());
+        let (auth, _, _) = result.unwrap();
+        assert!(auth.contains("Signature="));
+    }
+
+    #[test]
+    fn test_output_aws_sigv4_post_with_body() {
+        let headers = DynHeaders::new();
+        let result = output_aws_sigv4(
+            Some("aws:amz:us-east-1:s3"),
+            false,
+            "s3.us-east-1.amazonaws.com",
+            "AKID",
+            "secret",
+            "POST",
+            HttpReq::Post,
+            "/bucket",
+            None,
+            Some("{\"key\":\"value\"}"),
+            -1,
+            -1,
+            &headers,
+            Some("20200101T000000Z"),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_output_aws_sigv4_derive_from_hostname() {
+        let headers = DynHeaders::new();
+        // No region/service in sigv4 param — should derive from hostname
+        let result = output_aws_sigv4(
+            Some("aws:amz"),
+            false,
+            "s3.us-west-2.amazonaws.com",
+            "AKID",
+            "secret",
+            "GET",
+            HttpReq::Get,
+            "/",
+            None,
+            None,
+            -1,
+            -1,
+            &headers,
+            Some("20200101T000000Z"),
+        );
+        assert!(result.is_ok());
+        let (auth, _, _) = result.unwrap();
+        assert!(auth.contains("us-west-2/s3/aws4_request"));
+    }
+
+    #[test]
+    fn test_constants_values() {
+        assert_eq!(SHA256_HEX_LENGTH, 65);
+        assert_eq!(TIMESTAMP_SIZE, 17);
+        assert_eq!(MAX_QUERY_COMPONENTS, 128);
+        assert_eq!(MAX_SIGV4_LEN, 64);
+        assert_eq!(S3_UNSIGNED_PAYLOAD, "UNSIGNED-PAYLOAD");
+    }
+
+    #[test]
+    fn test_awssigv4_config_clone() {
+        let config = parse_sigv4_param("aws:amz:us-east-1:s3").unwrap();
+        let cloned = config.clone();
+        assert_eq!(config.provider0(), cloned.provider0());
+        assert_eq!(config.provider1(), cloned.provider1());
+        assert_eq!(config.region(), cloned.region());
+        assert_eq!(config.service(), cloned.service());
+    }
+
+    #[test]
+    fn test_awssigv4_config_debug() {
+        let config = parse_sigv4_param("aws:amz:us-east-1:s3").unwrap();
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("aws"));
+        assert!(debug.contains("s3"));
+    }
+
+    #[test]
+    fn test_derive_signing_key_consistent() {
+        let key1 = derive_signing_key("secret", "20200101", "us-east-1", "s3", "aws");
+        let key2 = derive_signing_key("secret", "20200101", "us-east-1", "s3", "aws");
+        assert_eq!(key1, key2);
+        assert_eq!(key1.len(), 32);
+    }
+
+    #[test]
+    fn test_derive_signing_key_different_dates() {
+        let key1 = derive_signing_key("secret", "20200101", "us-east-1", "s3", "aws");
+        let key2 = derive_signing_key("secret", "20200102", "us-east-1", "s3", "aws");
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_is_reserved_punctuation() {
+        // AWS-specific reserved punctuation
+        assert!(is_reserved_char(b'!'));
+        assert!(is_reserved_char(b'*'));
+        assert!(is_reserved_char(b'\''));
+        assert!(is_reserved_char(b'('));
+        assert!(is_reserved_char(b')'));
+    }
+
+    #[test]
+    fn test_bytes_to_hex_all_zeros() {
+        assert_eq!(bytes_to_hex(&[0, 0, 0, 0]), "00000000");
+    }
+
+    #[test]
+    fn test_bytes_to_hex_all_ff() {
+        assert_eq!(bytes_to_hex(&[0xff, 0xff]), "ffff");
+    }
 }

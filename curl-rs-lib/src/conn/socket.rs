@@ -1263,3 +1263,354 @@ impl ConnectionFilter for UdpSocketFilter {
         }
     }
 }
+
+// ===========================================================================
+// Unit Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+    // -----------------------------------------------------------------------
+    // SocketType tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_socket_type_transport_ids() {
+        assert_eq!(SocketType::Tcp.transport_id(), TRANSPORT_TCP);
+        assert_eq!(SocketType::Udp.transport_id(), TRANSPORT_UDP);
+        assert_eq!(SocketType::Unix.transport_id(), TRANSPORT_UNIX);
+    }
+
+    #[test]
+    fn test_socket_type_eq() {
+        assert_eq!(SocketType::Tcp, SocketType::Tcp);
+        assert_ne!(SocketType::Tcp, SocketType::Udp);
+        assert_ne!(SocketType::Udp, SocketType::Unix);
+    }
+
+    #[test]
+    fn test_socket_type_clone_copy() {
+        let s = SocketType::Tcp;
+        let s2 = s;
+        assert_eq!(s, s2);
+    }
+
+    #[test]
+    fn test_socket_type_debug() {
+        let dbg = format!("{:?}", SocketType::Udp);
+        assert!(dbg.contains("Udp"));
+    }
+
+    #[test]
+    fn test_socket_type_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(SocketType::Tcp);
+        set.insert(SocketType::Udp);
+        set.insert(SocketType::Tcp);
+        assert_eq!(set.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Transport constants tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_transport_constants() {
+        assert_eq!(TRANSPORT_TCP, 0);
+        assert_eq!(TRANSPORT_UDP, 1);
+        assert_eq!(TRANSPORT_UNIX, 3);
+        assert_eq!(TRANSPORT_QUIC, 5);
+    }
+
+    #[test]
+    fn test_default_connect_timeout() {
+        assert_eq!(DEFAULT_CONNECT_TIMEOUT, Duration::from_secs(300));
+    }
+
+    // -----------------------------------------------------------------------
+    // SocketConfig tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_socket_config_default() {
+        let cfg = SocketConfig::default();
+        assert!(cfg.tcp_nodelay);
+        assert!(!cfg.tcp_keepalive);
+        assert_eq!(cfg.keepalive_idle, Duration::from_secs(60));
+        assert_eq!(cfg.keepalive_interval, Duration::from_secs(60));
+        assert_eq!(cfg.keepalive_count, 9);
+        assert!(cfg.sndbuf_size.is_none());
+        assert!(cfg.rcvbuf_size.is_none());
+        assert!(cfg.bind_interface.is_none());
+        assert!(cfg.local_addr.is_none());
+        assert!(!cfg.tcp_fastopen);
+    }
+
+    #[test]
+    fn test_socket_config_custom() {
+        let cfg = SocketConfig {
+            tcp_nodelay: false,
+            tcp_keepalive: true,
+            keepalive_idle: Duration::from_secs(120),
+            keepalive_interval: Duration::from_secs(30),
+            keepalive_count: 5,
+            sndbuf_size: Some(65536),
+            rcvbuf_size: Some(32768),
+            bind_interface: Some("eth0".into()),
+            local_addr: Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080))),
+            tcp_fastopen: true,
+        };
+        assert!(!cfg.tcp_nodelay);
+        assert!(cfg.tcp_keepalive);
+        assert_eq!(cfg.keepalive_idle, Duration::from_secs(120));
+        assert_eq!(cfg.keepalive_count, 5);
+        assert_eq!(cfg.sndbuf_size, Some(65536));
+        assert_eq!(cfg.rcvbuf_size, Some(32768));
+        assert_eq!(cfg.bind_interface.as_deref(), Some("eth0"));
+        assert!(cfg.tcp_fastopen);
+    }
+
+    #[test]
+    fn test_socket_config_clone() {
+        let cfg = SocketConfig::default();
+        let cfg2 = cfg.clone();
+        assert_eq!(cfg.tcp_nodelay, cfg2.tcp_nodelay);
+        assert_eq!(cfg.keepalive_idle, cfg2.keepalive_idle);
+    }
+
+    // -----------------------------------------------------------------------
+    // Error mapping tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_io_to_connect_error_refused() {
+        let e = io::Error::new(io::ErrorKind::ConnectionRefused, "refused");
+        assert!(matches!(io_to_connect_error(e), CurlError::CouldntConnect));
+    }
+
+    #[test]
+    fn test_io_to_connect_error_reset() {
+        let e = io::Error::new(io::ErrorKind::ConnectionReset, "reset");
+        assert!(matches!(io_to_connect_error(e), CurlError::CouldntConnect));
+    }
+
+    #[test]
+    fn test_io_to_connect_error_aborted() {
+        let e = io::Error::new(io::ErrorKind::ConnectionAborted, "aborted");
+        assert!(matches!(io_to_connect_error(e), CurlError::CouldntConnect));
+    }
+
+    #[test]
+    fn test_io_to_connect_error_timeout() {
+        let e = io::Error::new(io::ErrorKind::TimedOut, "timeout");
+        assert!(matches!(io_to_connect_error(e), CurlError::OperationTimedOut));
+    }
+
+    #[test]
+    fn test_io_to_connect_error_addr_in_use() {
+        let e = io::Error::new(io::ErrorKind::AddrInUse, "in use");
+        assert!(matches!(io_to_connect_error(e), CurlError::InterfaceFailed));
+    }
+
+    #[test]
+    fn test_io_to_connect_error_addr_not_available() {
+        let e = io::Error::new(io::ErrorKind::AddrNotAvailable, "not available");
+        assert!(matches!(io_to_connect_error(e), CurlError::InterfaceFailed));
+    }
+
+    #[test]
+    fn test_io_to_connect_error_permission_denied() {
+        let e = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert!(matches!(io_to_connect_error(e), CurlError::InterfaceFailed));
+    }
+
+    #[test]
+    fn test_io_to_connect_error_other() {
+        let e = io::Error::new(io::ErrorKind::Other, "other");
+        assert!(matches!(io_to_connect_error(e), CurlError::CouldntConnect));
+    }
+
+    #[test]
+    fn test_io_to_send_error_would_block() {
+        let e = io::Error::new(io::ErrorKind::WouldBlock, "block");
+        assert!(matches!(io_to_send_error(e), CurlError::Again));
+    }
+
+    #[test]
+    fn test_io_to_send_error_broken_pipe() {
+        let e = io::Error::new(io::ErrorKind::BrokenPipe, "broken");
+        assert!(matches!(io_to_send_error(e), CurlError::SendError));
+    }
+
+    #[test]
+    fn test_io_to_send_error_reset() {
+        let e = io::Error::new(io::ErrorKind::ConnectionReset, "reset");
+        assert!(matches!(io_to_send_error(e), CurlError::SendError));
+    }
+
+    #[test]
+    fn test_io_to_send_error_aborted() {
+        let e = io::Error::new(io::ErrorKind::ConnectionAborted, "abort");
+        assert!(matches!(io_to_send_error(e), CurlError::SendError));
+    }
+
+    #[test]
+    fn test_io_to_send_error_other() {
+        let e = io::Error::new(io::ErrorKind::Other, "other");
+        assert!(matches!(io_to_send_error(e), CurlError::SendError));
+    }
+
+    #[test]
+    fn test_io_to_recv_error_would_block() {
+        let e = io::Error::new(io::ErrorKind::WouldBlock, "block");
+        assert!(matches!(io_to_recv_error(e), CurlError::Again));
+    }
+
+    #[test]
+    fn test_io_to_recv_error_reset() {
+        let e = io::Error::new(io::ErrorKind::ConnectionReset, "reset");
+        assert!(matches!(io_to_recv_error(e), CurlError::RecvError));
+    }
+
+    #[test]
+    fn test_io_to_recv_error_aborted() {
+        let e = io::Error::new(io::ErrorKind::ConnectionAborted, "abort");
+        assert!(matches!(io_to_recv_error(e), CurlError::RecvError));
+    }
+
+    #[test]
+    fn test_io_to_recv_error_other() {
+        let e = io::Error::new(io::ErrorKind::Other, "other");
+        assert!(matches!(io_to_recv_error(e), CurlError::RecvError));
+    }
+
+    #[test]
+    fn test_io_to_option_error() {
+        let e = io::Error::new(io::ErrorKind::Other, "option fail");
+        assert!(matches!(io_to_option_error(e), CurlError::CouldntConnect));
+    }
+
+    // -----------------------------------------------------------------------
+    // connection_timeout tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_connection_timeout_default() {
+        let data = TransferData {
+            timeout_ms: 0,
+            ..Default::default()
+        };
+        assert_eq!(connection_timeout(&data), DEFAULT_CONNECT_TIMEOUT);
+    }
+
+    #[test]
+    fn test_connection_timeout_custom() {
+        let data = TransferData {
+            timeout_ms: 5000,
+            ..Default::default()
+        };
+        assert_eq!(connection_timeout(&data), Duration::from_millis(5000));
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_tcp_options tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_tcp_options_default_config() {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        let config = SocketConfig::default();
+        let result = apply_tcp_options(&socket, &config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_apply_tcp_options_nodelay_off() {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        let config = SocketConfig {
+            tcp_nodelay: false,
+            ..Default::default()
+        };
+        let result = apply_tcp_options(&socket, &config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_apply_tcp_options_with_keepalive() {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        let config = SocketConfig {
+            tcp_keepalive: true,
+            keepalive_idle: Duration::from_secs(30),
+            keepalive_interval: Duration::from_secs(15),
+            keepalive_count: 3,
+            ..Default::default()
+        };
+        let result = apply_tcp_options(&socket, &config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_apply_tcp_options_with_buffer_sizes() {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        let config = SocketConfig {
+            sndbuf_size: Some(65536),
+            rcvbuf_size: Some(32768),
+            ..Default::default()
+        };
+        let result = apply_tcp_options(&socket, &config);
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_interface tests (if exposed)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_socket_addr_v4() {
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080));
+        assert_eq!(addr.port(), 8080);
+    }
+
+    #[test]
+    fn test_socket_addr_v6() {
+        let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 443, 0, 0));
+        assert_eq!(addr.port(), 443);
+    }
+
+    // -----------------------------------------------------------------------
+    // TcpSocketFilter unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tcp_socket_filter_new() {
+        let filter = TcpSocketFilter::new(SocketConfig::default());
+        assert!(!filter.is_connected());
+        assert_eq!(filter.name(), "tcp");
+    }
+
+    #[test]
+    fn test_tcp_socket_filter_with_custom_config() {
+        let config = SocketConfig {
+            tcp_nodelay: false,
+            tcp_keepalive: true,
+            ..Default::default()
+        };
+        let filter = TcpSocketFilter::new(config);
+        assert!(!filter.is_connected());
+    }
+
+    // -----------------------------------------------------------------------
+    // UdpSocketFilter unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_udp_socket_filter_new() {
+        let filter = UdpSocketFilter::new(SocketConfig::default());
+        assert!(!filter.is_connected());
+        assert_eq!(filter.name(), "udp");
+    }
+}

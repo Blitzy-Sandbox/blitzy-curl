@@ -458,7 +458,7 @@ mod tests {
         let buf = DynBuf::new();
         assert!(buf.is_empty());
         assert_eq!(buf.len(), 0);
-        assert_eq!(buf.as_bytes(), &[]);
+        assert_eq!(buf.as_bytes(), &[] as &[u8]);
         assert_eq!(buf.capacity(), 0);
     }
 
@@ -481,7 +481,7 @@ mod tests {
     fn from_vec_empty() {
         let buf = DynBuf::from_vec(Vec::new());
         assert!(buf.is_empty());
-        assert_eq!(buf.as_bytes(), &[]);
+        assert_eq!(buf.as_bytes(), &[] as &[u8]);
     }
 
     // --- Append Operations -------------------------------------------------
@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn as_bytes_on_empty() {
         let buf = DynBuf::new();
-        assert_eq!(buf.as_bytes(), &[]);
+        assert_eq!(buf.as_bytes(), &[] as &[u8]);
     }
 
     #[test]
@@ -617,7 +617,7 @@ mod tests {
         buf.reset();
         assert!(buf.is_empty());
         assert_eq!(buf.len(), 0);
-        assert_eq!(buf.as_bytes(), &[]);
+        assert_eq!(buf.as_bytes(), &[] as &[u8]);
         // Capacity should be preserved.
         assert!(buf.capacity() > 0);
         assert_eq!(buf.capacity(), cap_before);

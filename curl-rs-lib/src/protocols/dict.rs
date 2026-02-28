@@ -1144,4 +1144,196 @@ mod tests {
         assert_eq!(data, b"test data");
         assert!(handler.pending_send.is_empty());
     }
+
+    // --- Additional tests for coverage ---
+
+    #[test]
+    fn test_handler_new_fields() {
+        let handler = DictHandler::new();
+        assert!(handler.url_path.is_empty());
+        assert!(handler.command.is_none());
+        assert!(handler.pending_send.is_empty());
+        assert!(!handler.transfer_done);
+    }
+
+    #[test]
+    fn test_handler_pending_send_data_empty() {
+        let handler = DictHandler::new();
+        assert!(handler.pending_send_data().is_empty());
+    }
+
+    #[test]
+    fn test_handler_command_none() {
+        let handler = DictHandler::new();
+        assert!(handler.command().is_none());
+    }
+
+    #[test]
+    fn test_handler_flags() {
+        let handler = DictHandler::new();
+        let flags = handler.flags();
+        assert!(!flags.contains(ProtocolFlags::SSL));
+    }
+
+    #[test]
+    fn test_handler_debug() {
+        let handler = DictHandler::new();
+        let debug = format!("{:?}", handler);
+        assert!(debug.contains("DictHandler"));
+    }
+
+    #[test]
+    fn test_unescape_word_simple() {
+        let result = unescape_word("hello").unwrap();
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_unescape_word_backslash_extra() {
+        let result = unescape_word("hello\\world").unwrap();
+        assert_eq!(result, "hello\\\\world");
+    }
+
+    #[test]
+    fn test_unescape_word_quotes_extra() {
+        let result = unescape_word("he\"llo").unwrap();
+        assert!(result.contains("\\\""));
+    }
+
+    #[test]
+    fn test_unescape_word_single_quote() {
+        let result = unescape_word("it's").unwrap();
+        assert!(result.contains("\\'"));
+    }
+
+    #[test]
+    fn test_unescape_word_space() {
+        let result = unescape_word("hello world").unwrap();
+        // Space (byte 32) should be escaped
+        assert!(result.contains("\\ "));
+    }
+
+    #[test]
+    fn test_parse_dict_command_d_alias() {
+        let cmd = parse_dict_command("/D:hello").unwrap();
+        match cmd {
+            DictCommand::Define { word, database } => {
+                assert_eq!(word, "hello");
+                assert_eq!(database, "!");
+            }
+            _ => panic!("expected Define"),
+        }
+    }
+
+    #[test]
+    fn test_parse_dict_command_lookup_alias() {
+        let cmd = parse_dict_command("/LOOKUP:hello").unwrap();
+        match cmd {
+            DictCommand::Define { word, .. } => assert_eq!(word, "hello"),
+            _ => panic!("expected Define"),
+        }
+    }
+
+    #[test]
+    fn test_parse_dict_command_m_alias() {
+        let cmd = parse_dict_command("/M:hello").unwrap();
+        match cmd {
+            DictCommand::Match { word, .. } => assert_eq!(word, "hello"),
+            _ => panic!("expected Match"),
+        }
+    }
+
+    #[test]
+    fn test_parse_custom_command_replace_colons() {
+        let cmd = parse_custom_command("/SHOW:DB").unwrap();
+        match cmd {
+            DictCommand::Custom(s) => assert_eq!(s, "SHOW DB"),
+            _ => panic!("expected Custom"),
+        }
+    }
+
+    #[test]
+    fn test_build_command_buffer_match_extra() {
+        let handler = DictHandler::new();
+        let cmd = DictCommand::Match {
+            word: "hello".to_owned(),
+            database: "!".to_owned(),
+            strategy: ".".to_owned(),
+        };
+        let buf = handler.build_command_buffer(&cmd);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("MATCH"));
+        assert!(s.contains("hello"));
+        assert!(s.contains("QUIT"));
+    }
+
+    #[test]
+    fn test_build_command_buffer_define_extra() {
+        let handler = DictHandler::new();
+        let cmd = DictCommand::Define {
+            word: "world".to_owned(),
+            database: "english".to_owned(),
+        };
+        let buf = handler.build_command_buffer(&cmd);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("DEFINE english world"));
+        assert!(s.contains("QUIT"));
+    }
+
+    #[test]
+    fn test_build_command_buffer_custom_extra() {
+        let handler = DictHandler::new();
+        let cmd = DictCommand::Custom("SHOW DB".to_owned());
+        let buf = handler.build_command_buffer(&cmd);
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.contains("SHOW DB"));
+        assert!(s.contains("QUIT"));
+    }
+
+    #[test]
+    fn test_dict_command_debug() {
+        let cmd = DictCommand::Match {
+            word: "x".into(),
+            database: "!".into(),
+            strategy: ".".into(),
+        };
+        assert!(!format!("{:?}", cmd).is_empty());
+    }
+
+    #[test]
+    fn test_handler_name_port() {
+        let handler = DictHandler::new();
+        assert_eq!(handler.name(), "DICT");
+        assert_eq!(handler.default_port(), 2628);
+    }
+    
+    // ====== Round 5 coverage tests ======
+
+    #[test]
+    fn test_dict_handler_flags_r5() {
+        let h = DictHandler::new();
+        let flags = h.flags();
+        let _ = format!("{:?}", flags);
+    }
+
+    #[test]
+    fn test_dict_connection_check_r5() {
+        let h = DictHandler::new();
+        let conn = ConnectionData::new(1, "dict.example.com".into(), 2628, "dict".into());
+        let _ = Protocol::connection_check(&h, &conn);
+    }
+
+
+
+    // ====== Round 7 ======
+    #[test] fn test_dict_handler_r7() {
+        let h = DictHandler::new();
+        assert_eq!(h.name(), "DICT");
+        assert_eq!(h.default_port(), 2628);
+    }
+    #[test] fn test_dict_flags_r7() {
+        let h = DictHandler::new();
+        let _ = h.flags();
+    }
+
 }

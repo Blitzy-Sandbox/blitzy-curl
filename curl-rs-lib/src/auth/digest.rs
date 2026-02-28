@@ -895,3 +895,681 @@ pub fn http_auth_cleanup_digest(digest: &mut DigestData, proxy_digest: &mut Dige
     digest.cleanup();
     proxy_digest.cleanup();
 }
+
+// ===========================================================================
+// Unit Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // DigestData tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_digest_data_new() {
+        let d = DigestData::new();
+        assert!(d.nonce.is_none());
+        assert!(d.cnonce.is_none());
+        assert!(d.realm.is_none());
+        assert!(d.opaque.is_none());
+        assert_eq!(d.qop, 0);
+        assert_eq!(d.nc, 0);
+        assert_eq!(d.algo, ALGO_MD5);
+        assert!(!d.stale);
+        assert!(!d.userhash);
+    }
+
+    #[test]
+    fn test_digest_data_default() {
+        let d = DigestData::default();
+        assert_eq!(d.algo, ALGO_MD5);
+        assert_eq!(d.nc, 0);
+    }
+
+    #[test]
+    fn test_digest_data_cleanup() {
+        let mut d = DigestData::new();
+        d.nonce = Some("nonce123".into());
+        d.cnonce = Some("cnonce456".into());
+        d.realm = Some("testrealm@host.com".into());
+        d.opaque = Some("opaque789".into());
+        d.qop = DIGEST_QOP_VALUE_AUTH;
+        d.nc = 5;
+        d.algo = ALGO_SHA256;
+        d.stale = true;
+        d.userhash = true;
+        d.cleanup();
+        assert!(d.nonce.is_none());
+        assert!(d.cnonce.is_none());
+        assert!(d.realm.is_none());
+        assert!(d.opaque.is_none());
+        assert_eq!(d.qop, 0);
+        assert_eq!(d.nc, 0);
+        assert_eq!(d.algo, ALGO_MD5);
+        assert!(!d.stale);
+        assert!(!d.userhash);
+    }
+
+    #[test]
+    fn test_digest_data_clone() {
+        let d = DigestData {
+            nonce: Some("test".into()),
+            cnonce: Some("c".into()),
+            realm: Some("r".into()),
+            opaque: Some("o".into()),
+            qop: DIGEST_QOP_VALUE_AUTH,
+            nc: 3,
+            algo: ALGO_SHA256,
+            stale: false,
+            userhash: true,
+        };
+        let d2 = d.clone();
+        assert_eq!(d2.nonce.as_deref(), Some("test"));
+        assert_eq!(d2.algo, ALGO_SHA256);
+        assert!(d2.userhash);
+    }
+
+    // -----------------------------------------------------------------------
+    // Algorithm constants tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_algo_constants() {
+        assert_eq!(ALGO_MD5, 0);
+        assert_eq!(ALGO_MD5SESS, 1);
+        assert_eq!(ALGO_SHA256, 2);
+        assert_eq!(ALGO_SHA256SESS, 3);
+        assert_eq!(ALGO_SHA512_256, 4);
+        assert_eq!(ALGO_SHA512_256SESS, 5);
+    }
+
+    #[test]
+    fn test_session_algo_bit() {
+        assert_eq!(SESSION_ALGO, 1);
+        assert_eq!(ALGO_MD5 & SESSION_ALGO, 0);
+        assert_eq!(ALGO_MD5SESS & SESSION_ALGO, 1);
+        assert_eq!(ALGO_SHA256 & SESSION_ALGO, 0);
+        assert_eq!(ALGO_SHA256SESS & SESSION_ALGO, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // QoP constants tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qop_constants() {
+        assert_eq!(DIGEST_QOP_VALUE_AUTH, 1);
+        assert_eq!(DIGEST_QOP_VALUE_AUTH_INT, 2);
+        assert_eq!(DIGEST_QOP_VALUE_AUTH_CONF, 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // bytes_to_hex tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bytes_to_hex_empty() {
+        assert_eq!(bytes_to_hex(&[]), "");
+    }
+
+    #[test]
+    fn test_bytes_to_hex_single() {
+        assert_eq!(bytes_to_hex(&[0xff]), "ff");
+        assert_eq!(bytes_to_hex(&[0x00]), "00");
+        assert_eq!(bytes_to_hex(&[0x0a]), "0a");
+    }
+
+    #[test]
+    fn test_bytes_to_hex_multiple() {
+        assert_eq!(bytes_to_hex(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+    }
+
+    // -----------------------------------------------------------------------
+    // quoted_string_escape tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_quoted_string_escape_no_special() {
+        assert_eq!(quoted_string_escape("hello"), "hello");
+    }
+
+    #[test]
+    fn test_quoted_string_escape_quote() {
+        assert_eq!(quoted_string_escape("he\"llo"), "he\\\"llo");
+    }
+
+    #[test]
+    fn test_quoted_string_escape_backslash() {
+        assert_eq!(quoted_string_escape("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn test_quoted_string_escape_both() {
+        assert_eq!(quoted_string_escape("\"\\"), "\\\"\\\\");
+    }
+
+    #[test]
+    fn test_quoted_string_escape_empty() {
+        assert_eq!(quoted_string_escape(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // digest_get_pair tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_digest_get_pair_simple_unquoted() {
+        let result = digest_get_pair("algorithm=MD5").unwrap();
+        assert_eq!(result.0, "algorithm");
+        assert_eq!(result.1, "MD5");
+    }
+
+    #[test]
+    fn test_digest_get_pair_quoted() {
+        let result = digest_get_pair("nonce=\"abc123\"").unwrap();
+        assert_eq!(result.0, "nonce");
+        assert_eq!(result.1, "abc123");
+    }
+
+    #[test]
+    fn test_digest_get_pair_quoted_with_escape() {
+        let result = digest_get_pair("realm=\"test\\\"realm\"").unwrap();
+        assert_eq!(result.0, "realm");
+        assert_eq!(result.1, "test\"realm");
+    }
+
+    #[test]
+    fn test_digest_get_pair_with_leading_whitespace() {
+        let result = digest_get_pair("  realm=\"test\"").unwrap();
+        assert_eq!(result.0, "realm");
+        assert_eq!(result.1, "test");
+    }
+
+    #[test]
+    fn test_digest_get_pair_with_leading_comma() {
+        let result = digest_get_pair(", nonce=\"abc\"").unwrap();
+        assert_eq!(result.0, "nonce");
+        assert_eq!(result.1, "abc");
+    }
+
+    #[test]
+    fn test_digest_get_pair_empty() {
+        assert!(digest_get_pair("").is_none());
+    }
+
+    #[test]
+    fn test_digest_get_pair_no_equals() {
+        assert!(digest_get_pair("noequals").is_none());
+    }
+
+    #[test]
+    fn test_digest_get_pair_empty_name() {
+        assert!(digest_get_pair("=value").is_none());
+    }
+
+    #[test]
+    fn test_digest_get_pair_remaining() {
+        let result = digest_get_pair("a=1, b=2").unwrap();
+        assert_eq!(result.0, "a");
+        assert_eq!(result.1, "1");
+        let remaining = result.2;
+        let result2 = digest_get_pair(remaining).unwrap();
+        assert_eq!(result2.0, "b");
+        assert_eq!(result2.1, "2");
+    }
+
+    // -----------------------------------------------------------------------
+    // get_qop_values tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_qop_values_auth() {
+        assert_eq!(get_qop_values("auth"), DIGEST_QOP_VALUE_AUTH);
+    }
+
+    #[test]
+    fn test_get_qop_values_auth_int() {
+        assert_eq!(get_qop_values("auth-int"), DIGEST_QOP_VALUE_AUTH_INT);
+    }
+
+    #[test]
+    fn test_get_qop_values_auth_conf() {
+        assert_eq!(get_qop_values("auth-conf"), DIGEST_QOP_VALUE_AUTH_CONF);
+    }
+
+    #[test]
+    fn test_get_qop_values_multiple() {
+        let qop = get_qop_values("auth,auth-int");
+        assert_eq!(qop, DIGEST_QOP_VALUE_AUTH | DIGEST_QOP_VALUE_AUTH_INT);
+    }
+
+    #[test]
+    fn test_get_qop_values_case_insensitive() {
+        assert_eq!(get_qop_values("AUTH"), DIGEST_QOP_VALUE_AUTH);
+        assert_eq!(get_qop_values("Auth-Int"), DIGEST_QOP_VALUE_AUTH_INT);
+    }
+
+    #[test]
+    fn test_get_qop_values_unknown() {
+        assert_eq!(get_qop_values("unknown"), 0);
+    }
+
+    #[test]
+    fn test_get_qop_values_whitespace() {
+        let qop = get_qop_values("auth, auth-int");
+        assert_eq!(qop, DIGEST_QOP_VALUE_AUTH | DIGEST_QOP_VALUE_AUTH_INT);
+    }
+
+    // -----------------------------------------------------------------------
+    // hash_to_hex tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_hash_to_hex_md5() {
+        let result = hash_to_hex(b"test", ALGO_MD5);
+        assert_eq!(result.len(), 32); // MD5 produces 128-bit = 32 hex chars
+    }
+
+    #[test]
+    fn test_hash_to_hex_sha256() {
+        let result = hash_to_hex(b"test", ALGO_SHA256);
+        assert_eq!(result.len(), 64); // SHA-256 produces 256-bit = 64 hex chars
+    }
+
+    #[test]
+    fn test_hash_to_hex_sha512_256() {
+        let result = hash_to_hex(b"test", ALGO_SHA512_256);
+        assert_eq!(result.len(), 64); // SHA-512/256 produces 256-bit = 64 hex chars
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_ha1 tests (RFC 7616 test vectors)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_ha1_md5() {
+        // MD5(user:realm:pass) is deterministic
+        let ha1 = compute_ha1("user", "realm", "pass", "", "", ALGO_MD5);
+        assert_eq!(ha1.len(), 32);
+        // Verify it's consistent
+        let ha1_2 = compute_ha1("user", "realm", "pass", "", "", ALGO_MD5);
+        assert_eq!(ha1, ha1_2);
+    }
+
+    #[test]
+    fn test_compute_ha1_sha256() {
+        let ha1 = compute_ha1("user", "realm", "pass", "", "", ALGO_SHA256);
+        assert_eq!(ha1.len(), 64);
+    }
+
+    #[test]
+    fn test_compute_ha1_md5_sess() {
+        let ha1 = compute_ha1("user", "realm", "pass", "nonce", "cnonce", ALGO_MD5SESS);
+        assert_eq!(ha1.len(), 32);
+        // Session HA1 depends on nonce/cnonce
+        let ha1_diff = compute_ha1("user", "realm", "pass", "other_nonce", "cnonce", ALGO_MD5SESS);
+        assert_ne!(ha1, ha1_diff);
+    }
+
+    #[test]
+    fn test_compute_ha1_sha256_sess() {
+        let ha1 = compute_ha1("user", "realm", "pass", "nonce", "cnonce", ALGO_SHA256SESS);
+        assert_eq!(ha1.len(), 64);
+    }
+
+    #[test]
+    fn test_compute_ha1_sha512_256_sess() {
+        let ha1 = compute_ha1("user", "realm", "pass", "nonce", "cnonce", ALGO_SHA512_256SESS);
+        assert_eq!(ha1.len(), 64);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_ha2 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_ha2_auth() {
+        let ha2 = compute_ha2("GET", "/dir/index.html", DIGEST_QOP_VALUE_AUTH, ALGO_MD5);
+        assert_eq!(ha2.len(), 32);
+    }
+
+    #[test]
+    fn test_compute_ha2_auth_int() {
+        let ha2 = compute_ha2("POST", "/api", DIGEST_QOP_VALUE_AUTH_INT, ALGO_MD5);
+        assert_eq!(ha2.len(), 32);
+        // auth-int includes Hash(entity_body) in the computation
+        let ha2_auth = compute_ha2("POST", "/api", DIGEST_QOP_VALUE_AUTH, ALGO_MD5);
+        assert_ne!(ha2, ha2_auth);
+    }
+
+    #[test]
+    fn test_compute_ha2_no_qop() {
+        let ha2 = compute_ha2("GET", "/", 0, ALGO_MD5);
+        assert_eq!(ha2.len(), 32);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_response tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_response_with_qop() {
+        let resp = compute_response(
+            "ha1hex", "nonce", 1, "cnonce", DIGEST_QOP_VALUE_AUTH, "ha2hex", ALGO_MD5,
+        );
+        assert_eq!(resp.len(), 32);
+    }
+
+    #[test]
+    fn test_compute_response_without_qop() {
+        let resp = compute_response("ha1hex", "nonce", 0, "", 0, "ha2hex", ALGO_MD5);
+        assert_eq!(resp.len(), 32);
+    }
+
+    #[test]
+    fn test_compute_response_deterministic() {
+        let r1 = compute_response("a", "b", 1, "c", DIGEST_QOP_VALUE_AUTH, "d", ALGO_MD5);
+        let r2 = compute_response("a", "b", 1, "c", DIGEST_QOP_VALUE_AUTH, "d", ALGO_MD5);
+        assert_eq!(r1, r2);
+    }
+
+    // -----------------------------------------------------------------------
+    // algo_to_string tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_algo_to_string() {
+        assert_eq!(algo_to_string(ALGO_MD5), None);
+        assert_eq!(algo_to_string(ALGO_MD5SESS), Some("MD5-sess"));
+        assert_eq!(algo_to_string(ALGO_SHA256), Some("SHA-256"));
+        assert_eq!(algo_to_string(ALGO_SHA256SESS), Some("SHA-256-sess"));
+        assert_eq!(algo_to_string(ALGO_SHA512_256), Some("SHA-512-256"));
+        assert_eq!(algo_to_string(ALGO_SHA512_256SESS), Some("SHA-512-256-sess"));
+    }
+
+    // -----------------------------------------------------------------------
+    // decode_digest_http_message tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_http_message_basic() {
+        let mut d = DigestData::new();
+        let header = r#"realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", qop="auth""#;
+        let res = decode_digest_http_message(header, &mut d);
+        assert!(res.is_ok());
+        assert_eq!(d.realm.as_deref(), Some("testrealm@host.com"));
+        assert_eq!(d.nonce.as_deref(), Some("dcd98b7102dd2f0e8b11d0f600bfb0c093"));
+        assert_eq!(d.qop, DIGEST_QOP_VALUE_AUTH);
+        assert_eq!(d.algo, ALGO_MD5);
+    }
+
+    #[test]
+    fn test_decode_http_message_sha256() {
+        let mut d = DigestData::new();
+        let header = r#"realm="test", nonce="abc", algorithm=SHA-256"#;
+        let res = decode_digest_http_message(header, &mut d);
+        assert!(res.is_ok());
+        assert_eq!(d.algo, ALGO_SHA256);
+    }
+
+    #[test]
+    fn test_decode_http_message_sha256_sess() {
+        let mut d = DigestData::new();
+        let header = r#"realm="test", nonce="abc", algorithm=SHA-256-sess"#;
+        let res = decode_digest_http_message(header, &mut d);
+        assert!(res.is_ok());
+        assert_eq!(d.algo, ALGO_SHA256SESS);
+        // Session algo with qop=0 should auto-set qop to auth
+        assert_eq!(d.qop, DIGEST_QOP_VALUE_AUTH);
+    }
+
+    #[test]
+    fn test_decode_http_message_md5_sess() {
+        let mut d = DigestData::new();
+        let header = r#"nonce="n", algorithm=MD5-sess"#;
+        let res = decode_digest_http_message(header, &mut d);
+        assert!(res.is_ok());
+        assert_eq!(d.algo, ALGO_MD5SESS);
+        assert_eq!(d.qop, DIGEST_QOP_VALUE_AUTH); // auto-set for session
+    }
+
+    #[test]
+    fn test_decode_http_message_with_opaque() {
+        let mut d = DigestData::new();
+        let header = r#"nonce="n", opaque="5ccc069c403ebaf9f0171e9517f40e41""#;
+        let res = decode_digest_http_message(header, &mut d);
+        assert!(res.is_ok());
+        assert_eq!(d.opaque.as_deref(), Some("5ccc069c403ebaf9f0171e9517f40e41"));
+    }
+
+    #[test]
+    fn test_decode_http_message_stale() {
+        let mut d = DigestData::new();
+        let header = r#"nonce="new_nonce", stale=true"#;
+        let res = decode_digest_http_message(header, &mut d);
+        assert!(res.is_ok());
+        assert!(d.stale);
+        assert_eq!(d.nc, 0); // nc reset when stale
+    }
+
+    #[test]
+    fn test_decode_http_message_userhash() {
+        let mut d = DigestData::new();
+        let header = r#"nonce="n", userhash=true"#;
+        let res = decode_digest_http_message(header, &mut d);
+        assert!(res.is_ok());
+        assert!(d.userhash);
+    }
+
+    #[test]
+    fn test_decode_http_message_missing_nonce() {
+        let mut d = DigestData::new();
+        let header = r#"realm="test""#;
+        let res = decode_digest_http_message(header, &mut d);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_decode_http_message_unknown_algo() {
+        let mut d = DigestData::new();
+        let header = r#"nonce="n", algorithm=UNKNOWN"#;
+        let res = decode_digest_http_message(header, &mut d);
+        assert!(res.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // input_digest tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_input_digest_valid() {
+        let mut d = DigestData::new();
+        let header = r#"Digest realm="test", nonce="abc123""#;
+        let res = input_digest(header, false, &mut d);
+        assert!(res.is_ok());
+        assert_eq!(d.realm.as_deref(), Some("test"));
+        assert_eq!(d.nonce.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn test_input_digest_case_insensitive_prefix() {
+        let mut d = DigestData::new();
+        let header = r#"digest realm="test", nonce="abc""#;
+        let res = input_digest(header, false, &mut d);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_input_digest_not_digest() {
+        let mut d = DigestData::new();
+        let header = "Basic realm=\"test\"";
+        let res = input_digest(header, false, &mut d);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_input_digest_too_short() {
+        let mut d = DigestData::new();
+        let res = input_digest("Dig", false, &mut d);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_input_digest_proxy() {
+        let mut d = DigestData::new();
+        let header = r#"Digest realm="proxy", nonce="pn""#;
+        let res = input_digest(header, true, &mut d);
+        assert!(res.is_ok());
+        assert_eq!(d.realm.as_deref(), Some("proxy"));
+    }
+
+    // -----------------------------------------------------------------------
+    // create_digest_http_message tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_digest_http_message_md5() {
+        let mut d = DigestData::new();
+        d.nonce = Some("nonce123".into());
+        d.realm = Some("testrealm".into());
+        d.qop = DIGEST_QOP_VALUE_AUTH;
+        d.algo = ALGO_MD5;
+
+        let header = create_digest_http_message("user", "pass", "GET", "/index.html", &mut d);
+        assert!(header.is_ok());
+        let hdr = header.unwrap();
+        assert!(hdr.starts_with("Digest "));
+        assert!(hdr.contains("username=\"user\""));
+        assert!(hdr.contains("realm=\"testrealm\""));
+        assert!(hdr.contains("nonce=\"nonce123\""));
+        assert!(hdr.contains("uri=\"/index.html\""));
+        assert!(hdr.contains("response=\""));
+        assert!(hdr.contains("qop=auth"));
+        assert!(hdr.contains("nc=00000001"));
+        assert!(hdr.contains("cnonce=\""));
+        assert_eq!(d.nc, 1);
+    }
+
+    #[test]
+    fn test_create_digest_http_message_increments_nc() {
+        let mut d = DigestData::new();
+        d.nonce = Some("n".into());
+        d.qop = DIGEST_QOP_VALUE_AUTH;
+
+        create_digest_http_message("u", "p", "GET", "/", &mut d).unwrap();
+        assert_eq!(d.nc, 1);
+        create_digest_http_message("u", "p", "GET", "/", &mut d).unwrap();
+        assert_eq!(d.nc, 2);
+    }
+
+    #[test]
+    fn test_create_digest_http_message_sha256() {
+        let mut d = DigestData::new();
+        d.nonce = Some("n".into());
+        d.realm = Some("r".into());
+        d.algo = ALGO_SHA256;
+        d.qop = DIGEST_QOP_VALUE_AUTH;
+
+        let hdr = create_digest_http_message("u", "p", "GET", "/", &mut d).unwrap();
+        assert!(hdr.contains("algorithm=SHA-256"));
+    }
+
+    #[test]
+    fn test_create_digest_http_message_with_opaque() {
+        let mut d = DigestData::new();
+        d.nonce = Some("n".into());
+        d.opaque = Some("opaque_value".into());
+
+        let hdr = create_digest_http_message("u", "p", "GET", "/", &mut d).unwrap();
+        assert!(hdr.contains("opaque=\"opaque_value\""));
+    }
+
+    #[test]
+    fn test_create_digest_http_message_no_qop() {
+        let mut d = DigestData::new();
+        d.nonce = Some("n".into());
+        d.qop = 0;
+
+        let hdr = create_digest_http_message("u", "p", "GET", "/", &mut d).unwrap();
+        assert!(!hdr.contains("qop="));
+        assert!(!hdr.contains("nc="));
+        assert!(!hdr.contains("cnonce="));
+    }
+
+    #[test]
+    fn test_create_digest_http_message_userhash() {
+        let mut d = DigestData::new();
+        d.nonce = Some("n".into());
+        d.realm = Some("r".into());
+        d.userhash = true;
+
+        let hdr = create_digest_http_message("u", "p", "GET", "/", &mut d).unwrap();
+        assert!(hdr.contains("userhash=true"));
+        // Username should be a hash, not "u"
+        assert!(!hdr.contains("username=\"u\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // output_digest tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_output_digest() {
+        let mut d = DigestData::new();
+        d.nonce = Some("n".into());
+        d.realm = Some("r".into());
+        d.qop = DIGEST_QOP_VALUE_AUTH;
+
+        let result = output_digest("user", "pass", "GET", "/", false, &mut d);
+        assert!(result.is_ok());
+        assert!(result.unwrap().starts_with("Digest "));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_digest_supported test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_digest_supported() {
+        assert!(is_digest_supported());
+    }
+
+    // -----------------------------------------------------------------------
+    // http_auth_cleanup_digest test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_http_auth_cleanup_digest() {
+        let mut d1 = DigestData::new();
+        d1.nonce = Some("n1".into());
+        let mut d2 = DigestData::new();
+        d2.nonce = Some("n2".into());
+        http_auth_cleanup_digest(&mut d1, &mut d2);
+        assert!(d1.nonce.is_none());
+        assert!(d2.nonce.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Full roundtrip test (decode + create)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_digest_roundtrip() {
+        let mut d = DigestData::new();
+        let challenge = r#"realm="testrealm@host.com", nonce="dcd98b", qop="auth", algorithm=MD5"#;
+        decode_digest_http_message(challenge, &mut d).unwrap();
+
+        let header = create_digest_http_message(
+            "Mufasa", "Circle Of Life", "GET", "/dir/index.html", &mut d,
+        ).unwrap();
+
+        assert!(header.contains("Digest "));
+        assert!(header.contains("username=\"Mufasa\""));
+        assert!(header.contains("realm=\"testrealm@host.com\""));
+        assert!(header.contains("response=\""));
+        assert!(header.contains("qop=auth"));
+    }
+}

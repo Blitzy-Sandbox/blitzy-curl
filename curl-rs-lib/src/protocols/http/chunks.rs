@@ -1266,4 +1266,182 @@ mod tests {
         let result = add_chunked_reader(&mut chain);
         assert!(result.is_ok());
     }
+
+    // --- Additional tests for coverage ---
+
+    #[test]
+    fn chunker_reset_clears_state() {
+        let mut c = Chunker::new(false);
+        let _ = c.read(b"5\r\nhello\r\n", None);
+        c.reset(true);
+        assert_eq!(c.state(), ChunkyState::Hex);
+        assert!(!c.is_done());
+        assert_eq!(c.last_code(), ChunkError::Ok);
+    }
+
+    #[test]
+    fn chunker_ignore_body_mode() {
+        let mut c = Chunker::new(true);
+        let input = b"5\r\nhello\r\n0\r\n\r\n";
+        let result = c.read(input, None);
+        assert!(result.is_ok());
+        assert!(c.is_done());
+    }
+
+    #[test]
+    fn chunker_fail_sets_state() {
+        let mut c = Chunker::new(false);
+        c.fail(ChunkError::BadChunk);
+        assert_eq!(c.state(), ChunkyState::Failed);
+        assert_eq!(c.last_code(), ChunkError::BadChunk);
+    }
+
+    #[test]
+    fn chunker_is_hex_digit() {
+        assert!(Chunker::is_hex_digit(b'0'));
+        assert!(Chunker::is_hex_digit(b'9'));
+        assert!(Chunker::is_hex_digit(b'a'));
+        assert!(Chunker::is_hex_digit(b'f'));
+        assert!(Chunker::is_hex_digit(b'A'));
+        assert!(Chunker::is_hex_digit(b'F'));
+        assert!(!Chunker::is_hex_digit(b'g'));
+        assert!(!Chunker::is_hex_digit(b' '));
+    }
+
+    #[test]
+    fn chunker_multiple_chunks() {
+        let mut c = Chunker::new(false);
+        let input = b"3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n";
+        let (consumed, _) = c.read(input, None).unwrap();
+        assert_eq!(consumed, input.len());
+        assert!(c.is_done());
+    }
+
+    #[test]
+    fn chunker_hex_uppercase() {
+        let mut c = Chunker::new(false);
+        let input = b"A\r\n0123456789\r\n0\r\n\r\n";
+        let (consumed, _) = c.read(input, None).unwrap();
+        assert_eq!(consumed, input.len());
+        assert!(c.is_done());
+    }
+
+    #[test]
+    fn chunker_with_extension() {
+        let mut c = Chunker::new(false);
+        let input = b"5;ext=val\r\nhello\r\n0\r\n\r\n";
+        let (consumed, _) = c.read(input, None).unwrap();
+        assert_eq!(consumed, input.len());
+        assert!(c.is_done());
+    }
+
+    #[test]
+    fn chunker_with_trailer_headers() {
+        let mut c = Chunker::new(false);
+        let input = b"5\r\nhello\r\n0\r\nTrailer: value\r\n\r\n";
+        let (consumed, _) = c.read(input, None).unwrap();
+        assert_eq!(consumed, input.len());
+        assert!(c.is_done());
+    }
+
+    #[test]
+    fn chunk_error_all_variants_distinct() {
+        let errors = [
+            ChunkError::Ok,
+            ChunkError::TooLongHex,
+            ChunkError::IllegalHex,
+            ChunkError::BadChunk,
+            ChunkError::BadEncoding,
+            ChunkError::OutOfMemory,
+            ChunkError::PassthruError,
+        ];
+        let mut strs = std::collections::HashSet::new();
+        for e in &errors {
+            let s = Chunker::strerror(*e);
+            strs.insert(s);
+        }
+        assert_eq!(strs.len(), errors.len());
+    }
+
+    #[test]
+    fn chunked_writer_new_state() {
+        let w = ChunkedWriter::new();
+        assert_eq!(w.phase(), WriterPhase::TransferDecode);
+    }
+
+    #[test]
+    fn chunked_writer_init_flag() {
+        let mut w = ChunkedWriter::new();
+        w.init(true);
+        // After init the writer's phase is still TransferDecode
+        assert_eq!(w.phase(), WriterPhase::TransferDecode);
+    }
+
+    #[test]
+    fn chunked_writer_default() {
+        let w: ChunkedWriter = Default::default();
+        assert_eq!(w.phase(), WriterPhase::TransferDecode);
+    }
+
+    #[test]
+    fn chunked_writer_debug() {
+        let w = ChunkedWriter::new();
+        let debug = format!("{:?}", w);
+        assert!(debug.contains("ChunkedWriter"));
+    }
+
+    #[test]
+    fn chunked_reader_new_state() {
+        let r = ChunkedReader::new();
+        assert_eq!(r.phase(), ReaderPhase::TransferEncode);
+    }
+
+    #[test]
+    fn chunked_reader_default() {
+        let r: ChunkedReader = Default::default();
+        assert_eq!(r.phase(), ReaderPhase::TransferEncode);
+    }
+
+    #[test]
+    fn chunked_reader_debug() {
+        let r = ChunkedReader::new();
+        let debug = format!("{:?}", r);
+        assert!(debug.contains("ChunkedReader"));
+    }
+
+    #[test]
+    fn chunked_reader_init_resets() {
+        let mut r = ChunkedReader::new();
+        r.read_eos = true;
+        r.init();
+        assert!(!r.read_eos);
+    }
+
+    #[test]
+    fn constants_values_extra() {
+        assert!(CHUNK_MAXNUM_LEN > 0);
+        assert!(CURL_CHUNKED_MAXLEN > CURL_CHUNKED_MINLEN);
+        assert_eq!(CURL_CHUNKED_MAXLEN, 65536);
+        assert_eq!(CURL_CHUNKED_MINLEN, 1024);
+    }
+
+    #[test]
+    fn chunky_state_all_values_exist() {
+        let states = [
+            ChunkyState::Hex,
+            ChunkyState::Lf,
+            ChunkyState::Data,
+            ChunkyState::PostLf,
+            ChunkyState::Stop,
+            ChunkyState::Trailer,
+            ChunkyState::TrailerCr,
+            ChunkyState::TrailerPostCr,
+            ChunkyState::Done,
+            ChunkyState::Failed,
+        ];
+        assert_eq!(states.len(), 10);
+        for s in &states {
+            assert!(!format!("{:?}", s).is_empty());
+        }
+    }
 }

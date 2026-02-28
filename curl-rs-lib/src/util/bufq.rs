@@ -1147,7 +1147,7 @@ mod tests {
         let r = BufRef::new();
         assert!(r.is_empty());
         assert_eq!(r.len(), 0);
-        assert_eq!(r.as_slice(), &[]);
+        assert_eq!(r.as_slice(), &[] as &[u8]);
     }
 
     #[test]

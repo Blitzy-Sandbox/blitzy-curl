@@ -2415,22 +2415,823 @@ mod tests {
 
     #[test]
     fn test_fragmented_message_flow() {
-        // Test the continuation state tracking
         let cont = WsFlags::empty();
-
-        // First binary fragment
         let flags1 = firstbyte_to_flags(0x02, cont).unwrap();
         assert!(flags1.contains(WsFlags::BINARY));
         assert!(flags1.contains(WsFlags::CONT));
-
-        // Middle continuation fragment
         let flags2 = firstbyte_to_flags(0x00, flags1).unwrap();
         assert!(flags2.contains(WsFlags::BINARY));
         assert!(flags2.contains(WsFlags::CONT));
-
-        // Final continuation fragment
         let flags3 = firstbyte_to_flags(0x80, flags2).unwrap();
         assert!(flags3.contains(WsFlags::BINARY));
         assert!(!flags3.contains(WsFlags::CONT));
+    }
+
+    // -- WsFrame additional tests -----------------------------------------------
+
+    #[test]
+    fn test_ws_frame_flags_direct() {
+        let mut frame = WsFrame::new();
+        frame.flags = WsFlags::TEXT;
+        assert_eq!(frame.opcode(), Some(WsOpcode::Text));
+        assert!(frame.is_final()); // no CONT flag = final
+    }
+
+    #[test]
+    fn test_ws_frame_is_masked() {
+        let frame = WsFrame::new();
+        assert!(!frame.is_masked());
+    }
+
+    #[test]
+    fn test_ws_frame_update() {
+        let mut frame = WsFrame::new();
+        frame.update(0, WsFlags::BINARY, 0, 100, 50);
+        assert_eq!(frame.flags, WsFlags::BINARY);
+        assert_eq!(frame.len, 50);
+        assert_eq!(frame.bytesleft, 50);
+    }
+
+    #[test]
+    fn test_ws_frame_opcode_close() {
+        let mut frame = WsFrame::new();
+        frame.flags = WsFlags::CLOSE;
+        assert_eq!(frame.opcode(), Some(WsOpcode::Close));
+    }
+
+    #[test]
+    fn test_ws_frame_opcode_ping() {
+        let mut frame = WsFrame::new();
+        frame.flags = WsFlags::PING;
+        assert_eq!(frame.opcode(), Some(WsOpcode::Ping));
+    }
+
+    #[test]
+    fn test_ws_frame_opcode_pong() {
+        let mut frame = WsFrame::new();
+        frame.flags = WsFlags::PONG;
+        assert_eq!(frame.opcode(), Some(WsOpcode::Pong));
+    }
+
+    #[test]
+    fn test_ws_frame_opcode_continuation() {
+        let mut frame = WsFrame::new();
+        frame.flags = WsFlags::CONT;
+        assert_eq!(frame.opcode(), Some(WsOpcode::Continuation));
+    }
+
+    // -- WebSocket additional tests -------------------------------------------
+
+    #[test]
+    fn test_websocket_extra_accessors() {
+        let mut ws = WebSocket::new();
+        let _ = ws.decoder();
+        let _ = ws.encoder();
+        let _ = ws.recv_buf();
+        let _ = ws.send_buf();
+        assert_eq!(ws.pending_count(), 0);
+        assert!(!ws.is_raw_mode());
+    }
+
+    #[test]
+    fn test_websocket_set_recv_frame_binary() {
+        let mut ws = WebSocket::new();
+        let mut frame = WsFrame::new();
+        frame.flags = WsFlags::BINARY;
+        ws.set_recv_frame(frame);
+        assert_eq!(ws.recv_frame().opcode(), Some(WsOpcode::Binary));
+    }
+
+    // -- flags_to_firstbyte additional tests -----------------------------------
+
+    #[test]
+    fn test_flags_to_firstbyte_binary_extra() {
+        let byte = flags_to_firstbyte(WsFlags::BINARY, false).unwrap();
+        assert_eq!(byte & WSBIT_OPCODE_MASK, WsOpcode::Binary.as_u8());
+    }
+
+    #[test]
+    fn test_flags_to_firstbyte_cont_middle() {
+        let byte = flags_to_firstbyte(WsFlags::TEXT | WsFlags::CONT, true).unwrap();
+        assert_eq!(byte & WSBIT_OPCODE_MASK, WsOpcode::Continuation.as_u8());
+        assert_eq!(byte & WSBIT_FIN, 0);
+    }
+
+    // -- ws_meta / ws_setup_conn tests ----------------------------------------
+
+    #[test]
+    fn test_ws_meta_returns_frame() {
+        let ws = WebSocket::new();
+        let meta = ws_meta(&ws);
+        assert!(meta.is_some());
+    }
+
+    #[test]
+    fn test_ws_setup_conn_works() {
+        let mut conn = ConnectionData::new(1, "ws.example.com".into(), 80, "ws".into());
+        assert!(ws_setup_conn(&mut conn, 11).is_ok());
+    }
+
+    // -- WsDecState tests -----------------------------------------------------
+
+    #[test]
+    fn test_ws_dec_state_default() {
+        let state = WsDecState::default();
+        assert_eq!(state, WsDecState::Init);
+    }
+
+    #[test]
+    fn test_ws_dec_state_all_distinct() {
+        assert_ne!(WsDecState::Init, WsDecState::Head);
+        assert_ne!(WsDecState::Head, WsDecState::Payload);
+        assert_ne!(WsDecState::Init, WsDecState::Payload);
+    }
+
+    // -- Constants tests ------------------------------------------------------
+
+    #[test]
+    fn test_ws_bit_constants() {
+        assert_eq!(WSBIT_FIN, 0x80);
+        assert_eq!(WSBIT_RSV1, 0x40);
+        assert_eq!(WSBIT_RSV2, 0x20);
+        assert_eq!(WSBIT_RSV3, 0x10);
+        assert_eq!(WSBIT_MASK, 0x80);
+        assert_eq!(WSBIT_OPCODE_MASK, 0x0F);
+        assert_eq!(WS_MAX_CNTRL_LEN, 125);
+        assert_eq!(WS_CHUNK_SIZE, 65535);
+        assert_eq!(WS_CHUNK_COUNT, 2);
+    }
+
+    // === Round 3 tests — coverage boost ===
+
+    // -- WsDecoder advanced ---
+    #[test]
+    fn test_ws_decoder_reset() {
+        let mut dec = WsDecoder::new();
+        dec.frame_age = 5;
+        dec.payload_len = 100;
+        dec.state = WsDecState::Payload;
+        dec.reset();
+        assert_eq!(dec.frame_age, 0);
+        assert_eq!(dec.payload_len, 0);
+        assert_eq!(dec.state(), WsDecState::Init);
+    }
+
+    #[test]
+    fn test_ws_decoder_frame_metadata() {
+        let mut dec = WsDecoder::new();
+        dec.frame_flags = WsFlags::TEXT;
+        dec.payload_len = 50;
+        dec.payload_offset = 10;
+        let frame = dec.frame();
+        assert_eq!(frame.flags, WsFlags::TEXT);
+        assert_eq!(frame.offset, 10);
+        assert_eq!(frame.bytesleft, 40);
+    }
+
+    #[test]
+    fn test_ws_decoder_accessors() {
+        let mut dec = WsDecoder::new();
+        dec.payload_offset = 42;
+        dec.payload_len = 100;
+        dec.frame_flags = WsFlags::BINARY;
+        dec.frame_age = 3;
+        assert_eq!(dec.payload_offset(), 42);
+        assert_eq!(dec.payload_len(), 100);
+        assert_eq!(dec.frame_flags(), WsFlags::BINARY);
+        assert_eq!(dec.frame_age(), 3);
+    }
+
+    #[test]
+    fn test_ws_decoder_next_frame() {
+        let mut dec = WsDecoder::new();
+        dec.frame_age = 5;
+        dec.payload_len = 100;
+        dec.cont_flags = WsFlags::TEXT | WsFlags::CONT;
+        dec.next_frame();
+        assert_eq!(dec.frame_age, 0);
+        assert_eq!(dec.payload_len, 0);
+        assert_eq!(dec.state, WsDecState::Init);
+        // cont_flags preserved
+        assert!(dec.cont_flags.contains(WsFlags::TEXT));
+    }
+
+    #[test]
+    fn test_ws_decoder_decode_empty_returns_again() {
+        let mut dec = WsDecoder::new();
+        let mut inraw = BufQ::new(1024, 4);
+        let result = dec.decode(&mut inraw, |_, _, _, _, _| Ok(0));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ws_decoder_decode_text_frame() {
+        let mut dec = WsDecoder::new();
+        let mut inraw = BufQ::new(1024, 4);
+        // Unfragmented TEXT frame, 5 bytes payload
+        let frame_data = vec![0x81, 0x05, b'h', b'e', b'l', b'l', b'o'];
+        inraw.write(&frame_data).unwrap();
+
+        let mut received = Vec::new();
+        let result = dec.decode(&mut inraw, |data, _age, flags, _offset, _len| {
+            received.extend_from_slice(data);
+            assert!(flags.contains(WsFlags::TEXT));
+            Ok(data.len())
+        });
+        assert!(result.is_ok());
+        assert_eq!(&received, b"hello");
+    }
+
+    #[test]
+    fn test_ws_decoder_decode_binary_frame() {
+        let mut dec = WsDecoder::new();
+        let mut inraw = BufQ::new(1024, 4);
+        // Unfragmented BINARY frame, 3 bytes
+        inraw.write(&[0x82, 0x03, 0xAA, 0xBB, 0xCC]).unwrap();
+        let mut received = Vec::new();
+        let result = dec.decode(&mut inraw, |data, _, flags, _, _| {
+            received.extend_from_slice(data);
+            assert!(flags.contains(WsFlags::BINARY));
+            Ok(data.len())
+        });
+        assert!(result.is_ok());
+        assert_eq!(received, vec![0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn test_ws_decoder_decode_zero_payload() {
+        let mut dec = WsDecoder::new();
+        let mut inraw = BufQ::new(1024, 4);
+        // Close frame with 0-length payload
+        inraw.write(&[0x88, 0x00]).unwrap();
+        let result = dec.decode(&mut inraw, |_, _, _, _, _| Ok(0));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ws_decoder_decode_masked_rejected() {
+        let mut dec = WsDecoder::new();
+        let mut inraw = BufQ::new(1024, 4);
+        // Server frame with MASK bit set (illegal server→client)
+        inraw.write(&[0x81, 0x85, 0x00, 0x00, 0x00, 0x00, b'h', b'e', b'l', b'l', b'o']).unwrap();
+        let result = dec.decode(&mut inraw, |_, _, _, _, _| Ok(0));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ws_decoder_decode_ping_too_big() {
+        let mut dec = WsDecoder::new();
+        let mut inraw = BufQ::new(1024, 4);
+        // Ping frame with payload > 125 bytes
+        inraw.write(&[0x89, 126]).unwrap(); // 126 indicator = 2 extra bytes
+        inraw.write(&[0x00, 0x80]).unwrap(); // 128 bytes
+        let result = dec.decode(&mut inraw, |_, _, _, _, _| Ok(0));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ws_decoder_decode_16bit_length() {
+        let mut dec = WsDecoder::new();
+        let mut inraw = BufQ::new(65536, 2);
+        // Text frame with 16-bit length = 256 bytes
+        inraw.write(&[0x81, 126, 0x01, 0x00]).unwrap();
+        let payload = vec![0x41; 256]; // 256 'A' bytes
+        inraw.write(&payload).unwrap();
+        let mut total = 0;
+        let result = dec.decode(&mut inraw, |data, _, _, _, _| {
+            total += data.len();
+            Ok(data.len())
+        });
+        assert!(result.is_ok());
+        assert_eq!(total, 256);
+    }
+
+    // -- WsEncoder advanced ---
+    #[test]
+    fn test_ws_encoder_reset() {
+        let mut enc = WsEncoder::new();
+        enc.payload_remain = 100;
+        enc.contfragment = true;
+        enc.reset();
+        assert_eq!(enc.payload_remain(), 0);
+        assert!(!enc.is_cont_fragment());
+    }
+
+    #[test]
+    fn test_ws_encoder_payload_remain() {
+        let enc = WsEncoder::new();
+        assert_eq!(enc.payload_remain(), 0);
+    }
+
+    #[test]
+    fn test_ws_encoder_cont_fragment() {
+        let enc = WsEncoder::new();
+        assert!(!enc.is_cont_fragment());
+    }
+
+    #[test]
+    fn test_ws_encoder_write_head_text() {
+        let mut enc = WsEncoder::new();
+        let mut out = BufQ::new(1024, 4);
+        let result = enc.write_head(WsFlags::TEXT, 5, &mut out);
+        assert!(result.is_ok());
+        assert_eq!(enc.payload_remain, 5);
+    }
+
+    #[test]
+    fn test_ws_encoder_write_head_binary() {
+        let mut enc = WsEncoder::new();
+        let mut out = BufQ::new(1024, 4);
+        assert!(enc.write_head(WsFlags::BINARY, 10, &mut out).is_ok());
+        assert_eq!(enc.payload_remain, 10);
+    }
+
+    #[test]
+    fn test_ws_encoder_write_head_close() {
+        let mut enc = WsEncoder::new();
+        let mut out = BufQ::new(1024, 4);
+        assert!(enc.write_head(WsFlags::CLOSE, 2, &mut out).is_ok());
+    }
+
+    #[test]
+    fn test_ws_encoder_write_head_ping_too_big() {
+        let mut enc = WsEncoder::new();
+        let mut out = BufQ::new(1024, 4);
+        let result = enc.write_head(WsFlags::PING, 200, &mut out);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ws_encoder_write_head_pong_too_big() {
+        let mut enc = WsEncoder::new();
+        let mut out = BufQ::new(1024, 4);
+        assert!(enc.write_head(WsFlags::PONG, 200, &mut out).is_err());
+    }
+
+    #[test]
+    fn test_ws_encoder_write_head_close_too_big() {
+        let mut enc = WsEncoder::new();
+        let mut out = BufQ::new(1024, 4);
+        assert!(enc.write_head(WsFlags::CLOSE, 200, &mut out).is_err());
+    }
+
+    #[test]
+    fn test_ws_encoder_write_head_medium_payload() {
+        let mut enc = WsEncoder::new();
+        let mut out = BufQ::new(65536, 2);
+        assert!(enc.write_head(WsFlags::BINARY, 300, &mut out).is_ok());
+        assert_eq!(enc.payload_remain, 300);
+    }
+
+    #[test]
+    fn test_ws_encoder_write_head_large_payload() {
+        let mut enc = WsEncoder::new();
+        let mut out = BufQ::new(65536, 2);
+        assert!(enc.write_head(WsFlags::BINARY, 70000, &mut out).is_ok());
+        assert_eq!(enc.payload_remain, 70000);
+    }
+
+    #[test]
+    fn test_ws_encoder_write_payload() {
+        let mut enc = WsEncoder::new();
+        let mut out = BufQ::new(1024, 4);
+        enc.write_head(WsFlags::TEXT, 5, &mut out).unwrap();
+        let written = enc.write_payload(b"hello", &mut out).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(enc.payload_remain, 0);
+    }
+
+    #[test]
+    fn test_ws_encoder_write_payload_empty() {
+        let mut enc = WsEncoder::new();
+        let mut out = BufQ::new(1024, 4);
+        enc.write_head(WsFlags::TEXT, 0, &mut out).unwrap();
+        let written = enc.write_payload(b"", &mut out).unwrap();
+        assert_eq!(written, 0);
+    }
+
+    #[test]
+    fn test_ws_encoder_write_payload_partial() {
+        let mut enc = WsEncoder::new();
+        let mut out = BufQ::new(1024, 4);
+        enc.write_head(WsFlags::TEXT, 3, &mut out).unwrap();
+        let written = enc.write_payload(b"hello", &mut out).unwrap();
+        assert_eq!(written, 3); // limited by payload_remain
+        assert_eq!(enc.payload_remain, 0);
+    }
+
+    #[test]
+    fn test_ws_encoder_masking() {
+        let mut enc = WsEncoder::new();
+        let mut out = BufQ::new(1024, 4);
+        enc.write_head(WsFlags::TEXT, 5, &mut out).unwrap();
+        enc.write_payload(b"hello", &mut out).unwrap();
+        // Payload should be masked (not raw "hello")
+        let mut buf = vec![0u8; 256];
+        let n = out.read(&mut buf).unwrap();
+        assert!(n > 5); // header + masked payload
+    }
+
+    // -- WsEncoder control frame ---
+    #[test]
+    fn test_ws_encoder_add_control_frame_ping() {
+        let mut enc = WsEncoder::new();
+        let mut sendbuf = BufQ::new(1024, 4);
+        let mut pending = None;
+        let result = enc.add_control_frame(b"", WsFlags::PING, &mut sendbuf, &mut pending);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ws_encoder_add_control_frame_too_big() {
+        let mut enc = WsEncoder::new();
+        let mut sendbuf = BufQ::new(1024, 4);
+        let mut pending = None;
+        let big_payload = vec![0u8; 200];
+        let result = enc.add_control_frame(&big_payload, WsFlags::PING, &mut sendbuf, &mut pending);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ws_encoder_flush_pending_none() {
+        let mut enc = WsEncoder::new();
+        let mut sendbuf = BufQ::new(1024, 4);
+        let mut pending = None;
+        assert!(enc.flush_pending(&mut sendbuf, &mut pending).is_ok());
+    }
+
+    // -- WebSocket state ---
+    #[test]
+    fn test_websocket_decoder_mut() {
+        let mut ws = WebSocket::new();
+        ws.decoder_mut().reset();
+        assert_eq!(ws.decoder().state(), WsDecState::Init);
+    }
+
+    #[test]
+    fn test_websocket_encoder_mut() {
+        let mut ws = WebSocket::new();
+        ws.encoder_mut().reset();
+        assert_eq!(ws.encoder().payload_remain(), 0);
+    }
+
+    #[test]
+    fn test_websocket_recv_buf_mut() {
+        let mut ws = WebSocket::new();
+        let _ = ws.recv_buf_mut();
+    }
+
+    #[test]
+    fn test_websocket_send_buf_mut() {
+        let mut ws = WebSocket::new();
+        let _ = ws.send_buf_mut();
+    }
+
+    // -- ws_start_frame ---
+    #[test]
+    fn test_ws_start_frame_text() {
+        let mut ws = WebSocket::new();
+        let result = ws_start_frame(&mut ws, WsFlags::TEXT, 10);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ws_start_frame_raw_mode_error() {
+        let mut ws = WebSocket::new();
+        ws.raw_mode = true;
+        let result = ws_start_frame(&mut ws, WsFlags::TEXT, 10);
+        assert!(result.is_err());
+    }
+
+    // -- ws_meta ---
+    #[test]
+    fn test_ws_meta_raw_mode_none() {
+        let mut ws = WebSocket::new();
+        ws.raw_mode = true;
+        assert!(ws_meta(&ws).is_none());
+    }
+
+    // -- ws_setup_conn ---
+    #[test]
+    fn test_ws_setup_conn_http2_error() {
+        let mut conn = ConnectionData::new(1, "ws.example.com".into(), 80, "ws".into());
+        let result = ws_setup_conn(&mut conn, 2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ws_setup_conn_http11_ok() {
+        let mut conn = ConnectionData::new(1, "ws.example.com".into(), 80, "ws".into());
+        assert!(ws_setup_conn(&mut conn, 11).is_ok());
+    }
+
+    #[test]
+    fn test_ws_setup_conn_http10_ok() {
+        let mut conn = ConnectionData::new(1, "ws.example.com".into(), 80, "ws".into());
+        assert!(ws_setup_conn(&mut conn, 10).is_ok());
+    }
+
+    // -- firstbyte_to_flags additional ---
+    #[test]
+    fn test_firstbyte_to_flags_cont_no_ongoing_error() {
+        // 0x00 = intermediate continuation but no ongoing fragmented message
+        let result = firstbyte_to_flags(0x00, WsFlags::empty());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_firstbyte_to_flags_final_cont_no_ongoing_error() {
+        let result = firstbyte_to_flags(0x80, WsFlags::empty());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_firstbyte_to_flags_text_frag_start() {
+        let result = firstbyte_to_flags(0x01, WsFlags::empty()).unwrap();
+        assert!(result.contains(WsFlags::TEXT));
+        assert!(result.contains(WsFlags::CONT));
+    }
+
+    #[test]
+    fn test_firstbyte_to_flags_text_interrupted_error() {
+        // Starting new TEXT while continuation is ongoing
+        let result = firstbyte_to_flags(0x01, WsFlags::TEXT | WsFlags::CONT);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_firstbyte_to_flags_binary_frag_start() {
+        let result = firstbyte_to_flags(0x02, WsFlags::empty()).unwrap();
+        assert!(result.contains(WsFlags::BINARY));
+        assert!(result.contains(WsFlags::CONT));
+    }
+
+    #[test]
+    fn test_firstbyte_to_flags_binary_interrupted_error() {
+        let result = firstbyte_to_flags(0x02, WsFlags::BINARY | WsFlags::CONT);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_firstbyte_to_flags_unfrag_binary() {
+        let result = firstbyte_to_flags(0x82, WsFlags::empty()).unwrap();
+        assert!(result.contains(WsFlags::BINARY));
+        assert!(!result.contains(WsFlags::CONT));
+    }
+
+    #[test]
+    fn test_firstbyte_to_flags_frag_close_error() {
+        let result = firstbyte_to_flags(0x08, WsFlags::empty());
+        assert!(result.is_err()); // Fragmented CLOSE is invalid
+    }
+
+    #[test]
+    fn test_firstbyte_to_flags_frag_ping_error() {
+        let result = firstbyte_to_flags(0x09, WsFlags::empty());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_firstbyte_to_flags_frag_pong_error() {
+        let result = firstbyte_to_flags(0x0A, WsFlags::empty());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_firstbyte_to_flags_invalid_opcode() {
+        let result = firstbyte_to_flags(0x83, WsFlags::empty());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_firstbyte_to_flags_rsv_bits_error() {
+        let result = firstbyte_to_flags(0x41, WsFlags::empty()); // RSV1 set
+        assert!(result.is_err());
+    }
+
+    // -- flags_to_firstbyte additional ---
+    #[test]
+    fn test_flags_to_firstbyte_empty_no_cont_error() {
+        let result = flags_to_firstbyte(WsFlags::empty(), false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_flags_to_firstbyte_empty_with_cont() {
+        let byte = flags_to_firstbyte(WsFlags::empty(), true).unwrap();
+        assert_eq!(byte, WSBIT_FIN);
+    }
+
+    #[test]
+    fn test_flags_to_firstbyte_cont_only_with_ongoing() {
+        let byte = flags_to_firstbyte(WsFlags::CONT, true).unwrap();
+        assert_eq!(byte, 0x00); // CONT, no FIN
+    }
+
+    #[test]
+    fn test_flags_to_firstbyte_cont_only_no_ongoing_error() {
+        let result = flags_to_firstbyte(WsFlags::CONT, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_flags_to_firstbyte_text_cont_first() {
+        let byte = flags_to_firstbyte(WsFlags::TEXT | WsFlags::CONT, false).unwrap();
+        assert_eq!(byte, 0x01); // TEXT first fragment
+    }
+
+    #[test]
+    fn test_flags_to_firstbyte_text_cont_middle() {
+        let byte = flags_to_firstbyte(WsFlags::TEXT | WsFlags::CONT, true).unwrap();
+        assert_eq!(byte, 0x00); // Continuation
+    }
+
+    #[test]
+    fn test_flags_to_firstbyte_text_final_frag() {
+        let byte = flags_to_firstbyte(WsFlags::TEXT, true).unwrap();
+        assert_eq!(byte, WSBIT_FIN); // Final continuation fragment
+    }
+
+    #[test]
+    fn test_flags_to_firstbyte_binary_cont_first() {
+        let byte = flags_to_firstbyte(WsFlags::BINARY | WsFlags::CONT, false).unwrap();
+        assert_eq!(byte, 0x02);
+    }
+
+    #[test]
+    fn test_flags_to_firstbyte_binary_cont_middle() {
+        let byte = flags_to_firstbyte(WsFlags::BINARY | WsFlags::CONT, true).unwrap();
+        assert_eq!(byte, 0x00);
+    }
+
+    #[test]
+    fn test_flags_to_firstbyte_binary_final_frag() {
+        let byte = flags_to_firstbyte(WsFlags::BINARY, true).unwrap();
+        assert_eq!(byte, WSBIT_FIN);
+    }
+
+    #[test]
+    fn test_flags_to_firstbyte_ping_frag_error() {
+        let result = flags_to_firstbyte(WsFlags::PING | WsFlags::CONT, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_flags_to_firstbyte_pong_frag_error() {
+        let result = flags_to_firstbyte(WsFlags::PONG | WsFlags::CONT, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_flags_to_firstbyte_unknown_combo_error() {
+        let result = flags_to_firstbyte(WsFlags::TEXT | WsFlags::BINARY, false);
+        assert!(result.is_err());
+    }
+
+    // -- WsFlags bitops ---
+    #[test]
+    fn test_ws_flags_not() {
+        let flags = !WsFlags::TEXT;
+        assert!(!flags.contains(WsFlags::TEXT));
+    }
+
+    #[test]
+    fn test_ws_flags_bitand() {
+        let a = WsFlags::TEXT | WsFlags::BINARY;
+        let b = WsFlags::TEXT | WsFlags::PING;
+        let c = a & b;
+        assert!(c.contains(WsFlags::TEXT));
+        assert!(!c.contains(WsFlags::BINARY));
+        assert!(!c.contains(WsFlags::PING));
+    }
+
+    #[test]
+    fn test_ws_flags_bitand_assign() {
+        let mut a = WsFlags::TEXT | WsFlags::BINARY;
+        a &= WsFlags::TEXT;
+        assert!(a.contains(WsFlags::TEXT));
+        assert!(!a.contains(WsFlags::BINARY));
+    }
+
+    #[test]
+    fn test_ws_flags_bitor_assign() {
+        let mut a = WsFlags::TEXT;
+        a |= WsFlags::BINARY;
+        assert!(a.contains(WsFlags::TEXT));
+        assert!(a.contains(WsFlags::BINARY));
+    }
+
+    #[test]
+    fn test_ws_flags_from_bits() {
+        let flags = WsFlags::from_bits(WsFlags::TEXT.bits() | WsFlags::CONT.bits());
+        assert!(flags.contains(WsFlags::TEXT));
+        assert!(flags.contains(WsFlags::CONT));
+    }
+
+    // -- WsOpcode ---
+    #[test]
+    fn test_ws_opcode_name_all() {
+        assert_eq!(WsOpcode::Continuation.name(), "CONT");
+        assert_eq!(WsOpcode::Text.name(), "TEXT");
+        assert_eq!(WsOpcode::Binary.name(), "BIN");
+        assert_eq!(WsOpcode::Close.name(), "CLOSE");
+        assert_eq!(WsOpcode::Ping.name(), "PING");
+        assert_eq!(WsOpcode::Pong.name(), "PONG");
+    }
+
+    #[test]
+    fn test_ws_opcode_display() {
+        let s = format!("{}", WsOpcode::Text);
+        assert_eq!(s, "TEXT");
+    }
+
+    // -- WsFrame opcode mapping ---
+    #[test]
+    fn test_ws_frame_opcode_text_cont() {
+        let mut frame = WsFrame::new();
+        frame.flags = WsFlags::TEXT | WsFlags::CONT;
+        // When both TEXT and CONT are set, opcode should be TEXT
+        assert_eq!(frame.opcode(), Some(WsOpcode::Text));
+    }
+
+    // -- Protocol trait for WebSocket ---
+    #[test]
+    fn test_ws_protocol_name() {
+        let ws = WebSocket::new();
+        assert_eq!(Protocol::name(&ws), "WS");
+    }
+
+    #[test]
+    fn test_ws_protocol_default_port() {
+        let ws = WebSocket::new();
+        assert_eq!(Protocol::default_port(&ws), 80);
+    }
+
+    #[test]
+    fn test_ws_protocol_flags() {
+        let ws = WebSocket::new();
+        let flags = Protocol::flags(&ws);
+        assert!(flags.contains(ProtocolFlags::CREDSPERREQUEST));
+    }
+
+    #[test]
+    fn test_ws_connection_check_ok() {
+        let ws = WebSocket::new();
+        let conn = ConnectionData::new(1, "ws.example.com".into(), 80, "ws".into());
+        assert_eq!(Protocol::connection_check(&ws, &conn), ConnectionCheckResult::Ok);
+    }
+
+    // -- WsControlFrame ---
+    #[test]
+    fn test_ws_control_frame_debug() {
+        let frame = WsControlFrame {
+            frame_type: WsFlags::PING,
+            payload_len: 0,
+            payload: [0u8; WS_MAX_CNTRL_LEN],
+        };
+        let s = format!("{:?}", frame);
+        assert!(s.contains("WsControlFrame"));
+    }
+
+    #[test]
+    fn test_ws_control_frame_clone() {
+        let frame = WsControlFrame {
+            frame_type: WsFlags::PONG,
+            payload_len: 5,
+            payload: [0u8; WS_MAX_CNTRL_LEN],
+        };
+        let cloned = frame.clone();
+        assert_eq!(cloned.payload_len, 5);
+    }
+
+    // -- encode-decode roundtrip ---
+    #[test]
+    fn test_encode_decode_text_roundtrip() {
+        let mut enc = WsEncoder::new();
+        let mut out = BufQ::new(1024, 4);
+        enc.write_head(WsFlags::TEXT, 5, &mut out).unwrap();
+        enc.write_payload(b"world", &mut out).unwrap();
+
+        // Read encoded data
+        let mut encoded = vec![0u8; 256];
+        let n = out.read(&mut encoded).unwrap();
+        let encoded = &encoded[..n];
+
+        // Unmask: find mask key (bytes 2-5 for small payload)
+        let hlen = 2; // firstbyte + length byte
+        let mask = &encoded[hlen..hlen + 4];
+        let payload_start = hlen + 4;
+        let mut unmasked = Vec::new();
+        for (i, &b) in encoded[payload_start..].iter().enumerate() {
+            unmasked.push(b ^ mask[i & 3]);
+        }
+        assert_eq!(&unmasked, b"world");
+    }
+
+    // -- WebSocket auto_pong ---
+    #[test]
+    fn test_websocket_auto_pong_default() {
+        let ws = WebSocket::new();
+        assert!(ws.auto_pong);
     }
 }

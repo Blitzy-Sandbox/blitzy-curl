@@ -1218,3 +1218,1029 @@ impl Default for Request {
         Self::new()
     }
 }
+
+// ===========================================================================
+// Unit Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // RequestState tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_request_state_display() {
+        assert_eq!(format!("{}", RequestState::Idle), "Idle");
+        assert_eq!(format!("{}", RequestState::Connected), "Connected");
+        assert_eq!(format!("{}", RequestState::Sending), "Sending");
+        assert_eq!(format!("{}", RequestState::Receiving), "Receiving");
+        assert_eq!(format!("{}", RequestState::Complete), "Complete");
+        assert_eq!(format!("{}", RequestState::Failed), "Failed");
+    }
+
+    #[test]
+    fn test_request_state_eq_and_clone() {
+        let s1 = RequestState::Idle;
+        let s2 = s1;
+        assert_eq!(s1, s2);
+        assert_ne!(RequestState::Idle, RequestState::Connected);
+    }
+
+    #[test]
+    fn test_request_state_debug() {
+        let dbg = format!("{:?}", RequestState::Sending);
+        assert!(dbg.contains("Sending"));
+    }
+
+    #[test]
+    fn test_request_state_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(RequestState::Idle);
+        set.insert(RequestState::Connected);
+        set.insert(RequestState::Idle);
+        assert_eq!(set.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Expect100 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_expect100_default() {
+        assert_eq!(Expect100::default(), Expect100::SendData);
+    }
+
+    #[test]
+    fn test_expect100_variants() {
+        let variants = [
+            Expect100::SendData,
+            Expect100::AwaitingContinue,
+            Expect100::SendingRequest,
+            Expect100::Failed,
+        ];
+        for (i, v) in variants.iter().enumerate() {
+            for (j, w) in variants.iter().enumerate() {
+                if i == j {
+                    assert_eq!(v, w);
+                } else {
+                    assert_ne!(v, w);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_expect100_clone_copy() {
+        let e = Expect100::AwaitingContinue;
+        let e2 = e;
+        assert_eq!(e, e2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Upgrade101 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_upgrade101_default() {
+        assert_eq!(Upgrade101::default(), Upgrade101::None);
+    }
+
+    #[test]
+    fn test_upgrade101_variants() {
+        assert_ne!(Upgrade101::None, Upgrade101::WebSocket);
+        assert_ne!(Upgrade101::WebSocket, Upgrade101::Http2);
+        assert_ne!(Upgrade101::Http2, Upgrade101::Received);
+    }
+
+    #[test]
+    fn test_upgrade101_clone_copy() {
+        let u = Upgrade101::WebSocket;
+        let u2 = u;
+        assert_eq!(u, u2);
+    }
+
+    // -----------------------------------------------------------------------
+    // RequestTimings tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_request_timings_new_is_empty() {
+        let t = RequestTimings::new();
+        assert!(t.start_time().is_none());
+        assert!(t.name_lookup_duration().is_none());
+        assert!(t.connect_duration().is_none());
+        assert!(t.tls_handshake_duration().is_none());
+        assert!(t.time_to_first_byte().is_none());
+        assert!(t.total_duration().is_none());
+        assert!(t.total_millis().is_none());
+        assert!(t.total_secs_f64().is_none());
+    }
+
+    #[test]
+    fn test_request_timings_default_is_empty() {
+        let t = RequestTimings::default();
+        assert!(t.start_time().is_none());
+    }
+
+    #[test]
+    fn test_request_timings_reset_clears_all() {
+        let mut t = RequestTimings::new();
+        t.start = Some(Instant::now());
+        t.name_lookup = Some(Instant::now());
+        t.connect = Some(Instant::now());
+        t.app_connect = Some(Instant::now());
+        t.pre_transfer = Some(Instant::now());
+        t.start_transfer = Some(Instant::now());
+        t.reset();
+        assert!(t.start_time().is_none());
+        assert!(t.name_lookup_duration().is_none());
+        assert!(t.connect_duration().is_none());
+        assert!(t.tls_handshake_duration().is_none());
+        assert!(t.time_to_first_byte().is_none());
+    }
+
+    #[test]
+    fn test_request_timings_durations_with_start() {
+        let mut t = RequestTimings::new();
+        let start = Instant::now();
+        t.start = Some(start);
+        // total_duration should return Some now
+        assert!(t.total_duration().is_some());
+        assert!(t.total_millis().is_some());
+        assert!(t.total_secs_f64().is_some());
+        // But lookup/connect/etc. still None without their timestamps
+        assert!(t.name_lookup_duration().is_none());
+        assert!(t.connect_duration().is_none());
+    }
+
+    #[test]
+    fn test_request_timings_name_lookup_duration() {
+        let mut t = RequestTimings::new();
+        let start = Instant::now();
+        t.start = Some(start);
+        std::thread::sleep(Duration::from_millis(1));
+        t.name_lookup = Some(Instant::now());
+        let dur = t.name_lookup_duration().unwrap();
+        assert!(dur >= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_request_timings_connect_duration() {
+        let mut t = RequestTimings::new();
+        let start = Instant::now();
+        t.start = Some(start);
+        std::thread::sleep(Duration::from_millis(1));
+        t.connect = Some(Instant::now());
+        let dur = t.connect_duration().unwrap();
+        assert!(dur >= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_request_timings_tls_handshake() {
+        let mut t = RequestTimings::new();
+        t.connect = Some(Instant::now());
+        std::thread::sleep(Duration::from_millis(1));
+        t.app_connect = Some(Instant::now());
+        let dur = t.tls_handshake_duration().unwrap();
+        assert!(dur >= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn test_request_timings_ttfb() {
+        let mut t = RequestTimings::new();
+        let start = Instant::now();
+        t.start = Some(start);
+        std::thread::sleep(Duration::from_millis(1));
+        t.start_transfer = Some(Instant::now());
+        let dur = t.time_to_first_byte().unwrap();
+        assert!(dur >= Duration::from_millis(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // TransferConfig tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_transfer_config_default() {
+        let cfg = TransferConfig::default();
+        assert_eq!(cfg.upload_buffer_size, DEFAULT_UPLOAD_BUFFER_SIZE);
+        assert!(!cfg.no_body);
+        assert_eq!(cfg.max_send_speed, 0);
+        assert_eq!(cfg.max_recv_speed, 0);
+    }
+
+    #[test]
+    fn test_transfer_config_custom() {
+        let cfg = TransferConfig {
+            upload_buffer_size: 128 * 1024,
+            no_body: true,
+            max_send_speed: 1000,
+            max_recv_speed: 2000,
+        };
+        assert_eq!(cfg.upload_buffer_size, 128 * 1024);
+        assert!(cfg.no_body);
+        assert_eq!(cfg.max_send_speed, 1000);
+        assert_eq!(cfg.max_recv_speed, 2000);
+    }
+
+    #[test]
+    fn test_transfer_config_clone() {
+        let cfg = TransferConfig {
+            upload_buffer_size: 32 * 1024,
+            no_body: false,
+            max_send_speed: 500,
+            max_recv_speed: 700,
+        };
+        let cfg2 = cfg.clone();
+        assert_eq!(cfg.upload_buffer_size, cfg2.upload_buffer_size);
+        assert_eq!(cfg.no_body, cfg2.no_body);
+    }
+
+    // -----------------------------------------------------------------------
+    // Request::new() and Default tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_request_new_state_idle() {
+        let req = Request::new();
+        assert_eq!(req.state(), RequestState::Idle);
+    }
+
+    #[test]
+    fn test_request_default_eq_new() {
+        let req = Request::default();
+        assert_eq!(req.state(), RequestState::Idle);
+        assert_eq!(req.bytes_sent(), 0);
+        assert_eq!(req.bytes_received(), 0);
+        assert_eq!(req.response_code(), 0);
+    }
+
+    #[test]
+    fn test_request_new_counters_zero() {
+        let req = Request::new();
+        assert_eq!(req.bytes_sent(), 0);
+        assert_eq!(req.bytes_received(), 0);
+        assert_eq!(req.response_code(), 0);
+    }
+
+    #[test]
+    fn test_request_new_sendbuf_empty() {
+        let req = Request::new();
+        assert!(req.sendbuf_empty());
+    }
+
+    #[test]
+    fn test_request_new_timings_empty() {
+        let req = Request::new();
+        assert!(req.timings().start_time().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Request::prepare() tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prepare_from_idle() {
+        let mut req = Request::new();
+        let res = req.prepare(&TransferConfig::default());
+        assert!(res.is_ok());
+        assert_eq!(req.state(), RequestState::Connected);
+    }
+
+    #[test]
+    fn test_prepare_sets_start_time() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        assert!(req.timings().start_time().is_some());
+    }
+
+    #[test]
+    fn test_prepare_applies_config() {
+        let mut req = Request::new();
+        let cfg = TransferConfig {
+            upload_buffer_size: 128 * 1024,
+            no_body: true,
+            max_send_speed: 100,
+            max_recv_speed: 200,
+        };
+        req.prepare(&cfg).unwrap();
+        assert_eq!(req.state(), RequestState::Connected);
+    }
+
+    #[test]
+    fn test_prepare_from_non_idle_fails() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        // Trying to prepare again from Connected should fail
+        let res = req.prepare(&TransferConfig::default());
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_prepare_zero_buffer_uses_default() {
+        let mut req = Request::new();
+        let cfg = TransferConfig {
+            upload_buffer_size: 0,
+            ..Default::default()
+        };
+        req.prepare(&cfg).unwrap();
+        assert_eq!(req.state(), RequestState::Connected);
+    }
+
+    #[test]
+    fn test_prepare_resets_counters() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        assert_eq!(req.bytes_sent(), 0);
+        assert_eq!(req.bytes_received(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // State transition: send_headers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_send_headers_from_connected() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        let res = req.send_headers();
+        assert!(res.is_ok());
+        assert_eq!(req.state(), RequestState::Sending);
+    }
+
+    #[test]
+    fn test_send_headers_from_idle_fails() {
+        let mut req = Request::new();
+        let res = req.send_headers();
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_send_headers_from_sending_fails() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        let res = req.send_headers();
+        assert!(res.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // send_body tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_send_body_from_sending() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        let n = req.send_body(b"hello world").unwrap();
+        assert_eq!(n, 11);
+        assert_eq!(req.bytes_sent(), 11);
+    }
+
+    #[test]
+    fn test_send_body_empty_data() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        let n = req.send_body(b"").unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(req.bytes_sent(), 0);
+    }
+
+    #[test]
+    fn test_send_body_from_idle_fails() {
+        let mut req = Request::new();
+        let res = req.send_body(b"data");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_send_body_accumulates() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        req.send_body(b"abc").unwrap();
+        req.send_body(b"def").unwrap();
+        assert_eq!(req.bytes_sent(), 6);
+        assert!(!req.sendbuf_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // receive_headers tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_receive_headers_from_sending() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        let headers = req.receive_headers().unwrap();
+        assert_eq!(req.state(), RequestState::Receiving);
+        // Headers should be empty (no data pushed)
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn test_receive_headers_from_idle_fails() {
+        let mut req = Request::new();
+        let res = req.receive_headers();
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_receive_headers_from_connected_fails() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        let res = req.receive_headers();
+        assert!(res.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // receive_body tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_receive_body_empty_download_done() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        req.receive_headers().unwrap();
+        req.set_download_done(true);
+        let mut buf = [0u8; 128];
+        let n = req.receive_body(&mut buf).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_receive_body_with_data() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        req.receive_headers().unwrap();
+        req.push_received_data(b"hello world").unwrap();
+        let mut buf = [0u8; 128];
+        let n = req.receive_body(&mut buf).unwrap();
+        assert_eq!(n, 11);
+        assert_eq!(&buf[..11], b"hello world");
+        assert_eq!(req.bytes_received(), 11);
+    }
+
+    #[test]
+    fn test_receive_body_partial_read() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        req.receive_headers().unwrap();
+        req.push_received_data(b"abcdef").unwrap();
+        let mut buf = [0u8; 3];
+        let n = req.receive_body(&mut buf).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(&buf[..3], b"abc");
+        // Second read gets remaining
+        let n2 = req.receive_body(&mut buf).unwrap();
+        assert_eq!(n2, 3);
+        assert_eq!(&buf[..3], b"def");
+    }
+
+    #[test]
+    fn test_receive_body_from_idle_fails() {
+        let mut req = Request::new();
+        let mut buf = [0u8; 128];
+        let res = req.receive_body(&mut buf);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_receive_body_empty_buffer_returns_again() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        req.receive_headers().unwrap();
+        let mut buf = [0u8; 128];
+        let res = req.receive_body(&mut buf);
+        assert!(res.is_err()); // CurlError::Again
+    }
+
+    // -----------------------------------------------------------------------
+    // complete tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_complete_from_receiving() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        req.receive_headers().unwrap();
+        let res = req.complete();
+        assert!(res.is_ok());
+        assert_eq!(req.state(), RequestState::Complete);
+    }
+
+    #[test]
+    fn test_complete_from_idle_noop() {
+        let mut req = Request::new();
+        let res = req.complete();
+        assert!(res.is_ok());
+        assert_eq!(req.state(), RequestState::Idle);
+    }
+
+    #[test]
+    fn test_complete_from_complete_noop() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        req.receive_headers().unwrap();
+        req.complete().unwrap();
+        let res = req.complete();
+        assert!(res.is_ok());
+        assert_eq!(req.state(), RequestState::Complete);
+    }
+
+    #[test]
+    fn test_complete_from_sending() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        req.send_body(b"data").unwrap();
+        let res = req.complete();
+        assert!(res.is_ok());
+        assert_eq!(req.state(), RequestState::Complete);
+    }
+
+    // -----------------------------------------------------------------------
+    // reset tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reset_returns_to_idle() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        req.send_body(b"data").unwrap();
+        req.reset();
+        assert_eq!(req.state(), RequestState::Idle);
+        assert_eq!(req.bytes_sent(), 0);
+        assert_eq!(req.bytes_received(), 0);
+        assert_eq!(req.response_code(), 0);
+        assert!(req.sendbuf_empty());
+    }
+
+    #[test]
+    fn test_reset_after_complete() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        req.receive_headers().unwrap();
+        req.complete().unwrap();
+        req.reset();
+        assert_eq!(req.state(), RequestState::Idle);
+    }
+
+    #[test]
+    fn test_reset_clears_timings() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        assert!(req.timings().start_time().is_some());
+        req.reset();
+        assert!(req.timings().start_time().is_none());
+    }
+
+    #[test]
+    fn test_reset_clears_location() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.set_location(Some("http://example.com".to_string()));
+        req.reset();
+        assert!(req.location().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // want_send / want_recv tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_want_send_false_when_idle() {
+        let req = Request::new();
+        assert!(!req.want_send());
+    }
+
+    #[test]
+    fn test_want_send_true_after_prepare() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        assert!(req.want_send());
+    }
+
+    #[test]
+    fn test_want_recv_false_when_idle() {
+        let req = Request::new();
+        assert!(!req.want_recv());
+    }
+
+    #[test]
+    fn test_want_recv_true_after_prepare() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        assert!(req.want_recv());
+    }
+
+    // -----------------------------------------------------------------------
+    // done_sending tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_done_sending_false_initially() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        assert!(!req.done_sending());
+    }
+
+    #[test]
+    fn test_done_sending_true_after_set_upload_done() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.set_upload_done().unwrap();
+        assert!(req.done_sending());
+    }
+
+    // -----------------------------------------------------------------------
+    // abort_sending tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_abort_sending() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        req.send_body(b"payload").unwrap();
+        assert!(!req.sendbuf_empty());
+        req.abort_sending().unwrap();
+        assert!(req.sendbuf_empty());
+        assert!(!req.want_send());
+    }
+
+    #[test]
+    fn test_abort_sending_idempotent() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.abort_sending().unwrap();
+        req.abort_sending().unwrap(); // second call is no-op
+        assert!(req.sendbuf_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // stop_send_recv tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_stop_send_recv() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        assert!(req.want_send());
+        assert!(req.want_recv());
+        req.stop_send_recv().unwrap();
+        assert!(!req.want_send());
+        assert!(!req.want_recv());
+    }
+
+    // -----------------------------------------------------------------------
+    // set_upload_done tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_upload_done() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.set_upload_done().unwrap();
+        assert!(req.done_sending());
+        assert!(!req.want_send());
+    }
+
+    #[test]
+    fn test_set_upload_done_idempotent() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.set_upload_done().unwrap();
+        req.set_upload_done().unwrap();
+        assert!(req.done_sending());
+    }
+
+    // -----------------------------------------------------------------------
+    // Crate-internal helpers tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_push_received_data() {
+        let mut req = Request::new();
+        req.push_received_data(b"abc").unwrap();
+        req.push_received_data(b"def").unwrap();
+    }
+
+    #[test]
+    fn test_push_received_data_empty() {
+        let mut req = Request::new();
+        req.push_received_data(b"").unwrap();
+    }
+
+    #[test]
+    fn test_push_response_header() {
+        let mut req = Request::new();
+        req.push_response_header("Content-Type: text/html\r\n").unwrap();
+    }
+
+    #[test]
+    fn test_peek_send_buffer() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        req.send_body(b"hello").unwrap();
+        assert_eq!(req.peek_send_buffer(), b"hello");
+    }
+
+    #[test]
+    fn test_drain_send_buffer() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        req.send_body(b"hello world").unwrap();
+        req.drain_send_buffer(5);
+        assert_eq!(req.peek_send_buffer(), b" world");
+    }
+
+    #[test]
+    fn test_drain_send_buffer_beyond_length() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        req.send_body(b"ab").unwrap();
+        req.drain_send_buffer(100);
+        assert!(req.sendbuf_empty());
+    }
+
+    #[test]
+    fn test_drain_send_buffer_zero() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        req.send_body(b"ab").unwrap();
+        req.drain_send_buffer(0);
+        assert_eq!(req.peek_send_buffer(), b"ab");
+    }
+
+    #[test]
+    fn test_buffer_header_bytes() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.buffer_header_bytes(b"GET / HTTP/1.1\r\n").unwrap();
+        assert_eq!(req.send_buffer_header_len(), 16);
+        assert!(!req.sendbuf_empty());
+    }
+
+    #[test]
+    fn test_buffer_header_then_drain() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.buffer_header_bytes(b"ABCD").unwrap();
+        assert_eq!(req.send_buffer_header_len(), 4);
+        req.drain_send_buffer(2);
+        assert_eq!(req.send_buffer_header_len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Metadata setters/getters tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_response_code() {
+        let mut req = Request::new();
+        req.set_response_code(200);
+        assert_eq!(req.response_code(), 200);
+        req.set_response_code(404);
+        assert_eq!(req.response_code(), 404);
+    }
+
+    #[test]
+    fn test_set_http_version() {
+        let mut req = Request::new();
+        req.set_http_version(11);
+        req.set_http_version_sent(20);
+    }
+
+    #[test]
+    fn test_set_state_directly() {
+        let mut req = Request::new();
+        req.set_state(RequestState::Failed);
+        assert_eq!(req.state(), RequestState::Failed);
+    }
+
+    #[test]
+    fn test_location_accessors() {
+        let mut req = Request::new();
+        assert!(req.location().is_none());
+        req.set_location(Some("https://example.com/new".into()));
+        assert_eq!(req.location(), Some("https://example.com/new"));
+        req.set_location(None);
+        assert!(req.location().is_none());
+    }
+
+    #[test]
+    fn test_new_url_accessors() {
+        let mut req = Request::new();
+        assert!(req.new_url().is_none());
+        req.set_new_url(Some("https://redirect.example.com".into()));
+        assert_eq!(req.new_url(), Some("https://redirect.example.com"));
+        req.set_new_url(None);
+        assert!(req.new_url().is_none());
+    }
+
+    #[test]
+    fn test_expect100_accessors() {
+        let mut req = Request::new();
+        assert_eq!(req.expect100(), Expect100::SendData);
+        req.set_expect100(Expect100::AwaitingContinue);
+        assert_eq!(req.expect100(), Expect100::AwaitingContinue);
+    }
+
+    #[test]
+    fn test_upgrade101_accessors() {
+        let mut req = Request::new();
+        assert_eq!(req.upgrade101(), Upgrade101::None);
+        req.set_upgrade101(Upgrade101::WebSocket);
+        assert_eq!(req.upgrade101(), Upgrade101::WebSocket);
+    }
+
+    #[test]
+    fn test_chunked_accessors() {
+        let mut req = Request::new();
+        assert!(!req.is_chunked());
+        req.set_chunked(true);
+        assert!(req.is_chunked());
+    }
+
+    #[test]
+    fn test_auth_negotiation_accessors() {
+        let mut req = Request::new();
+        assert!(!req.is_auth_negotiation());
+        req.set_auth_negotiation(true);
+        assert!(req.is_auth_negotiation());
+    }
+
+    #[test]
+    fn test_keepon_accessors() {
+        let mut req = Request::new();
+        assert_eq!(req.keepon(), 0);
+        req.set_keepon(KEEP_SEND | KEEP_RECV);
+        assert_eq!(req.keepon(), KEEP_SEND | KEEP_RECV);
+    }
+
+    #[test]
+    fn test_content_length_accessors() {
+        let mut req = Request::new();
+        assert_eq!(req.content_length(), -1);
+        req.set_content_length(1024);
+        assert_eq!(req.content_length(), 1024);
+    }
+
+    #[test]
+    fn test_set_done() {
+        let mut req = Request::new();
+        assert!(!req.is_done());
+        req.set_done(true);
+        assert!(req.is_done());
+    }
+
+    #[test]
+    fn test_set_download_done() {
+        let mut req = Request::new();
+        req.set_download_done(true);
+    }
+
+    #[test]
+    fn test_set_eos_flags() {
+        let mut req = Request::new();
+        req.set_eos_written(true);
+        req.set_eos_read(true);
+        req.set_eos_sent(true);
+    }
+
+    #[test]
+    fn test_set_max_download() {
+        let mut req = Request::new();
+        req.set_max_download(1_000_000);
+    }
+
+    #[test]
+    fn test_response_headers_mut() {
+        let mut req = Request::new();
+        let _headers = req.response_headers_mut();
+    }
+
+    #[test]
+    fn test_response_headers_ref() {
+        let req = Request::new();
+        let _headers = req.response_headers_ref();
+    }
+
+    // -----------------------------------------------------------------------
+    // I/O handle tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reader_writer_take_none_initially() {
+        let mut req = Request::new();
+        assert!(req.take_reader().is_none());
+        assert!(req.take_writer().is_none());
+    }
+
+    #[test]
+    fn test_record_timestamps() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.record_name_lookup();
+        req.record_connect();
+        req.record_app_connect();
+        req.record_pre_transfer();
+        req.record_start_transfer();
+        assert!(req.timings().name_lookup_duration().is_some());
+        assert!(req.timings().connect_duration().is_some());
+    }
+
+    #[test]
+    fn test_record_start_transfer_idempotent() {
+        let mut req = Request::new();
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.record_start_transfer();
+        let first = req.timings().start_transfer;
+        std::thread::sleep(Duration::from_millis(1));
+        req.record_start_transfer();
+        // Second call should not overwrite
+        assert_eq!(req.timings().start_transfer, first);
+    }
+
+    // -----------------------------------------------------------------------
+    // Full lifecycle test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_full_request_lifecycle() {
+        let mut req = Request::new();
+        assert_eq!(req.state(), RequestState::Idle);
+
+        // Prepare
+        req.prepare(&TransferConfig::default()).unwrap();
+        assert_eq!(req.state(), RequestState::Connected);
+        assert!(req.want_send());
+        assert!(req.want_recv());
+
+        // Send headers
+        req.send_headers().unwrap();
+        assert_eq!(req.state(), RequestState::Sending);
+
+        // Send body
+        req.send_body(b"request body").unwrap();
+        assert_eq!(req.bytes_sent(), 12);
+
+        // Receive headers
+        let _hdrs = req.receive_headers().unwrap();
+        assert_eq!(req.state(), RequestState::Receiving);
+
+        // Push some received data and read it
+        req.push_received_data(b"response body").unwrap();
+        let mut buf = [0u8; 64];
+        let n = req.receive_body(&mut buf).unwrap();
+        assert_eq!(n, 13);
+        assert_eq!(&buf[..13], b"response body");
+
+        // Complete
+        req.complete().unwrap();
+        assert_eq!(req.state(), RequestState::Complete);
+        assert!(!req.want_send());
+        assert!(!req.want_recv());
+
+        // Reset for reuse
+        req.reset();
+        assert_eq!(req.state(), RequestState::Idle);
+        assert_eq!(req.bytes_sent(), 0);
+        assert_eq!(req.bytes_received(), 0);
+    }
+
+    #[test]
+    fn test_prepare_after_reset_cycle() {
+        let mut req = Request::new();
+        // First cycle
+        req.prepare(&TransferConfig::default()).unwrap();
+        req.send_headers().unwrap();
+        req.receive_headers().unwrap();
+        req.complete().unwrap();
+        req.reset();
+
+        // Second cycle should work
+        req.prepare(&TransferConfig::default()).unwrap();
+        assert_eq!(req.state(), RequestState::Connected);
+    }
+}

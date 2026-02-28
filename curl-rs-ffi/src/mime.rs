@@ -713,3 +713,388 @@ pub unsafe extern "C" fn curl_mime_headers(
 
     CURLE_OK
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    // -----------------------------------------------------------------------
+    // Constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn curl_zero_terminated_is_max_size_t() {
+        assert_eq!(CURL_ZERO_TERMINATED, usize::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // error_to_code helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_to_code_bad_function_argument() {
+        let code = error_to_code(CurlError::BadFunctionArgument);
+        assert_eq!(code, CURLE_BAD_FUNCTION_ARGUMENT);
+    }
+
+    #[test]
+    fn error_to_code_out_of_memory() {
+        let code = error_to_code(CurlError::OutOfMemory);
+        assert_eq!(code, CURLE_OUT_OF_MEMORY);
+    }
+
+    #[test]
+    fn error_to_code_other_maps_to_bad_arg() {
+        let code = error_to_code(CurlError::CouldntConnect);
+        assert_eq!(code, CURLE_BAD_FUNCTION_ARGUMENT);
+    }
+
+    // -----------------------------------------------------------------------
+    // result_to_code helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn result_to_code_ok() {
+        let code = result_to_code(Ok(()));
+        assert_eq!(code, CURLE_OK);
+    }
+
+    #[test]
+    fn result_to_code_err() {
+        let code = result_to_code(Err(CurlError::OutOfMemory));
+        assert_eq!(code, CURLE_OUT_OF_MEMORY);
+    }
+
+    // -----------------------------------------------------------------------
+    // c_str_opt helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn c_str_opt_null_returns_none() {
+        // SAFETY: null is a valid input for c_str_opt (returns None).
+        let result = unsafe { c_str_opt(ptr::null()) };
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn c_str_opt_valid_string() {
+        let s = CString::new("hello").unwrap();
+        // SAFETY: s is a valid null-terminated C string.
+        let result = unsafe { c_str_opt(s.as_ptr()) };
+        assert_eq!(result, Some("hello"));
+    }
+
+    #[test]
+    fn c_str_opt_empty_string() {
+        let s = CString::new("").unwrap();
+        let result = unsafe { c_str_opt(s.as_ptr()) };
+        assert_eq!(result, Some(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_mime_init / curl_mime_free
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mime_init_null_easy_returns_null() {
+        // SAFETY: Passing null easy handle returns null.
+        let mime = unsafe { curl_mime_init(ptr::null_mut()) };
+        assert!(mime.is_null());
+    }
+
+    #[test]
+    fn mime_init_with_easy_handle() {
+        // Create a real easy handle via the FFI layer.
+        let easy = unsafe { crate::easy::curl_easy_init() };
+        assert!(!easy.is_null());
+
+        let mime = unsafe { curl_mime_init(easy) };
+        assert!(!mime.is_null());
+
+        // Clean up.
+        unsafe { curl_mime_free(mime) };
+        unsafe { crate::easy::curl_easy_cleanup(easy) };
+    }
+
+    #[test]
+    fn mime_free_null_is_noop() {
+        // SAFETY: Passing null to curl_mime_free is documented as a no-op.
+        unsafe { curl_mime_free(ptr::null_mut()) };
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_mime_addpart
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mime_addpart_null_returns_null() {
+        let part = unsafe { curl_mime_addpart(ptr::null_mut()) };
+        assert!(part.is_null());
+    }
+
+    #[test]
+    fn mime_addpart_returns_valid_part() {
+        let easy = unsafe { crate::easy::curl_easy_init() };
+        let mime = unsafe { curl_mime_init(easy) };
+        assert!(!mime.is_null());
+
+        let part = unsafe { curl_mime_addpart(mime) };
+        assert!(!part.is_null());
+
+        unsafe { curl_mime_free(mime) };
+        unsafe { crate::easy::curl_easy_cleanup(easy) };
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_mime_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mime_name_null_part_returns_error() {
+        let name = CString::new("field").unwrap();
+        let rc = unsafe { curl_mime_name(ptr::null_mut(), name.as_ptr()) };
+        assert_eq!(rc, CURLE_BAD_FUNCTION_ARGUMENT);
+    }
+
+    #[test]
+    fn mime_name_valid() {
+        let easy = unsafe { crate::easy::curl_easy_init() };
+        let mime = unsafe { curl_mime_init(easy) };
+        let part = unsafe { curl_mime_addpart(mime) };
+        let name = CString::new("field1").unwrap();
+
+        let rc = unsafe { curl_mime_name(part, name.as_ptr()) };
+        assert_eq!(rc, CURLE_OK);
+
+        unsafe { curl_mime_free(mime) };
+        unsafe { crate::easy::curl_easy_cleanup(easy) };
+    }
+
+    #[test]
+    fn mime_name_null_name_is_ok() {
+        let easy = unsafe { crate::easy::curl_easy_init() };
+        let mime = unsafe { curl_mime_init(easy) };
+        let part = unsafe { curl_mime_addpart(mime) };
+
+        let rc = unsafe { curl_mime_name(part, ptr::null()) };
+        assert_eq!(rc, CURLE_OK);
+
+        unsafe { curl_mime_free(mime) };
+        unsafe { crate::easy::curl_easy_cleanup(easy) };
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_mime_data
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mime_data_null_part_returns_error() {
+        let data = CString::new("hello").unwrap();
+        let rc = unsafe {
+            curl_mime_data(ptr::null_mut(), data.as_ptr(), CURL_ZERO_TERMINATED)
+        };
+        assert_eq!(rc, CURLE_BAD_FUNCTION_ARGUMENT);
+    }
+
+    #[test]
+    fn mime_data_zero_terminated() {
+        let easy = unsafe { crate::easy::curl_easy_init() };
+        let mime = unsafe { curl_mime_init(easy) };
+        let part = unsafe { curl_mime_addpart(mime) };
+        let data = CString::new("body data").unwrap();
+
+        let rc = unsafe {
+            curl_mime_data(part, data.as_ptr(), CURL_ZERO_TERMINATED)
+        };
+        assert_eq!(rc, CURLE_OK);
+
+        unsafe { curl_mime_free(mime) };
+        unsafe { crate::easy::curl_easy_cleanup(easy) };
+    }
+
+    #[test]
+    fn mime_data_explicit_length() {
+        let easy = unsafe { crate::easy::curl_easy_init() };
+        let mime = unsafe { curl_mime_init(easy) };
+        let part = unsafe { curl_mime_addpart(mime) };
+        let bytes = b"binary data\x00with nulls";
+
+        let rc = unsafe {
+            curl_mime_data(part, bytes.as_ptr() as *const c_char, bytes.len())
+        };
+        assert_eq!(rc, CURLE_OK);
+
+        unsafe { curl_mime_free(mime) };
+        unsafe { crate::easy::curl_easy_cleanup(easy) };
+    }
+
+    #[test]
+    fn mime_data_null_data_clears() {
+        let easy = unsafe { crate::easy::curl_easy_init() };
+        let mime = unsafe { curl_mime_init(easy) };
+        let part = unsafe { curl_mime_addpart(mime) };
+
+        let rc = unsafe { curl_mime_data(part, ptr::null(), 0) };
+        assert_eq!(rc, CURLE_OK);
+
+        unsafe { curl_mime_free(mime) };
+        unsafe { crate::easy::curl_easy_cleanup(easy) };
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_mime_type
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mime_type_null_part_returns_error() {
+        let ctype = CString::new("text/plain").unwrap();
+        let rc = unsafe { curl_mime_type(ptr::null_mut(), ctype.as_ptr()) };
+        assert_eq!(rc, CURLE_BAD_FUNCTION_ARGUMENT);
+    }
+
+    #[test]
+    fn mime_type_valid() {
+        let easy = unsafe { crate::easy::curl_easy_init() };
+        let mime = unsafe { curl_mime_init(easy) };
+        let part = unsafe { curl_mime_addpart(mime) };
+        let ctype = CString::new("application/json").unwrap();
+
+        let rc = unsafe { curl_mime_type(part, ctype.as_ptr()) };
+        assert_eq!(rc, CURLE_OK);
+
+        unsafe { curl_mime_free(mime) };
+        unsafe { crate::easy::curl_easy_cleanup(easy) };
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_mime_filename
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mime_filename_null_part_returns_error() {
+        let fname = CString::new("file.txt").unwrap();
+        let rc = unsafe { curl_mime_filename(ptr::null_mut(), fname.as_ptr()) };
+        assert_eq!(rc, CURLE_BAD_FUNCTION_ARGUMENT);
+    }
+
+    #[test]
+    fn mime_filename_valid() {
+        let easy = unsafe { crate::easy::curl_easy_init() };
+        let mime = unsafe { curl_mime_init(easy) };
+        let part = unsafe { curl_mime_addpart(mime) };
+        let fname = CString::new("upload.bin").unwrap();
+
+        let rc = unsafe { curl_mime_filename(part, fname.as_ptr()) };
+        assert_eq!(rc, CURLE_OK);
+
+        unsafe { curl_mime_free(mime) };
+        unsafe { crate::easy::curl_easy_cleanup(easy) };
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_mime_encoder
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mime_encoder_null_part_returns_error() {
+        let enc = CString::new("base64").unwrap();
+        let rc = unsafe { curl_mime_encoder(ptr::null_mut(), enc.as_ptr()) };
+        assert_eq!(rc, CURLE_BAD_FUNCTION_ARGUMENT);
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_mime_headers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mime_headers_null_part_returns_error() {
+        let rc = unsafe {
+            curl_mime_headers(ptr::null_mut(), ptr::null_mut(), 0)
+        };
+        assert_eq!(rc, CURLE_BAD_FUNCTION_ARGUMENT);
+    }
+
+    #[test]
+    fn mime_headers_null_headers_clears() {
+        let easy = unsafe { crate::easy::curl_easy_init() };
+        let mime = unsafe { curl_mime_init(easy) };
+        let part = unsafe { curl_mime_addpart(mime) };
+
+        let rc = unsafe { curl_mime_headers(part, ptr::null_mut(), 0) };
+        assert_eq!(rc, CURLE_OK);
+
+        unsafe { curl_mime_free(mime) };
+        unsafe { crate::easy::curl_easy_cleanup(easy) };
+    }
+
+    // -----------------------------------------------------------------------
+    // curl_mime_subparts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mime_subparts_null_part_returns_error() {
+        let rc = unsafe { curl_mime_subparts(ptr::null_mut(), ptr::null_mut()) };
+        assert_eq!(rc, CURLE_BAD_FUNCTION_ARGUMENT);
+    }
+
+    // -----------------------------------------------------------------------
+    // Lifecycle: init → addpart → name → data → type → free
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mime_full_lifecycle() {
+        let easy = unsafe { crate::easy::curl_easy_init() };
+        assert!(!easy.is_null());
+
+        let mime = unsafe { curl_mime_init(easy) };
+        assert!(!mime.is_null());
+
+        let part = unsafe { curl_mime_addpart(mime) };
+        assert!(!part.is_null());
+
+        let name = CString::new("file").unwrap();
+        assert_eq!(unsafe { curl_mime_name(part, name.as_ptr()) }, CURLE_OK);
+
+        let data = CString::new("file content here").unwrap();
+        assert_eq!(
+            unsafe { curl_mime_data(part, data.as_ptr(), CURL_ZERO_TERMINATED) },
+            CURLE_OK,
+        );
+
+        let ctype = CString::new("text/plain").unwrap();
+        assert_eq!(unsafe { curl_mime_type(part, ctype.as_ptr()) }, CURLE_OK);
+
+        let fname = CString::new("document.txt").unwrap();
+        assert_eq!(
+            unsafe { curl_mime_filename(part, fname.as_ptr()) },
+            CURLE_OK,
+        );
+
+        // Add a second part.
+        let part2 = unsafe { curl_mime_addpart(mime) };
+        assert!(!part2.is_null());
+
+        let name2 = CString::new("field2").unwrap();
+        assert_eq!(unsafe { curl_mime_name(part2, name2.as_ptr()) }, CURLE_OK);
+
+        // Clean up.
+        unsafe { curl_mime_free(mime) };
+        unsafe { crate::easy::curl_easy_cleanup(easy) };
+    }
+
+    // -----------------------------------------------------------------------
+    // slist_from_c — with null input
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn slist_from_c_null_returns_empty() {
+        // SAFETY: Passing null returns an empty SList.
+        let slist = unsafe { slist_from_c(ptr::null()) };
+        assert!(slist.is_empty());
+    }
+}

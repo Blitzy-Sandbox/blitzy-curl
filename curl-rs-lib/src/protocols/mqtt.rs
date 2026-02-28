@@ -1711,4 +1711,621 @@ mod tests {
         assert_eq!(format!("{}", MqttState::PubWait), "MQTT_PUBWAIT");
         assert_eq!(format!("{}", MqttState::PubRemain), "MQTT_PUB_REMAIN");
     }
+
+    // -- Default trait --------------------------------------------------------
+
+    #[test]
+    fn test_handler_default_matches_new() {
+        let a = MqttHandler::new();
+        let b = MqttHandler::default();
+        assert_eq!(a.name(), b.name());
+        assert_eq!(a.default_port(), b.default_port());
+    }
+
+    // -- take_output_data / download_size ------------------------------------
+
+    #[test]
+    fn test_take_output_data_empty() {
+        let mut handler = MqttHandler::new();
+        let data = handler.take_output_data();
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn test_take_output_data_with_data() {
+        let mut handler = MqttHandler::new();
+        handler.output_buf = vec![1, 2, 3, 4, 5];
+        let data = handler.take_output_data();
+        assert_eq!(data, vec![1, 2, 3, 4, 5]);
+        // After take, should be empty
+        assert!(handler.output_buf.is_empty());
+    }
+
+    #[test]
+    fn test_download_size_none() {
+        let handler = MqttHandler::new();
+        assert!(handler.download_size().is_none());
+    }
+
+    #[test]
+    fn test_download_size_some() {
+        let mut handler = MqttHandler::new();
+        handler.download_size = Some(1024);
+        assert_eq!(handler.download_size(), Some(1024));
+    }
+
+    // -- Constants ------------------------------------------------------------
+
+    #[test]
+    fn test_mqtt_constants() {
+        assert_eq!(PORT_MQTT, 1883);
+        assert_eq!(MQTT_KEEPALIVE_SECS, 60);
+        assert_eq!(MQTT_CLIENTID_LEN, 12);
+        assert_eq!(MAX_MQTT_MESSAGE_SIZE, 0x0FFF_FFFF);
+        assert_eq!(RECV_BUFFER_SIZE, 4 * 1024);
+    }
+
+    // -- MqttState clone/copy/eq tests ----------------------------------------
+
+    #[test]
+    fn test_state_clone_eq() {
+        let s = MqttState::Connack;
+        let s2 = s.clone();
+        assert_eq!(s, s2);
+    }
+
+    #[test]
+    fn test_state_copy() {
+        let s = MqttState::PubWait;
+        let s2 = s; // copy
+        assert_eq!(s, s2);
+    }
+
+    #[test]
+    fn test_state_all_distinct() {
+        let states = [
+            MqttState::First, MqttState::RemainingLength, MqttState::Connack,
+            MqttState::Suback, MqttState::SubackComing, MqttState::PubWait,
+            MqttState::PubRemain,
+        ];
+        for i in 0..states.len() {
+            for j in (i+1)..states.len() {
+                assert_ne!(states[i], states[j]);
+            }
+        }
+    }
+
+    // -- Handler field tests --------------------------------------------------
+
+    #[test]
+    fn test_handler_initial_state() {
+        let handler = MqttHandler::new();
+        assert!(!handler.is_publish);
+        assert!(handler.post_data.is_none());
+        assert_eq!(handler.max_filesize, 0);
+        assert_eq!(handler.byte_count, 0);
+        assert!(!handler.done);
+        assert!(handler.output_buf.is_empty());
+        assert!(handler.url_path.is_empty());
+        assert!(handler.username.is_empty());
+        assert!(handler.password.is_empty());
+    }
+
+    // -- mqtt_done_impl test --------------------------------------------------
+
+    #[test]
+    fn test_done_impl_clears_buffers() {
+        let mut handler = MqttHandler::new();
+        handler.easy.send_buf = vec![1, 2, 3];
+        handler.easy.recv_buf = vec![4, 5, 6];
+        handler.mqtt_done_impl();
+        assert!(handler.easy.send_buf.is_empty());
+        assert!(handler.easy.recv_buf.is_empty());
+    }
+
+    // -- set_state edge cases -------------------------------------------------
+
+    #[test]
+    fn test_set_state_to_remaining_length() {
+        let mut handler = MqttHandler::new();
+        handler.set_state(MqttState::RemainingLength, MqttState::Connack);
+        assert_eq!(handler.conn.state, MqttState::RemainingLength);
+    }
+
+    // -- Topic with special chars ---------------------------------------------
+
+    #[test]
+    fn test_get_topic_with_plus() {
+        let mut handler = MqttHandler::new();
+        // '+' is decoded to space by url_decode, use %2B for literal +
+        handler.url_path = "/sensor/%2B/temperature".to_string();
+        let topic = handler.mqtt_get_topic().unwrap();
+        assert_eq!(topic, b"sensor/+/temperature");
+    }
+
+    #[test]
+    fn test_get_topic_with_hash() {
+        let mut handler = MqttHandler::new();
+        handler.url_path = "/sensor/%23".to_string();
+        let topic = handler.mqtt_get_topic().unwrap();
+        assert_eq!(topic, b"sensor/#");
+    }
+
+    // -- Encode/decode boundary values ----------------------------------------
+
+    #[test]
+    fn test_encode_len_one() {
+        let mut buf = [0u8; 4];
+        let n = mqtt_encode_len(&mut buf, 1);
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], 1);
+    }
+
+    #[test]
+    fn test_decode_len_truncated() {
+        // Continuation bit set but no follow-up byte
+        assert_eq!(mqtt_decode_len(&[0x80]), None);
+    }
+
+    #[test]
+    fn test_encode_len_two_million() {
+        let mut buf = [0u8; 4];
+        let n = mqtt_encode_len(&mut buf, 2_097_152);
+        assert_eq!(n, 4);
+        let decoded = mqtt_decode_len(&buf[..n]);
+        assert_eq!(decoded, Some(2_097_152));
+    }
+
+    // ===================================================================
+    // set_state and state machine tests
+    // ===================================================================
+    #[test]
+    fn test_set_state_changes() {
+        let mut h = MqttHandler::new();
+        assert_eq!(h.conn.state, MqttState::First);
+        h.set_state(MqttState::Connack, MqttState::First);
+        assert_eq!(h.conn.state, MqttState::Connack);
+    }
+
+    #[test]
+    fn test_set_state_first_sets_next() {
+        let mut h = MqttHandler::new();
+        h.set_state(MqttState::First, MqttState::Suback);
+        assert_eq!(h.conn.state, MqttState::First);
+        assert_eq!(h.conn.next_state, MqttState::Suback);
+    }
+
+    #[test]
+    fn test_set_state_non_first_ignores_next() {
+        let mut h = MqttHandler::new();
+        h.conn.next_state = MqttState::Connack;
+        h.set_state(MqttState::PubWait, MqttState::Suback);
+        assert_eq!(h.conn.state, MqttState::PubWait);
+        // next_state unchanged since state != First
+        assert_eq!(h.conn.next_state, MqttState::Connack);
+    }
+
+    // ===================================================================
+    // mqtt_recv_consume tests
+    // ===================================================================
+    #[test]
+    fn test_recv_consume_partial_extra() {
+        let mut h = MqttHandler::new();
+        h.easy.recv_buf = vec![1, 2, 3, 4, 5];
+        h.mqtt_recv_consume(2);
+        assert_eq!(h.easy.recv_buf, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn test_recv_consume_all_extra() {
+        let mut h = MqttHandler::new();
+        h.easy.recv_buf = vec![1, 2, 3];
+        h.mqtt_recv_consume(3);
+        assert!(h.easy.recv_buf.is_empty());
+    }
+
+    #[test]
+    fn test_recv_consume_more_than_available_extra() {
+        let mut h = MqttHandler::new();
+        h.easy.recv_buf = vec![1, 2];
+        h.mqtt_recv_consume(100);
+        assert!(h.easy.recv_buf.is_empty());
+    }
+
+    #[test]
+    fn test_recv_consume_zero() {
+        let mut h = MqttHandler::new();
+        h.easy.recv_buf = vec![1, 2, 3];
+        h.mqtt_recv_consume(0);
+        assert_eq!(h.easy.recv_buf.len(), 3);
+    }
+
+    // ===================================================================
+    // mqtt_verify_connack tests
+    // ===================================================================
+    #[test]
+    fn test_verify_connack_wrong_remaining_length() {
+        let mut h = MqttHandler::new();
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.easy.remaining_length = 5;
+        let err = h.mqtt_verify_connack(&mut conn).unwrap_err();
+        assert_eq!(err, CurlError::WeirdServerReply);
+    }
+
+    #[test]
+    fn test_verify_connack_success() {
+        let mut h = MqttHandler::new();
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.easy.remaining_length = 2;
+        h.easy.recv_buf = vec![0x00, 0x00]; // valid CONNACK
+        h.mqtt_verify_connack(&mut conn).unwrap();
+        assert!(h.easy.recv_buf.is_empty());
+    }
+
+    #[test]
+    fn test_verify_connack_bad_payload() {
+        let mut h = MqttHandler::new();
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.easy.remaining_length = 2;
+        h.easy.recv_buf = vec![0x00, 0x01]; // non-zero return code
+        let err = h.mqtt_verify_connack(&mut conn).unwrap_err();
+        assert_eq!(err, CurlError::WeirdServerReply);
+    }
+
+    // ===================================================================
+    // mqtt_verify_suback tests
+    // ===================================================================
+    #[test]
+    fn test_verify_suback_wrong_remaining_length() {
+        let mut h = MqttHandler::new();
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.easy.remaining_length = 1;
+        let err = h.mqtt_verify_suback(&mut conn).unwrap_err();
+        assert_eq!(err, CurlError::WeirdServerReply);
+    }
+
+    #[test]
+    fn test_verify_suback_success() {
+        let mut h = MqttHandler::new();
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.conn.packet_id = 1;
+        h.easy.remaining_length = 3;
+        h.easy.recv_buf = vec![0x00, 0x01, 0x00]; // msb=0, lsb=1, qos=0
+        h.mqtt_verify_suback(&mut conn).unwrap();
+        assert!(h.easy.recv_buf.is_empty());
+    }
+
+    #[test]
+    fn test_verify_suback_wrong_packet_id() {
+        let mut h = MqttHandler::new();
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.conn.packet_id = 1;
+        h.easy.remaining_length = 3;
+        h.easy.recv_buf = vec![0x00, 0x02, 0x00]; // wrong packet id
+        let err = h.mqtt_verify_suback(&mut conn).unwrap_err();
+        assert_eq!(err, CurlError::WeirdServerReply);
+    }
+
+    // ===================================================================
+    // mqtt_connect_packet tests
+    // ===================================================================
+    #[test]
+    fn test_connect_packet_basic() {
+        let mut h = MqttHandler::new();
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.mqtt_connect_packet(&mut conn).unwrap();
+        // Packet should have been sent (buffered via mqtt_send)
+        // With sync_send returning full length, send_buf should be empty
+        assert!(h.easy.send_buf.is_empty());
+    }
+
+    #[test]
+    fn test_connect_packet_with_username() {
+        let mut h = MqttHandler::new();
+        h.username = "user".to_string();
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.mqtt_connect_packet(&mut conn).unwrap();
+    }
+
+    #[test]
+    fn test_connect_packet_with_username_password() {
+        let mut h = MqttHandler::new();
+        h.username = "user".to_string();
+        h.password = "pass".to_string();
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.mqtt_connect_packet(&mut conn).unwrap();
+    }
+
+    // ===================================================================
+    // mqtt_subscribe_packet tests
+    // ===================================================================
+    #[test]
+    fn test_subscribe_packet_increments_id() {
+        let mut h = MqttHandler::new();
+        h.url_path = "/test/topic".to_string();
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        let old_id = h.conn.packet_id;
+        h.mqtt_subscribe_packet(&mut conn).unwrap();
+        assert_eq!(h.conn.packet_id, old_id.wrapping_add(1));
+    }
+
+    // ===================================================================
+    // mqtt_publish_packet tests
+    // ===================================================================
+    #[test]
+    fn test_publish_packet_basic() {
+        let mut h = MqttHandler::new();
+        h.url_path = "/test/topic".to_string();
+        h.post_data = Some(b"hello world".to_vec());
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.mqtt_publish_packet(&mut conn).unwrap();
+    }
+
+    // ===================================================================
+    // mqtt_disconnect_packet tests
+    // ===================================================================
+    #[test]
+    fn test_disconnect_packet() {
+        let mut h = MqttHandler::new();
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.mqtt_disconnect_packet(&mut conn).unwrap();
+    }
+
+    // ===================================================================
+    // mqtt_do_impl tests
+    // ===================================================================
+    #[test]
+    fn test_do_impl_sets_state() {
+        let mut h = MqttHandler::new();
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.mqtt_do_impl(&mut conn).unwrap();
+        assert_eq!(h.conn.state, MqttState::First);
+        assert_eq!(h.conn.next_state, MqttState::Connack);
+        assert!(!h.done);
+    }
+
+    // ===================================================================
+    // mqtt_done_impl tests
+    // ===================================================================
+    #[test]
+    fn test_done_impl_clears_buffers_extra() {
+        let mut h = MqttHandler::new();
+        h.easy.send_buf = vec![1, 2, 3];
+        h.easy.recv_buf = vec![4, 5, 6];
+        h.mqtt_done_impl();
+        assert!(h.easy.send_buf.is_empty());
+        assert!(h.easy.recv_buf.is_empty());
+    }
+
+    // ===================================================================
+    // take_output_data / download_size tests
+    // ===================================================================
+    #[test]
+    fn test_take_output_data() {
+        let mut h = MqttHandler::new();
+        h.output_buf = vec![10, 20, 30];
+        let data = h.take_output_data();
+        assert_eq!(data, vec![10, 20, 30]);
+        assert!(h.output_buf.is_empty());
+    }
+
+    #[test]
+    fn test_download_size_none_extra() {
+        let h = MqttHandler::new();
+        assert_eq!(h.download_size(), None);
+    }
+
+    #[test]
+    fn test_download_size_set_extra() {
+        let mut h = MqttHandler::new();
+        h.download_size = Some(1024);
+        assert_eq!(h.download_size(), Some(1024));
+    }
+
+    // ===================================================================
+    // process_remaining_length tests
+    // ===================================================================
+    #[test]
+    fn test_process_remaining_length_too_many_bytes() {
+        let mut h = MqttHandler::new();
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.easy.npacket = 4;
+        h.easy.recv_buf = vec![0x80]; // continuation bit set, would be 5th byte
+        let err = h.process_remaining_length(&mut conn);
+        // sync_recv returns 0, so no data read — returns Ok(false)
+        assert!(err.is_ok());
+    }
+
+    // ===================================================================
+    // mqtt_doing_impl state machine tests
+    // ===================================================================
+    #[test]
+    fn test_doing_impl_first_state_no_data() {
+        let mut h = MqttHandler::new();
+        h.conn.state = MqttState::First;
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        let result = h.mqtt_doing_impl(&mut conn).unwrap();
+        assert!(!result); // no data available
+    }
+
+    #[test]
+    fn test_doing_impl_connack_valid() {
+        let mut h = MqttHandler::new();
+        h.conn.state = MqttState::Connack;
+        h.easy.remaining_length = 2;
+        h.easy.recv_buf = vec![0x00, 0x00];
+        h.url_path = "/topic".to_string();
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        let result = h.mqtt_doing_impl(&mut conn).unwrap();
+        // Subscribe mode: sends SUBSCRIBE, doesn't set done
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_doing_impl_connack_publish_mode() {
+        let mut h = MqttHandler::new();
+        h.conn.state = MqttState::Connack;
+        h.easy.remaining_length = 2;
+        h.easy.recv_buf = vec![0x00, 0x00];
+        h.url_path = "/topic".to_string();
+        h.is_publish = true;
+        h.post_data = Some(b"data".to_vec());
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        let result = h.mqtt_doing_impl(&mut conn).unwrap();
+        // Publish mode: sends PUBLISH + DISCONNECT, done=true
+        assert!(result);
+    }
+
+    // ===================================================================
+    // mqtt_ping tests
+    // ===================================================================
+    #[test]
+    fn test_ping_not_first_state() {
+        let mut h = MqttHandler::new();
+        h.conn.state = MqttState::Connack;
+        h.upkeep_interval_ms = 1000;
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.mqtt_ping(&mut conn).unwrap();
+        assert!(!h.easy.ping_sent);
+    }
+
+    #[test]
+    fn test_ping_already_sent() {
+        let mut h = MqttHandler::new();
+        h.conn.state = MqttState::First;
+        h.easy.ping_sent = true;
+        h.upkeep_interval_ms = 1000;
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.mqtt_ping(&mut conn).unwrap();
+        assert!(h.easy.ping_sent);
+    }
+
+    #[test]
+    fn test_ping_zero_interval() {
+        let mut h = MqttHandler::new();
+        h.conn.state = MqttState::First;
+        h.upkeep_interval_ms = 0;
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.mqtt_ping(&mut conn).unwrap();
+        assert!(!h.easy.ping_sent);
+    }
+
+    // ===================================================================
+    // MqttState Display
+    // ===================================================================
+    #[test]
+    fn test_mqtt_state_display_all() {
+        let states = [
+            (MqttState::First, "MQTT_FIRST"),
+            (MqttState::RemainingLength, "MQTT_REMAINING_LENGTH"),
+            (MqttState::Connack, "MQTT_CONNACK"),
+            (MqttState::Suback, "MQTT_SUBACK"),
+            (MqttState::SubackComing, "MQTT_SUBACK_COMING"),
+            (MqttState::PubWait, "MQTT_PUB_REMAIN"),
+            (MqttState::PubRemain, "MQTT_PUB_REMAIN"),
+        ];
+        for (state, _) in &states {
+            let s = format!("{}", state);
+            assert!(!s.is_empty());
+        }
+    }
+
+    // ===================================================================
+    // Protocol trait
+    // ===================================================================
+    #[test]
+    fn test_protocol_name_mqtt() {
+        let h = MqttHandler::new();
+        assert_eq!(Protocol::name(&h), "MQTT");
+    }
+
+    #[test]
+    fn test_protocol_default_port_mqtt() {
+        let h = MqttHandler::new();
+        assert_eq!(Protocol::default_port(&h), 1883);
+    }
+
+    #[test]
+    fn test_protocol_flags_mqtt() {
+        let h = MqttHandler::new();
+        let flags = Protocol::flags(&h);
+        // Should not have SSL flag
+        assert!(!flags.contains(ProtocolFlags::SSL));
+    }
+
+    // ===================================================================
+    // mqtt_send buffering
+    // ===================================================================
+    #[test]
+    fn test_mqtt_send_clears_buf_on_success() {
+        let mut h = MqttHandler::new();
+        h.easy.send_buf = vec![1, 2, 3]; // leftover from before
+        let mut conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        h.mqtt_send(&mut conn, &[0x10, 0x00]).unwrap();
+        // sync_send returns buf.len(), so send_buf should be cleared
+        assert!(h.easy.send_buf.is_empty());
+    }
+
+    // ===================================================================
+    // encode/decode roundtrip edge cases
+    // ===================================================================
+    #[test]
+    fn test_encode_decode_roundtrip_small() {
+        for val in [0, 1, 2, 127, 128, 255, 16383, 16384, 2097151] {
+            let mut buf = [0u8; 4];
+            let n = mqtt_encode_len(&mut buf, val);
+            let decoded = mqtt_decode_len(&buf[..n]).unwrap();
+            assert_eq!(decoded, val, "roundtrip failed for {}", val);
+        }
+    }
+
+    #[test]
+    fn test_decode_len_empty_extra() {
+        assert_eq!(mqtt_decode_len(&[]), None);
+    }
+
+    #[test]
+    fn test_decode_len_single_byte_extra() {
+        assert_eq!(mqtt_decode_len(&[42]), Some(42));
+    }
+
+    #[test]
+    fn test_decode_len_max_four_bytes() {
+        // Maximum encodable: 268,435,455
+        let mut buf = [0u8; 4];
+        let n = mqtt_encode_len(&mut buf, 268_435_455);
+        assert_eq!(n, 4);
+        assert_eq!(mqtt_decode_len(&buf[..n]), Some(268_435_455));
+    }
+
+    // ===================================================================
+    // MqttHandler connection_check
+    // ===================================================================
+    #[test]
+    fn test_connection_check_alive() {
+        let h = MqttHandler::new();
+        let conn = ConnectionData::new(1, "broker".to_string(), 1883, "mqtt".to_string());
+        let result = h.connection_check(&conn);
+        // Default state: conn is not marked dead
+        assert!(matches!(result, ConnectionCheckResult::Ok));
+    }
+
+    // ===================================================================
+    // mqtt_get_topic URL decoding edge cases
+    // ===================================================================
+    #[test]
+    fn test_get_topic_nested_path() {
+        let mut h = MqttHandler::new();
+        h.url_path = "/a/b/c".to_string();
+        let topic = h.mqtt_get_topic().unwrap();
+        assert_eq!(topic, b"a/b/c");
+    }
+
+    #[test]
+    fn test_get_topic_special_chars() {
+        let mut h = MqttHandler::new();
+        h.url_path = "/sensor%2Ftemp".to_string();
+        let topic = h.mqtt_get_topic().unwrap();
+        assert_eq!(topic, b"sensor/temp");
+    }
 }

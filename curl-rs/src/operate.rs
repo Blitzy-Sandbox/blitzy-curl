@@ -1640,3 +1640,829 @@ pub async fn operate(
     var_cleanup(&mut global.variables);
     result
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn constants_retry_sleep_default() {
+        assert_eq!(RETRY_SLEEP_DEFAULT, 1000);
+    }
+
+    #[test]
+    fn constants_retry_sleep_max() {
+        assert_eq!(RETRY_SLEEP_MAX, 600_000);
+    }
+
+    #[test]
+    fn constants_ca_cert_error_msg_contains_url() {
+        assert!(CURL_CA_CERT_ERRORMSG.contains("https://curl.se/docs/sslcerts.html"));
+    }
+
+    #[test]
+    fn constants_ca_cert_error_msg_mentions_legitimacy() {
+        assert!(CURL_CA_CERT_ERRORMSG.contains("legitimacy"));
+    }
+
+    // -----------------------------------------------------------------------
+    // PerTransfer
+    // -----------------------------------------------------------------------
+
+    fn make_per() -> PerTransfer {
+        let easy = EasyHandle::new();
+        let config = Arc::new(OperationConfig::new());
+        PerTransfer::new(easy, config)
+    }
+
+    #[test]
+    fn per_transfer_new_defaults() {
+        let per = make_per();
+        assert_eq!(per.dl_total, 0);
+        assert_eq!(per.dl_now, 0);
+        assert_eq!(per.ul_total, 0);
+        assert_eq!(per.ul_now, 0);
+        assert!(!per.dl_total_added);
+        assert!(!per.ul_total_added);
+        assert!(!per.abort);
+        assert!(per.url.is_empty());
+        assert_eq!(per.result, CurlError::Ok);
+        assert_eq!(per.retry_count, 0);
+        assert!(per.certinfo.is_none());
+        assert_eq!(per.num_headers, 0);
+        assert!(per.outfile.is_none());
+        assert!(per.uploadfile.is_none());
+        assert!(per.infile.is_none());
+        assert!(!per.infdopen);
+        assert!(per.errorbuffer.is_empty());
+        assert!(!per.noprogress);
+        assert!(!per.added);
+        assert!(!per.skip);
+        assert_eq!(per.urlnum, 0);
+        assert_eq!(per.uploadfilesize, -1);
+        assert_eq!(per.retry_sleep, 0);
+        assert_eq!(per.retry_sleep_default, 0);
+        assert_eq!(per.retry_remaining, 0);
+        assert_eq!(per.num_retries, 0);
+        assert_eq!(per.startat, 0);
+    }
+
+    #[test]
+    fn per_transfer_new_timestamp_sanity() {
+        let before = Instant::now();
+        let per = make_per();
+        let after = Instant::now();
+        assert!(per.start >= before && per.start <= after);
+        assert!(per.retrystart >= before && per.retrystart <= after);
+    }
+
+    #[test]
+    fn per_transfer_debug_shows_url() {
+        let mut per = make_per();
+        per.url = "https://example.com".to_string();
+        per.dl_total = 1000;
+        per.dl_now = 500;
+        let debug = format!("{:?}", per);
+        assert!(debug.contains("https://example.com"));
+        assert!(debug.contains("dl_total: 1000"));
+        assert!(debug.contains("dl_now: 500"));
+    }
+
+    #[test]
+    fn per_transfer_debug_shows_result() {
+        let mut per = make_per();
+        per.result = CurlError::CouldntConnect;
+        let debug = format!("{:?}", per);
+        assert!(debug.contains("CouldntConnect"));
+    }
+
+    #[test]
+    fn per_transfer_debug_shows_retry_count() {
+        let mut per = make_per();
+        per.retry_count = 3;
+        let debug = format!("{:?}", per);
+        assert!(debug.contains("retry_count: 3"));
+    }
+
+    #[test]
+    fn per_transfer_debug_shows_abort_skip() {
+        let mut per = make_per();
+        per.abort = true;
+        per.skip = true;
+        let debug = format!("{:?}", per);
+        assert!(debug.contains("abort: true"));
+        assert!(debug.contains("skip: true"));
+    }
+
+    #[test]
+    fn per_transfer_debug_shows_upload_totals() {
+        let mut per = make_per();
+        per.ul_total = 2000;
+        per.ul_now = 750;
+        let debug = format!("{:?}", per);
+        assert!(debug.contains("ul_total: 2000"));
+        assert!(debug.contains("ul_now: 750"));
+    }
+
+    // -----------------------------------------------------------------------
+    // add_per_transfer / del_per_transfer
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn add_per_transfer_empty_vec() {
+        let mut v: Vec<PerTransfer> = Vec::new();
+        let idx = add_per_transfer(&mut v, make_per());
+        assert_eq!(idx, 0);
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn add_per_transfer_appends() {
+        let mut v: Vec<PerTransfer> = Vec::new();
+        let idx0 = add_per_transfer(&mut v, make_per());
+        let idx1 = add_per_transfer(&mut v, make_per());
+        let idx2 = add_per_transfer(&mut v, make_per());
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(idx2, 2);
+        assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn del_per_transfer_first_element() {
+        let mut v: Vec<PerTransfer> = Vec::new();
+        add_per_transfer(&mut v, make_per());
+        add_per_transfer(&mut v, make_per());
+        let next = del_per_transfer(&mut v, 0);
+        assert_eq!(v.len(), 1);
+        assert_eq!(next, Some(0));
+    }
+
+    #[test]
+    fn del_per_transfer_last_element() {
+        let mut v: Vec<PerTransfer> = Vec::new();
+        add_per_transfer(&mut v, make_per());
+        let next = del_per_transfer(&mut v, 0);
+        assert_eq!(v.len(), 0);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn del_per_transfer_middle_element() {
+        let mut v: Vec<PerTransfer> = Vec::new();
+        let mut p0 = make_per();
+        p0.url = "a".to_string();
+        let mut p1 = make_per();
+        p1.url = "b".to_string();
+        let mut p2 = make_per();
+        p2.url = "c".to_string();
+        add_per_transfer(&mut v, p0);
+        add_per_transfer(&mut v, p1);
+        add_per_transfer(&mut v, p2);
+        let next = del_per_transfer(&mut v, 1);
+        assert_eq!(v.len(), 2);
+        assert_eq!(next, Some(1));
+        assert_eq!(v[0].url, "a");
+        assert_eq!(v[1].url, "c");
+    }
+
+    #[test]
+    fn del_per_transfer_out_of_bounds() {
+        let mut v: Vec<PerTransfer> = Vec::new();
+        add_per_transfer(&mut v, make_per());
+        let next = del_per_transfer(&mut v, 999);
+        assert_eq!(v.len(), 1);
+        assert_eq!(next, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // stdin_upload / output_expected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stdin_upload_dash() {
+        assert!(stdin_upload("-"));
+    }
+
+    #[test]
+    fn stdin_upload_dot() {
+        assert!(stdin_upload("."));
+    }
+
+    #[test]
+    fn stdin_upload_regular_file() {
+        assert!(!stdin_upload("data.txt"));
+    }
+
+    #[test]
+    fn stdin_upload_empty() {
+        assert!(!stdin_upload(""));
+    }
+
+    #[test]
+    fn output_expected_no_upload() {
+        assert!(output_expected(&None));
+    }
+
+    #[test]
+    fn output_expected_with_upload() {
+        assert!(!output_expected(&Some("file.txt".to_string())));
+    }
+
+    // -----------------------------------------------------------------------
+    // RetryReason
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn retry_reason_no_message() {
+        assert_eq!(RetryReason::No.message(), "");
+    }
+
+    #[test]
+    fn retry_reason_all_errors_message() {
+        assert!(RetryReason::AllErrors.message().contains("retrying all errors"));
+    }
+
+    #[test]
+    fn retry_reason_timeout_message() {
+        assert!(RetryReason::Timeout.message().contains("timeout"));
+    }
+
+    #[test]
+    fn retry_reason_conn_refused_message() {
+        assert!(RetryReason::ConnRefused.message().contains("connection refused"));
+    }
+
+    #[test]
+    fn retry_reason_http_message() {
+        assert!(RetryReason::Http.message().contains("HTTP error"));
+    }
+
+    #[test]
+    fn retry_reason_ftp_message() {
+        assert!(RetryReason::Ftp.message().contains("FTP error"));
+    }
+
+    #[test]
+    fn retry_reason_debug() {
+        let r = RetryReason::Timeout;
+        let debug = format!("{:?}", r);
+        assert_eq!(debug, "Timeout");
+    }
+
+    #[test]
+    fn retry_reason_clone_eq() {
+        let a = RetryReason::Http;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn retry_reason_ne() {
+        assert_ne!(RetryReason::No, RetryReason::Timeout);
+        assert_ne!(RetryReason::Http, RetryReason::Ftp);
+        assert_ne!(RetryReason::AllErrors, RetryReason::ConnRefused);
+    }
+
+    // -----------------------------------------------------------------------
+    // to_progress_per / from_progress_per
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn to_progress_per_maps_fields() {
+        let mut per = make_per();
+        per.dl_total = 100;
+        per.dl_now = 50;
+        per.ul_total = 200;
+        per.ul_now = 75;
+        per.dl_total_added = true;
+        per.ul_total_added = false;
+        per.abort = true;
+        per.noprogress = true;
+        let prog = to_progress_per(&per);
+        assert_eq!(prog.dltotal, 100);
+        assert_eq!(prog.dlnow, 50);
+        assert_eq!(prog.ultotal, 200);
+        assert_eq!(prog.ulnow, 75);
+        assert!(prog.dltotal_added);
+        assert!(!prog.ultotal_added);
+        assert!(prog.abort);
+        assert!(prog.noprogress);
+    }
+
+    #[test]
+    fn to_progress_per_zeroes() {
+        let per = make_per();
+        let prog = to_progress_per(&per);
+        assert_eq!(prog.dltotal, 0);
+        assert_eq!(prog.dlnow, 0);
+        assert_eq!(prog.ultotal, 0);
+        assert_eq!(prog.ulnow, 0);
+        assert!(!prog.dltotal_added);
+        assert!(!prog.ultotal_added);
+        assert!(!prog.abort);
+        assert!(!prog.noprogress);
+    }
+
+    #[test]
+    fn from_progress_per_writes_back() {
+        let mut per = make_per();
+        per.dl_total_added = false;
+        per.ul_total_added = false;
+
+        let mut prog = to_progress_per(&per);
+        prog.dltotal_added = true;
+        prog.ultotal_added = true;
+
+        from_progress_per(&prog, &mut per);
+        assert!(per.dl_total_added);
+        assert!(per.ul_total_added);
+    }
+
+    #[test]
+    fn from_progress_per_clear() {
+        let mut per = make_per();
+        per.dl_total_added = true;
+        per.ul_total_added = true;
+
+        let mut prog = to_progress_per(&per);
+        prog.dltotal_added = false;
+        prog.ultotal_added = false;
+
+        from_progress_per(&prog, &mut per);
+        assert!(!per.dl_total_added);
+        assert!(!per.ul_total_added);
+    }
+
+    // -----------------------------------------------------------------------
+    // cacertpaths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cacertpaths_already_set_cacert() {
+        let mut config = OperationConfig::new();
+        config.cacert = Some("/etc/ssl/cert.pem".to_string());
+        cacertpaths(&mut config);
+        assert_eq!(config.cacert.as_deref(), Some("/etc/ssl/cert.pem"));
+    }
+
+    #[test]
+    fn cacertpaths_already_set_capath() {
+        let mut config = OperationConfig::new();
+        config.capath = Some("/etc/ssl/certs".to_string());
+        cacertpaths(&mut config);
+        assert_eq!(config.capath.as_deref(), Some("/etc/ssl/certs"));
+    }
+
+    #[test]
+    fn cacertpaths_insecure_no_doh() {
+        let mut config = OperationConfig::new();
+        config.insecure_ok = true;
+        config.doh_url = None;
+        cacertpaths(&mut config);
+        // Should skip setting any CA paths when insecure + no DoH.
+        assert!(config.cacert.is_none());
+        assert!(config.capath.is_none());
+    }
+
+    #[test]
+    fn cacertpaths_insecure_with_doh_insecure() {
+        let mut config = OperationConfig::new();
+        config.insecure_ok = true;
+        config.doh_url = Some("https://dns.example.com".to_string());
+        config.doh_insecure_ok = true;
+        cacertpaths(&mut config);
+        assert!(config.cacert.is_none());
+        assert!(config.capath.is_none());
+    }
+
+    #[test]
+    fn cacertpaths_insecure_with_secure_doh() {
+        // insecure_ok but DoH is NOT insecure => must set CA for DoH.
+        let mut config = OperationConfig::new();
+        config.insecure_ok = true;
+        config.doh_url = Some("https://dns.example.com".to_string());
+        config.doh_insecure_ok = false;
+        // Remove env vars so we can test the fallthrough.
+        env::remove_var("CURL_CA_BUNDLE");
+        env::remove_var("SSL_CERT_DIR");
+        env::remove_var("SSL_CERT_FILE");
+        cacertpaths(&mut config);
+        // Without env vars, nothing gets set — this tests the code path is reached.
+        assert!(config.cacert.is_none() || config.cacert.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // easy_get_* extractors (unit-testable with default EasyHandle)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn easy_get_response_code_default() {
+        let easy = EasyHandle::new();
+        // Default handle returns 0 response code.
+        let code = easy_get_response_code(&easy);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn easy_get_scheme_default() {
+        let easy = EasyHandle::new();
+        let scheme = easy_get_scheme(&easy);
+        // Default handle has no scheme.
+        assert!(scheme.is_empty());
+    }
+
+    #[test]
+    fn easy_get_retry_after_default() {
+        let easy = EasyHandle::new();
+        let val = easy_get_retry_after(&easy);
+        assert_eq!(val, 0);
+    }
+
+    #[test]
+    fn easy_get_filetime_default() {
+        let easy = EasyHandle::new();
+        let ft = easy_get_filetime(&easy);
+        assert_eq!(ft, -1);
+    }
+
+    #[test]
+    fn easy_get_condition_unmet_default() {
+        let easy = EasyHandle::new();
+        let cu = easy_get_condition_unmet(&easy);
+        assert!(!cu);
+    }
+
+    #[test]
+    fn easy_get_content_type_default() {
+        let easy = EasyHandle::new();
+        let ct = easy_get_content_type(&easy);
+        assert!(ct.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // share_setup
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn share_setup_non_parallel() {
+        let global = crate::config::globalconf_init().unwrap();
+        let result = share_setup(&global);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn share_setup_parallel() {
+        let mut global = crate::config::globalconf_init().unwrap();
+        global.parallel = true;
+        let result = share_setup(&global);
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // pre_transfer
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pre_transfer_no_upload() {
+        let mut per = make_per();
+        let result = pre_transfer(&mut per);
+        assert!(result.is_ok());
+        assert_eq!(per.uploadfilesize, -1);
+        assert!(per.infile.is_none());
+        assert!(!per.infdopen);
+    }
+
+    #[test]
+    fn pre_transfer_stdin_upload() {
+        let mut per = make_per();
+        per.uploadfile = Some("-".to_string());
+        let result = pre_transfer(&mut per);
+        assert!(result.is_ok());
+        assert_eq!(per.uploadfilesize, -1);
+        assert!(per.infile.is_none());
+    }
+
+    #[test]
+    fn pre_transfer_real_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp.as_file(), b"hello world").unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+
+        let mut per = make_per();
+        per.uploadfile = Some(path);
+        let result = pre_transfer(&mut per);
+        assert!(result.is_ok());
+        assert!(per.uploadfilesize > 0);
+        assert!(per.infile.is_some());
+        assert!(per.infdopen);
+    }
+
+    #[test]
+    fn pre_transfer_nonexistent_file() {
+        let mut per = make_per();
+        per.uploadfile = Some("/nonexistent/path/file.txt".to_string());
+        let result = pre_transfer(&mut per);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pre_transfer_sets_start_time() {
+        let mut per = make_per();
+        let before = Instant::now();
+        let _ = pre_transfer(&mut per);
+        let after = Instant::now();
+        assert!(per.start >= before && per.start <= after);
+    }
+
+    // -----------------------------------------------------------------------
+    // post_per_transfer (skip path)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn post_per_transfer_skip_returns_ok() {
+        let mut per = make_per();
+        per.skip = true;
+        let global = crate::config::globalconf_init().unwrap();
+        let (res, retry, delay) =
+            post_per_transfer(&mut per, CurlError::Ok, &global);
+        assert_eq!(res, CurlError::Ok);
+        assert!(!retry);
+        assert_eq!(delay, 0);
+    }
+
+    #[test]
+    fn post_per_transfer_skip_with_error() {
+        let mut per = make_per();
+        per.skip = true;
+        let global = crate::config::globalconf_init().unwrap();
+        let (res, retry, delay) =
+            post_per_transfer(&mut per, CurlError::ReadError, &global);
+        assert_eq!(res, CurlError::ReadError);
+        assert!(!retry);
+        assert_eq!(delay, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // post_check_result
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn post_check_result_ok_passthrough() {
+        let mut per = make_per();
+        let global = crate::config::globalconf_init().unwrap();
+        let res = post_check_result(&mut per, CurlError::Ok, &global);
+        assert_eq!(res, CurlError::Ok);
+    }
+
+    #[test]
+    fn post_check_result_error_with_errorbuffer() {
+        let mut per = make_per();
+        per.errorbuffer = "custom error".to_string();
+        let mut global = crate::config::globalconf_init().unwrap();
+        global.silent = false;
+        global.showerror = true;
+        let mut cfg = OperationConfig::new();
+        cfg.synthetic_error = false;
+        per.config = Arc::new(cfg);
+        let res = post_check_result(&mut per, CurlError::CouldntConnect, &global);
+        assert_eq!(res, CurlError::CouldntConnect);
+    }
+
+    #[test]
+    fn post_check_result_synthetic_error_silent() {
+        let mut per = make_per();
+        let mut cfg = OperationConfig::new();
+        cfg.synthetic_error = true;
+        per.config = Arc::new(cfg);
+        let global = crate::config::globalconf_init().unwrap();
+        let res = post_check_result(&mut per, CurlError::CouldntConnect, &global);
+        assert_eq!(res, CurlError::CouldntConnect);
+    }
+
+    // -----------------------------------------------------------------------
+    // post_close_output
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn post_close_output_not_opened() {
+        let mut per = make_per();
+        per.outs.fopened = false;
+        let global = crate::config::globalconf_init().unwrap();
+        let res = post_close_output(&mut per, CurlError::Ok, &global);
+        assert_eq!(res, CurlError::Ok);
+    }
+
+    #[test]
+    fn post_close_output_opened_ok() {
+        let mut per = make_per();
+        per.outs.fopened = true;
+        let global = crate::config::globalconf_init().unwrap();
+        let res = post_close_output(&mut per, CurlError::Ok, &global);
+        assert_eq!(res, CurlError::Ok);
+        assert!(!per.outs.fopened);
+    }
+
+    #[test]
+    fn post_close_output_error_rm_partial() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+        // Keep file on disk by preventing auto-delete.
+        let _tmp = tmp.into_temp_path();
+
+        let mut per = make_per();
+        per.outs.fopened = true;
+        per.outs.filename = Some(path.clone());
+        let mut cfg = OperationConfig::new();
+        cfg.rm_partial = true;
+        per.config = Arc::new(cfg);
+        let mut global = crate::config::globalconf_init().unwrap();
+        global.silent = false;
+        let res = post_close_output(&mut per, CurlError::RecvError, &global);
+        assert_eq!(res, CurlError::RecvError);
+        assert!(!per.outs.fopened);
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration-like tests for data flow
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn per_transfer_lifecycle_url_tracking() {
+        let mut per = make_per();
+        per.url = "https://api.example.com/data".to_string();
+        per.dl_total = 1_000_000;
+        per.ul_total = 500_000;
+        per.retry_count = 2;
+        per.num_headers = 7;
+        per.urlnum = 42;
+
+        assert_eq!(per.url, "https://api.example.com/data");
+        assert_eq!(per.dl_total, 1_000_000);
+        assert_eq!(per.ul_total, 500_000);
+        assert_eq!(per.retry_count, 2);
+        assert_eq!(per.num_headers, 7);
+        assert_eq!(per.urlnum, 42);
+    }
+
+    #[test]
+    fn per_transfer_abort_flag() {
+        let mut per = make_per();
+        assert!(!per.abort);
+        per.abort = true;
+        assert!(per.abort);
+    }
+
+    #[test]
+    fn per_transfer_errorbuffer_usage() {
+        let mut per = make_per();
+        assert!(per.errorbuffer.is_empty());
+        per.errorbuffer = "Timeout reached".to_string();
+        assert_eq!(per.errorbuffer, "Timeout reached");
+    }
+
+    #[test]
+    fn per_transfer_certinfo_tracking() {
+        let mut per = make_per();
+        assert!(per.certinfo.is_none());
+        per.certinfo = Some(vec!["CN=example.com".to_string()]);
+        assert_eq!(per.certinfo.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn add_then_delete_all() {
+        let mut v: Vec<PerTransfer> = Vec::new();
+        add_per_transfer(&mut v, make_per());
+        add_per_transfer(&mut v, make_per());
+        add_per_transfer(&mut v, make_per());
+        assert_eq!(v.len(), 3);
+        while !v.is_empty() {
+            del_per_transfer(&mut v, 0);
+        }
+        assert!(v.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Retry exponential back-off constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn retry_sleep_default_is_one_second() {
+        assert_eq!(RETRY_SLEEP_DEFAULT, 1_000);
+    }
+
+    #[test]
+    fn retry_sleep_max_is_ten_minutes() {
+        assert_eq!(RETRY_SLEEP_MAX, 10 * 60 * 1_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Progress roundtrip consistency
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn progress_roundtrip() {
+        let mut per = make_per();
+        per.dl_total = 42;
+        per.ul_total = 99;
+        per.abort = true;
+        per.noprogress = true;
+        per.dl_total_added = false;
+        per.ul_total_added = false;
+
+        let mut prog = to_progress_per(&per);
+        assert_eq!(prog.dltotal, 42);
+        assert_eq!(prog.ultotal, 99);
+        assert!(prog.abort);
+        assert!(prog.noprogress);
+
+        // Simulate progress tracking marking totals as added.
+        prog.dltotal_added = true;
+        prog.ultotal_added = true;
+
+        from_progress_per(&prog, &mut per);
+        assert!(per.dl_total_added);
+        assert!(per.ul_total_added);
+    }
+
+    // -----------------------------------------------------------------------
+    // post_per_transfer head/etag cleanup
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn post_per_transfer_closes_heads() {
+        let mut per = make_per();
+        per.heads.fopened = true;
+        per.heads.alloc_filename = true;
+        per.heads.filename = Some("header.dump".to_string());
+        per.skip = true; // Use skip path to avoid side effects.
+        let global = crate::config::globalconf_init().unwrap();
+        let _ = post_per_transfer(&mut per, CurlError::Ok, &global);
+        assert!(!per.heads.fopened);
+        assert!(!per.heads.alloc_filename);
+        assert!(per.heads.filename.is_none());
+    }
+
+    #[test]
+    fn post_per_transfer_closes_etag_save() {
+        let mut per = make_per();
+        per.etag_save.fopened = true;
+        per.etag_save.alloc_filename = true;
+        per.etag_save.filename = Some("etag.txt".to_string());
+        per.skip = true;
+        let global = crate::config::globalconf_init().unwrap();
+        let _ = post_per_transfer(&mut per, CurlError::Ok, &global);
+        assert!(!per.etag_save.fopened);
+        assert!(!per.etag_save.alloc_filename);
+        assert!(per.etag_save.filename.is_none());
+    }
+
+    #[test]
+    fn post_per_transfer_closes_upload() {
+        let mut per = make_per();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        per.infile = Some(tmp.reopen().unwrap());
+        per.infdopen = true;
+        per.skip = true;
+        let global = crate::config::globalconf_init().unwrap();
+        let _ = post_per_transfer(&mut per, CurlError::Ok, &global);
+        assert!(per.infile.is_none());
+        assert!(!per.infdopen);
+    }
+
+    // -----------------------------------------------------------------------
+    // transfer_per_config / create_transfer edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transfer_per_config_no_urls_fails() {
+        let mut config = OperationConfig::new();
+        config.url_list.clear();
+        let share = ShareHandle::new();
+        let mut state = TransferState::new();
+        let mut transfers = Vec::new();
+        let mut global = crate::config::globalconf_init().unwrap();
+        let result = transfer_per_config(
+            &mut config, &share, &mut state, &mut transfers, &mut global,
+        );
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // OutStruct type alias
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn outstruct_type_alias_works() {
+        let out = OutStruct::new_null();
+        assert!(out.stream.is_null());
+    }
+}

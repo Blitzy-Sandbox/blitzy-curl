@@ -2554,4 +2554,1375 @@ mod tests {
         let _config = TransferConfig::default();
         let _engine = TransferEngine::default();
     }
+
+    // ====================================================================
+    // Additional tests for coverage boost (Issue #2)
+    // ====================================================================
+
+    // -- Constants -------------------------------------------------------
+
+    #[test]
+    fn test_default_buffer_size_constant() {
+        assert_eq!(DEFAULT_BUFFER_SIZE, 16 * 1024);
+    }
+
+    #[test]
+    fn test_default_upload_buffer_size_constant() {
+        assert_eq!(DEFAULT_UPLOAD_BUFFER_SIZE, 64 * 1024);
+    }
+
+    #[test]
+    fn test_max_recv_loops_constant() {
+        assert_eq!(MAX_RECV_LOOPS, 10);
+    }
+
+    #[test]
+    fn test_conn_max_retries_constant() {
+        assert_eq!(CONN_MAX_RETRIES, 5);
+    }
+
+    #[test]
+    fn test_default_max_redirects_constant() {
+        assert_eq!(DEFAULT_MAX_REDIRECTS, 50);
+    }
+
+    // -- TransferState traits -------------------------------------------
+
+    #[test]
+    fn test_transfer_state_clone_copy() {
+        let s = TransferState::Sending;
+        let cloned = s.clone();
+        let copied = s;
+        assert_eq!(cloned, TransferState::Sending);
+        assert_eq!(copied, TransferState::Sending);
+    }
+
+    #[test]
+    fn test_transfer_state_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(TransferState::Idle);
+        set.insert(TransferState::Connecting);
+        set.insert(TransferState::Sending);
+        set.insert(TransferState::Receiving);
+        set.insert(TransferState::Done);
+        assert_eq!(set.len(), 5);
+    }
+
+    #[test]
+    fn test_transfer_state_debug() {
+        let dbg = format!("{:?}", TransferState::Connecting);
+        assert!(dbg.contains("Connecting"));
+    }
+
+    #[test]
+    fn test_transfer_state_display_all_variants() {
+        assert_eq!(TransferState::Idle.to_string(), "Idle");
+        assert_eq!(TransferState::Connecting.to_string(), "Connecting");
+        assert_eq!(TransferState::Sending.to_string(), "Sending");
+        assert_eq!(TransferState::Receiving.to_string(), "Receiving");
+        assert_eq!(TransferState::Done.to_string(), "Done");
+    }
+
+    #[test]
+    fn test_transfer_state_equality() {
+        assert_eq!(TransferState::Idle, TransferState::Idle);
+        assert_ne!(TransferState::Idle, TransferState::Done);
+    }
+
+    // -- TimeCondition traits -------------------------------------------
+
+    #[test]
+    fn test_time_condition_default() {
+        let tc: TimeCondition = TimeCondition::default();
+        assert_eq!(tc, TimeCondition::None);
+    }
+
+    #[test]
+    fn test_time_condition_clone_copy() {
+        let tc = TimeCondition::IfModifiedSince;
+        let cloned = tc.clone();
+        let copied = tc;
+        assert_eq!(cloned, TimeCondition::IfModifiedSince);
+        assert_eq!(copied, TimeCondition::IfModifiedSince);
+    }
+
+    #[test]
+    fn test_time_condition_debug() {
+        let dbg = format!("{:?}", TimeCondition::LastMod);
+        assert!(dbg.contains("LastMod"));
+    }
+
+    #[test]
+    fn test_time_condition_all_variants_eq() {
+        assert_eq!(TimeCondition::None, TimeCondition::None);
+        assert_eq!(TimeCondition::IfModifiedSince, TimeCondition::IfModifiedSince);
+        assert_eq!(TimeCondition::IfUnmodifiedSince, TimeCondition::IfUnmodifiedSince);
+        assert_eq!(TimeCondition::LastMod, TimeCondition::LastMod);
+        assert_ne!(TimeCondition::None, TimeCondition::LastMod);
+    }
+
+    // -- CallbackResult traits ------------------------------------------
+
+    #[test]
+    fn test_callback_result_debug() {
+        let dbg = format!("{:?}", CallbackResult::Pause);
+        assert!(dbg.contains("Pause"));
+    }
+
+    #[test]
+    fn test_callback_result_clone_copy() {
+        let cr = CallbackResult::Abort;
+        let cloned = cr.clone();
+        let copied = cr;
+        assert_eq!(cloned, CallbackResult::Abort);
+        assert_eq!(copied, CallbackResult::Abort);
+    }
+
+    #[test]
+    fn test_callback_result_all_variants() {
+        assert_eq!(CallbackResult::Continue, CallbackResult::Continue);
+        assert_eq!(CallbackResult::Pause, CallbackResult::Pause);
+        assert_eq!(CallbackResult::Abort, CallbackResult::Abort);
+        assert_ne!(CallbackResult::Continue, CallbackResult::Pause);
+        assert_ne!(CallbackResult::Pause, CallbackResult::Abort);
+    }
+
+    // -- DebugInfoType traits -------------------------------------------
+
+    #[test]
+    fn test_debug_info_type_all_variants() {
+        let variants = [
+            DebugInfoType::Text,
+            DebugInfoType::HeaderIn,
+            DebugInfoType::HeaderOut,
+            DebugInfoType::DataIn,
+            DebugInfoType::DataOut,
+            DebugInfoType::SslDataIn,
+            DebugInfoType::SslDataOut,
+        ];
+        for v in &variants {
+            let dbg = format!("{:?}", v);
+            assert!(!dbg.is_empty());
+        }
+        assert_eq!(DebugInfoType::Text, DebugInfoType::Text);
+        assert_ne!(DebugInfoType::Text, DebugInfoType::HeaderIn);
+    }
+
+    #[test]
+    fn test_debug_info_type_clone_copy() {
+        let dit = DebugInfoType::DataOut;
+        let cloned = dit.clone();
+        let copied = dit;
+        assert_eq!(cloned, DebugInfoType::DataOut);
+        assert_eq!(copied, DebugInfoType::DataOut);
+    }
+
+    // -- TransferConfig additional setters ------------------------------
+
+    #[test]
+    fn test_transfer_config_set_time_condition() {
+        let mut config = TransferConfig::new();
+        config.set_time_condition(TimeCondition::IfModifiedSince, 1234567890);
+        assert_eq!(config.time_condition, TimeCondition::IfModifiedSince);
+        assert_eq!(config.time_value, 1234567890);
+    }
+
+    #[test]
+    fn test_transfer_config_set_verbose() {
+        let mut config = TransferConfig::new();
+        assert!(!config.verbose);
+        config.set_verbose(true);
+        assert!(config.verbose);
+        config.set_verbose(false);
+        assert!(!config.verbose);
+    }
+
+    #[test]
+    fn test_transfer_config_add_custom_header() {
+        let mut config = TransferConfig::new();
+        assert!(config.custom_headers.is_empty());
+        config.add_custom_header("X-Test: value1".to_string());
+        config.add_custom_header("X-Other: value2".to_string());
+        assert_eq!(config.custom_headers.len(), 2);
+        assert_eq!(config.custom_headers[0], "X-Test: value1");
+        assert_eq!(config.custom_headers[1], "X-Other: value2");
+    }
+
+    #[test]
+    fn test_transfer_config_upload_buffer_zero_ignored() {
+        let mut config = TransferConfig::new();
+        let original = config.upload_buffer_size;
+        config.set_upload_buffer_size(0);
+        assert_eq!(config.upload_buffer_size, original);
+    }
+
+    #[test]
+    fn test_transfer_config_debug() {
+        let config = TransferConfig::new();
+        let dbg = format!("{:?}", config);
+        assert!(dbg.contains("TransferConfig"));
+    }
+
+    #[test]
+    fn test_transfer_config_set_low_speed_time() {
+        let mut config = TransferConfig::new();
+        config.set_low_speed_time(Duration::from_secs(30));
+        assert_eq!(config.low_speed_time, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_transfer_config_chained_setters() {
+        let mut config = TransferConfig::new();
+        config
+            .set_timeout(Duration::from_secs(60))
+            .set_verbose(true)
+            .set_follow_location(true)
+            .set_max_redirects(5)
+            .set_time_condition(TimeCondition::IfUnmodifiedSince, 100)
+            .add_custom_header("Host: example.com".to_string());
+
+        assert_eq!(config.timeout, Duration::from_secs(60));
+        assert!(config.verbose);
+        assert!(config.follow_location);
+        assert_eq!(config.max_redirects, 5);
+        assert_eq!(config.time_condition, TimeCondition::IfUnmodifiedSince);
+        assert_eq!(config.time_value, 100);
+        assert_eq!(config.custom_headers.len(), 1);
+    }
+
+    // -- TransferEngine accessors ---------------------------------------
+
+    #[test]
+    fn test_engine_config_accessor() {
+        let engine = TransferEngine::new();
+        let config = engine.config();
+        assert_eq!(config.buffer_size, DEFAULT_BUFFER_SIZE);
+    }
+
+    #[test]
+    fn test_engine_config_mut_accessor() {
+        let mut engine = TransferEngine::new();
+        engine.config_mut().set_timeout(Duration::from_secs(42));
+        assert_eq!(engine.config().timeout, Duration::from_secs(42));
+    }
+
+    #[test]
+    fn test_engine_progress_accessor() {
+        let engine = TransferEngine::new();
+        let _progress = engine.progress();
+    }
+
+    #[test]
+    fn test_engine_progress_mut_accessor() {
+        let mut engine = TransferEngine::new();
+        let _progress = engine.progress_mut();
+    }
+
+    #[test]
+    fn test_engine_state_accessor() {
+        let engine = TransferEngine::new();
+        assert_eq!(engine.state(), TransferState::Idle);
+    }
+
+    // -- State transitions (begin_send, mark_done, reset) ---------------
+
+    #[test]
+    fn test_begin_send() {
+        let mut engine = TransferEngine::new();
+        assert_eq!(engine.state(), TransferState::Idle);
+        engine.begin_send();
+        assert_eq!(engine.state(), TransferState::Sending);
+    }
+
+    #[test]
+    fn test_mark_done() {
+        let mut engine = TransferEngine::new();
+        engine.begin_send();
+        engine.mark_done();
+        assert_eq!(engine.state(), TransferState::Done);
+    }
+
+    #[test]
+    fn test_reset_state() {
+        let mut engine = TransferEngine::new();
+        engine.begin_send();
+        engine.mark_done();
+        engine.reset();
+        assert_eq!(engine.state(), TransferState::Idle);
+    }
+
+    #[test]
+    fn test_state_full_lifecycle() {
+        let mut engine = TransferEngine::new();
+        assert_eq!(engine.state(), TransferState::Idle);
+
+        engine.begin_send();
+        assert_eq!(engine.state(), TransferState::Sending);
+
+        engine.mark_done();
+        assert_eq!(engine.state(), TransferState::Done);
+
+        engine.reset();
+        assert_eq!(engine.state(), TransferState::Idle);
+    }
+
+    // -- Callback setters -----------------------------------------------
+
+    #[test]
+    fn test_set_read_callback() {
+        let mut engine = TransferEngine::new();
+        assert!(engine.read_callback.is_none());
+        engine.set_read_callback(Box::new(|_buf: &mut [u8]| Ok(0)));
+        assert!(engine.read_callback.is_some());
+    }
+
+    #[test]
+    fn test_set_header_callback() {
+        let mut engine = TransferEngine::new();
+        assert!(engine.header_callback.is_none());
+        engine.set_header_callback(Box::new(|data: &[u8]| Ok(data.len())));
+        assert!(engine.header_callback.is_some());
+    }
+
+    #[test]
+    fn test_set_debug_callback() {
+        let mut engine = TransferEngine::new();
+        assert!(engine.debug_callback.is_none());
+        engine.set_debug_callback(Box::new(|_info_type, _data| {}));
+        assert!(engine.debug_callback.is_some());
+    }
+
+    // -- write_response_header ------------------------------------------
+
+    #[test]
+    fn test_write_response_header_status_line_http11() {
+        let mut engine = TransferEngine::new();
+        let result = engine.write_response_header("HTTP/1.1 200 OK\r\n", false);
+        assert!(result.is_ok());
+        assert_eq!(engine.response_code(), 200);
+    }
+
+    #[test]
+    fn test_write_response_header_status_line_http2() {
+        let mut engine = TransferEngine::new();
+        let result = engine.write_response_header("HTTP/2 404 Not Found\r\n", false);
+        assert!(result.is_ok());
+        assert_eq!(engine.response_code(), 404);
+    }
+
+    #[test]
+    fn test_write_response_header_status_line_http10() {
+        let mut engine = TransferEngine::new();
+        let result = engine.write_response_header("HTTP/1.0 301 Moved\r\n", false);
+        assert!(result.is_ok());
+        assert_eq!(engine.response_code(), 301);
+    }
+
+    #[test]
+    fn test_write_response_header_status_500() {
+        let mut engine = TransferEngine::new();
+        let result = engine.write_response_header("HTTP/1.1 500 Internal Server Error\r\n", false);
+        assert!(result.is_ok());
+        assert_eq!(engine.response_code(), 500);
+    }
+
+    #[test]
+    fn test_write_response_header_regular_header() {
+        let mut engine = TransferEngine::new();
+        let result = engine.write_response_header("Content-Type: text/html\r\n", false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_write_response_header_multiple_headers() {
+        let mut engine = TransferEngine::new();
+        engine.write_response_header("HTTP/1.1 200 OK\r\n", false).unwrap();
+        engine.write_response_header("Content-Type: text/html\r\n", false).unwrap();
+        engine.write_response_header("Content-Length: 42\r\n", false).unwrap();
+        assert_eq!(engine.response_code(), 200);
+    }
+
+    #[test]
+    fn test_write_response_header_empty_line_eos() {
+        let mut engine = TransferEngine::new();
+        engine.write_response_header("HTTP/1.1 200 OK\r\n", false).unwrap();
+        let result = engine.write_response_header("\r\n", true);
+        assert!(result.is_ok());
+        assert!(engine.eos_written);
+    }
+
+    #[test]
+    fn test_write_response_header_with_header_callback() {
+        let mut engine = TransferEngine::new();
+        let mut received_headers: Vec<Vec<u8>> = Vec::new();
+        engine.set_header_callback(Box::new(move |data: &[u8]| {
+            received_headers.push(data.to_vec());
+            Ok(data.len())
+        }));
+        let result = engine.write_response_header("HTTP/1.1 200 OK\r\n", false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_write_response_header_callback_abort() {
+        let mut engine = TransferEngine::new();
+        engine.set_header_callback(Box::new(|_data: &[u8]| {
+            Err(CallbackResult::Abort)
+        }));
+        let result = engine.write_response_header("HTTP/1.1 200 OK\r\n", false);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            CurlError::AbortedByCallback => {}
+            e => panic!("expected AbortedByCallback, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_write_response_header_callback_pause() {
+        let mut engine = TransferEngine::new();
+        engine.set_header_callback(Box::new(|_data: &[u8]| {
+            Err(CallbackResult::Pause)
+        }));
+        let result = engine.write_response_header("HTTP/1.1 200 OK\r\n", false);
+        assert!(result.is_ok());
+        assert!(engine.recv_paused);
+    }
+
+    #[test]
+    fn test_write_response_header_callback_continue() {
+        let mut engine = TransferEngine::new();
+        engine.set_header_callback(Box::new(|_data: &[u8]| {
+            Err(CallbackResult::Continue)
+        }));
+        let result = engine.write_response_header("Content-Type: text/html\r\n", false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_write_response_header_verbose_debug_callback() {
+        let mut engine = TransferEngine::new();
+        engine.config.verbose = true;
+        let mut called = false;
+        engine.set_debug_callback(Box::new(move |info_type, _data| {
+            assert_eq!(info_type, DebugInfoType::HeaderIn);
+            called = true;
+        }));
+        let result = engine.write_response_header("HTTP/1.1 200 OK\r\n", false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_write_response_header_not_verbose_no_debug() {
+        let mut engine = TransferEngine::new();
+        engine.config.verbose = false;
+        engine.set_debug_callback(Box::new(move |_info_type, _data| {
+            panic!("debug callback should not be called when verbose=false");
+        }));
+        let result = engine.write_response_header("HTTP/1.1 200 OK\r\n", false);
+        assert!(result.is_ok());
+    }
+
+    // -- write_response_bytes edge cases --------------------------------
+
+    #[test]
+    fn test_write_response_callback_continue_result() {
+        let mut engine = TransferEngine::new();
+        engine.set_write_callback(Box::new(|_data: &[u8]| {
+            Err(CallbackResult::Continue)
+        }));
+        let result = engine.write_response(b"some data", false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_write_response_callback_short_consume_error() {
+        let mut engine = TransferEngine::new();
+        engine.set_write_callback(Box::new(|_data: &[u8]| {
+            Ok(1) // consume only 1 byte out of many
+        }));
+        let result = engine.write_response(b"hello world", false);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            CurlError::WriteError => {}
+            e => panic!("expected WriteError, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_write_response_empty_data_not_eos() {
+        let mut engine = TransferEngine::new();
+        let result = engine.write_response(b"", false);
+        assert!(result.is_ok());
+        assert!(!engine.eos_written);
+    }
+
+    #[test]
+    fn test_write_response_empty_eos_with_callback() {
+        let mut engine = TransferEngine::new();
+        engine.set_write_callback(Box::new(|_data: &[u8]| {
+            Ok(0)
+        }));
+        let result = engine.write_response(b"", true);
+        assert!(result.is_ok());
+        assert!(engine.eos_written);
+        assert!(engine.download_done);
+    }
+
+    #[test]
+    fn test_write_response_large_data() {
+        let mut engine = TransferEngine::new();
+        let data = vec![b'X'; 65536];
+        engine.set_write_callback(Box::new(move |d: &[u8]| {
+            Ok(d.len())
+        }));
+        let result = engine.write_response(&data, false);
+        assert!(result.is_ok());
+    }
+
+    // -- setup_content_decoding -----------------------------------------
+
+    #[test]
+    fn test_setup_content_decoding_empty() {
+        let mut engine = TransferEngine::new();
+        let result = engine.setup_content_decoding("");
+        assert!(result.is_ok());
+        assert!(engine.content_decoder.is_none());
+    }
+
+    #[test]
+    fn test_setup_content_decoding_identity() {
+        let mut engine = TransferEngine::new();
+        let result = engine.setup_content_decoding("identity");
+        assert!(result.is_ok());
+        assert!(engine.content_decoder.is_none());
+    }
+
+    #[test]
+    fn test_setup_content_decoding_identity_case_insensitive() {
+        let mut engine = TransferEngine::new();
+        let result = engine.setup_content_decoding("Identity");
+        assert!(result.is_ok());
+        assert!(engine.content_decoder.is_none());
+    }
+
+    #[test]
+    fn test_setup_content_decoding_gzip() {
+        let mut engine = TransferEngine::new();
+        let result = engine.setup_content_decoding("gzip");
+        assert!(result.is_ok());
+        assert!(engine.content_decoder.is_some());
+    }
+
+    #[test]
+    fn test_setup_content_decoding_deflate() {
+        let mut engine = TransferEngine::new();
+        let result = engine.setup_content_decoding("deflate");
+        assert!(result.is_ok());
+        assert!(engine.content_decoder.is_some());
+    }
+
+    #[test]
+    fn test_setup_content_decoding_replaces_previous() {
+        let mut engine = TransferEngine::new();
+        engine.setup_content_decoding("gzip").unwrap();
+        assert!(engine.content_decoder.is_some());
+        engine.setup_content_decoding("identity").unwrap();
+        assert!(engine.content_decoder.is_none());
+    }
+
+    // -- write_done with decoder ----------------------------------------
+
+    #[test]
+    fn test_write_done_eos_not_written_no_decoder() {
+        let mut engine = TransferEngine::new();
+        engine.eos_written = false;
+        let result = engine.write_done(false);
+        assert!(result.is_ok());
+        assert!(engine.eos_written);
+    }
+
+    #[test]
+    fn test_write_done_premature_eos_not_written() {
+        let mut engine = TransferEngine::new();
+        engine.eos_written = false;
+        let result = engine.write_done(true);
+        assert!(result.is_ok());
+        assert!(engine.eos_written);
+    }
+
+    // -- write_response with content decoding ---------------------------
+
+    #[test]
+    fn test_write_response_with_gzip_decoder() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Prepare gzip-encoded data.
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(b"hello decoded world").unwrap();
+        let compressed = gz.finish().unwrap();
+
+        let mut engine = TransferEngine::new();
+        engine.setup_content_decoding("gzip").unwrap();
+        let mut decoded_output = Vec::new();
+        engine.set_write_callback(Box::new(move |data: &[u8]| {
+            decoded_output.extend_from_slice(data);
+            Ok(data.len())
+        }));
+        // Write compressed data, then signal EOS.
+        let result = engine.write_response(&compressed, false);
+        assert!(result.is_ok());
+        let result = engine.write_response(b"", true);
+        assert!(result.is_ok());
+        assert!(engine.eos_written);
+    }
+
+    #[test]
+    fn test_write_response_with_deflate_decoder() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b"deflated content here").unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let mut engine = TransferEngine::new();
+        engine.setup_content_decoding("deflate").unwrap();
+        engine.set_write_callback(Box::new(move |data: &[u8]| Ok(data.len())));
+        let result = engine.write_response(&compressed, false);
+        assert!(result.is_ok());
+    }
+
+    // -- bytes tracking -------------------------------------------------
+
+    #[test]
+    fn test_bytes_received_tracking() {
+        let mut engine = TransferEngine::new();
+        assert_eq!(engine.bytes_received(), 0);
+        engine.bytes_received = 42;
+        assert_eq!(engine.bytes_received(), 42);
+    }
+
+    #[test]
+    fn test_bytes_sent_tracking() {
+        let mut engine = TransferEngine::new();
+        assert_eq!(engine.bytes_sent(), 0);
+        engine.bytes_sent = 100;
+        assert_eq!(engine.bytes_sent(), 100);
+    }
+
+    // -- Upload/download done flags -------------------------------------
+
+    #[test]
+    fn test_is_download_done_tracking() {
+        let mut engine = TransferEngine::new();
+        assert!(!engine.is_download_done());
+        engine.download_done = true;
+        assert!(engine.is_download_done());
+    }
+
+    #[test]
+    fn test_is_upload_done_tracking() {
+        let mut engine = TransferEngine::new();
+        assert!(!engine.is_upload_done());
+        engine.upload_done = true;
+        assert!(engine.is_upload_done());
+    }
+
+    // -- Redirect tracking extended ------------------------------------
+
+    #[test]
+    fn test_redirect_url_clear() {
+        let mut engine = TransferEngine::new();
+        engine.set_redirect_url(Some("http://a.com".to_string()));
+        assert!(engine.redirect_url().is_some());
+        engine.set_redirect_url(None);
+        assert!(engine.redirect_url().is_none());
+    }
+
+    #[test]
+    fn test_increment_redirect_multiple() {
+        let mut engine = TransferEngine::new();
+        for i in 1..=5 {
+            engine.increment_redirect();
+            assert_eq!(engine.redirect_count(), i);
+        }
+    }
+
+    // -- is_send_paused / is_recv_paused with rate limiter ---------------
+
+    #[test]
+    fn test_is_send_paused_with_rate_limiter() {
+        let mut engine = TransferEngine::new();
+        engine.config.max_send_speed = 100;
+        engine.pretransfer().unwrap();
+        assert!(!engine.is_send_paused());
+        engine.pause_send(true).unwrap();
+        assert!(engine.is_send_paused());
+        engine.pause_send(false).unwrap();
+        assert!(!engine.is_send_paused());
+    }
+
+    #[test]
+    fn test_is_recv_paused_with_rate_limiter() {
+        let mut engine = TransferEngine::new();
+        engine.config.max_recv_speed = 100;
+        engine.pretransfer().unwrap();
+        assert!(!engine.is_recv_paused());
+        engine.pause_recv(true).unwrap();
+        assert!(engine.is_recv_paused());
+        engine.pause_recv(false).unwrap();
+        assert!(!engine.is_recv_paused());
+    }
+
+    // -- setup variants -------------------------------------------------
+
+    #[test]
+    fn test_setup_send_from_non_idle() {
+        let mut engine = TransferEngine::new();
+        engine.state = TransferState::Receiving;
+        engine.setup_send();
+        // State should NOT change because it's not Idle.
+        assert_eq!(engine.state(), TransferState::Receiving);
+        assert!(engine.want_send);
+        assert!(!engine.want_recv);
+    }
+
+    #[test]
+    fn test_setup_recv_zero_size() {
+        let mut engine = TransferEngine::new();
+        engine.setup_recv(0);
+        assert_eq!(engine.expected_size, 0);
+        assert!(engine.want_recv);
+    }
+
+    #[test]
+    fn test_setup_recv_negative_size() {
+        let mut engine = TransferEngine::new();
+        engine.setup_recv(-1);
+        assert_eq!(engine.expected_size, -1);
+    }
+
+    #[test]
+    fn test_setup_recv_from_sending_state() {
+        let mut engine = TransferEngine::new();
+        engine.state = TransferState::Sending;
+        engine.setup_recv(1024);
+        assert_eq!(engine.state(), TransferState::Receiving);
+    }
+
+    #[test]
+    fn test_setup_sendrecv_negative_size() {
+        let mut engine = TransferEngine::new();
+        engine.setup_sendrecv(-1);
+        assert_eq!(engine.expected_size, -1);
+        assert!(engine.want_send);
+        assert!(engine.want_recv);
+    }
+
+    #[test]
+    fn test_setup_sendrecv_from_non_idle() {
+        let mut engine = TransferEngine::new();
+        engine.state = TransferState::Receiving;
+        engine.setup_sendrecv(1024);
+        // State should NOT change because it's not Idle.
+        assert_eq!(engine.state(), TransferState::Receiving);
+    }
+
+    // -- retry_request edge cases ---------------------------------------
+
+    #[test]
+    fn test_retry_request_not_reused_not_refused() {
+        let mut engine = TransferEngine::new();
+        engine.bytes_received = 0;
+        engine.bytes_sent = 0;
+        let result = engine.retry_request("http://example.com", false, false);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_retry_request_reused_with_data_received() {
+        let mut engine = TransferEngine::new();
+        engine.bytes_received = 100;
+        engine.bytes_sent = 0;
+        let result = engine.retry_request("http://example.com", true, false);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_retry_request_reused_with_data_sent() {
+        let mut engine = TransferEngine::new();
+        engine.bytes_received = 0;
+        engine.bytes_sent = 50;
+        let result = engine.retry_request("http://example.com", true, false);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_retry_request_refused_with_data() {
+        let mut engine = TransferEngine::new();
+        engine.bytes_received = 100;
+        let result = engine.retry_request("http://example.com", false, true);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_retry_request_increments_count() {
+        let mut engine = TransferEngine::new();
+        engine.bytes_received = 0;
+        engine.bytes_sent = 0;
+        for i in 1..=CONN_MAX_RETRIES {
+            let result = engine.retry_request("http://ex.com", true, false).unwrap();
+            assert!(result.is_some());
+            assert_eq!(engine.retry_count, i);
+            // Reset bytes so next iteration triggers retry again.
+            engine.bytes_received = 0;
+            engine.bytes_sent = 0;
+        }
+        // One more should fail.
+        let result = engine.retry_request("http://ex.com", true, false);
+        assert!(result.is_err());
+    }
+
+    // -- pretransfer with existing state --------------------------------
+
+    #[test]
+    fn test_pretransfer_resets_prior_state() {
+        let mut engine = TransferEngine::new();
+        // Set up some state.
+        engine.bytes_received = 1234;
+        engine.bytes_sent = 5678;
+        engine.redirect_count = 3;
+        engine.redirect_url = Some("http://old.com".to_string());
+        engine.response_code = 301;
+        engine.download_done = true;
+        engine.upload_done = true;
+        engine.eos_written = true;
+        engine.send_paused = true;
+        engine.recv_paused = true;
+        engine.retry_count = 2;
+        engine.state = TransferState::Done;
+
+        let result = engine.pretransfer();
+        assert!(result.is_ok());
+
+        // All should be reset.
+        assert_eq!(engine.bytes_received, 0);
+        assert_eq!(engine.bytes_sent, 0);
+        assert_eq!(engine.redirect_count, 0);
+        assert!(engine.redirect_url.is_none());
+        assert_eq!(engine.response_code, 0);
+        assert!(!engine.download_done);
+        assert!(!engine.upload_done);
+        assert!(!engine.eos_written);
+        assert!(!engine.send_paused);
+        assert!(!engine.recv_paused);
+        assert_eq!(engine.retry_count, 0);
+        assert_eq!(engine.state, TransferState::Idle);
+        assert!(engine.start_time.is_some());
+    }
+
+    #[test]
+    fn test_pretransfer_clears_content_decoder() {
+        let mut engine = TransferEngine::new();
+        engine.setup_content_decoding("gzip").unwrap();
+        assert!(engine.content_decoder.is_some());
+        engine.pretransfer().unwrap();
+        assert!(engine.content_decoder.is_none());
+    }
+
+    #[test]
+    fn test_pretransfer_clears_buffers() {
+        let mut engine = TransferEngine::new();
+        engine.send_buf.put_slice(b"leftover send data");
+        engine.recv_buf.put_slice(b"leftover recv data");
+        engine.pretransfer().unwrap();
+        assert!(engine.send_buf.is_empty());
+        assert!(engine.recv_buf.is_empty());
+    }
+
+    // -- check_headers edge cases ---------------------------------------
+
+    #[test]
+    fn test_check_headers_empty_list() {
+        let engine = TransferEngine::new();
+        assert!(engine.check_headers("Content-Type").is_none());
+    }
+
+    #[test]
+    fn test_check_headers_prefix_only_no_separator() {
+        let mut engine = TransferEngine::new();
+        engine.config.custom_headers = vec!["ContentType".to_string()];
+        assert!(engine.check_headers("ContentType").is_none());
+    }
+
+    #[test]
+    fn test_check_headers_semicolon_separator() {
+        let mut engine = TransferEngine::new();
+        engine.config.custom_headers = vec!["X-Remove;".to_string()];
+        assert!(engine.check_headers("X-Remove").is_some());
+    }
+
+    #[test]
+    fn test_check_headers_returns_first_match() {
+        let mut engine = TransferEngine::new();
+        engine.config.custom_headers = vec![
+            "Accept: text/html".to_string(),
+            "Accept: application/json".to_string(),
+        ];
+        let found = engine.check_headers("Accept");
+        assert_eq!(found, Some("Accept: text/html"));
+    }
+
+    // -- meets_timecondition edge cases ---------------------------------
+
+    #[test]
+    fn test_meets_timecondition_lastmod() {
+        let mut engine = TransferEngine::new();
+        engine.config.time_condition = TimeCondition::LastMod;
+        engine.config.time_value = 1000;
+        // LastMod always returns true.
+        assert!(engine.meets_timecondition(500));
+        assert!(engine.meets_timecondition(1000));
+        assert!(engine.meets_timecondition(2000));
+    }
+
+    #[test]
+    fn test_meets_timecondition_doc_time_zero() {
+        let mut engine = TransferEngine::new();
+        engine.config.time_condition = TimeCondition::IfModifiedSince;
+        engine.config.time_value = 1000;
+        // doc time 0 → always met.
+        assert!(engine.meets_timecondition(0));
+    }
+
+    #[test]
+    fn test_meets_timecondition_ref_time_zero() {
+        let mut engine = TransferEngine::new();
+        engine.config.time_condition = TimeCondition::IfUnmodifiedSince;
+        engine.config.time_value = 0;
+        // ref time 0 → always met.
+        assert!(engine.meets_timecondition(5000));
+    }
+
+    // -- TypedTransfer lifecycle ----------------------------------------
+
+    #[test]
+    fn test_typed_transfer_idle_new() {
+        let engine = TransferEngine::new();
+        let transfer = TypedTransfer::<Idle>::new(engine);
+        assert_eq!(transfer.engine().state(), TransferState::Idle);
+    }
+
+    #[test]
+    fn test_typed_transfer_idle_engine_mut() {
+        let engine = TransferEngine::new();
+        let mut transfer = TypedTransfer::<Idle>::new(engine);
+        transfer.engine_mut().config_mut().set_verbose(true);
+        assert!(transfer.engine().config().verbose);
+    }
+
+    #[test]
+    fn test_typed_transfer_connect() {
+        let engine = TransferEngine::new();
+        let idle = TypedTransfer::<Idle>::new(engine);
+        let connected = idle.connect().unwrap();
+        assert!(connected.engine().start_time.is_some());
+    }
+
+    #[test]
+    fn test_typed_transfer_connected_engine() {
+        let engine = TransferEngine::new();
+        let idle = TypedTransfer::<Idle>::new(engine);
+        let connected = idle.connect().unwrap();
+        let _ = connected.engine().config();
+    }
+
+    #[test]
+    fn test_typed_transfer_connected_engine_mut() {
+        let engine = TransferEngine::new();
+        let idle = TypedTransfer::<Idle>::new(engine);
+        let mut connected = idle.connect().unwrap();
+        connected.engine_mut().config_mut().set_timeout(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_typed_transfer_start_sending() {
+        let engine = TransferEngine::new();
+        let idle = TypedTransfer::<Idle>::new(engine);
+        let connected = idle.connect().unwrap();
+        let transferring = connected.start_sending().unwrap();
+        assert_eq!(transferring.engine().state(), TransferState::Sending);
+    }
+
+    #[test]
+    fn test_typed_transfer_transferring_engine() {
+        let engine = TransferEngine::new();
+        let t = TypedTransfer::<Idle>::new(engine)
+            .connect().unwrap()
+            .start_sending().unwrap();
+        assert_eq!(t.engine().state(), TransferState::Sending);
+    }
+
+    #[test]
+    fn test_typed_transfer_transferring_engine_mut() {
+        let engine = TransferEngine::new();
+        let mut t = TypedTransfer::<Idle>::new(engine)
+            .connect().unwrap()
+            .start_sending().unwrap();
+        t.engine_mut().set_response_code(200);
+        assert_eq!(t.engine().response_code(), 200);
+    }
+
+    #[test]
+    fn test_typed_transfer_complete() {
+        let engine = TransferEngine::new();
+        let t = TypedTransfer::<Idle>::new(engine)
+            .connect().unwrap()
+            .start_sending().unwrap()
+            .complete().unwrap();
+        assert_eq!(t.engine().state(), TransferState::Done);
+    }
+
+    #[test]
+    fn test_typed_transfer_complete_into_engine() {
+        let engine = TransferEngine::new();
+        let complete = TypedTransfer::<Idle>::new(engine)
+            .connect().unwrap()
+            .start_sending().unwrap()
+            .complete().unwrap();
+        let recovered = complete.into_engine();
+        assert_eq!(recovered.state(), TransferState::Done);
+    }
+
+    #[test]
+    fn test_typed_transfer_reset() {
+        let engine = TransferEngine::new();
+        let idle_again = TypedTransfer::<Idle>::new(engine)
+            .connect().unwrap()
+            .start_sending().unwrap()
+            .complete().unwrap()
+            .reset();
+        assert_eq!(idle_again.engine().state(), TransferState::Idle);
+    }
+
+    #[test]
+    fn test_typed_transfer_full_lifecycle() {
+        let mut engine = TransferEngine::new();
+        engine.config_mut().set_max_recv_speed(1024);
+
+        let idle = TypedTransfer::<Idle>::new(engine);
+        let connected = idle.connect().unwrap();
+        let transferring = connected.start_sending().unwrap();
+        let complete = transferring.complete().unwrap();
+        let idle_again = complete.reset();
+
+        assert_eq!(idle_again.engine().state(), TransferState::Idle);
+        assert_eq!(idle_again.engine().config().max_recv_speed, 1024);
+    }
+
+    // -- Marker type Debug impls ----------------------------------------
+
+    #[test]
+    fn test_marker_type_debug() {
+        assert!(!format!("{:?}", Idle).is_empty());
+        assert!(!format!("{:?}", Connected).is_empty());
+        assert!(!format!("{:?}", Transferring).is_empty());
+        assert!(!format!("{:?}", Complete).is_empty());
+    }
+
+    // -- needs_flush and send_buf interaction ---------------------------
+
+    #[test]
+    fn test_needs_flush_after_clear() {
+        let mut engine = TransferEngine::new();
+        engine.send_buf.put_slice(b"data");
+        assert!(engine.needs_flush());
+        engine.send_buf.clear();
+        assert!(!engine.needs_flush());
+    }
+
+    // -- headersep extended tests --------------------------------------
+
+    #[test]
+    fn test_headersep_all_ascii() {
+        let separators = [b':', b';'];
+        let non_sep = [b' ', b'\t', b'=', b',', b'A', b'z', b'0', b'\0', b'\n'];
+        for &ch in &separators {
+            assert!(headersep(ch), "expected '{}' to be separator", ch as char);
+        }
+        for &ch in &non_sep {
+            assert!(!headersep(ch), "expected '{}' to NOT be separator", ch as char);
+        }
+    }
+
+    // -- response_headers accessor -------------------------------------
+
+    #[test]
+    fn test_response_headers_accessor() {
+        let engine = TransferEngine::new();
+        let headers = engine.response_headers();
+        assert!(headers.is_empty());
+    }
+
+    // -- supported_encodings content ------------------------------------
+
+    #[test]
+    fn test_supported_encodings_contains_br() {
+        let engine = TransferEngine::new();
+        let enc = engine.supported_encodings();
+        // Brotli is compiled in — should appear.
+        assert!(enc.contains("br"));
+    }
+
+    #[test]
+    fn test_supported_encodings_contains_zstd() {
+        let engine = TransferEngine::new();
+        let enc = engine.supported_encodings();
+        assert!(enc.contains("zstd"));
+    }
+
+    // -- write_response_header status line parsing ----------------------
+
+    #[test]
+    fn test_write_response_header_status_100_continue() {
+        let mut engine = TransferEngine::new();
+        engine.write_response_header("HTTP/1.1 100 Continue\r\n", false).unwrap();
+        assert_eq!(engine.response_code(), 100);
+    }
+
+    #[test]
+    fn test_write_response_header_status_204_no_content() {
+        let mut engine = TransferEngine::new();
+        engine.write_response_header("HTTP/1.1 204 No Content\r\n", false).unwrap();
+        assert_eq!(engine.response_code(), 204);
+    }
+
+    #[test]
+    fn test_write_response_header_status_304_not_modified() {
+        let mut engine = TransferEngine::new();
+        engine.write_response_header("HTTP/1.1 304 Not Modified\r\n", false).unwrap();
+        assert_eq!(engine.response_code(), 304);
+    }
+
+    // -- shutdown flags -------------------------------------------------
+
+    #[test]
+    fn test_shutdown_flags_after_setup_send() {
+        let mut engine = TransferEngine::new();
+        engine.shutdown_on_done = true;
+        engine.shutdown_err_ignore = true;
+        engine.setup_send();
+        assert!(!engine.shutdown_on_done);
+        assert!(!engine.shutdown_err_ignore);
+    }
+
+    #[test]
+    fn test_shutdown_flags_after_setup_recv() {
+        let mut engine = TransferEngine::new();
+        engine.shutdown_on_done = true;
+        engine.shutdown_err_ignore = true;
+        engine.setup_recv(100);
+        assert!(!engine.shutdown_on_done);
+        assert!(!engine.shutdown_err_ignore);
+    }
+
+    #[test]
+    fn test_shutdown_flags_after_setup_sendrecv() {
+        let mut engine = TransferEngine::new();
+        engine.shutdown_on_done = true;
+        engine.shutdown_err_ignore = true;
+        engine.setup_sendrecv(100);
+        assert!(!engine.shutdown_on_done);
+        assert!(!engine.shutdown_err_ignore);
+    }
+
+    // -- expected_size tracking ----------------------------------------
+
+    #[test]
+    fn test_expected_size_default() {
+        let engine = TransferEngine::new();
+        assert_eq!(engine.expected_size, -1);
+    }
+
+    #[test]
+    fn test_expected_size_after_setup_recv() {
+        let mut engine = TransferEngine::new();
+        engine.setup_recv(4096);
+        assert_eq!(engine.expected_size, 4096);
+    }
+
+    #[test]
+    fn test_expected_size_after_setup_sendrecv() {
+        let mut engine = TransferEngine::new();
+        engine.setup_sendrecv(8192);
+        assert_eq!(engine.expected_size, 8192);
+    }
+
+    // -- want_send / want_recv tracking --------------------------------
+
+    #[test]
+    fn test_want_send_recv_defaults() {
+        let engine = TransferEngine::new();
+        assert!(!engine.want_send);
+        assert!(!engine.want_recv);
+    }
+
+    #[test]
+    fn test_want_send_after_setup_send() {
+        let mut engine = TransferEngine::new();
+        engine.setup_send();
+        assert!(engine.want_send);
+        assert!(!engine.want_recv);
+    }
+
+    #[test]
+    fn test_want_recv_after_setup_recv() {
+        let mut engine = TransferEngine::new();
+        engine.setup_recv(100);
+        assert!(!engine.want_send);
+        assert!(engine.want_recv);
+    }
+
+    #[test]
+    fn test_want_both_after_setup_sendrecv() {
+        let mut engine = TransferEngine::new();
+        engine.setup_sendrecv(100);
+        assert!(engine.want_send);
+        assert!(engine.want_recv);
+    }
+
+    // -- pretransfer resets want flags ----------------------------------
+
+    #[test]
+    fn test_pretransfer_resets_want_flags() {
+        let mut engine = TransferEngine::new();
+        engine.setup_sendrecv(100);
+        assert!(engine.want_send);
+        assert!(engine.want_recv);
+        engine.pretransfer().unwrap();
+        assert!(!engine.want_send);
+        assert!(!engine.want_recv);
+    }
+
+    // -- write_response_header complex flows ----------------------------
+
+    #[test]
+    fn test_write_response_header_full_http_flow() {
+        let mut engine = TransferEngine::new();
+        // Simulate a complete HTTP response header sequence.
+        engine.write_response_header("HTTP/1.1 200 OK\r\n", false).unwrap();
+        engine.write_response_header("Content-Type: text/plain\r\n", false).unwrap();
+        engine.write_response_header("Content-Length: 13\r\n", false).unwrap();
+        engine.write_response_header("\r\n", true).unwrap();
+
+        assert_eq!(engine.response_code(), 200);
+        assert!(engine.eos_written);
+    }
+
+    #[test]
+    fn test_write_response_header_overwrites_status_code() {
+        let mut engine = TransferEngine::new();
+        engine.write_response_header("HTTP/1.1 301 Moved\r\n", false).unwrap();
+        assert_eq!(engine.response_code(), 301);
+        // Second status line (e.g., after redirect) overwrites.
+        engine.write_response_header("HTTP/1.1 200 OK\r\n", false).unwrap();
+        assert_eq!(engine.response_code(), 200);
+    }
+
+    // -- pause_send and pause_recv with rate limiter --------------------
+
+    #[test]
+    fn test_pause_send_toggle_with_rate_limiter() {
+        let mut engine = TransferEngine::new();
+        engine.config.max_send_speed = 50;
+        engine.pretransfer().unwrap();
+
+        engine.pause_send(true).unwrap();
+        assert!(engine.send_paused);
+        engine.pause_send(false).unwrap();
+        assert!(!engine.send_paused);
+    }
+
+    #[test]
+    fn test_pause_recv_toggle_with_rate_limiter() {
+        let mut engine = TransferEngine::new();
+        engine.config.max_recv_speed = 50;
+        engine.pretransfer().unwrap();
+
+        engine.pause_recv(true).unwrap();
+        assert!(engine.recv_paused);
+        engine.pause_recv(false).unwrap();
+        assert!(!engine.recv_paused);
+    }
+
+    // -- is_blocked comprehensive scenarios ----------------------------
+
+    #[test]
+    fn test_is_blocked_only_send_not_paused() {
+        let mut engine = TransferEngine::new();
+        engine.want_send = true;
+        engine.want_recv = false;
+        engine.send_paused = false;
+        assert!(!engine.is_blocked());
+    }
+
+    #[test]
+    fn test_is_blocked_both_only_recv_paused() {
+        let mut engine = TransferEngine::new();
+        engine.want_send = true;
+        engine.want_recv = true;
+        engine.recv_paused = true;
+        engine.send_paused = false;
+        assert!(!engine.is_blocked());
+    }
+
+    #[test]
+    fn test_is_blocked_both_only_send_paused() {
+        let mut engine = TransferEngine::new();
+        engine.want_send = true;
+        engine.want_recv = true;
+        engine.send_paused = true;
+        engine.recv_paused = false;
+        assert!(!engine.is_blocked());
+    }
+
+    // -- Config interactions with pretransfer ---------------------------
+
+    #[test]
+    fn test_pretransfer_progress_configuration() {
+        let mut engine = TransferEngine::new();
+        engine.config.low_speed_limit = 1024;
+        engine.config.low_speed_time = Duration::from_secs(30);
+        engine.pretransfer().unwrap();
+        // Verify progress tracker was configured.
+        assert_eq!(engine.progress.low_speed_limit, 1024);
+        assert_eq!(engine.progress.low_speed_time, 30);
+    }
+
+    // -- write_response with eos and no callback -----------------------
+
+    #[test]
+    fn test_write_response_eos_sets_both_flags() {
+        let mut engine = TransferEngine::new();
+        engine.write_response(b"final", true).unwrap();
+        assert!(engine.eos_written);
+        assert!(engine.download_done);
+    }
+
+    #[test]
+    fn test_write_response_eos_callback_full_consume() {
+        let mut engine = TransferEngine::new();
+        engine.set_write_callback(Box::new(|d: &[u8]| Ok(d.len())));
+        engine.write_response(b"final data", true).unwrap();
+        assert!(engine.eos_written);
+        assert!(engine.download_done);
+    }
 }
