@@ -2495,7 +2495,7 @@ mod tests {
     fn test_quic_initial_mtu_reasonable() {
         // QUIC MTU should be between 1200 (minimum) and 65535
         assert!(QUIC_INITIAL_MTU >= 1200);
-        assert!(QUIC_INITIAL_MTU <= 65535);
+        assert!((QUIC_INITIAL_MTU as u32) <= 65535);
     }
 
     #[test]
@@ -2926,7 +2926,7 @@ mod tests {
     #[test]
     fn r15b_h3_comprehensive() {
         // Filter exercise
-        let mut f = Http3Filter::new();
+        let f = Http3Filter::new();
         let _ = f.name();
         let _ = f.type_flags();
         // Error codes comprehensive

@@ -2781,7 +2781,7 @@ mod tests {
 
     #[test]
     fn test_tftp_check_overall_timeout_r5() {
-        let mut t = Tftp::new();
+        let t = Tftp::new();
         let _ = t.check_overall_timeout();
     }
 

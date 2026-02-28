@@ -5261,7 +5261,7 @@ mod tests {
         assert!(find_header_line_end(b"no end").is_none());
     }
     #[test] fn test_parse_status_r7() {
-        let (v, c, r) = parse_status_line(b"HTTP/1.1 200 OK\r\n").unwrap();
+        let (_v, c, _r) = parse_status_line(b"HTTP/1.1 200 OK\r\n").unwrap();
         assert_eq!(c, 200);
     }
     #[test] fn test_parse_status_bad_r7() {
@@ -5272,7 +5272,7 @@ mod tests {
         assert_eq!(default_port_for_scheme("https"), "443");
     }
     #[test] fn test_parse_url_origin_r7() {
-        let (s, h, p) = parse_url_origin("https://a.com:8443/p");
+        let (s, h, _p) = parse_url_origin("https://a.com:8443/p");
         assert_eq!(s, "https");
         assert_eq!(h, "a.com");
     }
@@ -5680,7 +5680,7 @@ mod tests {
 
     #[test]
     fn r9_http_protocol_setup_conn() {
-        let mut proto = HttpProtocol::new(false);
+        let proto = HttpProtocol::new(false);
         let _ = proto.name();
     }
 
@@ -6127,8 +6127,8 @@ mod tests {
     #[test]
     fn r11_get_dyn_header_entry_basic() {
         let mut headers = DynHeaders::new();
-        headers.add("Content-Type", "text/html");
-        headers.add("Accept", "*/*");
+        let _ = headers.add("Content-Type", "text/html");
+        let _ = headers.add("Accept", "*/*");
         let entry = get_dyn_header_entry(&headers, "Content-Type");
         assert!(entry.is_some());
         let missing = get_dyn_header_entry(&headers, "X-None");
@@ -6137,8 +6137,8 @@ mod tests {
     #[test]
     fn r11_bump_headersize_basic() {
         let mut proto = HttpProtocol::new(false);
-        bump_headersize(&mut proto, 100, HeaderType::Header);
-        bump_headersize(&mut proto, 200, HeaderType::Header);
+        let _ = bump_headersize(&mut proto, 100, HeaderType::Header);
+        let _ = bump_headersize(&mut proto, 200, HeaderType::Header);
     }
     #[test]
     fn r11_create_chains() {
@@ -6277,9 +6277,9 @@ mod tests {
         // bump_headersize
         let mut proto = HttpProtocol::new(false);
         for i in 0..10 {
-            bump_headersize(&mut proto, 100 + i, HeaderType::Header);
-            bump_headersize(&mut proto, 50 + i, HeaderType::Trailer);
-            bump_headersize(&mut proto, 200 + i, HeaderType::Connect);
+            let _ = bump_headersize(&mut proto, 100 + i, HeaderType::Header);
+            let _ = bump_headersize(&mut proto, 50 + i, HeaderType::Trailer);
+            let _ = bump_headersize(&mut proto, 200 + i, HeaderType::Connect);
         }
     }
 
@@ -6383,11 +6383,11 @@ mod tests {
     fn r17_http_header_operations() {
         // DynHeaders operations
         let mut dh = DynHeaders::new();
-        dh.add("Content-Type", "text/html");
-        dh.add("Content-Length", "100");
-        dh.add("X-Custom", "value");
-        dh.add("Set-Cookie", "a=1");
-        dh.add("Set-Cookie", "b=2");
+        let _ = dh.add("Content-Type", "text/html");
+        let _ = dh.add("Content-Length", "100");
+        let _ = dh.add("X-Custom", "value");
+        let _ = dh.add("Set-Cookie", "a=1");
+        let _ = dh.add("Set-Cookie", "b=2");
         let _ = dh.get("Content-Type");
         let _ = dh.get("X-Custom");
         let _ = dh.get("Missing");

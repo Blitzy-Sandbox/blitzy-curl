@@ -2484,7 +2484,7 @@ mod tests {
 
     #[test]
     fn test_websocket_extra_accessors() {
-        let mut ws = WebSocket::new();
+        let ws = WebSocket::new();
         let _ = ws.decoder();
         let _ = ws.encoder();
         let _ = ws.recv_buf();

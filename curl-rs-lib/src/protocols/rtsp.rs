@@ -2434,7 +2434,7 @@ mod tests {
             (RtspRequest::Receive, true, false),
             (RtspRequest::Last, false, false),
         ];
-        for (req, needs_session, has_body) in &requests {
+        for (req, _needs_session, _has_body) in &requests {
             let name = req.as_str();
             let _ = name;
             let _ = req.requires_session();

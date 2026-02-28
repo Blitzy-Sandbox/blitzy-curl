@@ -3003,10 +3003,9 @@ mod tests {
     fn test_write_response_header_verbose_debug_callback() {
         let mut engine = TransferEngine::new();
         engine.config.verbose = true;
-        let mut called = false;
+        let _called = false;
         engine.set_debug_callback(Box::new(move |info_type, _data| {
             assert_eq!(info_type, DebugInfoType::HeaderIn);
-            called = true;
         }));
         let result = engine.write_response_header("HTTP/1.1 200 OK\r\n", false);
         assert!(result.is_ok());

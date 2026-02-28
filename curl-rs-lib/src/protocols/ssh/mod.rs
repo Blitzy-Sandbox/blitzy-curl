@@ -3072,7 +3072,6 @@ mod tests {
     }
     #[test]
     fn r11_verify_host_key_no_known_hosts() {
-        use russh_keys as ssh_keys;
         let handler = SshClientHandler::new(None, None, None, "example.com".to_string(), 22);
         // Without known_hosts file, should handle gracefully
         let _ = handler;
@@ -3098,7 +3097,7 @@ mod tests {
     // ===== ROUND 12 TESTS =====
     #[test]
     fn r12_ssh_session_default() {
-        use super::{SshSession, SshState};
+        use super::SshSession;
         let s = SshSession::new();
         assert!(!s.authed);
         assert!(s.homedir.is_empty());
@@ -3366,7 +3365,7 @@ mod tests {
     #[test]
     fn r16_ssh_client_handler() {
         use std::path::PathBuf;
-        let mut h1 = SshClientHandler::new(None, None, None, "example.com".to_string(), 22);
+        let h1 = SshClientHandler::new(None, None, None, "example.com".to_string(), 22);
         h1.auth_banner_log("Welcome banner");
         h1.auth_banner_log("");
         h1.auth_banner_log("Multi\nLine\nBanner");

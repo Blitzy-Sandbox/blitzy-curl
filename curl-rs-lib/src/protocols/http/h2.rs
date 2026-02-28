@@ -2661,7 +2661,7 @@ mod tests {
     }
     #[test]
     fn r14_http2_filter_repeated_checks() {
-        let mut f = Http2Filter::new();
+        let f = Http2Filter::new();
         for _ in 0..10 {
             assert!(!f.is_alive());
             assert!(!f.is_connected());

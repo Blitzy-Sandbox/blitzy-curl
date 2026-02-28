@@ -2787,7 +2787,7 @@ mod tests {
     // ===== ROUND 16 - COVERAGE PUSH =====
     #[test]
     fn r16_imap_handler_lifecycle() {
-        let mut h = ImapHandler::new();
+        let h = ImapHandler::new();
         let _ = h;
     }
     #[test]

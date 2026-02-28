@@ -1363,7 +1363,7 @@ mod tests {
         assert!(w.starts_with(b"POST"));
     }
     #[test] fn test_h1_parse_start_10_r7() {
-        let (v, c, _) = parse_start_line(b"HTTP/1.0 301 Moved\r\n").unwrap();
+        let (_v, c, _) = parse_start_line(b"HTTP/1.0 301 Moved\r\n").unwrap();
         assert_eq!(c, 301);
     }
     #[test] fn test_h1_parse_header_multi_colon_r7() {

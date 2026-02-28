@@ -1432,11 +1432,12 @@ mod tests {
         let _ = format!("{:?}", c);
     }
     #[test] fn test_pp_new_r7() {
-        let pp = PingPong::new(PingPongConfig::default());
+        let _pp = PingPong::new(PingPongConfig::default());
         let _ = "PingPong";
     }
     #[test] fn test_pp_disconnect_r7() {
         let mut pp = PingPong::new(PingPongConfig::default());
+        let _ = &pp;
         pp.disconnect();
     }
     #[test] fn test_poll_flags_r7() {
@@ -1446,7 +1447,7 @@ mod tests {
         assert!(f.contains(PollFlags::POLLIN));
     }
     #[test] fn test_pp_flush_r7() {
-        let mut pp = PingPong::new(PingPongConfig::default());
+        let pp = PingPong::new(PingPongConfig::default());
         let _ = pp.needs_flush();
     }
 

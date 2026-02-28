@@ -1950,28 +1950,28 @@ mod tests {
     fn test_parse_scp_header_no_newline() {
         let data = b"C0644 100 file.txt";
         // parse_scp_header tolerates missing trailing newline
-        let _ = ScpHandler::parse_scp_header(data);;
+        let _ = ScpHandler::parse_scp_header(data);
     }
 
     #[test]
     fn test_parse_scp_header_wrong_prefix() {
         let data = b"D0755 100 dir\n";
         // parse_scp_header tolerates missing trailing newline
-        let _ = ScpHandler::parse_scp_header(data);;
+        let _ = ScpHandler::parse_scp_header(data);
     }
 
     #[test]
     fn test_parse_scp_header_too_short() {
         let data = b"C\n";
         // parse_scp_header tolerates missing trailing newline
-        let _ = ScpHandler::parse_scp_header(data);;
+        let _ = ScpHandler::parse_scp_header(data);
     }
 
     #[test]
     fn test_parse_scp_header_missing_fields() {
         let data = b"C0644\n";
         // parse_scp_header tolerates missing trailing newline
-        let _ = ScpHandler::parse_scp_header(data);;
+        let _ = ScpHandler::parse_scp_header(data);
     }
 
     #[test]
