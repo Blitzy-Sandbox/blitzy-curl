@@ -5,11 +5,9 @@ metadata:
   description: "Complete C-to-Rust rewrite of curl 8.19.0-DEV — 3-crate workspace, 215K lines of Rust, 7,312 tests passing"
   tags:
     - rust
-    - c
     - infrastructure
-    - in-progress
+    - refactor
   labels:
-    blitzy.com/status: in-progress
     blitzy.com/language: rust
   annotations:
     github.com/project-slug: Blitzy-Sandbox/blitzy-curl
