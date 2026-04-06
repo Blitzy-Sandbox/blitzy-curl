@@ -1,0 +1,30 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: blitzy-curl
+  description: "Complete C-to-Rust rewrite of curl 8.19.0-DEV — 3-crate workspace, 215K lines of Rust, 7,312 tests passing"
+  tags:
+    - rust
+    - c
+    - infrastructure
+    - in-progress
+  labels:
+    blitzy.com/status: in-progress
+    blitzy.com/language: rust
+  annotations:
+    github.com/project-slug: Blitzy-Sandbox/blitzy-curl
+    backstage.io/source-location: url:https://github.com/Blitzy-Sandbox/blitzy-curl/tree/master/
+  links:
+    - url: https://github.com/Blitzy-Sandbox/blitzy-curl
+      title: GitHub Repository
+    - url: https://github.com/Blitzy-Sandbox/blitzy-curl/pull/1
+      title: "PR #1: C-to-Rust Rewrite — 215K Lines"
+      icon: github
+    - url: https://github.com/Blitzy-Sandbox/blitzy-curl/tree/master/blitzy/documentation
+      title: Blitzy Documentation
+      icon: docs
+spec:
+  type: library
+  lifecycle: experimental
+  owner: blitzy-sandbox
+  system: blitzy-sandbox-projects
