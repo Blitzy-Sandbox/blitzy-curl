@@ -1,5 +1,6 @@
 docs_dir: blitzy-docs
 site_name: 'blitzy-curl'
+use_directory_urls: false
 nav:
   - Home: index.md
   - Project Guide: project-guide.md
