@@ -1,5 +1,7 @@
 site_name: 'blitzy-curl'
 nav:
   - Home: index.md
+  - Project Guide: project-guide.md
+  - Technical Specifications: technical-specifications.md
 plugins:
   - techdocs-core
