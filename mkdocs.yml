@@ -1,3 +1,4 @@
+docs_dir: blitzy-docs
 site_name: 'blitzy-curl'
 nav:
   - Home: index.md
