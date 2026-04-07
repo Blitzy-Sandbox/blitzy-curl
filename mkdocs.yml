@@ -1,5 +1,6 @@
 site_name: 'blitzy-curl'
-use_directory_urls: false
+exclude_docs: |
+  INSTALL
 plugins:
   - techdocs-core
   - mermaid2
