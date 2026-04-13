@@ -1,0 +1,131 @@
+# -----------------------------------------------------------------------
+# curl-rs binary crate manifest
+#
+# Produces the `curl-rs` CLI executable — a 1:1 functional replacement
+# for the curl 8.x command-line tool (src/*.c, 43 files, 19,344 LoC).
+#
+# Source reference: src/CMakeLists.txt — the original C build config for
+# the curl CLI executable which links against libcurl and the curlx
+# portability utilities.
+#
+# All dependency versions are inherited from the workspace root
+# Cargo.toml via `workspace = true`, except for the in-workspace path
+# dependency on curl-rs-lib.
+#
+# SPDX-License-Identifier: curl
+# -----------------------------------------------------------------------
+
+[package]
+name = "curl-rs"
+version = "8.19.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "curl command-line tool rewritten in Rust — 1:1 functional parity with curl 8.x"
+repository.workspace = true
+publish = false
+default-run = "curl-rs"
+
+[[bin]]
+name = "curl-rs"
+path = "src/main.rs"
+
+# ---------------------------------------------------------------------------
+# Runtime Dependencies
+#
+# The binary crate delegates all protocol, TLS, and transfer logic to
+# curl-rs-lib.  Direct dependencies here are limited to what the CLI
+# layer itself needs: argument parsing, async runtime, I/O formatting,
+# date handling, URL/glob expansion, and variable encoding.
+# ---------------------------------------------------------------------------
+[dependencies]
+
+# Core library — all protocols, TLS, transfer engine, auth, DNS
+curl-rs-lib = { path = "../curl-rs-lib" }
+
+# Async runtime — current-thread flavor for sequential CLI operations
+# (AAP Section 0.4.4: `#[tokio::main(flavor = "current_thread")]`)
+tokio = { workspace = true }
+
+# CLI argument parsing with derive macros — maps all 200+ curl 8.x flags
+# (replaces src/tool_getparam.c argument table)
+clap = { workspace = true }
+
+# Shell completion generation (bash, zsh, fish, powershell, elvish)
+clap_complete = { workspace = true }
+
+# Contextual error handling in the CLI binary
+# (AAP Section 0.6.1: anyhow for CLI error propagation)
+anyhow = { workspace = true }
+
+# Config file deserialization (src/tool_parsecfg.c, src/tool_cfgable.c)
+serde = { workspace = true }
+
+# JSON write-out output (src/tool_writeout_json.c → writeout_json.rs)
+serde_json = { workspace = true }
+
+# Structured logging and verbose/trace output
+# (replaces src/tool_cb_dbg.c debug callback formatting)
+tracing = { workspace = true }
+
+# Tracing output formatting for --trace / --trace-ascii / --verbose
+tracing-subscriber = { workspace = true }
+
+# Date/time handling for file timestamps and progress display
+# (src/tool_filetime.c, src/tool_progress.c)
+chrono = { workspace = true }
+
+# URL parsing for URL globbing, IPFS gateway rewriting, and validation
+# (src/tool_urlglob.c, src/tool_ipfs.c)
+url = { workspace = true }
+
+# Glob pattern matching for URL range expansion
+# (src/tool_urlglob.c — {a,b,c} and [range] expansion)
+glob = { workspace = true }
+
+# Base64 encoding/decoding for --variable :b64/:64dec operations
+# (src/var.c variable expansion)
+base64 = { workspace = true }
+
+# URL percent-encoding for --variable :url/:urldec operations
+# (src/var.c variable expansion)
+percent-encoding = { workspace = true }
+
+# Async stream utilities for transfer pipeline composition
+futures-util = { workspace = true }
+
+# Low-level socket creation for MPTCP open-socket callback
+# (src/tool_cb_soc.c → callbacks/socket.rs — safe wrapper around socket())
+socket2 = { workspace = true }
+
+# Extended filesystem attributes for --xattr option
+# (src/tool_xattr.c → xattr.rs)
+xattr = { workspace = true }
+
+# Cross-platform password reading with echo disabled
+# (src/tool_getpass.c → getpass.rs — secure terminal input)
+rpassword = { workspace = true }
+
+# Cross-platform terminal size detection
+# (src/terminal.c → terminal.rs — replaces ioctl(TIOCGWINSZ) / GetConsoleScreenBufferInfo)
+terminal_size = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Development / Test Dependencies
+#
+# Used for integration testing the CLI binary — verifying exit codes,
+# stdout/stderr output, and flag behavior match curl 8.x.
+# ---------------------------------------------------------------------------
+[dev-dependencies]
+
+# CLI binary integration testing — spawns curl-rs and asserts output
+assert_cmd = { workspace = true }
+
+# Assertion predicates for matching stdout/stderr content and exit codes
+predicates = { workspace = true }
+
+# Temporary file/directory creation for test fixtures (cookie jars, certs)
+tempfile = { workspace = true }
+
+# Test utilities for async code validation
+tokio-test = { workspace = true }

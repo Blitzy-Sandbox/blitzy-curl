@@ -1,0 +1,135 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# Rust workspace CI — build, test, lint, safety, coverage, and security gates
+
+name: 'Rust CI'
+
+'on':
+  push:
+    branches:
+      - 'main'
+  pull_request:
+    branches:
+      - 'main'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  rust-ci:
+    name: '${{ matrix.name }}'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 'Linux x86_64'
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            use_cross: false
+
+          - name: 'Linux aarch64'
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            use_cross: true
+
+          - name: 'macOS x86_64'
+            os: macos-13
+            target: x86_64-apple-darwin
+            use_cross: false
+
+          - name: 'macOS arm64'
+            os: macos-latest
+            target: aarch64-apple-darwin
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 'Install Rust stable'
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+
+      - name: 'Add clippy and llvm-tools'
+        run: rustup component add clippy llvm-tools-preview
+
+      - name: 'Install nightly toolchain'
+        run: rustup toolchain install nightly
+
+      - name: 'Add Miri and rust-src (nightly)'
+        run: rustup component add --toolchain nightly miri rust-src
+
+      - name: 'Install cross'
+        if: matrix.use_cross
+        run: cargo install cross --locked
+
+      - name: 'Install cargo-llvm-cov'
+        if: "!matrix.use_cross"
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: 'Install cargo-audit and cargo-deny'
+        if: "!matrix.use_cross"
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-deny --locked
+
+      - name: 'Cache Cargo registry and build'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: 'Build (release)'
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --workspace --target ${{ matrix.target }}
+          else
+            cargo build --release --workspace --target ${{ matrix.target }}
+          fi
+        env:
+          RUSTFLAGS: '-D warnings'
+
+      - name: 'Clippy lint'
+        if: "!matrix.use_cross"
+        run: cargo clippy --workspace --target ${{ matrix.target }} -- -D warnings
+
+      - name: 'Run tests'
+        if: "!matrix.use_cross"
+        run: cargo test --workspace --target ${{ matrix.target }}
+
+      - name: 'Miri (memory safety)'
+        if: "!matrix.use_cross"
+        run: cargo +nightly miri test -p curl-rs-lib
+
+      - name: 'AddressSanitizer (FFI boundary)'
+        if: "!matrix.use_cross && runner.os == 'Linux'"
+        run: cargo +nightly test -p curl-rs-ffi --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: '-Z sanitizer=address'
+          RUSTDOCFLAGS: '-Z sanitizer=address'
+
+      - name: 'Coverage'
+        if: "!matrix.use_cross"
+        run: cargo llvm-cov --workspace --fail-under-lines 80
+
+      - name: 'Security audit'
+        if: "!matrix.use_cross"
+        run: cargo audit
+
+      - name: 'Cargo deny'
+        if: "!matrix.use_cross"
+        run: cargo deny check

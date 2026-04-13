@@ -1,0 +1,113 @@
+[package]
+name = "curl-rs-lib"
+version = "8.19.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core library crate for curl-rs — Rust rewrite of libcurl"
+repository.workspace = true
+publish = false
+
+[lib]
+name = "curl_rs_lib"
+
+[features]
+default = ["http", "ftp", "smtp", "imap", "pop3", "tftp", "telnet", "dict", "mqtt", "rtsp", "cookies", "brotli", "zstd"]
+
+# Protocol features (replacing CURL_DISABLE_* macros)
+http = []
+ftp = []
+smtp = []
+imap = []
+pop3 = []
+tftp = []
+telnet = []
+dict = []
+mqtt = []
+rtsp = []
+
+# Functionality features
+cookies = []
+
+# Compression features
+brotli = ["dep:brotli"]
+zstd = ["dep:zstd"]
+
+# Optional DNS resolver
+hickory-dns = ["dep:hickory-resolver"]
+
+# Authentication features
+gssapi = []
+
+[dependencies]
+# Core Runtime & Networking
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+pin-project-lite = { workspace = true }
+socket2 = { workspace = true }
+
+# HTTP/1.1 + HTTP/2
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+h2 = { workspace = true }
+
+# HTTP/3 + QUIC
+quinn = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
+
+# TLS (rustls exclusively)
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+webpki-roots = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+# SSH (SFTP/SCP via russh)
+russh = { workspace = true }
+russh-sftp = { workspace = true }
+russh-keys = { workspace = true }
+
+# DNS (optional)
+hickory-resolver = { workspace = true, optional = true }
+
+# Cryptography
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+md-5 = { workspace = true }
+md4 = { workspace = true }
+hmac = { workspace = true }
+des = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+
+# Compression
+flate2 = { workspace = true }
+brotli = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
+
+# Serialization and Utilities
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+percent-encoding = { workspace = true }
+idna = { workspace = true }
+publicsuffix = { workspace = true }
+glob = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = { workspace = true }
+rcgen = { workspace = true }
+assert_cmd = { workspace = true }
+predicates = { workspace = true }

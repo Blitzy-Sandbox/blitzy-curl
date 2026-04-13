@@ -160,3 +160,35 @@ diminishes over time when keys are rediscovered. Note that this also works for
 putting a new ticket into the cache: when no present entry matches, a new one
 with peer key is created. This peer key then no longer bears the cost of hash
 computes.
+
+## curl-rs Rust Workspace — TLS Session Management
+
+In the curl-rs Rust workspace, TLS session management is handled entirely
+through rustls's built-in session resumption capabilities. The core
+implementation lives in `curl-rs-lib/src/tls/session_cache.rs`, which wraps
+rustls's native session storage while preserving the `ssl_peer_key` concept
+described above for cache lookup compatibility.
+
+Key differences from the C implementation:
+
+- **Single TLS backend** — rustls (0.23.x) is the exclusive TLS backend,
+  replacing all seven C backends (OpenSSL, Schannel, GnuTLS, mbedTLS,
+  wolfSSL, Apple Security Transport, and the C rustls-ffi binding).
+- **TLSv1.3 single-use tickets** — the single-use session ticket semantics
+  required by RFC 8446 are enforced natively by rustls, eliminating the need
+  for the manual put/take/return bookkeeping described in the C cache above.
+- **Session resumption and 0-RTT** — resumption and early data support
+  leverage rustls's `Resumption` API rather than raw ticket byte manipulation.
+
+Additional TLS modules in the Rust workspace (`curl-rs-lib/src/tls/`):
+
+- `tls/mod.rs` — TLS abstraction layer (replaces `vtls/vtls.c`)
+- `tls/config.rs` — unified TLS configuration builder using rustls
+  `ClientConfig`
+- `tls/keylog.rs` — `SSLKEYLOGFILE` support via rustls `KeyLog` trait
+  (replaces `vtls/keylog.c`)
+- `tls/hostname.rs` — hostname verification, handled internally by rustls
+  (replaces `vtls/hostcheck.c`)
+
+See the target design TLS module table (AAP Section 0.5.1) for the complete
+file mapping from the C `lib/vtls/` directory to the Rust `tls/` module.

@@ -1,0 +1,115 @@
+# -----------------------------------------------------------------------
+# curl-rs workspace root manifest
+#
+# Defines three member crates (curl-rs-lib, curl-rs, curl-rs-ffi) and
+# centralizes all shared dependency versions per AAP Section 0.6.1.
+# Replaces CMakeLists.txt find_package() calls from the C codebase.
+#
+# SPDX-License-Identifier: curl
+# -----------------------------------------------------------------------
+
+[workspace]
+members = ["curl-rs-lib", "curl-rs", "curl-rs-ffi"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "curl"
+repository = "https://github.com/curl/curl"
+
+# ---------------------------------------------------------------------------
+# Shared dependency versions — all member crates reference these via
+# `dep.workspace = true`. Version strings match AAP Section 0.6.1 exactly
+# unless a specific version is broken (documented inline).
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+
+# Core Runtime and Networking
+tokio = { version = "1.49.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "compat", "io"] }
+bytes = "1"
+futures-util = "0.3"
+pin-project-lite = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
+
+# HTTP/1.1 + HTTP/2
+hyper = { version = "1.7.0", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "tokio"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+h2 = "0.4"
+
+# HTTP/3 + QUIC
+quinn = "0.11.9"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+
+# TLS (rustls exclusively — zero C TLS library linkage)
+rustls = "0.23.36"
+tokio-rustls = "0.26.4"
+rustls-pki-types = "1"
+webpki-roots = "1"
+rustls-pemfile = "2"
+
+# SSH (SFTP/SCP via russh)
+# AAP specified russh 0.54.6 but that version has a yanked transitive
+# dependency (libcrux-ml-kem 0.0.3). Using 0.55 — the first fully
+# resolvable release. See setup log for details.
+russh = "0.55"
+russh-sftp = "2.1.1"
+russh-keys = "0.49.2"
+
+# DNS (optional, feature-gated via hickory-dns feature in curl-rs-lib)
+hickory-resolver = "0.25.2"
+
+# CLI
+clap = { version = "4.5.54", features = ["derive", "env", "string"] }
+clap_complete = "4"
+
+# FFI
+libc = "0.2"
+
+# Cryptography (for auth protocols — Digest, NTLM, AWS SigV4, SASL)
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+md4 = "0.10"
+hmac = "0.12"
+des = "0.8"
+base64 = "0.22"
+rand = "0.8"
+
+# Compression (content-encoding: gzip, brotli, zstd)
+flate2 = "1"
+brotli = "8"
+zstd = "0.13"
+
+# Serialization and Utilities
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+percent-encoding = "2"
+idna = "1"
+publicsuffix = "2"
+glob = "0.3"
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+xattr = "1"
+rpassword = "7.4.0"
+terminal_size = "0.4"
+
+# Dev Dependencies (shared across member crates)
+rcgen = "0.14"
+tokio-test = "0.4"
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+
+# Build Dependencies (for curl-rs-ffi cbindgen C header generation)
+cbindgen = "0.29.2"

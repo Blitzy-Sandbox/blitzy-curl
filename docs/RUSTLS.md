@@ -83,3 +83,58 @@ their build/platform requirements.
 [cargo-c pkg]: https://github.com/lu-zero/cargo-c?tab=readme-ov-file#availability
 [cargo-c prebuilt]: https://github.com/lu-zero/cargo-c/releases
 [cryptography provider]: https://github.com/cpu/rustls-ffi?tab=readme-ov-file#cryptography-provider
+
+## curl-rs Rust Workspace — Native Rustls
+
+The **curl-rs** Rust workspace uses rustls **natively** as its exclusive TLS
+backend. Unlike the C codebase described above (which relies on rustls-ffi C
+bindings), the Rust workspace depends on the `rustls` crate directly — no
+separate rustls-ffi build step is needed.
+
+### TLS dependency stack
+
+| Crate | Version | Role |
+|-------|---------|------|
+| `rustls` | 0.23.36 | TLS 1.2/1.3 implementation — sole TLS provider |
+| `tokio-rustls` | 0.26.4 | Async TLS stream integration with the Tokio runtime |
+| `webpki-roots` | 1.x | Mozilla root certificate bundle for default trust |
+| `rustls-pemfile` | 2.x | PEM certificate and private-key file parsing |
+| `rustls-pki-types` | 1.x | Shared PKI type definitions (certificates, keys) |
+
+All of these are regular Cargo dependencies resolved automatically from
+crates.io — **no manual installation or linking** is required.
+
+### What this replaces
+
+The native Rust TLS stack replaces **all** C TLS backends that were previously
+selectable at configure time:
+
+- OpenSSL / LibreSSL
+- GnuTLS
+- mbedTLS
+- wolfSSL
+- Apple Security Transport (SecureTransport)
+- Windows Schannel (SChannel)
+
+With curl-rs there is **zero C TLS library linkage** in any build
+configuration. The `rustls` crate is the only TLS provider.
+
+### Building
+
+TLS support is included automatically when you build the workspace:
+
+    % cargo build --release --workspace
+
+No `--with-rustls` flag or separate configure step is necessary.
+
+### Certificate validation
+
+TLS certificate validation is **ON** by default. If the `--insecure` (`-k`)
+flag is passed, a warning is emitted to stderr before the transfer proceeds,
+matching the behavior of curl 8.x.
+
+### Minimum Supported Rust Version
+
+The curl-rs workspace requires **Rust 1.75** or newer (the `rustls` 0.23.x
+crate itself requires Rust 1.71+). The pinned toolchain is defined in
+`rust-toolchain.toml` at the repository root.

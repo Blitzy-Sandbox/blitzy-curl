@@ -34,6 +34,129 @@ If you get your code off a git repository instead of a release tarball, see
 the [GIT-INFO.md](https://github.com/curl/curl/blob/master/GIT-INFO.md) file in
 the root directory for specific instructions on how to proceed.
 
+# Building the Rust Workspace (curl-rs)
+
+This repository also contains a Rust workspace that provides a complete
+rewrite of curl and libcurl in Rust. The Rust workspace produces three crates:
+
+- **curl-rs-lib** — core library crate (protocols, TLS, transfer, DNS, auth)
+- **curl-rs** — CLI binary crate (functionally equivalent to the C `curl` binary)
+- **curl-rs-ffi** — FFI compatibility crate (produces a libcurl-compatible shared
+  library that can be used as a drop-in replacement for libcurl)
+
+The Rust build is entirely independent of the C build system described in the
+sections below. You do not need `configure`, `make`, or any C compiler to build
+the Rust workspace.
+
+## Prerequisites
+
+- **Rust stable toolchain**, version **1.75 or later** (edition 2021)
+- Install via [rustup](https://rustup.rs/):
+
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+- Verify the installed version:
+
+      rustc --version
+
+  The reported version must be **1.75.0** or newer.
+- **Cargo** is included automatically with the Rust toolchain installed by rustup.
+
+For optional Miri-based memory safety testing you also need the nightly
+toolchain with the Miri and rust-src components:
+
+    rustup toolchain install nightly
+    rustup component add --toolchain nightly miri rust-src
+
+## Building
+
+Clone the repository and enter the project root, then build all three crates
+in release mode:
+
+    cargo build --release --workspace
+
+This must complete with **zero warnings**.
+
+After a successful build, the artifacts are located at:
+
+| Artifact | Path |
+|---|---|
+| CLI binary | `target/release/curl-rs` |
+| Shared library (Linux) | `target/release/libcurl_rs_ffi.so` |
+| Shared library (macOS) | `target/release/libcurl_rs_ffi.dylib` |
+| Static library | `target/release/libcurl_rs_ffi.a` |
+
+## Testing
+
+Run the full test suite for all crates:
+
+    cargo test --workspace
+
+Run Clippy lint checks (must pass with zero warnings):
+
+    cargo clippy --workspace -- -D warnings
+
+Run Miri to verify memory safety of the core library (requires the nightly
+toolchain):
+
+    cargo +nightly miri test -p curl-rs-lib
+
+## Installation
+
+Install the `curl-rs` binary into your Cargo binary directory (`~/.cargo/bin/`):
+
+    cargo install --path curl-rs
+
+After installation, you can invoke the binary as `curl-rs` from any terminal
+session where `~/.cargo/bin` is in your `PATH`.
+
+## TLS Backend
+
+The Rust workspace uses **rustls** exclusively as its TLS backend. No separate
+TLS library installation is required — all TLS support is compiled in
+automatically via Cargo dependencies.
+
+This replaces the C build's TLS backend selection options (`--with-openssl`,
+`--with-gnutls`, `--with-mbedtls`, `--with-wolfssl`, `--with-schannel`,
+`--with-amissl`). Certificate verification is enabled by default; the
+`--insecure` CLI flag can be used to skip verification (a warning is printed to
+stderr, matching curl's existing behavior).
+
+## Cross-Compilation
+
+The workspace is tested on the following CI targets:
+
+- Linux x86\_64 (`x86_64-unknown-linux-gnu`)
+- Linux aarch64 (`aarch64-unknown-linux-gnu`)
+- macOS x86\_64 (`x86_64-apple-darwin`)
+- macOS arm64 (`aarch64-apple-darwin`)
+
+To cross-compile for a different target, first install the target via rustup
+and then build:
+
+    rustup target add aarch64-unknown-linux-gnu
+    cargo build --release --target aarch64-unknown-linux-gnu
+
+Target-specific linker and build settings are configured in
+`.cargo/config.toml`.
+
+## Feature Flags
+
+Protocol support and optional functionality can be toggled via Cargo feature
+flags. For example, to build without FTP support:
+
+    cargo build --release --workspace --no-default-features --features "http,cookies,brotli,zstd"
+
+For a complete mapping between C preprocessor `CURL_DISABLE_*` macros and Cargo
+feature flags, see
+[CURL-DISABLE](https://github.com/curl/curl/blob/master/docs/CURL-DISABLE.md).
+
+---
+
+The sections below describe how to build the **original C implementation** of
+curl and libcurl using `configure`/`make`, CMake, or platform-specific
+toolchains.
+
 # Unix
 
 A normal Unix installation is made in three or four steps (after you have
