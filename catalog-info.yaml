@@ -2,12 +2,15 @@ apiVersion: backstage.io/v1alpha1
 kind: Component
 metadata:
   name: blitzy-curl
-  description: "Complete C-to-Rust rewrite of curl 8.19.0-DEV — 3-crate workspace, 215K lines of Rust, 7,312 tests passing"
+  description: Complete C-to-Rust rewrite of curl 8.19.0-DEV — 3-crate workspace,
+    215K lines of Rust, 7,312 tests passing
   tags:
-    - c
-    - rust
-    - infrastructure
-    - refactor
+  - c
+  - infrastructure
+  - library
+  - refactor
+  - rewrite
+  - rust
   labels:
     blitzy.com/language: rust
   annotations:
@@ -15,14 +18,14 @@ metadata:
     github.com/project-slug: Blitzy-Sandbox/blitzy-curl
     backstage.io/source-location: url:https://github.com/Blitzy-Sandbox/blitzy-curl/tree/master/
   links:
-    - url: https://github.com/Blitzy-Sandbox/blitzy-curl
-      title: GitHub Repository
-    - url: https://github.com/Blitzy-Sandbox/blitzy-curl/pull/1
-      title: "PR #1: C-to-Rust Rewrite — 215K Lines"
-      icon: github
-    - url: https://github.com/Blitzy-Sandbox/blitzy-curl/tree/master/blitzy/documentation
-      title: Blitzy Documentation
-      icon: docs
+  - url: https://github.com/Blitzy-Sandbox/blitzy-curl
+    title: GitHub Repository
+  - url: https://github.com/Blitzy-Sandbox/blitzy-curl/pull/1
+    title: 'PR #1: C-to-Rust Rewrite — 215K Lines'
+    icon: github
+  - url: https://github.com/Blitzy-Sandbox/blitzy-curl/tree/master/blitzy/documentation
+    title: Blitzy Documentation
+    icon: docs
 spec:
   type: library
   lifecycle: experimental
