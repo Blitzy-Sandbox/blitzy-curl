@@ -242,6 +242,20 @@ unix-sockets = []    # curl `UnixSockets`
 proxy = []           # HTTP / SOCKS proxy support
 aws-sigv4 = []       # AWS SigV4 request signing
 
+# ---- additional HTTP / SASL auth schemes (default OFF — match curl's build) --
+# These mirror curl's `USE_SPNEGO` / `USE_KERBEROS5` / `USE_GSASL` build
+# switches, which are OFF in curl's default build. They are deliberately
+# EXCLUDED from the `default` set below so that curl_version_info() /
+# `curl --version` reports the same capability set as curl 8.x's default build
+# (the CURL_VERSION_SPNEGO 1<<8, CURL_VERSION_GSSAPI 1<<17,
+# CURL_VERSION_KERBEROS5 1<<18, and CURL_VERSION_GSASL 1<<29 bits stay off —
+# AAP §0.7.3, in lockstep with src/version.rs). `src/auth/mod.rs` gates its
+# Negotiate / Kerberos / SCRAM submodules and the matching challenge-picker
+# branches on these features.
+spnego = []          # curl `USE_SPNEGO`    — HTTP Negotiate (SPNEGO)
+gssapi = []          # curl `USE_KERBEROS5` — Kerberos 5 / GSS-API
+gsasl = []           # curl `USE_GSASL`     — GSASL (SCRAM)
+
 # ---- optional-dependency-backed features ------------------------------------
 brotli = ["dep:brotli"]                 # curl `USE_BROTLI` (default ON)
 zstd = ["dep:zstd"]                     # curl `USE_ZSTD`   (default ON)

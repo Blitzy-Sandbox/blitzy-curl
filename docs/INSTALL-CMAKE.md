@@ -16,6 +16,13 @@ instructions below for the platform you are building on.
 CMake builds can be configured either from the command line, or from one of
 CMake's GUIs.
 
+This document covers building the C implementation with CMake. The repository
+also ships a memory-safe Rust rewrite - a Cargo workspace of the `curl-rs-lib`,
+`curl-rs`, and `curl-rs-ffi` crates - that is built with `cargo` rather than
+CMake. Build it from the repository root with `cargo build --release
+--workspace` (stable toolchain, MSRV 1.75, edition 2021). See `docs/INSTALL.md`
+and the top-level `README.md` for details.
+
 # Configuring
 
 A CMake configuration of curl is similar to the autotools build of curl.
