@@ -85,6 +85,12 @@ pub mod idn; // Internationalized Domain Names (feature `idn`).
 pub mod netrc; // `.netrc` credential file parsing.
 pub mod psl; // Public Suffix List handling (feature `psl`).
 
+// The shared-state handle (`curl_share` / `CURLSH`, `lib/curl_share.c`): an
+// `Arc<Mutex<…>>`-backed pool of the stateful subsystems above (cookies, HSTS,
+// PSL) plus the DNS / TLS-session / connection caches, attachable to many easy
+// handles. Declared after the subsystems it pools.
+pub mod share;
+
 // Transfer-support subsystems.
 pub mod content_encoding; // gzip/deflate/brotli/zstd decoding dispatch.
 pub mod progress; // Transfer progress accounting, timers, and the progress meter.
@@ -95,6 +101,7 @@ pub mod transfer; // The async transfer engine (type-state flow) — `lib/transf
 // Subsystem module trees.
 pub mod auth; // Authentication: HTTP schemes + the shared SASL state machine (`lib/vauth/`, `lib/curl_sasl.c`, …).
 pub mod conn; // Connection-filter chain + filters (`lib/cfilters.c`, `lib/cf-*.c`).
+pub mod protocols; // Per-protocol engines and codecs (`lib/http*.c`, `lib/ftp.c`, …).
 pub mod proxy; // SOCKS / HTTP proxy + no-proxy matching (`lib/socks.c`, …).
 pub mod tls; // The single `rustls` TLS backend (`lib/vtls/`).
 pub mod util; // Portable utilities and containers (`lib/curlx/`, `lib/hash.c`, …).
