@@ -1,0 +1,289 @@
+# =============================================================================
+# curl-rs-lib — core async library crate manifest
+# =============================================================================
+#
+# `curl-rs-lib` is the foundation crate of the curl-rs workspace: the
+# memory-safe, asynchronous Rust reimplementation of the libcurl core (the C
+# `lib/` tree — protocol engines, the TLS layer, the transfer engine,
+# connection management, DNS, and authentication). It has no 1:1 C-source
+# equivalent; its structural analog is the libcurl C build manifest
+# `lib/CMakeLists.txt`, and its [features] set is the Rust replacement for
+# curl's compile-time `#ifdef CURL_DISABLE_* / USE_*` gates as reported by
+# `lib/version.c`.
+#
+# Dependency direction (AAP §0.1.1 / §0.4 — STRICTLY one-directional):
+#   * This crate is the dependency TARGET of both `curl-rs` (the CLI binary)
+#     and `curl-rs-ffi` (the `extern "C"` libcurl ABI crate).
+#   * It depends on NEITHER of them. Never add `curl-rs` or `curl-rs-ffi` here.
+#
+# Version inheritance (single source of truth):
+#   Every dependency version and every shared [package] field is inherited from
+#   the workspace root `/Cargo.toml` via `<field>.workspace = true` and
+#   `<dep> = { workspace = true, ... }`. This manifest pins NO versions of its
+#   own — there are zero literal "x.y.z" version strings below (outside
+#   comments) so the root remains the only place versions are declared.
+#
+# Human-facing version string:
+#   curl's `LIBCURL_VERSION` is "8.19.0-DEV" (`LIBCURL_VERSION_NUM 0x081300`,
+#   from include/curl/curlver.h). Cargo's SemVer `version` field cannot carry
+#   the "-DEV" pre-release marker the way the C macro does (a literal
+#   "8.19.0-DEV" here would be read as a SemVer pre-release and sort *below*
+#   "8.19.0"), so the workspace pins the numeric "8.19.0" and the exact
+#   "8.19.0-DEV" string reported by `curl_version()` / `curl --version` is owned
+#   by this crate's `src/version.rs`, not by this manifest.
+#
+# Memory safety (AAP §0.7.1):
+#   `src/lib.rs` and the protocol/tls/transfer module roots carry
+#   `#![forbid(unsafe_code)]`. Every dependency below exposes a safe API, so the
+#   safe core never needs `unsafe`; raw-pointer / FFI handling lives only in
+#   `curl-rs-ffi`. No OpenSSL / native-tls / C-TLS or C-protocol crate appears
+#   here — rustls is the exclusive TLS backend (AAP §0.8.1, enforced by the
+#   workspace `deny.toml`).
+# =============================================================================
+
+[package]
+name = "curl-rs-lib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core async library crate of the curl-rs workspace — a memory-safe Rust reimplementation of the libcurl core (protocol engines, TLS, transfer engine, connection management, DNS, authentication)."
+
+# -----------------------------------------------------------------------------
+# Library target. The default crate type is `rlib`, which is exactly what an
+# internal workspace library needs: it is linked into `curl-rs` and
+# `curl-rs-ffi` as a normal Rust dependency. The `cdylib` / `staticlib`
+# artifacts that form the drop-in `libcurl` are produced ONLY by `curl-rs-ffi`,
+# never here — so there is deliberately NO `crate-type` override below.
+#
+# `name` is set explicitly to its default purely for documentation: the crate's
+# Rust import path is `curl_rs_lib` (Cargo turns the `-` in the package name
+# into `_`), which is what `curl-rs` and `curl-rs-ffi` write as
+# `use curl_rs_lib::…`.
+# -----------------------------------------------------------------------------
+[lib]
+name = "curl_rs_lib"
+
+# -----------------------------------------------------------------------------
+# Inherit the workspace-wide lint policy (root [workspace.lints]). This opts
+# into `unsafe_op_in_unsafe_fn = "deny"`, reinforcing the memory-safety mandate
+# (AAP §0.7.1): it is a no-op in this safe crate (which layers
+# `#![forbid(unsafe_code)]` on top) and keeps the policy consistent across all
+# three workspace members.
+# -----------------------------------------------------------------------------
+[lints]
+workspace = true
+
+# =============================================================================
+# [dependencies] — the runtime dependencies of the core library.
+#
+# Every entry inherits its exact version from the root [workspace.dependencies]
+# via `workspace = true`; only `features` / `optional` are set locally. CLI-only
+# crates (clap, clap_complete, anyhow, glob, tracing-subscriber), the FFI-only
+# crates (libc, cbindgen), and serde / serde_json are intentionally NOT declared
+# here — they belong to `curl-rs` / `curl-rs-ffi`.
+# =============================================================================
+[dependencies]
+
+# ---- async runtime & I/O ----------------------------------------------------
+# `rt-multi-thread` is mandatory: the `Multi` handle (`src/multi.rs`) drives
+# concurrent transfers on a Tokio multi-thread runtime (AAP §0.4.4), while the
+# CLI one-shot path uses the current-thread runtime. The feature set is kept
+# lean (no `features = ["full"]`) per the minimal-change mandate.
+tokio = { workspace = true, features = [
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "macros",
+    "fs",
+] }
+tokio-util.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+pin-project-lite.workspace = true
+socket2.workspace = true
+
+# ---- HTTP/1.1 + HTTP/2 (hyper + h2, ALPN over rustls) -----------------------
+hyper = { workspace = true, features = ["client", "http1", "http2"] }
+hyper-util.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+h2.workspace = true
+
+# ---- HTTP/3 + QUIC (replaces ngtcp2 + nghttp3 / quiche) ---------------------
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+
+# ---- TLS — the EXCLUSIVE backend (AAP §0.8.1) -------------------------------
+# rustls only. No OpenSSL / GnuTLS / mbedTLS / wolfSSL / Schannel / Secure
+# Transport, and no `*-sys` C-TLS crate anywhere (deny.toml-enforced).
+# Certificate validation is ON by default; the mandatory `--insecure` stderr
+# warning is emitted in the CLI / transfer layer, not in this manifest.
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+webpki-roots.workspace = true
+rustls-pemfile.workspace = true
+
+# ---- SSH transport: SFTP / SCP (replaces libssh / libssh2) ------------------
+# NOTE: there is intentionally NO `russh-keys` dependency. The workspace pins
+# russh 0.61.x (the AAP's 0.54.6 is uninstallable — its transitive
+# `libcrux-ml-kem 0.0.3` is yanked from crates.io), and on that line SSH key
+# handling is provided by the in-crate `russh::keys` module. The standalone
+# `russh-keys` crate is therefore not declared by the workspace and must not be
+# referenced here.
+russh.workspace = true
+russh-sftp.workspace = true
+
+# ---- crypto / auth primitives (NTLM, Digest, SASL, SCRAM — AAP §0.6.1) ------
+sha2.workspace = true
+md-5.workspace = true
+md4.workspace = true
+hmac.workspace = true
+des.workspace = true
+base64.workspace = true
+rand.workspace = true
+
+# ---- content-encoding -------------------------------------------------------
+# `flate2` (gzip / deflate) is a regular, always-on dependency: it maps to
+# curl's always-present `libz` capability (HAVE_LIBZ in lib/version.c), which is
+# not behind a `CURL_DISABLE_*` gate. Brotli and zstd ARE feature-gated (default
+# on) to mirror curl's `USE_BROTLI` / `USE_ZSTD` build switches.
+flate2.workspace = true
+brotli = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
+
+# ---- URL / IDN / PSL --------------------------------------------------------
+url.workspace = true
+percent-encoding.workspace = true
+idna.workspace = true            # → curl `IDN` capability
+publicsuffix.workspace = true    # → curl `PSL` capability
+
+# ---- DNS (optional async resolver; OFF by default) --------------------------
+# Default name resolution uses the system / Tokio resolver. `hickory-resolver`
+# is the optional async backend behind the `hickory-dns` feature — curl's
+# `USE_ARES` analog, which is OFF in curl's default build (AAP §0.6.2).
+hickory-resolver = { workspace = true, optional = true }
+
+# ---- misc -------------------------------------------------------------------
+# chrono:    date parsing / formatting for cookies, HSTS, alt-svc expiry, and
+#            HTTP date headers (replaces lib/parsedate.c).
+# tracing:   structured verbose-trace events (replaces lib/curl_trc.c). This
+#            crate only EMITS events; the subscriber is configured by the binary
+#            crate, so `tracing-subscriber` is deliberately not a dependency.
+# thiserror: derives the `CurlError` enum in src/error.rs.
+chrono.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+# =============================================================================
+# [features] — the Rust replacement for curl's compile-time
+# `#ifdef CURL_DISABLE_* / USE_*` gates.
+#
+# Protocol / capability features are "marker" features (empty arrays): the code
+# consumes them via `#[cfg(feature = "…")]` / `cfg!(feature = "…")` so that
+# disabling one compiles it out without breaking the build. `brotli`, `zstd`,
+# and `hickory-dns` additionally toggle their optional dependency via `dep:`.
+#
+# There is intentionally no `ssl` feature: rustls is a non-optional dependency,
+# so TLS (`SSL`) and every `…s` scheme (https, ftps, imaps, …) are ALWAYS
+# available, matching curl's `USE_SSL`-always default build.
+# =============================================================================
+[features]
+
+# ---- protocol schemes (curl `CURL_DISABLE_<PROTO>` gates; all default ON) ----
+http = []
+ftp = []
+smtp = []
+imap = []
+pop3 = []
+tftp = []
+telnet = []
+dict = []
+mqtt = []
+rtsp = []
+ftps = []
+scp = []
+sftp = []
+file = []
+gopher = []
+smb = []
+ldap = []
+websockets = []      # curl `ws` / `wss`
+
+# ---- HTTP versions ----------------------------------------------------------
+http2 = []           # curl `HTTP2` (via h2)
+http3 = []           # curl `HTTP3` (via quinn + h3)
+
+# ---- stateful subsystems & capabilities (default ON) ------------------------
+cookies = []         # curl `CURL_DISABLE_COOKIES` gate
+alt-svc = []         # curl `alt-svc`
+hsts = []            # curl `HSTS`
+ipv6 = []            # curl `IPv6`
+ntlm = []            # curl `NTLM`
+unix-sockets = []    # curl `UnixSockets`
+proxy = []           # HTTP / SOCKS proxy support
+aws-sigv4 = []       # AWS SigV4 request signing
+
+# ---- optional-dependency-backed features ------------------------------------
+brotli = ["dep:brotli"]                 # curl `USE_BROTLI` (default ON)
+zstd = ["dep:zstd"]                     # curl `USE_ZSTD`   (default ON)
+hickory-dns = ["dep:hickory-resolver"]  # curl `USE_ARES` analog (default OFF)
+
+# -----------------------------------------------------------------------------
+# Default feature set chosen to equal curl's default build so
+# curl_version_info() / `curl --version` capability + protocol reporting in
+# src/version.rs matches curl 8.x exactly (this drives which feature-gated cases
+# `runtests` selects — AAP §0.7.3). It lists every default-ON feature above and
+# EXCLUDES `hickory-dns` (curl's default build does not use c-ares / USE_ARES).
+# -----------------------------------------------------------------------------
+default = [
+    "http",
+    "ftp",
+    "smtp",
+    "imap",
+    "pop3",
+    "tftp",
+    "telnet",
+    "dict",
+    "mqtt",
+    "rtsp",
+    "ftps",
+    "scp",
+    "sftp",
+    "file",
+    "gopher",
+    "smb",
+    "ldap",
+    "websockets",
+    "http2",
+    "http3",
+    "cookies",
+    "alt-svc",
+    "hsts",
+    "ipv6",
+    "ntlm",
+    "unix-sockets",
+    "proxy",
+    "aws-sigv4",
+    "brotli",
+    "zstd",
+]
+
+# =============================================================================
+# [dev-dependencies] — test-only dependencies for this crate's unit /
+# integration tests. (The CLI-binary test helpers `assert_cmd` / `predicates`
+# belong to `curl-rs`, not here.)
+# =============================================================================
+[dev-dependencies]
+tokio-test.workspace = true   # async test utilities
+tempfile.workspace = true     # temp files / dirs in tests
+rcgen.workspace = true        # self-signed certs for TLS validation tests
