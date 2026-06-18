@@ -9,21 +9,29 @@ name: 'Rust'
     branches:
       - master
       - '*/ci'
-    paths-ignore:
-      - '**/*.md'
-      - '.circleci/**'
-      - 'appveyor.*'
-      - 'Dockerfile'
-      - 'projects/**'
+    paths:
+      - '.cargo/**'
+      - '.github/workflows/rust.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'curl-rs*/**'
+      - 'deny.toml'
+      - 'README.md'
+      - 'docs/INSTALL.md'
+      - 'rust-toolchain.toml'
   pull_request:
     branches:
       - master
-    paths-ignore:
-      - '**/*.md'
-      - '.circleci/**'
-      - 'appveyor.*'
-      - 'Dockerfile'
-      - 'projects/**'
+    paths:
+      - '.cargo/**'
+      - '.github/workflows/rust.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'curl-rs*/**'
+      - 'deny.toml'
+      - 'README.md'
+      - 'docs/INSTALL.md'
+      - 'rust-toolchain.toml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -239,7 +247,7 @@ jobs:
           key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml') }}
 
       - name: 'install cargo-llvm-cov'
-        run: cargo install --locked cargo-llvm-cov
+        run: cargo install --locked cargo-llvm-cov --version 0.8.7
 
       - name: 'run coverage'
         run: cargo llvm-cov --workspace --json --output-path coverage.json
@@ -298,8 +306,11 @@ jobs:
           rustup show
           cargo --version
 
-      - name: 'install cargo-audit and cargo-deny'
-        run: cargo install --locked cargo-audit cargo-deny
+      - name: 'install cargo-audit'
+        run: cargo install --locked cargo-audit --version 0.22.2
+
+      - name: 'install cargo-deny'
+        run: cargo install --locked cargo-deny --version 0.19.9
 
       - name: 'cargo audit'
         run: cargo audit

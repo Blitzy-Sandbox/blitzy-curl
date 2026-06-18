@@ -47,6 +47,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -164,8 +165,16 @@ zstd = { workspace = true, optional = true }
 # ---- URL / IDN / PSL --------------------------------------------------------
 url.workspace = true
 percent-encoding.workspace = true
-idna.workspace = true            # → curl `IDN` capability
-publicsuffix.workspace = true    # → curl `PSL` capability
+# Optional, feature-gated to keep capability reporting in lockstep with compiled
+# behavior (AAP §0.6.2): `idna` is pulled in only when the `idn` feature is on
+# and `publicsuffix` only when `psl` is on. Both features are ON in the default
+# set below (mirroring curl's default `USE_LIBIDN2` / `USE_LIBPSL` build), so a
+# default build compiles the real IDN/PSL paths AND reports the capabilities;
+# `--no-default-features` (or omitting the feature) drops both the dependency and
+# the advertised capability together. `version.rs` gates its `IDN`/`PSL`
+# reporting on these exact same features, so the two can never drift apart.
+idna = { workspace = true, optional = true }            # feature `idn`  → curl `IDN`
+publicsuffix = { workspace = true, optional = true }    # feature `psl`  → curl `PSL`
 
 # ---- DNS (optional async resolver; OFF by default) --------------------------
 # Default name resolution uses the system / Tokio resolver. `hickory-resolver`
@@ -236,13 +245,16 @@ aws-sigv4 = []       # AWS SigV4 request signing
 # ---- optional-dependency-backed features ------------------------------------
 brotli = ["dep:brotli"]                 # curl `USE_BROTLI` (default ON)
 zstd = ["dep:zstd"]                     # curl `USE_ZSTD`   (default ON)
+idn = ["dep:idna"]                      # curl `USE_LIBIDN2` → `IDN` capability (default ON)
+psl = ["dep:publicsuffix"]              # curl `USE_LIBPSL`  → `PSL` capability (default ON)
 hickory-dns = ["dep:hickory-resolver"]  # curl `USE_ARES` analog (default OFF)
 
 # -----------------------------------------------------------------------------
 # Default feature set chosen to equal curl's default build so
 # curl_version_info() / `curl --version` capability + protocol reporting in
 # src/version.rs matches curl 8.x exactly (this drives which feature-gated cases
-# `runtests` selects — AAP §0.7.3). It lists every default-ON feature above and
+# `runtests` selects — AAP §0.7.3). It lists every default-ON feature above —
+# including `idn` and `psl` (curl's default `USE_LIBIDN2` / `USE_LIBPSL`) — and
 # EXCLUDES `hickory-dns` (curl's default build does not use c-ares / USE_ARES).
 # -----------------------------------------------------------------------------
 default = [
@@ -276,6 +288,8 @@ default = [
     "aws-sigv4",
     "brotli",
     "zstd",
+    "idn",
+    "psl",
 ]
 
 # =============================================================================

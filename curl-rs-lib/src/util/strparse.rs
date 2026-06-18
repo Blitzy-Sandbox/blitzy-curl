@@ -458,11 +458,7 @@ impl<'a> Str<'a> {
     /// - [`StrError::Big`] (`STRE_BIG`) if the inner content would exceed `max`
     ///   bytes.
     /// - [`StrError::EndQuote`] (`STRE_ENDQUOTE`) if no closing `"` is found.
-    pub fn curlx_str_quotedword(
-        &mut self,
-        out: &mut Str<'a>,
-        max: usize,
-    ) -> Result<(), StrError> {
+    pub fn curlx_str_quotedword(&mut self, out: &mut Str<'a>, max: usize) -> Result<(), StrError> {
         *out = Str::default();
         let s = self.s;
         if s.is_empty() || s[0] != b'"' {
@@ -1189,7 +1185,10 @@ mod tests {
     fn number_no_digit_is_no_num() {
         let mut s = Str::new("xyz");
         let mut n = 5u64;
-        assert_eq!(s.curlx_str_number(&mut n, CURL_OFF_T_MAX), Err(StrError::NoNum));
+        assert_eq!(
+            s.curlx_str_number(&mut n, CURL_OFF_T_MAX),
+            Err(StrError::NoNum)
+        );
         assert_eq!(n, 0);
         // Cursor untouched on error.
         assert_eq!(s.curlx_str(), b"xyz");
@@ -1268,7 +1267,10 @@ mod tests {
     fn hex_no_digit_and_overflow() {
         let mut none = Str::new("ghi");
         let mut n = 0u64;
-        assert_eq!(none.curlx_str_hex(&mut n, CURL_OFF_T_MAX), Err(StrError::NoNum));
+        assert_eq!(
+            none.curlx_str_hex(&mut n, CURL_OFF_T_MAX),
+            Err(StrError::NoNum)
+        );
 
         // Low-max branch (max = 15 < base = 16).
         let mut ok = Str::new("f");
@@ -1300,7 +1302,10 @@ mod tests {
         // A leading 8 means no octal digit at all.
         let mut bad = Str::new("8");
         let mut k = 0u64;
-        assert_eq!(bad.curlx_str_octal(&mut k, CURL_OFF_T_MAX), Err(StrError::NoNum));
+        assert_eq!(
+            bad.curlx_str_octal(&mut k, CURL_OFF_T_MAX),
+            Err(StrError::NoNum)
+        );
     }
 
     #[test]
@@ -1403,4 +1408,3 @@ mod tests {
         assert!(strncasecompare(b"", b"", 5));
     }
 }
-

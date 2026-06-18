@@ -53,15 +53,12 @@
 //!   a `char *buf` and returns it; the idiomatic Rust form returns an owned
 //!   [`String`]. A buffer-shaped variant, [`curlx_strerror_into`], is provided
 //!   for ported call sites that want to mirror the C "fill my buffer" shape.
-//! * **Message text.** [`std::io::Error`] renders a recognized code's message
-//!   the same way as the platform `strerror` (for example `"No such file or
-//!   directory"` for `ENOENT`), but appends a `" (os error N)"` suffix and, for
-//!   unrecognized codes, yields `"Unknown error N (os error N)"`. curl's C code
-//!   strips that suffix and emits `"Unknown error N"`. The Rust wording is
-//!   therefore *recognizable and never empty* but not byte-identical to the C
-//!   output. These strings are diagnostic only and are **not** part of the
-//!   libcurl ABI (the ABI-bearing strings all live in `crate::error`), so the
-//!   difference is benign.
+//! * **Message text.** [`std::io::Error`] renders recognized code messages
+//!   through the same platform facilities that curl uses, but Rust appends an
+//!   implementation-specific `" (os error N)"` suffix. The wrapper removes that
+//!   suffix and preserves curl's `"Unknown error N"` fallback shape for
+//!   unrecognized codes so user-visible diagnostics stay byte-compatible with
+//!   the C helper wherever the underlying platform wording is the same.
 //! * **No range checking.** Like the C helper, no validation is performed on
 //!   `err`; out-of-range or negative values produce the standard-library
 //!   fallback string rather than panicking.
@@ -92,16 +89,38 @@
 /// [`std::io::Error::from_raw_os_error`], which delegates to the platform's
 /// thread-safe message lookup (`strerror_r` / `FormatMessage`).
 ///
-/// Recognized codes yield the platform message (with a trailing
-/// `" (os error N)"`); unrecognized codes yield a non-empty
-/// `"Unknown error N (os error N)"` fallback. The function never panics and
-/// performs no range checking on `err`, matching the C helper's documented
-/// contract. For example, on POSIX systems `curlx_strerror(2)` (`ENOENT`)
-/// contains `"No such file or directory"`.
+/// Recognized codes yield the platform message with Rust's trailing
+/// `" (os error N)"` suffix removed; unrecognized codes yield curl's non-empty
+/// `"Unknown error N"` fallback. The function never panics and performs no
+/// range checking on `err`, matching the C helper's documented contract. For
+/// example, on POSIX systems `curlx_strerror(2)` (`ENOENT`) returns
+/// `"No such file or directory"`.
 #[inline]
 #[must_use]
 pub fn curlx_strerror(err: i32) -> String {
-    std::io::Error::from_raw_os_error(err).to_string()
+    format_raw_os_error(err)
+}
+
+/// Formats a raw OS error code using the standard library and normalizes the
+/// wording to curl's `curlx_strerror` shape.
+#[inline]
+fn format_raw_os_error(err: i32) -> String {
+    normalize_os_error_message(err, std::io::Error::from_raw_os_error(err).to_string())
+}
+
+/// Removes Rust-specific adornments from the platform error text.
+///
+/// The C helper copies the platform message directly, falls back to
+/// `"Unknown error N"` when the platform cannot render the code, and strips any
+/// trailing CR/LF from Windows messages. `std::io::Error` can append
+/// `" (os error N)"`; removing that suffix restores curl-compatible
+/// diagnostics without introducing any unsafe `strerror_r`/`FormatMessage`
+/// calls.
+#[inline]
+fn normalize_os_error_message(err: i32, message: String) -> String {
+    let message = message.trim_end_matches(['\r', '\n']);
+    let suffix = format!(" (os error {err})");
+    message.strip_suffix(&suffix).unwrap_or(message).to_owned()
 }
 
 /// Buffer-shaped parity variant of [`curlx_strerror`].
@@ -128,7 +147,11 @@ pub fn curlx_strerror_into(err: i32, buf: &mut String) {
 #[inline]
 #[must_use]
 pub fn last_os_error() -> String {
-    std::io::Error::last_os_error().to_string()
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(err) => normalize_os_error_message(err, error.to_string()),
+        None => error.to_string().trim_end_matches(['\r', '\n']).to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -151,24 +174,29 @@ mod tests {
             msg.contains("No such file or directory"),
             "unexpected ENOENT rendering: {msg:?}"
         );
+        assert!(
+            !msg.contains("os error 2"),
+            "Rust-specific OS suffix must be stripped: {msg:?}"
+        );
     }
 
     /// An out-of-range / unrecognized code must still yield a non-empty
-    /// fallback (the standard library renders `"Unknown error N (os error N)"`).
+    /// fallback matching curl's `"Unknown error N"` shape.
     #[test]
     fn unknown_code_has_non_empty_fallback() {
         let msg = curlx_strerror(999_999);
-        assert!(!msg.is_empty());
-        assert!(
-            msg.contains("999999"),
-            "fallback should mention the offending code: {msg:?}"
-        );
+        assert_eq!(msg, "Unknown error 999999");
     }
 
     /// Parity with the C helper: no range checking, no panic on negative input.
     #[test]
     fn negative_code_does_not_panic() {
-        assert!(!curlx_strerror(-1).is_empty());
+        let msg = curlx_strerror(-1);
+        assert!(!msg.is_empty());
+        assert!(
+            !msg.contains("os error -1"),
+            "Rust-specific OS suffix must be stripped: {msg:?}"
+        );
     }
 
     /// The buffer variant must clear stale content and then match the

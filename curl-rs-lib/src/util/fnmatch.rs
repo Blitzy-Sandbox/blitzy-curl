@@ -350,7 +350,10 @@ fn parsekeyword(pat: &[u8], pidx: &mut usize, charset: &mut [bool; CURLFNM_CHSET
     // The keyword consists of the lowercase bytes written above, terminated by
     // the first 0 (the `:`/`]` slots were never written). Compare against the
     // known class names exactly as the C `strcmp` chain does.
-    let end = keyword.iter().position(|&b| b == 0).unwrap_or(keyword.len());
+    let end = keyword
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(keyword.len());
     let kw = &keyword[..end];
 
     let flag = match kw {
@@ -891,7 +894,10 @@ mod tests {
         assert_eq!(run(b"?", b"\xff"), FnMatch::Match);
         assert_eq!(run(b"\xff*", b"\xffabc"), FnMatch::Match);
         // A literal UTF-8 multibyte sequence matches itself byte-for-byte.
-        assert_eq!(run(b"Lindm\xc3\xa4tarv", b"Lindm\xc3\xa4tarv"), FnMatch::Match);
+        assert_eq!(
+            run(b"Lindm\xc3\xa4tarv", b"Lindm\xc3\xa4tarv"),
+            FnMatch::Match
+        );
     }
 
     /// Empty pattern / empty string edge cases.

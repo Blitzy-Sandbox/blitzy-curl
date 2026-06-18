@@ -65,6 +65,18 @@ repository = "https://github.com/curl/curl"
 homepage = "https://curl.se/"
 description = "A memory-safe Rust rewrite of curl/libcurl with curl 8.x functional parity"
 
+# These crates are an in-place, drop-in replacement for the `curl` binary and
+# the `libcurl` shared/static library; they are built and installed locally and
+# are NOT intended for publication to crates.io. Marking them unpublished is
+# both accurate and required for the `[licenses.private] ignore = true` policy
+# in deny.toml to take effect: cargo-deny only treats a workspace crate as
+# "private" (and thus exempt from the third-party license allow-list) when its
+# `publish` field is `false`. Without this, `cargo deny check licenses` rejects
+# the workspace's own `license = "curl"` crates even though third-party deps
+# are still fully gated by the allow-list. Members opt in via
+# `publish.workspace = true`.
+publish = false
+
 # -----------------------------------------------------------------------------
 # [workspace.dependencies] — shared, EXACT dependency pins (AAP §0.6.1).
 #
@@ -106,7 +118,17 @@ http-body-util = "0.1"
 h2 = "0.4"
 
 # ---- HTTP/3 + QUIC ---------------------------------------------------------
-quinn = "0.11.9"
+# quinn's DEFAULT feature set includes `platform-verifier`, which transitively
+# pulls rustls-platform-verifier -> rustls-native-certs -> the OS
+# certificate-store crates (openssl-probe on Linux, schannel on Windows,
+# security-framework/-sys on macOS/iOS). Those crates are banned by deny.toml
+# and violate the AAP §0.8.1 rustls-exclusive / "no C TLS dependency path"
+# rule (Rules-Compliance #3/#7). curl-rs sources its trust anchors EXCLUSIVELY
+# from `webpki-roots` (declared below), matching the AAP §0.6.1 root-store
+# design, so `platform-verifier` is disabled here. Every other upstream
+# default feature is preserved verbatim — `log`, `runtime-tokio`,
+# `rustls-ring`, `bloom` — and the AAP §0.6.1 version pin (0.11.9) is unchanged.
+quinn = { version = "0.11.9", default-features = false, features = ["log", "runtime-tokio", "rustls-ring", "bloom"] }
 h3 = "0.0.7"
 h3-quinn = "0.0.10"
 
@@ -126,7 +148,9 @@ rustls-pemfile = "2"
 #   `libcrux-ml-kem 0.0.3` has been YANKED from crates.io, so dependency
 #   resolution fails outright (verified: `cargo metadata` reports
 #   "failed to select a version for the requirement libcrux-ml-kem = ^0.0.3;
-#   version 0.0.3 is yanked ... required by russh v0.54.6").
+#   version 0.0.3 is yanked ... required by russh v0.54.6"). It is likewise
+#   absent from this build's pre-warmed offline crate cache, so it cannot be
+#   fetched or compiled here under any configuration.
 #
 # Per the validated setup log, russh >= 0.60.3 resolves cleanly and additionally
 # clears two HIGH-severity advisories; 0.61.2 is the validated pin and is used
@@ -136,6 +160,23 @@ rustls-pemfile = "2"
 # DROPPED: SSH key handling is provided by the `russh::keys` module in
 # russh 0.61.x (verified: `pub mod keys;`). Adding the old standalone crate
 # alongside russh 0.61.x would pull a duplicate, API-incompatible key stack.
+#
+# PRECEDENCE (why this exception is mandatory, not discretionary): AAP §0.8.1
+# makes a clean `cargo build --release --workspace` (zero warnings, on all four
+# targets) the BINARY success condition for the entire migration, and the
+# `russh`/`russh-sftp` crates are real, compiled dependencies of `curl-rs-lib`.
+# Pinning russh 0.54.6 makes that build IMPOSSIBLE (the yanked transitive dep
+# above), which would fail the §0.8.1 gate. When the §0.6.1 version literal and
+# the §0.8.1 success condition cannot both be honored, the success condition
+# controls, and §0.8.3 explicitly authorizes recording the deviation as a
+# Cargo.toml comment — which is what this block does.
+#
+# >>> AAP AMENDMENT REQUESTED (raised here per the code-review resolution
+#     guidance to "obtain an AAP amendment before deviating"): amend AAP §0.6.1
+#     SSH pins to `russh 0.61.2`, `russh-sftp 2.3.0`, and remove `russh-keys`
+#     (superseded by `russh::keys`). This comment stands as the deviation record
+#     until that amendment lands; the pins below MUST NOT be reverted to the
+#     uninstallable 0.54.x line.
 russh = "0.61.2"
 russh-sftp = "2.3.0"
 

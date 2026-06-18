@@ -636,4 +636,3 @@ mod tests {
         assert_eq!(DYN_KEYFILE_SIZE, 100 * 1024);
     }
 }
-

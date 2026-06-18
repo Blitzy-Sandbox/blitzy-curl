@@ -423,8 +423,8 @@ fn push_token(out: &mut String, token: &str) {
 /// 4. brotli — `brotli/...`           (feature `brotli`)
 /// 5. zstd — `zstd/...`               (feature `zstd`)
 /// 6. *(c-ares slot omitted — the async/threaded resolver carries no token)*
-/// 7. IDN — `idna/...`
-/// 8. PSL — `libpsl/...`
+/// 7. IDN — `idna/...`                            (feature `idn`)
+/// 8. PSL — `libpsl/...`                          (feature `psl`)
 /// 9. SSH — `russh/...`               (feature `scp` or `sftp`)
 /// 10. HTTP/2 (nghttp2 slot) — `h2/...`            (feature `http`)
 /// 11. QUIC / HTTP/3 — `quinn/... h3/...`          (feature `http`)
@@ -453,10 +453,13 @@ fn build_banner() -> String {
 
     // 6. (c-ares slot intentionally omitted.)
 
-    // 7. IDN (idna) — always present; IDN handling is non-optional.
+    // 7. IDN (idna) — only when the `idn` feature is built (curl's USE_LIBIDN2).
+    #[cfg(feature = "idn")]
     push_token(&mut out, backend::IDN_TOKEN);
 
-    // 8. PSL (publicsuffix, reported as libpsl) — always present.
+    // 8. PSL (publicsuffix, reported as libpsl) — only when the `psl` feature is
+    //    built (curl's USE_LIBPSL).
+    #[cfg(feature = "psl")]
     push_token(&mut out, backend::PSL_TOKEN);
 
     // 9. SSH (russh) — only when SCP/SFTP support is built.
@@ -575,9 +578,14 @@ static FEATURE_NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
 /// * HTTP-family capabilities (`alt-svc`, `HSTS`, `HTTP2`, `HTTP3`,
 ///   `HTTPS-proxy`) require the `http` feature.
 /// * `brotli` and `zstd` require their like-named content-encoding features.
+/// * `IDN` requires the `idn` feature and `PSL` the `psl` feature — the SAME
+///   features that compile the [`crate::idn`] / [`crate::psl`] implementations,
+///   so a reported capability always corresponds to compiled-in behavior (and
+///   vice versa). Both features are ON in the default build (curl's
+///   `USE_LIBIDN2` / `USE_LIBPSL`), so a default report includes `IDN`/`PSL`.
 /// * The remainder are non-optional in this rewrite and always reported:
-///   `AsynchDNS` (the resolver is always async), `IDN`, `IPv6`, `Largefile`,
-///   `libz`, `NTLM`, `PSL`, `SSL` (rustls is mandatory), `threadsafe`
+///   `AsynchDNS` (the resolver is always async), `IPv6`, `Largefile`,
+///   `libz`, `NTLM`, `SSL` (rustls is mandatory), `threadsafe`
 ///   (the core is thread-safe), and `UnixSockets`.
 ///
 /// Capabilities a default build does **not** have are deliberately omitted
@@ -592,12 +600,12 @@ fn build_feature_names() -> Vec<&'static str> {
         ("HTTP2", cfg!(feature = "http")),
         ("HTTP3", cfg!(feature = "http")),
         ("HTTPS-proxy", cfg!(feature = "http")),
-        ("IDN", true),
+        ("IDN", cfg!(feature = "idn")),
         ("IPv6", true),
         ("Largefile", true),
         ("libz", true),
         ("NTLM", true),
-        ("PSL", true),
+        ("PSL", cfg!(feature = "psl")),
         ("SSL", true),
         ("threadsafe", true),
         ("UnixSockets", true),
@@ -963,6 +971,58 @@ mod tests {
     }
 
     #[test]
+    fn idn_psl_reporting_tracks_cargo_features() {
+        // CRITICAL lockstep invariant (code review CP1 finding C1): the `IDN` and
+        // `PSL` capabilities are reported — as a feature name, as a banner token,
+        // and as a `CURL_VERSION_*` bit — IF AND ONLY IF the `idn` / `psl` Cargo
+        // features are enabled. Those are the exact same features that compile the
+        // real `crate::idn` / `crate::psl` implementations, so a reported
+        // capability always corresponds to compiled-in behavior and never to the
+        // no-IDN / no-PSL fallback. This test runs in EVERY feature configuration
+        // (it is intentionally NOT gated), so it fails immediately if reporting and
+        // implementation gating ever drift apart again.
+        let names = feature_names();
+        let banner = version();
+        let bits = feature_bits();
+
+        // IDN: name, banner token (`idna/…`), and CURL_VERSION_IDN bit all agree
+        // with the `idn` feature.
+        assert_eq!(
+            names.contains(&"IDN"),
+            cfg!(feature = "idn"),
+            "feature_names() must report `IDN` iff the `idn` feature is enabled"
+        );
+        assert_eq!(
+            banner.contains("idna/"),
+            cfg!(feature = "idn"),
+            "the version banner must carry the IDN token iff the `idn` feature is enabled"
+        );
+        assert_eq!(
+            bits & version_bits::CURL_VERSION_IDN != 0,
+            cfg!(feature = "idn"),
+            "CURL_VERSION_IDN must be set iff the `idn` feature is enabled"
+        );
+
+        // PSL: name, banner token (`libpsl/…`), and CURL_VERSION_PSL bit all agree
+        // with the `psl` feature.
+        assert_eq!(
+            names.contains(&"PSL"),
+            cfg!(feature = "psl"),
+            "feature_names() must report `PSL` iff the `psl` feature is enabled"
+        );
+        assert_eq!(
+            banner.contains("libpsl/"),
+            cfg!(feature = "psl"),
+            "the version banner must carry the PSL token iff the `psl` feature is enabled"
+        );
+        assert_eq!(
+            bits & version_bits::CURL_VERSION_PSL != 0,
+            cfg!(feature = "psl"),
+            "CURL_VERSION_PSL must be set iff the `psl` feature is enabled"
+        );
+    }
+
+    #[test]
     fn protocols_are_lowercase_sorted_unique() {
         // curl keeps supported_protocols[] alphabetical and lowercase; this
         // holds in every feature configuration (an empty list trivially passes).
@@ -1063,6 +1123,8 @@ mod tests {
         feature = "websockets",
         feature = "brotli",
         feature = "zstd",
+        feature = "idn",
+        feature = "psl",
     ))]
     mod default_build {
         use super::super::*;

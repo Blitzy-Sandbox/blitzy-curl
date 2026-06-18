@@ -144,6 +144,9 @@ deny = [
     { crate = "security-framework-sys", reason = "Apple Secure Transport C FFI banned: rustls only (AAP §0.8.1)" },
     { crate = "mbedtls", reason = "mbedTLS (C) backend banned: rustls only (AAP §0.8.1)" },
     { crate = "mbedtls-sys-auto", reason = "mbedTLS C FFI banned: rustls only (AAP §0.8.1)" },
+    { crate = "mbedtls-sys", reason = "mbedTLS C FFI (the bindgen-based -sys crate) banned: rustls only (AAP §0.8.1)" },
+    { crate = "gnutls", reason = "GnuTLS (C) backend banned: rustls replaces all six C TLS backends, GnuTLS included (AAP §0.8.1)" },
+    { crate = "gnutls-sys", reason = "GnuTLS C FFI banned: rustls only (AAP §0.8.1)" },
     { crate = "wolfssl", reason = "wolfSSL (C) backend banned: rustls only (AAP §0.8.1)" },
     { crate = "wolfssl-sys", reason = "wolfSSL C FFI banned: rustls only (AAP §0.8.1)" },
     { crate = "boring", reason = "BoringSSL (C) backend banned: rustls only (AAP §0.8.1)" },
@@ -160,10 +163,18 @@ deny = [
     { crate = "libssh2-sys", reason = "libssh2 (C) banned: SFTP/SCP are provided by the pure-Rust `russh` (AAP §0.6.2)" },
     { crate = "ssh2", reason = "libssh2 wrapper banned: SSH transport is `russh` (AAP §0.6.2)" },
     { crate = "libssh-sys", reason = "libssh (C) banned: SSH transport is `russh` (AAP §0.6.2)" },
+    { crate = "libssh", reason = "libssh (C) high-level wrapper banned: SSH transport is the pure-Rust `russh` (AAP §0.6.2)" },
 
     # --- C async DNS (c-ares) -> replaced by system resolver / hickory-dns ---
     { crate = "c-ares", reason = "c-ares (C) banned: DNS uses the system resolver, optionally hickory-dns (AAP §0.6.2)" },
     { crate = "c-ares-sys", reason = "c-ares C FFI banned: DNS uses the system resolver / hickory-dns (AAP §0.6.2)" },
+
+    # --- C libcurl bindings (the very library curl-rs REPLACES) ---
+    # curl-rs IS the drop-in libcurl; linking the C libcurl through these
+    # bindings would defeat the entire rewrite and transitively reintroduce the
+    # whole C backend stack (OpenSSL, nghttp2, c-ares, ...). Banned by name so no
+    # transitive dependency can pull the C libcurl back in.
+    { crate = "curl-sys", reason = "C libcurl FFI banned: curl-rs replaces libcurl itself; linking C libcurl reintroduces the C backend stack (AAP §0.1.1 / §0.8.1)" },
 ]
 
 # ----------------------------------------------------------------------------

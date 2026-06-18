@@ -591,7 +591,6 @@ pub enum CurlError {
     Unknown(CurlCode),
 }
 
-
 impl CurlError {
     /// Returns the exact C `CURLcode` integer for this error.
     ///
@@ -754,8 +753,12 @@ impl CurlError {
             CurlError::RecvError => "Failure when receiving data from the peer",
             CurlError::SslCertproblem => "Problem with the local SSL certificate",
             CurlError::SslCipher => "Could not use specified SSL cipher",
-            CurlError::PeerFailedVerification => "SSL peer certificate or SSH remote key was not OK",
-            CurlError::BadContentEncoding => "Unrecognized or bad HTTP Content or Transfer-Encoding",
+            CurlError::PeerFailedVerification => {
+                "SSL peer certificate or SSH remote key was not OK"
+            }
+            CurlError::BadContentEncoding => {
+                "Unrecognized or bad HTTP Content or Transfer-Encoding"
+            }
             CurlError::FilesizeExceeded => "Maximum file size exceeded",
             CurlError::UseSslFailed => "Requested SSL level failed",
             CurlError::SendFailRewind => "Send failed since rewinding of the data stream failed",
@@ -955,7 +958,6 @@ impl From<std::io::Error> for CurlError {
     }
 }
 
-
 /// The multi-interface result code, mirroring C's `CURLMcode`
 /// (`include/curl/multi.h`).
 ///
@@ -1085,7 +1087,6 @@ impl From<&CurlMError> for CurlCode {
     }
 }
 
-
 /// The URL-API result code, mirroring C's `CURLUcode`
 /// (`include/curl/urlapi.h`).
 ///
@@ -1210,9 +1211,7 @@ impl CurlUError {
             CurlUError::BadHandle => "An invalid CURLU pointer was passed as argument",
             CurlUError::BadPartpointer => "An invalid 'part' argument was passed as argument",
             CurlUError::MalformedInput => "Malformed input to a URL function",
-            CurlUError::BadPortNumber => {
-                "Port number was not a decimal number between 0 and 65535"
-            }
+            CurlUError::BadPortNumber => "Port number was not a decimal number between 0 and 65535",
             CurlUError::UnsupportedScheme => "Unsupported URL scheme",
             CurlUError::Urldecode => {
                 "URL decode error, most likely because of rubbish in the input"
@@ -1306,7 +1305,6 @@ impl From<&CurlUError> for CurlCode {
         error.code()
     }
 }
-
 
 /// The share-interface result code, mirroring C's `CURLSHcode`
 /// (`include/curl/curl.h`).
@@ -1523,7 +1521,6 @@ const _: () = {
     assert_copy::<CurlShError>();
     assert_copy::<CurlHError>();
 };
-
 
 #[cfg(test)]
 mod tests {
@@ -1752,7 +1749,10 @@ mod tests {
         // Counts: 87 active + 15 obsolete == 102 == CURL_LAST.
         assert_eq!(ACTIVE.len(), 87);
         assert_eq!(OBSOLETE.len(), 15);
-        assert_eq!(ACTIVE.len() as CurlCode + OBSOLETE.len() as CurlCode, codes::CURL_LAST);
+        assert_eq!(
+            ACTIVE.len() as CurlCode + OBSOLETE.len() as CurlCode,
+            codes::CURL_LAST
+        );
     }
 
     #[test]
@@ -1874,7 +1874,10 @@ mod tests {
         assert_eq!(CurlUError::BadHostname.code(), 21);
         assert_eq!(CurlUError::BadIpv6.code(), 22);
         assert_eq!(CurlUError::BadLogin.code(), 23);
-        assert_eq!(CurlUError::BadHandle.description(), "An invalid CURLU pointer was passed as argument");
+        assert_eq!(
+            CurlUError::BadHandle.description(),
+            "An invalid CURLU pointer was passed as argument"
+        );
         assert_eq!(CurlUError::BadIpv6.description(), "Bad IPv6 address");
     }
 
@@ -1904,7 +1907,10 @@ mod tests {
         assert_eq!(codes::share::CURLSHE_LAST, 6);
 
         assert_eq!(CurlShError::BadOption.description(), "Unknown share option");
-        assert_eq!(CurlShError::NotBuiltIn.description(), "Feature not enabled in this library");
+        assert_eq!(
+            CurlShError::NotBuiltIn.description(),
+            "Feature not enabled in this library"
+        );
 
         for code in 0..codes::share::CURLSHE_LAST {
             let s = CurlShError::from_code(code).expect("0..LAST must be defined");
@@ -1933,7 +1939,10 @@ mod tests {
 
         // Named constants agree with the variant integers.
         assert_eq!(CurlHError::Ok.code(), codes::header::CURLHE_OK);
-        assert_eq!(CurlHError::NotBuiltIn.code(), codes::header::CURLHE_NOT_BUILT_IN);
+        assert_eq!(
+            CurlHError::NotBuiltIn.code(),
+            codes::header::CURLHE_NOT_BUILT_IN
+        );
 
         // Display text matches description() for every variant.
         for code in 0..codes::header::CURLHE_LAST {
@@ -1966,4 +1975,3 @@ mod tests {
         assert!(!CurlError::Http2.is_ok());
     }
 }
-

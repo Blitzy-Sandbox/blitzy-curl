@@ -625,6 +625,7 @@ mod tests {
         // /1 compares only the top bit of the first byte.
         assert!(cidr6_match("ff00::", "ff80::", 1)); // both have the high bit set
         assert!(!cidr6_match("ff00::", "7f00::", 1)); // high bit differs
+
         // /33 compares 4 whole bytes plus the top bit of the 5th.
         assert!(cidr6_match("2001:db8:8000::", "2001:db8:8000::", 33));
         assert!(!cidr6_match("2001:db8:8000::", "2001:db8::", 33));
@@ -721,13 +722,33 @@ mod tests {
 
         // (name, no_proxy, expected match)
         let cases: &[(&str, &str, bool)] = &[
-            ("www.example.com", "localhost .example.com .example.de", false),
-            ("www.example.com", "localhost,.example.com,.example.de", true),
-            ("www.example.com.", "localhost,.example.com,.example.de", true),
+            (
+                "www.example.com",
+                "localhost .example.com .example.de",
+                false,
+            ),
+            (
+                "www.example.com",
+                "localhost,.example.com,.example.de",
+                true,
+            ),
+            (
+                "www.example.com.",
+                "localhost,.example.com,.example.de",
+                true,
+            ),
             ("example.com", "localhost,.example.com,.example.de", true),
             ("example.com.", "localhost,.example.com,.example.de", true),
-            ("www.example.com", "localhost,.example.com.,.example.de", true),
-            ("www.example.com", "localhost,www.example.com.,.example.de", true),
+            (
+                "www.example.com",
+                "localhost,.example.com.,.example.de",
+                true,
+            ),
+            (
+                "www.example.com",
+                "localhost,www.example.com.,.example.de",
+                true,
+            ),
             ("example.com", "localhost,example.com,.example.de", true),
             ("example.com.", "localhost,example.com,.example.de", true),
             ("nexample.com", "localhost,example.com,.example.de", false),

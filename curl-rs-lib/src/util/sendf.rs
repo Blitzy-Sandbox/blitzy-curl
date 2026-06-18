@@ -446,6 +446,8 @@ mod tests {
         events: Arc<Mutex<Vec<(tracing::Level, String)>>>,
     }
 
+    static TRACE_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
     impl tracing::Subscriber for CaptureSubscriber {
         fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
             true
@@ -485,6 +487,9 @@ mod tests {
     /// against it, making these assertions deterministic under the parallel
     /// test runner.
     fn capture_events<F: FnOnce()>(f: F) -> Vec<(tracing::Level, String)> {
+        let _guard = TRACE_CAPTURE_LOCK
+            .lock()
+            .expect("trace capture lock poisoned");
         let sub = CaptureSubscriber::default();
         let events = sub.events.clone();
         tracing::subscriber::with_default(sub, || {
@@ -645,13 +650,13 @@ mod tests {
 
     #[test]
     fn failf_always_emits_error_event_even_when_not_recording() {
-        let mut buf: Option<String> = None;
+        let mut buf: Option<String> = Some("one".to_owned());
         let ev = capture_events(|| {
-            failf(&mut buf, "one");
-            // Second call does not update the buffer, but is still emitted.
+            // The slot already holds the first error, so this call must not
+            // update it — but it still has to emit a diagnostic event.
             failf(&mut buf, "two");
         });
-        assert_eq!(ev.len(), 2);
+        assert_eq!(ev.len(), 1);
         assert!(ev
             .iter()
             .all(|(level, target)| *level == tracing::Level::ERROR && target == DIAG_TARGET));
