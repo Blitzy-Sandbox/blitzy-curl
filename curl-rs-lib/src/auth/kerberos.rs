@@ -258,7 +258,7 @@ pub fn create_gssapi_user_message(
     // `negotiate.rs` produces. `build_spn(service, None, host)` yields the
     // host-based `service@host`, matching the C `(service, NULL, host)` call.
     if krb5.spn.is_none() {
-        krb5.spn = Some(build_spn(service, None, host));
+        krb5.spn = Some(build_spn(service, None, Some(host)));
     }
 
     // Decode the optional server challenge from its base64 wire form. A present
@@ -521,7 +521,7 @@ mod tests {
         // `(service, None, host)`, proving the delegation (and keeping this in
         // lockstep with `negotiate.rs`). For the host-based GSSAPI form that is
         // `service@host`.
-        let expected = build_spn(service, None, host);
+        let expected = build_spn(service, None, Some(host));
         assert_eq!(krb5.spn(), Some(expected.as_str()));
     }
 

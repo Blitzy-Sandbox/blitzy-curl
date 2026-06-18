@@ -11,6 +11,11 @@
 //!
 //! # Submodules
 //!
+//! * [`config`]   — the curl-TLS-options → `rustls::ClientConfig` builder and the
+//!   [`TlsConfig`] model (`lib/vtls/rustls.c` + `lib/vtls/vtls.c`): the
+//!   foundational TLS configuration surface, including the custom
+//!   `ServerCertVerifier`s, the version/cipher mapping, the pinned-public-key
+//!   check, and the rustls-error mapping. [`TlsConfig`] is re-exported here.
 //! * [`hostname`] — RFC 6125 hostname / wildcard certificate-name matching
 //!   (`lib/vtls/hostcheck.c`): the helper consumed by the certificate verifier
 //!   for the paths where curl applies its own name check.
@@ -18,10 +23,13 @@
 //!   (`lib/vtls/keylog.c`): emits the pre-master/secret key-log lines for
 //!   on-the-wire TLS debugging, wired into rustls's key-log hook.
 //!
-//! The TLS configuration and connector itself (`config`, the custom
-//! `ServerCertVerifier`, the session cache) are authored as sibling submodules
-//! in their own migration step (AAP §0.8.4 step 4); this `mod.rs` is the single
-//! declaration point that wires the TLS submodules into the crate as they land.
+//! The session cache and the connector wiring (`session_cache`, the
+//! `mod::connect` entrypoint) are authored in their own migration step
+//! (AAP §0.8.4 step 4); this `mod.rs` is the single declaration point that wires
+//! the TLS submodules into the crate as they land.
 
+pub mod config;
 pub mod hostname;
 pub mod keylog;
+
+pub use config::TlsConfig;

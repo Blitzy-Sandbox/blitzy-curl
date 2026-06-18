@@ -75,9 +75,11 @@ pub mod escape; // URL percent-encode / -decode (`lib/escape.c`).
 pub mod headers; // Response-header data model (`lib/headers.c`).
 pub mod options; // Option metadata table (`lib/easyoptions.c`).
 pub mod slist; // `curl_slist` string list (`lib/slist.c`).
+pub mod url; // URL parsing / building — the URL API (`lib/url.c`, `lib/urlapi.c`).
 
 // Stateful subsystems (`lib/*.c`).
 pub mod altsvc; // HTTP Alt-Svc cache.
+pub mod cookie; // HTTP cookie engine and jar (feature-gated module, `cookies`).
 pub mod hsts; // HTTP Strict-Transport-Security store (feature-gated module).
 pub mod idn; // Internationalized Domain Names (feature `idn`).
 pub mod netrc; // `.netrc` credential file parsing.
@@ -85,10 +87,14 @@ pub mod psl; // Public Suffix List handling (feature `psl`).
 
 // Transfer-support subsystems.
 pub mod content_encoding; // gzip/deflate/brotli/zstd decoding dispatch.
+pub mod progress; // Transfer progress accounting, timers, and the progress meter.
 pub mod ratelimit; // Transfer rate limiting / pacing.
 pub mod request; // Per-request buffer and byte accounting.
+pub mod transfer; // The async transfer engine (type-state flow) — `lib/transfer.c`.
 
 // Subsystem module trees.
+pub mod auth; // Authentication: HTTP schemes + the shared SASL state machine (`lib/vauth/`, `lib/curl_sasl.c`, …).
+pub mod conn; // Connection-filter chain + filters (`lib/cfilters.c`, `lib/cf-*.c`).
 pub mod proxy; // SOCKS / HTTP proxy + no-proxy matching (`lib/socks.c`, …).
 pub mod tls; // The single `rustls` TLS backend (`lib/vtls/`).
 pub mod util; // Portable utilities and containers (`lib/curlx/`, `lib/hash.c`, …).

@@ -278,6 +278,32 @@ impl CfQuery {
     }
 }
 
+/// The local/remote address pair of an established connection — the Rust mirror
+/// of C's `struct ip_quadruple` (urldata.h).
+///
+/// The transport (socket) filter fills one of these when answering a
+/// [`CfQuery::IpInfo`] query, so that filters layered above it (notably the
+/// HAProxy PROTOCOL header emitter, `crate::conn::haproxy`) can read the
+/// connection's endpoints without performing any OS call themselves. The C
+/// layout is `{ char remote_ip[]; char local_ip[]; uint16_t remote_port;
+/// uint16_t local_port; uint8_t transport; }`; the textual IPs are kept as
+/// owned [`String`]s (already rendered in presentation form, e.g. `"127.0.0.1"`
+/// or `"::1"`) and the ports as [`u16`], matching how curl stores and prints
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IpQuadruple {
+    /// Presentation-form remote (peer) IP address (C: `ip_quadruple.remote_ip`).
+    pub remote_ip: String,
+    /// Presentation-form local IP address (C: `ip_quadruple.local_ip`).
+    pub local_ip: String,
+    /// Remote (peer) port (C: `ip_quadruple.remote_port`).
+    pub remote_port: u16,
+    /// Local port (C: `ip_quadruple.local_port`).
+    pub local_port: u16,
+    /// Transport identifier (`TRNSPRT_*`); C: `ip_quadruple.transport`.
+    pub transport: u8,
+}
+
 /// Heterogeneous result of a [`ConnectionFilter::query`] call.
 ///
 /// In C a query returns its answer through two out-parameters — `int *pres1`
@@ -302,10 +328,19 @@ pub enum CfQueryResult {
     StreamError(i32),
     /// Whether the filter has unsent data (`CF_QUERY_NEED_FLUSH`).
     NeedFlush(bool),
-    /// IP-level info (`CF_QUERY_IP_INFO`): whether the connection is IPv6.
+    /// IP-level info (`CF_QUERY_IP_INFO`): the connection's address family flag
+    /// together with its local/remote endpoint quadruple.
+    ///
+    /// C's `Curl_conn_cf_get_ip_info` answers this query through two
+    /// out-parameters — `bool *is_ipv6` and `struct ip_quadruple *ipquad` — so
+    /// the typed result carries both: the address-family flag and the
+    /// [`IpQuadruple`]. The HAProxy filter (`crate::conn::haproxy`) consumes
+    /// both to build its PROXY protocol header line.
     IpInfo {
         /// `true` if the established connection is IPv6.
         is_ipv6: bool,
+        /// The local/remote address pair of the established connection.
+        quadruple: IpQuadruple,
     },
     /// HTTP version in use (`CF_QUERY_HTTP_VERSION`): `9`/`10`/`11`/`20`/`30`.
     HttpVersion(u8),

@@ -1,12 +1,32 @@
-//! Portable utility layer — the Rust home of curl's `lib/curlx/*` helpers and
-//! the internal container/buffer types (`lib/hash.c`, `lib/llist.c`,
-//! `lib/bufq.c`, …).
+//! Portable utility layer — the foundational, dependency-light toolkit of the
+//! `curl-rs-lib` core crate.
 //!
-//! This module groups the small, dependency-light building blocks that the rest
-//! of `curl-rs-lib` (the engine, the protocol handlers, the TLS layer, …) builds
-//! on. Each submodule is a focused, memory-safe reimplementation of one C
-//! utility, consumed through ordinary Rust paths (`crate::util::<name>`) rather
-//! than via curl's C `#include` graph (Agent Action Plan §0.5.2).
+//! This module is the Rust home of curl's `lib/curlx/*` portable helpers
+//! together with libcurl's generic containers, buffers, and crypto primitives
+//! (`lib/hash.c`, `lib/llist.c`, `lib/splay.c`, `lib/bufq.c`, `lib/md5.c`,
+//! `lib/sha256.c`, …). It plays the same "collect the toolkit" role that curl's
+//! umbrella header `lib/curlx/curlx.h` plays in the C tree: it gathers the small,
+//! self-contained building blocks that the rest of the crate — the engine
+//! (`easy`, `multi`, `transfer`), the `conn/`, `protocols/`, `tls/`, `auth/`,
+//! `dns/`, and `proxy/` subtrees — composes into higher-level behavior.
+//!
+//! These primitives are consumed through ordinary Rust module paths
+//! (`crate::util::<name>`) rather than via curl's C `#include` graph (Agent
+//! Action Plan §0.5.2). Aside from the crate's shared error type
+//! ([`crate::error`]), the `util` tree is internally dependency-free: nothing
+//! here reaches "upward" into the engine or protocol layers, which keeps it a
+//! stable, reusable foundation.
+//!
+//! # Memory safety
+//!
+//! Per AAP §0.7.1 the safe core forbids `unsafe`. Each leaf submodule that is
+//! provably allocation- and raw-pointer-free opts into `#![forbid(unsafe_code)]`
+//! at its own root (the crate root deliberately does **not** apply a single
+//! crate-wide forbid, so the few audited OS-integration primitives — e.g.
+//! [`nonblock`] and [`select`] — can keep their minimal, `// SAFETY:`-documented
+//! `unsafe` where the operating system requires it). This aggregator file is
+//! pure module wiring and therefore contains no `unsafe` of its own and imposes
+//! no blanket forbid that would override a submodule's own choice.
 //!
 //! # Submodules
 //!
@@ -20,13 +40,15 @@
 //! * [`md5`]      — MD5 digest wrapper (`lib/md5.c`, parity-required legacy).
 //! * [`mprintf`]  — curl's `*printf` family (`lib/mprintf.c`).
 //! * [`nonblock`] — non-blocking socket toggling (`lib/curlx/nonblock.*`).
+//! * [`parsedate`] — permissive HTTP/RFC date-string parser (`lib/parsedate.c`).
 //! * [`rand`]     — randomness (OS RNG by default) (`lib/rand.c`).
-//! * [`select`]   — readiness waiting (`lib/curlx/wait.*` / `select.c`).
+//! * [`select`]   — readiness waiting (`lib/curlx/wait.*` / `lib/select.c`).
 //! * [`sendf`]    — low-level send/recv movers + the `infof!`/`failf!` macros (`lib/sendf.c`).
 //! * [`sha256`]   — SHA-256 digest wrapper (`lib/sha256.c`).
-//! * [`strerror`] — OS/error-number to message formatting (`lib/curlx/strerr.*`).
-//! * [`strparse`] — the bounds-checked string parser AND curl's ASCII case-insensitive compare helpers (`lib/curlx/strparse.*`).
-//! * [`timediff`] — saturating time-difference arithmetic.
+//! * [`splay`]    — splay tree backing the multi handle's timer/expiry keys (`lib/splay.c`).
+//! * [`strerror`] — OS/error-number to message formatting (`lib/strerror.c`, `lib/curlx/strerr.*`).
+//! * [`strparse`] — the bounds-checked string parser **and** curl's ASCII case-insensitive compare helpers (`lib/curlx/strparse.*`).
+//! * [`timediff`] — saturating time-difference arithmetic (`lib/curlx/timediff.*`).
 //! * [`timeval`]  — monotonic/absolute time values (`lib/curlx/timeval.*`).
 //! * [`warnless`] — lossless/saturating numeric conversions (`lib/curlx/warnless.*`).
 //!
@@ -34,12 +56,12 @@
 //!
 //! curl's ASCII case-insensitive comparison helpers (`Curl_strcasecompare` /
 //! `Curl_strncasecompare`) are implemented inside [`strparse`] on purpose —
-//! there is deliberately no separate `strcase.rs`. They are surfaced under the
-//! conventional `crate::util::strcase` path (matching the C `strcase.h` home)
-//! through the [`strcase`] re-export module below, so sibling modules such as
-//! [`crate::proxy::noproxy`] and [`crate::tls::hostname`] can `use
-//! crate::util::strcase::strncasecompare;` exactly as they would have included
-//! `strcase.h` in C.
+//! there is deliberately no separate `strcase.rs` file. They are surfaced under
+//! the conventional `crate::util::strcase` path (mirroring the C `strcase.h`
+//! home) through the [`strcase`] re-export module below, so sibling modules such
+//! as [`crate::proxy::noproxy`] and [`crate::tls::hostname`] can write
+//! `use crate::util::strcase::strncasecompare;` exactly as they would have
+//! included `strcase.h` in C.
 
 pub mod base64;
 pub mod bufq;
@@ -51,10 +73,12 @@ pub mod llist;
 pub mod md5;
 pub mod mprintf;
 pub mod nonblock;
+pub mod parsedate;
 pub mod rand;
 pub mod select;
 pub mod sendf;
 pub mod sha256;
+pub mod splay;
 pub mod strerror;
 pub mod strparse;
 pub mod timediff;
@@ -64,10 +88,14 @@ pub mod warnless;
 /// curl's ASCII case-insensitive comparison helpers, surfaced under the
 /// conventional `strcase` path.
 ///
-/// These functions are defined in [`strparse`] (curl folds them into the same
-/// translation unit); this module simply re-exports them so call sites can use
-/// the `crate::util::strcase::…` path that mirrors curl's `strcase.h`. See the
-/// module-level docs in [`strparse`] for the rationale.
+/// These functions are defined in [`strparse`] (curl folds the case-compare
+/// helpers into the same translation unit as the string parser); this module
+/// simply re-exports them so call sites can use the `crate::util::strcase::…`
+/// path that mirrors curl's `strcase.h`. The actively consumed helper is
+/// [`strncasecompare`](crate::util::strparse::strncasecompare) (used by
+/// [`crate::proxy::noproxy`] and [`crate::tls::hostname`]); the full set is
+/// re-exported so the `strcase` surface matches curl's. See the module-level
+/// docs in [`strparse`] for the rationale.
 pub mod strcase {
     pub use super::strparse::{
         curlx_str_casecompare, curlx_str_cmp, strcasecompare, strncasecompare,
