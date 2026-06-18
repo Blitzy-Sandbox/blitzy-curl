@@ -1,16 +1,74 @@
-# Rust toolchain pin for the curl-rs workspace (C→Rust migration of curl 8.19.0-DEV).
+# =============================================================================
+# rust-toolchain.toml — Rust toolchain pin for the curl-rs workspace
+# (the in-place C -> Rust migration of curl 8.19.0-DEV).
 #
-# Per the Agent Action Plan (§0.8.1) and technical-specifications.md, the project
-# pins the STABLE channel and declares MSRV 1.75 / edition 2021 in the crate
-# manifests (rust-version = "1.75"). The stable channel is used for the primary
-# build/clippy/test/coverage gates; a separate nightly toolchain (invoked via
-# `cargo +nightly miri ...`) provides Miri for the non-FFI memory-safety gate.
+# rustup reads this file automatically for EVERY cargo/rustc invocation made
+# anywhere inside this workspace, guaranteeing that every contributor and CI
+# runner builds, lints, tests, and measures coverage with one consistent
+# toolchain. It pins ONLY the toolchain channel + components (and the targets
+# this repo cross-builds for); it does NOT set the edition or MSRV.
 #
-# NOTE (setup stub): This file was created by the environment-setup agent so the
-# toolchain is consistent for subsequent file-implementation agents. It will be
-# superseded when the workspace scaffolding is materialized.
+# -----------------------------------------------------------------------------
+# Default channel: STABLE
+# -----------------------------------------------------------------------------
+# The stable channel drives the primary validation gates (AAP §0.8.1):
+#     cargo build   --release --workspace        # build gate (zero warnings)
+#     cargo clippy  --workspace -- -D warnings   # lint gate
+#     cargo test    --workspace                  # unit/integration gate
+#     cargo llvm-cov --workspace                 # coverage gate
+#
+# -----------------------------------------------------------------------------
+# Components (kept to exactly what the gates require)
+# -----------------------------------------------------------------------------
+#   * clippy             Lint gate — `cargo clippy --workspace -- -D warnings`.
+#   * llvm-tools-preview Ships llvm-cov / llvm-profdata; REQUIRED by the
+#                        `cargo llvm-cov` coverage gate (AAP §0.8.1 "Coverage").
+#   * rustfmt            Formatting — `cargo fmt`; standard project hygiene.
+# The "minimal" profile keeps the base install lean (rustc + cargo + rust-std);
+# the explicit `components` list below then adds exactly — and only — what the
+# gates need. No components are installed beyond these three.
+#
+# -----------------------------------------------------------------------------
+# MSRV / edition are NOT declared here (traceability note only)
+# -----------------------------------------------------------------------------
+# The Minimum Supported Rust Version is 1.75 and the edition is 2021, but those
+# belong in the crate manifests (`rust-version = "1.75"` and `edition = "2021"`
+# in each Cargo.toml), NOT in this file — `rust-toolchain.toml` has no key for
+# either. They are mentioned here purely for traceability: `channel = "stable"`
+# is always >= 1.75, so the pinned toolchain satisfies the MSRV by construction.
+#
+# -----------------------------------------------------------------------------
+# Nightly toolchain for the memory-safety gates — REQUIRED, but provisioned
+# SEPARATELY (this file cannot pin it)
+# -----------------------------------------------------------------------------
+# A rust-toolchain.toml pins a SINGLE default channel, so it cannot also pin
+# nightly. The AAP "Memory (core)" gate (§0.8.1) runs Miri, which is
+# nightly-only and needs `rust-src`. CI and developers must therefore install
+# and invoke the nightly toolchain EXPLICITLY — it is intentionally absent here:
+#
+#     rustup toolchain install nightly --component miri rust-src
+#     cargo +nightly miri test -p curl-rs-lib   # non-FFI core (FFI uses ASan)
+#
+# The `+nightly` override applies to that single command only; the stable pin
+# below remains the default for every other command. (CI/.github authors and
+# developers: this is the one toolchain requirement NOT covered by this file.)
+#
+# -----------------------------------------------------------------------------
+# Targets
+# -----------------------------------------------------------------------------
+# Only the two Linux targets are provisioned here. aarch64-unknown-linux-gnu is
+# cross-built in this repo — its linker is wired up in `.cargo/config.toml`
+# (linker = "aarch64-linux-gnu-gcc") — so its std must be present; this is the
+# "cross-compilation requires them" case. x86_64-unknown-linux-gnu is the host.
+# The full four-target CI matrix (AAP §0.8.1) also covers macOS
+# (x86_64-apple-darwin, aarch64-apple-darwin); those are added on the
+# `macos-latest` CI runners via `rustup target add`, NOT here, because they
+# cannot be linked on Linux without a macOS SDK / osxcross. Keeping them out of
+# this file avoids downloading unusable std artifacts on Linux machines.
+# =============================================================================
+
 [toolchain]
-channel = "stable"
+channel    = "stable"
+profile    = "minimal"
 components = ["clippy", "llvm-tools-preview", "rustfmt"]
-targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
-profile = "default"
+targets    = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]

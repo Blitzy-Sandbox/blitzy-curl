@@ -1,19 +1,53 @@
-# Cargo configuration for the curl-rs workspace.
+# .cargo/config.toml — workspace-wide Cargo build configuration for the
+# curl -> Rust migration (net-new scaffolding; no C-source equivalent).
 #
-# Cross-compilation linker settings for the four-target CI matrix
-# (AAP §0.8.1 / technical-specifications.md §0.4): Linux x86_64, Linux aarch64,
-# macOS x86_64, macOS arm64.
+# Purpose: carry ONLY the per-target linker/version args needed so the
+# `curl-rs-ffi` crate emits a drop-in `libcurl`-compatible shared library.
+# Source context (traceability, not transliteration): the C build/link policy
+# under CMake/ (CurlSymbolHiding.cmake) and the libcurl SONAME in
+# lib/Makefile.soname (SONAME = 4 => libcurl.so.4 / libcurl.4.dylib).
 #
-# Linux aarch64 cross-compilation is wired here and is functional in this
-# environment (the gcc-aarch64-linux-gnu cross toolchain is installed). The two
-# macOS targets require macOS runners (or an osxcross SDK); they are produced on
-# the `macos-latest` CI runners rather than this Linux host.
+# Minimal-change mandate (AAP §0.8.1): nothing beyond what a drop-in libcurl
+# strictly requires. Deliberately NOT configured here:
+#   * target provisioning  -> owned by rust-toolchain.toml / CI (rustup target add)
+#   * cross-compilation linkers -> aarch64-linux is built "via cross"; no linker
+#                                  selection is required here
+#   * [source]/[patch]/vendoring -> none (AAP §0.8.3; matches workspace Cargo.toml)
+#   * any C-TLS/OpenSSL flags -> rustls is the exclusive TLS backend (deny.toml)
+#   * [env] / build-time env vars -> none (AAP §0.8.3). SSL_CERT_FILE and HOME are
+#                                    honored at RUNTIME by curl-rs-lib via std::env,
+#                                    not as build-time configuration.
+
+# --- libcurl SONAME (drop-in shared-library identity) ---
+# curl's libcurl uses SONAME version 4 (lib/Makefile.soname: -version-info 12:0:8,
+# SONAME = current-age = 4). Stamping the cdylib's DT_SONAME as libcurl.so.4 makes
+# curl-rs-ffi a true drop-in for libcurl.so.4.
 #
-# NOTE (setup stub): created by the environment-setup agent; superseded when the
-# workspace scaffolding is materialized.
+# NOTE: these rustflags apply to every crate built for the triple, so they also
+# reach the `curl-rs` executable link. GNU ld accepts `-soname` on an executable
+# link WITHOUT any warning (no warning -> the zero-warnings gate, AAP §0.8.1, is
+# preserved) and the linked binary runs normally; the flag is likewise inert for
+# rlib/staticlib (no link step). On a PIE executable ld may record a DT_SONAME
+# entry, but it is inert there: the dynamic loader honors SONAME only for objects
+# loaded as a shared-library dependency, never for a directly-run program. The
+# flag's only MEANINGFUL effect is stamping the curl-rs-ffi cdylib's DT_SONAME as
+# libcurl.so.4, which is exactly the intent.
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,-soname,libcurl.so.4"]
 
 [target.aarch64-unknown-linux-gnu]
-linker = "aarch64-linux-gnu-gcc"
+rustflags = ["-C", "link-arg=-Wl,-soname,libcurl.so.4"]
 
-# Example for explicit cross runs:
-#   cargo build --release --target aarch64-unknown-linux-gnu
+# --- macOS install_name ---
+# The macOS dylib install_name (@rpath/libcurl.4.dylib) is intentionally NOT set
+# here. `-install_name` emits a linker warning when applied to the curl-rs
+# executable, and config.toml [target.*] rustflags cannot be scoped to a single
+# crate type. It must instead be applied CDYLIB-SCOPED in curl-rs-ffi/build.rs:
+#
+#   if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+#       println!("cargo::rustc-cdylib-link-arg=-Wl,-install_name,@rpath/libcurl.4.dylib");
+#   }
+#
+# That mechanism is cdylib-only (no executable warning) and is not overridden by a
+# RUSTFLAGS env var. (No [target.*-apple-darwin] rustflags are defined here.)

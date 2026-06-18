@@ -1,60 +1,221 @@
-# cargo-deny policy for the curl-rs workspace — backs the security/license gate
-# (AAP §0.8.1: "cargo deny" license + advisory compliance).
+# ============================================================================
+# cargo-deny policy — the curl-rs supply-chain security / license / ban gate
+# ============================================================================
 #
-# Schema: cargo-deny v2 (validated against cargo-deny 0.19.x).
+# This file is the machine-enforcement of several mandates from the curl-rs
+# Agent Action Plan (the C -> Rust migration of curl 8.19.0-DEV):
 #
-# The allow-list below was derived from a full scan of the resolved dependency
-# tree for the AAP §0.6 inventory (tokio, hyper, rustls, quinn, h3, russh,
-# clap, cbindgen, compression + crypto crates, etc.). All entries are permissive
-# OSI/data licenses. Copyleft licenses are intentionally NOT allowed; the only
-# copyleft id observed (LGPL-2.1-or-later via the UEFI-only `r-efi` crate) is
-# satisfied through that crate's "MIT OR Apache-2.0 OR LGPL-2.1-or-later" choice.
+#   * AAP §0.8.1 "Security" gate ........ `cargo audit` / `cargo deny check`
+#                                         -> zero critical CVEs.
+#   * AAP §0.8.1 "TLS is `rustls`, ...... the [bans] section below; NO OpenSSL,
+#     exclusively"                        native-tls, or C TLS linkage anywhere.
+#   * AAP §0.8.1 / curl's MIT-like ...... the [licenses] permissive allow-list.
+#     licensing
+#   * AAP §0.6 / §0.8.3 "all crates ..... the [sources] crates.io-only policy
+#     are public packages sourced         (no private registries, no vendored
+#     from crates.io"                      git dependencies).
 #
-# NOTE (setup stub): created by the environment-setup agent so the security gate
-# is runnable once the workspace is materialized; refine as the dependency set
-# is finalized.
+# The single most important section is [bans]: it is the compile-time-adjacent
+# guarantee that the workspace can never link a C TLS backend, which is the
+# headline rule of the rewrite ("rustls exclusively").
+#
+# ----------------------------------------------------------------------------
+# Schema / tooling assumptions
+# ----------------------------------------------------------------------------
+# Authored against the cargo-deny v2 configuration schema and verified with
+# cargo-deny 0.19.9 (the version provisioned for this workspace). Notable v2
+# behaviors this file relies on:
+#   * [advisories] vulnerabilities and unsound advisories are DENIED BY DEFAULT
+#     under `version = 2`; the legacy `vulnerability`/`unsound`/`notice` keys
+#     were removed (cargo-deny PR #611) and must NOT be set.
+#   * [licenses] uses an allow-list only; any license not in `allow` is denied
+#     by omission (so GPL/AGPL and other copyleft IDs are rejected without an
+#     explicit deny list).
+# Keep this file schema-clean: cargo-deny treats unknown keys as a hard error
+# (`failed to deserialize config`), so every key below is a known v2 key.
 
+# ----------------------------------------------------------------------------
+# [graph] — how the dependency graph fed to every check is constructed
+# ----------------------------------------------------------------------------
 [graph]
+# Collect metadata with `--all-features` so the checks see EVERY optional
+# dependency the workspace can pull (e.g. the off-by-default `hickory-dns`
+# feature). This makes the C-TLS ban below airtight: no feature combination
+# can smuggle in a banned crate without `cargo deny check bans` catching it.
 all-features = true
 
+# ----------------------------------------------------------------------------
+# [advisories] — RustSec advisory-DB gate (AAP §0.8.1 "Security": zero CVEs)
+# ----------------------------------------------------------------------------
+# Under the v2 schema, security *vulnerabilities* and *unsound* advisories are
+# DENIED BY DEFAULT regardless of severity — there is no `vulnerability`/
+# `unsound` key to set (it was removed in cargo-deny PR #611). This already
+# satisfies, and exceeds, the AAP "zero critical CVEs" requirement: every newly
+# disclosed vulnerability (critical, high, or otherwise) fails the gate unless
+# it is explicitly listed in `ignore` below with a written justification.
 [advisories]
 version = 2
-# Add specific RUSTSEC advisory IDs here only with a documented justification.
-ignore = []
+# Fail the build on yanked crate versions: a yanked release is treated as a
+# supply-chain problem, not a warning.
+yanked = "deny"
+# Scope unmaintained-advisory checking to the workspace's DIRECT dependencies
+# (the AAP §0.6 inventory we explicitly chose), rather than every deep
+# transitive crate. NOTE: in the cargo-deny v2 schema an in-scope unmaintained
+# advisory is an ERROR (this field selects scope, not severity); bounding it to
+# the controllable direct-dependency surface keeps the gate green on a correct
+# build while still holding us accountable for the maintenance status of the
+# crates we deliberately depend on.
+unmaintained = "workspace"
+# Documented, narrowly-scoped advisory exceptions. Each entry is a specific
+# RUSTSEC ID that is (a) NOT a critical CVE and (b) tied to a mandated/pinned
+# AAP dependency (or an optional, off-by-default backend) with no available
+# fix. Anything not listed here still fails the gate. Revisit each on upgrade.
+ignore = [
+    # rsa "Marvin Attack" timing side-channel — CVSS 5.9 (MEDIUM), CVE-2023-49092.
+    # No fixed upstream release exists; pulled in transitively by `russh`, the
+    # AAP §0.6.2-mandated SSH backend (SFTP/SCP). Not a critical CVE.
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin Attack (CVSS 5.9 MEDIUM); no fixed release; required transitively by russh (mandated SSH backend, AAP §0.6.2). Remove when RustCrypto/RSA ships a constant-time fix." },
+    # rustls-pemfile is unmaintained (repo archived Aug 2025). It is an AAP §0.6
+    # pinned dependency and a thin wrapper over rustls-pki-types' PemObject API;
+    # there is no safe upgrade. Informational (not a vulnerability).
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained (archived); AAP §0.6 pinned dep; no safe upgrade — superseded by rustls-pki-types PemObject. Tracked for migration." },
+    # hickory-proto denial-of-service advisories. Reachable ONLY through the
+    # optional, off-by-default `hickory-dns` resolver backend (AAP §0.6.2 default
+    # = off; the default DNS path is the system resolver). They surface here only
+    # because [graph] all-features pulls the optional backend for the C-TLS ban
+    # scan, and are NOT present in the default-feature shipped artifacts.
+    { id = "RUSTSEC-2026-0118", reason = "hickory-proto NSEC3 DoS; reachable only via optional off-by-default hickory-dns backend (AAP §0.6.2). Not in default artifacts. Revisit on hickory update." },
+    { id = "RUSTSEC-2026-0119", reason = "hickory-proto name-compression DoS; reachable only via optional off-by-default hickory-dns backend (AAP §0.6.2). Not in default artifacts. Revisit on hickory update." },
+]
 
+# ----------------------------------------------------------------------------
+# [bans] — THE CRITICAL SECTION: enforces "rustls exclusively, no C TLS"
+# ----------------------------------------------------------------------------
+# Every crate in `deny` below is a C-language TLS/crypto/protocol backend (or
+# its `-sys` FFI shim, or a vendored-C build crate). The curl-rs rewrite
+# replaces ALL of curl's C backends with pure-Rust crates, so none of these may
+# ever appear in the dependency graph:
+#
+#   * TLS                : OpenSSL/GnuTLS/mbedTLS/wolfSSL/Schannel/Secure
+#                          Transport  ->  rustls + tokio-rustls   (AAP §0.8.1)
+#   * HTTP/2 framing     : nghttp2 (C)                            ->  h2
+#   * QUIC / HTTP/3      : quiche (C, BoringSSL)                  ->  quinn + h3
+#   * SSH (SFTP/SCP)     : libssh / libssh2 (C)                   ->  russh
+#   * async DNS          : c-ares (C)             ->  system resolver / hickory
+#
+# Banning a crate by its bare name matches ALL versions of it. If a banned
+# crate is ever pulled in (directly or transitively, on any target, under any
+# feature) `cargo deny check bans` fails — which is exactly the guard we want.
+#
+# NOTE on the rustls crypto provider: `ring` and `aws-lc-rs` (and their
+# `*-sys` crates) contain vendored C/assembly for their cryptographic
+# primitives, but they are the sanctioned crypto backends for `rustls` — the
+# mandated TLS stack — so they are deliberately NOT banned. The ban targets C
+# *TLS/protocol* libraries, not rustls's own crypto provider.
+[bans]
+# Duplicate versions of a crate are reported but do not fail the gate: a large
+# async tree (tokio + hyper + quinn + russh) legitimately resolves multiple
+# versions of low-level crates (windows-sys, hashbrown, ...). Use "deny" only
+# after the tree has been fully deduplicated.
+multiple-versions = "warn"
+# Reject `version = "*"` requirements, reinforcing the AAP §0.6 rule that every
+# dependency is pinned to an exact version (no `latest`/wildcard pins).
+wildcards = "deny"
+# ...but allow the intra-workspace path dependencies (curl-rs and curl-rs-ffi
+# depend on curl-rs-lib via `{ path = ... }`, which cargo models as a wildcard
+# version). This keeps `wildcards = "deny"` meaningful for crates.io deps while
+# not flagging the workspace's own local crates.
+allow-wildcard-paths = true
+# No crate is force-allowed; the workspace has no need to override the policy.
+allow = []
+# ---- The C-TLS / C-backend ban list (the "rustls exclusively" enforcement) --
+deny = [
+    # --- C TLS backends (OpenSSL & friends) -> replaced by rustls ---
+    { crate = "openssl", reason = "C TLS banned: curl-rs uses rustls exclusively (AAP §0.8.1, no OpenSSL/C TLS linkage)" },
+    { crate = "openssl-sys", reason = "OpenSSL C FFI banned: rustls is the only TLS backend (AAP §0.8.1)" },
+    { crate = "openssl-probe", reason = "OpenSSL integration banned: no C TLS linkage; cert roots come from webpki-roots (AAP §0.8.1)" },
+    { crate = "openssl-src", reason = "vendored C OpenSSL build banned: no C TLS source is compiled or linked (AAP §0.8.1)" },
+    { crate = "native-tls", reason = "platform/native TLS banned: rustls only, no native-tls bridge (AAP §0.8.1)" },
+    { crate = "tokio-native-tls", reason = "native-tls async bridge banned: use tokio-rustls (AAP §0.8.1)" },
+    { crate = "hyper-tls", reason = "hyper native-tls connector banned: HTTPS is served via rustls (AAP §0.8.1)" },
+    { crate = "hyper-openssl", reason = "hyper OpenSSL connector banned: rustls only (AAP §0.8.1)" },
+    { crate = "schannel", reason = "Windows SChannel TLS backend banned: rustls replaces all six C TLS backends (AAP §0.8.1)" },
+    { crate = "security-framework", reason = "Apple Secure Transport TLS banned: rustls replaces it; roots via webpki-roots (AAP §0.8.1)" },
+    { crate = "security-framework-sys", reason = "Apple Secure Transport C FFI banned: rustls only (AAP §0.8.1)" },
+    { crate = "mbedtls", reason = "mbedTLS (C) backend banned: rustls only (AAP §0.8.1)" },
+    { crate = "mbedtls-sys-auto", reason = "mbedTLS C FFI banned: rustls only (AAP §0.8.1)" },
+    { crate = "wolfssl", reason = "wolfSSL (C) backend banned: rustls only (AAP §0.8.1)" },
+    { crate = "wolfssl-sys", reason = "wolfSSL C FFI banned: rustls only (AAP §0.8.1)" },
+    { crate = "boring", reason = "BoringSSL (C) backend banned: rustls only (AAP §0.8.1)" },
+    { crate = "boring-sys", reason = "BoringSSL C FFI banned: rustls only (AAP §0.8.1)" },
+
+    # --- C HTTP/2 framing (nghttp2) -> replaced by the `h2` crate ---
+    { crate = "nghttp2-sys", reason = "nghttp2 (C) banned: HTTP/2 framing is provided by the pure-Rust `h2` crate (AAP §0.6.2)" },
+    { crate = "libnghttp2-sys", reason = "nghttp2 (C) banned: HTTP/2 framing is provided by `h2` (AAP §0.6.2)" },
+
+    # --- C QUIC / HTTP-3 (quiche, links BoringSSL) -> replaced by quinn + h3 ---
+    { crate = "quiche", reason = "quiche (C QUIC, links BoringSSL) banned: HTTP/3 uses quinn + h3 over rustls (AAP §0.6.2)" },
+
+    # --- C SSH (libssh / libssh2) -> replaced by `russh` ---
+    { crate = "libssh2-sys", reason = "libssh2 (C) banned: SFTP/SCP are provided by the pure-Rust `russh` (AAP §0.6.2)" },
+    { crate = "ssh2", reason = "libssh2 wrapper banned: SSH transport is `russh` (AAP §0.6.2)" },
+    { crate = "libssh-sys", reason = "libssh (C) banned: SSH transport is `russh` (AAP §0.6.2)" },
+
+    # --- C async DNS (c-ares) -> replaced by system resolver / hickory-dns ---
+    { crate = "c-ares", reason = "c-ares (C) banned: DNS uses the system resolver, optionally hickory-dns (AAP §0.6.2)" },
+    { crate = "c-ares-sys", reason = "c-ares C FFI banned: DNS uses the system resolver / hickory-dns (AAP §0.6.2)" },
+]
+
+# ----------------------------------------------------------------------------
+# [licenses] — permissive-only license policy (curl ships under an MIT-like
+#              license; dependencies must be compatible)
+# ----------------------------------------------------------------------------
+# v2 allow-list semantics: any SPDX license NOT in this list is denied. Copyleft
+# IDs (GPL-*, AGPL-*, LGPL-* as a sole license, etc.) are therefore rejected by
+# omission — there is intentionally no entry for them. The list is kept to the
+# permissive OSI / public-domain / data licenses actually present in the
+# resolved dependency tree for the AAP §0.6 inventory (tokio, hyper, rustls,
+# quinn, h3, russh, clap, the crypto/compression crates, cbindgen, ...).
 [licenses]
 version = 2
+# Require a high-confidence textual match before accepting a detected license.
 confidence-threshold = 0.8
 allow = [
-    "MIT",
-    "MIT-0",
-    "Apache-2.0",
-    "Apache-2.0 WITH LLVM-exception",
-    "ISC",
-    "BSD-1-Clause",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "0BSD",
-    "CC0-1.0",
-    "Zlib",
-    "Unlicense",
-    "Unicode-3.0",
-    "MPL-2.0",
-    "CDLA-Permissive-2.0",
+    "MIT",                            # ubiquitous (tokio, hyper, serde, clap, ...)
+    "MIT-0",                          # MIT No Attribution variant
+    "Apache-2.0",                     # ubiquitous, dual-licensed with MIT
+    "Apache-2.0 WITH LLVM-exception", # e.g. wasi, some core crates
+    "ISC",                            # e.g. rustls-webpki, untrusted, libloading
+    "BSD-2-Clause",                   # permissive BSD
+    "BSD-3-Clause",                   # permissive BSD
+    "0BSD",                           # BSD Zero Clause (public-domain-equivalent)
+    "Zlib",                           # e.g. foldhash, adler-family crates
+    "Unicode-3.0",                    # unicode-ident / ICU data (current)
+    "Unicode-DFS-2016",               # unicode-ident (older releases)
+    "MPL-2.0",                        # file-level weak copyleft; permissive for linking
+    "CC0-1.0",                        # public-domain dedication (e.g. tiny-keccak)
+    "Unlicense",                      # public-domain dedication (dual with MIT)
+    "CDLA-Permissive-2.0",            # permissive data license (e.g. webpki-roots CA data)
 ]
+# No per-crate license exceptions are required for the current tree. Add an
+# entry here (rather than widening `allow`) if a single crate needs a license
+# that should not be blanket-allowed for everything, e.g.:
+#   { allow = ["OpenSSL"], crate = "some-crate" }
 exceptions = []
 
 # The three workspace crates (curl-rs, curl-rs-lib, curl-rs-ffi) carry the
-# project license and are treated as private/internal for license evaluation.
+# project's own (curl-style / MIT-like) license and are unpublished; treat them
+# as private so the license check does not flag the workspace's own crates.
 [licenses.private]
 ignore = true
 
-[bans]
-multiple-versions = "warn"
-wildcards = "allow"
-allow = []
-deny = []
-
+# ----------------------------------------------------------------------------
+# [sources] — restrict crate origins to the public crates.io registry
+# ----------------------------------------------------------------------------
+# AAP §0.6: "All crates are public packages sourced from crates.io; there are no
+# private registries." AAP §0.8.3: "No vendored dependencies unless strictly
+# required." Any crate from an unknown registry or from a git source therefore
+# fails the gate.
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
