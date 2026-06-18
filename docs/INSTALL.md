@@ -34,6 +34,30 @@ If you get your code off a git repository instead of a release tarball, see
 the [GIT-INFO.md](https://github.com/curl/curl/blob/master/GIT-INFO.md) file in
 the root directory for specific instructions on how to proceed.
 
+## Building the Rust implementation
+
+This repository also contains a memory-safe Rust rewrite of curl and libcurl,
+organized as a Cargo workspace that lives alongside the C sources. It produces
+a drop-in `curl` binary and a `libcurl`-compatible shared and static library,
+and targets functional parity with curl 8.x. The C tree is retained as the
+behavioral and ABI reference.
+
+The workspace consists of three crates:
+
+- `curl-rs-lib` - the core async library (protocols, TLS, transfer, connection
+  management, DNS, and authentication).
+- `curl-rs` - the command-line binary, a drop-in replacement for `curl`.
+- `curl-rs-ffi` - the FFI crate that exposes the `extern "C"` libcurl ABI and
+  builds the `libcurl`-compatible shared and static libraries.
+
+Building requires a Rust toolchain matching `rust-toolchain.toml` (stable
+channel, MSRV 1.75, edition 2021). From the repository root, run:
+
+    cargo build --release --workspace
+
+TLS is provided exclusively by Rustls and certificate verification is on by
+default. See the top-level `README.md` for full build and usage instructions.
+
 # Unix
 
 A normal Unix installation is made in three or four steps (after you have
