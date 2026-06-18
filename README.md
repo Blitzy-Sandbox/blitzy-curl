@@ -52,6 +52,45 @@ Download the latest source from the Git server:
 
     git clone https://github.com/curl/curl
 
+## Building the Rust implementation (curl-rs)
+
+This repository also contains a memory-safe Rust rewrite of curl, organized as a
+Cargo workspace. It produces a drop-in `curl` binary and a `libcurl`-compatible
+shared/static library, targeting functional parity with curl 8.x. The Rust
+workspace lives alongside the original C tree, which is retained as the
+behavioral and ABI reference.
+
+The workspace is split into three crates:
+
+- `curl-rs-lib`: the core async library (protocol engines, TLS, transfer,
+  connection management, DNS, and authentication).
+- `curl-rs`: the command-line binary crate; a drop-in replacement for `curl`.
+- `curl-rs-ffi`: the FFI crate that exposes the `extern "C"` libcurl ABI and
+  builds the `libcurl`-compatible `cdylib`/`staticlib`.
+
+Building requires a Rust toolchain matching `rust-toolchain.toml` (the stable
+channel; MSRV 1.75, edition 2021). The memory-safety gates additionally
+require a nightly toolchain with the `miri` and `rust-src` components.
+
+Build everything in release mode, run the CLI (the produced binary acts as a
+drop-in `curl`), and run the test and lint gates:
+
+```sh
+cargo build --release --workspace
+cargo run --release --bin curl-rs -- https://example.com
+cargo test --workspace
+cargo clippy --workspace -- -D warnings
+```
+
+TLS is provided exclusively by [rustls](https://github.com/rustls/rustls); there
+is no OpenSSL, native-tls, or C TLS linkage. Certificate validation is on by
+default, and `--insecure` emits a warning on stderr.
+
+The produced artifacts substitute for `curl` and `libcurl` at the same
+integration points, and the C headers in `include/curl/*.h` continue to define
+the stable ABI (regenerated from the Rust sources via
+[cbindgen](https://github.com/mozilla/cbindgen)).
+
 ## Security problems
 
 Report suspected security problems

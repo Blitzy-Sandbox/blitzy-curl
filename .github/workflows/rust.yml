@@ -1,0 +1,377 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+name: 'Rust'
+
+'on':
+  push:
+    branches:
+      - master
+      - '*/ci'
+    paths-ignore:
+      - '**/*.md'
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+  pull_request:
+    branches:
+      - master
+    paths-ignore:
+      - '**/*.md'
+      - '.circleci/**'
+      - 'appveyor.*'
+      - 'Dockerfile'
+      - 'projects/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  CURL_CI: github
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+jobs:
+  # Gates 1-3 (AAP 0.8.1): Build (zero warnings), Lint (clippy -D warnings) and
+  # Unit/integration tests, run natively on all four required targets.
+  build:
+    name: 'build ${{ matrix.name }}'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 'linux-x86_64'
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: 'linux-aarch64'
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: 'macos-x86_64'
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+          - name: 'macos-arm64'
+            os: macos-latest
+            target: aarch64-apple-darwin
+    env:
+      MATRIX_TARGET: '${{ matrix.target }}'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'toolchain versions'
+        # The root rust-toolchain.toml pins the stable channel plus the clippy
+        # and llvm-tools-preview components; the first rustup/cargo call in the
+        # repo auto-installs it. Add the matrix target (a no-op when it is the
+        # host triple) so the mapping in the matrix is explicit.
+        run: |
+          rustup show
+          rustup target add "${MATRIX_TARGET}"
+          rustc --version
+          cargo --version
+          cargo clippy --version
+
+      - name: 'cargo cache'
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml') }}
+
+      - name: 'build (release, zero warnings)'
+        # Gate 1: cargo build --release --workspace with zero warnings. RUSTFLAGS
+        # -D warnings turns warnings into errors for the workspace crates; cargo
+        # caps dependency lints to 'allow', so third-party warnings cannot fail
+        # this build.
+        env:
+          RUSTFLAGS: '-D warnings'
+        run: cargo build --release --workspace
+
+      - name: 'clippy (-D warnings)'
+        # Gate 2: clippy must be clean with all warnings denied.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 'test'
+        # Gate 3: unit and integration tests must pass.
+        run: cargo test --workspace
+
+  # Gates 4-5 (AAP 0.8.1): Memory safety. Miri validates the non-FFI safe core;
+  # AddressSanitizer validates the unsafe FFI boundary. Both require nightly and
+  # are host-agnostic, so they run on the primary linux-x86_64 host.
+  memory:
+    name: 'memory (miri core + asan ffi)'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'install nightly toolchain (miri + rust-src)'
+        # The Memory(core) gate requires a nightly toolchain with the miri and
+        # rust-src components; the Memory(FFI) ASan build also requires nightly.
+        run: |
+          rustup toolchain install nightly --component miri rust-src
+          rustup +nightly show
+
+      - name: 'cargo cache'
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-memory-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml') }}
+
+      - name: 'miri (core crate, excludes FFI)'
+        # Gate 4 (Memory core): zero undefined behavior in the safe core. Scoped
+        # to curl-rs-lib and deliberately excludes curl-rs-ffi, whose unsafe FFI
+        # boundary is exercised by AddressSanitizer below.
+        run: cargo +nightly miri test -p curl-rs-lib
+
+      - name: 'addresssanitizer (FFI crate)'
+        # Gate 5 (Memory FFI): build the FFI crate and its integration tests with
+        # AddressSanitizer (nightly + a native target) and run them; zero errors.
+        env:
+          RUSTFLAGS: '-Zsanitizer=address'
+          RUSTDOCFLAGS: '-Zsanitizer=address'
+        run: cargo +nightly test -p curl-rs-ffi --target x86_64-unknown-linux-gnu
+
+  # Gate 6 (AAP 0.8.1): FFI symbol parity. The produced libcurl-compatible
+  # cdylib must export exactly the 100 curl_* symbols enumerated in
+  # lib/libcurl.def (the canonical export list).
+  symbols:
+    name: 'ffi symbol parity'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'toolchain versions'
+        run: |
+          rustup show
+          cargo --version
+
+      - name: 'cargo cache'
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-symbols-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml') }}
+
+      - name: 'build libcurl-compatible cdylib'
+        run: cargo build --release -p curl-rs-ffi
+
+      - name: 'compare exported symbols against lib/libcurl.def'
+        # The def file is `EXPORTS` on line 1 then one curl_* symbol per line.
+        # The exported curl_* set of the cdylib must match it exactly (100). On
+        # Linux (ELF) symbols carry no leading underscore; on macOS (Mach-O) a
+        # leading '_' is stripped and `nm -gU` is used instead of `nm -D`.
+        run: |
+          grep '^curl_' lib/libcurl.def | sort -u > expected-symbols.txt
+          echo "expected curl_* symbols: $(wc -l < expected-symbols.txt | tr -d '[:space:]')"
+          lib="$(find target/release -maxdepth 1 -type f \
+            \( -name 'libcurl_rs_ffi.so' -o -name 'libcurl.so' \
+            -o -name 'libcurl_rs_ffi.dylib' -o -name 'libcurl.dylib' \) -print -quit)"
+          if [ -z "${lib}" ]; then
+            echo 'ERROR: no produced cdylib found under target/release' >&2
+            find target/release -maxdepth 1 -type f \( -name '*.so' -o -name '*.dylib' \) >&2 || true
+            exit 1
+          fi
+          echo "inspecting: ${lib}"
+          if [ "$(uname)" = 'Darwin' ]; then
+            nm -gU "${lib}" | awk '{ print $NF }' | sed 's/^_//' | grep '^curl_' | sort -u > actual-symbols.txt || true
+          else
+            nm -D --defined-only "${lib}" | awk '$2 == "T" { print $3 }' | grep '^curl_' | sort -u > actual-symbols.txt || true
+          fi
+          echo "exported curl_* symbols: $(wc -l < actual-symbols.txt | tr -d '[:space:]')"
+          if ! diff -u expected-symbols.txt actual-symbols.txt; then
+            echo 'ERROR: exported curl_* symbol set does not match lib/libcurl.def' >&2
+            exit 1
+          fi
+          count="$(wc -l < actual-symbols.txt | tr -d '[:space:]')"
+          if [ "${count}" -ne 100 ]; then
+            echo "ERROR: expected 100 curl_* symbols, found ${count}" >&2
+            exit 1
+          fi
+          echo 'OK: 100 curl_* symbols match lib/libcurl.def exactly'
+
+  # Gate 7 (AAP 0.8.1): Coverage. Require >=80% line coverage on the protocol
+  # engines (curl-rs-lib/src/protocols/) and the transfer engine
+  # (curl-rs-lib/src/transfer.rs). Host-agnostic; runs on linux-x86_64.
+  coverage:
+    name: 'coverage (protocols + transfer >= 80%)'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'toolchain versions'
+        # llvm-tools-preview (pinned by rust-toolchain.toml) is required by
+        # cargo-llvm-cov; re-add defensively in case the cache lacks it.
+        run: |
+          rustup show
+          rustup component add llvm-tools-preview
+          cargo --version
+
+      - name: 'cargo cache'
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml') }}
+
+      - name: 'install cargo-llvm-cov'
+        run: cargo install --locked cargo-llvm-cov
+
+      - name: 'run coverage'
+        run: cargo llvm-cov --workspace --json --output-path coverage.json
+
+      - name: 'enforce coverage threshold'
+        # Parse the llvm-cov export JSON and require >=80% line coverage across
+        # the gated paths (protocols/ and transfer.rs), per AAP 0.8.1.
+        env:
+          COVERAGE_MIN: '80'
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          threshold = float(os.environ["COVERAGE_MIN"])
+          with open("coverage.json", encoding="utf-8") as handle:
+              report = json.load(handle)
+          def gated(path):
+              norm = path.replace("\\", "/")
+              return "curl-rs-lib/src/protocols/" in norm or norm.endswith("curl-rs-lib/src/transfer.rs")
+          covered = 0
+          total = 0
+          files = 0
+          for data in report.get("data", []):
+              for entry in data.get("files", []):
+                  name = entry.get("filename", "")
+                  if not gated(name):
+                      continue
+                  files += 1
+                  lines = entry["summary"]["lines"]
+                  covered += lines["covered"]
+                  total += lines["count"]
+          if files == 0:
+              sys.exit("ERROR: no gated files (protocols/ or transfer.rs) in coverage report")
+          pct = (100.0 * covered / total) if total else 0.0
+          print(f"gated files: {files}; line coverage: {pct:.2f}% ({covered}/{total}); threshold {threshold:.0f}%")
+          if pct < threshold:
+              sys.exit(f"ERROR: line coverage {pct:.2f}% is below the required {threshold:.0f}%")
+          print("OK: coverage threshold met")
+          PY
+
+  # Gate 8 (AAP 0.8.1): Security. cargo-audit fails on known CVEs; cargo-deny
+  # enforces the root deny.toml policy (rustls only; no C-TLS/OpenSSL crates;
+  # sources restricted to crates.io).
+  security:
+    name: 'security (audit + deny)'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'toolchain versions'
+        run: |
+          rustup show
+          cargo --version
+
+      - name: 'install cargo-audit and cargo-deny'
+        run: cargo install --locked cargo-audit cargo-deny
+
+      - name: 'cargo audit'
+        run: cargo audit
+
+      - name: 'cargo deny check'
+        run: cargo deny check
+
+  # Gate 9 (AAP 0.8.1 + 0.7.3): Suite parity. The existing curl 8.x regression
+  # suite (tests/data definitions, tests/libtest, runtests.pl/runner.pm/
+  # servers.pm) runs UNMODIFIED against the Rust drop-in and must pass at 100%.
+  # This is the heaviest gate and is given its own job.
+  test-suite:
+    name: 'curl 8.x suite parity'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: 'toolchain versions'
+        run: |
+          rustup show
+          cargo --version
+
+      - name: 'cargo cache'
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-suite-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml') }}
+
+      - name: 'build rust artifacts (drop-in curl + libcurl)'
+        run: cargo build --release --workspace
+
+      - name: 'install test-harness prereqs'
+        # The runner scripts are Perl; the pytest http suite and helpers need the
+        # Python requirements shipped with the tests tree (installed unmodified).
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/{azure-cli.sources,microsoft-prod.list,ondrej-ubuntu-php-noble.sources}
+          sudo apt-get -o Dpkg::Use-Pty=0 update
+          sudo apt-get -o Dpkg::Use-Pty=0 install stunnel4
+          python3 -m venv ~/venv
+          ~/venv/bin/pip --disable-pip-version-check --no-input --no-cache-dir install --progress-bar off --prefer-binary \
+            -r tests/requirements.txt \
+            -r tests/http/requirements.txt
+
+      - name: 'run the unmodified curl 8.x regression suite'
+        # Per AAP 0.7.3 the suite runs UNMODIFIED and the intent is 100% pass.
+        # The binary crate curl-rs produces a drop-in `curl`; expose it under the
+        # name the harness expects, then invoke the standard runtests.pl runner.
+        # NOTE: a complete run additionally requires the curl test-server programs
+        # and tests/libtest, which are produced by the repository's existing build
+        # infrastructure; this job wires the gate (implementation step 14) and
+        # must not be weakened with continue-on-error.
+        run: |
+          source ~/venv/bin/activate
+          mkdir -p bin
+          rust_curl=''
+          for candidate in target/release/curl-rs target/release/curl; do
+            if [ -x "${candidate}" ]; then
+              rust_curl="${candidate}"
+              break
+            fi
+          done
+          if [ -z "${rust_curl}" ]; then
+            echo 'ERROR: no Rust curl binary found under target/release' >&2
+            exit 1
+          fi
+          ln -sf "${PWD}/${rust_curl}" bin/curl
+          export PATH="${PWD}/bin:${PATH}"
+          curl --version
+          perl ./tests/runtests.pl -a

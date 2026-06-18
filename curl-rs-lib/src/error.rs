@@ -260,6 +260,24 @@ pub mod codes {
         /// One past the last defined `CURLSHcode`; never a real result code.
         pub const CURLSHE_LAST: i32 = 6;
     }
+
+    /// `CURLHcode` constants — `include/curl/header.h`.
+    ///
+    /// The header-API result codes returned by `curl_easy_header()`. The C enum
+    /// is sequential from `0`; these integers are observed by C consumers and the
+    /// `tests/data` header-API tests, so the values are pinned exactly.
+    pub mod header {
+        pub const CURLHE_OK: i32 = 0;
+        pub const CURLHE_BADINDEX: i32 = 1;
+        pub const CURLHE_MISSING: i32 = 2;
+        pub const CURLHE_NOHEADERS: i32 = 3;
+        pub const CURLHE_NOREQUEST: i32 = 4;
+        pub const CURLHE_OUT_OF_MEMORY: i32 = 5;
+        pub const CURLHE_BAD_ARGUMENT: i32 = 6;
+        pub const CURLHE_NOT_BUILT_IN: i32 = 7;
+        /// One past the last defined `CURLHcode`; never a real result code.
+        pub const CURLHE_LAST: i32 = 8;
+    }
 }
 
 /// The crate-internal error type, modelling curl's `CURLcode` result space.
@@ -1372,6 +1390,115 @@ impl From<&CurlShError> for CurlCode {
     }
 }
 
+/// The header-API result code, mirroring C's `CURLHcode`
+/// (`include/curl/header.h`).
+///
+/// Returned by `curl_easy_header()` (and produced internally by
+/// [`crate::headers`]) to describe the outcome of a response-header lookup. The
+/// integer value of each variant matches curl 8.x exactly (`CURLHE_OK = 0`
+/// through `CURLHE_NOT_BUILT_IN = 7`); the values are observed directly by C
+/// consumers and the `tests/data` header-API tests, so they are part of the ABI.
+///
+/// Unlike [`CurlError`], curl exposes no `curl_*_strerror()` for `CURLHcode`,
+/// so the [`Display`](core::fmt::Display) strings here are derived from the
+/// descriptive comments in `include/curl/header.h` rather than from
+/// `lib/strerror.c`.
+///
+/// In idiomatic Rust the success case (`CURLHE_OK`) is represented with
+/// [`Result::Ok`]; [`CurlHError::Ok`] exists so that the FFI layer and
+/// [`from_code`](CurlHError::from_code)/[`code`](CurlHError::code) form a total
+/// mapping over the C code space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[repr(i32)]
+pub enum CurlHError {
+    /// `CURLHE_OK` (0) — success.
+    #[error("No error")]
+    Ok = 0,
+    /// `CURLHE_BADINDEX` (1) — the header exists but not with this index.
+    #[error("header exists but not with this index")]
+    BadIndex = 1,
+    /// `CURLHE_MISSING` (2) — no such header exists.
+    #[error("no such header exists")]
+    Missing = 2,
+    /// `CURLHE_NOHEADERS` (3) — no headers at all exist (yet).
+    #[error("no headers at all exist (yet)")]
+    NoHeaders = 3,
+    /// `CURLHE_NOREQUEST` (4) — no request with this number was used.
+    #[error("no request with this number was used")]
+    NoRequest = 4,
+    /// `CURLHE_OUT_OF_MEMORY` (5) — out of memory while processing.
+    #[error("out of memory while processing")]
+    OutOfMemory = 5,
+    /// `CURLHE_BAD_ARGUMENT` (6) — a function argument was not okay.
+    #[error("a function argument was not okay")]
+    BadArgument = 6,
+    /// `CURLHE_NOT_BUILT_IN` (7) — the header API was disabled in the build.
+    #[error("the header API was disabled in the build")]
+    NotBuiltIn = 7,
+}
+
+impl CurlHError {
+    /// Returns the exact C `CURLHcode` integer for this code.
+    #[must_use]
+    pub const fn code(&self) -> CurlCode {
+        *self as CurlCode
+    }
+
+    /// Returns a static description for this code.
+    ///
+    /// curl has no `curl_*_strerror()` for `CURLHcode`; these strings mirror the
+    /// descriptive comments next to each value in `include/curl/header.h`.
+    #[must_use]
+    pub const fn description(&self) -> &'static str {
+        match self {
+            CurlHError::Ok => "No error",
+            CurlHError::BadIndex => "header exists but not with this index",
+            CurlHError::Missing => "no such header exists",
+            CurlHError::NoHeaders => "no headers at all exist (yet)",
+            CurlHError::NoRequest => "no request with this number was used",
+            CurlHError::OutOfMemory => "out of memory while processing",
+            CurlHError::BadArgument => "a function argument was not okay",
+            CurlHError::NotBuiltIn => "the header API was disabled in the build",
+        }
+    }
+
+    /// Builds a [`CurlHError`] from a raw `CURLHcode` integer.
+    ///
+    /// Returns `None` for any value outside the defined `0..=7` range.
+    #[must_use]
+    pub const fn from_code(code: CurlCode) -> Option<CurlHError> {
+        match code {
+            codes::header::CURLHE_OK => Some(CurlHError::Ok),
+            codes::header::CURLHE_BADINDEX => Some(CurlHError::BadIndex),
+            codes::header::CURLHE_MISSING => Some(CurlHError::Missing),
+            codes::header::CURLHE_NOHEADERS => Some(CurlHError::NoHeaders),
+            codes::header::CURLHE_NOREQUEST => Some(CurlHError::NoRequest),
+            codes::header::CURLHE_OUT_OF_MEMORY => Some(CurlHError::OutOfMemory),
+            codes::header::CURLHE_BAD_ARGUMENT => Some(CurlHError::BadArgument),
+            codes::header::CURLHE_NOT_BUILT_IN => Some(CurlHError::NotBuiltIn),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if this represents success (`CURLHE_OK`).
+    #[must_use]
+    pub const fn is_ok(&self) -> bool {
+        matches!(self, CurlHError::Ok)
+    }
+}
+
+impl From<CurlHError> for CurlCode {
+    fn from(error: CurlHError) -> Self {
+        error.code()
+    }
+}
+
+impl From<&CurlHError> for CurlCode {
+    fn from(error: &CurlHError) -> Self {
+        error.code()
+    }
+}
+
 /// The crate-wide result type.
 ///
 /// Equivalent to [`core::result::Result<T, CurlError>`]. Internal APIs return
@@ -1394,6 +1521,7 @@ const _: () = {
     assert_copy::<CurlMError>();
     assert_copy::<CurlUError>();
     assert_copy::<CurlShError>();
+    assert_copy::<CurlHError>();
 };
 
 
@@ -1786,6 +1914,39 @@ mod tests {
         }
         assert_eq!(CurlShError::from_code(6), None);
         assert_eq!(CurlShError::from_code(-1), None);
+    }
+
+    // ---- CURLHcode (header API) --------------------------------------------
+
+    #[test]
+    fn header_exact_integers_strings_and_roundtrip() {
+        // Pin the exact CURLHcode integers from include/curl/header.h.
+        assert_eq!(CurlHError::Ok.code(), 0);
+        assert_eq!(CurlHError::BadIndex.code(), 1);
+        assert_eq!(CurlHError::Missing.code(), 2);
+        assert_eq!(CurlHError::NoHeaders.code(), 3);
+        assert_eq!(CurlHError::NoRequest.code(), 4);
+        assert_eq!(CurlHError::OutOfMemory.code(), 5);
+        assert_eq!(CurlHError::BadArgument.code(), 6);
+        assert_eq!(CurlHError::NotBuiltIn.code(), 7);
+        assert_eq!(codes::header::CURLHE_LAST, 8);
+
+        // Named constants agree with the variant integers.
+        assert_eq!(CurlHError::Ok.code(), codes::header::CURLHE_OK);
+        assert_eq!(CurlHError::NotBuiltIn.code(), codes::header::CURLHE_NOT_BUILT_IN);
+
+        // Display text matches description() for every variant.
+        for code in 0..codes::header::CURLHE_LAST {
+            let h = CurlHError::from_code(code).expect("0..LAST must be defined");
+            assert_eq!(h.code(), code);
+            assert_eq!(CurlCode::from(h), code);
+            assert_eq!(CurlCode::from(&h), code);
+            assert_eq!(h.to_string(), h.description());
+        }
+        assert_eq!(CurlHError::from_code(8), None);
+        assert_eq!(CurlHError::from_code(-1), None);
+        assert!(CurlHError::Ok.is_ok());
+        assert!(!CurlHError::Missing.is_ok());
     }
 
     // ---- Ergonomics --------------------------------------------------------
