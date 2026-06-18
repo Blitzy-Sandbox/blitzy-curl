@@ -72,3 +72,10 @@ libstandaloneengine.a
 tests/string
 tests/config
 tests/ech-log/
+
+# Rust / Cargo build artifacts (curl-rs workspace)
+/target/
+**/target/
+*.rs.bk
+# cbindgen scratch output
+curl-rs-ffi/generated_curl.h

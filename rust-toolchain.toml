@@ -1,0 +1,16 @@
+# Rust toolchain pin for the curl-rs workspace (C→Rust migration of curl 8.19.0-DEV).
+#
+# Per the Agent Action Plan (§0.8.1) and technical-specifications.md, the project
+# pins the STABLE channel and declares MSRV 1.75 / edition 2021 in the crate
+# manifests (rust-version = "1.75"). The stable channel is used for the primary
+# build/clippy/test/coverage gates; a separate nightly toolchain (invoked via
+# `cargo +nightly miri ...`) provides Miri for the non-FFI memory-safety gate.
+#
+# NOTE (setup stub): This file was created by the environment-setup agent so the
+# toolchain is consistent for subsequent file-implementation agents. It will be
+# superseded when the workspace scaffolding is materialized.
+[toolchain]
+channel = "stable"
+components = ["clippy", "llvm-tools-preview", "rustfmt"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+profile = "default"

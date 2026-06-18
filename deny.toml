@@ -1,0 +1,61 @@
+# cargo-deny policy for the curl-rs workspace — backs the security/license gate
+# (AAP §0.8.1: "cargo deny" license + advisory compliance).
+#
+# Schema: cargo-deny v2 (validated against cargo-deny 0.19.x).
+#
+# The allow-list below was derived from a full scan of the resolved dependency
+# tree for the AAP §0.6 inventory (tokio, hyper, rustls, quinn, h3, russh,
+# clap, cbindgen, compression + crypto crates, etc.). All entries are permissive
+# OSI/data licenses. Copyleft licenses are intentionally NOT allowed; the only
+# copyleft id observed (LGPL-2.1-or-later via the UEFI-only `r-efi` crate) is
+# satisfied through that crate's "MIT OR Apache-2.0 OR LGPL-2.1-or-later" choice.
+#
+# NOTE (setup stub): created by the environment-setup agent so the security gate
+# is runnable once the workspace is materialized; refine as the dependency set
+# is finalized.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Add specific RUSTSEC advisory IDs here only with a documented justification.
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "CC0-1.0",
+    "Zlib",
+    "Unlicense",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+exceptions = []
+
+# The three workspace crates (curl-rs, curl-rs-lib, curl-rs-ffi) carry the
+# project license and are treated as private/internal for license evaluation.
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+allow = []
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

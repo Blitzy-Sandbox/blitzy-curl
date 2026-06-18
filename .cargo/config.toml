@@ -1,0 +1,19 @@
+# Cargo configuration for the curl-rs workspace.
+#
+# Cross-compilation linker settings for the four-target CI matrix
+# (AAP §0.8.1 / technical-specifications.md §0.4): Linux x86_64, Linux aarch64,
+# macOS x86_64, macOS arm64.
+#
+# Linux aarch64 cross-compilation is wired here and is functional in this
+# environment (the gcc-aarch64-linux-gnu cross toolchain is installed). The two
+# macOS targets require macOS runners (or an osxcross SDK); they are produced on
+# the `macos-latest` CI runners rather than this Linux host.
+#
+# NOTE (setup stub): created by the environment-setup agent; superseded when the
+# workspace scaffolding is materialized.
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+# Example for explicit cross runs:
+#   cargo build --release --target aarch64-unknown-linux-gnu
