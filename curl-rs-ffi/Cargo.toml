@@ -1,0 +1,174 @@
+# =============================================================================
+# curl-rs-ffi — FFI crate manifest (produces the drop-in libcurl)
+# =============================================================================
+#
+# `curl-rs-ffi` is the FFI layer of the three-crate curl -> Rust workspace. It
+# exposes curl's public `extern "C"` C ABI and is compiled into the
+# `libcurl`-compatible shared and static libraries (a drop-in replacement for
+# the C `libcurl`). There is no 1:1 C-source equivalent for this manifest; it is
+# pure scaffolding mandated by the Agent Action Plan (§0.3.1 / §0.4.1 / §0.5.1).
+#
+# (a) INHERITS, NEVER RE-PINS.
+#     Every shared [package] field and every dependency version is inherited
+#     from the workspace root `/Cargo.toml` (the single source of truth) via
+#     `<field>.workspace = true` and `<dep> = { workspace = true, ... }`. This
+#     manifest declares ZERO literal "x.y.z" version strings outside comments;
+#     the only literals here are `features` flags, `[lib]` settings, the
+#     `description`, and comments.
+#
+# (b) ONE-DIRECTIONAL DEPENDENCY GRAPH (AAP §0.1.1 / §0.4).
+#     This crate depends on `curl-rs-lib` (the async core) and MUST NEVER depend
+#     on `curl-rs` (the binary CLI). The two leaf crates (`curl-rs`,
+#     `curl-rs-ffi`) never depend on each other:  curl-rs-ffi -> curl-rs-lib.
+#
+# (c) THE ONLY CRATE THAT CONTAINS `unsafe` (AAP §0.7.1).
+#     All raw-pointer handling at the C boundary (`Box::into_raw` /
+#     `Box::from_raw` handle lifecycle, `*mut` / `*const` shims, `#[repr(C)]`
+#     structs, variadic-setopt dispatch) lives in this crate. The safe core
+#     (`curl-rs-lib`) carries `#![forbid(unsafe_code)]` at its
+#     protocol/tls/transfer roots; this crate does not (and cannot) forbid it.
+#     The manifest does not express that rule, but it sets the crate's context.
+#
+# (d) HUMAN-FACING VERSION STRING vs. CARGO SemVer.
+#     curl's `LIBCURL_VERSION` is "8.19.0-DEV" (`LIBCURL_VERSION_NUM 0x081300`,
+#     from include/curl/curlver.h). The exact "8.19.0-DEV" string reported by
+#     `curl_version()` / `curl_version_info()` / `curl --version` is owned by
+#     `curl-rs-lib`'s version module, NOT by this manifest: Cargo's SemVer
+#     `version` field cannot carry the "-DEV" pre-release marker (a literal
+#     "8.19.0-DEV" would be read as a SemVer pre-release and sort *below*
+#     "8.19.0"), so the workspace pins the numeric "8.19.0" instead.
+# =============================================================================
+
+[package]
+name = "curl-rs-ffi"
+# All shared package fields are inherited from [workspace.package] in the root
+# manifest, so versioning / licensing / authorship stay single-sourced (note a).
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "FFI crate of the curl-rs workspace — exposes the extern \"C\" libcurl C ABI and builds the libcurl-compatible cdylib/staticlib (drop-in libcurl)."
+
+# -----------------------------------------------------------------------------
+# [lib] — THIS is what makes the crate a drop-in `libcurl`.
+#
+# `name = "curl"` is CRITICAL: the linker derives artifact names from the lib
+# name, so `name = "curl"` yields `libcurl.so` / `libcurl.a` / `libcurl.dylib`
+# (a true drop-in for the C `libcurl`). It is a coordination point with the root
+# `.cargo/config.toml`, which stamps `DT_SONAME = libcurl.so.4` on Linux (and
+# the macOS `install_name = @rpath/libcurl.4.dylib` is applied cdylib-scoped in
+# `curl-rs-ffi/build.rs`). Renaming the lib would break the SONAME / install_name
+# and the drop-in identity.
+#
+# `crate-type`:
+#   * "cdylib"    -> the drop-in shared library (libcurl.so / libcurl.dylib).
+#   * "staticlib" -> the drop-in static library (libcurl.a).
+# The exported-symbol surface of the `cdylib` is determined SOLELY by this
+# crate's `#[no_mangle] pub extern "C"` items and is checked by the nm / objdump
+# parity gate against `lib/libcurl.def` (100 `curl_*` symbols, AAP §0.7.2).
+#
+# Kept MINIMAL (no `lib` / `rlib`): there is no `curl-rs-ffi/tests/` directory,
+# so no Rust *integration* test links this crate as a Rust library. In-crate
+# unit tests (`#[cfg(test)]`) still compile and run because the test harness
+# builds the crate root directly. If integration tests are later added under
+# `tests/`, prepend `"lib"` -> `crate-type = ["lib", "cdylib", "staticlib"]`;
+# adding `lib` / `rlib` does NOT change the `cdylib` exported-symbol surface, so
+# the nm / objdump parity gate is unaffected.
+# -----------------------------------------------------------------------------
+[lib]
+name = "curl"
+crate-type = ["cdylib", "staticlib"]
+
+# -----------------------------------------------------------------------------
+# [lints] — inherit the workspace-wide lint policy (root [workspace.lints]).
+#
+# Opts into `unsafe_op_in_unsafe_fn = "deny"` from the root manifest. This is
+# especially meaningful HERE: curl-rs-ffi is the ONLY crate that contains
+# `unsafe`, and this lint forces every unsafe operation inside an `unsafe fn` to
+# sit in an explicit `unsafe { }` block, keeping the FFI surface auditable and
+# reinforcing the memory-safety mandate (AAP §0.7.1). It introduces no version
+# literal and mirrors the sibling `curl-rs-lib` manifest, keeping the policy
+# consistent across all three workspace members (the root manifest explicitly
+# invites members to opt in this way).
+# -----------------------------------------------------------------------------
+[lints]
+workspace = true
+
+# =============================================================================
+# [dependencies]
+#
+# Every entry inherits its EXACT version from the root [workspace.dependencies]
+# via `workspace = true`; only `features` are set locally. No version literal
+# appears below (note a).
+#
+# ABSOLUTE BAN (AAP §0.8.1): no native C-TLS, C-protocol, or sibling `-sys`
+# backend crate (the legacy C TLS / HTTP2 / QUIC / SSH bindings curl once linked)
+# may be added here. The complete forbidden-backend list is enumerated and
+# machine-enforced by the workspace `deny.toml`; this crate links none of them.
+# TLS is `rustls` exclusively and lives behind `curl-rs-lib`, never in this crate.
+# Likewise, the binary CLI crate is NOT a dependency: the graph is strictly
+# one-directional and this FFI crate depends only on `curl-rs-lib` (note b).
+# =============================================================================
+[dependencies]
+
+# The async core this FFI layer wraps. Pulled with its DEFAULT features, which
+# equal curl's default build, so `curl_version_info()` / `curl --version` report
+# curl's default capability + protocol set (AAP §0.6.2 / §0.7.3). The Rust
+# import path is `curl_rs_lib` (Cargo maps `-` -> `_`).
+curl-rs-lib.workspace = true
+
+# C primitive types at the FFI boundary (`c_int`, `c_char`, `c_void`, `c_long`,
+# `size_t`, `FILE`, ...) used by the `extern "C"` shims and `#[repr(C)]` structs.
+libc.workspace = true
+
+# Sync-over-async bridge (AAP §0.4.4 / §0.7): each blocking C entrypoint (e.g.
+# `curl_easy_perform`) calls `block_on()` on a thread-local CURRENT-THREAD Tokio
+# runtime to drive the async core to completion under the synchronous C
+# contract. The `rt` feature provides `tokio::runtime::{Runtime, Builder}`
+# (current-thread), which is sufficient for `block_on`. `rt-multi-thread` is
+# deliberately NOT requested here: the multi-thread runtime backing the `Multi`
+# handle is owned inside `curl-rs-lib` (its `Multi` struct), and the FFI
+# `curl_multi_*` shims call into that core. The feature list is kept minimal per
+# the minimal-change mandate (AAP §0.8.1).
+tokio = { workspace = true, features = ["rt"] }
+
+# =============================================================================
+# [build-dependencies] — exactly one.
+#
+# `cbindgen` (version pinned by the workspace) is used by `build.rs` to
+# (re)generate `include/curl/curl.h` from this crate's `extern "C"` /
+# `#[no_mangle]` / `#[repr(C)]` items (AAP §0.5.2). The curated `include/curl/*.h`
+# headers remain authoritative; cbindgen is a synchronization / verification
+# mechanism (see `curl-rs-ffi/cbindgen.toml`). This is the ONLY build-dependency.
+# =============================================================================
+[build-dependencies]
+cbindgen.workspace = true
+
+# =============================================================================
+# [features] — minimal; protocol / capability features are OWNED by curl-rs-lib.
+#
+# The protocol / capability feature set (http, ftp, http2, http3, cookies, ...)
+# is defined and DEFAULTED in `curl-rs-lib` (its [features] default equals
+# curl's default build). Depending on `curl-rs-lib` with its default features
+# (above) therefore yields curl's default capability set, so
+# `curl_version_info()` / `curl --version` reporting matches curl 8.x exactly
+# (AAP §0.6.2 / §0.7.3). No FFI-only capability features are invented here
+# (minimal-change mandate, AAP §0.8.1).
+# =============================================================================
+[features]
+
+# Empty default: the drop-in `libcurl` build inherits curl-rs-lib's defaults
+# (= curl's default build). Do NOT list capability features here.
+default = []
+
+# Forward the single OFF-by-default optional backend so a `libcurl` build can
+# opt in: `cargo build -p curl-rs-ffi --features hickory-dns` propagates to
+# `curl-rs-lib/hickory-dns` (pulling `hickory-resolver`). This is curl's
+# `USE_ARES` analog, OFF in curl's default build (AAP §0.6.2). The default-ON
+# optional backends (`brotli`, `zstd`) are intentionally NOT re-exposed here:
+# leaving them as curl-rs-lib defaults keeps the drop-in `libcurl` capability
+# set identical to curl 8.x without adding extra knobs.
+hickory-dns = ["curl-rs-lib/hickory-dns"]
