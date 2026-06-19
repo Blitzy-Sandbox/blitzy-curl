@@ -105,6 +105,11 @@ pub mod transfer; // The async transfer engine (type-state flow) — `lib/transf
 // `recv`/`send`/`upkeep`) plus process-global init/cleanup/sslset (`lib/easy.c`).
 pub mod easy;
 
+// The multi-handle engine: the opaque `CURLM` handle that drives concurrent
+// transfers on a lazily-created Tokio multi-thread runtime, preserving curl's
+// synchronous socket/timer callback contract (`lib/multi.c`, `lib/multi_ev.c`).
+pub mod multi;
+
 // Subsystem module trees.
 pub mod auth; // Authentication: HTTP schemes + the shared SASL state machine (`lib/vauth/`, `lib/curl_sasl.c`, …).
 pub mod conn; // Connection-filter chain + filters (`lib/cfilters.c`, `lib/cf-*.c`).
