@@ -46,7 +46,7 @@
 // linted in isolation.
 #![allow(non_camel_case_types)]
 
-use core::ffi::{c_char, c_double, c_int, c_long, c_uchar, c_uint, c_void};
+use core::ffi::{c_char, c_double, c_int, c_long, c_short, c_uchar, c_uint, c_void};
 use libc::{size_t, sockaddr, time_t};
 
 // =============================================================================
@@ -124,6 +124,106 @@ pub struct curl_pushheaders {
     _private: [u8; 0],
 }
 
+// --- Multi-handle poll descriptor (`struct curl_waitfd`) --------------------
+
+/// A single descriptor to poll, passed to `curl_multi_wait` / `curl_multi_poll`
+/// (as `extra_fds[]`) and filled by `curl_multi_waitfds` (`struct curl_waitfd`,
+/// `include/curl/multi.h`).
+///
+/// The field order, names and widths mirror the C struct exactly: a
+/// [`curl_socket_t`] descriptor and two `short` event bitmasks built from the
+/// `CURL_WAIT_POLL*` flags below. `revents` is filled by libcurl to report which
+/// events actually occurred.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct curl_waitfd {
+    /// The socket / file descriptor to monitor.
+    pub fd: curl_socket_t,
+    /// Requested events bitmask (`CURL_WAIT_POLLIN` / `..PRI` / `..POLLOUT`).
+    pub events: c_short,
+    /// Returned events bitmask, filled in by libcurl.
+    pub revents: c_short,
+}
+
+/// `CURL_WAIT_POLLIN` (`include/curl/multi.h`): the descriptor has data to read.
+pub const CURL_WAIT_POLLIN: c_short = 0x0001;
+
+/// `CURL_WAIT_POLLPRI` (`include/curl/multi.h`): priority data to read.
+pub const CURL_WAIT_POLLPRI: c_short = 0x0002;
+
+/// `CURL_WAIT_POLLOUT` (`include/curl/multi.h`): writing will not block.
+pub const CURL_WAIT_POLLOUT: c_short = 0x0004;
+
+// --- Multi socket-callback poll actions (`CURL_POLL_*`) ---------------------
+
+/// `CURL_POLL_NONE` (`include/curl/multi.h`): register, not interested in
+/// readiness.
+pub const CURL_POLL_NONE: c_int = 0;
+
+/// `CURL_POLL_IN` (`include/curl/multi.h`): wait for the socket to become
+/// readable.
+pub const CURL_POLL_IN: c_int = 1;
+
+/// `CURL_POLL_OUT` (`include/curl/multi.h`): wait for the socket to become
+/// writable.
+pub const CURL_POLL_OUT: c_int = 2;
+
+/// `CURL_POLL_INOUT` (`include/curl/multi.h`): wait for readable or writable.
+pub const CURL_POLL_INOUT: c_int = 3;
+
+/// `CURL_POLL_REMOVE` (`include/curl/multi.h`): stop monitoring the socket.
+pub const CURL_POLL_REMOVE: c_int = 4;
+
+/// `CURL_SOCKET_TIMEOUT` (`include/curl/multi.h`): the "socket" value passed to
+/// `curl_multi_socket_action` to signal a timeout (an alias of
+/// [`CURL_SOCKET_BAD`]).
+pub const CURL_SOCKET_TIMEOUT: curl_socket_t = CURL_SOCKET_BAD;
+
+// --- Multi socket-callback readiness bits (`CURL_CSELECT_*`) ----------------
+
+/// `CURL_CSELECT_IN` (`include/curl/multi.h`): socket is readable
+/// (`ev_bitmask`).
+pub const CURL_CSELECT_IN: c_int = 0x01;
+
+/// `CURL_CSELECT_OUT` (`include/curl/multi.h`): socket is writable
+/// (`ev_bitmask`).
+pub const CURL_CSELECT_OUT: c_int = 0x02;
+
+/// `CURL_CSELECT_ERR` (`include/curl/multi.h`): socket has an error condition
+/// (`ev_bitmask`).
+pub const CURL_CSELECT_ERR: c_int = 0x04;
+
+// --- HTTP/2 server-push callback return values (`CURL_PUSH_*`) --------------
+
+/// `CURL_PUSH_OK` (`include/curl/multi.h`): accept the pushed stream.
+pub const CURL_PUSH_OK: c_int = 0;
+
+/// `CURL_PUSH_DENY` (`include/curl/multi.h`): reject the pushed stream.
+pub const CURL_PUSH_DENY: c_int = 1;
+
+/// `CURL_PUSH_ERROROUT` (`include/curl/multi.h`): fail the whole connection.
+pub const CURL_PUSH_ERROROUT: c_int = 2;
+
+// --- Multi notification kinds (`CURLMNOTIFY_*`) -----------------------------
+
+/// `CURLMNOTIFY_INFO_READ` (`include/curl/multi.h`): a message became readable
+/// via `curl_multi_info_read`.
+pub const CURLMNOTIFY_INFO_READ: c_uint = 0;
+
+/// `CURLMNOTIFY_EASY_DONE` (`include/curl/multi.h`): an easy handle finished.
+pub const CURLMNOTIFY_EASY_DONE: c_uint = 1;
+
+// --- Legacy pipelining bitmask (`CURLPIPE_*`, `CURLMOPT_PIPELINING`) --------
+
+/// `CURLPIPE_NOTHING` (`include/curl/multi.h`): no multiplexing.
+pub const CURLPIPE_NOTHING: c_long = 0;
+
+/// `CURLPIPE_HTTP1` (`include/curl/multi.h`): legacy HTTP/1 pipelining (inert).
+pub const CURLPIPE_HTTP1: c_long = 1;
+
+/// `CURLPIPE_MULTIPLEX` (`include/curl/multi.h`): enable HTTP/2+ multiplexing.
+pub const CURLPIPE_MULTIPLEX: c_long = 2;
+
 // =============================================================================
 // Phase 3 — Integer tag aliases for the large option/info enums
 // =============================================================================
@@ -156,6 +256,15 @@ pub type CURLINFO = c_int;
 /// `curl_multi_setopt` shim maps this int to it. The full enumeration lives in
 /// the curated `include/curl/multi.h`.
 pub type CURLMoption = c_int;
+
+/// ABI-compatible `int` alias for `CURLMinfo_offt` (used by
+/// `curl_multi_get_offt`; values `CURLMINFO_NONE = 0` …
+/// `CURLMINFO_XFERS_ADDED = 5`). The typed enumeration is owned by
+/// `curl-rs-lib::multi` ([`curl_rs_lib::multi::CurlMInfo`]) and the
+/// `curl_multi_get_offt` shim maps this int to it; the full enumeration lives in
+/// the curated `include/curl/multi.h`. C enums are `int`-sized, so the alias is
+/// an exact ABI match.
+pub type CURLMinfo_offt = c_int;
 
 /// ABI-compatible `int` alias for `CURLformoption` (used by `curl_forms.option`
 /// and `curl_formadd`). The full enumeration lives in the curated
@@ -1094,3 +1203,59 @@ pub type curl_ssls_export_cb = unsafe extern "C" fn(
     alpn: *const c_char,
     earlydata_max: size_t,
 ) -> i32;
+
+// --- Multi-handle callbacks (`include/curl/multi.h`) ------------------------
+//
+// These four callback typedefs are consumed by `curl_multi_setopt`
+// (`CURLMOPT_SOCKETFUNCTION` / `TIMERFUNCTION` / `PUSHFUNCTION` /
+// `NOTIFYFUNCTION`). The variadic `curl_multi_setopt` shim in `multi.rs` stores
+// the installed pointer and reconstructs the concrete `extern "C" fn` to invoke
+// it; these `Option<…>` typedefs name the public C signatures so `cbindgen` and
+// callers see the exact ABI (mirroring the curated `include/curl/multi.h`).
+
+/// `CURLMOPT_SOCKETFUNCTION` callback (`curl_socket_callback`,
+/// `include/curl/multi.h`). Reports a change in I/O interest for a socket; the
+/// return value is `0` on success. `what` is one of the `CURL_POLL_*` values.
+pub type curl_socket_callback = Option<
+    unsafe extern "C" fn(
+        easy: *mut CURL,
+        s: curl_socket_t,
+        what: c_int,
+        userp: *mut c_void,
+        socketp: *mut c_void,
+    ) -> c_int,
+>;
+
+/// `CURLMOPT_TIMERFUNCTION` callback (`curl_multi_timer_callback`,
+/// `include/curl/multi.h`). Reports a change in the maximum time the application
+/// may wait before driving the multi again; `timeout_ms` is `-1` to clear. The
+/// callback should return `0`.
+pub type curl_multi_timer_callback = Option<
+    unsafe extern "C" fn(multi: *mut CURLM, timeout_ms: c_long, userp: *mut c_void) -> c_int,
+>;
+
+/// `CURLMOPT_PUSHFUNCTION` callback (`curl_push_callback`,
+/// `include/curl/multi.h`). Approves (`CURL_PUSH_OK`), denies (`CURL_PUSH_DENY`)
+/// or fails (`CURL_PUSH_ERROROUT`) a server-pushed HTTP/2 stream.
+pub type curl_push_callback = Option<
+    unsafe extern "C" fn(
+        parent: *mut CURL,
+        easy: *mut CURL,
+        num_headers: size_t,
+        headers: *mut curl_pushheaders,
+        userp: *mut c_void,
+    ) -> c_int,
+>;
+
+/// `CURLMOPT_NOTIFYFUNCTION` callback (`curl_notify_callback`,
+/// `include/curl/multi.h`). Delivers a multi-level notification
+/// (`CURLMNOTIFY_INFO_READ` / `CURLMNOTIFY_EASY_DONE`) when enabled. Returns
+/// nothing.
+pub type curl_notify_callback = Option<
+    unsafe extern "C" fn(
+        multi: *mut CURLM,
+        notification: c_uint,
+        easy: *mut CURL,
+        user_data: *mut c_void,
+    ),
+>;

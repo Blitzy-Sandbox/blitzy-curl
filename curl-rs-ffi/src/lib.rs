@@ -147,12 +147,12 @@ pub mod global;
 /// `curl_easy_perform` is the canonical [`block_on`] bridge point (AAP §0.4.4).
 pub mod easy;
 
-// The multi-interface API (`curl_multi_*`, `curl_pushheader_*`). The opaque
-// `CURLM` handle wraps `core::Multi`; the drive functions bridge the
-// synchronous event-loop contract to the core runtime (AAP §0.7.4).
-// Declaration disabled until `multi.rs` is authored (AAP §0.8.4 step 13);
-// re-enable by uncommenting once the module file is present.
-// pub mod multi;
+/// The multi-interface API (`curl_multi_*`, `curl_pushheader_*`). The opaque
+/// `CURLM` handle wraps `core::Multi`; the drive functions bridge the
+/// synchronous event-loop contract to the core's multi-thread runtime (owned
+/// inside `curl-rs-lib`), preserving `curl_multi_socket_action` /
+/// `CURLM_CALL_MULTI_PERFORM` semantics for external event loops (AAP §0.7.4).
+pub mod multi;
 
 /// The shared-state API (`curl_share_init` / `setopt` / `cleanup` /
 /// `strerror`). The opaque `CURLSH` handle wraps `core::Share`

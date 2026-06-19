@@ -51,6 +51,38 @@ mod writeout_json;
 #[allow(dead_code)]
 mod urlglob;
 
+// CLI option-parsing closure — staged together because they form one mutually
+// dependent group (`messages → config → {args, formparse, urlglob}`, and
+// `args`/`formparse`/`parsecfg` all consume `config`/`messages`). They are ports
+// of `src/tool_msgs.c`, `tool_cfgable.*`, `tool_getparam.c`, `tool_formparse.c`,
+// and `tool_parsecfg.c` respectively. Their public surfaces are driven by
+// `operate` (the operation driver), which lands in a later migration step
+// (AAP §0.8.4 step 12); staging them now keeps the whole option front-end
+// compiled, clippy-linted, and unit-tested as part of the binary build. The
+// `#[allow(dead_code)]` on the not-yet-fully-wired modules follows the same
+// construction-order staging convention as `writeout_json`/`urlglob` above
+// (`formparse` and `parsecfg` already carry their own inner `#![allow(dead_code)]`
+// and so need no outer allow); the allows are removed once `operate` drives them.
+#[allow(dead_code)]
+mod args;
+#[allow(dead_code)]
+mod config;
+mod formparse;
+#[allow(dead_code)]
+mod messages;
+mod parsecfg;
+// `setopt` (port of `src/config2setopts.c` plus `tool_setopt.c`'s `setopt_bad`)
+// translates a parsed `OperationConfig` into `curl_rs_lib::Easy` option calls,
+// and `writeout` (port of `src/tool_writeout.c`) renders `--write-out`. Both are
+// driven by `operate` (the operation driver, AAP §0.8.4 step 11/12), which lands
+// in a later migration step, so they are staged with the same construction-order
+// `#[allow(dead_code)]` as the option front-end above to keep them compiled,
+// clippy-linted, and unit-tested as part of the binary build.
+#[allow(dead_code)]
+mod setopt;
+#[allow(dead_code)]
+mod writeout;
+
 /// curl-rs — a memory-safe Rust reimplementation of the `curl` command-line
 /// tool.
 ///

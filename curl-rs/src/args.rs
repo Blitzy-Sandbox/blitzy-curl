@@ -3302,7 +3302,10 @@ fn opt_file(
                 );
                 return Err(ParameterError::BadUse);
             }
-            crate::parsecfg::parseconfig(global, nextarg, max_recursive)?;
+            // `parseconfig` takes `Option<&str>` (a faithful translation of the
+            // C `const char *filename`, where `None` selects the default
+            // `~/.curlrc`); an explicit `--config <file>` always names a file.
+            crate::parsecfg::parseconfig(global, Some(nextarg), max_recursive)?;
         }
         OptId::Crlfile => {
             global.operations[idx].crlfile = existingfile(global, "crlfile", nextarg)?;
@@ -3740,7 +3743,19 @@ fn opt_string(global: &mut GlobalConfig, id: OptId, nextarg: &str) -> Result<(),
         }
         OptId::Form | OptId::FormString => {
             let literal = id == OptId::FormString;
-            if crate::formparse::formparse(&mut global.operations[idx], nextarg, literal).is_err() {
+            // `formparse` borrows `global` (for `warnf` diagnostics) and the
+            // operation it mutates (`&mut OperationConfig`) as separate
+            // parameters. Here that operation is `global.operations[idx]` — a
+            // field of `global` — so passing both directly would be a
+            // shared/mutable borrow conflict. Swap the operation out to a local
+            // for the duration of the call (its accumulated `mimeroot` state
+            // travels with it) and restore it immediately afterward. The
+            // diagnostic functions read only top-level `global` flags, so the
+            // temporary `Default` placeholder left in the slot is invisible.
+            let mut op = std::mem::take(&mut global.operations[idx]);
+            let formres = crate::formparse::formparse(global, &mut op, nextarg, literal);
+            global.operations[idx] = op;
+            if formres.is_err() {
                 return Err(ParameterError::BadUse);
             }
             if set_httprequest(global, idx, HttpReq::MimePost) {
