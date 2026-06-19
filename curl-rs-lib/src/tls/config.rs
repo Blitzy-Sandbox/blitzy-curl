@@ -52,8 +52,10 @@ use std::sync::{Arc, Once};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{ClientConfig, ClientSessionStore, Resumption, WebPkiServerVerifier};
 use rustls::crypto::CryptoProvider;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{
-    CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName, UnixTime,
+    CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName,
+    SubjectPublicKeyInfoDer, UnixTime,
 };
 use rustls::{
     CertificateError, DigitallySignedStruct, DistinguishedName, Error, RootCertStore,
@@ -622,8 +624,7 @@ impl ServerCertVerifier for NoHostnameVerify {
 /// Parses zero or more PEM certificates from `pem` into owned
 /// [`CertificateDer`]s. A parse error maps to `CURLE_SSL_CACERT_BADFILE`.
 fn parse_pem_certs(pem: &[u8]) -> crate::error::Result<Vec<CertificateDer<'static>>> {
-    let mut reader = std::io::Cursor::new(pem);
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_slice_iter(pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| CurlError::SslCacertBadfile)
 }
@@ -709,8 +710,7 @@ impl TlsConfig {
         let bytes = std::fs::read(path).map_err(|_| CurlError::SslCrlBadfile)?;
 
         let pem_crls: Vec<CertificateRevocationListDer<'static>> = {
-            let mut reader = std::io::Cursor::new(bytes.as_slice());
-            rustls_pemfile::crls(&mut reader)
+            CertificateRevocationListDer::pem_slice_iter(bytes.as_slice())
                 .collect::<Result<_, _>>()
                 .map_err(|_| CurlError::SslCrlBadfile)?
         };
@@ -797,10 +797,10 @@ impl TlsConfig {
     /// requires both or neither: a lone cert or lone key, an unreadable/empty
     /// cert, or an unparseable key all map to `CURLE_SSL_CERTPROBLEM`.
     ///
-    /// NOTE: `rustls-pemfile` does not decrypt encrypted private keys, so a
-    /// `CURLOPT_KEYPASSWD`-protected key cannot be loaded here. This is a known,
-    /// documented limitation; the curl regression suite predominantly uses
-    /// unencrypted keys.
+    /// NOTE: the `rustls-pki-types` PEM decoder does not decrypt encrypted
+    /// private keys, so a `CURLOPT_KEYPASSWD`-protected key cannot be loaded
+    /// here. This is a known, documented limitation; the curl regression suite
+    /// predominantly uses unencrypted keys.
     #[allow(clippy::type_complexity)]
     fn load_client_auth(
         &self,
@@ -812,8 +812,7 @@ impl TlsConfig {
             (Some(cert_path), Some(key_path)) => {
                 let cert_bytes = std::fs::read(cert_path).map_err(|_| CurlError::SslCertproblem)?;
                 let certs: Vec<CertificateDer<'static>> = {
-                    let mut reader = std::io::Cursor::new(cert_bytes.as_slice());
-                    rustls_pemfile::certs(&mut reader)
+                    CertificateDer::pem_slice_iter(cert_bytes.as_slice())
                         .collect::<Result<_, _>>()
                         .map_err(|_| CurlError::SslCertproblem)?
                 };
@@ -822,12 +821,12 @@ impl TlsConfig {
                 }
 
                 let key_bytes = std::fs::read(key_path).map_err(|_| CurlError::SslCertproblem)?;
-                let key: PrivateKeyDer<'static> = {
-                    let mut reader = std::io::Cursor::new(key_bytes.as_slice());
-                    rustls_pemfile::private_key(&mut reader)
-                        .map_err(|_| CurlError::SslCertproblem)?
-                        .ok_or(CurlError::SslCertproblem)?
-                };
+                // `PrivateKeyDer::from_pem_slice` returns the first private key of any
+                // supported kind (PKCS#8 / PKCS#1 / SEC1), matching the old
+                // `rustls_pemfile::private_key`; `Error::NoItemsFound` (no key present)
+                // and any decode error both map to `SslCertproblem`, exactly as before.
+                let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_slice(key_bytes.as_slice())
+                    .map_err(|_| CurlError::SslCertproblem)?;
                 Ok(Some((certs, key)))
             }
         }
@@ -976,8 +975,7 @@ pub fn verify_pinned_pubkey(pinned: &str, peer_spki_der: &[u8]) -> crate::error:
     // Extract the SPKI DER: prefer a PEM "PUBLIC KEY" block; otherwise treat the
     // whole file as raw DER (matching curl's PEM-or-DER acceptance).
     let spki_der: Vec<u8> = {
-        let mut reader = std::io::Cursor::new(bytes.as_slice());
-        let keys: Vec<_> = rustls_pemfile::public_keys(&mut reader)
+        let keys: Vec<_> = SubjectPublicKeyInfoDer::pem_slice_iter(bytes.as_slice())
             .collect::<Result<Vec<_>, _>>()
             .unwrap_or_default();
         match keys.into_iter().next() {

@@ -149,16 +149,23 @@ pub extern "C" fn curl_share_init() -> *mut CURLSH {
 }
 
 // =============================================================================
-// Exported symbol 2 / 4 — curl_share_setopt  (VARIADIC, single trailing arg)
+// Exported symbol 2 / 4 — curl_share_setopt  (VARIADIC)
+//
+// As with `curl_easy_setopt`, the public, ABI-exported
+// `curl_share_setopt(CURLSH *, CURLSHoption, ...)` symbol is a genuine C-variadic
+// trampoline in `csrc/variadic_trampolines.c`; a fixed-arity Rust shim is not
+// ABI-equivalent on every target (macOS arm64 stack-passes the first variadic
+// argument). The trampoline extracts the single trailing argument with `va_arg`
+// and forwards it to this typed Rust implementation, `curlrs_share_setopt_impl`.
 // =============================================================================
 
-/// Configure a shared-cache handle (`curl_share_setopt`).
+/// Typed Rust implementation behind the public `curl_share_setopt` C-variadic
+/// trampoline (the analog of `lib/curl_share.c`).
 ///
-/// `curl_share_setopt(share, option, param)` carries exactly one trailing
-/// argument (guaranteed by the three-argument enforcement macro in
-/// `include/curl/curl.h`); see the module-level docs for why this shim takes it
-/// as a single fixed pointer-width `arg` rather than as a true Rust variadic.
-/// `arg` is decoded according to `option`:
+/// The C trampoline forwards the single trailing
+/// `curl_share_setopt(share, option, param)` argument here
+/// (guaranteed by the three-argument enforcement macro in
+/// `include/curl/curl.h`). `arg` is decoded according to `option`:
 ///
 /// * `CURLSHOPT_SHARE` / `CURLSHOPT_UNSHARE` — `arg` is a `curl_lock_data`
 ///   integer naming the resource to start / stop sharing (e.g.
@@ -194,7 +201,7 @@ pub extern "C" fn curl_share_init() -> *mut CURLSH {
 /// state is internally synchronized, so concurrent calls from multiple threads
 /// are sound.
 #[no_mangle]
-pub unsafe extern "C" fn curl_share_setopt(
+pub unsafe extern "C" fn curlrs_share_setopt_impl(
     share: *mut CURLSH,
     option: CURLSHoption,
     arg: usize,
@@ -428,6 +435,15 @@ pub unsafe extern "C" fn curl_share_strerror(code: CURLSHcode) -> *const c_char 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The public `curl_share_setopt` symbol is now the C-variadic `va_arg`
+    // trampoline in `csrc/variadic_trampolines.c`; the typed dispatch logic these
+    // tests exercise (including the compile-time signature binding below) lives in
+    // the Rust implementation it forwards to. Alias the implementation symbol back
+    // to the public name so the test bodies — which already pass exactly one
+    // pointer-width trailing argument as `usize` — read unchanged. (The
+    // trampoline's pure va_arg extraction is a C-ABI concern verified by the
+    // C/`tests/libtest` callers, not reachable from Rust.)
+    use super::curlrs_share_setopt_impl as curl_share_setopt;
     // `super::*` re-imports the parent's `core` alias (= `curl_rs_lib`), which
     // shadows the built-in `core` crate; root this import at `super::core` so it
     // is unambiguously the alias rather than the standard `core` crate.

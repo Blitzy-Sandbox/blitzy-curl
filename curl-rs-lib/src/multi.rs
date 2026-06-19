@@ -710,6 +710,13 @@ enum PollOutcome {
     Wakeup,
     /// The timeout elapsed with no other event.
     Timeout,
+    /// At least one application-provided descriptor (`extra_fds`) became ready.
+    ///
+    /// Produced only on Unix targets, where external descriptors are folded into
+    /// the wait via [`AsyncFd`](tokio::io::unix::AsyncFd); the per-fd readiness is
+    /// returned alongside this outcome and written into the caller's array.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    ExtraReady,
 }
 
 // ===========================================================================
@@ -1628,27 +1635,37 @@ impl Multi {
     /// `curl_multi_poll`.
     ///
     /// Blocks the calling thread (driving the runtime) until a transfer makes
-    /// progress, [`wakeup`](Multi::wakeup) is called, or `timeout_ms` elapses,
-    /// then returns `(code, numfds)` where `numfds` is the number of readiness
-    /// events observed. Unlike [`wait`](Multi::wait), `poll` sleeps even when
-    /// there is nothing to wait on (so it can be interrupted by `wakeup`).
-    pub fn poll(&mut self, extra_fds: &[Waitfd], timeout_ms: i32) -> (CurlMError, i32) {
+    /// progress, one of the application-provided `extra_fds` becomes ready,
+    /// [`wakeup`](Multi::wakeup) is called, or `timeout_ms` elapses, then returns
+    /// `(code, numfds)` where `numfds` is the number of readiness events
+    /// observed. Each ready entry in `extra_fds` has its `revents` filled in,
+    /// exactly like `curl_multi_poll`. Unlike [`wait`](Multi::wait), `poll`
+    /// sleeps even when there is nothing to wait on (so it can be interrupted by
+    /// `wakeup`).
+    pub fn poll(&mut self, extra_fds: &mut [Waitfd], timeout_ms: i32) -> (CurlMError, i32) {
         self.poll_core(extra_fds, timeout_ms, true)
     }
 
     /// Wait for activity, returning immediately if idle — the equivalent of
     /// `curl_multi_wait`.
     ///
-    /// Identical to [`poll`](Multi::poll) except that, like `curl_multi_wait`, it
-    /// returns at once when there is nothing to wait on rather than sleeping.
-    pub fn wait(&mut self, extra_fds: &[Waitfd], timeout_ms: i32) -> (CurlMError, i32) {
+    /// Identical to [`poll`](Multi::poll) — including filling each ready entry's
+    /// `revents` — except that, like `curl_multi_wait`, it returns at once when
+    /// there is nothing to wait on rather than sleeping.
+    pub fn wait(&mut self, extra_fds: &mut [Waitfd], timeout_ms: i32) -> (CurlMError, i32) {
         self.poll_core(extra_fds, timeout_ms, false)
     }
 
     /// Shared implementation of [`poll`](Multi::poll) / [`wait`](Multi::wait).
+    ///
+    /// On Unix the application-provided `extra_fds` are folded into the wait via
+    /// [`AsyncFd`](tokio::io::unix::AsyncFd) (see [`wait_with_extra`]): each ready
+    /// descriptor has its `revents` written and is counted into the returned
+    /// `numfds`, alongside any internal-socket activity. This stays free of
+    /// `unsafe` — the descriptor is registered, not owned, so the caller keeps it.
     fn poll_core(
         &mut self,
-        extra_fds: &[Waitfd],
+        extra_fds: &mut [Waitfd],
         timeout_ms: i32,
         sleep_when_idle: bool,
     ) -> (CurlMError, i32) {
@@ -1671,27 +1688,23 @@ impl Multi {
             Err(err) => return (err, 0),
         };
         let wakeup = Arc::clone(&self.wakeup);
-        let outcome = {
+        // Drive the wait on the runtime: race internal completions, wakeup, the
+        // external descriptors, and the timeout. `wait_with_extra` fills each
+        // ready entry's `revents` and returns how many external fds were ready.
+        let (outcome, ext_ready) = {
             let rx = &mut self.rx;
-            handle.block_on(async move {
-                tokio::select! {
-                    biased;
-                    () = wakeup.notified() => PollOutcome::Wakeup,
-                    completion = rx.recv() => PollOutcome::Completion(completion),
-                    () = tokio::time::sleep(duration) => PollOutcome::Timeout,
-                }
-            })
+            handle.block_on(wait_with_extra(extra_fds, wakeup, rx, duration))
         };
-        let numfds = match outcome {
-            PollOutcome::Completion(Some(completion)) => {
-                self.pending_completions.push_back(completion);
-                1
-            }
-            PollOutcome::Completion(None) | PollOutcome::Wakeup | PollOutcome::Timeout => 0,
-        };
+        // Internal-socket activity surfaces as a completion arriving; add the
+        // application descriptors the wait reported ready (already in `revents`).
+        let mut numfds = ext_ready;
+        if let PollOutcome::Completion(Some(completion)) = outcome {
+            self.pending_completions.push_back(completion);
+            numfds += 1;
+        }
         // Apply the completion we just received (plus any that raced in).
         self.reap_completions();
-        (CurlMError::Ok, numfds)
+        (CurlMError::Ok, clamp_to_i32(numfds))
     }
 
     /// Interrupt a blocking [`poll`](Multi::poll) / [`wait`](Multi::wait) — the
@@ -1779,6 +1792,187 @@ fn wait_duration(timeout_ms: i32) -> Duration {
     } else {
         Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0))
     }
+}
+
+/// A borrowed, **non-owning** wrapper around a raw descriptor for [`AsyncFd`].
+///
+/// [`AsyncFd`] registers the descriptor with the Tokio reactor but, because
+/// `PollFd` has no `Drop`, dropping the `AsyncFd` only *deregisters* the fd — it
+/// never closes it. The application that passed the `curl_waitfd` therefore
+/// keeps full ownership of its socket, exactly as `curl_multi_wait`/`poll`
+/// require. This is what lets the external-fd polling stay inside the
+/// `#![forbid(unsafe_code)]` core: no raw-pointer or `close()` handling is
+/// needed.
+///
+/// [`AsyncFd`]: tokio::io::unix::AsyncFd
+#[cfg(unix)]
+struct PollFd(std::os::fd::RawFd);
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for PollFd {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0
+    }
+}
+
+/// Translate a Tokio [`Ready`] set into curl `CURL_WAIT_POLL*` `revents`, masked
+/// to the events the caller actually requested in `want`.
+///
+/// `read_closed`/`write_closed` (peer hangup) fold into readability/writability
+/// because a hung-up descriptor reports as readable/writable to `poll()` — the
+/// caller then observes EOF or the error on its next I/O, matching curl. A
+/// `CURL_WAIT_POLLPRI` request cannot be distinguished portably from plain
+/// readability through [`AsyncFd`] (Tokio's `Interest::PRIORITY` is Linux-only),
+/// so it is reported alongside readability only when the caller asked for it.
+///
+/// [`Ready`]: tokio::io::Ready
+#[cfg(unix)]
+fn ready_to_revents(ready: tokio::io::Ready, want: i16) -> i16 {
+    let mut revents = 0i16;
+    if ready.is_readable() || ready.is_read_closed() {
+        if want & CURL_WAIT_POLLIN != 0 {
+            revents |= CURL_WAIT_POLLIN;
+        }
+        if want & CURL_WAIT_POLLPRI != 0 {
+            revents |= CURL_WAIT_POLLPRI;
+        }
+    }
+    if (ready.is_writable() || ready.is_write_closed()) && want & CURL_WAIT_POLLOUT != 0 {
+        revents |= CURL_WAIT_POLLOUT;
+    }
+    revents
+}
+
+/// Drive one blocking wait, folding the application's `extra` descriptors into
+/// the runtime's reactor (the Unix implementation).
+///
+/// Races four sources of readiness on the runtime: a [`wakeup`](Multi::wakeup),
+/// an internal transfer completion, any of the `extra` descriptors becoming
+/// ready, and the `duration` timeout. Returns the [`PollOutcome`] of the race
+/// plus the number of `extra` descriptors found ready; the matching `revents`
+/// are written into `extra` in place.
+///
+/// Descriptors the reactor cannot poll (for example regular files, which `poll()`
+/// treats as always ready) are reported ready immediately with the requested I/O
+/// bits. A descriptor with no requested events, or a negative fd, is skipped —
+/// exactly like `poll()`.
+#[cfg(unix)]
+async fn wait_with_extra(
+    extra: &mut [Waitfd],
+    wakeup: Arc<Notify>,
+    rx: &mut UnboundedReceiver<Completion>,
+    duration: Duration,
+) -> (PollOutcome, usize) {
+    use futures_util::FutureExt;
+    use std::os::fd::RawFd;
+    use tokio::io::unix::AsyncFd;
+    use tokio::io::Interest;
+
+    const POLL_MASK: i16 = CURL_WAIT_POLLIN | CURL_WAIT_POLLPRI | CURL_WAIT_POLLOUT;
+
+    // Register each application descriptor with the runtime's I/O reactor.
+    let mut regs: Vec<(usize, AsyncFd<PollFd>, Interest, i16)> = Vec::new();
+    let mut immediate = 0usize;
+    for (idx, w) in extra.iter_mut().enumerate() {
+        let events = w.events;
+        let fd = w.fd;
+        // `revents` is a pure output: libcurl always overwrites it.
+        w.revents = 0;
+        let want_read = events & (CURL_WAIT_POLLIN | CURL_WAIT_POLLPRI) != 0;
+        let want_write = events & CURL_WAIT_POLLOUT != 0;
+        let interest = match (want_read, want_write) {
+            (true, true) => Interest::READABLE | Interest::WRITABLE,
+            (true, false) => Interest::READABLE,
+            (false, true) => Interest::WRITABLE,
+            // Nothing requested for this fd: poll() would simply ignore it.
+            (false, false) => continue,
+        };
+        if fd < 0 {
+            // A negative descriptor is ignored, exactly like poll().
+            continue;
+        }
+        match AsyncFd::with_interest(PollFd(fd as RawFd), interest) {
+            Ok(afd) => regs.push((idx, afd, interest, events)),
+            Err(_) => {
+                // Non-pollable descriptors (e.g. regular files) are treated by
+                // poll() as always ready; report the requested I/O bits.
+                w.revents = events & POLL_MASK;
+                immediate += 1;
+            }
+        }
+    }
+
+    // A future that resolves once at least one descriptor is ready — immediately
+    // when a non-pollable (always-ready) descriptor is present, and never (so the
+    // other arms drive) when there is nothing external to wait on.
+    let wait_extra = async {
+        if immediate > 0 {
+            return;
+        }
+        if regs.is_empty() {
+            std::future::pending::<()>().await;
+            return;
+        }
+        let readiness = regs.iter().map(|(_, afd, interest, _)| {
+            let interest = *interest;
+            Box::pin(async move {
+                let _ = afd.ready(interest).await;
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>
+        });
+        let _ = futures_util::future::select_all(readiness).await;
+    };
+
+    let outcome = tokio::select! {
+        biased;
+        () = wakeup.notified() => PollOutcome::Wakeup,
+        completion = rx.recv() => PollOutcome::Completion(completion),
+        () = wait_extra => PollOutcome::ExtraReady,
+        () = tokio::time::sleep(duration) => PollOutcome::Timeout,
+    };
+
+    // The reactor turn above cached readiness for every descriptor that is
+    // currently ready, so a single non-blocking probe per fd reports them all.
+    let mut ext_ready = immediate;
+    for (idx, afd, interest, want) in &regs {
+        if let Some(result) = afd.ready(*interest).now_or_never() {
+            let revents = match result {
+                Ok(guard) => ready_to_revents(guard.ready(), *want),
+                // A reactor error on the fd surfaces as the requested I/O bits so
+                // the caller wakes and observes the condition (matching poll()).
+                Err(_) => *want & POLL_MASK,
+            };
+            if revents != 0 {
+                extra[*idx].revents = revents;
+                ext_ready += 1;
+            }
+        }
+    }
+    (outcome, ext_ready)
+}
+
+/// Drive one blocking wait (the non-Unix fallback).
+///
+/// [`AsyncFd`](tokio::io::unix::AsyncFd) is Unix-only, so on other targets the
+/// application descriptors cannot be folded into the reactor: their `revents` are
+/// cleared and the wait races only the internal completion, wakeup and timeout
+/// sources. (All four CP targets are Unix; this exists for portability.)
+#[cfg(not(unix))]
+async fn wait_with_extra(
+    extra: &mut [Waitfd],
+    wakeup: Arc<Notify>,
+    rx: &mut UnboundedReceiver<Completion>,
+    duration: Duration,
+) -> (PollOutcome, usize) {
+    for w in extra.iter_mut() {
+        w.revents = 0;
+    }
+    let outcome = tokio::select! {
+        biased;
+        () = wakeup.notified() => PollOutcome::Wakeup,
+        completion = rx.recv() => PollOutcome::Completion(completion),
+        () = tokio::time::sleep(duration) => PollOutcome::Timeout,
+    };
+    (outcome, 0)
 }
 
 // ===========================================================================
@@ -2260,7 +2454,7 @@ mod tests {
     fn wait_returns_immediately_when_idle() {
         let mut multi = Multi::new();
         let start = Instant::now();
-        let (code, numfds) = multi.wait(&[], 1000);
+        let (code, numfds) = multi.wait(&mut [], 1000);
         assert_eq!(code, CurlMError::Ok);
         assert_eq!(numfds, 0);
         assert!(
@@ -2269,13 +2463,103 @@ mod tests {
         );
     }
 
+    /// `wait` must actually poll an application-provided descriptor and report
+    /// its readiness in `revents` (the CP3 F4 fix). Uses a real connected TCP
+    /// pair on loopback so the test stays within the `#![forbid(unsafe_code)]`
+    /// core (no `libc::socketpair`).
+    #[test]
+    #[cfg(unix)]
+    fn wait_polls_external_fd_and_reports_revents() {
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+        use std::os::fd::AsRawFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (mut server, _peer) = listener.accept().expect("accept");
+        let fd = client.as_raw_fd() as CurlSocket;
+
+        let mut multi = Multi::new();
+
+        // A freshly connected socket is immediately writable.
+        let mut fds = [Waitfd {
+            fd,
+            events: CURL_WAIT_POLLOUT,
+            revents: 0,
+        }];
+        let (code, numfds) = multi.wait(&mut fds, 2000);
+        assert_eq!(code, CurlMError::Ok);
+        assert_eq!(numfds, 1, "a connected socket is writable");
+        assert_eq!(fds[0].revents & CURL_WAIT_POLLOUT, CURL_WAIT_POLLOUT);
+
+        // With no data pending, the socket is not readable: wait times out and
+        // reports nothing ready (it must *not* report a stale/aggregate count).
+        let mut fds = [Waitfd {
+            fd,
+            events: CURL_WAIT_POLLIN,
+            revents: 0,
+        }];
+        let (code, numfds) = multi.wait(&mut fds, 200);
+        assert_eq!(code, CurlMError::Ok);
+        assert_eq!(numfds, 0, "no data → not readable");
+        assert_eq!(fds[0].revents, 0);
+
+        // Send a byte from the peer; the descriptor must now report readable.
+        server.write_all(b"x").expect("write");
+        let mut fds = [Waitfd {
+            fd,
+            events: CURL_WAIT_POLLIN,
+            revents: 0,
+        }];
+        let (code, numfds) = multi.wait(&mut fds, 2000);
+        assert_eq!(code, CurlMError::Ok);
+        assert_eq!(numfds, 1, "the external fd became readable");
+        assert_eq!(fds[0].revents & CURL_WAIT_POLLIN, CURL_WAIT_POLLIN);
+    }
+
+    /// When several application descriptors are ready at once, `wait` reports
+    /// every one of them (both `revents` and the aggregate `numfds`).
+    #[test]
+    #[cfg(unix)]
+    fn wait_reports_every_ready_external_fd() {
+        use std::net::{TcpListener, TcpStream};
+        use std::os::fd::AsRawFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, _peer) = listener.accept().expect("accept");
+
+        let mut multi = Multi::new();
+
+        // Both ends of a connected pair are writable simultaneously.
+        let mut fds = [
+            Waitfd {
+                fd: client.as_raw_fd() as CurlSocket,
+                events: CURL_WAIT_POLLOUT,
+                revents: 0,
+            },
+            Waitfd {
+                fd: server.as_raw_fd() as CurlSocket,
+                events: CURL_WAIT_POLLOUT,
+                revents: 0,
+            },
+        ];
+        let (code, numfds) = multi.wait(&mut fds, 2000);
+        assert_eq!(code, CurlMError::Ok);
+        assert_eq!(numfds, 2, "both descriptors are writable");
+        assert_eq!(fds[0].revents & CURL_WAIT_POLLOUT, CURL_WAIT_POLLOUT);
+        assert_eq!(fds[1].revents & CURL_WAIT_POLLOUT, CURL_WAIT_POLLOUT);
+    }
+
     #[test]
     fn wakeup_interrupts_poll() {
         let mut multi = Multi::new();
         // Pre-arm the wakeup; poll would otherwise sleep when idle.
         assert_eq!(multi.wakeup(), CurlMError::Ok);
         let start = Instant::now();
-        let (code, _numfds) = multi.poll(&[], 5000);
+        let (code, _numfds) = multi.poll(&mut [], 5000);
         assert_eq!(code, CurlMError::Ok);
         assert!(
             start.elapsed() < Duration::from_millis(2000),
@@ -2292,7 +2576,7 @@ mod tests {
         let (_code, running) = multi.perform();
         // If still running, poll should block until the completion arrives.
         if running > 0 {
-            let (code, _numfds) = multi.poll(&[], 5000);
+            let (code, _numfds) = multi.poll(&mut [], 5000);
             assert_eq!(code, CurlMError::Ok);
         }
         // Finish draining and confirm we got the DONE message.

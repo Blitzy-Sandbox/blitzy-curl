@@ -63,8 +63,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use hickory_resolver::config::{LookupIpStrategy, NameServerConfig, ResolverConfig};
-use hickory_resolver::name_server::TokioConnectionProvider;
-use hickory_resolver::proto::xfer::Protocol;
+use hickory_resolver::lookup_ip::LookupIp;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
 
 use crate::dns::{IpVersion, ResolvedAddrs, CURL_TIMEOUT_RESOLVE};
@@ -182,7 +182,9 @@ fn default_resolver() -> Result<TokioResolver> {
 fn build_system_resolver() -> Result<TokioResolver> {
     let mut builder = TokioResolver::builder_tokio().map_err(|_| CurlError::CouldntResolveHost)?;
     builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
-    Ok(builder.build())
+    // hickory-resolver 0.26 made `ResolverBuilder::build` fallible (it returns
+    // `Result<Resolver, NetError>`; 0.25 returned the resolver directly).
+    builder.build().map_err(|_| CurlError::CouldntResolveHost)
 }
 
 /// Builds a resolver honoring [`DnsOptions`].
@@ -203,19 +205,49 @@ fn build_custom_resolver(options: &DnsOptions) -> Result<TokioResolver> {
         return build_system_resolver();
     }
 
-    let mut config = ResolverConfig::new();
-    for &server in &options.servers {
-        for protocol in [Protocol::Udp, Protocol::Tcp] {
-            let mut name_server = NameServerConfig::new(server, protocol);
-            name_server.bind_addr = pick_bind_addr(server, options);
-            config.add_name_server(name_server);
-        }
-    }
-
+    let config = build_resolver_config(options);
     let mut builder =
-        TokioResolver::builder_with_config(config, TokioConnectionProvider::default());
+        TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
     builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
-    Ok(builder.build())
+    builder.build().map_err(|_| CurlError::CouldntResolveHost)
+}
+
+/// Assembles the [`ResolverConfig`] for explicitly configured nameservers.
+///
+/// Each configured server is registered as one [`NameServerConfig`] carrying
+/// both a UDP and a TCP [`ConnectionConfig`] (curl issues UDP queries and falls
+/// back to TCP on truncation). The server's port comes from the configured
+/// [`SocketAddr`], and the matching local bind address (if any) is attached to
+/// every connection.
+///
+/// hickory-resolver 0.26 reshaped this API: a `NameServerConfig` is now keyed by
+/// an [`IpAddr`] and holds a `Vec<ConnectionConfig>` (each carrying its own
+/// `port` and `bind_addr`), replacing 0.25's per-(addr, protocol)
+/// `NameServerConfig::new(socket_addr, protocol)` plus a `bind_addr` field. The
+/// resulting resolver behavior — query each server over UDP then TCP, on the
+/// configured port, from the configured local address — is identical.
+///
+/// Kept as a pure, runtime-independent function so the registration logic stays
+/// unit-testable without constructing a live resolver (0.26 also removed the
+/// `Resolver::config()` accessor the previous test relied on).
+fn build_resolver_config(options: &DnsOptions) -> ResolverConfig {
+    let mut config = ResolverConfig::default();
+    for &server in &options.servers {
+        let bind_addr = pick_bind_addr(server, options);
+        let port = server.port();
+        // `udp_and_tcp` yields a NameServerConfig keyed by the server IP with one
+        // UDP and one TCP connection; we then set each connection's remote port
+        // (from the configured SocketAddr) and local bind address. The 0.26 config
+        // structs are `#[non_exhaustive]`, so they are built via their public
+        // constructors and adjusted by field rather than with struct literals.
+        let mut name_server = NameServerConfig::udp_and_tcp(server.ip());
+        for conn in &mut name_server.connections {
+            conn.port = port;
+            conn.bind_addr = bind_addr;
+        }
+        config.add_name_server(name_server);
+    }
+    config
 }
 
 /// Selects the local bind address for a query to `server`, choosing the IPv4 or
@@ -351,26 +383,35 @@ async fn run_lookup(
     ip_version: IpVersion,
 ) -> Result<ResolvedAddrs> {
     let ips: Vec<IpAddr> = match ip_version {
-        IpVersion::V4 => resolver
-            .ipv4_lookup(host)
-            .await
-            .map_err(|_| CurlError::CouldntResolveHost)?
-            .into_iter()
-            .map(|record| IpAddr::V4(record.0))
-            .collect(),
-        IpVersion::V6 => resolver
-            .ipv6_lookup(host)
-            .await
-            .map_err(|_| CurlError::CouldntResolveHost)?
-            .into_iter()
-            .map(|record| IpAddr::V6(record.0))
-            .collect(),
-        IpVersion::Any => resolver
-            .lookup_ip(host)
-            .await
-            .map_err(|_| CurlError::CouldntResolveHost)?
-            .into_iter()
-            .collect(),
+        IpVersion::V4 => {
+            // `ipv4_lookup` issues an A-only query (preserving curl's `--ipv4`
+            // wire behavior). hickory 0.26 returns a generic `Lookup`; wrapping
+            // it in `LookupIp` exposes the public `iter()` that maps A-record
+            // RData to `IpAddr` (an A-only response carries no AAAA records, so
+            // only V4 addresses are produced).
+            let lookup = resolver
+                .ipv4_lookup(host)
+                .await
+                .map_err(|_| CurlError::CouldntResolveHost)?;
+            LookupIp::from(lookup).iter().collect()
+        }
+        IpVersion::V6 => {
+            // `ipv6_lookup` issues an AAAA-only query (curl's `--ipv6`).
+            let lookup = resolver
+                .ipv6_lookup(host)
+                .await
+                .map_err(|_| CurlError::CouldntResolveHost)?;
+            LookupIp::from(lookup).iter().collect()
+        }
+        IpVersion::Any => {
+            // `lookup_ip` already yields a `LookupIp`; hickory 0.26 replaced its
+            // `IntoIterator` impl with the borrowing `iter()` (Item = `IpAddr`).
+            let lookup = resolver
+                .lookup_ip(host)
+                .await
+                .map_err(|_| CurlError::CouldntResolveHost)?;
+            lookup.iter().collect()
+        }
     };
 
     let addrs = fold_addrs(ips, port, ip_version);
@@ -485,25 +526,32 @@ mod tests {
             ..DnsOptions::default()
         };
 
-        let resolver = build_custom_resolver(&options).expect("custom resolver builds");
-        let name_servers = resolver.config().name_servers();
+        // Introspect the assembled config directly (hickory 0.26 removed the
+        // `Resolver::config()` accessor). In the 0.26 model each server is ONE
+        // `NameServerConfig` (keyed by `ip`) holding a UDP and a TCP
+        // `ConnectionConfig`, so two servers yield two entries, each with two
+        // connections — behaviorally identical to 0.25's four single-protocol
+        // entries.
+        let config = build_resolver_config(&options);
+        let name_servers = config.name_servers();
+        assert_eq!(name_servers.len(), 2);
 
-        // Two servers × {UDP, TCP} = four NameServerConfig entries.
-        assert_eq!(name_servers.len(), 4);
-
-        // Both UDP+TCP entries for the IPv4 server carry the configured bind.
-        let v4_with_bind = name_servers
+        // The IPv4 server: a UDP and a TCP connection, both carrying the bind.
+        let v4 = name_servers
             .iter()
-            .filter(|ns| ns.socket_addr.is_ipv4() && ns.bind_addr.is_some())
-            .count();
-        assert_eq!(v4_with_bind, 2);
+            .find(|ns| ns.ip.is_ipv4())
+            .expect("IPv4 nameserver present");
+        assert_eq!(v4.connections.len(), 2);
+        assert!(v4.connections.iter().all(|c| c.bind_addr.is_some()));
+        assert_eq!(v4.connections[0].port, 53);
 
         // The IPv6 server has no IPv6 local set, so no bind is attached.
-        let v6_with_bind = name_servers
+        let v6 = name_servers
             .iter()
-            .filter(|ns| ns.socket_addr.is_ipv6() && ns.bind_addr.is_some())
-            .count();
-        assert_eq!(v6_with_bind, 0);
+            .find(|ns| ns.ip.is_ipv6())
+            .expect("IPv6 nameserver present");
+        assert_eq!(v6.connections.len(), 2);
+        assert!(v6.connections.iter().all(|c| c.bind_addr.is_none()));
     }
 
     #[tokio::test]
@@ -514,9 +562,12 @@ mod tests {
         // here — we only assert it does not panic and yields a Result.
         let result = build_custom_resolver(&DnsOptions::default());
         match result {
+            // The system config built successfully. hickory 0.26 removed the
+            // `Resolver::config()` accessor, so we can only assert that a usable
+            // resolver was produced (the `Ok` arm itself); the dual-family
+            // strategy is exercised by the resolution tests below.
             Ok(resolver) => {
-                // System config built; strategy must be the dual-family one.
-                let _ = resolver.config();
+                let _ = resolver;
             }
             Err(err) => assert_eq!(err, CurlError::CouldntResolveHost),
         }

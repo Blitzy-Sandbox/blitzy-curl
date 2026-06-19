@@ -142,7 +142,15 @@ rustls = "=0.23.36"
 tokio-rustls = "=0.26.4"
 rustls-pki-types = "=1.14.1"
 webpki-roots = "=1.0.8"
-rustls-pemfile = "=2.2.0"
+# `rustls-pemfile` was REMOVED (RUSTSEC-2025-0134: the crate is unmaintained —
+# its repository was archived). Its certs / CRLs / private-key / public-key PEM
+# decoders are superseded by the `PemObject` trait in `rustls-pki-types` (the
+# maintained successor, already a workspace dependency and re-exported as
+# `rustls::pki_types`), which provides byte-identical decoding semantics:
+# `CertificateDer::pem_slice_iter`, `CertificateRevocationListDer::pem_slice_iter`,
+# `PrivateKeyDer::from_pem_slice` (matches PKCS#8/PKCS#1/SEC1, exactly like the
+# old `private_key`), and `SubjectPublicKeyInfoDer::pem_slice_iter`. See
+# `curl-rs-lib/src/tls/config.rs`.
 
 # ---- SSH transport: SFTP / SCP (replaces libssh / libssh2) -----------------
 # DOCUMENTED EXCEPTION (AAP §0.8.3) to the AAP §0.6.1 pins (russh 0.54.6,
@@ -186,7 +194,19 @@ russh = "=0.61.2"
 russh-sftp = "=2.3.0"
 
 # ---- DNS (optional async resolver; feature-gated OFF by default, AAP §0.6.2) -
-hickory-resolver = "=0.25.2"
+# SECURITY UPGRADE (supersedes the AAP §0.6.1 pin `=0.25.2`): hickory-proto 0.25.2
+# is affected by two RustSec advisories — RUSTSEC-2026-0118 (NSEC3 closest-encloser
+# unbounded loop; `unaffected = ">= 0.26.0-beta.1"`) and RUSTSEC-2026-0119
+# (O(n^2) name-compression CPU exhaustion; `patched = ">= 0.26.1"`). hickory-resolver
+# 0.26.1 pulls hickory-proto >= 0.26.1, clearing BOTH, and resolves cleanly from the
+# offline cache. AAP §0.8.1 makes "zero unresolved advisories" a binary security gate,
+# so the fixed release controls over the §0.6.1 literal (§0.8.3 authorizes recording
+# such a deviation as a Cargo.toml comment).
+#
+# >>> AAP AMENDMENT REQUESTED: amend AAP §0.6.1 DNS pin to `hickory-resolver 0.26.1`.
+#     This comment stands as the deviation record until that amendment lands; the pin
+#     below MUST NOT be reverted to the advisory-affected 0.25.2 line.
+hickory-resolver = "=0.26.1"
 
 # ---- CLI -------------------------------------------------------------------
 clap = "=4.6.1"

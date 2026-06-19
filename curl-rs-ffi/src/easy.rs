@@ -372,17 +372,33 @@ pub unsafe extern "C" fn curl_easy_perform(handle: *mut CURL) -> CURLcode {
 }
 
 // =============================================================================
-// Exported symbol 6 / 13 — curl_easy_setopt  (VARIADIC, single trailing arg)
+// Exported symbol 6 / 13 — curl_easy_setopt  (VARIADIC)
+//
+// The public, ABI-exported `curl_easy_setopt(CURL *, CURLoption, ...)` symbol is
+// a genuine C-variadic trampoline defined in `csrc/variadic_trampolines.c`
+// (compiled and whole-archive-linked by `build.rs`). Stable Rust cannot DEFINE a
+// C-variadic `extern "C"` function (that needs the nightly-only `c_variadic`
+// feature), and a fixed-arity `extern "C" fn(.., arg: usize)` is NOT ABI-
+// equivalent to a variadic on every target — notably macOS arm64 passes the
+// first variadic argument on the stack while a fixed parameter would occupy a
+// register, so a fixed-arity shim would read the wrong slot (AAP §0.7.2 / §0.8.3
+// document this C-trampoline exception). The trampoline therefore owns the
+// exported `curl_easy_setopt` name, extracts the single trailing argument with
+// `va_arg` per the C ABI, and forwards it here. This function is the typed Rust
+// implementation it dispatches to; it is named `curlrs_easy_setopt_impl` (the
+// non-`curl_` prefix keeps it out of the exported `curl_*` ABI surface) and is
+// reached only through the C trampoline.
 // =============================================================================
 
-/// Set an option on an easy handle (`curl_easy_setopt`, `include/curl/easy.h`).
+/// Typed Rust implementation behind the public `curl_easy_setopt` C-variadic
+/// trampoline (the analog of `lib/setopt.c`, `include/curl/easy.h`).
 ///
-/// `curl_easy_setopt(handle, option, param)` carries exactly one trailing
-/// argument (guaranteed by the three-argument enforcement macro in
-/// `include/curl/easy.h`); see the module-level docs for why this shim takes it
-/// as a single fixed pointer-width `arg` rather than as a true Rust variadic.
-/// `arg` is decoded according to `option`'s value type (recorded in the
-/// canonical option table) and applied to the core handle:
+/// The C trampoline (`csrc/variadic_trampolines.c`) extracts the single trailing
+/// `curl_easy_setopt(handle, option, param)` argument with `va_arg` and forwards
+/// it here as a fixed pointer-width `arg` (the C call carries exactly one trailing
+/// argument, guaranteed by the three-argument enforcement macro in
+/// `include/curl/easy.h`). `arg` is decoded according to `option`'s value type
+/// (recorded in the canonical option table) and applied to the core handle:
 ///
 /// * `CURLOT_LONG` / `CURLOT_VALUES` — `arg` is a C `long`.
 /// * `CURLOT_OFF_T` — `arg` is a `curl_off_t`.
@@ -417,7 +433,7 @@ pub unsafe extern "C" fn curl_easy_perform(handle: *mut CURL) -> CURLcode {
 /// region must hold at least `CURLOPT_POSTFIELDSIZE` bytes (or be a
 /// NUL-terminated string when the size is unset/`-1`).
 #[no_mangle]
-pub unsafe extern "C" fn curl_easy_setopt(
+pub unsafe extern "C" fn curlrs_easy_setopt_impl(
     handle: *mut CURL,
     option: CURLoption,
     arg: usize,
@@ -664,13 +680,21 @@ unsafe fn copy_postfields(arg: usize, postfieldsize: i64) -> Option<Vec<u8>> {
 }
 
 // =============================================================================
-// Exported symbol 7 / 13 — curl_easy_getinfo  (VARIADIC, single trailing arg)
+// Exported symbol 7 / 13 — curl_easy_getinfo  (VARIADIC)
+//
+// As with `curl_easy_setopt` above, the public, ABI-exported
+// `curl_easy_getinfo(CURL *, CURLINFO, ...)` symbol is a genuine C-variadic
+// trampoline in `csrc/variadic_trampolines.c`; it extracts the single trailing
+// argument with `va_arg` and forwards it to this typed Rust implementation,
+// named `curlrs_easy_getinfo_impl`. The trailing `curl_easy_getinfo` argument is
+// always an output pointer, so the trampoline reads one pointer-width slot.
 // =============================================================================
 
-/// Read information from an easy handle (`curl_easy_getinfo`,
-/// `include/curl/easy.h`).
+/// Typed Rust implementation behind the public `curl_easy_getinfo` C-variadic
+/// trampoline (the analog of `lib/getinfo.c`, `include/curl/easy.h`).
 ///
-/// `curl_easy_getinfo(handle, info, arg)` carries exactly one trailing argument
+/// The C trampoline forwards the single trailing
+/// `curl_easy_getinfo(handle, info, arg)` argument here
 /// (guaranteed by the three-argument enforcement macro); `arg` is a pointer to
 /// caller-provided storage whose type is fixed by `info`'s `CURLINFO_*` type
 /// group: `long*`, `curl_off_t*`, `double*`, `curl_socket_t*`, `const char**`,
@@ -695,7 +719,7 @@ unsafe fn copy_postfields(arg: usize, postfieldsize: i64) -> Option<Vec<u8>> {
 /// [`curl_easy_duphandle`] not yet cleaned up. `arg` must be NULL or a valid,
 /// well-aligned, writable pointer to storage of the exact type `info` requires.
 #[no_mangle]
-pub unsafe extern "C" fn curl_easy_getinfo(
+pub unsafe extern "C" fn curlrs_easy_getinfo_impl(
     handle: *mut CURL,
     info: CURLINFO,
     arg: usize,
@@ -1076,6 +1100,17 @@ pub unsafe extern "C" fn curl_easy_ssls_export(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The public `curl_easy_setopt` / `curl_easy_getinfo` symbols are now the
+    // C-variadic `va_arg` trampolines in `csrc/variadic_trampolines.c`; the typed
+    // marshalling/dispatch logic these tests exercise lives in the Rust
+    // implementations the trampolines forward to. Alias the implementation
+    // symbols back to the public names so the test bodies below — which already
+    // pass exactly one pointer-width trailing argument as `usize`, precisely what
+    // the trampoline extracts — read unchanged and continue to validate the
+    // dispatch path. (The trampoline's pure va_arg extraction is a C-ABI concern
+    // verified by the C/`tests/libtest` callers, not reachable from Rust.)
+    use super::curlrs_easy_getinfo_impl as curl_easy_getinfo;
+    use super::curlrs_easy_setopt_impl as curl_easy_setopt;
     // `super::*` re-imports the parent's `core` alias (= `curl_rs_lib`), which
     // shadows the built-in `core` crate, along with the parent's `std::ffi::*`
     // primitive imports (`c_char`, `c_long`, `c_double`, `c_void`, `CStr`) and

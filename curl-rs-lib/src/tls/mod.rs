@@ -295,8 +295,8 @@ fn server_name(host: &str) -> Result<ServerName<'static>> {
 // The extracted bytes are the *complete* `SubjectPublicKeyInfo` SEQUENCE, which
 // is exactly what `config::verify_pinned_pubkey` expects: it SHA-256-hashes that
 // DER for the `sha256//` pin form, and byte-compares it for the file-pin form
-// (where the SPKI comes from `rustls_pemfile::public_keys`, likewise a full
-// SPKI SEQUENCE).
+// (where the SPKI comes from `SubjectPublicKeyInfoDer::pem_slice_iter`, likewise
+// a full SPKI SEQUENCE).
 //
 //   Certificate ::= SEQUENCE {
 //       tbsCertificate       TBSCertificate,

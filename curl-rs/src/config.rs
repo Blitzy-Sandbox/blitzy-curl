@@ -653,15 +653,20 @@ pub struct State {
 /// One `--variable` entry, mirroring `struct tool_var` (`src/var.h`).
 ///
 /// C stores the variable list as a singly-linked list of `tool_var` nodes whose
-/// content is a length-counted byte buffer. Here the store is a [`Vec<ToolVar>`]
-/// on [`GlobalConfig`] and the content is an owned [`String`]; the byte length
-/// (C `clen`) is simply the string's length.
+/// content is a length-counted byte buffer (`content` + `clen`). Here the store
+/// is a [`Vec<ToolVar>`] on [`GlobalConfig`] and the content is an owned
+/// [`Vec<u8>`] — **raw bytes**, not a `String`. `--variable` content read from a
+/// file, stdin, or an environment value may be arbitrary binary (`src/var.c`
+/// keeps it length-counted and only rejects NUL bytes at expansion time), so a
+/// lossy UTF-8 conversion at storage would irreversibly corrupt non-UTF-8 input.
+/// The byte length (C `clen`) is `content.len()`; decoding to text happens only
+/// at the expansion output boundary, exactly as curl does.
 #[derive(Clone, Debug, Default)]
 pub struct ToolVar {
     /// The variable name (C `name`).
     pub name: String,
-    /// The variable content (C `content` + `clen`).
-    pub content: String,
+    /// The variable content as raw bytes (C `content` + `clen`).
+    pub content: Vec<u8>,
 }
 
 // ===========================================================================
@@ -997,8 +1002,11 @@ impl GlobalConfig {
             return Ok(());
         };
 
-        let content = String::from_utf8_lossy(&content_bytes).into_owned();
-        self.add_variable(name.to_string(), content);
+        // Store the raw bytes verbatim — curl keeps `--variable` content as a
+        // length-counted byte buffer (`src/var.c`), so non-UTF-8 file/stdin/env
+        // content must survive intact. Any text decoding is deferred to the
+        // expansion output boundary (`var_expand`), matching the C oracle.
+        self.add_variable(name.to_string(), content_bytes);
         Ok(())
     }
 
@@ -1028,15 +1036,19 @@ impl GlobalConfig {
         let showerror = self.showerror;
         let input = line;
         let mut line = line;
-        let mut out = String::new();
+        // The expansion buffer is assembled as raw bytes so a variable value
+        // containing non-UTF-8 bytes is carried through verbatim (the C oracle
+        // writes the value into a byte `dynbuf`). The buffer is decoded to text
+        // only once, at the return — the single output boundary.
+        let mut out: Vec<u8> = Vec::new();
         let mut added = false;
 
         while let Some(pos) = line.find("{{") {
             // A backslash immediately before "{{" escapes it: emit the text up
             // to (but excluding) the backslash, then a literal "{{".
             if pos > 0 && line.as_bytes()[pos - 1] == b'\\' {
-                out.push_str(&line[..pos - 1]);
-                out.push_str("{{");
+                out.extend_from_slice(&line.as_bytes()[..pos - 1]);
+                out.extend_from_slice(b"{{");
                 line = &line[pos + 2..];
                 continue;
             }
@@ -1059,47 +1071,51 @@ impl GlobalConfig {
             if nlen == 0 || nlen >= MAX_VAR_LEN {
                 var_warn(silent, &format!("bad variable name length '{input}'"));
                 // Not a variable reference: keep the whole "{{...}}" verbatim.
-                out.push_str(&line[..upto]);
+                out.extend_from_slice(&line.as_bytes()[..upto]);
                 line = &line[upto..];
                 continue;
             }
 
             // Emit the text preceding "{{".
-            out.push_str(&line[..pos]);
+            out.extend_from_slice(&line.as_bytes()[..pos]);
 
             if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
                 var_warn(silent, &format!("bad variable name: {name}"));
-                out.push_str(&line[pos..upto]);
+                out.extend_from_slice(&line.as_bytes()[pos..upto]);
                 line = &line[upto..];
                 continue;
             }
 
-            // Resolve the value (an unset variable expands to empty), then apply
-            // any `:func` chain.
-            let value: String = match func_region {
+            // Resolve the value as raw bytes (an unset variable expands to
+            // empty), then apply any `:func` chain — all byte-preserving.
+            let value: Vec<u8> = match func_region {
                 Some(funcs) => {
-                    let base = self.varcontent(name).unwrap_or("");
+                    let base = self.varcontent(name).unwrap_or(&[]);
                     self.varfunc(base, funcs)?
                 }
-                None => self.varcontent(name).unwrap_or("").to_string(),
+                None => self.varcontent(name).unwrap_or(&[]).to_vec(),
             };
 
-            // A value containing a null byte cannot be represented.
-            if !value.is_empty() && value.as_bytes().contains(&0u8) {
+            // A value containing a null byte cannot be represented (matches the
+            // C oracle's `memchr(value, '\0', vlen)` check at expansion time).
+            if !value.is_empty() && value.contains(&0u8) {
                 var_error(silent, showerror, "variable contains null byte");
                 return Err(ParameterError::ExpandError);
             }
 
-            out.push_str(&value);
+            out.extend_from_slice(&value);
             added = true;
             line = &line[upto..];
         }
 
         if added {
             if !line.is_empty() {
-                out.push_str(line);
+                out.extend_from_slice(line.as_bytes());
             }
-            Ok((out, true))
+            // Decode the assembled bytes to text at the output boundary only —
+            // the lone place curl converts, and the lone unavoidable lossy point
+            // for a raw (non-encoded) non-UTF-8 expansion in a String-based CLI.
+            Ok((String::from_utf8_lossy(&out).into_owned(), true))
         } else {
             // Nothing substituted: use the original line verbatim.
             Ok((input.to_string(), false))
@@ -1114,11 +1130,11 @@ impl GlobalConfig {
     }
 
     /// Looks up a variable's content by exact name (C `varcontent`).
-    fn varcontent(&self, name: &str) -> Option<&str> {
+    fn varcontent(&self, name: &str) -> Option<&[u8]> {
         self.variables
             .iter()
             .find(|v| v.name == name)
-            .map(|v| v.content.as_str())
+            .map(|v| v.content.as_slice())
     }
 
     /// Applies the `:`-separated function chain in `funcs` (which begins with a
@@ -1128,10 +1144,10 @@ impl GlobalConfig {
     /// `url`, `b64`, `64dec`. An empty content yields empty for every function
     /// (curl skips the transform when the length is zero — notably `64dec` does
     /// not fail on empty input). An unrecognized function is an error.
-    fn varfunc(&self, content: &str, funcs: &str) -> Result<String, crate::args::ParameterError> {
+    fn varfunc(&self, content: &[u8], funcs: &str) -> Result<Vec<u8>, crate::args::ParameterError> {
         use crate::args::ParameterError;
 
-        let mut cur: Vec<u8> = content.as_bytes().to_vec();
+        let mut cur: Vec<u8> = content.to_vec();
         let mut f = funcs; // begins with ':'
 
         // Consume the leading ':' (guaranteed on entry and after each match by
@@ -1180,7 +1196,11 @@ impl GlobalConfig {
             }
         }
 
-        Ok(String::from_utf8_lossy(&cur).into_owned())
+        // Return the raw bytes — the caller (`var_expand`) keeps the value as
+        // bytes and only decodes at its output boundary. Encoders (`json`/`url`/
+        // `b64`) already yield ASCII; `64dec`/`trim` may yield binary, which is
+        // now carried through losslessly instead of being UTF-8-mangled here.
+        Ok(cur)
     }
 
     /// Inserts or overwrites a variable (last definition wins) — the analog of
@@ -1189,7 +1209,7 @@ impl GlobalConfig {
     /// curl prepends a duplicate node and warns; the observable result (the
     /// value returned by [`varcontent`](GlobalConfig::varcontent) and the
     /// `Note:` message) is preserved here by updating in place.
-    fn add_variable(&mut self, name: String, content: String) {
+    fn add_variable(&mut self, name: String, content: Vec<u8>) {
         let trace_on = self.tracetype != TraceType::None;
         if let Some(existing) = self.variables.iter_mut().find(|v| v.name == name) {
             var_note(trace_on, &format!("Overwriting variable '{name}'"));
@@ -1489,7 +1509,7 @@ mod tests {
         for (n, c) in vars {
             g.variables.push(ToolVar {
                 name: (*n).to_string(),
-                content: (*c).to_string(),
+                content: (*c).as_bytes().to_vec(),
             });
         }
         g
@@ -1636,12 +1656,12 @@ mod tests {
     fn set_literal_and_last_wins() {
         let mut g = GlobalConfig::new();
         g.set_variable("x=hello").unwrap();
-        assert_eq!(g.varcontent("x"), Some("hello"));
+        assert_eq!(g.varcontent("x"), Some(b"hello".as_slice()));
         g.set_variable("y=").unwrap();
-        assert_eq!(g.varcontent("y"), Some(""));
+        assert_eq!(g.varcontent("y"), Some(b"".as_slice()));
         // Last definition wins; the store keeps a single entry per name.
         g.set_variable("x=world").unwrap();
-        assert_eq!(g.varcontent("x"), Some("world"));
+        assert_eq!(g.varcontent("x"), Some(b"world".as_slice()));
         assert_eq!(g.variables.iter().filter(|v| v.name == "x").count(), 1);
     }
 
@@ -1660,12 +1680,12 @@ mod tests {
     fn set_byte_range() {
         let mut g = GlobalConfig::new();
         g.set_variable("a[1-3]=hello").unwrap();
-        assert_eq!(g.varcontent("a"), Some("ell"));
+        assert_eq!(g.varcontent("a"), Some(b"ell".as_slice()));
         g.set_variable("b[2-]=hello").unwrap();
-        assert_eq!(g.varcontent("b"), Some("llo"));
+        assert_eq!(g.varcontent("b"), Some(b"llo".as_slice()));
         // Start past the end yields empty.
         g.set_variable("c[9-]=hi").unwrap();
-        assert_eq!(g.varcontent("c"), Some(""));
+        assert_eq!(g.varcontent("c"), Some(b"".as_slice()));
     }
 
     #[test]
@@ -1687,7 +1707,7 @@ mod tests {
         std::env::set_var(key, "fromenv");
         let mut g = GlobalConfig::new();
         g.set_variable(&format!("%{key}")).unwrap();
-        assert_eq!(g.varcontent(key), Some("fromenv"));
+        assert_eq!(g.varcontent(key), Some(b"fromenv".as_slice()));
         std::env::remove_var(key);
     }
 
@@ -1709,7 +1729,7 @@ mod tests {
         let mut g = GlobalConfig::new();
         // Unset variable with a trailing literal fallback uses the fallback.
         g.set_variable(&format!("%{key}=defaultval")).unwrap();
-        assert_eq!(g.varcontent(key), Some("defaultval"));
+        assert_eq!(g.varcontent(key), Some(b"defaultval".as_slice()));
     }
 
     #[test]
@@ -1720,10 +1740,39 @@ mod tests {
 
         let mut g = GlobalConfig::new();
         g.set_variable(&format!("fv@{}", path.display())).unwrap();
-        assert_eq!(g.varcontent("fv"), Some("hello"));
+        assert_eq!(g.varcontent("fv"), Some(b"hello".as_slice()));
         g.set_variable(&format!("fr[1-3]@{}", path.display()))
             .unwrap();
-        assert_eq!(g.varcontent("fr"), Some("ell"));
+        assert_eq!(g.varcontent("fr"), Some(b"ell".as_slice()));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// `--variable name@file` with **non-UTF-8** file content must be stored
+    /// byte-for-byte (the CP3 F6 fix). Before the fix the bytes were run through
+    /// `String::from_utf8_lossy` at storage, replacing each invalid byte with
+    /// U+FFFD and irreversibly corrupting the value — so even `{{v:b64}}` would
+    /// encode the mangled bytes. This proves the raw bytes survive and that an
+    /// encoder sees the originals.
+    #[test]
+    fn set_from_file_preserves_non_utf8_bytes() {
+        // 0xFF, 0xFE, 0x80 are all invalid as standalone UTF-8; mixed with ASCII.
+        let raw: &[u8] = &[0xFF, 0xFE, 0x80, b'A', 0x7F];
+        let mut path = std::env::temp_dir();
+        path.push(format!("curlrs_cfg_test_{}_binary.bin", std::process::id()));
+        fs::write(&path, raw).expect("write temp file");
+
+        let mut g = GlobalConfig::new();
+        g.set_variable(&format!("bin@{}", path.display())).unwrap();
+
+        // Storage is byte-exact — no U+FFFD substitution.
+        assert_eq!(g.varcontent("bin"), Some(raw));
+
+        // An encoder applied at expansion sees the original bytes: the base64 of
+        // the value must equal the base64 of the raw input, not of a mangled
+        // (lossy) version.
+        let expected_b64 = String::from_utf8(base64_encode_bytes(raw)).unwrap();
+        assert_eq!(g.var_expand("{{bin:b64}}").unwrap().0, expected_b64);
 
         let _ = fs::remove_file(&path);
     }

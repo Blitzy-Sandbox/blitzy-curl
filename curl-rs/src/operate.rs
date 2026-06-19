@@ -2013,7 +2013,7 @@ impl Driver {
                     }
                 }
 
-                let (pcode, _running_after_poll) = multi.poll(&[], 1000);
+                let (pcode, _running_after_poll) = multi.poll(&mut [], 1000);
                 s.mcode = pcode;
                 if s.mcode == CurlMError::Ok {
                     let (pcode2, running) = multi.perform();

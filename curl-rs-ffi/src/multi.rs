@@ -440,25 +440,26 @@ unsafe fn collect_extra_fds(fds: *mut curl_waitfd, n: c_uint) -> Vec<Waitfd> {
     out
 }
 
-/// Clear the `revents` output field of every entry in the caller's array.
+/// Write the per-fd `revents` the core computed back into the caller's array.
 ///
 /// `curl_multi_wait`/`poll` treat `revents` as an output that libcurl always
-/// overwrites. The async core reports activity only as an aggregate ready count
-/// (it does not poll the caller's extra fds individually), so there is no
-/// per-fd readiness to report; we therefore reset `revents` to `0` rather than
-/// leaving a stale value the caller might misread.
+/// overwrites. The core ([`core::Multi::wait`]/[`poll`](core::Multi::poll)) now
+/// polls each application descriptor and records the readiness it observed into
+/// the `Waitfd` it was handed; this copies that readiness back to the C
+/// `curl_waitfd` array entry-for-entry. `extras` was built from the same array
+/// by [`collect_extra_fds`], so the indices line up; `take(n)` is defensive.
 ///
 /// # Safety
 ///
 /// When `n > 0`, `fds` must point to `n` writable [`curl_waitfd`] entries.
-unsafe fn clear_extra_revents(fds: *mut curl_waitfd, n: c_uint) {
+unsafe fn write_back_revents(fds: *mut curl_waitfd, n: c_uint, extras: &[Waitfd]) {
     if fds.is_null() || n == 0 {
         return;
     }
-    for i in 0..n as usize {
+    for (i, w) in extras.iter().enumerate().take(n as usize) {
         // SAFETY: `i < n`; the caller guarantees `n` writable entries.
         unsafe {
-            (*fds.add(i)).revents = 0;
+            (*fds.add(i)).revents = w.revents;
         }
     }
 }
@@ -949,12 +950,12 @@ pub unsafe extern "C" fn curl_multi_wait(
         None => return CURLMcode::CURLM_BAD_HANDLE,
     };
     // SAFETY: the caller guarantees `extra_fds` points to `extra_nfds` entries.
-    let extras = unsafe { collect_extra_fds(extra_fds, extra_nfds) };
-    let (code, ready) = handle.inner.wait(&extras, timeout_ms);
-    // The core reports only an aggregate ready count, so clear the per-fd
-    // `revents` outputs (see `clear_extra_revents`).
+    let mut extras = unsafe { collect_extra_fds(extra_fds, extra_nfds) };
+    let (code, ready) = handle.inner.wait(&mut extras, timeout_ms);
+    // The core polled each descriptor and recorded its readiness; propagate the
+    // per-fd `revents` back to the caller's array (see `write_back_revents`).
     // SAFETY: same array contract as `collect_extra_fds`.
-    unsafe { clear_extra_revents(extra_fds, extra_nfds) };
+    unsafe { write_back_revents(extra_fds, extra_nfds, &extras) };
     if !ret.is_null() {
         // SAFETY: the caller guarantees a writable `int` when non-NULL.
         unsafe { *ret = ready as c_int };
@@ -988,12 +989,12 @@ pub unsafe extern "C" fn curl_multi_poll(
         None => return CURLMcode::CURLM_BAD_HANDLE,
     };
     // SAFETY: the caller guarantees `extra_fds` points to `extra_nfds` entries.
-    let extras = unsafe { collect_extra_fds(extra_fds, extra_nfds) };
-    let (code, ready) = handle.inner.poll(&extras, timeout_ms);
-    // The core reports only an aggregate ready count, so clear the per-fd
-    // `revents` outputs (see `clear_extra_revents`).
+    let mut extras = unsafe { collect_extra_fds(extra_fds, extra_nfds) };
+    let (code, ready) = handle.inner.poll(&mut extras, timeout_ms);
+    // The core polled each descriptor and recorded its readiness; propagate the
+    // per-fd `revents` back to the caller's array (see `write_back_revents`).
     // SAFETY: same array contract as `collect_extra_fds`.
-    unsafe { clear_extra_revents(extra_fds, extra_nfds) };
+    unsafe { write_back_revents(extra_fds, extra_nfds, &extras) };
     if !ret.is_null() {
         // SAFETY: the caller guarantees a writable `int` when non-NULL.
         unsafe { *ret = ready as c_int };
@@ -1212,14 +1213,19 @@ pub unsafe extern "C" fn curl_multi_get_handles(multi: *mut CURLM) -> *mut *mut 
 // Phase 6 — curl_multi_setopt (variadic) / get_offt / notify enable+disable
 // ===========================================================================
 
-/// `curl_multi_setopt` — set an option on the multi handle
-/// (`include/curl/multi.h:429`). **Variadic** in C (`CURLMoption option, ...`).
+/// Typed Rust implementation behind the public `curl_multi_setopt` C-variadic
+/// trampoline (`include/curl/multi.h:429`; **variadic** in C as
+/// `CURLMoption option, ...`).
 ///
-/// Like [`curl_easy_setopt`](crate::easy), this uses a single fixed trailing
-/// argument (`arg: usize`) rather than a Rust `...` definition. C passes exactly
-/// one value after `option`, and on the supported targets (x86_64 / aarch64,
-/// matching `easy.rs`/`share.rs`) that first variadic argument lands in the same
-/// register/stack slot a fixed parameter would, so the ABI is identical. The
+/// As with [`curl_easy_setopt`](crate::easy), the public, ABI-exported
+/// `curl_multi_setopt` symbol is a genuine C-variadic trampoline in
+/// `csrc/variadic_trampolines.c`: a fixed-arity `extern "C" fn(.., arg: usize)`
+/// is NOT ABI-equivalent to a C-variadic on every target (macOS arm64 passes the
+/// first variadic argument on the stack, not in the register a fixed parameter
+/// would use), so the trampoline owns the exported name, extracts the single
+/// trailing argument with `va_arg`, and forwards it to this implementation
+/// (named `curlrs_multi_setopt_impl`; the non-`curl_` prefix keeps it off the
+/// exported `curl_*` ABI surface). C passes exactly one value after `option`. The
 /// option id is classified via [`CurlMOption::from_raw`] and dispatched to the
 /// core's typed [`setopt`](curl_rs_lib::Multi). Function-pointer options install
 /// one of the [`FfiSocketCb`]/[`FfiTimerCb`]/[`FfiPushCb`]/[`FfiNotifyCb`]
@@ -1235,7 +1241,7 @@ pub unsafe extern "C" fn curl_multi_get_handles(multi: *mut CURLM) -> *mut *mut 
 /// for `long` options it is the integer value. Exactly one trailing argument
 /// must be supplied, as the C prototype requires.
 #[no_mangle]
-pub unsafe extern "C" fn curl_multi_setopt(
+pub unsafe extern "C" fn curlrs_multi_setopt_impl(
     multi: *mut CURLM,
     option: CURLMoption,
     arg: usize,
@@ -1465,6 +1471,14 @@ pub extern "C" fn curl_multi_strerror(code: CURLMcode) -> *const c_char {
 mod tests {
     use super::*;
     use std::ffi::CStr;
+    // The public `curl_multi_setopt` symbol is now the C-variadic `va_arg`
+    // trampoline in `csrc/variadic_trampolines.c`; the typed dispatch logic these
+    // tests exercise lives in the Rust implementation it forwards to. Alias the
+    // implementation symbol back to the public name so the test bodies — which
+    // already pass exactly one pointer-width trailing argument as `usize` — read
+    // unchanged. (The trampoline's pure va_arg extraction is a C-ABI concern
+    // verified by the C/`tests/libtest` callers, not reachable from Rust.)
+    use super::curlrs_multi_setopt_impl as curl_multi_setopt;
 
     /// Allocate a fresh easy handle exactly as `curl_easy_init` does, so the
     /// `*mut CURL` is a `Box<core::Easy>` at a stable address.

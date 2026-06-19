@@ -1,0 +1,164 @@
+/*
+ * variadic_trampolines.c — genuine C-variadic shims for the libcurl option and
+ * info entry points that take a single trailing argument:
+ *
+ *   curl_easy_setopt(CURL *,   CURLoption,   ...)
+ *   curl_easy_getinfo(CURL *,  CURLINFO,     ...)
+ *   curl_multi_setopt(CURLM *, CURLMoption,  ...)
+ *   curl_share_setopt(CURLSH *,CURLSHoption, ...)
+ *
+ * Why C and not Rust
+ * ------------------
+ * These four symbols are declared C-variadic in the public headers
+ * (include/curl/easy.h, multi.h, curl.h). Stable Rust cannot DEFINE a variadic
+ * `extern "C"` function (that requires the nightly-only `c_variadic` feature),
+ * and — crucially — a fixed-arity Rust shim `fn(.., arg: usize)` is NOT
+ * ABI-equivalent to a C-variadic on every supported target. The four required
+ * targets are linux-x86_64, linux-aarch64, macOS-x86_64 and macOS-arm64; on
+ * macOS arm64 (Apple's AAPCS64 variant) variadic arguments are passed on the
+ * STACK while a named parameter of the same position would be passed in a
+ * register. A fixed-register-slot Rust shim therefore reads the wrong location
+ * for the trailing pointer/object/function argument on that target, which is the
+ * exact ABI defect this file fixes (review CP3 / AAP G4).
+ *
+ * So each trampoline below OWNS the exported `curl_*` symbol, uses `va_arg` to
+ * read the single trailing argument exactly as the C ABI prescribes, and
+ * forwards it to the typed, non-`curl_`-prefixed Rust implementation
+ * (`curlrs_*_impl`, defined `#[no_mangle] pub extern "C"` in
+ * curl-rs-ffi/src/{easy,multi,share}.rs). The non-`curl_` prefix keeps the Rust
+ * implementations off the exported `curl_*` ABI surface that the nm/objdump
+ * parity gate measures against lib/libcurl.def — the trampolines are the only
+ * `curl_*` definitions, so the exported set is unchanged.
+ *
+ * AAP §0.7.2 (variadic FFI) and §0.8.2/§0.8.3 document this C-linkage exception:
+ * it is dependency-free (no libcurl/libssl/C-TLS linkage), the minimal piece of
+ * C required to reproduce curl's variadic ABI faithfully. The build wires this
+ * file in via curl-rs-ffi/build.rs (a `cc` step that auto-discovers the C
+ * sources under csrc/) and links it whole-archive so the exported `curl_*`
+ * symbols are retained.
+ *
+ * Reading the single trailing argument
+ * ------------------------------------
+ * Every one of these calls passes EXACTLY ONE trailing argument (libcurl's
+ * public headers enforce this with a three-argument typecheck macro). The
+ * argument's logical type varies by the option/info selector — a `long`, a
+ * `curl_off_t`, an object/string/function pointer, or (for the two share
+ * data-type options) an `int`. Rather than replicate libcurl's entire option
+ * table in C, the trampoline reads the one pointer-width slot generically and
+ * forwards its bits to the Rust side, which already reinterprets them per the
+ * selector (e.g. `arg as c_long`, `arg as i32`, or as a pointer) using the
+ * canonical option table — mirroring how the existing csrc/formadd_trampoline.c
+ * forwards `va_list` entries to `curlrs_formadd_impl`.
+ *
+ * This is sound on the four required targets because they are all LP64: `long`,
+ * `long long`/`curl_off_t`, every data/function pointer, and `size_t`/`void *`
+ * are all 64-bit and occupy one variadic slot of identical class, so reading the
+ * slot as `void *` yields the correct bits for the pointer/`long`/`curl_off_t`
+ * cases. The static assertions below pin that invariant at compile time. The
+ * single sub-64-bit case is curl_share_setopt's CURLSHOPT_SHARE/UNSHARE, whose
+ * `int` (default-argument-promoted) value lives in the low 32 bits of the slot;
+ * the Rust implementation masks it with `arg as i32`, so any high-bit noise from
+ * the wider read is discarded and the result equals a correct `va_arg(int)`.
+ */
+
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/*
+ * LP64 invariant the single-slot read relies on. If any of these ever fails the
+ * generic `va_arg(ap, void *)` read would be incorrect and the build must stop
+ * rather than silently miscompile the ABI bridge.
+ */
+_Static_assert(sizeof(void *) == 8, "variadic trampolines require a 64-bit (LP64) pointer");
+_Static_assert(sizeof(long) == sizeof(void *), "variadic trampolines require LP64 (long == pointer width)");
+_Static_assert(sizeof(long long) == sizeof(void *), "variadic trampolines require long long == pointer width");
+_Static_assert(sizeof(size_t) == sizeof(void *), "variadic trampolines require size_t == pointer width");
+
+/* Opaque libcurl handles are `typedef void` in the public headers, so a plain
+ * `void *` reproduces `CURL *` / `CURLM *` / `CURLSH *` exactly. The selector
+ * enums (`CURLoption`, `CURLINFO`, `CURLMoption`, `CURLSHoption`) and the result
+ * enums (`CURLcode`, `CURLMcode`, `CURLSHcode`) are all `int`-sized in the ABI,
+ * matching the Rust `c_int` selectors and `#[repr(i32)]` result codes. We use
+ * `int` here rather than #include <curl/curl.h>, because that header is
+ * regenerated by cbindgen and is not guaranteed present/final when this
+ * translation unit is compiled (identical rationale to formadd_trampoline.c).
+ */
+
+/* Typed, non-variadic Rust implementations (curl-rs-ffi/src/{easy,multi,share}.rs).
+ * The third parameter is the single trailing argument's pointer-width bits,
+ * matching the Rust `arg: usize`. */
+extern int curlrs_easy_setopt_impl(void *handle, int option, size_t arg);
+extern int curlrs_easy_getinfo_impl(void *handle, int info, size_t arg);
+extern int curlrs_multi_setopt_impl(void *multi, int option, size_t arg);
+extern int curlrs_share_setopt_impl(void *share, int option, size_t arg);
+
+/*
+ * curl_easy_setopt(CURL *handle, CURLoption option, ...) — exported, ABI-exact.
+ * Signature matches include/curl/easy.h.
+ */
+int curl_easy_setopt(void *handle, int option, ...)
+{
+  va_list ap;
+  void *arg;
+
+  va_start(ap, option);
+  /* Single trailing argument; read the one pointer-width slot (see file banner
+   * for the LP64 justification). */
+  arg = va_arg(ap, void *);
+  va_end(ap);
+
+  return curlrs_easy_setopt_impl(handle, option, (size_t)arg);
+}
+
+/*
+ * curl_easy_getinfo(CURL *handle, CURLINFO info, ...) — exported, ABI-exact.
+ * The trailing argument is always an output pointer, so the pointer-width read
+ * is exact for every CURLINFO. Signature matches include/curl/easy.h.
+ */
+int curl_easy_getinfo(void *handle, int info, ...)
+{
+  va_list ap;
+  void *arg;
+
+  va_start(ap, info);
+  arg = va_arg(ap, void *);
+  va_end(ap);
+
+  return curlrs_easy_getinfo_impl(handle, info, (size_t)arg);
+}
+
+/*
+ * curl_multi_setopt(CURLM *multi, CURLMoption option, ...) — exported, ABI-exact.
+ * Signature matches include/curl/multi.h.
+ */
+int curl_multi_setopt(void *multi, int option, ...)
+{
+  va_list ap;
+  void *arg;
+
+  va_start(ap, option);
+  arg = va_arg(ap, void *);
+  va_end(ap);
+
+  return curlrs_multi_setopt_impl(multi, option, (size_t)arg);
+}
+
+/*
+ * curl_share_setopt(CURLSH *share, CURLSHoption option, ...) — exported,
+ * ABI-exact. For CURLSHOPT_SHARE/UNSHARE the trailing argument is an `int`
+ * (default-argument-promoted) occupying the low 32 bits of the slot; the Rust
+ * implementation masks it with `arg as i32`. For the callback/userdata options
+ * it is a genuine pointer. Signature matches include/curl/curl.h.
+ */
+int curl_share_setopt(void *share, int option, ...)
+{
+  va_list ap;
+  void *arg;
+
+  va_start(ap, option);
+  arg = va_arg(ap, void *);
+  va_end(ap);
+
+  return curlrs_share_setopt_impl(share, option, (size_t)arg);
+}

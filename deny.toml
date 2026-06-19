@@ -73,19 +73,16 @@ unmaintained = "workspace"
 ignore = [
     # rsa "Marvin Attack" timing side-channel — CVSS 5.9 (MEDIUM), CVE-2023-49092.
     # No fixed upstream release exists; pulled in transitively by `russh`, the
-    # AAP §0.6.2-mandated SSH backend (SFTP/SCP). Not a critical CVE.
+    # AAP §0.6.2-mandated SSH backend (SFTP/SCP). Not a critical CVE. This is the
+    # SOLE remaining documented residual: it has no available fix, so it cannot be
+    # eliminated without dropping the mandated SSH backend.
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin Attack (CVSS 5.9 MEDIUM); no fixed release; required transitively by russh (mandated SSH backend, AAP §0.6.2). Remove when RustCrypto/RSA ships a constant-time fix." },
-    # rustls-pemfile is unmaintained (repo archived Aug 2025). It is an AAP §0.6
-    # pinned dependency and a thin wrapper over rustls-pki-types' PemObject API;
-    # there is no safe upgrade. Informational (not a vulnerability).
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained (archived); AAP §0.6 pinned dep; no safe upgrade — superseded by rustls-pki-types PemObject. Tracked for migration." },
-    # hickory-proto denial-of-service advisories. Reachable ONLY through the
-    # optional, off-by-default `hickory-dns` resolver backend (AAP §0.6.2 default
-    # = off; the default DNS path is the system resolver). They surface here only
-    # because [graph] all-features pulls the optional backend for the C-TLS ban
-    # scan, and are NOT present in the default-feature shipped artifacts.
-    { id = "RUSTSEC-2026-0118", reason = "hickory-proto NSEC3 DoS; reachable only via optional off-by-default hickory-dns backend (AAP §0.6.2). Not in default artifacts. Revisit on hickory update." },
-    { id = "RUSTSEC-2026-0119", reason = "hickory-proto name-compression DoS; reachable only via optional off-by-default hickory-dns backend (AAP §0.6.2). Not in default artifacts. Revisit on hickory update." },
+    # NOTE: RUSTSEC-2025-0134 (rustls-pemfile unmaintained) was RESOLVED by removing
+    # the dependency entirely in favor of `rustls-pki-types`' PemObject API, and
+    # RUSTSEC-2026-0118 / RUSTSEC-2026-0119 (hickory-proto DoS) were RESOLVED by
+    # upgrading the hickory stack to 0.26.1 (hickory-proto >= 0.26.1, which is in the
+    # advisories' patched/unaffected ranges). Their ignore entries were therefore
+    # removed — the advisories no longer fire.
 ]
 
 # ----------------------------------------------------------------------------

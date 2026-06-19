@@ -132,7 +132,8 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
 webpki-roots.workspace = true
-rustls-pemfile.workspace = true
+# `rustls-pemfile` removed (RUSTSEC-2025-0134, unmaintained). PEM decoding now uses
+# the `PemObject` trait from `rustls-pki-types` (above) — see `src/tls/config.rs`.
 
 # ---- SSH transport: SFTP / SCP (replaces libssh / libssh2) ------------------
 # NOTE: there is intentionally NO `russh-keys` dependency. The workspace pins
