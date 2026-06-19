@@ -57,6 +57,7 @@ use curl_rs_lib::{
     CurlCode, CurlError, CurlInfo, CurlOption, Easy, InfoValue, Multi, OptionValue, Share,
 };
 
+use crate::callbacks::ProgressData;
 use crate::config::{FailMode, GlobalConfig, HttpReq, OperationConfig};
 use crate::setopt;
 use crate::urlglob;
@@ -129,28 +130,15 @@ pub struct OutStruct {
 
 // ===========================================================================
 // ProgressData — custom progress-bar state (C `struct ProgressData`,
-// src/tool_cb_prg.h). The full bar is driven by the transfer engine; the
-// fields the driver needs are mirrored here.
+// src/tool_cb_prg.h).
+//
+// The canonical struct and its callback (`tool_progress_cb`/`progressbarinit`,
+// the `-#` bar) are owned by `crate::callbacks::progress` (the port of
+// `src/tool_cb_prg.c`); it is imported above and embedded unchanged as the
+// `progressbar` field of `PerTransfer` below. The driver only reads
+// `progressbar.calls` (to decide whether to close the bar with a trailing
+// newline in `post_per_transfer`).
 // ===========================================================================
-
-/// Per-transfer state for the `-#`/`--progress-bar` meter
-/// (C `struct ProgressData`). The transfer engine updates the counters; the
-/// driver only needs to know whether the bar was ever drawn (to emit the
-/// trailing newline in `post_per_transfer`).
-#[derive(Debug, Default)]
-pub struct ProgressData {
-    /// Number of times the progress callback has fired (`prog.calls`). A
-    /// non-zero value means a bar line was printed and needs a closing newline.
-    pub calls: u64,
-    /// Total bytes accounted for by the bar so far (`prog.total`).
-    pub total: i64,
-    /// Previous absolute byte position used to render the bar (`prog.prev`).
-    pub prev: i64,
-    /// Bar width in characters (`prog.width`).
-    pub width: i32,
-    /// Initial transfer size for resumed transfers (`prog.initial_size`).
-    pub initial_size: i64,
-}
 
 // ===========================================================================
 // HdrCbData — header callback state (C `struct HdrCbData`, src/tool_cb_hdr.h)
@@ -243,6 +231,18 @@ pub struct PerTransfer {
     pub uploadfile: Option<String>,
     /// The computed upload size, or `-1` when unknown (C `per->uploadfilesize`).
     pub uploadfilesize: i64,
+    /// Running count of upload-body bytes consumed so far (C
+    /// `per->uploadedsofar`). The read callback (`crate::callbacks::read`) uses
+    /// it to detect completion and to cap an over-growing source at the original
+    /// [`uploadfilesize`](Self::uploadfilesize); libcurl's transfer engine
+    /// accounts the consumed bytes into it.
+    pub uploadedsofar: i64,
+    /// Previous `ulnow` (uploaded-bytes-now) seen by the busy-read unpauser
+    /// (`tool_readbusy_cb`). curl keeps this in a function-`static curl_off_t
+    /// ulprev`; storing it per-transfer here avoids `static mut`/`unsafe` and is
+    /// more correct (no cross-transfer bleed) while preserving the stall
+    /// detection (a 1 ms wait only when the upload has not advanced).
+    pub ulprev: i64,
     /// The libcurl error buffer (`CURLOPT_ERRORBUFFER`; C
     /// `per->errorbuffer[CURL_ERROR_SIZE]`). Empty string means "no message".
     pub errorbuffer: String,
@@ -301,7 +301,10 @@ impl PerTransfer {
     /// zero-initialized node `add_per_transfer` allocates in C. Timestamps are
     /// seeded with [`Instant::now`]; they are overwritten by `pre_transfer`
     /// before the transfer actually runs.
-    fn new(config_idx: usize) -> Self {
+    ///
+    /// `pub(crate)` so sibling modules (e.g. `crate::callbacks`) can construct a
+    /// transfer record for unit tests of the callbacks they register.
+    pub(crate) fn new(config_idx: usize) -> Self {
         let now = Instant::now();
         PerTransfer {
             config_idx,
@@ -322,6 +325,8 @@ impl PerTransfer {
             infile: None,
             uploadfile: None,
             uploadfilesize: -1,
+            uploadedsofar: 0,
+            ulprev: 0,
             errorbuffer: String::new(),
             num_headers: 0,
             startat: 0,

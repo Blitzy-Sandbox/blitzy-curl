@@ -87,6 +87,16 @@ mod writeout;
 // `operate::operate` once the transfer engine lands.
 #[allow(dead_code)]
 mod operate;
+// The transfer callbacks (ports of `src/tool_cb_*.c`): the write/read/seek/
+// header/progress/debug callbacks the CLI installs on each transfer. Their
+// registration against the easy handle is performed by the integration layer
+// (`operate`) once it lands (AAP §0.8.4 step 12), so the module is staged with
+// the same construction-order `#[allow(dead_code)]` as the other not-yet-wired
+// modules above to keep each callback compiled, clippy-linted, and unit-tested
+// as part of the binary build; the allow is removed once `operate` registers
+// them.
+#[allow(dead_code)]
+mod callbacks;
 
 /// curl-rs — a memory-safe Rust reimplementation of the `curl` command-line
 /// tool.

@@ -16,6 +16,11 @@
 //!   (`lib/http_chunks.c`): a resumable, byte-exact decoder for response bodies
 //!   (with trailer capture and the `--raw` pass-through path) and an encoder for
 //!   request bodies carrying `Transfer-Encoding: chunked`.
+//! * [`proxy`] — forward (non-tunneling) HTTP-proxy request rewriting
+//!   (`lib/http.c` `http_target`): the origin-form → absolute-URI request-target
+//!   construction plus the forward-proxy custom-header selection rules
+//!   (`lib/http_proxy.c` `dynhds_add_custom`). This is **not** the `CONNECT`
+//!   tunnel filter (that lives in [`crate::conn`] and [`crate::proxy`]).
 //!
 //! The remaining engines — `h1`, `h2`, `h3`, and the proxy-connect helpers — are
 //! authored by sibling migration steps and declared here as they land.
@@ -39,3 +44,4 @@
 
 pub mod aws_sigv4;
 pub mod chunks;
+pub mod proxy;
