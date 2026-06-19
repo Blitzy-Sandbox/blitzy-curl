@@ -10,6 +10,23 @@ The canonical libcurl internals documentation is now in the [everything
 curl](https://everything.curl.dev/internals) book. This file lists supported
 versions of libs and build tools.
 
+## Rust workspace
+
+This repository now also contains a memory-safe Rust rewrite of curl and
+libcurl that lives alongside the C tree. The C sources are retained as the
+behavioral and ABI reference; the Rust code targets functional parity with
+curl 8.x. The Rust implementation is a Cargo workspace of three crates:
+
+- `curl-rs-lib` - the core async library (protocols, TLS, transfer, connection
+  management, DNS, and authentication).
+- `curl-rs` - the command-line binary, a drop-in replacement for `curl`.
+- `curl-rs-ffi` - the FFI crate that exposes the `extern "C"` libcurl ABI and
+  regenerates `include/curl/curl.h` via `cbindgen`.
+
+Build it from the repository root with `cargo build --release --workspace`
+(stable toolchain, MSRV 1.75, edition 2021). See the top-level `README.md` for
+build and usage instructions.
+
 ## Portability
 
 We write curl and libcurl to compile with C89 compilers on 32-bit and up

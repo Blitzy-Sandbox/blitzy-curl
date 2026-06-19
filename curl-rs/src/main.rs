@@ -82,6 +82,11 @@ mod parsecfg;
 mod setopt;
 #[allow(dead_code)]
 mod writeout;
+// The operation driver (port of `src/tool_operate.c` + folded helpers). Staged
+// like the other not-yet-wired front-end modules; `run()` will call
+// `operate::operate` once the transfer engine lands.
+#[allow(dead_code)]
+mod operate;
 
 /// curl-rs — a memory-safe Rust reimplementation of the `curl` command-line
 /// tool.
