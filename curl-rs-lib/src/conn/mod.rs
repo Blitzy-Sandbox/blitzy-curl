@@ -81,5 +81,10 @@ pub mod h2_proxy;
 /// first to connect as its `next` and tearing down the losers.
 pub mod happy_eyeballs;
 pub mod haproxy;
+/// HTTPS connection establishment (`lib/vtls/vtls.c` cf-ssl + `lib/cf-https-connect.c`):
+/// the TLS connection filter (`TlsFilter`) and the ALPN-eyeballs HTTPS
+/// coordinator (`HttpsConnectFilter`) that races h3-over-QUIC against
+/// h2/h1-over-TLS and promotes the first protocol stack to connect.
+pub mod https_connect;
 pub mod socket;
 pub mod shutdown;
