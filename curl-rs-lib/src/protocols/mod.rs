@@ -122,19 +122,19 @@ pub mod http;
 // implemented so far. This keeps the crate building while preserving the full
 // protocol registry/dispatch infrastructure defined further down in this file.
 // ---------------------------------------------------------------------------
-// /// The pingpong command/response state machine shared by the line-based
-// /// protocols (`lib/pingpong.c`); used by FTP and the mail family. Compiled when
-// /// any of those protocols is enabled, mirroring curl's `lib/pingpong.c` guard.
-// #[cfg(any(feature = "ftp", feature = "imap", feature = "pop3", feature = "smtp"))]
-// pub mod pingpong;
+/// The pingpong command/response state machine shared by the line-based
+/// protocols (`lib/pingpong.c`); used by FTP and the mail family. Compiled when
+/// any of those protocols is enabled, mirroring curl's `lib/pingpong.c` guard.
+#[cfg(any(feature = "ftp", feature = "imap", feature = "pop3", feature = "smtp"))]
+pub mod pingpong;
 
 // /// FTP / FTPS (`lib/ftp.c`). curl `CURL_DISABLE_FTP`.
 // #[cfg(feature = "ftp")]
 // pub mod ftp;
 
-// /// FTP `LIST` response parser (`lib/ftplistparser.c`); part of the FTP feature.
-// #[cfg(feature = "ftp")]
-// pub mod ftp_list;
+/// FTP `LIST` response parser (`lib/ftplistparser.c`); part of the FTP feature.
+#[cfg(feature = "ftp")]
+pub mod ftp_list;
 
 // /// IMAP / IMAPS (`lib/imap.c`). curl `CURL_DISABLE_IMAP`.
 // #[cfg(feature = "imap")]
@@ -148,48 +148,63 @@ pub mod http;
 // #[cfg(feature = "smtp")]
 // pub mod smtp;
 
-// /// RTSP (`lib/rtsp.c`). curl `CURL_DISABLE_RTSP`.
-// #[cfg(feature = "rtsp")]
-// pub mod rtsp;
+/// RTSP (`lib/rtsp.c`). curl `CURL_DISABLE_RTSP`.
+#[cfg(feature = "rtsp")]
+pub mod rtsp;
 
-// /// MQTT / MQTTS (`lib/mqtt.c`). curl `CURL_DISABLE_MQTT`.
-// #[cfg(feature = "mqtt")]
-// pub mod mqtt;
+/// MQTT / MQTTS (`lib/mqtt.c`). curl `CURL_DISABLE_MQTT`.
+#[cfg(feature = "mqtt")]
+pub mod mqtt;
 
 // /// WebSocket `ws` / `wss` (`lib/ws.c`). curl `CURL_DISABLE_WEBSOCKETS`.
 // #[cfg(feature = "websockets")]
 // pub mod ws;
 
-// /// TELNET (`lib/telnet.c`). curl `CURL_DISABLE_TELNET`.
-// #[cfg(feature = "telnet")]
-// pub mod telnet;
+/// TELNET (`lib/telnet.c`). curl `CURL_DISABLE_TELNET`.
+#[cfg(feature = "telnet")]
+pub mod telnet;
 
-// /// TFTP (`lib/tftp.c`). curl `CURL_DISABLE_TFTP`.
-// #[cfg(feature = "tftp")]
-// pub mod tftp;
+/// TFTP (`lib/tftp.c`). curl `CURL_DISABLE_TFTP`.
+#[cfg(feature = "tftp")]
+pub mod tftp;
 
-// /// GOPHER / GOPHERS (`lib/gopher.c`). curl `CURL_DISABLE_GOPHER`.
-// #[cfg(feature = "gopher")]
-// pub mod gopher;
+/// GOPHER / GOPHERS (`lib/gopher.c`). curl `CURL_DISABLE_GOPHER`.
+#[cfg(feature = "gopher")]
+pub mod gopher;
 
-// /// SMB / SMBS (`lib/smb.c`). curl `CURL_DISABLE_SMB`.
-// #[cfg(feature = "smb")]
-// pub mod smb;
+/// SMB / SMBS (`lib/smb.c`). curl `CURL_DISABLE_SMB` **and** `USE_CURL_NTLM_CORE`
+/// — SMB authenticates with NTLM, so the C source compiles `lib/smb.c` only when
+/// both `!CURL_DISABLE_SMB` and `USE_CURL_NTLM_CORE` hold. We mirror that with a
+/// combined `smb` + `ntlm` feature gate (the `smb`/`smbs` *schemes* stay
+/// registered in [`SCHEME_TABLE`] whenever `smb` is on, but their handler is only
+/// available when `ntlm` is also on — exactly as curl's `Curl_scheme_smb` keeps
+/// the scheme but sets the protocol vtable to `ZERO_NULL` without NTLM).
+#[cfg(all(feature = "smb", feature = "ntlm"))]
+pub mod smb;
 
-// /// DICT (`lib/dict.c`). curl `CURL_DISABLE_DICT`.
-// #[cfg(feature = "dict")]
-// pub mod dict;
+/// DICT (`lib/dict.c`). curl `CURL_DISABLE_DICT`.
+#[cfg(feature = "dict")]
+pub mod dict;
 
 // /// FILE (`lib/file.c`). curl `CURL_DISABLE_FILE`.
 // #[cfg(feature = "file")]
 // pub mod file;
 
-// /// LDAP / LDAPS (`lib/openldap.c`). curl `CURL_DISABLE_LDAP`.
-// #[cfg(feature = "ldap")]
-// pub mod ldap;
+/// LDAP / LDAPS (`lib/ldap.c`, `lib/openldap.c`). curl `CURL_DISABLE_LDAP`.
+#[cfg(feature = "ldap")]
+pub mod ldap;
 
 // /// The SSH family — SFTP and SCP (`lib/vssh/`). Compiled when either SSH-based
 // /// scheme is enabled. curl `USE_SSH` (`CURL_DISABLE_*` per scheme).
+// ///
+// /// Construction-order staging: the `ssh` module root (`ssh/mod.rs`) is present
+// /// and complete, but it forward-declares its `scp` and `sftp` submodules whose
+// /// source files (`ssh/scp.rs`, `ssh/sftp.rs`) are authored in a later step. Per
+// /// the staging convention above, `pub mod ssh;` stays commented until those
+// /// submodule files land — re-enable it (and the SCP/SFTP `scheme_handler` arms
+// /// below) at that moment. Until then `scp`/`sftp` remain registered schemes in
+// /// `SCHEME_TABLE` and dispatch to the stub handler, exactly like the other
+// /// not-yet-completed protocols above.
 // #[cfg(any(feature = "scp", feature = "sftp"))]
 // pub mod ssh;
 
@@ -1135,16 +1150,66 @@ pub fn scheme_descriptor(scheme_name: &str) -> Option<&'static Scheme> {
 /// (the analog of curl's `Curl_get_scheme` returning a `Curl_handler`).
 ///
 /// Returns `None` exactly when [`scheme_descriptor`] does (unknown scheme, or a
-/// scheme whose feature is disabled). For a recognized scheme this currently
-/// returns a [`StubProtocol`] bound to the scheme's descriptor; as each
-/// per-protocol module lands, its handler constructor replaces the stub arm
-/// here. Because the stub inherits the trait's default
-/// [`Protocol::do_it`], invoking a transfer on a not-yet-implemented protocol
-/// yields [`CurlError::UnsupportedProtocol`] rather than a panic.
+/// scheme whose feature is disabled). For a recognized scheme whose engine has
+/// landed, the protocol's own handler constructor is returned; the remaining
+/// recognized schemes fall back to a [`StubProtocol`] bound to the scheme's
+/// descriptor. Because the stub inherits the trait's default [`Protocol::do_it`],
+/// invoking a transfer on a not-yet-implemented protocol yields
+/// [`CurlError::UnsupportedProtocol`] rather than a panic.
+///
+/// The SSH family (`scp`/`sftp`) dispatches to the real handlers in
+/// [`crate::protocols::ssh`]; each arm is feature-gated identically to the
+/// scheme's presence in [`SCHEME_TABLE`], so dispatch and descriptor resolution
+/// stay in lockstep.
 #[must_use]
 pub fn scheme_handler(scheme_name: &str) -> Option<Box<dyn Protocol>> {
-    scheme_descriptor(scheme_name)
-        .map(|scheme| Box::new(StubProtocol { scheme }) as Box<dyn Protocol>)
+    let scheme = scheme_descriptor(scheme_name)?;
+    // SMB / SMBS are served by [`smb::SmbProtocol`] when both the `smb` scheme
+    // and the `ntlm` auth core are compiled in (curl's
+    // `!CURL_DISABLE_SMB && USE_CURL_NTLM_CORE`). Without `ntlm` the scheme stays
+    // recognized but unsupported (the stub), mirroring curl's `ZERO_NULL` vtable.
+    #[cfg(all(feature = "smb", feature = "ntlm"))]
+    {
+        if scheme.name == SCHEME_SMB.name {
+            return Some(Box::new(smb::SmbProtocol::new(&SCHEME_SMB)) as Box<dyn Protocol>);
+        }
+        if scheme.name == SCHEME_SMBS.name {
+            return Some(Box::new(smb::SmbProtocol::new(&SCHEME_SMBS)) as Box<dyn Protocol>);
+        }
+    }
+
+    // TELNET is implemented (`telnet::Telnet`, `lib/telnet.c`).
+    #[cfg(feature = "telnet")]
+    {
+        if scheme.name == SCHEME_TELNET.name {
+            return Some(Box::new(telnet::Telnet::new()) as Box<dyn Protocol>);
+        }
+    }
+
+    let handler: Box<dyn Protocol> = match scheme.name {
+        // TFTP has a full handler (`lib/tftp.c`).
+        #[cfg(feature = "tftp")]
+        "tftp" => Box::new(tftp::TftpHandler::new()),
+        // LDAP and LDAPS share the single `ldap::LdapHandler`, distinguished by
+        // the scheme descriptor it carries.
+        #[cfg(feature = "ldap")]
+        "ldap" | "ldaps" => Box::new(ldap::LdapHandler::new(scheme)),
+        // MQTT / MQTTS are fully implemented (`lib/mqtt.c` analog).
+        #[cfg(feature = "mqtt")]
+        "mqtt" | "mqtts" => Box::new(mqtt::MqttProtocol::new(scheme)),
+        // SCP / SFTP — the pure-Rust `russh`-backed engines (`lib/vssh/`). Staged
+        // off together with `pub mod ssh;` above until `ssh/scp.rs` and
+        // `ssh/sftp.rs` land; `scp`/`sftp` fall through to the stub handler in the
+        // meantime (they stay registered in `SCHEME_TABLE`).
+        // #[cfg(feature = "scp")]
+        // "scp" => ssh::scp_handler(),
+        // #[cfg(feature = "sftp")]
+        // "sftp" => ssh::sftp_handler(),
+        // Every other recognized scheme falls back to the self-contained stub
+        // until its dedicated handler is wired in.
+        _ => Box::new(StubProtocol { scheme }),
+    };
+    Some(handler)
 }
 
 /// The sorted list of scheme names compiled into this build, in the exact order

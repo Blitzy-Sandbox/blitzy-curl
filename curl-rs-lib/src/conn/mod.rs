@@ -467,6 +467,21 @@ pub struct Connection {
     /// protocol-specific disconnect WITHOUT `conn/` importing `crate::protocols`.
     /// One-shot, mirroring the C `disconnect` handler.
     disconnect_hook: Option<DisconnectHook>,
+    /// Opaque per-connection protocol state — the Rust analog of curl's
+    /// `conn->proto` union and the `CURL_META_*` connection meta map (e.g.
+    /// `CURL_META_SSH_CONN`). A protocol engine (for example
+    /// `crate::protocols::ssh`) boxes its per-connection state here on connect
+    /// and reclaims it on done/disconnect. It is stored as `dyn Any` so that
+    /// `conn/` stays strictly acyclic: it persists protocol state without ever
+    /// naming a `crate::protocols` type. Access is via [`Connection::set_proto_state`],
+    /// [`Connection::proto_state_mut`], and [`Connection::take_proto_state`].
+    ///
+    /// The bound is `Send` (not `Send + Sync`) to match the connection's other
+    /// boxed-trait field [`disconnect_hook`](Self::set_disconnect_hook) (also
+    /// `Send`-only) — a `Connection` is moved between async tasks but never
+    /// shared, so protocol sessions that are `Send` but not `Sync` (e.g. a
+    /// `russh` client handle) can be parked here.
+    proto_state: Option<Box<dyn core::any::Any + Send>>,
     /// An optional notifier for the owning multi handle, invoked when the
     /// connection becomes multiplexed (the C `Curl_multi_connchanged`).
     attached_multi: Option<ConnChangedNotifier>,
@@ -510,6 +525,7 @@ impl Connection {
             connect_only: false,
             remote_addr: [None; NUM_SOCKETS],
             disconnect_hook: None,
+            proto_state: None,
             attached_multi: None,
             attached_xfers: 0,
             lastused: now,
@@ -610,6 +626,38 @@ impl Connection {
     /// importing `crate::protocols`).
     pub fn set_disconnect_hook(&mut self, hook: DisconnectHook) {
         self.disconnect_hook = Some(hook);
+    }
+
+    /// Install opaque per-connection protocol state (the C `conn->proto` /
+    /// `CURL_META_SSH_CONN` analog). Any previously stored state is dropped.
+    ///
+    /// The state is type-erased (`dyn Any`) so that `conn/` never depends on
+    /// `crate::protocols`; protocol engines retrieve their concrete type via
+    /// [`proto_state_mut`](Self::proto_state_mut).
+    pub fn set_proto_state(&mut self, state: Box<dyn core::any::Any + Send>) {
+        self.proto_state = Some(state);
+    }
+
+    /// Borrow the per-connection protocol state, downcast to the protocol's
+    /// concrete type `T`. Returns `None` if no state is installed or the stored
+    /// state is not a `T`.
+    #[must_use]
+    pub fn proto_state_mut<T: core::any::Any>(&mut self) -> Option<&mut T> {
+        self.proto_state.as_mut().and_then(|b| b.downcast_mut::<T>())
+    }
+
+    /// Borrow the per-connection protocol state immutably, downcast to `T`.
+    #[must_use]
+    pub fn proto_state_ref<T: core::any::Any>(&self) -> Option<&T> {
+        self.proto_state.as_ref().and_then(|b| b.downcast_ref::<T>())
+    }
+
+    /// Remove and return the per-connection protocol state, so the protocol
+    /// engine can take ownership during done/disconnect (e.g. to move the live
+    /// session into the [`disconnect_hook`](Self::set_disconnect_hook) closure).
+    #[must_use]
+    pub fn take_proto_state(&mut self) -> Option<Box<dyn core::any::Any + Send>> {
+        self.proto_state.take()
     }
 
     /// Attach the owning multi handle's change notifier (invoked by

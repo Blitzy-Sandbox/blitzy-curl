@@ -344,7 +344,12 @@ fn des56(key7: &[u8; 7], plaintext8: &[u8; 8]) -> [u8; 8] {
 /// each, and concatenates the three 8-byte results into a 24-byte response.
 /// This is curl's `Curl_ntlm_core_lm_resp`, used for both the LM and the NTLMv1
 /// responses.
-fn lm_resp(keys21: &[u8; 21], plaintext8: &[u8; 8]) -> [u8; 24] {
+///
+/// Exposed at `pub(crate)` so the SMB protocol engine
+/// ([`crate::protocols::smb`]) can build the raw LM/NT responses its
+/// `SESSION_SETUP_ANDX` message carries (curl's `lib/smb.c` calls
+/// `Curl_ntlm_core_lm_resp` directly), keeping all NTLM crypto in this module.
+pub(crate) fn lm_resp(keys21: &[u8; 21], plaintext8: &[u8; 8]) -> [u8; 24] {
     let mut out = [0u8; 24];
     let mut k = [0u8; 7];
 
@@ -365,7 +370,11 @@ fn lm_resp(keys21: &[u8; 21], plaintext8: &[u8; 8]) -> [u8; 24] {
 /// NUL-pad it to 14 bytes, then DES-encrypt the magic constant `"KGS!@#$%"`
 /// under each 7-byte half. The two 8-byte ciphertexts form the 16-byte LM hash,
 /// zero-extended to 21 bytes so it can drive [`lm_resp`].
-fn mk_lm_hash(password: &[u8]) -> [u8; 21] {
+///
+/// Exposed at `pub(crate)` for the SMB protocol engine
+/// ([`crate::protocols::smb`]), whose `SESSION_SETUP_ANDX` authentication uses
+/// curl's `Curl_ntlm_core_mk_lm_hash` directly.
+pub(crate) fn mk_lm_hash(password: &[u8]) -> [u8; 21] {
     /// The fixed DES plaintext for the LM hash (ASCII `"KGS!@#$%"`).
     const MAGIC: [u8; 8] = *b"KGS!@#$%";
 
@@ -392,7 +401,11 @@ fn mk_lm_hash(password: &[u8]) -> [u8; 21] {
 /// Builds the NT hashed password, curl's `Curl_ntlm_core_mk_nt_hash`: MD4 of
 /// the UTF-16LE password, zero-extended to 21 bytes so it can drive
 /// [`lm_resp`].
-fn mk_nt_hash(password: &[u8]) -> [u8; 21] {
+///
+/// Exposed at `pub(crate)` for the SMB protocol engine
+/// ([`crate::protocols::smb`]), whose `SESSION_SETUP_ANDX` authentication uses
+/// curl's `Curl_ntlm_core_mk_nt_hash` directly.
+pub(crate) fn mk_nt_hash(password: &[u8]) -> [u8; 21] {
     let unicode = ascii_to_utf16le(password);
     let digest = md4it(&unicode); // [u8; 16]
     let mut out = [0u8; 21];

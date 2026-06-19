@@ -12,8 +12,8 @@
 //! Per-transfer callbacks for the `curl-rs` CLI.
 //!
 //! Each submodule ports one of curl's `src/tool_cb_*.c` callback units — the
-//! write/read/seek/progress callbacks and the `CURLOPT_DEBUGFUNCTION` trace
-//! callback. Each callback is a memory-safe function that the integration layer
+//! write/read/seek/header/progress callbacks and the `CURLOPT_DEBUGFUNCTION`
+//! trace callback. Each callback is a memory-safe function that the integration layer
 //! ([`crate::operate`]) wires to the corresponding `CURLOPT_*FUNCTION`/
 //! `CURLOPT_*DATA` setter; together they implement curl's observable I/O
 //! behavior (output, upload, resume, header capture, the progress meter, and
@@ -23,6 +23,10 @@
 //!
 //! * [`debug`] — the `CURLOPT_DEBUGFUNCTION` `-v`/`--trace`/`--trace-ascii`
 //!   trace callback (`src/tool_cb_dbg.c`).
+//! * [`header`] — the `CURLOPT_HEADERFUNCTION` header callback: `-D`/`--dump-header`
+//!   file output, `-J`/`--remote-header-name` Content-Disposition filename
+//!   derivation, `--etag-save` capture, and styled/OSC-8-hyperlinked header echo
+//!   (`src/tool_cb_hdr.c`).
 //! * [`progress`] — the `-#`/`--progress-bar` `CURLOPT_XFERINFOFUNCTION`
 //!   callback; owns the [`ProgressData`] state that
 //!   `crate::operate::PerTransfer` embeds (`src/tool_cb_prg.c`).
@@ -44,6 +48,7 @@
 //! callback.
 
 pub mod debug;
+pub mod header;
 pub mod progress;
 pub mod read;
 pub mod seek;

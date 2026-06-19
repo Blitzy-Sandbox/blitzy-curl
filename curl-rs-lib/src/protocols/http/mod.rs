@@ -12,6 +12,15 @@
 //! * [`aws_sigv4`] — AWS Signature Version 4 request signing
 //!   (`lib/http_aws_sigv4.c`): the canonical request, string-to-sign, signing-key
 //!   HMAC chain, and `Authorization: AWS4-HMAC-SHA256 …` header value.
+//! * [`h1`] — the HTTP/1.1 protocol engine (`lib/http.c`, `lib/http1.c`): the
+//!   request builder (method, target, default + custom headers in curl's exact
+//!   order), the `Expect: 100-continue` handshake, the hand-rolled wire codec
+//!   (request-head serialization, status-line / header parsing, and
+//!   Content-Length / chunked / close-delimited body de-framing), and the
+//!   redirect-method-rewrite and connection-reuse policy helpers. It orchestrates
+//!   but does not re-implement auth, cookies, content-decoding, the chunked
+//!   codec, the proxy target, or AWS signing — those are delegated to their
+//!   dedicated modules.
 //! * [`chunks`] — the HTTP/1.1 chunked Transfer-Encoding codec
 //!   (`lib/http_chunks.c`): a resumable, byte-exact decoder for response bodies
 //!   (with trailer capture and the `--raw` pass-through path) and an encoder for
@@ -22,7 +31,7 @@
 //!   (`lib/http_proxy.c` `dynhds_add_custom`). This is **not** the `CONNECT`
 //!   tunnel filter (that lives in [`crate::conn`] and [`crate::proxy`]).
 //!
-//! The remaining engines — `h1`, `h2`, `h3`, and the proxy-connect helpers — are
+//! The remaining engines — `h2`, `h3`, and the proxy-connect helpers — are
 //! authored by sibling migration steps and declared here as they land.
 //!
 //! # Memory safety
@@ -44,4 +53,5 @@
 
 pub mod aws_sigv4;
 pub mod chunks;
+pub mod h1;
 pub mod proxy;
