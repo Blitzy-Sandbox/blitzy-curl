@@ -72,6 +72,7 @@ pub mod version;
 
 // Public-facing helpers and data models.
 pub mod escape; // URL percent-encode / -decode (`lib/escape.c`).
+pub mod getinfo; // Typed `curl_easy_getinfo` info retrieval (`lib/getinfo.c`).
 pub mod headers; // Response-header data model (`lib/headers.c`).
 pub mod options; // Option metadata table (`lib/easyoptions.c`).
 pub mod setopt; // Typed `curl_easy_setopt` option application (`lib/setopt.c`).
@@ -98,6 +99,11 @@ pub mod progress; // Transfer progress accounting, timers, and the progress mete
 pub mod ratelimit; // Transfer rate limiting / pacing.
 pub mod request; // Per-request buffer and byte accounting.
 pub mod transfer; // The async transfer engine (type-state flow) — `lib/transfer.c`.
+
+// The easy-handle engine: the opaque `CURL` handle lifecycle and the easy API
+// (`curl_easy_init`/`setopt`/`getinfo`/`perform`/`reset`/`duphandle`/`pause`/
+// `recv`/`send`/`upkeep`) plus process-global init/cleanup/sslset (`lib/easy.c`).
+pub mod easy;
 
 // Subsystem module trees.
 pub mod auth; // Authentication: HTTP schemes + the shared SASL state machine (`lib/vauth/`, `lib/curl_sasl.c`, …).
