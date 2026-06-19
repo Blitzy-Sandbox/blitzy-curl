@@ -137,16 +137,33 @@ libc.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 
 # =============================================================================
-# [build-dependencies] — exactly one.
+# [build-dependencies] — exactly two.
 #
 # `cbindgen` (version pinned by the workspace) is used by `build.rs` to
 # (re)generate `include/curl/curl.h` from this crate's `extern "C"` /
 # `#[no_mangle]` / `#[repr(C)]` items (AAP §0.5.2). The curated `include/curl/*.h`
 # headers remain authoritative; cbindgen is a synchronization / verification
-# mechanism (see `curl-rs-ffi/cbindgen.toml`). This is the ONLY build-dependency.
+# mechanism (see `curl-rs-ffi/cbindgen.toml`).
+#
+# `cc` compiles the C ABI trampolines under `csrc/*.c` (see `build.rs`). Those
+# shims define the exported `curl_*` symbols whose ABI stable Rust CANNOT
+# express — the C-variadic / `va_list` printf family (`curl_mprintf` & friends;
+# see `src/mprintf.rs`) and the variadic `curl_easy_setopt` / `curl_easy_getinfo`
+# / `curl_multi_setopt` / `curl_formadd` shims (`c_variadic` and
+# `core::ffi::VaList` are nightly-only; AAP §0.7.2).
+#
+# DOCUMENTED no-C-mandate exception (AAP §0.8.2/§0.8.3): AAP §0.8.2 bans C
+# linkage against `libcurl` / `libssl` / C TLS libraries and C protocol/TLS
+# backends. `cc` here builds NONE of those — only dependency-free
+# calling-convention adapters that forward to the platform C library's standard
+# `printf` family / dispatch into the safe Rust core. No third-party C library
+# is linked. This is the established, minimal mechanism for a C ABI that stable
+# Rust cannot express; it does not weaken the memory-safety mandate (all such
+# `unsafe`/raw-pointer handling already lives in this FFI crate, AAP §0.7.1).
 # =============================================================================
 [build-dependencies]
 cbindgen.workspace = true
+cc.workspace = true
 
 # =============================================================================
 # [features] — minimal; protocol / capability features are OWNED by curl-rs-lib.

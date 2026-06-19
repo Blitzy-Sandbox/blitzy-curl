@@ -199,6 +199,18 @@ libc = "=0.2.186"
 # here so the FFI crate can reference it as `cbindgen.workspace = true` under
 # its own [build-dependencies] table.
 cbindgen = "=0.29.4"
+# `cc` is a BUILD-dependency of curl-rs-ffi: it compiles the tiny C ABI
+# trampolines under `curl-rs-ffi/csrc/*.c` that bridge calling conventions
+# stable Rust cannot express — the C-variadic / `va_list` printf family
+# (`curl_mprintf` & friends) and the variadic `curl_easy_setopt` /
+# `curl_easy_getinfo` / `curl_multi_setopt` / `curl_formadd` shims (AAP §0.7.2).
+# This is the documented no-C-mandate exception (AAP §0.8.2/§0.8.3): the
+# trampolines forward to the platform C library only and link NO third-party C
+# library (no TLS/protocol backend). Pinned to the version already present in
+# Cargo.lock (a transitive build dep of aws-lc-sys / ring / zstd-sys), so adding
+# it here introduces no lockfile churn. Referenced as `cc.workspace = true`
+# under curl-rs-ffi's [build-dependencies].
+cc = "=1.2.64"
 
 # ---- crypto / auth (NTLM, Digest, SASL, SCRAM) -----------------------------
 sha2 = "=0.10.9"

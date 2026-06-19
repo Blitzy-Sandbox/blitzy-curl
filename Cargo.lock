@@ -728,6 +728,7 @@ name = "curl-rs-ffi"
 version = "8.19.0"
 dependencies = [
  "cbindgen",
+ "cc",
  "curl-rs-lib",
  "libc",
  "tokio",

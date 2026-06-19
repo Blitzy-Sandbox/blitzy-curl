@@ -65,6 +65,13 @@
 //! dangling or speculative `mod` declarations), and it compiles cleanly under
 //! the default, all-features, and no-default-features configurations.
 
+/// The connection pool / cache (`lib/conncache.c` + `lib/conncache.h`): the
+/// per-destination bundles of reusable connections, the per-host/total/idle
+/// connection limits, oldest-idle eviction, dead-connection pruning, and the
+/// network-change invalidation. Shareable across easy handles as an
+/// `Arc<Mutex<ConnectionPool>>`; the reuse-eligibility predicate itself is
+/// `crate::url`'s responsibility, invoked through `ConnectionPool::find`.
+pub mod cache;
 pub mod filters;
 /// Connection setup and the SETUP meta-filter chain-builder (`lib/connect.c` +
 /// `lib/connect.h`): assembles the connection-filter stack in the canonical

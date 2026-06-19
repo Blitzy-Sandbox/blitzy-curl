@@ -42,6 +42,15 @@ use curl_rs_lib::version;
 #[allow(dead_code)]
 mod writeout_json;
 
+// `urlglob` — curl's URL-globbing engine (port of `src/tool_urlglob.c`). It is a
+// dependency-free leaf module (it relies only on `curl-rs-lib`), so it is staged
+// into the binary now to be compiled, clippy-linted, and unit-tested as part of
+// the build, following the same `allow(dead_code)` construction-order staging as
+// `writeout_json` above. The `allow(dead_code)` is removed once `operate`/`config`
+// drive it (`config::State` already names `crate::urlglob::UrlGlob`).
+#[allow(dead_code)]
+mod urlglob;
+
 /// curl-rs — a memory-safe Rust reimplementation of the `curl` command-line
 /// tool.
 ///

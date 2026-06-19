@@ -142,12 +142,10 @@ pub mod slist;
 /// C-heap string allocation contract that `curl_free` reclaims.
 pub mod global;
 
-// The easy-handle API (`curl_easy_init` / `setopt` / `perform` / `getinfo` /
-// `cleanup` / …). The opaque `CURL` handle wraps `core::Easy`;
-// `curl_easy_perform` is the canonical [`block_on`] bridge point (AAP §0.4.4).
-// Declaration disabled until `easy.rs` is authored (AAP §0.8.4 step 13);
-// re-enable by uncommenting once the module file is present.
-// pub mod easy;
+/// The easy-handle API (`curl_easy_init` / `setopt` / `perform` / `getinfo` /
+/// `cleanup` / …). The opaque `CURL` handle wraps `core::Easy`;
+/// `curl_easy_perform` is the canonical [`block_on`] bridge point (AAP §0.4.4).
+pub mod easy;
 
 // The multi-interface API (`curl_multi_*`, `curl_pushheader_*`). The opaque
 // `CURLM` handle wraps `core::Multi`; the drive functions bridge the
@@ -161,11 +159,11 @@ pub mod global;
 /// (`Arc<Mutex<…>>`-backed).
 pub mod share;
 
-// The URL API (`curl_url`, `curl_url_dup`, `curl_url_get`, `curl_url_set`,
-// `curl_url_strerror`, `curl_url_cleanup`) over `core::Url`.
-// Declaration disabled until `url.rs` is authored (AAP §0.8.4 step 13);
-// re-enable by uncommenting once the module file is present.
-// pub mod url;
+/// The URL API (`curl_url`, `curl_url_dup`, `curl_url_get`, `curl_url_set`,
+/// `curl_url_strerror`, `curl_url_cleanup`) over `core::url::CurlUrl`. The
+/// opaque `CURLU` handle boxes a [`core::url::CurlUrl`]; `curl_url_get` hands
+/// out caller-owned strings reclaimed via `curl_free`.
+pub mod url;
 
 /// The WebSockets API (`curl_ws_recv` / `curl_ws_send` / `curl_ws_start_frame` /
 /// `curl_ws_meta`); the blocking `recv` / `send` also bridge via [`block_on`].
@@ -178,17 +176,19 @@ pub mod options;
 /// The response-header API (`curl_easy_header`, `curl_easy_nextheader`).
 pub mod header;
 
-// The `curl_mprintf` printf family (`curl_mprintf` / `mfprintf` / `msprintf` /
-// `msnprintf` / `maprintf` and the `v*` variants).
-// Declaration disabled until `mprintf.rs` is authored (AAP §0.8.4 step 13);
-// re-enable by uncommenting once the module file is present.
-// pub mod mprintf;
+/// The `curl_mprintf` printf family (`curl_mprintf` / `mfprintf` / `msprintf` /
+/// `msnprintf` / `maprintf` and the `v*printf` variants). The ten symbols are
+/// C-variadic / `va_list`-taking and so cannot be defined in stable Rust; they
+/// are provided by the `csrc/mprintf.c` trampoline compiled and linked by
+/// `build.rs` (AAP §0.7.2). This module documents that strategy and carries the
+/// behavioral tests for it; it defines no `#[no_mangle]` symbols itself.
+pub mod mprintf;
 
-// The MIME / multipart form-data API (`curl_mime_*`) plus the legacy
-// `curl_formadd` / `curl_formget` / `curl_formfree` form symbols.
-// Declaration disabled until `mime.rs` is authored (AAP §0.8.4 step 13);
-// re-enable by uncommenting once the module file is present.
-// pub mod mime;
+/// The MIME / multipart form-data API (`curl_mime_*`) plus the legacy
+/// `curl_formadd` / `curl_formget` / `curl_formfree` form symbols. The variadic
+/// `curl_formadd` symbol itself is provided by a C trampoline
+/// (`csrc/formadd_trampoline.c`) that calls this module's `curlrs_formadd_impl`.
+pub mod mime;
 
 // ===========================================================================
 // The sync-over-async `block_on` bridge (AAP §0.4.4).
