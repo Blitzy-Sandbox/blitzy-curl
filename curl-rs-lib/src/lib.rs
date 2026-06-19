@@ -74,6 +74,7 @@ pub mod version;
 pub mod escape; // URL percent-encode / -decode (`lib/escape.c`).
 pub mod headers; // Response-header data model (`lib/headers.c`).
 pub mod options; // Option metadata table (`lib/easyoptions.c`).
+pub mod setopt; // Typed `curl_easy_setopt` option application (`lib/setopt.c`).
 pub mod slist; // `curl_slist` string list (`lib/slist.c`).
 pub mod url; // URL parsing / building — the URL API (`lib/url.c`, `lib/urlapi.c`).
 
@@ -101,6 +102,7 @@ pub mod transfer; // The async transfer engine (type-state flow) — `lib/transf
 // Subsystem module trees.
 pub mod auth; // Authentication: HTTP schemes + the shared SASL state machine (`lib/vauth/`, `lib/curl_sasl.c`, …).
 pub mod conn; // Connection-filter chain + filters (`lib/cfilters.c`, `lib/cf-*.c`).
+pub mod dns; // Name resolution: system resolver, DoH, optional hickory backend (`lib/hostip.c`, `lib/doh.c`, `lib/asyn-*.c`).
 pub mod protocols; // Per-protocol engines and codecs (`lib/http*.c`, `lib/ftp.c`, …).
 pub mod proxy; // SOCKS / HTTP proxy + no-proxy matching (`lib/socks.c`, …).
 pub mod tls; // The single `rustls` TLS backend (`lib/vtls/`).
