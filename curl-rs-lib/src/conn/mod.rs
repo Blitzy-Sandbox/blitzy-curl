@@ -66,6 +66,11 @@
 //! the default, all-features, and no-default-features configurations.
 
 pub mod filters;
+/// Connection setup and the SETUP meta-filter chain-builder (`lib/connect.c` +
+/// `lib/connect.h`): assembles the connection-filter stack in the canonical
+/// order (EYEBALLS → SOCKS → HTTP-PROXY → HAPROXY → SSL), plus the connect-
+/// timeout budget, `conncontrol`, and address formatting.
+pub mod connect;
 /// The HTTP/1.x `CONNECT` tunnel filter (`lib/cf-h1-proxy.c`), gated on curl's
 /// `!CURL_DISABLE_PROXY && !CURL_DISABLE_HTTP` ⇒ the `proxy` + `http` features.
 #[cfg(all(feature = "proxy", feature = "http"))]
