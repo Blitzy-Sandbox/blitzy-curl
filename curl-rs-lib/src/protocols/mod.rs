@@ -25,6 +25,18 @@
 //! [`http`] and its codecs — which makes the "zero `unsafe` outside the FFI
 //! crate" rule (AAP §0.7.1) compiler-enforced across the whole protocol tree.
 //! Descendant modules therefore do **not** re-declare it.
+//!
+//! # Scope
+//!
+//! This file is a minimal module root — module wiring and documentation only,
+//! with no protocol implementation logic of its own. It is formally in scope for
+//! this single-phase migration (AAP §0.5.4: the migration ships in one phase and
+//! *"No file is deferred to a later phase"*); the [`http`] subtree it declares is
+//! authored and reviewed within this checkpoint, and the crate cannot compile
+//! without this declaration point. It was therefore reviewed in full rather than
+//! deferred — its single declaration matches the directory contents and it
+//! compiles cleanly under the default, all-features, and no-default-features
+//! configurations.
 
 #![forbid(unsafe_code)]
 

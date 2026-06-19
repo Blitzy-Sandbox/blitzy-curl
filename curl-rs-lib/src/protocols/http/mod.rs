@@ -24,6 +24,18 @@
 //!
 //! This subtree inherits `#![forbid(unsafe_code)]` from [`crate::protocols`]; it
 //! is intentionally **not** re-declared here.
+//!
+//! # Scope
+//!
+//! This file is a minimal module root — `pub mod` wiring and documentation only,
+//! with no HTTP implementation logic of its own (the codecs live in the leaf
+//! modules above). It is formally in scope for this single-phase migration
+//! (AAP §0.5.4: one-phase delivery, *"No file is deferred to a later phase"*);
+//! the [`aws_sigv4`] and [`chunks`] codecs it declares are authored and reviewed
+//! within this checkpoint, and the crate cannot compile without their
+//! declaration point. It was therefore reviewed in full rather than deferred —
+//! its declarations match the directory contents and it compiles cleanly under
+//! the default, all-features, and no-default-features configurations.
 
 pub mod aws_sigv4;
 pub mod chunks;

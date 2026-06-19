@@ -19,14 +19,21 @@
 //!
 //! # Memory safety
 //!
-//! Per AAP §0.7.1 the safe core forbids `unsafe`. Each leaf submodule that is
-//! provably allocation- and raw-pointer-free opts into `#![forbid(unsafe_code)]`
-//! at its own root (the crate root deliberately does **not** apply a single
-//! crate-wide forbid, so the few audited OS-integration primitives — e.g.
-//! [`nonblock`] and [`select`] — can keep their minimal, `// SAFETY:`-documented
-//! `unsafe` where the operating system requires it). This aggregator file is
-//! pure module wiring and therefore contains no `unsafe` of its own and imposes
-//! no blanket forbid that would override a submodule's own choice.
+//! Per AAP §0.7.1 the safe core forbids `unsafe`, and that rule is
+//! compiler-enforced **crate-wide**: the crate root (`curl-rs-lib/src/lib.rs`)
+//! applies `#![forbid(unsafe_code)]`, so every module in this crate — this
+//! `util` aggregator and each of its leaves included — is compiled with
+//! `unsafe` forbidden. There is therefore **no `unsafe` anywhere in
+//! `curl-rs-lib`**; all raw-pointer / `va_list` / C-ABI handling (and hence all
+//! `unsafe`) is confined to the `curl-rs-ffi` crate.
+//!
+//! Several leaf submodules — including the OS-integration primitives
+//! [`nonblock`] and [`select`] — additionally restate `#![forbid(unsafe_code)]`
+//! at their own root. Re-forbidding an already-forbidden lint is an idempotent
+//! no-op; it simply keeps each file's safety contract self-evident when the file
+//! is read or audited in isolation. Those primitives perform their work through
+//! safe std/`tokio` APIs and contain no `unsafe`. This aggregator file is itself
+//! pure module wiring and contains no `unsafe` of its own.
 //!
 //! # Submodules
 //!

@@ -575,15 +575,17 @@ where
 // =============================================================================
 
 /// The pinned `rustls` dependency version, kept in lockstep with the workspace
-/// `Cargo.toml` pin (`rustls = "0.23.36"`) and `crate::version`'s `SSL_VERSION`
+/// `Cargo.toml` pin (`rustls = "=0.23.36"`) and `crate::version`'s `SSL_VERSION`
 /// constant.
 ///
 /// `rustls` does not expose its own version string at runtime, so — as the AAP
 /// permits — this is a documented constant. The single source of truth for the
 /// pin is the workspace manifest; if it changes, update this constant (and
-/// `crate::version`) to match. A `Cargo.lock` may resolve a newer patch on the
-/// same `0.23.x` line, but the *advertised* contract version is the pin, exactly
-/// as curl reports its configured TLS-backend version.
+/// `crate::version`) to match. The manifest uses an **exact** requirement
+/// (`=0.23.36`, AAP §0.6.1/§0.8.1/§0.8.3), so `Cargo.lock` resolves *exactly*
+/// this version — never a newer patch on the `0.23.x` line — guaranteeing the
+/// advertised contract version equals the compiled crate, exactly as curl
+/// reports its configured TLS-backend version.
 pub const RUSTLS_VERSION: &str = "0.23.36";
 
 /// Returns the TLS-backend version string for `crate::version`'s `ssl_version`

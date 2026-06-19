@@ -1060,8 +1060,15 @@ pub fn host_is_ipnum(host: &str) -> bool {
 /// the resolver only declines a family it cannot represent at all.
 #[must_use]
 pub fn can_resolve_ip_version(ip_version: IpVersion) -> bool {
+    // Whether IPv6 is compiled in. Binding the `cfg!` result to a local (instead
+    // of placing the literal directly in the match arm) means the arms are not
+    // both bool *literals*, so the expression is not reducible to a `matches!`
+    // call. That keeps the function clippy-clean (`clippy::match_like_matches_macro`)
+    // in BOTH builds — with the `ipv6` feature on (`true`) and off (`false`) —
+    // which the `--no-default-features` lint gate exercises (AAP §0.6.2).
+    let ipv6_supported = cfg!(feature = "ipv6");
     match ip_version {
-        IpVersion::V6 => cfg!(feature = "ipv6"),
+        IpVersion::V6 => ipv6_supported,
         _ => true,
     }
 }

@@ -93,14 +93,28 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::{Arc, Mutex, RwLock};
+// `Arc` and `RwLock` back the share handle itself (`Arc<RwLock<SharedData>>`),
+// so they are always used. `Mutex`, by contrast, guards only the per-resource
+// shared slots (`Arc<Mutex<CookieJar>>`, `Arc<Mutex<HstsStore>>`,
+// `Arc<Mutex<Psl>>`), each of which is feature-gated. With none of those
+// capabilities compiled in (e.g. `--no-default-features`) `Mutex` is unused, so
+// its import carries the same `#[cfg]` predicate as its uses — keeping curl's
+// compile-time feature-disable model (AAP §0.6.2) clippy-clean.
+use std::sync::{Arc, RwLock};
+#[cfg(any(feature = "cookies", feature = "hsts", feature = "psl"))]
+use std::sync::Mutex;
 
 // `crate::error::CurlShError` is the share result-code enum; its discriminants
 // are the exact `CURLSHcode` integers consumed at the FFI boundary.
 use crate::error::CurlShError;
 
-// The Public Suffix List handle is always available (the `Psl` type has a
-// zero-sized fallback when the `psl` feature is off — see `crate::psl`).
+// The Public Suffix List type is named here only by the `psl`-gated shared slot
+// below (`Arc<Mutex<Psl>>`), so the import carries the same `#[cfg]` as its uses;
+// with the `psl` feature off that slot does not exist and the import would
+// otherwise be unused. (The `Psl` type itself always exists — `crate::psl`
+// provides a zero-sized fallback when the feature is off — but it is not
+// referenced by name in that build.)
+#[cfg(feature = "psl")]
 use crate::psl::Psl;
 
 // The cookie jar and HSTS store types only exist when their feature is enabled
@@ -927,6 +941,12 @@ impl Share {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `Arc` is named here only by `Arc::ptr_eq` in the `cookies`-gated
+    // `cookie_sharing_allocates_and_releases_the_jar` test; every other test uses
+    // `Share::clone()` (an inherent method needing no `Arc` import). Gate the
+    // import with the same predicate so `--no-default-features` test builds stay
+    // clippy-clean.
+    #[cfg(feature = "cookies")]
     use std::sync::Arc;
 
     /// Compile-time proof that the handle and its inner state are thread-safe,

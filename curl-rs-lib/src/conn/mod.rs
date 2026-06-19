@@ -50,6 +50,20 @@
 //! authored as sibling submodules in their own migration steps; this `mod.rs`
 //! is the single declaration point that wires the connection submodules into
 //! the crate as they land.
+//!
+//! # Scope
+//!
+//! This file is a minimal module root: it contains only `pub mod` wiring and
+//! documentation — there is no connection or filter implementation logic of its
+//! own, which lives entirely in the leaf submodules listed above. It is formally
+//! in scope for this single-phase migration (AAP §0.5.4: *"the entire migration
+//! is executed in a single Blitzy phase … No file is deferred to a later
+//! phase"*): the connection leaves it declares are authored and reviewed within
+//! this checkpoint, and the crate cannot compile without their declaration
+//! point. The file was therefore reviewed in full alongside those leaves rather
+//! than deferred — declaration set verified against the directory contents (no
+//! dangling or speculative `mod` declarations), and it compiles cleanly under
+//! the default, all-features, and no-default-features configurations.
 
 pub mod filters;
 /// The HTTP/1.x `CONNECT` tunnel filter (`lib/cf-h1-proxy.c`), gated on curl's
