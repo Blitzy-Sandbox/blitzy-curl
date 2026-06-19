@@ -56,7 +56,16 @@ pub mod filters;
 /// `!CURL_DISABLE_PROXY && !CURL_DISABLE_HTTP` ⇒ the `proxy` + `http` features.
 #[cfg(all(feature = "proxy", feature = "http"))]
 pub mod h1_proxy;
+/// The HTTP/2 `CONNECT` tunnel filter (`lib/cf-h2-proxy.c`), gated on curl's
+/// `!CURL_DISABLE_HTTP && !CURL_DISABLE_PROXY && USE_NGHTTP2` ⇒ the `proxy` +
+/// `http` + `http2` features (an HTTP/2 proxy filter requires HTTP/2 support).
+#[cfg(all(feature = "proxy", feature = "http", feature = "http2"))]
 pub mod h2_proxy;
+/// RFC 8305 Happy-Eyeballs v2 (`lib/cf-ip-happy.c`): the bottom "EYEBALLS"
+/// filter that establishes the transport by racing IPv4/IPv6 candidate
+/// addresses (alternating families, ~200 ms staggered attempts), promoting the
+/// first to connect as its `next` and tearing down the losers.
+pub mod happy_eyeballs;
 pub mod haproxy;
 pub mod socket;
 pub mod shutdown;
