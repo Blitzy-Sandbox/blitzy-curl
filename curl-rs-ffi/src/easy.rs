@@ -489,6 +489,15 @@ pub unsafe extern "C" fn curl_easy_perform(handle: *mut CURL) -> CURLcode {
         None => return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
     };
 
+    // Resolve a stored `CURLOPT_CURLU` pointer into an owned URL clone now, at
+    // perform time — curl reads the `CURLU` handle here, not at setopt. This is
+    // the deferred dereference that implements the store-only contract; a NULL
+    // (unset) `uh_ptr` is a no-op.
+    // SAFETY: per `curl_easy_perform`'s `# Safety` contract the handle is valid
+    // and exclusively borrowed here, and the caller upholds curl's contract that
+    // the `CURLU` passed to `CURLOPT_CURLU` remains valid until the transfer.
+    unsafe { resolve_curlu(easy) };
+
     // Bridge the consumer's registered C callbacks to the core's sink/source so
     // the transfer routes body/header bytes to `CURLOPT_WRITEFUNCTION` /
     // `HEADERFUNCTION` and pulls upload bytes from `CURLOPT_READFUNCTION`. The
@@ -681,8 +690,15 @@ unsafe fn build_object_value(
     match opt {
         // SAFETY: `CURLOPT_SHARE`'s `arg` is NULL or a live `CURLSH *`.
         O::CURLOPT_SHARE => V::Share(unsafe { clone_share(arg) }),
-        // SAFETY: `CURLOPT_CURLU`'s `arg` is NULL or a live `CURLU *`.
-        O::CURLOPT_CURLU => V::Curlu(unsafe { clone_curlu(arg) }),
+        // `CURLOPT_CURLU` stores the caller's `CURLU *` as an opaque address
+        // WITHOUT dereferencing it, honouring curl's store-only contract
+        // (`lib/setopt.c`: `s->uh = (CURLU *)ptr;`). The pointer is dereferenced
+        // and cloned into the handle only at perform time (see [`resolve_curlu`],
+        // invoked by [`curl_easy_perform`] and `curl_multi_add_handle`). This is
+        // a plain address store — no `unsafe` — so the dummy pointer that
+        // `tests/libtest/lib1521` deliberately passes to verify the contract is
+        // accepted without being touched.
+        O::CURLOPT_CURLU => V::Ptr(core::setopt::CDataPtr(arg)),
         // SAFETY: `CURLOPT_COPYPOSTFIELDS`'s `arg` is NULL or points to a body of
         // the length implied by `postfieldsize`.
         O::CURLOPT_COPYPOSTFIELDS => V::Bytes(unsafe { copy_postfields(arg, postfieldsize) }),
@@ -775,20 +791,41 @@ unsafe fn clone_share(arg: usize) -> Option<core::Share> {
     }
 }
 
-/// Deep-copy the [`core::Url`](curl_rs_lib::Url) behind a `CURLU *` argument
-/// (NULL → `None`), so the easy handle owns an independent URL (curl dups the
-/// passed `CURLU` handle).
+/// Resolve a handle's stored `CURLOPT_CURLU` pointer into an owned URL clone,
+/// just before a transfer is driven — the deferred dereference that implements
+/// curl's store-only `CURLOPT_CURLU` contract.
+///
+/// `curl_easy_setopt(CURLOPT_CURLU, ptr)` stores `ptr` verbatim in
+/// `easy.set.uh_ptr` without touching it (matching `lib/setopt.c`'s
+/// `s->uh = (CURLU *)ptr;`), so a dummy pointer that is never performed against
+/// (as `tests/libtest/lib1521` passes) cannot crash. curl reads the handle at
+/// perform time; this function reproduces that by dereferencing the stored
+/// pointer and depositing an owned [`core::url::CurlUrl`] clone into
+/// `easy.set.uh`, which the transfer engine then reads (`Easy::pre_perform`).
+///
+/// A `NULL` (`0`) stored pointer leaves `easy.set.uh` untouched, so a handle
+/// configured purely via `CURLOPT_URL` — or driven directly by the core without
+/// the FFI — is unaffected. Re-resolving on every perform mirrors curl's
+/// read-at-perform behaviour: a caller that mutates its `CURLU` between performs
+/// sees the change reflected.
 ///
 /// # Safety
-/// `arg` is `0` (NULL) or a live `CURLU *` from `curl_url`.
-#[inline]
-unsafe fn clone_curlu(arg: usize) -> Option<core::Url> {
-    if arg == 0 {
-        None
-    } else {
-        // SAFETY: per the contract `arg` is a live `core::Url` (`Box::into_raw`
-        // of a `Url` by `curl_url`); a shared borrow to deep-copy is sound.
-        Some(unsafe { &*(arg as *const core::Url) }.clone())
+///
+/// If `easy.set.uh_ptr` is non-NULL it must be a live `CURLU *` produced by
+/// `curl_url` / `curl_url_dup` (a `Box::into_raw` of a [`core::url::CurlUrl`])
+/// that has not been cleaned up — i.e. the caller upholds curl's contract that
+/// the `CURLU` handle supplied to `CURLOPT_CURLU` stays valid until the transfer
+/// is performed. `easy` must be a unique borrow (curl's single-thread-per-handle
+/// contract), so writing `easy.set.uh` is sound.
+pub(crate) unsafe fn resolve_curlu(easy: &mut core::Easy) {
+    let addr = easy.set.uh_ptr.0;
+    if addr != 0 {
+        // SAFETY: per this function's contract `addr` is a live `CURLU *`
+        // (`Box::into_raw` of a `core::url::CurlUrl` by `curl_url`/`curl_url_dup`,
+        // not yet cleaned up). A shared borrow to deep-copy is sound, and the
+        // caller owns the original; we only clone it.
+        let url = unsafe { &*(addr as *const core::url::CurlUrl) }.clone();
+        easy.set.uh = Some(url);
     }
 }
 

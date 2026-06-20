@@ -157,7 +157,7 @@ pub struct Blob {
 /// argument.
 // `OptionValue` is a transient dispatch value: the FFI builds exactly one per
 // `curl_easy_setopt` call and `apply` consumes it immediately, so the size
-// disparity between, e.g., `Long(i64)` and `Curlu(Option<CurlUrl>)` carries no
+// disparity between, e.g., `Long(i64)` and `Slist(Option<SList>)` carries no
 // memory cost worth an extra heap indirection. Boxing the large variants would
 // only complicate the FFI marshaling for no practical benefit.
 #[allow(clippy::large_enum_variant)]
@@ -181,8 +181,6 @@ pub enum OptionValue {
     Slist(Option<SList>),
     /// A `CURLSH *` share-handle argument; `None` disconnects the share.
     Share(Option<Share>),
-    /// A `CURLU *` URL-handle argument (`CURLOPT_CURLU`); `None` is `NULL`.
-    Curlu(Option<CurlUrl>),
     /// A function pointer argument (`CURLOPTTYPE_FUNCTIONPOINT`).
     Callback(CCallback),
     /// An opaque object / data pointer argument (`void *`, `FILE *`, `CURL *`,
@@ -246,14 +244,6 @@ impl OptionValue {
     fn into_share(self) -> Result<Option<Share>> {
         match self {
             OptionValue::Share(s) => Ok(s),
-            _ => Err(CurlError::BadFunctionArgument),
-        }
-    }
-
-    /// Consumes the value as an optional [`CurlUrl`].
-    fn into_curlu(self) -> Result<Option<CurlUrl>> {
-        match self {
-            OptionValue::Curlu(u) => Ok(u),
             _ => Err(CurlError::BadFunctionArgument),
         }
     }
@@ -880,8 +870,30 @@ pub struct UserDefined {
     pub hstsfiles: Vec<String>,
 
     // ---- URL handle --------------------------------------------------------
-    /// `CURLOPT_CURLU` pre-parsed URL handle.
+    /// `CURLOPT_CURLU` pre-parsed URL handle, **resolved** to an owned,
+    /// independent [`CurlUrl`] clone.
+    ///
+    /// curl's `CURLOPT_CURLU` contract is store-only: `lib/setopt.c` keeps the
+    /// caller's `CURLU *` pointer (`s->uh = (CURLU *)ptr;`) and only reads it at
+    /// perform time. The raw caller pointer therefore lives in [`Self::uh_ptr`];
+    /// the FFI layer dereferences it and deposits an owned clone here just
+    /// before a transfer is driven (see `curl-rs-ffi`'s `resolve_curlu`). The
+    /// transfer engine, in turn, reads this resolved handle (see
+    /// `Easy::pre_perform`). When the core is driven without the FFI (e.g. unit
+    /// tests set this field directly) `uh_ptr` stays `NULL` and this field is
+    /// authoritative on its own.
     pub uh: Option<CurlUrl>,
+
+    /// The raw `CURLU *` address supplied to `CURLOPT_CURLU`, stored verbatim
+    /// (`0` = `NULL`) without being dereferenced — the safe equivalent of curl's
+    /// `s->uh = (CURLU *)ptr;`.
+    ///
+    /// Holding the address is a safe operation; only the FFI layer dereferences
+    /// it (at perform time, into [`Self::uh`]). Deferring the dereference is what
+    /// makes `curl_easy_setopt(CURLOPT_CURLU, ptr)` honour curl's store-only
+    /// contract: a caller (notably `tests/libtest/lib1521`) may pass a dummy
+    /// pointer that is never read, and setopt must accept it without touching it.
+    pub uh_ptr: CDataPtr,
 
     // ---- shared state ------------------------------------------------------
     /// `CURLOPT_SHARE` attached shared-state handle (`data->share` in curl).
@@ -1225,6 +1237,7 @@ impl Default for UserDefined {
             hstsfiles: Vec::new(),
 
             uh: None,
+            uh_ptr: CDataPtr::NULL,
             share: None,
 
             // TLS: validation ON by default for host TLS; proxy TLS likewise.
@@ -2596,9 +2609,18 @@ fn apply_cptr(set: &mut UserDefined, opt: CurlOption, val: OptionValue) -> Resul
 
     // ---- CURLU: pre-parsed URL handle -------------------------------------
     if opt == O::CURLOPT_CURLU {
-        // Setting a URL handle clears any string URL previously stored.
+        // curl's contract is store-only (`lib/setopt.c`: `s->uh = (CURLU *)ptr;`):
+        // the caller's `CURLU *` is kept verbatim and only read at perform time.
+        // We therefore store the raw address WITHOUT dereferencing it (the FFI
+        // resolves it into `set.uh` just before a transfer, mirroring curl's
+        // read-at-perform behaviour). Eagerly dereferencing here would crash on
+        // the dummy pointer `tests/libtest/lib1521` deliberately passes to verify
+        // this contract. Setting a URL handle clears any string URL previously
+        // stored, and the stale resolved handle (if any) so the next perform
+        // re-resolves from the freshly stored pointer.
         set.set_str(S::SetUrl, None);
-        set.uh = val.into_curlu()?;
+        set.uh_ptr = val.as_ptr()?;
+        set.uh = None;
         return Ok(());
     }
 

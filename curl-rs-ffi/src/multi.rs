@@ -555,7 +555,18 @@ pub unsafe extern "C" fn curl_multi_add_handle(multi: *mut CURLM, easy: *mut CUR
     // SAFETY: `easy` is a live `Box<core::Easy>` (from `curl_easy_init`),
     // exclusively accessible here under curl's single-thread-per-handle
     // contract, so replacing its pointee is sound and leaves a valid `Easy`.
-    let real = unsafe { mem::replace(&mut *(easy as *mut core::Easy), core::Easy::new()) };
+    let mut real = unsafe { mem::replace(&mut *(easy as *mut core::Easy), core::Easy::new()) };
+
+    // Resolve a stored `CURLOPT_CURLU` pointer into an owned URL clone now, before
+    // the core takes ownership and drives the transfer (curl reads the `CURLU`
+    // handle at perform time). This mirrors the easy interface's resolve in
+    // [`crate::easy::curl_easy_perform`] so multi-interface `CURLOPT_CURLU`
+    // consumers behave identically; a NULL (unset) `uh_ptr` is a no-op.
+    // SAFETY: `real` is the live `Easy` just moved out of the caller's handle and
+    // is uniquely owned here; the caller upholds curl's contract that the `CURLU`
+    // passed to `CURLOPT_CURLU` stays valid until the transfer is performed.
+    unsafe { crate::easy::resolve_curlu(&mut real) };
+
     let shared = shared_easy(real);
 
     // Hand a clone to the core; it takes ownership of its clone (enlisting it in
@@ -1453,8 +1464,15 @@ pub unsafe extern "C" fn curl_pushheader_bynum(
 /// `CURLM_UNRECOVERABLE_POLL` (12)). The returned pointer is valid for the life
 /// of the program and must not be freed. Mirrors
 /// `lib/strerror.c:curl_multi_strerror`.
+///
+/// The parameter is a plain `c_int`, **not** the closed `CURLMcode` enum: a C
+/// caller may pass any integer, so receiving it as `c_int` (rather than a
+/// by-value enum, which would materialize an invalid discriminant — undefined
+/// behaviour — for an out-of-range value) keeps the boundary sound. The internal
+/// total mapping falls through to `"Unknown error"` for any unmapped integer,
+/// exactly as `lib/strerror.c`'s `default` arm does.
 #[no_mangle]
-pub extern "C" fn curl_multi_strerror(code: CURLMcode) -> *const c_char {
+pub extern "C" fn curl_multi_strerror(code: c_int) -> *const c_char {
     multi_strerror(code)
 }
 
@@ -1590,11 +1608,26 @@ mod tests {
             CURLMcode::CURLM_UNRECOVERABLE_POLL,
         ];
         for code in codes {
-            let p = curl_multi_strerror(code);
+            let p = curl_multi_strerror(code as c_int);
             assert!(!p.is_null());
             // SAFETY: `multi_strerror` returns a static NUL-terminated string.
             let s = unsafe { CStr::from_ptr(p) };
             assert!(!s.to_bytes().is_empty(), "{code:?} has an empty string");
+        }
+    }
+
+    /// Issue 2 regression: the exported `curl_multi_strerror` takes a `c_int`, so
+    /// a C caller may pass any out-of-range integer without invoking undefined
+    /// behaviour; every unmapped value returns the catch-all "Unknown error"
+    /// string (matching `lib/strerror.c`), never NULL and never a crash.
+    #[test]
+    fn strerror_out_of_range_is_catch_all() {
+        for code in [9999, -5, c_int::MIN, c_int::MAX] {
+            let p = curl_multi_strerror(code);
+            assert!(!p.is_null(), "multi strerror({code}) returned NULL");
+            // SAFETY: returns a static NUL-terminated string for any `c_int`.
+            let s = unsafe { CStr::from_ptr(p) }.to_bytes();
+            assert_eq!(s, b"Unknown error", "multi strerror({code})");
         }
     }
 

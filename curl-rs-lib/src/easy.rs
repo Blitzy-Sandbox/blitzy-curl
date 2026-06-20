@@ -574,6 +574,10 @@ impl Easy {
             cookie_commands: src.cookie_commands.clone(),
             hstsfiles: src.hstsfiles.clone(),
             uh: src.uh.clone(),
+            // Duplicate the raw `CURLOPT_CURLU` pointer verbatim, matching curl's
+            // `curl_easy_duphandle` which copies `set.uh` (the stored pointer).
+            // The dup'd handle re-resolves it into `uh` at its own perform time.
+            uh_ptr: src.uh_ptr,
             ssl: src.ssl.clone(),
             proxy_ssl: src.proxy_ssl.clone(),
             general_ssl: src.general_ssl.clone(),

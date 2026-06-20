@@ -73,7 +73,7 @@
 //! `unsafe extern "C"` entry point documents its preconditions under a
 //! `# Safety` section.
 
-use std::ffi::{c_char, c_void};
+use std::ffi::{c_char, c_int, c_void};
 use std::{mem, ptr};
 
 // Per the crate-wide FFI invariant, the safe async core is reached through the
@@ -415,16 +415,24 @@ pub unsafe extern "C" fn curl_share_cleanup(share: *mut CURLSH) -> CURLSHcode {
 /// `free()` / `curl_free`. No allocation is performed, matching curl, which
 /// returns string literals.
 ///
+/// The parameter is a plain `c_int`, **not** the closed `CURLSHcode` enum: a C
+/// caller may pass any integer, so receiving it as `c_int` (rather than a
+/// by-value enum, which would materialize an invalid discriminant — undefined
+/// behaviour — for an out-of-range value) keeps the boundary sound. The internal
+/// total mapping then falls through to `"CURLSHcode unknown"` for any unmapped
+/// integer, exactly as `lib/strerror.c`'s `default` arm does.
+///
 /// # Safety
 ///
 /// This function performs no pointer dereferences and is sound for every value
-/// of `code` (an out-of-range code maps to the catch-all "CURLSHcode unknown"
+/// of `code` (the parameter is a `c_int`, so every C integer is a valid
+/// argument; an out-of-range code maps to the catch-all "CURLSHcode unknown"
 /// string). It is declared `unsafe extern "C"` only to match curl's published
 /// FFI surface (mirroring `curl_easy_strerror`); callers must nonetheless treat
 /// the returned pointer as borrowed `'static` data and must not free or mutate
 /// it.
 #[no_mangle]
-pub unsafe extern "C" fn curl_share_strerror(code: CURLSHcode) -> *const c_char {
+pub unsafe extern "C" fn curl_share_strerror(code: c_int) -> *const c_char {
     share_strerror_cstr(code).as_ptr()
 }
 
@@ -649,11 +657,28 @@ mod tests {
         ];
         for (code, expected) in cases {
             // SAFETY: curl_share_strerror returns a non-null 'static C string.
-            let p = unsafe { curl_share_strerror(code) };
+            let p = unsafe { curl_share_strerror(code as c_int) };
             assert!(!p.is_null());
             // SAFETY: the returned pointer is a valid NUL-terminated 'static str.
             let got = unsafe { CStr::from_ptr(p) }.to_str().unwrap();
             assert_eq!(got, expected, "strerror mismatch for {code:?}");
+        }
+    }
+
+    /// Issue 2 regression: the exported `curl_share_strerror` takes a `c_int`, so
+    /// a C caller may pass any out-of-range integer without invoking undefined
+    /// behaviour; every unmapped value returns the catch-all "CURLSHcode unknown"
+    /// string (matching `lib/strerror.c`), never NULL and never a crash.
+    #[test]
+    fn strerror_out_of_range_is_catch_all() {
+        for code in [9999, -1, c_int::MIN, c_int::MAX] {
+            // SAFETY: returns a non-null 'static NUL-terminated string for any
+            // `c_int`; we only read it.
+            let p = unsafe { curl_share_strerror(code) };
+            assert!(!p.is_null(), "share strerror({code}) returned NULL");
+            // SAFETY: the returned pointer is a valid NUL-terminated 'static str.
+            let got = unsafe { CStr::from_ptr(p) }.to_str().unwrap();
+            assert_eq!(got, "CURLSHcode unknown", "share strerror({code})");
         }
     }
 
@@ -767,6 +792,6 @@ mod tests {
         let _setopt: unsafe extern "C" fn(*mut CURLSH, CURLSHoption, usize) -> CURLSHcode =
             curl_share_setopt;
         let _cleanup: unsafe extern "C" fn(*mut CURLSH) -> CURLSHcode = curl_share_cleanup;
-        let _strerror: unsafe extern "C" fn(CURLSHcode) -> *const c_char = curl_share_strerror;
+        let _strerror: unsafe extern "C" fn(c_int) -> *const c_char = curl_share_strerror;
     }
 }

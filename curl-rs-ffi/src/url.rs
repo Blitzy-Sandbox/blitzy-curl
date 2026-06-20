@@ -79,7 +79,7 @@
 // `share.rs`.
 use curl_rs_lib as core;
 
-use std::ffi::{c_char, c_uint, CStr};
+use std::ffi::{c_char, c_int, c_uint, CStr};
 
 use crate::error_codes::{result_to_ucode, url_strerror, CURLUcode};
 use crate::global::c_strdup_str;
@@ -457,15 +457,23 @@ pub unsafe extern "C" fn curl_url_set(
 /// matching curl, which returns string literals. An out-of-range `code` maps to
 /// the catch-all `"CURLUcode unknown"` string.
 ///
+/// The parameter is a plain `c_int`, **not** the closed `CURLUcode` enum: a C
+/// caller may pass any integer, so receiving it as `c_int` (rather than a
+/// by-value enum, which would materialize an invalid discriminant — undefined
+/// behaviour — for an out-of-range value) keeps the boundary sound. The internal
+/// total mapping then falls through to `"CURLUcode unknown"` for any unmapped
+/// integer, exactly as `lib/strerror.c`'s `default` arm does.
+///
 /// # Safety
 ///
 /// This function performs no pointer dereferences and is sound for every value
-/// of `code`. It is declared `unsafe extern "C"` only to match curl's published
+/// of `code` (the parameter is a `c_int`, so every C integer is a valid
+/// argument). It is declared `unsafe extern "C"` only to match curl's published
 /// FFI surface (mirroring the sibling `curl_share_strerror` /
 /// `curl_easy_strerror`); callers must nonetheless treat the returned pointer as
 /// borrowed `'static` data and must not free or mutate it.
 #[no_mangle]
-pub unsafe extern "C" fn curl_url_strerror(code: CURLUcode) -> *const c_char {
+pub unsafe extern "C" fn curl_url_strerror(code: c_int) -> *const c_char {
     url_strerror(code)
 }
 
@@ -807,25 +815,41 @@ mod tests {
 
     #[test]
     fn strerror_returns_static_strings() {
-        let text = |code: CURLUcode| {
+        let text = |code: c_int| {
             // SAFETY: `curl_url_strerror` returns a 'static, NUL-terminated,
             // read-only string for every code; we only read it.
             unsafe { CStr::from_ptr(curl_url_strerror(code)) }
                 .to_str()
                 .expect("strerror strings are valid UTF-8")
         };
-        assert_eq!(text(CURLUcode::CURLUE_OK), "No error");
+        assert_eq!(text(CURLUcode::CURLUE_OK as c_int), "No error");
         assert_eq!(
-            text(CURLUcode::CURLUE_BAD_HANDLE),
+            text(CURLUcode::CURLUE_BAD_HANDLE as c_int),
             "An invalid CURLU pointer was passed as argument"
         );
         assert_eq!(
-            text(CURLUcode::CURLUE_NO_SCHEME),
+            text(CURLUcode::CURLUE_NO_SCHEME as c_int),
             "No scheme part in the URL"
         );
         assert_eq!(
-            text(CURLUcode::CURLUE_UNKNOWN_PART),
+            text(CURLUcode::CURLUE_UNKNOWN_PART as c_int),
             "An unknown part ID was passed to a URL API function"
         );
+    }
+
+    /// Issue 2 regression: the exported `curl_url_strerror` takes a `c_int`, so
+    /// a C caller may pass any out-of-range integer without invoking undefined
+    /// behaviour; every unmapped value returns the catch-all "CURLUcode unknown"
+    /// string (matching `lib/strerror.c`), never NULL and never a crash.
+    #[test]
+    fn strerror_out_of_range_is_catch_all() {
+        for code in [9999, -1, c_int::MIN, c_int::MAX] {
+            // SAFETY: returns a 'static, NUL-terminated, read-only pointer for
+            // any `c_int`; we only read it.
+            let s = unsafe { CStr::from_ptr(curl_url_strerror(code)) }
+                .to_str()
+                .expect("strerror strings are valid UTF-8");
+            assert_eq!(s, "CURLUcode unknown", "url strerror({code})");
+        }
     }
 }

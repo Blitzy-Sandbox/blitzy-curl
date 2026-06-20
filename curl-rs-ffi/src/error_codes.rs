@@ -61,7 +61,7 @@
 // compiled or linted in isolation (mirrors `types.rs`).
 #![allow(non_camel_case_types)]
 
-use core::ffi::{c_char, CStr};
+use core::ffi::{c_char, c_int, CStr};
 
 // The integer constants are owned by `curl-rs-lib` (single source of truth); the
 // idiomatic error enums convert into the C enums declared here.
@@ -463,11 +463,14 @@ pub fn result_to_code<T>(r: CurlResult<T>) -> CURLcode {
 /// out-of-range integer are not listed and therefore fall through to
 /// `"Unknown error"`, exactly as the C `switch`'s `default` arm does.
 ///
-/// We match on `code as i32` (rather than on the enum variants) so that an
-/// out-of-range integer passed across the FFI boundary by a C caller is handled
-/// gracefully instead of being treated as an exhaustive-match miss.
-fn easy_strerror_cstr(code: CURLcode) -> &'static CStr {
-    match code as i32 {
+/// The `code` is the raw `i32` received from C (the public `curl_easy_strerror`
+/// shim takes a `c_int`, not the closed `CURLcode` enum, precisely so that a C
+/// caller may pass *any* integer without materializing an invalid enum
+/// discriminant — which would be undefined behaviour at the FFI boundary). The
+/// `match` is total: every unmapped or out-of-range integer falls through to the
+/// `_ => "Unknown error"` arm, exactly as the C `switch`'s `default` does.
+fn easy_strerror_cstr(code: i32) -> &'static CStr {
+    match code {
         codes::CURLE_OK => cstr(b"No error\0"),
         codes::CURLE_UNSUPPORTED_PROTOCOL => cstr(b"Unsupported protocol\0"),
         codes::CURLE_FAILED_INIT => cstr(b"Failed initialization\0"),
@@ -604,15 +607,26 @@ fn easy_strerror_cstr(code: CURLcode) -> &'static CStr {
 /// that is **never freed**; the caller must not pass it to `free()`/`curl_free`.
 /// This matches `lib/strerror.c`, which returns string literals.
 ///
+/// The parameter is a plain `c_int`, **not** the closed `CURLcode` enum. curl's
+/// headers treat result codes as `int`-compatible values, and a C caller may
+/// legitimately pass any integer — including the public out-of-band sentinel
+/// `CURLE_ALREADY_COMPLETE` (`99999`) or a value from a newer/older header.
+/// Receiving the value as `c_int` (rather than by-value `CURLcode`) means no
+/// invalid enum discriminant is ever materialized, so there is no undefined
+/// behaviour at the boundary; the internal total `match` maps every unmapped or
+/// out-of-range integer to `"Unknown error"`, mirroring `lib/strerror.c`'s
+/// `default` arm.
+///
 /// # Safety
 ///
 /// This function performs no pointer dereferences and is sound for every
-/// possible bit pattern of `code` (out-of-range integers are mapped to
-/// `"Unknown error"`). It is declared `unsafe extern "C"` only to match curl's
-/// published FFI surface; callers must nonetheless treat the returned pointer as
-/// borrowed `'static` data and must not free or mutate it.
+/// possible bit pattern of `code` (the parameter is a `c_int`, so every C
+/// integer is a valid argument; out-of-range values map to `"Unknown error"`).
+/// It is declared `unsafe extern "C"` only to match curl's published FFI
+/// surface; callers must nonetheless treat the returned pointer as borrowed
+/// `'static` data and must not free or mutate it.
 #[no_mangle]
-pub unsafe extern "C" fn curl_easy_strerror(code: CURLcode) -> *const c_char {
+pub unsafe extern "C" fn curl_easy_strerror(code: c_int) -> *const c_char {
     easy_strerror_cstr(code).as_ptr()
 }
 
@@ -728,8 +742,8 @@ pub fn result_to_mcode<T>(r: core::result::Result<T, CurlMError>) -> CURLMcode {
 /// Not exported here; `multi.rs` wraps this in its `#[no_mangle]`
 /// `curl_multi_strerror` shim.
 #[must_use]
-pub fn multi_strerror_cstr(code: CURLMcode) -> &'static CStr {
-    match code as i32 {
+pub fn multi_strerror_cstr(code: i32) -> &'static CStr {
+    match code {
         codes::multi::CURLM_CALL_MULTI_PERFORM => cstr(b"Please call curl_multi_perform() soon\0"),
         codes::multi::CURLM_OK => cstr(b"No error\0"),
         codes::multi::CURLM_BAD_HANDLE => cstr(b"Invalid multi handle\0"),
@@ -759,7 +773,7 @@ pub fn multi_strerror_cstr(code: CURLMcode) -> &'static CStr {
 /// `*const c_char` form of [`multi_strerror_cstr`] for `multi.rs`'s FFI shim.
 #[inline]
 #[must_use]
-pub fn multi_strerror(code: CURLMcode) -> *const c_char {
+pub fn multi_strerror(code: i32) -> *const c_char {
     multi_strerror_cstr(code).as_ptr()
 }
 
@@ -898,8 +912,8 @@ pub fn result_to_ucode<T>(r: core::result::Result<T, CurlUError>) -> CURLUcode {
 /// Not exported here; `url.rs` wraps this in its `#[no_mangle]`
 /// `curl_url_strerror` shim.
 #[must_use]
-pub fn url_strerror_cstr(code: CURLUcode) -> &'static CStr {
-    match code as i32 {
+pub fn url_strerror_cstr(code: i32) -> &'static CStr {
+    match code {
         codes::url::CURLUE_OK => cstr(b"No error\0"),
         codes::url::CURLUE_BAD_HANDLE => cstr(b"An invalid CURLU pointer was passed as argument\0"),
         codes::url::CURLUE_BAD_PARTPOINTER => {
@@ -949,7 +963,7 @@ pub fn url_strerror_cstr(code: CURLUcode) -> &'static CStr {
 /// `*const c_char` form of [`url_strerror_cstr`] for `url.rs`'s FFI shim.
 #[inline]
 #[must_use]
-pub fn url_strerror(code: CURLUcode) -> *const c_char {
+pub fn url_strerror(code: i32) -> *const c_char {
     url_strerror_cstr(code).as_ptr()
 }
 
@@ -1036,8 +1050,8 @@ pub fn result_to_shcode<T>(r: core::result::Result<T, CurlShError>) -> CURLSHcod
 /// Not exported here; `share.rs` wraps this in its `#[no_mangle]`
 /// `curl_share_strerror` shim.
 #[must_use]
-pub fn share_strerror_cstr(code: CURLSHcode) -> &'static CStr {
-    match code as i32 {
+pub fn share_strerror_cstr(code: i32) -> &'static CStr {
+    match code {
         codes::share::CURLSHE_OK => cstr(b"No error\0"),
         codes::share::CURLSHE_BAD_OPTION => cstr(b"Unknown share option\0"),
         codes::share::CURLSHE_IN_USE => cstr(b"Share currently in use\0"),
@@ -1051,7 +1065,7 @@ pub fn share_strerror_cstr(code: CURLSHcode) -> &'static CStr {
 /// `*const c_char` form of [`share_strerror_cstr`] for `share.rs`'s FFI shim.
 #[inline]
 #[must_use]
-pub fn share_strerror(code: CURLSHcode) -> *const c_char {
+pub fn share_strerror(code: i32) -> *const c_char {
     share_strerror_cstr(code).as_ptr()
 }
 
@@ -1280,7 +1294,7 @@ mod tests {
     fn easy_strerror_no_error_is_byte_exact() {
         // SAFETY: `curl_easy_strerror` returns a non-null, 'static,
         // NUL-terminated pointer that the caller must not free.
-        let p = unsafe { curl_easy_strerror(CURLcode::CURLE_OK) };
+        let p = unsafe { curl_easy_strerror(CURLcode::CURLE_OK as c_int) };
         assert!(!p.is_null());
         // SAFETY: `p` points at a 'static NUL-terminated C string (see above).
         let s = unsafe { CStr::from_ptr(p) };
@@ -1292,7 +1306,7 @@ mod tests {
         // An obsolete (reserved) code is a valid enum variant that is absent from
         // the description table, so it must hit curl's default "Unknown error".
         // SAFETY: as above.
-        let p = unsafe { curl_easy_strerror(CURLcode::CURLE_OBSOLETE20) };
+        let p = unsafe { curl_easy_strerror(CURLcode::CURLE_OBSOLETE20 as c_int) };
         // SAFETY: as above.
         let s = unsafe { CStr::from_ptr(p) };
         assert_eq!(s.to_bytes(), b"Unknown error");
@@ -1426,9 +1440,7 @@ mod tests {
     #[test]
     fn easy_strings_match_core_description() {
         for n in codes::CURLE_OK..CURL_LAST {
-            let mine = easy_strerror_cstr(int_to_code(n))
-                .to_str()
-                .expect("valid UTF-8");
+            let mine = easy_strerror_cstr(n).to_str().expect("valid UTF-8");
             let core_desc = CurlError::from_code(n).description();
             assert_eq!(mine, core_desc, "CURLcode {n} string mismatch");
         }
@@ -1437,9 +1449,7 @@ mod tests {
     #[test]
     fn multi_strings_match_core_description() {
         for n in codes::multi::CURLM_CALL_MULTI_PERFORM..CURLM_LAST {
-            let mine = multi_strerror_cstr(int_to_mcode(n))
-                .to_str()
-                .expect("valid UTF-8");
+            let mine = multi_strerror_cstr(n).to_str().expect("valid UTF-8");
             let core_desc = CurlMError::from_code(n)
                 .expect("defined CURLMcode")
                 .description();
@@ -1450,9 +1460,7 @@ mod tests {
     #[test]
     fn share_strings_match_core_description() {
         for n in codes::share::CURLSHE_OK..CURLSHE_LAST {
-            let mine = share_strerror_cstr(int_to_shcode(n))
-                .to_str()
-                .expect("valid UTF-8");
+            let mine = share_strerror_cstr(n).to_str().expect("valid UTF-8");
             let core_desc = CurlShError::from_code(n)
                 .expect("defined CURLSHcode")
                 .description();
@@ -1463,9 +1471,7 @@ mod tests {
     #[test]
     fn url_strings_match_core_description() {
         for n in codes::url::CURLUE_OK..CURLUE_LAST {
-            let mine = url_strerror_cstr(int_to_ucode(n))
-                .to_str()
-                .expect("valid UTF-8");
+            let mine = url_strerror_cstr(n).to_str().expect("valid UTF-8");
             let core_desc = CurlUError::from_code(n)
                 .expect("defined CURLUcode")
                 .description();
@@ -1478,15 +1484,69 @@ mod tests {
     fn strerror_pointer_helpers_are_non_null_nonempty() {
         // SAFETY: each helper returns a 'static NUL-terminated pointer.
         let cases: [*const c_char; 3] = [
-            multi_strerror(CURLMcode::CURLM_OK),
-            share_strerror(CURLSHcode::CURLSHE_OK),
-            url_strerror(CURLUcode::CURLUE_OK),
+            multi_strerror(CURLMcode::CURLM_OK as i32),
+            share_strerror(CURLSHcode::CURLSHE_OK as i32),
+            url_strerror(CURLUcode::CURLUE_OK as i32),
         ];
         for p in cases {
             assert!(!p.is_null());
             // SAFETY: `p` is a 'static NUL-terminated C string (see above).
             let bytes = unsafe { CStr::from_ptr(p) }.to_bytes();
             assert!(!bytes.is_empty());
+        }
+    }
+
+    // ---- Out-of-range / sentinel codes are safe (Issue 2 regression) -------
+    // A C caller may legitimately pass ANY integer to the strerror accessors —
+    // e.g. the public out-of-band sentinel `CURLE_ALREADY_COMPLETE` (99999), a
+    // value from a newer/older header, or even a garbage integer. Because the
+    // exported shims now take a `c_int` (not the closed `#[repr(i32)]` enum by
+    // value), no invalid enum discriminant is ever materialized, so there is no
+    // undefined behaviour at the FFI boundary; the internal `match` is total and
+    // every unmapped integer falls through to the catch-all string, exactly as
+    // `lib/strerror.c`'s `default` arm does. This is the source-level lock for
+    // the runtime SIGSEGV that previously affected the strerror family when a C
+    // caller passed an out-of-range code.
+    #[test]
+    fn strerror_out_of_range_codes_are_safe() {
+        // The exported easy accessor must accept any integer and never crash,
+        // mapping every out-of-range value to curl's "Unknown error".
+        for &code in &[
+            CURLE_ALREADY_COMPLETE, // 99999 — a documented public value
+            100_000,
+            -7,
+            CURL_LAST, // 102 — one past the last defined easy code
+            i32::MIN,
+            i32::MAX,
+        ] {
+            // SAFETY: returns a non-null 'static NUL-terminated pointer for any
+            // `c_int`; we only read it and never free it.
+            let p = unsafe { curl_easy_strerror(code) };
+            assert!(!p.is_null(), "easy strerror({code}) returned NULL");
+            // SAFETY: `p` is a 'static NUL-terminated C string (see above).
+            let bytes = unsafe { CStr::from_ptr(p) }.to_bytes();
+            assert_eq!(bytes, b"Unknown error", "easy strerror({code})");
+        }
+
+        // The total mappings backing curl_multi / curl_url / curl_share_strerror
+        // must likewise fall through to their respective catch-all strings for
+        // any out-of-range integer — never panic, never index out of bounds.
+        for &code in &[9999, -5, i32::MIN, i32::MAX] {
+            assert_eq!(
+                multi_strerror_cstr(code).to_bytes(),
+                b"Unknown error",
+                "multi strerror({code})"
+            );
+            assert_eq!(
+                url_strerror_cstr(code).to_bytes(),
+                b"CURLUcode unknown",
+                "url strerror({code})"
+            );
+            assert_eq!(
+                share_strerror_cstr(code).to_bytes(),
+                b"CURLSHcode unknown",
+                "share strerror({code})"
+            );
         }
     }
 }
