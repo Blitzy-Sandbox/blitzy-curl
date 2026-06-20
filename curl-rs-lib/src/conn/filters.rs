@@ -792,6 +792,27 @@ impl FilterChain {
         self.head.as_deref_mut()
     }
 
+    /// Detach and return the head (top) filter, leaving the chain empty.
+    ///
+    /// The entire already-linked sub-chain travels with the returned head —
+    /// each filter owns its `next` (see the module-level chain description) — so
+    /// this hands ownership of the whole connected stack to the caller in one
+    /// move, leaving `self` empty (`is_setup()` becomes `false`).
+    ///
+    /// This is the move-out counterpart of [`head_mut`](Self::head_mut)/
+    /// [`head_ref`](Self::head_ref): the HTTP/2 engine uses it to **move** the
+    /// connected (post-TLS) filter chain out of a [`crate::conn::Connection`]
+    /// and into an `h2`-owned I/O adapter
+    /// ([`crate::protocols::http::h2::ConnFilterIo`]), which the spawned `h2`
+    /// connection task then owns for the connection's lifetime — satisfying the
+    /// `'static` bound of `h2_client_handshake`. The byte path is unchanged:
+    /// reads/writes still route through the same filter, now driven by the `h2`
+    /// task instead of the borrowing [`crate::conn::Curl_conn_recv`]/`send`.
+    #[must_use]
+    pub fn take_head(&mut self) -> Option<Box<dyn ConnectionFilter>> {
+        self.head.take()
+    }
+
     /// The index (0 = head) of the first filter whose [`name`](ConnectionFilter::name)
     /// equals `name`, if present.
     #[must_use]

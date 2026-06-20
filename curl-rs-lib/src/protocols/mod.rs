@@ -1332,11 +1332,24 @@ pub(crate) async fn perform_transfer(
         return drive_file_transfer(data, sink, source).await;
     }
 
-    // A recognized network scheme: its end-to-end drive over the `conn` filter
-    // chain and the per-protocol exchange engine is the remaining transfer
-    // integration. Until then report `UnsupportedProtocol`, the same code curl
-    // yields for an unhandled scheme. (`let _` keeps `sink`/`source`/`scheme`
-    // used across every feature combination, including a `file`-less build.)
+    // `http`/`https` are driven end-to-end by the HTTP engine: the connection
+    // filter chain (plain TCP, or TLS + ALPN) plus the version-appropriate
+    // [`ProtocolExchange`](crate::transfer::ProtocolExchange) (HTTP/1.x, HTTP/2
+    // via ALPN/prior-knowledge, or HTTP/3 over QUIC), all driven through
+    // [`crate::transfer::drive_transfer`]. This is the network-transfer seam
+    // whose absence produced QA findings F-CRIT-1/2/3/4 and F-FFI-1 (every
+    // network scheme returned `UnsupportedProtocol` before a socket opened).
+    #[cfg(feature = "http")]
+    if matches!(scheme_name.as_str(), "http" | "https") {
+        return http::perform_http(data, sink, source).await;
+    }
+
+    // Every other recognized network scheme's end-to-end drive over the `conn`
+    // filter chain and its per-protocol exchange engine is the remaining
+    // transfer integration. Until then report `UnsupportedProtocol`, the same
+    // code curl yields for an unhandled scheme. (`let _` keeps
+    // `sink`/`source`/`scheme` used across every feature combination, including
+    // a `file`-less or `http`-less build.)
     let _ = (scheme, sink, source);
     Err(CurlError::UnsupportedProtocol)
 }

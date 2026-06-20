@@ -111,19 +111,57 @@ pub mod h3;
 use crate::conn::{BoxFuture, Connection, Curl_conn_get_alpn_negotiated};
 use crate::easy::Easy;
 use crate::error::Result;
-// `CurlError` is named only when HTTP/3 is compiled out, to reject an explicit
-// `--http3`/`--http3-only` with `CURLE_NOT_BUILT_IN`. Under the default build
-// the `http3` engine handles those values, so importing it unconditionally
-// would be an unused import.
-#[cfg(not(feature = "http3"))]
+// `CurlError` is used by the version selector (to reject an explicit
+// `--http3`/`--http3-only` with `CURLE_NOT_BUILT_IN` when HTTP/3 is compiled
+// out) and by the transfer driver [`perform_http`] (URL/scheme rejection,
+// resolve/connect failures). It is therefore imported unconditionally.
 use crate::error::CurlError;
 use crate::protocols::{Protocol, ProtocolTransfer, Scheme, TransferDirection};
 // ALPN wire-byte constants, compared against the negotiated protocol so this
 // module and `crate::tls` never drift. `h3` is selected by transport (QUIC),
 // not by TLS-ALPN, so `ALPN_H3` is intentionally not used here; `http/1.1`
 // (`ALPN_HTTP_1_1`) is the universal default and is handled by the fall-through
-// arm rather than an explicit comparison.
-use crate::tls::{ALPN_H2, ALPN_HTTP_1_0};
+// arm rather than an explicit comparison. [`alpn_protocols`] computes the
+// ordered ALPN offer for an HTTPS connection in [`perform_http`].
+use crate::tls::{alpn_protocols, ALPN_H2, ALPN_HTTP_1_0};
+
+// ---------------------------------------------------------------------------
+// Additional imports for the `perform_http` transfer driver (Phase E). These
+// are the building blocks the seam composes: the connection-establishment
+// entry point and its filter factories, the DNS resolver (+ `--resolve`
+// overrides), the per-easy TLS config, the scheme descriptors, the option
+// accessors, and the transfer-engine driver and its parts.
+// ---------------------------------------------------------------------------
+use crate::conn::connect::{eyeballs_factory, tls_factory, SetupConfig};
+use crate::conn::{
+    establish_connection, ConnSetup, SchemeDescriptor, CURL_CF_SSL_DISABLE, CURL_CF_SSL_ENABLE,
+    FIRSTSOCKET, TRNSPRT_TCP,
+};
+use crate::dns::{self, load_host_pairs, DnsCache, IpVersion, ResolveParams, ResolvedAddrs};
+use crate::progress::Progress;
+use crate::protocols::pingpong::tls_config_from_easy;
+use crate::protocols::{SCHEME_HTTP, SCHEME_HTTPS};
+use crate::request::Request;
+use crate::setopt::{HttpReq, OptionValue, StrId};
+// `Request`/`Progress` are imported from their own modules above: `transfer.rs`
+// pulls them in via a *private* `use`, so they are not re-exported there.
+use crate::transfer::{
+    drive_transfer, ClientWriter, ErrorBuffer, ProtocolExchange, ReadCallback, TransferLimits,
+    TransferParts, WriteCallbacks, CURL_READFUNC_ABORT, CURL_READFUNC_PAUSE,
+};
+use crate::url::{CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_GUESS_SCHEME, CURLU_URLDECODE};
+use crate::util::timeval::curlx_now;
+// DoH transport seam: this module is the runtime collaborator that carries a
+// DoH probe as an HTTP(S) `POST` (see `crate::dns::doh`). The transport is
+// installed lazily at [`perform_http`] entry so `--doh-url` resolution can
+// re-enter the engine via a short-lived internal easy handle.
+use crate::dns::doh::{install_transport as install_doh_transport, DohProbeRequest, DohTransport};
+use crate::options::CurlOption;
+use crate::slist::SList;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // `CURLOPT_HTTP_VERSION` request values (`CURL_HTTP_VERSION_*`).
@@ -372,6 +410,848 @@ impl Protocol for HttpProtocol {
             let _ = conn.take_proto_state();
             Ok(())
         })
+    }
+}
+
+// ===========================================================================
+// Phase E — the network transfer driver (`perform_http`)
+//
+// The integration seam that drives a recognized `http`/`https` transfer end to
+// end — the missing top-level wiring identified by QA findings F-CRIT-1 (h1),
+// F-CRIT-2 (h2), F-CRIT-3 (h3), F-CRIT-4 (wire parity), and F-FFI-1 (libcurl
+// drop-in), all of which share the single root cause that `perform_transfer`
+// rejected every network scheme before opening a socket.
+//
+// This is the Rust analog of curl's `Curl_connect` -> `Curl_do` ->
+// `Curl_sendrecv` for HTTP: parse the URL, resolve the host (honoring
+// `--resolve`/`--connect-to`), establish the connection-filter chain (plain TCP,
+// or TCP + TLS with an ALPN offer), select the wire version (HTTP/1.x, HTTP/2
+// via ALPN or prior-knowledge, or HTTP/3 over QUIC), build the request via the
+// shared `h1` helpers (so the wire bytes are byte-for-byte identical across
+// versions), and drive the response through `transfer::drive_transfer`.
+//
+// The request body is fully buffered into the prepared exchange *before*
+// driving, because `drive_transfer` only reads the response (it never calls
+// `send_body`): the h1/h2 engines send their carried body lazily on the first
+// poll, and the h3 path pushes the body explicitly before reading.
+// ===========================================================================
+
+/// Drive an `http`/`https` transfer to completion.
+///
+/// Dispatches on the requested HTTP version: `--http3`/`--http3-only` connect
+/// over QUIC (HTTP/3); every other request connects over TCP and then selects
+/// HTTP/1.0, HTTP/1.1, or HTTP/2 from the forced option or the negotiated ALPN.
+///
+/// # Errors
+///
+/// * [`CurlError::UrlMalformat`] — the URL is missing, unparseable, or has no
+///   host.
+/// * [`CurlError::UnsupportedProtocol`] — a non-HTTP(S) scheme reaches here, or
+///   `--http3` is requested for a cleartext URL.
+/// * [`CurlError::NotBuiltIn`] — an HTTP version whose feature is compiled out.
+/// * [`CurlError::CouldntResolveHost`] / [`CurlError::CouldntConnect`] and any
+///   TLS, protocol, or transfer error propagated from the layers below.
+pub(crate) async fn perform_http(
+    data: &mut Easy,
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+) -> Result<()> {
+    let verbose = data.set.verbose;
+
+    // (0) Ensure the DoH transport is available before any name resolution.
+    //     `--doh-url` resolution (reached below via `resolve_addrs` →
+    //     `dns::resolve` → `doh::resolve`) needs a process-wide
+    //     `DohTransport`; install ours (idempotent) so the probe `POST` is
+    //     carried by this very engine.
+    install_doh_transport_once();
+
+    // (1) Resolve the request URL: prefer a pre-parsed `CURLOPT_CURLU` handle
+    //     (already deposited by the FFI layer), else parse the stored URL
+    //     string. `CURLU_GUESS_SCHEME` mirrors curl's scheme guessing and
+    //     `CURLU_DEFAULT_PORT` lets the port query fall back to the default.
+    let url = if let Some(uh) = data.set.uh.clone() {
+        uh
+    } else {
+        let url_str = data.url().ok_or(CurlError::UrlMalformat)?.to_string();
+        let mut parsed = CurlUrl::new();
+        parsed
+            .set(
+                CurlUPart::Url,
+                Some(&url_str),
+                CURLU_GUESS_SCHEME | CURLU_DEFAULT_PORT,
+            )
+            .map_err(|_| CurlError::UrlMalformat)?;
+        parsed
+    };
+
+    let scheme = url
+        .get(CurlUPart::Scheme, 0)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let is_https = scheme.eq_ignore_ascii_case("https");
+
+    // The request host (for the `Host:` header, SNI, and default ALPN). Kept
+    // with IPv6 brackets for the header builder, stripped for DNS/SNI/identity.
+    let host_bracketed = url.get(CurlUPart::Host, CURLU_URLDECODE).unwrap_or_default();
+    if host_bracketed.is_empty() {
+        return Err(CurlError::UrlMalformat);
+    }
+    let host = strip_brackets(&host_bracketed).to_string();
+    let default_port = if is_https {
+        SCHEME_HTTPS.default_port
+    } else {
+        SCHEME_HTTP.default_port
+    };
+    let port = url
+        .get(CurlUPart::Port, 0)
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(default_port);
+
+    let ipver = IpVersion::from_raw(i64::from(data.set.ipver));
+    let httpwant = data.set.httpwant;
+
+    // (2) HTTP/3 connects over QUIC (UDP), not TCP, so it branches before the
+    //     TCP connect. `CURL_HTTP_VERSION_3` (30) and `_3ONLY` (31) request it.
+    #[cfg(feature = "http3")]
+    if matches!(httpwant, CURL_HTTP_VERSION_3 | CURL_HTTP_VERSION_3ONLY) {
+        return perform_http3(data, &url, &host, port, ipver, sink, source, verbose).await;
+    }
+    #[cfg(not(feature = "http3"))]
+    if matches!(httpwant, CURL_HTTP_VERSION_3 | CURL_HTTP_VERSION_3ONLY) {
+        // Parity with `select_http_version` when HTTP/3 is compiled out.
+        return Err(CurlError::NotBuiltIn);
+    }
+
+    // (3) Resolve the connect target (honoring `--connect-to`), then its
+    //     addresses (honoring `--resolve`, else the system resolver).
+    let (connect_host, connect_port) = connect_target(data, &host, port);
+    let addrs = resolve_addrs(data, &connect_host, connect_port, ipver, verbose).await?;
+
+    // (4) Build the connection and its filter chain. HTTPS installs a TLS filter
+    //     carrying the ALPN offer; cleartext HTTP is a plain TCP chain.
+    let desc = http_scheme_descriptor(is_https);
+    let mut conn = Connection::new(
+        format!("{connect_host}:{connect_port}"),
+        TRNSPRT_TCP,
+        desc,
+    )
+    .with_verbose(verbose);
+    conn.set_remote(connect_host, connect_port);
+
+    let ssl_mode = if is_https {
+        CURL_CF_SSL_ENABLE
+    } else {
+        CURL_CF_SSL_DISABLE
+    };
+    let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, addrs);
+    let dispatch = if is_https {
+        // ALPN offer: h2 (unless a 1.x version is forced or HTTP/2 is compiled
+        // out) plus http/1.1, so the server's ALPN pick selects the version.
+        // `--http1.0`/`--http1.1` force HTTP/1.x; the default and `--http2`
+        // defer the choice to ALPN.
+        let want_h2 = cfg!(feature = "http2")
+            && !matches!(httpwant, CURL_HTTP_VERSION_1_0 | CURL_HTTP_VERSION_1_1);
+        let only_http_10 = httpwant == CURL_HTTP_VERSION_1_0;
+        let alpn = alpn_protocols(want_h2, true, false, only_http_10, data.set.ssl_enable_alpn);
+        let tls = tls_config_from_easy(data);
+        let ssl = tls_factory(tls, host.clone(), port, None, alpn);
+        ConnSetup::Default(SetupConfig::new(ssl_mode, true, eyeballs).with_ssl(ssl))
+    } else {
+        ConnSetup::Default(SetupConfig::new(ssl_mode, false, eyeballs))
+    };
+    establish_connection(&mut conn, FIRSTSOCKET, ssl_mode, dispatch, true).await?;
+
+    // (5) Buffer the request body (upload/POST) before building the request, so
+    //     the prepared exchange carries it (the transfer driver only reads the
+    //     response). A plain GET/HEAD has no body and never touches `source`.
+    let body = build_request_body(data, source)?;
+
+    // (6) Select the wire version (forced option, else negotiated ALPN) and
+    //     build + drive the matching exchange.
+    let version = select_http_version(data, &conn)?;
+    match version {
+        HttpVersion::Http10 | HttpVersion::Http11 => {
+            let http_minor = if version == HttpVersion::Http10 { 0 } else { 1 };
+            let custom_headers = collect_custom_headers(data);
+            let plan = {
+                let inputs = make_inputs(
+                    data,
+                    &url,
+                    &conn,
+                    &custom_headers,
+                    &host,
+                    port,
+                    is_https,
+                    body,
+                    http_minor,
+                );
+                h1::build_request(&inputs)?
+            };
+            let mut exchange = h1::H1Exchange::new(
+                h1::ConnByteStream::new(&mut conn),
+                plan,
+                data.set.http09_allowed,
+                false,
+            );
+            let result = drive_one(data, &mut exchange, sink).await;
+            // Record curl's keep-alive decision for the (future) connection pool;
+            // for a single `perform` the connection is dropped right after.
+            let keepalive = exchange.keepalive();
+            drop(exchange);
+            h1::apply_connection_reuse(&mut conn, keepalive);
+            result
+        }
+        HttpVersion::H2 => {
+            #[cfg(feature = "http2")]
+            {
+                let custom_headers = collect_custom_headers(data);
+                // Reuse the shared h1 request builder, then map the serialized
+                // head to HTTP/2 pseudo-headers (`build_h2_request`), so the
+                // request is identical to the h1 path bar the framing.
+                let (req, h2_body, no_body) = {
+                    let inputs = make_inputs(
+                        data,
+                        &url,
+                        &conn,
+                        &custom_headers,
+                        &host,
+                        port,
+                        is_https,
+                        body,
+                        1,
+                    );
+                    self::h2::build_h2_request(&inputs)?
+                };
+                // Move the connected (post-TLS) filter chain into an h2-owned IO
+                // adapter; the `'static` chain travels with the head.
+                let filter = conn.cfilter[FIRSTSOCKET]
+                    .take_head()
+                    .ok_or(CurlError::FailedInit)?;
+                let io = self::h2::ConnFilterIo::new(filter);
+                let mut h2conn =
+                    self::h2::h2_client_handshake(io, self::h2::H2Settings::default()).await?;
+                let mut exchange = h2conn.start_exchange(req, h2_body, no_body).await?;
+                let result = drive_one(data, &mut exchange, sink).await;
+                h2conn.close();
+                result
+            }
+            #[cfg(not(feature = "http2"))]
+            {
+                // The version selector never yields H2 without the feature, but
+                // keep the arm total with curl's compiled-out parity code.
+                let _ = body;
+                Err(CurlError::NotBuiltIn)
+            }
+        }
+        // HTTP/3 is selected before the TCP connect (it rides QUIC); neither the
+        // ALPN path nor the forced-version path can yield it here. Defensive
+        // parity error instead of a panic.
+        HttpVersion::H3 => {
+            let _ = body;
+            Err(CurlError::UnsupportedProtocol)
+        }
+    }
+}
+
+/// Drive an HTTP/3 transfer over QUIC end to end (`quinn` + `h3`).
+///
+/// HTTP/3 is HTTPS-only; the request is built with the same shared `h1` helpers
+/// the TCP path uses (authority, request target, method) so the request head
+/// matches HTTP/1.1 and HTTP/2. The request body (if any) is pushed on the QUIC
+/// send stream before the response is read, since [`drive_transfer`] only reads.
+///
+/// # Errors
+///
+/// [`CurlError::UnsupportedProtocol`] for a non-HTTPS URL, plus any resolve,
+/// QUIC-connect, TLS, or transfer error from the layers below.
+#[cfg(feature = "http3")]
+#[allow(clippy::too_many_arguments)]
+async fn perform_http3(
+    data: &mut Easy,
+    url: &CurlUrl,
+    host: &str,
+    port: u16,
+    ipver: IpVersion,
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+    verbose: bool,
+) -> Result<()> {
+    use crate::protocols::http::h3::{build_h3_request, h3_alpn, Http3Session};
+
+    // HTTP/3 is https-only (curl rejects `--http3` on a cleartext URL).
+    let scheme = url.get(CurlUPart::Scheme, 0).unwrap_or_default();
+    if !scheme.eq_ignore_ascii_case("https") {
+        return Err(CurlError::UnsupportedProtocol);
+    }
+
+    // Resolve the UDP endpoint (honoring `--connect-to`/`--resolve`).
+    let (connect_host, connect_port) = connect_target(data, host, port);
+    let addrs = resolve_addrs(data, &connect_host, connect_port, ipver, verbose).await?;
+    let addr = addrs
+        .addrs
+        .first()
+        .copied()
+        .ok_or(CurlError::CouldntResolveHost)?;
+
+    // Buffer the request body (POST/upload) up front so the shared request
+    // builder can frame it (Content-Length / Transfer-Encoding) and the QUIC
+    // send stream can push it before the response is read.
+    let body = build_request_body(data, source)?;
+
+    // Build the request via the SAME shared h1 builder the TCP h1/h2 paths use,
+    // then translate its serialized head to HTTP/3. This delivers full wire
+    // parity (G6) with h1/h2: the correct method (a `-d` POST stays POST —
+    // `make_inputs` sets `is_upload = method == Put`, so it is never coerced to
+    // PUT), `Host` → `:authority`, `User-Agent`, `Accept`, `Content-Length`,
+    // the default `Content-Type` for a plain POST, and every custom `-H` header.
+    let is_upload = data.set.method == HttpReq::Put;
+    let authority = h1::build_host_header_value(host, port, true);
+    // A throwaway direct connection only to compute the origin-form target
+    // (HTTP/3 has no forward-proxy absolute-form here).
+    let path = {
+        let conn = Connection::new("h3", crate::conn::TRNSPRT_QUIC, http_scheme_descriptor(true));
+        h1::request_target(url, &conn, None, false, false)?
+    };
+    let resolved = h1::resolve_http_method(
+        data.set.method,
+        data.set.opt_no_body,
+        data.set.str(StrId::Customrequest),
+        false,
+        is_upload,
+    )?;
+
+    // Derive the full request header set from the shared builder's serialized
+    // head (`make_inputs` + `build_request`), exactly as the h2 path does via
+    // `build_h2_request`. `build_h3_request` drops the hop-by-hop fields itself
+    // (incl. `Host`, which becomes `:authority`), so the complete list is passed
+    // through unchanged.
+    let custom_headers = collect_custom_headers(data);
+    let (request_headers, h3_body) = {
+        let conn = Connection::new("h3", crate::conn::TRNSPRT_QUIC, http_scheme_descriptor(true));
+        let inputs = make_inputs(data, url, &conn, &custom_headers, host, port, true, body, 1);
+        let plan = h1::build_request(&inputs)?;
+        // `plan.head` is "REQUEST-LINE\r\n(name: value\r\n)*\r\n"; skip the
+        // request line, then collect each header until the blank separator
+        // (`parse_header_line` trims the trailing CRLF and yields `None` for the
+        // blank line that ends the head).
+        let mut headers: Vec<(String, String)> = Vec::new();
+        let mut lines = plan.head.split(|&b| b == b'\n');
+        let _request_line = lines.next();
+        for line in lines {
+            match h1::parse_header_line(line) {
+                Some((name, value)) => headers.push((
+                    String::from_utf8_lossy(name).into_owned(),
+                    String::from_utf8_lossy(value).into_owned(),
+                )),
+                None => break,
+            }
+        }
+        (headers, plan.body)
+    };
+    let req = build_h3_request(&resolved.method, "https", &authority, &path, &request_headers)?;
+
+    // Owned `rustls::ClientConfig` (the QUIC connector consumes it by value),
+    // carrying the h3 ALPN and honoring `-k` via `tls_config_from_easy`.
+    let tls_arc = tls_config_from_easy(data).build_client_config(&h3_alpn(), None)?;
+    let tls = std::sync::Arc::try_unwrap(tls_arc).unwrap_or_else(|arc| (*arc).clone());
+
+    // Connect, send the request, push any body, then drive the response.
+    let session = Http3Session::connect(addr, host, tls).await?;
+    let mut exchange = session.send_request(req).await?;
+
+    // Push the request body (POST or PUT) on the QUIC send stream. Decoupled
+    // from `is_upload` so a `-d` POST body (no longer an "upload") is still sent.
+    let bytes = match h3_body {
+        h1::RequestBody::Sized(b) | h1::RequestBody::Chunked(b) => b,
+        h1::RequestBody::None => Vec::new(),
+    };
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let sent = exchange.send_body(&bytes[offset..]).await?;
+        if sent == 0 {
+            break;
+        }
+        offset += sent;
+    }
+
+    let result = drive_one(data, &mut exchange, sink).await;
+    session.close();
+    result
+}
+
+// ---------------------------------------------------------------------------
+// `perform_http` helpers
+// ---------------------------------------------------------------------------
+
+/// Run the transfer-engine byte loop for a prepared `exchange`, delivering the
+/// response through the client `sink`. Bundles the per-transfer state
+/// ([`Request`]/[`Progress`]/[`ClientWriter`]/[`ErrorBuffer`]/[`TransferLimits`])
+/// the same way curl's `Curl_sendrecv` does, reading the handle's `CURLOPT_*`
+/// limits (`HEADER`, `VERBOSE`, `TIMEOUT(_MS)`, `LOW_SPEED_*`).
+async fn drive_one<P: ProtocolExchange>(
+    data: &mut Easy,
+    exchange: &mut P,
+    sink: &mut dyn WriteCallbacks,
+) -> Result<()> {
+    let mut request = Request::new();
+    // Seed `no_body` from the easy handle, mirroring curl's `Curl_req_hard_reset`
+    // (`request->no_body == data->set.opt_no_body`). This is essential for HEAD
+    // (`-I` / `CURLOPT_NOBODY`): the response still carries `Content-Length`, so
+    // `drive_transfer`'s end-of-transfer `check_partial_file` would otherwise see
+    // `size = Some(n)` but `bytecount = 0` and wrongly report `CURLE_PARTIAL_FILE`.
+    // With `no_body = true` that check short-circuits, matching curl.
+    request.no_body = data.set.opt_no_body;
+    let mut progress = Progress::new(Instant::now());
+    let mut writer = ClientWriter::with_options(data.set.include_header, false);
+    let mut errbuf = ErrorBuffer::with_verbose(data.set.verbose);
+    let deadline = (data.set.timeout > 0)
+        .then(|| Instant::now() + Duration::from_millis(data.set.timeout as u64));
+    let limits = TransferLimits {
+        deadline,
+        low_speed_limit: data.set.low_speed_limit,
+        low_speed_time: u32::from(data.set.low_speed_time),
+    };
+    drive_transfer(
+        TransferParts {
+            exchange,
+            request: &mut request,
+            progress: &mut progress,
+            writer: &mut writer,
+            write_cb: sink,
+            limits: &limits,
+            errbuf: &mut errbuf,
+        },
+        None,
+        None,
+    )
+    .await?;
+
+    // Record the post-transfer `data->info` store so `curl_easy_getinfo`
+    // (CURLINFO_RESPONSE_CODE / SIZE_DOWNLOAD / SIZE_UPLOAD / HTTP_VERSION) and
+    // the CLI's `--write-out` observe the real values, mirroring the typestate
+    // transfer's `complete()` finalize (curl's `Curl_pgrsUpdate` + the
+    // `PureInfo` fields). Without this, those fields would stay at their `0`
+    // defaults even after a fully successful transfer (e.g. `%{http_code}` would
+    // report `000`). The Easy-handle `Info` has no `record_progress` helper (that
+    // lives on the typestate `TransferInfo`), so the fields are set directly.
+    data.info.response_code = i64::from(request.httpcode);
+    data.info.http_version = i64::from(request.httpversion);
+    data.info.size_download = progress.download_size();
+    data.info.size_upload = progress.upload_size();
+    Ok(())
+}
+
+/// The [`SchemeDescriptor`] for `http`/`https`, carrying the canonical port and
+/// `PROTOPT_*` flags so the connection layer sees the same scheme metadata as
+/// the registered handler.
+fn http_scheme_descriptor(is_https: bool) -> SchemeDescriptor {
+    let scheme: &Scheme = if is_https { &SCHEME_HTTPS } else { &SCHEME_HTTP };
+    SchemeDescriptor::new(
+        scheme.name,
+        scheme.default_port,
+        scheme.flags,
+        scheme.protocol,
+    )
+}
+
+/// Strip a single surrounding `[`…`]` IPv6 bracket pair, returning the inner
+/// host; non-bracketed input is returned unchanged.
+fn strip_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// Collect the application's `CURLOPT_HTTPHEADER` lines as owned strings (the
+/// `RequestInputs` custom-header slice borrows from this).
+fn collect_custom_headers(data: &Easy) -> Vec<String> {
+    data.set
+        .headers
+        .as_ref()
+        .map(|list| {
+            list.iter()
+                .filter_map(|c| c.to_str().ok().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a custom header named `target` is present (case-insensitive),
+/// matching [`build_request`]'s own `find_custom_header_value` detection exactly
+/// (the untrimmed `curlx_str_cspn` name span via [`proxy::parse_custom_header_line`]).
+fn any_custom_header(lines: &[String], target: &str) -> bool {
+    lines.iter().any(|line| {
+        matches!(
+            proxy::parse_custom_header_line(line),
+            proxy::CustomHeader::Add { name, .. } if name.eq_ignore_ascii_case(target)
+        )
+    })
+}
+
+/// Whether the application requested a chunked upload via an explicit
+/// `Transfer-Encoding: chunked` custom header.
+fn upload_is_chunked(data: &Easy) -> bool {
+    data.set.headers.as_ref().is_some_and(|list| {
+        list.iter().any(|c| {
+            c.to_str().is_ok_and(|line| {
+                matches!(
+                    proxy::parse_custom_header_line(line),
+                    proxy::CustomHeader::Add { name, value }
+                        if name.eq_ignore_ascii_case("Transfer-Encoding")
+                            && value.eq_ignore_ascii_case("chunked")
+                )
+            })
+        })
+    })
+}
+
+/// Buffer the request body for the transfer:
+///
+/// * `CURLOPT_COPYPOSTFIELDS` / `-d` -> a sized body of the copied bytes.
+/// * An upload (`CURLOPT_UPLOAD` / `-T`, `method == Put`) or a `CURLOPT_POST`
+///   without copied fields -> the source read fully (chunked if the application
+///   announced `Transfer-Encoding: chunked`, else sized).
+/// * Otherwise (GET/HEAD/DELETE without data) -> no body; `source` is untouched.
+fn build_request_body(data: &Easy, source: &mut dyn ReadCallback) -> Result<h1::RequestBody> {
+    if let Some(fields) = data.set.copypostfields.as_ref() {
+        return Ok(h1::RequestBody::Sized(fields.clone()));
+    }
+    let reads_source = data.set.method == HttpReq::Put || data.set.method == HttpReq::Post;
+    if reads_source {
+        let bytes = read_full_upload(source)?;
+        return Ok(if upload_is_chunked(data) {
+            h1::RequestBody::Chunked(bytes)
+        } else {
+            h1::RequestBody::Sized(bytes)
+        });
+    }
+    Ok(h1::RequestBody::None)
+}
+
+/// Read the upload source to end-of-input into one buffer. A buffered request
+/// body cannot honor a mid-read pause, so [`CURL_READFUNC_PAUSE`] is a read
+/// error rather than a silent truncation; [`CURL_READFUNC_ABORT`] aborts.
+fn read_full_upload(source: &mut dyn ReadCallback) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match source.read(&mut buf) {
+            0 => break,
+            CURL_READFUNC_ABORT => return Err(CurlError::AbortedByCallback),
+            CURL_READFUNC_PAUSE => return Err(CurlError::ReadError),
+            n if n <= buf.len() => body.extend_from_slice(&buf[..n]),
+            _ => return Err(CurlError::ReadError),
+        }
+    }
+    Ok(body)
+}
+
+/// Apply `--connect-to` (`CURLOPT_CONNECT_TO`): if an entry matches the request
+/// `host`/`port` (an empty field matches anything), return the substituted
+/// connect host/port; otherwise the request host/port are used unchanged. The
+/// `Host:` header and SNI keep the original host (the caller passes the request
+/// host to the request builder), matching curl's `conn->conn_to_host` behavior.
+fn connect_target(data: &Easy, host: &str, port: u16) -> (String, u16) {
+    let Some(list) = data.set.connect_to.as_ref() else {
+        return (host.to_string(), port);
+    };
+    for entry in list.iter() {
+        let Ok(line) = entry.to_str() else { continue };
+        let Some((h1, p1, h2, p2)) = split_connect_to(line) else {
+            continue;
+        };
+        let host_matches = h1.is_empty()
+            || h1.eq_ignore_ascii_case(host)
+            || strip_brackets(&h1).eq_ignore_ascii_case(host);
+        let port_matches = p1.is_empty() || p1.parse::<u16>() == Ok(port);
+        if host_matches && port_matches {
+            let new_host = if h2.is_empty() {
+                host.to_string()
+            } else {
+                strip_brackets(&h2).to_string()
+            };
+            let new_port = if p2.is_empty() {
+                port
+            } else {
+                p2.parse::<u16>().unwrap_or(port)
+            };
+            return (new_host, new_port);
+        }
+    }
+    (host.to_string(), port)
+}
+
+/// Split one `--connect-to` entry `HOST1:PORT1:HOST2:PORT2` into its four
+/// fields, honoring `[bracketed IPv6]` host fields. Returns `None` if the entry
+/// does not have the four colon-separated sections.
+fn split_connect_to(line: &str) -> Option<(String, String, String, String)> {
+    let (h1, rest) = take_host_field(line);
+    let rest = rest.strip_prefix(':')?;
+    let (p1, rest) = take_plain_field(rest);
+    let rest = rest.strip_prefix(':')?;
+    let (h2, rest) = take_host_field(rest);
+    let rest = rest.strip_prefix(':')?;
+    Some((h1, p1, h2, rest.to_string()))
+}
+
+/// Take a host field, which may be a `[bracketed IPv6]` literal (kept bracketed)
+/// or a plain token up to the next `:`. Returns the field and the remainder
+/// (which begins at the delimiter `:` if any).
+fn take_host_field(s: &str) -> (String, &str) {
+    if let Some(after_open) = s.strip_prefix('[') {
+        if let Some(close) = after_open.find(']') {
+            let host = &after_open[..close];
+            return (format!("[{host}]"), &after_open[close + 1..]);
+        }
+    }
+    take_plain_field(s)
+}
+
+/// Take a plain token up to the next `:`; returns the token and the remainder
+/// (beginning at the `:` if present, else empty).
+fn take_plain_field(s: &str) -> (String, &str) {
+    match s.find(':') {
+        Some(i) => (s[..i].to_string(), &s[i..]),
+        None => (s.to_string(), ""),
+    }
+}
+
+/// Resolve `host:port` through curl's complete resolution pipeline.
+///
+/// `--resolve` (`CURLOPT_RESOLVE`) overrides are pre-loaded into a transient
+/// cache as **permanent** entries (curl's `Curl_loadhostpairs`), then resolution
+/// runs through [`dns::resolve`], which applies the full curl ordering:
+/// IDN→ACE, `.onion` rejection, DNS cache lookup (which finds the pre-loaded
+/// `--resolve` entries), IP-literal and `localhost` shortcuts, and finally
+/// either DoH (`CURLOPT_DOH_URL` / `--doh-url`) or the system resolver.
+///
+/// Routing through [`dns::resolve`] — rather than calling the system backend
+/// directly — is what makes `--doh-url` take effect on the transfer path: the
+/// previous implementation consulted only the `--resolve` cache and then went
+/// straight to the system resolver, silently ignoring the configured DoH URL.
+async fn resolve_addrs(
+    data: &Easy,
+    host: &str,
+    port: u16,
+    ipver: IpVersion,
+    verbose: bool,
+) -> Result<ResolvedAddrs> {
+    // A single cache backs both the `--resolve` pre-load and the resolve below,
+    // so the permanent pre-loaded entries are visible to `dns::resolve`'s cache
+    // lookup (a permanent entry has no timestamp and is never evicted as stale).
+    let mut cache = DnsCache::new();
+    let mut errbuf: Option<String> = None;
+
+    // Pre-load `--resolve` host:port:addr overrides (curl's `Curl_loadhostpairs`).
+    if let Some(list) = data.set.resolve.as_ref() {
+        let entries: Vec<String> = list
+            .iter()
+            .filter_map(|c| c.to_str().ok().map(String::from))
+            .collect();
+        if !entries.is_empty() {
+            load_host_pairs(&mut cache, &entries, curlx_now(), verbose, &mut errbuf)?;
+        }
+    }
+
+    // Resolve through the full pipeline, honoring `CURLOPT_DOH_URL` so that
+    // `--doh-url` routes name resolution through DNS-over-HTTPS rather than the
+    // system resolver. All other fields keep curl's defaults from
+    // `ResolveParams::new`.
+    let mut params = ResolveParams::new(host, port);
+    params.ip_version = ipver;
+    params.doh_url = data.set.str(StrId::Doh);
+    params.verbose = verbose;
+
+    let entry = dns::resolve(&mut cache, &params, &mut errbuf).await?;
+    Ok(entry.addrs.clone())
+}
+
+// ===========================================================================
+// DoH transport — carries a DoH probe as an HTTP(S) `POST` through this engine
+// ===========================================================================
+
+/// Installs the engine-backed [`DohTransport`] process-wide (once).
+///
+/// Invoked at [`perform_http`] entry. [`install_doh_transport`] is itself
+/// idempotent (a `OnceLock::set`), so repeated calls — including the re-entrant
+/// call made by the DoH probe's own internal transfer — are cheap no-ops after
+/// the first.
+fn install_doh_transport_once() {
+    install_doh_transport(Arc::new(EngineDohTransport));
+}
+
+/// The production [`DohTransport`]: it issues each DoH probe as an HTTP(S)
+/// `POST` using a short-lived internal easy handle, mirroring curl's
+/// `doh->probe[].easy` sub-transfers. Reusing the engine means the DoH request
+/// shares the exact connect / TLS / HTTP framing / response-read path as any
+/// other transfer — no separate HTTP client, no wire divergence.
+struct EngineDohTransport;
+
+impl DohTransport for EngineDohTransport {
+    fn send<'a>(
+        &'a self,
+        req: DohProbeRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>> {
+        Box::pin(doh_probe_post(req))
+    }
+}
+
+/// A [`WriteCallbacks`] sink that accumulates the DoH response body. Header
+/// bytes are discarded (DoH consumes only the binary `application/dns-message`
+/// body); returning `None` matches curl's NULL header-callback contract.
+#[derive(Default)]
+struct DohBodySink {
+    body: Vec<u8>,
+}
+
+impl WriteCallbacks for DohBodySink {
+    fn write_body(&mut self, data: &[u8]) -> usize {
+        self.body.extend_from_slice(data);
+        data.len()
+    }
+    fn write_header(&mut self, _data: &[u8]) -> Option<usize> {
+        None
+    }
+}
+
+/// An empty upload source: the DoH `POST` body is supplied via
+/// `CURLOPT_COPYPOSTFIELDS`, so the read callback is never the body source.
+/// This guards against any path consulting the source (it must not block on,
+/// e.g., stdin).
+struct EmptyReadSource;
+
+impl ReadCallback for EmptyReadSource {
+    fn read(&mut self, _buf: &mut [u8]) -> usize {
+        0
+    }
+}
+
+/// Issues a single DoH probe as an HTTP(S) `POST` and returns the raw response
+/// body — the body of [`EngineDohTransport::send`].
+///
+/// The internal easy handle is configured exactly as curl configures a DoH
+/// probe (`doh.c`): `POST` the encoded query as an owned body, set both
+/// `Content-Type` and `Accept` to `application/dns-message`, and apply the DoH
+/// SSL posture inherited from the parent transfer (`CURLOPT_DOH_SSL_VERIFY*`,
+/// CA material). The handle carries no `CURLOPT_DOH_URL`, so resolving the DoH
+/// endpoint itself uses the IP-literal shortcut / system resolver — there is no
+/// recursion.
+async fn doh_probe_post(req: DohProbeRequest) -> Result<Vec<u8>> {
+    let mut sub = Easy::new();
+
+    // Endpoint URL (the `CURLOPT_DOH_URL` value).
+    sub.setopt(CurlOption::CURLOPT_URL, OptionValue::Str(Some(req.url)))?;
+
+    // `Content-Type` + `Accept: application/dns-message` (curl sets both).
+    let mut headers = SList::new();
+    headers.append(&format!("Content-Type: {}", req.content_type))?;
+    headers.append(&format!("Accept: {}", req.content_type))?;
+    sub.setopt(
+        CurlOption::CURLOPT_HTTPHEADER,
+        OptionValue::Slist(Some(headers)),
+    )?;
+
+    // The encoded DNS query is the POST body. `COPYPOSTFIELDS` takes ownership
+    // (G1: Rust owns the bytes) and switches the method to `POST`.
+    sub.setopt(
+        CurlOption::CURLOPT_COPYPOSTFIELDS,
+        OptionValue::Bytes(Some(req.body)),
+    )?;
+
+    // DoH SSL posture inherited from the parent transfer
+    // (`CURLOPT_DOH_SSL_VERIFY*`). `verify_host` maps to curl's 0/2 long.
+    sub.setopt(
+        CurlOption::CURLOPT_SSL_VERIFYPEER,
+        OptionValue::Long(i64::from(req.ssl.verify_peer)),
+    )?;
+    sub.setopt(
+        CurlOption::CURLOPT_SSL_VERIFYHOST,
+        OptionValue::Long(if req.ssl.verify_host { 2 } else { 0 }),
+    )?;
+    sub.setopt(
+        CurlOption::CURLOPT_SSL_VERIFYSTATUS,
+        OptionValue::Long(i64::from(req.ssl.verify_status)),
+    )?;
+    if let Some(ca_info) = req.ssl.ca_info {
+        sub.setopt(CurlOption::CURLOPT_CAINFO, OptionValue::Str(Some(ca_info)))?;
+    }
+    if let Some(ca_path) = req.ssl.ca_path {
+        sub.setopt(CurlOption::CURLOPT_CAPATH, OptionValue::Str(Some(ca_path)))?;
+    }
+    if let Some(crl_file) = req.ssl.crl_file {
+        sub.setopt(CurlOption::CURLOPT_CRLFILE, OptionValue::Str(Some(crl_file)))?;
+    }
+
+    // Drive the probe transfer, collecting the binary response body.
+    let mut sink = DohBodySink::default();
+    let mut source = EmptyReadSource;
+    sub.perform_with(&mut sink, &mut source).await?;
+    Ok(sink.body)
+}
+
+/// Assemble the [`RequestInputs`] for [`build_request`]/[`build_h2_request`] from
+/// the handle's options. Header-suppression flags (`Host`/`Accept`/`Expect`
+/// present) are derived from the custom-header lines exactly as the builder's
+/// own lookup does; auth/cookie-engine/encoding values that belong to other
+/// stateful subsystems are left to their defaults for this HTTP-transfer seam.
+#[allow(clippy::too_many_arguments)]
+fn make_inputs<'a>(
+    data: &'a Easy,
+    url: &'a CurlUrl,
+    conn: &'a Connection,
+    custom_headers: &'a [String],
+    host: &'a str,
+    port: u16,
+    is_https: bool,
+    body: h1::RequestBody,
+    http_minor: u8,
+) -> h1::RequestInputs<'a> {
+    let (content_length, chunked) = match &body {
+        h1::RequestBody::Sized(b) => (Some(b.len() as i64), false),
+        h1::RequestBody::Chunked(_) => (None, true),
+        h1::RequestBody::None => (None, false),
+    };
+    h1::RequestInputs {
+        url,
+        conn,
+        method_kind: data.set.method,
+        no_body: data.set.opt_no_body,
+        custom_request: data.set.str(StrId::Customrequest),
+        is_websocket: false,
+        is_upload: data.set.method == HttpReq::Put,
+        host,
+        port,
+        is_https,
+        host_header_present: any_custom_header(custom_headers, "Host"),
+        user_agent: data.set.str(StrId::Useragent),
+        authorization: None,
+        proxy_authorization: None,
+        range: data.set.str(StrId::SetRange),
+        accept_present: any_custom_header(custom_headers, "Accept"),
+        te_gzip: false,
+        accept_encoding: data.set.str(StrId::Encoding),
+        referer: data.set.str(StrId::SetReferer),
+        proxy_connection_keepalive: false,
+        cookie: data.set.str(StrId::Cookie),
+        body,
+        content_type: None,
+        content_length,
+        chunked,
+        disable_expect: false,
+        expect_present: any_custom_header(custom_headers, "Expect"),
+        custom_expect_100: false,
+        is_upgrade: false,
+        custom_headers,
+        proxy_headers: &[],
+        sep_headers: false,
+        authneg: false,
+        allowed_to_host: true,
+        http_minor,
+        request_target_override: None,
+        proxy_transfer_mode: false,
+        prefer_ascii: data.set.prefer_ascii,
+        expect_100_timeout_ms: data.set.expect_100_timeout,
     }
 }
 

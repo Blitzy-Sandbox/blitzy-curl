@@ -1963,7 +1963,13 @@ pub struct TransferParts<'a, P: ProtocolExchange> {
 /// `OperationTimedout`), or the final short-read check (`PartialFile`).
 pub async fn drive_transfer<P: ProtocolExchange>(
     parts: TransferParts<'_, P>,
-    mut progress_cb: Option<&mut dyn FnMut(i64, i64, i64, i64) -> i32>,
+    // `+ Send`: the transfer future is spawned on the multi-thread multi-handle
+    // runtime (`Multi::spawn_pending` → `tokio::runtime::Handle::spawn`, which
+    // requires `Future: Send`). The callback is held across `.await`, so its
+    // trait-object type must be `Send` for the whole future to be `Send`. Every
+    // production caller passes `None`; a wired `CURLOPT_XFERINFOFUNCTION` bridge
+    // is `Send` because it crosses the same spawn boundary.
+    mut progress_cb: Option<&mut (dyn FnMut(i64, i64, i64, i64) -> i32 + Send)>,
     mut rate_limit: Option<&mut RateLimit>,
 ) -> Result<()> {
     let TransferParts {
@@ -2213,7 +2219,10 @@ impl Transfer<Transferring> {
         exchange: &mut P,
         writer: &mut ClientWriter,
         write_cb: &mut dyn WriteCallbacks,
-        progress_cb: Option<&mut dyn FnMut(i64, i64, i64, i64) -> i32>,
+        // `+ Send` mirrors [`drive_transfer`]: this future is also driven on the
+        // multi-thread multi-handle runtime, so the forwarded callback's
+        // trait-object type must be `Send`. Production callers pass `None`.
+        progress_cb: Option<&mut (dyn FnMut(i64, i64, i64, i64) -> i32 + Send)>,
     ) -> Result<Transfer<Complete>> {
         // TransferLimits is Copy; take a local copy so the immutable borrow does
         // not collide with the mutable field borrows below.
@@ -3694,9 +3703,12 @@ mod tests {
 
     #[tokio::test]
     async fn drive_invokes_progress_callback() {
-        let calls = std::cell::Cell::new(0u32);
+        // `AtomicU32` (not `Cell`) so the capturing closure is `Send`, matching
+        // [`drive_transfer`]'s `+ Send` progress-callback bound (the live driver
+        // runs on the multi-thread multi-handle runtime).
+        let calls = std::sync::atomic::AtomicU32::new(0);
         let mut cbfn = |_dltotal: i64, _dlnow: i64, _ultotal: i64, _ulnow: i64| -> i32 {
-            calls.set(calls.get() + 1);
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             0
         };
 
@@ -3725,7 +3737,10 @@ mod tests {
             errbuf: &mut errbuf,
         };
         drive_transfer(parts, Some(&mut cbfn), None).await.unwrap();
-        assert!(calls.get() >= 1, "progress callback invoked at least once");
+        assert!(
+            calls.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "progress callback invoked at least once"
+        );
     }
 
     #[tokio::test]

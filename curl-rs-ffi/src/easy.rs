@@ -1453,11 +1453,13 @@ mod tests {
 
     #[test]
     fn perform_with_url_no_handler_is_unsupported_protocol() {
-        // With a valid URL but no protocol handler wired into this layer's
-        // dependency closure, `perform` resolves the URL then reports
-        // UNSUPPORTED_PROTOCOL — still without any network I/O.
+        // A recognized network scheme whose end-to-end drive is not yet wired
+        // still reports UNSUPPORTED_PROTOCOL. `http`/`https` are now driven over
+        // the network, so this uses `gopher` — recognized by the build but with
+        // no driven handler — to exercise the unsupported-drive path without
+        // attempting a real transfer (no network I/O).
         let h = curl_easy_init();
-        let url = CString::new("http://example.com/").unwrap();
+        let url = CString::new("gopher://example.com/").unwrap();
         // SAFETY: live handle; `url` outlives the copying setopt call.
         unsafe {
             assert_eq!(

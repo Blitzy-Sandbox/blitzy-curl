@@ -781,7 +781,7 @@ impl Easy {
     pub async fn perform(&mut self) -> Result<()> {
         // curl's default client I/O (see the doc above). These owned sinks live
         // only for the duration of the transfer.
-        let mut sink = DefaultClientOutput::new(self.set.include_header);
+        let mut sink = DefaultClientOutput::new();
         let mut source = DefaultClientInput;
         self.perform_with(&mut sink, &mut source).await
     }
@@ -830,19 +830,19 @@ impl Easy {
 }
 
 /// curl's default `CURLOPT_WRITEFUNCTION` / `CURLOPT_HEADERFUNCTION`: response
-/// body bytes are written to `stdout`, and header bytes are delivered to the
-/// same output only when `CURLOPT_HEADER` is set (curl writes headers to the
-/// body output in that case). Used by [`Easy::perform`] when no front-end sink
-/// is supplied.
-struct DefaultClientOutput {
-    /// `CURLOPT_HEADER`: whether header bytes are written alongside the body.
-    include_header: bool,
-}
+/// body bytes are written to `stdout`. The default path configures *no separate
+/// header destination* (curl's `-D`/`--dump-header` is what would set one), so
+/// the header-stream callback is NULL and header bytes are silently consumed on
+/// that stream. Response headers still reach `stdout` when `CURLOPT_HEADER`
+/// (`-i`/`-I`) is set, because the client-writer ([`crate::transfer`]'s
+/// `cw_out_write`) routes header bytes to the *body* stream in that case. Used
+/// by [`Easy::perform`] when no front-end sink is supplied.
+struct DefaultClientOutput;
 
 impl DefaultClientOutput {
-    /// Build the default output sink, honoring the handle's `CURLOPT_HEADER`.
-    fn new(include_header: bool) -> Self {
-        Self { include_header }
+    /// Build the default output sink.
+    fn new() -> Self {
+        Self
     }
 }
 
@@ -858,17 +858,15 @@ impl WriteCallbacks for DefaultClientOutput {
         }
     }
 
-    fn write_header(&mut self, data: &[u8]) -> Option<usize> {
-        if !self.include_header {
-            // No header sink configured: curl silently consumes header bytes
-            // (`cw_get_writefunc` yields a NULL callback).
-            return None;
-        }
-        use std::io::Write;
-        match std::io::stdout().write_all(data) {
-            Ok(()) => Some(data.len()),
-            Err(_) => Some(0),
-        }
+    fn write_header(&mut self, _data: &[u8]) -> Option<usize> {
+        // The default CLI path configures no separate header destination (no
+        // `-D`/`--dump-header`), so curl's header-stream callback is NULL and
+        // the bytes are silently consumed. Returning `None` models that NULL
+        // callback. Response headers still reach `stdout` when `CURLOPT_HEADER`
+        // (`-i`/`-I`) is on, because `CwOut::do_client_write` routes header
+        // bytes to the *body* stream in that case — delivering them via
+        // [`Self::write_body`]. Writing here too would emit each header twice.
+        None
     }
 }
 
@@ -1112,13 +1110,18 @@ mod tests {
     #[tokio::test]
     async fn perform_preflights_then_reports_unsupported_protocol() {
         let mut e = Easy::new();
+        // `gopher` is a recognized network scheme whose end-to-end drive is not
+        // wired (only `http`/`https` are driven over the network, plus the
+        // NONETWORK `file` scheme); it therefore still exercises the
+        // "preflight succeeds, then the transfer reports UnsupportedProtocol"
+        // path. (Using `http` here would now attempt a real network transfer.)
         e.setopt(
             CurlOption::CURLOPT_URL,
-            OptionValue::Str(Some("http://example.com/".to_string())),
+            OptionValue::Str(Some("gopher://example.com/".to_string())),
         )
         .unwrap();
 
-        // No protocol handler in this layer: the transfer cannot proceed, but the
+        // No driven handler for this scheme: the transfer cannot proceed, but the
         // preflight must have populated the effective URL / scheme first.
         assert_eq!(
             e.perform().await.unwrap_err(),
@@ -1127,12 +1130,12 @@ mod tests {
 
         match e.getinfo(CurlInfo::EffectiveUrl).unwrap() {
             InfoValue::Str(Some(s)) => {
-                assert!(s.to_str().unwrap().starts_with("http://example.com"));
+                assert!(s.to_str().unwrap().starts_with("gopher://example.com"));
             }
             other => panic!("expected effective-url string, got {other:?}"),
         }
         match e.getinfo(CurlInfo::Scheme).unwrap() {
-            InfoValue::Str(Some(s)) => assert_eq!(s.to_str().unwrap(), "HTTP"),
+            InfoValue::Str(Some(s)) => assert_eq!(s.to_str().unwrap(), "GOPHER"),
             other => panic!("expected scheme string, got {other:?}"),
         }
         assert_eq!(
@@ -1295,11 +1298,14 @@ mod tests {
     #[tokio::test]
     async fn perform_with_unknown_scheme_is_unsupported() {
         // A recognized network scheme whose end-to-end drive is not yet wired
-        // still reports UnsupportedProtocol (the keystone-remaining path).
+        // still reports UnsupportedProtocol. `http`/`https` are now driven over
+        // the network, so this uses `gopher` — recognized by the build but with
+        // no driven handler — to exercise the unsupported-drive path without
+        // attempting a real transfer.
         let mut e = Easy::new();
         e.setopt(
             CurlOption::CURLOPT_URL,
-            OptionValue::Str(Some("http://example.com/".to_string())),
+            OptionValue::Str(Some("gopher://example.com/".to_string())),
         )
         .unwrap();
 

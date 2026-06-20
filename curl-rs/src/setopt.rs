@@ -1383,15 +1383,28 @@ fn setopt_post(
                 errorf(global, "cannot mix --continue-at with --data");
                 return Err(CurlError::from_code(codes::CURLE_FAILED_INIT));
             }
-            // CURLOPT_POSTFIELDS keeps a borrowed pointer into config.postdata
-            // (no copy), exactly as curl passes `curlx_dyn_ptr(&postdata)`.
-            // `config` outlives the transfer, so the pointer stays valid.
-            let ptr = CDataPtr(config.postdata.as_ptr() as usize);
-            my_setopt(easy, O::CURLOPT_POSTFIELDS, OptionValue::Ptr(ptr))?;
+            // The accumulated `-d` body lives in `config.postdata`, owned by the
+            // operation driver. curl's C tool passes a *borrowed* pointer via
+            // `CURLOPT_POSTFIELDS` (`curlx_dyn_ptr(&postdata)`); a borrowed raw
+            // pointer, however, cannot be read by the `#![forbid(unsafe_code)]`
+            // library core. The memory-safe, wire-identical equivalent is
+            // `CURLOPT_COPYPOSTFIELDS`, which hands the library an *owned* copy of
+            // the exact body bytes (`data.set.copypostfields`). The produced
+            // request — POST method, default `Content-Type`, `Content-Length`,
+            // and body — is byte-for-byte identical; only the body's memory
+            // ownership differs. This realizes the AAP's G1 memory-safety mandate
+            // at the POST seam. `POSTFIELDSIZE` is programmed first (curl's
+            // documented "size before copy" order, while no owned copy yet
+            // exists) so the announced length matches the copied bytes.
             set_offt(
                 easy,
                 O::CURLOPT_POSTFIELDSIZE_LARGE,
                 config.postdata.len() as i64,
+            )?;
+            my_setopt(
+                easy,
+                O::CURLOPT_COPYPOSTFIELDS,
+                OptionValue::Bytes(Some(config.postdata.clone())),
             )?;
         }
         HttpReq::MimePost => {
@@ -1545,6 +1558,15 @@ pub fn config2setopts(
     gen_cb_setopts(global, per, easy)?;
 
     set_long(easy, O::CURLOPT_NOBODY, i64::from(config.no_body))?;
+    // `-i`/`--include` and `-I`/`--head` both set `config.show_headers`. curl's C
+    // tool surfaces the response headers via its own `CURLOPT_HEADERFUNCTION`
+    // callback (`tool_cb_hdr.c`), writing them to stdout when `show_headers` is
+    // set. The curl-rs library instead delivers headers on the body stream when
+    // `CURLOPT_HEADER` is enabled (`include_header`), which is byte-identical to
+    // curl's `-i`/`-I` output (status line + header lines + blank line, then the
+    // body for `-i`). Wire the existing flag to that mechanism so `-I`/`-i`
+    // produce the expected header output. (No new flag or behavior is added.)
+    set_long(easy, O::CURLOPT_HEADER, i64::from(config.show_headers))?;
     set_str(
         easy,
         O::CURLOPT_XOAUTH2_BEARER,

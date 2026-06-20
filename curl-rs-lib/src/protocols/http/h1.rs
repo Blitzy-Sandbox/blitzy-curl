@@ -791,7 +791,17 @@ pub fn build_request(inputs: &RequestInputs<'_>) -> Result<RequestPlan> {
     // cookies and custom headers (oracle: `http_req_set_TE`, the dedicated
     // `H1_HD_TRANSFER_ENCODING` slot — distinct from `H1_HD_CONTENT`). HTTP/2+
     // never chunks; the caller leaves `inputs.chunked` false on those versions.
-    if inputs.chunked && !hds.contains("Transfer-Encoding") {
+    //
+    // curl only auto-emits `Transfer-Encoding: chunked` when the application has
+    // NOT already supplied one (`Curl_checkheaders(data, "Transfer-Encoding")`):
+    // a user-provided `-H 'Transfer-Encoding: chunked'` is what enables chunked
+    // upload, and the custom-header machinery (below) emits it — so adding it
+    // here too would duplicate the header on the wire. Skip the auto-emit when a
+    // custom `Transfer-Encoding` header is present.
+    if inputs.chunked
+        && !hds.contains("Transfer-Encoding")
+        && find_custom_header_value(inputs.custom_headers, "Transfer-Encoding").is_none()
+    {
         hds.add("Transfer-Encoding", "chunked")?;
     }
 
