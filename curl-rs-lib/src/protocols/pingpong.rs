@@ -693,6 +693,45 @@ impl PingPong {
         self.sendleft == 0 && self.recvbuf.len() > self.nfinal
     }
 
+    /// Detach already-buffered bytes that follow the last matched final
+    /// response line — the pipelined "overflow" the engine would otherwise
+    /// serve to the next [`readresp`](PingPong::readresp) — for protocols whose
+    /// message **body** arrives in the same buffer as (or right after) the final
+    /// command-response line.
+    ///
+    /// It first drops the kept final line (exactly as [`readresp`](PingPong::readresp)
+    /// does on its next call, trimming `nfinal` leading bytes), then removes and
+    /// returns up to `max` bytes from the front of the receive buffer, leaving
+    /// any remainder buffered (with [`overflow`](PingPong) updated) so a later
+    /// `readresp` (e.g. the IMAP `FETCH` tagged-completion read in `done`)
+    /// serves it without blocking.
+    ///
+    /// Two body-bearing line protocols use this:
+    ///
+    /// * **POP3 `RETR`** (C `pop3.c`): the body follows the `+OK` line and runs
+    ///   to the `CRLF.CRLF` marker; the driver pulls the buffered prefix with
+    ///   `max == usize::MAX`, then reads the rest from the socket.
+    /// * **IMAP `FETCH`** (C `imap.c`): a `{size}` literal of known length
+    ///   follows the untagged `* … FETCH (… {size}` line; the driver pulls up to
+    ///   `size` buffered bytes, then reads exactly the remainder, leaving the
+    ///   closing `)` + tagged status for `done`.
+    ///
+    /// Mirrors the C transfer loop replaying `pp->overflow` as body bytes.
+    pub fn take_buffered_body(&mut self, max: usize) -> Vec<u8> {
+        if self.nfinal > 0 {
+            let drop = self.nfinal.min(self.recvbuf.len());
+            self.recvbuf.drain(0..drop);
+            self.nfinal = 0;
+        }
+        let take = max.min(self.recvbuf.len());
+        let body: Vec<u8> = self.recvbuf.drain(0..take).collect();
+        // Any bytes still buffered belong to the next response (e.g. the IMAP
+        // FETCH closing line + tagged status); record them as overflow so the
+        // next `readresp` serves them from the buffer rather than the socket.
+        self.overflow = self.recvbuf.len();
+        body
+    }
+
     /// Drive one iteration of the protocol's command/response exchange
     /// (C `Curl_pp_statemach`).
     ///
@@ -958,6 +997,61 @@ mod tests {
                 .expect("second readresp");
             assert_eq!(code2, 226, "pipelined response parsed from overflow");
             assert_eq!(pp.overflow, 0, "overflow consumed");
+        });
+    }
+
+    #[test]
+    fn take_buffered_body_unbounded_drains_overflow_after_final_line() {
+        run(async {
+            let mut data = Easy::new();
+            // A final response line followed immediately by body bytes — the
+            // pipelined "overflow" a POP3 `RETR` body arrives as behind `+OK`.
+            let (mut conn, _sent) = conn_with(vec![b"226 ok\r\nBODYBYTES".to_vec()]);
+            let mut pp = PingPong::new();
+            pp.init(timeval::curlx_now());
+            let mut proto = FtpStyle;
+
+            let (code, _size) = pp
+                .readresp(&mut data, &mut conn, FIRSTSOCKET, &mut proto)
+                .await
+                .expect("readresp");
+            assert_eq!(code, 226);
+            assert_eq!(pp.overflow, 9, "9 trailing body bytes are overflow");
+            assert_eq!(&pp.recvbuf[..pp.nfinal], b"226 ok\r\n");
+
+            // Unbounded take (POP3): drop the kept final line, return all body.
+            let body = pp.take_buffered_body(usize::MAX);
+            assert_eq!(body, b"BODYBYTES");
+            assert_eq!(pp.overflow, 0, "buffer drained");
+            assert!(pp.recvbuf.is_empty());
+        });
+    }
+
+    #[test]
+    fn take_buffered_body_bounded_leaves_remainder_as_overflow() {
+        run(async {
+            let mut data = Easy::new();
+            // Final line + buffered bytes; the IMAP `FETCH` case where a
+            // fixed-size literal is followed by the closing `)` + tagged status.
+            let (mut conn, _sent) = conn_with(vec![b"226 x\r\nHELLOWORLD".to_vec()]);
+            let mut pp = PingPong::new();
+            pp.init(timeval::curlx_now());
+            let mut proto = FtpStyle;
+
+            let (code, _size) = pp
+                .readresp(&mut data, &mut conn, FIRSTSOCKET, &mut proto)
+                .await
+                .expect("readresp");
+            assert_eq!(code, 226);
+            assert_eq!(pp.overflow, 10, "10 trailing bytes buffered");
+
+            // Bounded take (IMAP literal of size 5): take exactly 5, leaving the
+            // rest buffered (as overflow) for the trailing `done` read.
+            let body = pp.take_buffered_body(5);
+            assert_eq!(body, b"HELLO");
+            assert_eq!(pp.recvbuf, b"WORLD", "remainder kept for the next read");
+            assert_eq!(pp.overflow, 5, "remainder recorded as overflow");
+            assert_eq!(pp.nfinal, 0, "final line dropped");
         });
     }
 

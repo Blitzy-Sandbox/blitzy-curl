@@ -34,7 +34,12 @@ use crate::conn::{
 };
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
-use crate::protocols::{Protocol, ProtocolTransfer, Scheme, TransferDirection, SCHEME_RTSP};
+use crate::protocols::{
+    connect_network_scheme, Protocol, ProtocolTransfer, Scheme, TransferDirection, SCHEME_RTSP,
+};
+use crate::transfer::{
+    ClientWriteType, ClientWriter, ReadCallback, ReadStep, UploadReader, WriteCallbacks,
+};
 // Dependency justification: `StrId` lives in `crate::setopt`, which is outside
 // this file's `depends_on_files` whitelist. Reading the RTSP string options
 // (`CURLOPT_RTSP_STREAM_URI` / `_SESSION_ID` / `_TRANSPORT`, and the shared
@@ -1137,33 +1142,39 @@ impl Protocol for RtspProtocol {
         _premature: bool,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            // Propagate a transfer-phase error rather than swallowing it. C
+            // `rtsp_done` returns `httpStatus = Curl_http_done(data, status, …)`,
+            // which carries `status` when the transfer failed, and only runs the
+            // `CSeq` check under `if(!status && !httpStatus)`. Mirroring that, an
+            // error `status` (e.g. `CURLE_GOT_NOTHING` from an empty reply) is
+            // returned unchanged so the final exit code matches curl.
+            status?;
+
+            // Transfer succeeded: validate the response sequence numbers.
             let rtspreq = data.set.rtspreq;
-            // Only validate when the transfer itself succeeded (C `rtsp_done`).
-            if status.is_ok() {
-                let (sent, recv, channel) = {
-                    let sess = self.lock();
-                    (
-                        sess.state.cseq_sent,
-                        sess.state.cseq_recv,
-                        sess.conn.rtp_channel,
-                    )
-                };
-                if rtspreq == RTSPREQ_RECEIVE && channel == -1 {
-                    infof(
-                        data.set.verbose,
-                        &format!("Got an RTP Receive with a CSeq of {recv}"),
-                    );
-                }
-                if let Err(e) = check_cseq(rtspreq, sent, recv) {
-                    let mut errbuf: Option<String> = None;
-                    failf(
-                        &mut errbuf,
-                        &format!(
-                            "The CSeq of this request {sent} did not match the response {recv}"
-                        ),
-                    );
-                    return Err(e);
-                }
+            let (sent, recv, channel) = {
+                let sess = self.lock();
+                (
+                    sess.state.cseq_sent,
+                    sess.state.cseq_recv,
+                    sess.conn.rtp_channel,
+                )
+            };
+            if rtspreq == RTSPREQ_RECEIVE && channel == -1 {
+                infof(
+                    data.set.verbose,
+                    &format!("Got an RTP Receive with a CSeq of {recv}"),
+                );
+            }
+            if let Err(e) = check_cseq(rtspreq, sent, recv) {
+                let mut errbuf: Option<String> = None;
+                failf(
+                    &mut errbuf,
+                    &format!(
+                        "The CSeq of this request {sent} did not match the response {recv}"
+                    ),
+                );
+                return Err(e);
             }
             Ok(())
         })
@@ -1231,6 +1242,267 @@ impl Protocol for RtspProtocol {
         }
         result
     }
+}
+
+// ===========================================================================
+// Transfer-engine driver (C `Curl_do` → `Curl_done` for an `rtsp://` transfer).
+// ===========================================================================
+
+/// Find the first occurrence of `needle` in `haystack` (a tiny `memmem` — the
+/// header block is small, so the naive window scan is more than adequate).
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Parse a `Content-Length:` value from a single CRLF-terminated header line,
+/// case-insensitively on the field name (C reads it via `Curl_compareheader`).
+/// Returns `None` for any other header or an unparseable value.
+fn rtsp_content_length(line: &[u8]) -> Option<u64> {
+    let s = std::str::from_utf8(line).ok()?;
+    let (name, value) = s.split_once(':')?;
+    if !name.trim().eq_ignore_ascii_case("Content-Length") {
+        return None;
+    }
+    value.trim().parse::<u64>().ok()
+}
+
+/// Buffer the entire RTSP request body from the upload read callback (`-T`),
+/// the analog of SMTP's `read_upload_to_end`: loop until the source yields no
+/// more data. Used for body-bearing methods when no in-memory `-d`
+/// (`copypostfields`) buffer is set.
+fn read_rtsp_upload(source: &mut dyn ReadCallback) -> Result<Vec<u8>> {
+    let mut reader = UploadReader::new(None, false);
+    let mut body = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    while let ReadStep::Data(n) = reader.read(&mut buf, source)? {
+        body.extend_from_slice(&buf[..n]);
+    }
+    Ok(body)
+}
+
+/// Read and dispatch one RTSP response off `conn`, mirroring curl's split of
+/// `Curl_http_readwrite_headers` (header lines) and `rtsp_rtp_write_resp`
+/// (body + interleaved RTP). The RTSP response is HTTP-shaped
+/// (`RTSP/1.0 <code> <reason>\r\n<headers>\r\n\r\n[body]`):
+///
+/// 1. Read until the blank-line header terminator (`\r\n\r\n`) or peer close.
+/// 2. Feed every CRLF-delimited line — including the status line, which curl
+///    also writes as a header — to [`RtspProtocol::write_resp_hd`], which tracks
+///    `CSeq`/`Session` (consumed by the `done`-phase `CSeq` check) and returns
+///    `Ok(false)` so the line is also written to the client header stream.
+///    `Content-Length` is parsed here to bound the body.
+/// 3. Feed the body bytes (those already read past the header terminator, plus
+///    any remainder read from the socket, bounded by `Content-Length`) to
+///    [`RtspProtocol::write_resp`], which demuxes interleaved RTP and
+///    accumulates the demuxed body.
+/// 4. Deliver the accumulated body to the client `sink` with an end-of-stream.
+///
+/// # Errors
+///
+/// Any transport error from [`Curl_conn_recv`], a header-parse error surfaced by
+/// the handler, or a client write error.
+async fn read_rtsp_response(
+    data: &mut Easy,
+    conn: &mut Connection,
+    handler: &RtspProtocol,
+    sink: &mut dyn WriteCallbacks,
+) -> Result<()> {
+    let mut writer = ClientWriter::with_options(data.set.include_header, false);
+    let mut acc: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; RTP_RECV_CHUNK];
+
+    // (1) Read until the end of the header block (CRLF CRLF) or peer close.
+    let header_end = loop {
+        if let Some(pos) = find_subsequence(&acc, b"\r\n\r\n") {
+            break Some(pos + 4);
+        }
+        match Curl_conn_recv(conn, FIRSTSOCKET, &mut buf).await {
+            Ok(0) => break None, // peer closed before a complete header block
+            Ok(n) => acc.extend_from_slice(&buf[..n]),
+            Err(CurlError::Again) => continue,
+            Err(e) => return Err(e),
+        }
+    };
+
+    let Some(header_end) = header_end else {
+        // The peer closed before a complete header block.
+        if acc.is_empty() {
+            // Nothing at all was received: curl's transfer loop reports
+            // `CURLE_GOT_NOTHING` ("Empty reply from server", exit 52) for this
+            // case — the same code system curl returns against a server that
+            // accepts the connection and closes without replying. Surface it so
+            // the exit code matches (G6 behavioral parity).
+            return Err(CurlError::GotNothing);
+        }
+        // Some bytes arrived but never completed the header block (a truncated
+        // response). Flush a zero-length body end-of-stream so the writer
+        // finalizes; the `done`-phase `CSeq` check then surfaces the protocol
+        // error (`recv` stays 0), exactly as curl reports a truncated RTSP
+        // response.
+        writer.write(ClientWriteType::BODY.union(ClientWriteType::EOS), &[], sink)?;
+        return Ok(());
+    };
+
+    // (2) Dispatch each header line (status line included), retaining its CRLF
+    //     so the bytes match what curl hands the header writer.
+    let mut content_length: Option<u64> = None;
+    let mut start = 0usize;
+    while start < header_end {
+        let Some(rel) = find_subsequence(&acc[start..header_end], b"\r\n") else {
+            break;
+        };
+        let line_end = start + rel + 2; // include the CRLF
+        let line = acc[start..line_end].to_vec();
+        let is_terminator = line.as_slice() == b"\r\n";
+        if !is_terminator {
+            if let Some(v) = rtsp_content_length(&line) {
+                content_length = Some(v);
+            }
+        }
+        let handled = handler.write_resp_hd(data, &line, is_terminator)?;
+        if !handled && writer.write(ClientWriteType::HEADER, &line, sink).is_err() {
+            return Err(CurlError::WriteError);
+        }
+        start = line_end;
+        if is_terminator {
+            break;
+        }
+    }
+
+    // (3) Body: the bytes after the header terminator, bounded by
+    //     `Content-Length` (RTSP requires it for a body; its absence means no
+    //     body). Feed to the protocol's demux (`write_resp`).
+    let body_target = content_length.unwrap_or(0);
+    let mut body_seen: u64 = 0;
+    let leading = acc.split_off(header_end); // bytes already read past the headers
+    if body_target > 0 && !leading.is_empty() {
+        let take = ((body_target - body_seen) as usize).min(leading.len());
+        handler.write_resp(data, &leading[..take], false)?;
+        body_seen += take as u64;
+    }
+    while body_seen < body_target {
+        let want = ((body_target - body_seen) as usize).min(buf.len());
+        match Curl_conn_recv(conn, FIRSTSOCKET, &mut buf[..want]).await {
+            Ok(0) => break, // peer closed before the full body arrived
+            Ok(n) => {
+                handler.write_resp(data, &buf[..n], false)?;
+                body_seen += n as u64;
+            }
+            Err(CurlError::Again) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    // Signal end-of-body to the demux filter (no-op on an empty buffer).
+    handler.write_resp(data, &[], true)?;
+
+    // (4) Deliver the demuxed body to the client.
+    let body = handler.take_pending_body();
+    writer.write(
+        ClientWriteType::BODY.union(ClientWriteType::EOS),
+        &body,
+        sink,
+    )?;
+    data.info.size_download = body.len() as i64;
+    Ok(())
+}
+
+/// Drive an `rtsp://` transfer end-to-end, the RTSP analog of
+/// [`pop3::perform_pop3`](crate::protocols::pop3::perform_pop3) and the seam
+/// [`perform_transfer`](crate::protocols::perform_transfer) dispatches every
+/// `rtsp` scheme to:
+///
+/// 1. Open the plain-TCP connection-filter chain with [`connect_network_scheme`]
+///    (RTSP has a single scheme; RTSP-over-TLS exists only via an explicit
+///    proxy tunnel, out of scope here).
+/// 2. [`connect`](Protocol::connect) initializes the client/server `CSeq`
+///    counters (C `rtsp_connect`).
+/// 3. [`do_it`](Protocol::do_it) sends the request line + headers (e.g.
+///    `OPTIONS`/`DESCRIBE`/`SETUP`/`PLAY`) and reports the transfer shape. For a
+///    body-bearing method (`ANNOUNCE`/`SET_PARAMETER`/`GET_PARAMETER` with
+///    content) the request body is sent here — from the in-memory `-d`
+///    (`copypostfields`) buffer or the `-T` upload read callback — immediately
+///    after the headers. The response (status line + headers + optional
+///    `Content-Length` body, with interleaved-RTP demux) is then read by
+///    [`read_rtsp_response`]; the `RECEIVE` pseudo-request instead delivers the
+///    single chunk `do_it` already demuxed.
+/// 4. [`done`](Protocol::done) validates the response `CSeq` (C `rtsp_done`) and
+///    [`disconnect`](Protocol::disconnect) tears down.
+///
+/// This is the wiring whose absence produced QA finding **F5-CRIT-10** (every
+/// `rtsp://` transfer returned `UnsupportedProtocol` before a socket opened).
+///
+/// # Errors
+///
+/// Propagates any connection-setup, request-send, response-read, `CSeq`
+/// validation, or client write error as the corresponding [`CurlError`].
+pub(crate) async fn perform_rtsp(
+    data: &mut Easy,
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+) -> Result<()> {
+    // RTSP has a single scheme descriptor (default port 554).
+    let scheme: &'static Scheme = &SCHEME_RTSP;
+
+    // (1) Establish the plain-TCP connection.
+    let mut conn = connect_network_scheme(data, scheme).await?;
+
+    // (2) Connect phase: initialize the CSeq counters (C `rtsp_connect`).
+    let handler = RtspProtocol::new();
+    handler.connect(data, &mut conn).await?;
+
+    // (3) DO phase: send the request, optionally send the request body, then
+    //     read the response. Fenced so a failure still runs `done`.
+    let result: Result<()> = async {
+        let xfer = handler.do_it(data, &mut conn).await?;
+        let rtspreq = data.set.rtspreq;
+
+        // (3a) Body-bearing methods: `do_it` sent the headers (incl.
+        //      `Content-Length`); the body follows on the same connection.
+        if matches!(
+            xfer.direction,
+            TransferDirection::Upload | TransferDirection::Bidirectional
+        ) {
+            if let Some(len) = xfer.expected_size {
+                let mut body = if let Some(cp) = data.set.copypostfields.clone() {
+                    cp
+                } else {
+                    read_rtsp_upload(source)?
+                };
+                body.truncate(len as usize);
+                if !body.is_empty() {
+                    Curl_conn_send(&mut conn, FIRSTSOCKET, &body, false).await?;
+                }
+            }
+        }
+
+        // (3b) Read the response. RTSP always returns a status line + headers
+        //      (`has_response_headers` is always set), except the `RECEIVE`
+        //      pseudo-request, which `do_it` already serviced by demuxing one
+        //      interleaved chunk.
+        if rtspreq == RTSPREQ_RECEIVE {
+            let body = handler.take_pending_body();
+            let mut writer = ClientWriter::with_options(data.set.include_header, false);
+            writer.write(
+                ClientWriteType::BODY.union(ClientWriteType::EOS),
+                &body,
+                sink,
+            )?;
+            data.info.size_download = body.len() as i64;
+        } else if xfer.has_response_headers {
+            read_rtsp_response(data, &mut conn, &handler, sink).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    // (4) Finalize (validates the response CSeq) then best-effort tear-down.
+    let premature = result.is_err();
+    let done = handler.done(data, &mut conn, result, premature).await;
+    let _ = handler.disconnect(data, &mut conn, done.is_err()).await;
+    done
 }
 
 // ===========================================================================

@@ -1585,7 +1585,7 @@ fn ws_request_headers(key: &str) -> [(&'static str, String); 3] {
 /// if the user has not already supplied that header (curl's `Curl_checkheaders`
 /// guard). The HTTP/1.1 engine emits the custom header list verbatim, so these
 /// ride out on the upgrade `GET`.
-fn ws_inject_request_headers(data: &mut Easy) -> Result<()> {
+pub(crate) fn ws_inject_request_headers(data: &mut Easy) -> Result<()> {
     let key = generate_sec_websocket_key()?;
     let list = data.set.headers.get_or_insert_with(Default::default);
     for (name, value) in ws_request_headers(&key) {

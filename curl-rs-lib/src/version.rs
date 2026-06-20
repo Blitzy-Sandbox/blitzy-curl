@@ -63,6 +63,18 @@ use std::sync::OnceLock;
 /// apart from the C original — it does not claim to be C-curl.
 pub const NAME: &str = "curl-rs";
 
+/// The wire-protocol product name, exactly as defined by the `LIBCURL_NAME`
+/// macro in `lib/urldata.h` (`"libcurl"`).
+///
+/// This is distinct from [`NAME`]: [`NAME`] is the **consumer-facing** identity
+/// reported by `curl_version()` / `curl --version` (deliberately `"curl-rs"` so
+/// downstreams can recognize the Rust implementation), whereas `LIBCURL_NAME` is
+/// the **on-the-wire** product token that some protocols transmit verbatim to a
+/// remote peer (e.g. the DICT `CLIENT` line — C `dict_do` emits
+/// `"CLIENT " LIBCURL_NAME " " LIBCURL_VERSION`). Wire bytes must match curl 8.x
+/// byte-for-byte (AAP G6), so the literal `"libcurl"` is preserved here.
+pub const LIBCURL_NAME: &str = "libcurl";
+
 /// The human-readable libcurl version string, exactly as defined by
 /// `LIBCURL_VERSION` in `include/curl/curlver.h`.
 ///

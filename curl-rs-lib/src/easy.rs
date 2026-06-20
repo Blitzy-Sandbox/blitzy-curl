@@ -67,10 +67,12 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Once;
 
+use crate::conn::Connection;
 use crate::error::{CurlError, Result};
 use crate::getinfo::{self, CurlInfo, Info, InfoValue};
 use crate::headers::HeaderCollector;
 use crate::options::CurlOption;
+use crate::protocols::ws::{WsConnState, WsFrameMeta};
 use crate::setopt::{self, CDataPtr, OptionValue, StrId, UserDefined};
 use crate::transfer::{uc_to_curlcode, ReadCallback, WriteCallbacks};
 use crate::url::{CurlUPart, CurlUrl, CURLU_GUESS_SCHEME};
@@ -298,7 +300,6 @@ struct EasyState {
 ///
 /// [`set`]: Easy::set
 /// [`info`]: Easy::info
-#[derive(Debug)]
 pub struct Easy {
     /// Configured options (curl's `data->set`): everything written by
     /// `curl_easy_setopt`. The sole state deep-copied by
@@ -314,6 +315,48 @@ pub struct Easy {
     /// Received-header store backing the header API (curl's
     /// `data->state.httphdrs`).
     response_headers: HeaderCollector,
+    /// The connection retained by a `CURLOPT_CONNECT_ONLY` transfer (curl's
+    /// `data->conn` surviving past `perform` for the app's own I/O). `None`
+    /// until a CONNECT_ONLY [`perform`](Easy::perform) succeeds; populated by
+    /// [`attach_ws_connection`](Easy::attach_ws_connection) so the subsequent
+    /// `curl_ws_*` (and raw `curl_easy_recv`/`send`) calls have a live socket to
+    /// drive. It is held alongside [`ws_state`](Self::ws_state) rather than
+    /// inside the connection's `proto_state` so the framing engine and the
+    /// connection can be borrowed disjointly.
+    ///
+    /// The connection is wrapped in a [`std::sync::Mutex`] purely to keep `Easy`
+    /// `Sync`: a bare [`Connection`] is `Send` but not `Sync` (its
+    /// `dyn ConnectionFilter` chain is `Send`-only), and the protocol futures
+    /// hold `&Easy` across `Send` await points, which requires `Easy: Sync`.
+    /// `Mutex<Connection>` restores `Sync` (a `Mutex<T>` is `Sync` whenever
+    /// `T: Send`). The handle is never shared across threads concurrently (the
+    /// libcurl threading contract), so the mutex is only ever reached via
+    /// [`Mutex::get_mut`] on `&mut self` — no lock is taken and no guard is held
+    /// across `.await`.
+    connect_only_conn: Option<std::sync::Mutex<Connection>>,
+    /// The RFC 6455 framing engine for a retained `ws`/`wss` CONNECT_ONLY
+    /// connection (curl's per-connection `websocket` state, `CURL_META_PROTO_WS_CONN`).
+    /// `Some` only while a WebSocket CONNECT_ONLY connection is attached; this is
+    /// the "active WebSocket context" that gates `curl_ws_meta` (a NULL result
+    /// outside it — QA F5-MINOR-2) and backs `curl_ws_send`/`curl_ws_recv`.
+    ws_state: Option<WsConnState>,
+}
+
+// `Easy` is `Debug` (formerly derived) but the retained-connection fields hold
+// heavy, non-`Debug` engine types (`Connection`, `WsConnState`); render those
+// compactly as presence flags so the handle stays printable without forcing a
+// noisy `Debug` onto the connection/framing internals.
+impl core::fmt::Debug for Easy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Easy")
+            .field("set", &self.set)
+            .field("info", &self.info)
+            .field("state", &self.state)
+            .field("response_headers", &self.response_headers)
+            .field("connect_only_conn", &self.connect_only_conn.is_some())
+            .field("ws_state", &self.ws_state.is_some())
+            .finish()
+    }
 }
 
 impl Easy {
@@ -331,6 +374,8 @@ impl Easy {
             info: Info::new(),
             state: EasyState::default(),
             response_headers: HeaderCollector::new(),
+            connect_only_conn: None,
+            ws_state: None,
         }
     }
 }
@@ -465,6 +510,10 @@ impl Easy {
             info: Info::new(),
             state: EasyState::default(),
             response_headers: HeaderCollector::new(),
+            // A duplicated handle inherits no live connection (curl's
+            // `curl_easy_duphandle` starts with empty caches and no `data->conn`).
+            connect_only_conn: None,
+            ws_state: None,
         }
     }
 
@@ -969,6 +1018,125 @@ impl Easy {
         Err(CurlError::UnsupportedProtocol)
     }
 
+    // ----- WebSocket CONNECT_ONLY surface (backs the `curl_ws_*` FFI) ------
+
+    /// Attach a retained WebSocket `CURLOPT_CONNECT_ONLY` connection to the
+    /// handle (the Rust analog of `Curl_ws_accept` leaving `data->conn` and the
+    /// connection's `websocket` state live past the upgrade `perform`).
+    ///
+    /// Called by the WebSocket transfer driver once the HTTP/1.1 Upgrade has
+    /// completed: the live [`Connection`] and its [`WsConnState`] framing engine
+    /// are moved onto the handle so the subsequent `curl_ws_send`/`curl_ws_recv`/
+    /// `curl_ws_meta` calls operate on them. `has_connection` is set so the
+    /// connection-gated entrypoints observe the attached socket.
+    pub(crate) fn attach_ws_connection(&mut self, conn: Connection, ws: WsConnState) {
+        self.state.has_connection = true;
+        self.connect_only_conn = Some(std::sync::Mutex::new(conn));
+        self.ws_state = Some(ws);
+    }
+
+    /// Whether a live WebSocket context is attached (an active `ws`/`wss`
+    /// CONNECT_ONLY connection). This is the gate curl applies before returning
+    /// frame metadata from `curl_ws_meta` (`data->conn` + the connection's
+    /// `websocket` state); outside it, `curl_ws_meta` must report NULL
+    /// (QA F5-MINOR-2).
+    #[must_use]
+    pub fn is_websocket(&self) -> bool {
+        self.ws_state.is_some()
+    }
+
+    /// `curl_ws_send` — send one WebSocket frame (or frame chunk) on the
+    /// retained connection.
+    ///
+    /// Frames the `payload` per RFC 6455 (opcode/FIN from `flags`, masked) and
+    /// transmits it, returning the number of *payload* bytes accepted. With
+    /// `CURLWS_OFFSET`, `fragsize` is the total frame length and this call
+    /// supplies one chunk. In `CURLWS_RAW_MODE` the bytes go out verbatim.
+    ///
+    /// # Errors
+    ///
+    /// [`CurlError::UnsupportedProtocol`] when no WebSocket connection is
+    /// attached (curl requires a `CONNECT_ONLY` WebSocket connection), plus any
+    /// framing/transport error from the connection.
+    pub async fn ws_send(&mut self, payload: &[u8], flags: u32, fragsize: i64) -> Result<usize> {
+        // Borrow the two disjoint fields directly so the framing engine and the
+        // connection are held mutably at the same time (the borrow checker
+        // splits `self.ws_state` and `self.connect_only_conn`). `get_mut` on the
+        // wrapping mutex never blocks given `&mut self`.
+        let ws = self
+            .ws_state
+            .as_mut()
+            .ok_or(CurlError::UnsupportedProtocol)?;
+        let conn = self
+            .connect_only_conn
+            .as_mut()
+            .ok_or(CurlError::UnsupportedProtocol)?
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ws.ws_send(conn, payload, flags, fragsize).await
+    }
+
+    /// `curl_ws_recv` — receive and decode the next WebSocket frame (or chunk)
+    /// from the retained connection into `buf`.
+    ///
+    /// Returns the number of payload bytes written to `buf` and the frame
+    /// metadata. Control PINGs are auto-answered (unless `CURLWS_NOAUTOPONG`) and
+    /// not surfaced.
+    ///
+    /// # Errors
+    ///
+    /// [`CurlError::UnsupportedProtocol`] when no WebSocket connection is
+    /// attached; [`CurlError::GotNothing`] on a clean close; plus any
+    /// framing/transport error.
+    pub async fn ws_recv(&mut self, buf: &mut [u8]) -> Result<(usize, WsFrameMeta)> {
+        let ws = self
+            .ws_state
+            .as_mut()
+            .ok_or(CurlError::UnsupportedProtocol)?;
+        let conn = self
+            .connect_only_conn
+            .as_mut()
+            .ok_or(CurlError::UnsupportedProtocol)?
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ws.ws_recv(conn, buf).await
+    }
+
+    /// `curl_ws_start_frame` — buffer a frame header for piecewise
+    /// (`CURLWS_OFFSET`) delivery without sending payload yet.
+    ///
+    /// # Errors
+    ///
+    /// [`CurlError::SendError`] when no WebSocket connection is attached (curl's
+    /// "no associated connection" path) or a previous frame is still open.
+    pub fn ws_start_frame(&mut self, flags: u32, frame_len: i64) -> Result<()> {
+        // curl's `curl_ws_start_frame` reports `CURLE_SEND_ERROR` when there is
+        // no associated WebSocket connection.
+        let ws = self.ws_state.as_mut().ok_or(CurlError::SendError)?;
+        // Route any diagnostic straight into the connection's error buffer (so
+        // verbose/`CURLINFO` observes it), borrowing the disjoint `connect_only_conn`
+        // field via `get_mut` (never blocks under `&mut self`).
+        match self
+            .connect_only_conn
+            .as_mut()
+            .map(|m| m.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner))
+        {
+            Some(conn) => ws.ws_start_frame(&mut conn.filter_data.error_buffer, flags, frame_len),
+            None => {
+                let mut err_buf = None;
+                ws.ws_start_frame(&mut err_buf, flags, frame_len)
+            }
+        }
+    }
+
+    /// `curl_ws_meta` — the metadata of the most recently received frame, or
+    /// `None` when no WebSocket context is attached (QA F5-MINOR-2: curl returns
+    /// NULL outside an active WebSocket transfer).
+    #[must_use]
+    pub fn ws_meta(&self) -> Option<WsFrameMeta> {
+        self.ws_state.as_ref().map(WsConnState::meta)
+    }
+
     /// `curl_easy_upkeep` — perform connection-pool upkeep.
     ///
     /// curl runs `Curl_cpool_upkeep` over the handle's connection cache, pinging
@@ -1110,19 +1278,26 @@ mod tests {
     #[tokio::test]
     async fn perform_preflights_then_reports_unsupported_protocol() {
         let mut e = Easy::new();
-        // `gopher` is a recognized network scheme whose end-to-end drive is not
-        // wired (only `http`/`https` are driven over the network, plus the
-        // NONETWORK `file` scheme); it therefore still exercises the
-        // "preflight succeeds, then the transfer reports UnsupportedProtocol"
-        // path. (Using `http` here would now attempt a real network transfer.)
-        e.setopt(
-            CurlOption::CURLOPT_URL,
-            OptionValue::Str(Some("gopher://example.com/".to_string())),
+        // Every *recognized* scheme is now driven end-to-end over the network
+        // (wiring that absence was exactly QA findings F4/F5-CRIT-*), so to
+        // exercise the "preflight succeeds, then the transfer reports
+        // UnsupportedProtocol" path we use a scheme with no registered handler
+        // at all. curl's URL parser rejects an unknown scheme unless
+        // `CURLU_NON_SUPPORT_SCHEME` is set, so the URL is supplied as a
+        // pre-parsed `CURLOPT_CURLU` handle built with that flag (the
+        // string-parse preflight path would otherwise reject it). Dispatch fails
+        // at scheme lookup before any socket opens — so this stays network-free.
+        let mut uh = CurlUrl::new();
+        uh.set(
+            CurlUPart::Url,
+            Some("xyz://example.com/"),
+            crate::url::CURLU_NON_SUPPORT_SCHEME,
         )
-        .unwrap();
+        .expect("CURLU_NON_SUPPORT_SCHEME accepts an unknown scheme");
+        e.set.uh = Some(uh);
 
-        // No driven handler for this scheme: the transfer cannot proceed, but the
-        // preflight must have populated the effective URL / scheme first.
+        // No registered handler for this scheme: the transfer cannot proceed,
+        // but the preflight must have populated the effective URL / scheme first.
         assert_eq!(
             e.perform().await.unwrap_err(),
             CurlError::UnsupportedProtocol
@@ -1130,12 +1305,12 @@ mod tests {
 
         match e.getinfo(CurlInfo::EffectiveUrl).unwrap() {
             InfoValue::Str(Some(s)) => {
-                assert!(s.to_str().unwrap().starts_with("gopher://example.com"));
+                assert!(s.to_str().unwrap().starts_with("xyz://example.com"));
             }
             other => panic!("expected effective-url string, got {other:?}"),
         }
         match e.getinfo(CurlInfo::Scheme).unwrap() {
-            InfoValue::Str(Some(s)) => assert_eq!(s.to_str().unwrap(), "GOPHER"),
+            InfoValue::Str(Some(s)) => assert_eq!(s.to_str().unwrap(), "XYZ"),
             other => panic!("expected scheme string, got {other:?}"),
         }
         assert_eq!(
@@ -1297,17 +1472,21 @@ mod tests {
 
     #[tokio::test]
     async fn perform_with_unknown_scheme_is_unsupported() {
-        // A recognized network scheme whose end-to-end drive is not yet wired
-        // still reports UnsupportedProtocol. `http`/`https` are now driven over
-        // the network, so this uses `gopher` — recognized by the build but with
-        // no driven handler — to exercise the unsupported-drive path without
-        // attempting a real transfer.
+        // A scheme with no registered handler reports UnsupportedProtocol. Every
+        // *recognized* scheme is now driven over the network, so this uses a
+        // truly unknown scheme, supplied as a pre-parsed `CURLOPT_CURLU` handle
+        // built with `CURLU_NON_SUPPORT_SCHEME` (the string-parse preflight
+        // rejects an unknown scheme otherwise). Dispatch fails at scheme lookup —
+        // no socket is opened.
         let mut e = Easy::new();
-        e.setopt(
-            CurlOption::CURLOPT_URL,
-            OptionValue::Str(Some("gopher://example.com/".to_string())),
+        let mut uh = CurlUrl::new();
+        uh.set(
+            CurlUPart::Url,
+            Some("xyz://example.com/"),
+            crate::url::CURLU_NON_SUPPORT_SCHEME,
         )
-        .unwrap();
+        .expect("CURLU_NON_SUPPORT_SCHEME accepts an unknown scheme");
+        e.set.uh = Some(uh);
 
         let mut sink = CollectSink::default();
         let mut source = NoSource;

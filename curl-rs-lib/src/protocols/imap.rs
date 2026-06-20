@@ -72,16 +72,18 @@ use crate::auth::sasl::{
 };
 use crate::conn::https_connect::create_tls_filter;
 use crate::conn::{
-    BoxFuture, Connection, Curl_conn_cf_add, Curl_conn_connect, Curl_conn_is_ssl, FIRSTSOCKET,
-    PROTOPT_SSL,
+    BoxFuture, Connection, Curl_conn_cf_add, Curl_conn_connect, Curl_conn_is_ssl, Curl_conn_send,
+    FIRSTSOCKET, PROTOPT_SSL,
 };
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
 use crate::protocols::pingpong::{tls_config_from_easy, PingPong, PingPongProtocol, PpTransfer};
 use crate::protocols::{
-    Protocol, ProtocolTransfer, Scheme, TransferDirection, CURLPROTO_IMAPS, DEFAULT_PORT_IMAPS,
+    connect_network_scheme, stream_body_to_sink, Protocol, ProtocolTransfer, Scheme,
+    TransferDirection, CURLPROTO_IMAPS, DEFAULT_PORT_IMAPS, SCHEME_IMAP, SCHEME_IMAPS,
 };
 use crate::setopt::{HttpReq, StrId};
+use crate::transfer::{ReadCallback, ReadStep, UploadReader, WriteCallbacks};
 use crate::url::{CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_URLDECODE};
 use crate::util::dynbuf::DYN_IMAP_CMD;
 use crate::util::timeval::curlx_now;
@@ -2050,6 +2052,123 @@ impl Protocol for ImapHandler {
             Ok(())
         })
     }
+}
+
+// ===========================================================================
+// `perform_imap` — the IMAP/IMAPS transfer-engine seam
+// ===========================================================================
+
+/// Drive an `imap://` / `imaps://` transfer end-to-end, the IMAP analog of
+/// [`ftp::perform_ftp`](crate::protocols::ftp::perform_ftp): establish the
+/// (optionally implicit-TLS) connection, run the greeting → `CAPABILITY` →
+/// optional `STARTTLS` → authentication session, then the DO phase
+/// (`SELECT`/`FETCH`/`APPEND`/`LIST`/`SEARCH`/custom), move the body, and read
+/// the trailing tagged completion in `done`, followed by a `LOGOUT` teardown.
+///
+/// # Body delivery
+///
+/// * **`FETCH`** returns a `{size}` literal of known length:
+///   [`ImapHandler::do_it`] parses the size and leaves `Stop` right after the
+///   untagged `* … FETCH (… {size}` line; the literal's leading bytes may
+///   already sit in the ping-pong overflow ([`PingPong::take_buffered_body`]),
+///   the remainder is read off the socket — exactly `size` bytes, never the
+///   trailing `)` + tagged status — and delivered to `sink`. `done` then reads
+///   the tagged completion (`ImapState::FetchFinal`).
+/// * **`APPEND`** is an upload: after `do_it`'s `{size}` continuation, the
+///   message body is streamed from `source` to the server, then `done`
+///   terminates the literal and reads the tagged completion.
+/// * A non-body command (`SELECT`-only, `--head`, etc.) moves no body.
+///
+/// # Errors
+///
+/// Any connection-establishment, session, authentication, command, body, or
+/// transport error surfaced by the IMAP handler or the body loop.
+pub(crate) async fn perform_imap(
+    data: &mut Easy,
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+) -> Result<()> {
+    // Resolve the concrete scheme descriptor (`imaps` adds `PROTOPT_SSL`).
+    let is_imaps = data
+        .info
+        .scheme
+        .as_ref()
+        .and_then(|s| s.to_str().ok())
+        .is_some_and(|s| s.eq_ignore_ascii_case("imaps"));
+    let scheme: &'static Scheme = if is_imaps { &SCHEME_IMAPS } else { &SCHEME_IMAP };
+
+    // (1) Establish the (optionally TLS) connection.
+    let mut conn = connect_network_scheme(data, scheme).await?;
+
+    // (2) Run the connect-phase session (greeting / CAPABILITY / STARTTLS /
+    //     authentication).
+    let handler = ImapHandler::new(scheme);
+    handler.connect(data, &mut conn).await?;
+
+    // (3) DO phase + body movement.
+    let result: Result<()> = async {
+        let xfer = handler.do_it(data, &mut conn).await?;
+        match xfer.direction {
+            TransferDirection::Download => {
+                if let Some(size) = xfer.expected_size {
+                    // FETCH literal: pull any leading literal bytes the ping-pong
+                    // engine already buffered behind the untagged FETCH line, then
+                    // stream exactly `size` bytes (prefix + bounded socket reads)
+                    // to the client, leaving the closing `)` + tagged status for
+                    // `done`.
+                    let prefix = {
+                        let mut state = take_imap_conn(&mut conn)?;
+                        let body = state.pp.take_buffered_body(size as usize);
+                        conn.set_proto_state(state);
+                        body
+                    };
+                    stream_body_to_sink(data, &mut conn, sink, &prefix, Some(size)).await?;
+                } else {
+                    // A body transfer with no up-front literal size (e.g. a
+                    // LIST/SEARCH listing) is consumed within the DO dialogue;
+                    // flush a zero-length end-of-stream so the client writer
+                    // finalizes without a blocking socket read.
+                    stream_body_to_sink(data, &mut conn, sink, &[], Some(0)).await?;
+                }
+            }
+            TransferDirection::Upload => {
+                // APPEND: stream the message body from the client source to the
+                // server (the literal whose size `do_it` already announced).
+                let total_len = if data.set.filesize >= 0 {
+                    Some(data.set.filesize as u64)
+                } else {
+                    None
+                };
+                let mut reader = UploadReader::new(total_len, false);
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut total: i64 = 0;
+                // `read` yields `Data` until EOF (and never `Paused`, since
+                // `can_pause = false`), so the loop ends on the first non-`Data`.
+                while let ReadStep::Data(n) = reader.read(&mut buf, source)? {
+                    let mut off = 0usize;
+                    while off < n {
+                        let wrote =
+                            Curl_conn_send(&mut conn, FIRSTSOCKET, &buf[off..n], false).await?;
+                        if wrote == 0 {
+                            return Err(CurlError::UploadFailed);
+                        }
+                        off += wrote;
+                    }
+                    total += n as i64;
+                }
+                data.info.size_upload = total;
+            }
+            TransferDirection::None | TransferDirection::Bidirectional => {}
+        }
+        Ok(())
+    }
+    .await;
+
+    // (4) Finalize (reads the tagged completion for FETCH/APPEND) then `LOGOUT`.
+    let premature = result.is_err();
+    let done = handler.done(data, &mut conn, result, premature).await;
+    let _ = handler.disconnect(data, &mut conn, done.is_err()).await;
+    done
 }
 
 // ===========================================================================

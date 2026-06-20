@@ -42,8 +42,8 @@ use crate::conn::{
 };
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
-use crate::protocols::{Protocol, ProtocolTransfer, Scheme, TransferDirection};
-use crate::transfer::{ClientWriteType, ClientWriter, WriteCallbacks};
+use crate::protocols::{connect_network_scheme, Protocol, ProtocolTransfer, Scheme, TransferDirection};
+use crate::transfer::{ClientWriteType, ClientWriter, ReadCallback, WriteCallbacks};
 use crate::url::{CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_URLDECODE};
 use crate::util::dynbuf::{DynBuf, DYN_MQTT_RECV, DYN_MQTT_SEND};
 
@@ -906,6 +906,71 @@ impl Protocol for MqttProtocol {
         // are already released by `Drop`; nothing remains to clean up.
         Box::pin(async move { Ok(()) })
     }
+}
+
+/// Drive an `mqtt://` or `mqtts://` transfer end-to-end — [F5-CRIT-9].
+///
+/// This is the production engine seam for the publish/subscribe protocol,
+/// mirroring `mqtt.c`'s `mqtt_do` → transfer-loop → `mqtt_done` sequence. Before
+/// this driver existed the recognized `mqtt`/`mqtts` schemes fell through to
+/// `CURLE_UNSUPPORTED_PROTOCOL` in [`perform_transfer`](super::perform_transfer),
+/// so no socket was ever opened.
+///
+/// The shape mirrors the other line-protocol drivers ([`perform_dict`](super::dict::perform_dict),
+/// the mail drivers): establish the connection over the shared filter-chain
+/// seam, run the protocol exchange, then finalize. `do_it` performs `CONNECT` /
+/// `CONNACK` and then either the upload path (`PUBLISH` + `DISCONNECT`, fully
+/// completed inside `do_it`) or the download path (`SUBSCRIBE` sent; the body is
+/// pumped by [`MqttProtocol::run_subscription`]).
+///
+/// MQTT's `do_it` also calls `Curl_conn_connect`, but that is idempotent (the
+/// connection filter chain's "already connected" fast-path), so pre-connecting
+/// here — to fail fast and share the one connection seam every protocol driver
+/// uses — is safe and matches curl, where the easy/multi engine connects before
+/// dispatching the handler's `do_it`.
+///
+/// The `source` is unused: MQTT's upload payload comes from `CURLOPT_POSTFIELDS`
+/// (read inside `do_it` from the owned `copypostfields`), not the read callback.
+///
+/// # Errors
+///
+/// Any connection, protocol, or client-write error. A transfer-phase failure
+/// takes precedence over the `done` result (`result.and(done)`), so the default
+/// no-op `done` — which ignores its status argument — cannot mask a real error.
+pub(crate) async fn perform_mqtt(
+    data: &mut Easy,
+    scheme: &'static Scheme,
+    sink: &mut dyn WriteCallbacks,
+    _source: &mut dyn ReadCallback,
+) -> Result<()> {
+    // (1) Establish the connection (plain TCP for `mqtt`, implicit TLS for
+    //     `mqtts`) over the shared filter chain.
+    let mut conn = connect_network_scheme(data, scheme).await?;
+    let handler = MqttProtocol::new(scheme);
+
+    // (2) DO phase, fenced so a failure still runs `done`.
+    let result: Result<()> = async {
+        let xfer = handler.do_it(data, &mut conn).await?;
+        if xfer.direction == TransferDirection::Download {
+            // The MQTT body carries no headers, so a plain body writer
+            // (honoring content decoding and the write callback) matches
+            // `mqtt.c`'s `Curl_client_write(CLIENTWRITE_BODY)`. The packet id is
+            // 1 — the value `do_it` used in the `SUBSCRIBE` (mqtt.c increments
+            // `packetid` from 0 → 1).
+            let mut writer = ClientWriter::new();
+            handler
+                .run_subscription(data, &mut conn, &mut writer, sink, 1)
+                .await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    // (3) Finalize then best-effort tear-down.
+    let premature = result.is_err();
+    let done = handler.done(data, &mut conn, result, premature).await;
+    let _ = handler.disconnect(data, &mut conn, done.is_err()).await;
+    result.and(done)
 }
 
 // ===========================================================================

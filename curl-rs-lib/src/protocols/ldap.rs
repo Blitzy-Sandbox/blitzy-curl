@@ -55,12 +55,16 @@
 //! `Vec<u8>` / `&[u8]` slices with checked indexing, so the BER decoder cannot
 //! over-read.
 
+use std::sync::Mutex;
+
 use crate::conn::{BoxFuture, Connection, Curl_conn_recv, Curl_conn_send, FIRSTSOCKET};
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
 use crate::protocols::{
-    Protocol, ProtocolTransfer, Scheme, TransferDirection, SCHEME_LDAP, SCHEME_LDAPS,
+    connect_network_scheme, stream_body_to_sink, Protocol, ProtocolTransfer, Scheme,
+    TransferDirection, SCHEME_LDAP, SCHEME_LDAPS,
 };
+use crate::transfer::{ReadCallback, WriteCallbacks};
 use crate::url::{
     CurlUPart, CurlUrl, CURLU_GUESS_SCHEME, CURLU_NON_SUPPORT_SCHEME, CURLU_URLDECODE,
 };
@@ -1287,6 +1291,12 @@ async fn next_message(conn: &mut Connection, rxbuf: &mut Vec<u8>) -> Result<(i64
 pub struct LdapHandler {
     /// The static scheme descriptor ([`SCHEME_LDAP`] or [`SCHEME_LDAPS`]).
     scheme: &'static Scheme,
+    /// The LDIF result body assembled during [`do_it`](Protocol::do_it),
+    /// awaiting delivery to the client write callback. `do_it` takes `&self`
+    /// (the trait contract), so interior mutability stages the body for the
+    /// driver to drain afterwards — the same handoff SMB uses for its download
+    /// body.
+    download_body: Mutex<Vec<u8>>,
 }
 
 impl LdapHandler {
@@ -1295,7 +1305,10 @@ impl LdapHandler {
     /// table.
     #[must_use]
     pub const fn new(scheme: &'static Scheme) -> Self {
-        Self { scheme }
+        Self {
+            scheme,
+            download_body: Mutex::new(Vec::new()),
+        }
     }
 
     /// Construct the `ldap://` handler ([`SCHEME_LDAP`], port 389).
@@ -1308,6 +1321,15 @@ impl LdapHandler {
     #[must_use]
     pub const fn ldaps() -> Self {
         Self::new(&SCHEME_LDAPS)
+    }
+
+    /// Take the LDIF body assembled by the last [`do_it`](Protocol::do_it),
+    /// leaving the buffer empty. The driver forwards these bytes to the client
+    /// write callback (the analog of SMB's `take_download_body`).
+    #[must_use]
+    pub fn take_download_body(&self) -> Vec<u8> {
+        let mut guard = self.download_body.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *guard)
     }
 }
 
@@ -1463,15 +1485,81 @@ impl Protocol for LdapHandler {
             let unbind = build_unbind_request(3);
             let _ = send_all(conn, &unbind).await;
 
-            // PARITY: the assembled LDIF `body` is delivered to the client
-            // writer here once the transfer engine's protocol-drive seam is
-            // wired (no protocol delivers a body to the writer at this
-            // checkpoint — `do_it` is not yet invoked by the engine for any
-            // scheme). The transfer descriptor reports the body's size so the
-            // engine can account for it; the byte handoff lands with the seam.
-            Ok(ProtocolTransfer::new(TransferDirection::Download).with_size(body.len() as u64))
+            // Stage the assembled LDIF `body` for the driver ([`perform_ldap`])
+            // to forward to the client write callback, mirroring SMB's download
+            // handoff. The transfer descriptor reports the body's size so the
+            // engine can account for it.
+            let body_len = body.len() as u64;
+            {
+                let mut guard = self.download_body.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = body;
+            }
+            Ok(ProtocolTransfer::new(TransferDirection::Download).with_size(body_len))
         })
     }
+}
+
+/// Drive an `ldap://` or `ldaps://` transfer end-to-end — the driver that wires
+/// the LDAP handler into [`perform_transfer`](super::perform_transfer),
+/// resolving QA finding **F5-CRIT-12** (every `ldap`/`ldaps` transfer previously
+/// returned `UnsupportedProtocol` before a socket opened).
+///
+/// The flow mirrors the other command/line-protocol drivers (DICT/GOPHER) over
+/// the shared connection-filter chain:
+///
+/// 1. [`connect_network_scheme`] opens the connection — plain TCP for `ldap`
+///    (`PROTOPT_SSL_REUSE`), implicit TLS for `ldaps` (`PROTOPT_SSL`).
+/// 2. `do_it` runs the whole LDAP exchange (bind → search → collect LDIF →
+///    unbind) and stages the assembled LDIF body on the handler.
+/// 3. The body — already complete in memory (LDAP does not stream further bytes
+///    off the socket after `searchResultDone`) — is handed to the client write
+///    callback in one shot via [`stream_body_to_sink`] with `expected ==
+///    body.len()`, so the helper emits the buffer and reads no additional bytes.
+/// 4. `done`/`disconnect` (handler defaults) run for symmetry, then the driver
+///    returns `result.and(done)` so a bind/search error takes precedence over
+///    the no-op `done`.
+///
+/// # Errors
+///
+/// Propagates the connection error from [`connect_network_scheme`], or the LDAP
+/// handler's error mapping (`UrlMalformat`, `LdapCannotBind`,
+/// `LdapSearchFailed`, …) from `do_it`.
+pub(crate) async fn perform_ldap(
+    data: &mut Easy,
+    scheme: &'static Scheme,
+    sink: &mut dyn WriteCallbacks,
+    _source: &mut dyn ReadCallback,
+) -> Result<()> {
+    // (1) Establish the connection (plain TCP for `ldap`, implicit TLS for
+    //     `ldaps`). Pick the handler matching the scheme so `scheme()` reports
+    //     the right identity.
+    let mut conn = connect_network_scheme(data, scheme).await?;
+    let handler = LdapHandler::new(scheme);
+
+    // (2) LDAP has no separate greeting/login phase (`connect` defaults to a
+    //     no-op): the bind is issued inside `do_it`.
+    handler.connect(data, &mut conn).await?;
+
+    // (3) DO phase: bind → search → assemble LDIF → unbind, then deliver the
+    //     staged body. Fenced so a failure still runs `done`/`disconnect`.
+    let result: Result<()> = async {
+        let xfer = handler.do_it(data, &mut conn).await?;
+        if xfer.direction == TransferDirection::Download {
+            let body = handler.take_download_body();
+            let len = body.len() as u64;
+            stream_body_to_sink(data, &mut conn, sink, &body, Some(len)).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    // (4) Finalize then best-effort tear-down. The transfer status takes
+    //     precedence over the (default no-op) `done`, so return `result.and(done)`
+    //     — `CurlError` is `Copy`, so `result` survives the move into `done`.
+    let premature = result.is_err();
+    let done = handler.done(data, &mut conn, result, premature).await;
+    let _ = handler.disconnect(data, &mut conn, done.is_err()).await;
+    result.and(done)
 }
 
 // ===========================================================================

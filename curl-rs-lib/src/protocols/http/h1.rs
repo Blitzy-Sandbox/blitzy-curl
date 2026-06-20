@@ -887,9 +887,28 @@ pub fn build_request(inputs: &RequestInputs<'_>) -> Result<RequestPlan> {
         add
     };
 
-    // H1_HD_CONNECTION — only the internal `TE` token on the h1 path.
-    if inputs.te_gzip && !hds.contains("Connection") {
-        hds.add("Connection", "TE")?;
+    // H1_HD_CONNECTION — curl's internal `Connection:` tokens
+    // (`http_add_connection_hd`), comma-joined in curl's fixed order: `TE` (the
+    // gzip transfer-encoding token, gated by `data->state.http_hd_te`) then
+    // `Upgrade` (the WebSocket / HTTP-Upgrade handshake token, gated by
+    // `data->state.http_hd_upgrade`, which `Curl_ws_request` sets — see
+    // `lib/ws.c`). `is_websocket` is this seam's analog of `http_hd_upgrade`
+    // (curl-rs negotiates HTTP/2 via ALPN/prior-knowledge, never the cleartext
+    // `h2c` upgrade, so `Upgrade` here is exclusively the WebSocket token). The
+    // tokens are emitted as a single header, and only when the application
+    // supplied no `Connection:` of its own (the h1 path does not model curl's
+    // interleaving of custom + internal `Connection:` values).
+    if !hds.contains("Connection") {
+        let mut tokens: Vec<&str> = Vec::new();
+        if inputs.te_gzip {
+            tokens.push("TE");
+        }
+        if inputs.is_websocket {
+            tokens.push("Upgrade");
+        }
+        if !tokens.is_empty() {
+            hds.add("Connection", &tokens.join(", "))?;
+        }
     }
 
     let head = serialize_request_head(&resolved.method, &target, inputs.http_minor, &hds)?;
@@ -1089,6 +1108,20 @@ impl<C: ByteStream> H1Exchange<C> {
     #[must_use]
     pub fn response_minor(&self) -> u8 {
         self.resp_minor
+    }
+
+    /// Take the bytes read from the wire but not yet consumed by the response
+    /// codec (the `rbuf` leftovers).
+    ///
+    /// After a header-only response (e.g. a `101 Switching Protocols` upgrade,
+    /// which carries no body), any remaining buffered bytes are payload the peer
+    /// sent on the upgraded connection — for a WebSocket upgrade, the first
+    /// frame(s). The WebSocket driver hands these to
+    /// [`WsConnState::buffer_received`](crate::protocols::ws::WsConnState::buffer_received)
+    /// so no bytes are lost across the protocol switch (the analog of curl's
+    /// `Curl_ws_accept` seeding `ws->recvbuf` with the leftover upgrade bytes).
+    pub(crate) fn take_rbuf(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.rbuf)
     }
 
     /// Whether the connection may be kept alive (reused) after this response —

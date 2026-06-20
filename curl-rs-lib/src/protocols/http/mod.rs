@@ -583,6 +583,7 @@ pub(crate) async fn perform_http(
                     &host,
                     port,
                     is_https,
+                    false,
                     body,
                     http_minor,
                 );
@@ -618,6 +619,7 @@ pub(crate) async fn perform_http(
                         &host,
                         port,
                         is_https,
+                        false,
                         body,
                         1,
                     );
@@ -729,7 +731,8 @@ async fn perform_http3(
     let custom_headers = collect_custom_headers(data);
     let (request_headers, h3_body) = {
         let conn = Connection::new("h3", crate::conn::TRNSPRT_QUIC, http_scheme_descriptor(true));
-        let inputs = make_inputs(data, url, &conn, &custom_headers, host, port, true, body, 1);
+        let inputs =
+            make_inputs(data, url, &conn, &custom_headers, host, port, true, false, body, 1);
         let plan = h1::build_request(&inputs)?;
         // `plan.head` is "REQUEST-LINE\r\n(name: value\r\n)*\r\n"; skip the
         // request line, then collect each header until the blank separator
@@ -778,6 +781,169 @@ async fn perform_http3(
     let result = drive_one(data, &mut exchange, sink).await;
     session.close();
     result
+}
+
+/// Drive a WebSocket (`ws`/`wss`) transfer end to end.
+///
+/// The WebSocket opening handshake is an ordinary HTTP/1.1 `GET` with the
+/// `Upgrade: websocket` / `Sec-WebSocket-*` headers (curl's `Curl_protocol_ws.do_it
+/// == Curl_http`), so this reuses the HTTP/1.1 connect + request machinery
+/// wholesale, differing only in three ways:
+///
+/// * the WebSocket Upgrade request headers are injected first
+///   ([`ws_inject_request_headers`](crate::protocols::ws::ws_inject_request_headers),
+///   curl's `Curl_ws_request`);
+/// * the request is built with `is_websocket = true`, forcing the `GET` verb;
+/// * the `101 Switching Protocols` response is a header-only message, so after
+///   the head is delivered the [`WsConnState`](crate::protocols::ws::WsConnState)
+///   RFC 6455 framing engine is installed on the connection (curl's
+///   `Curl_ws_accept`).
+///
+/// Two completion modes mirror curl exactly:
+///
+/// * **`CURLOPT_CONNECT_ONLY`** (the typical `curl_ws_*` API usage): the live
+///   connection and framing engine are handed to the easy handle
+///   ([`Easy::attach_ws_connection`]) and the function returns — the application
+///   then drives frames with `curl_ws_send`/`curl_ws_recv`.
+/// * **plain `curl ws://…`**: the transfer's download continues by reading
+///   frames and writing their payloads to the write callback until the server
+///   closes the connection, exactly as curl's transfer loop does.
+///
+/// HTTPS/`wss` rides implicit TLS; the upgrade is always HTTP/1.1 (no ALPN h2),
+/// matching curl's WebSocket connection setup which pins HTTP/1.1.
+///
+/// # Errors
+///
+/// [`CurlError::UrlMalformat`] for a host-less URL, plus any resolve, connect,
+/// TLS, handshake, or frame-transfer error from the layers below.
+pub(crate) async fn perform_ws(
+    data: &mut Easy,
+    scheme: &'static Scheme,
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+) -> Result<()> {
+    use crate::protocols::ws::{ws_inject_request_headers, WsConnState};
+
+    // (1) Inject the WebSocket Upgrade request headers (curl's `Curl_ws_request`),
+    //     each only if the user has not already supplied it.
+    ws_inject_request_headers(data)?;
+
+    // (2) Re-derive the request URL/host/port for the request builder. This is
+    //     the same resolution `connect_network_scheme` performs internally; the
+    //     parse is pure, so doing it here (to feed `make_inputs`) is harmless.
+    let url = if let Some(uh) = data.set.uh.clone() {
+        uh
+    } else {
+        let url_str = data.url().ok_or(CurlError::UrlMalformat)?.to_string();
+        let mut parsed = CurlUrl::new();
+        parsed
+            .set(
+                CurlUPart::Url,
+                Some(&url_str),
+                CURLU_GUESS_SCHEME | CURLU_DEFAULT_PORT,
+            )
+            .map_err(|_| CurlError::UrlMalformat)?;
+        parsed
+    };
+    // `wss` rides TLS; this drives default-port elision in the `Host:` header
+    // (443 vs 80). Taken from the resolved scheme descriptor (the single source
+    // of truth shared with `connect_network_scheme`) rather than re-parsing.
+    let is_wss = scheme.is_ssl();
+    let host_bracketed = url.get(CurlUPart::Host, CURLU_URLDECODE).unwrap_or_default();
+    if host_bracketed.is_empty() {
+        return Err(CurlError::UrlMalformat);
+    }
+    let host = strip_brackets(&host_bracketed).to_string();
+    let port = url
+        .get(CurlUPart::Port, 0)
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(scheme.default_port);
+
+    // (3) Connect — plain TCP for `ws`, implicit TLS for `wss` — via the shared
+    //     network-scheme connector (no ALPN; the upgrade is HTTP/1.1).
+    let mut conn = crate::protocols::connect_network_scheme(data, scheme).await?;
+
+    // (4) Build + drive the HTTP/1.1 `GET` Upgrade exchange. `is_websocket = true`
+    //     forces `GET`; the `101` is delivered as a header-only response (no
+    //     body), so the upgrade headers (including `Sec-WebSocket-Accept`) reach
+    //     the sink under `--include`. Any bytes the server already pushed after
+    //     the head are returned as the exchange's leftovers.
+    let custom_headers = collect_custom_headers(data);
+    let body = build_request_body(data, source)?;
+    let leftover = {
+        let plan = {
+            let inputs = make_inputs(
+                data,
+                &url,
+                &conn,
+                &custom_headers,
+                &host,
+                port,
+                is_wss,
+                true, // is_websocket → forces GET
+                body,
+                1, // HTTP/1.1
+            );
+            h1::build_request(&inputs)?
+        };
+        let mut exchange = h1::H1Exchange::new(
+            h1::ConnByteStream::new(&mut conn),
+            plan,
+            data.set.http09_allowed,
+            false,
+        );
+        drive_one(data, &mut exchange, sink).await?;
+        exchange.take_rbuf()
+    };
+
+    // (5) Handshake complete: install the RFC 6455 framing engine, seeded with
+    //     any post-upgrade bytes the server already sent (curl's `Curl_ws_accept`
+    //     writing the leftover into `ws->recvbuf`).
+    let mut ws = WsConnState::new(data.set.ws_raw_mode, data.set.ws_no_auto_pong);
+    ws.buffer_received(&leftover);
+
+    if data.set.connect_only {
+        // CONNECT_ONLY: hand the connection + framing engine to the easy handle
+        // for the application's own `curl_ws_send`/`curl_ws_recv`.
+        data.attach_ws_connection(conn, ws);
+        return Ok(());
+    }
+
+    // (6) Plain `curl ws://…`: continue the transfer by reading frames and
+    //     writing their payloads to the sink until the server closes.
+    ws_cli_recv_loop(&mut conn, &mut ws, sink).await
+}
+
+/// The non-`CONNECT_ONLY` WebSocket download loop: read decoded frames and write
+/// their payloads to the client `sink` until the server closes the connection.
+///
+/// This mirrors curl's transfer loop for a plain `curl ws://…`: a clean close
+/// ([`CurlError::GotNothing`]) ends the transfer successfully; a short write to
+/// the sink fails it with [`CurlError::WriteError`]; any other framing/transport
+/// error propagates. A server that sends nothing (e.g. an echo server awaiting
+/// the client) leaves this blocked in `recv` — exactly as curl blocks — until
+/// the caller's timeout fires.
+async fn ws_cli_recv_loop(
+    conn: &mut Connection,
+    ws: &mut crate::protocols::ws::WsConnState,
+    sink: &mut dyn WriteCallbacks,
+) -> Result<()> {
+    // A 64 KiB receive buffer; `ws_recv` writes at most this many payload bytes
+    // per call (a large frame is delivered in successive chunks).
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match ws.ws_recv(conn, &mut buf).await {
+            Ok((n, _meta)) => {
+                if n > 0 && sink.write_body(&buf[..n]) != n {
+                    return Err(CurlError::WriteError);
+                }
+            }
+            // A clean close with no further frames ends the transfer.
+            Err(CurlError::GotNothing) => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1204,6 +1370,7 @@ fn make_inputs<'a>(
     host: &'a str,
     port: u16,
     is_https: bool,
+    is_websocket: bool,
     body: h1::RequestBody,
     http_minor: u8,
 ) -> h1::RequestInputs<'a> {
@@ -1218,7 +1385,7 @@ fn make_inputs<'a>(
         method_kind: data.set.method,
         no_body: data.set.opt_no_body,
         custom_request: data.set.str(StrId::Customrequest),
-        is_websocket: false,
+        is_websocket,
         is_upload: data.set.method == HttpReq::Put,
         host,
         port,

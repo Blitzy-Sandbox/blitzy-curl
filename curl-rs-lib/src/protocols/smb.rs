@@ -54,7 +54,10 @@ use crate::auth::ntlm::{lm_resp, mk_lm_hash, mk_nt_hash};
 use crate::conn::{BoxFuture, Connection, Curl_conn_recv, Curl_conn_send, FIRSTSOCKET};
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
-use crate::protocols::{Protocol, ProtocolTransfer, Scheme, TransferDirection};
+use crate::protocols::{
+    connect_network_scheme, stream_body_to_sink, Protocol, ProtocolTransfer, Scheme,
+    TransferDirection,
+};
 // `StrId` / `HttpReq` live in `crate::setopt`, but they are the *public option
 // vocabulary* of the `Easy` handle (a declared dependency): the only way to read
 // `CURLOPT_USERNAME` / `CURLOPT_PASSWORD` (the `-u user:pass` form that
@@ -62,7 +65,7 @@ use crate::protocols::{Protocol, ProtocolTransfer, Scheme, TransferDirection};
 // `HttpReq::Put`) is through `data.set.str(StrId::…)` / `data.set.method`. They
 // are imported here for that reason.
 use crate::setopt::{HttpReq, StrId};
-use crate::transfer::uc_to_curlcode;
+use crate::transfer::{uc_to_curlcode, ReadCallback, ReadStep, UploadReader, WriteCallbacks};
 use crate::url::{CurlUPart, CurlUrl, CURLU_URLDECODE};
 use crate::util::sendf::failf;
 
@@ -1226,6 +1229,125 @@ impl Protocol for SmbProtocol {
             }
         })
     }
+}
+
+/// Read the entire upload body from the client read callback into memory.
+///
+/// SMB transmits its payload inside a sequence of `SMB_COM_WRITE_ANDX` requests
+/// and [`SmbProtocol::do_it`] consumes the body from the handler's staged
+/// `upload_body` (a `Vec`, not a streaming source), so the body must be fully
+/// buffered before `do_it` runs. Draining it here — *before* any socket is
+/// opened — also makes a read-callback failure short-circuit the transfer
+/// before connecting, the same ordering [`perform_smtp`](super::smtp::perform_smtp)
+/// uses for the `DATA` payload.
+fn read_upload_to_end(source: &mut dyn ReadCallback) -> Result<Vec<u8>> {
+    let mut reader = UploadReader::new(None, false);
+    let mut body = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    // Loop while the source yields data; `Eof`/`Paused` end the `while let`
+    // (PAUSE is unsupported for this buffered read and is mapped to an error by
+    // the reader).
+    while let ReadStep::Data(n) = reader.read(&mut buf, source)? {
+        body.extend_from_slice(&buf[..n]);
+    }
+    Ok(body)
+}
+
+/// Drive an `smb://` or `smbs://` transfer end-to-end — the driver that wires
+/// the SMB handler into [`perform_transfer`](super::perform_transfer), resolving
+/// QA finding **F5-CRIT-11** (every `smb`/`smbs` transfer previously returned
+/// `UnsupportedProtocol` before a socket opened).
+///
+/// SMB's [`do_it`](Protocol::do_it) runs the complete CIFS exchange — NEGOTIATE
+/// → SESSION_SETUP (NTLMv1) → TREE_CONNECT → open → read/write → close →
+/// TREE_DISCONNECT — staging a downloaded body on the handler and pulling an
+/// upload body the driver stages beforehand. The driver therefore:
+///
+/// 1. For an upload (`CURLOPT_UPLOAD` ⇒ [`HttpReq::Put`]), buffers the body from
+///    the read callback up front so a read failure short-circuits before the
+///    socket opens. The byte count is *not* used as the transfer size: curl
+///    requires the size via `CURLOPT_INFILESIZE`, which `do_it` validates
+///    (`SMB upload needs to know the size up front`).
+/// 2. [`connect_network_scheme`] opens the connection — plain TCP for `smb`
+///    (`PROTOPT_CONN_REUSE`), implicit TLS for `smbs` (`PROTOPT_SSL`).
+/// 3. [`setup_connection`](Protocol::setup_connection) validates that the URL
+///    path contains a share (SMB overrides the default no-op, unlike the other
+///    command-line protocols).
+/// 4. For an upload, the buffered body is staged via
+///    [`set_upload_body`](SmbProtocol::set_upload_body) before `do_it`.
+/// 5. `do_it` runs the whole exchange; a downloaded body is then forwarded to
+///    the client write callback in one shot via [`stream_body_to_sink`] (the
+///    bytes are already complete in memory, so the helper emits the buffer and
+///    reads no further socket bytes).
+/// 6. `done`/`disconnect` (handler defaults) run, then the driver returns
+///    `result.and(done)` so a transfer error takes precedence over the no-op
+///    `done`.
+///
+/// # Errors
+///
+/// Propagates a read-callback failure (upload buffering), the connection error
+/// from [`connect_network_scheme`], or the SMB handler's error mapping
+/// (`UrlMalformat` / missing share, `LoginDenied`, `SendError` for a
+/// size-unknown upload, the NTLM / negotiate failures from `do_it`).
+pub(crate) async fn perform_smb(
+    data: &mut Easy,
+    scheme: &'static Scheme,
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+) -> Result<()> {
+    // (0) Buffer the upload body (if any) before opening a socket, mirroring
+    //     `perform_smtp`: `do_it` pulls the payload from the handler's staged
+    //     `upload_body`, and a read-callback failure must short-circuit before
+    //     connecting. Upload mode is `CURLOPT_UPLOAD` (⇒ `HttpReq::Put`), the
+    //     same predicate `do_it` uses to select the write path.
+    let staged_upload: Option<Vec<u8>> = if data.set.method == HttpReq::Put {
+        Some(read_upload_to_end(source)?)
+    } else {
+        None
+    };
+
+    // (1) Establish the connection (plain TCP for `smb`, implicit TLS for
+    //     `smbs`). Pick the handler matching the scheme so `scheme()` reports
+    //     the right identity.
+    let mut conn = connect_network_scheme(data, scheme).await?;
+    let handler = SmbProtocol::new(scheme);
+
+    // (2) Per-connection setup validates that the URL path contains a share
+    //     (`smb_setup_connection` → `smb_parse_url_path`). SMB overrides the
+    //     default no-op `setup_connection`, so run it explicitly.
+    handler.setup_connection(data, &mut conn).await?;
+
+    // Stage the buffered upload body for `do_it` to send during the write phase.
+    if let Some(body) = staged_upload {
+        handler.set_upload_body(body);
+    }
+
+    // (3) SMB drives NEGOTIATE / SESSION_SETUP inside `do_it` rather than a
+    //     separate greeting phase; `connect` is the default no-op, run for
+    //     symmetry with the other drivers.
+    handler.connect(data, &mut conn).await?;
+
+    // (4) DO phase: the full CIFS exchange, then deliver any downloaded body.
+    //     Fenced so a failure still runs `done`/`disconnect`.
+    let result: Result<()> = async {
+        let xfer = handler.do_it(data, &mut conn).await?;
+        if xfer.direction == TransferDirection::Download {
+            let body = handler.take_download_body();
+            let len = body.len() as u64;
+            stream_body_to_sink(data, &mut conn, sink, &body, Some(len)).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    // (5) Finalize then best-effort tear-down. SMB uses the default no-op
+    //     `done`, so return `result.and(done)` to surface a transfer error
+    //     rather than masking it — `CurlError` is `Copy`, so `result` survives
+    //     the move into `done`.
+    let premature = result.is_err();
+    let done = handler.done(data, &mut conn, result, premature).await;
+    let _ = handler.disconnect(data, &mut conn, done.is_err()).await;
+    result.and(done)
 }
 
 // ===========================================================================

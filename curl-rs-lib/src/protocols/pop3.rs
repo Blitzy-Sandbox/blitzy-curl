@@ -39,14 +39,18 @@ use crate::auth::sasl::{
     SASL_FLAG_BASE64,
 };
 use crate::conn::connect::tls_factory;
-use crate::conn::{BoxFuture, Connection, Curl_conn_connect, Curl_conn_is_ssl, FIRSTSOCKET};
+use crate::conn::{
+    BoxFuture, Connection, Curl_conn_connect, Curl_conn_is_ssl, Curl_conn_recv, FIRSTSOCKET,
+};
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
 use crate::protocols::pingpong::{tls_config_from_easy, PingPong, PingPongProtocol};
 use crate::protocols::{
-    Protocol, ProtocolTransfer, Scheme, TransferDirection, SCHEME_POP3, SCHEME_POP3S,
+    connect_network_scheme, Protocol, ProtocolTransfer, Scheme, TransferDirection, SCHEME_POP3,
+    SCHEME_POP3S,
 };
 use crate::setopt::StrId;
+use crate::transfer::{ClientWriteType, ClientWriter, ReadCallback, WriteCallbacks};
 use crate::url::{CurlUPart, CurlUrl, CURLU_GUESS_SCHEME, CURLU_NON_SUPPORT_SCHEME};
 use crate::util::md5;
 use crate::util::sendf;
@@ -1676,6 +1680,111 @@ impl Protocol for Pop3Protocol {
         }
         Ok(true)
     }
+}
+
+// ===========================================================================
+// `perform_pop3` — the POP3/POP3S transfer-engine seam
+// ===========================================================================
+
+/// Drive a `pop3://` / `pop3s://` transfer end-to-end, the POP3 analog of
+/// [`ftp::perform_ftp`](crate::protocols::ftp::perform_ftp): establish the
+/// (optionally implicit-TLS) connection, run the greeting → `CAPA` → optional
+/// `STLS` → authentication session, then the DO phase (`RETR`/`LIST`/`TOP`), and
+/// finally a best-effort `QUIT` teardown.
+///
+/// # Body delivery
+///
+/// Like curl, POP3's `do_it` drives the command/response dialogue only up to the
+/// opening `+OK` of a multi-line `RETR`; the message body itself (dot-unstuffed,
+/// terminated by `CRLF.CRLF`) is moved by the transfer loop here. Body bytes can
+/// arrive in three places: already buffered behind the `+OK` line in the
+/// ping-pong engine's overflow (drained with [`PingPong::take_buffered_body`]),
+/// then read from the socket. Each chunk is routed through
+/// [`Pop3Protocol::write_resp`] (which un-stuffs doubled leading dots and
+/// detects the end-of-body marker), and the cleaned body is delivered to the
+/// client `sink` via a [`ClientWriter`] (honoring `CURLOPT_HEADER` and content
+/// decoding). A command-only exchange (`TransferDirection::None`) moves no body.
+///
+/// # Errors
+///
+/// Any connection-establishment, session, authentication, command, or transport
+/// error surfaced by the POP3 handler or the body read loop.
+pub(crate) async fn perform_pop3(
+    data: &mut Easy,
+    sink: &mut dyn WriteCallbacks,
+    _source: &mut dyn ReadCallback,
+) -> Result<()> {
+    // Resolve the concrete scheme descriptor (`pop3s` adds `PROTOPT_SSL`).
+    let is_pop3s = data
+        .info
+        .scheme
+        .as_ref()
+        .and_then(|s| s.to_str().ok())
+        .is_some_and(|s| s.eq_ignore_ascii_case("pop3s"));
+    let scheme: &'static Scheme = if is_pop3s { &SCHEME_POP3S } else { &SCHEME_POP3 };
+
+    // (1) Establish the (optionally TLS) connection.
+    let mut conn = connect_network_scheme(data, scheme).await?;
+
+    // (2) Run the connect-phase session (greeting / CAPA / STLS / AUTH).
+    let handler = Pop3Protocol::new(scheme);
+    handler.connect(data, &mut conn).await?;
+
+    // (3) DO phase + body movement.
+    let result: Result<()> = async {
+        let xfer = handler.do_it(data, &mut conn).await?;
+        if xfer.direction == TransferDirection::Download {
+            // Pull any body bytes the ping-pong engine already buffered behind
+            // the `+OK` line (the C overflow-as-body replay).
+            let buffered = {
+                let state = conn.take_proto_state().ok_or(CurlError::FailedInit)?;
+                let mut pop3c = state
+                    .downcast::<Pop3Conn>()
+                    .map_err(|_| CurlError::FailedInit)?;
+                let body = pop3c.pp.take_buffered_body(usize::MAX);
+                conn.set_proto_state(pop3c);
+                body
+            };
+            if !buffered.is_empty() {
+                handler.write_resp(data, &buffered, false)?;
+            }
+
+            // Read the remainder from the socket until the end-of-body marker
+            // (`CRLF.CRLF`) is consumed or the peer closes.
+            let mut buf = vec![0u8; 64 * 1024];
+            while !handler.body_complete() {
+                match Curl_conn_recv(&mut conn, FIRSTSOCKET, &mut buf).await {
+                    Ok(0) => {
+                        // Peer closed before the marker: treat the bytes so far
+                        // as the complete body (C ends the transfer on EOF).
+                        handler.write_resp(data, &[], true)?;
+                        break;
+                    }
+                    Ok(n) => handler.write_resp(data, &buf[..n], false)?,
+                    Err(CurlError::Again) => continue,
+                    Err(e) => return Err(e),
+                };
+            }
+
+            // Deliver the un-stuffed body to the client writer.
+            let body = handler.take_pending_body();
+            let mut writer = ClientWriter::with_options(data.set.include_header, false);
+            writer.write(
+                ClientWriteType::BODY.union(ClientWriteType::EOS),
+                &body,
+                sink,
+            )?;
+            data.info.size_download = body.len() as i64;
+        }
+        Ok(())
+    }
+    .await;
+
+    // (4) Finalize then best-effort `QUIT` teardown.
+    let premature = result.is_err();
+    let done = handler.done(data, &mut conn, result, premature).await;
+    let _ = handler.disconnect(data, &mut conn, done.is_err()).await;
+    done
 }
 
 // ===========================================================================

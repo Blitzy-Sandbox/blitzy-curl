@@ -2644,6 +2644,46 @@ fn getinfo_scheme(per: &PerTransfer) -> String {
     }
 }
 
+/// Builds curl's exact "unsupported protocol" diagnostic for a transfer whose
+/// URL scheme resolved to no compiled-in handler — the `lib/url.c`
+/// `findprotocol` message `Protocol "<scheme>" not supported`.
+///
+/// curl emits this from the library via `failf`, so a C consumer reads it back
+/// through `CURLOPT_ERRORBUFFER` and the tool prints it on both the
+/// `curl: (N) ...` line and in `%{errormsg}`. The async core here is
+/// `#![forbid(unsafe_code)]` and the CLI drives the library directly (not
+/// through the FFI crate that owns the C error buffer), so the engine cannot
+/// populate that buffer; the message is instead reconstructed at the tool layer
+/// from the input URL's scheme. That scheme is curl's `protostr` — parsed from
+/// the raw URL *before* the handler lookup and lower-cased exactly as the URL
+/// API (and `%{url.scheme}`) reports it — so the text is byte-identical to
+/// curl's. `CURLINFO_SCHEME` is deliberately **not** used: like curl, it stays
+/// empty until a connection is established, so it is unavailable on this
+/// pre-connection failure.
+///
+/// Returns [`None`] when no scheme can be recovered (e.g. no input URL or an
+/// unparseable one), so the caller falls back to the static
+/// [`CurlError::description`] text.
+fn unsupported_protocol_message(per: &PerTransfer) -> Option<String> {
+    use curl_rs_lib::url::{
+        CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_GUESS_SCHEME, CURLU_NON_SUPPORT_SCHEME,
+    };
+    // Parse the raw input URL with the same flags curl's `%{url.scheme}` uses.
+    let url = per.url.as_deref()?;
+    let mut uh = CurlUrl::new();
+    uh.set(
+        CurlUPart::Url,
+        Some(url),
+        CURLU_GUESS_SCHEME | CURLU_NON_SUPPORT_SCHEME,
+    )
+    .ok()?;
+    let scheme = uh.get(CurlUPart::Scheme, CURLU_DEFAULT_PORT).ok()?;
+    if scheme.is_empty() {
+        return None;
+    }
+    Some(format!("Protocol \"{scheme}\" not supported"))
+}
+
 /// Returns the HTTP/FTP response code reported for the transfer
 /// (`CURLINFO_RESPONSE_CODE`), or `0` when unavailable.
 fn getinfo_response(per: &PerTransfer) -> i64 {
@@ -2682,6 +2722,24 @@ fn post_per_transfer(
     per.infile = None;
 
     if !per.skip {
+        // F5-MINOR-1: reproduce curl's library `failf` text for a recognized
+        // URL whose scheme has no handler. curl prints
+        // `Protocol "<scheme>" not supported` (lib/url.c `findprotocol`) via
+        // `CURLOPT_ERRORBUFFER`; the async core cannot write that C buffer (it
+        // is `#![forbid(unsafe_code)]` and the CLI drives the library directly,
+        // not through the FFI), so synthesize the identical text into the tool
+        // error buffer here — before the result is reported — keeping both the
+        // `curl: (N) ...` diagnostic and `%{errormsg}` in parity with curl.
+        // Recognized, wired schemes never reach this branch (they no longer
+        // return `CURLE_UNSUPPORTED_PROTOCOL`); only a truly-unknown scheme
+        // does. The `is_empty` guard preserves any message a future engine
+        // path might record, and a missing/unparseable scheme falls back to the
+        // static code description.
+        if result == codes::CURLE_UNSUPPORTED_PROTOCOL && per.errorbuffer.is_empty() {
+            if let Some(msg) = unsupported_protocol_message(per) {
+                per.errorbuffer = msg;
+            }
+        }
         result = post_check_result(global, per, result);
         result = post_output_handling(global, per, result);
 

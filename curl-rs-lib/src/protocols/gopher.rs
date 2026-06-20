@@ -61,11 +61,14 @@
 //! is intentionally **not** re-declared here. The module is pure, allocation-safe
 //! Rust with no raw pointers.
 
-use super::{Protocol, ProtocolTransfer, Scheme, TransferDirection, SCHEME_GOPHER, SCHEME_GOPHERS};
+use super::{
+    connect_network_scheme, stream_body_to_sink, Protocol, ProtocolTransfer, Scheme,
+    TransferDirection, SCHEME_GOPHER, SCHEME_GOPHERS,
+};
 use crate::conn::{BoxFuture, Connection, Curl_conn_send, FIRSTSOCKET};
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
-use crate::transfer::uc_to_curlcode;
+use crate::transfer::{uc_to_curlcode, ReadCallback, WriteCallbacks};
 use crate::url::{CurlUPart, CurlUrl, CURLU_GUESS_SCHEME};
 use crate::util::sendf::failf;
 
@@ -328,6 +331,85 @@ impl Protocol for Gophers {
     ) -> BoxFuture<'a, Result<ProtocolTransfer>> {
         Box::pin(gopher_do(data, conn))
     }
+}
+
+// ===========================================================================
+// Transfer-engine driver (C `Curl_do` → `Curl_done` for a `gopher(s)://`
+// transfer).
+// ===========================================================================
+
+/// Drive a `gopher://` or `gophers://` transfer end-to-end, the GOPHER analog
+/// of [`pop3::perform_pop3`](crate::protocols::pop3::perform_pop3) and the seam
+/// [`perform_transfer`](crate::protocols::perform_transfer) dispatches every
+/// `gopher`/`gophers` scheme to. GOPHER has no login phase: the client opens the
+/// connection, sends a single selector line, and reads the response to EOF.
+///
+/// 1. Open the connection-filter chain with [`connect_network_scheme`] — a bare
+///    TCP chain for `gopher://`, or an implicit-TLS chain for `gophers://`
+///    (`scheme.is_ssl()`, the [`PROTOPT_SSL`](super::PROTOPT_SSL) descriptor);
+///    TLS is provided entirely by the filter chain, so the two schemes share
+///    identical request logic.
+/// 2. [`Gopher::do_it`](Protocol::do_it) / [`Gophers::do_it`](Protocol::do_it)
+///    sends the selector (C `gopher_do`) and reports
+///    [`TransferDirection::Download`].
+/// 3. [`stream_body_to_sink`] reads the menu/file response off the socket and
+///    writes it to the client `sink` until the server closes the connection
+///    (GOPHER has no length framing — read to EOF, C
+///    `Curl_xfer_setup_recv(data, FIRSTSOCKET, -1)`).
+/// 4. [`done`](Protocol::done) and [`disconnect`](Protocol::disconnect) finalize
+///    (both no-ops for GOPHER).
+///
+/// This is the wiring whose absence produced QA finding **F5-CRIT-6** (every
+/// `gopher`/`gophers` transfer returned `UnsupportedProtocol` before a socket
+/// opened).
+///
+/// # Errors
+///
+/// Propagates any connection-setup, request-send, body-streaming, or finalize
+/// error as the corresponding [`CurlError`].
+pub(crate) async fn perform_gopher(
+    data: &mut Easy,
+    scheme: &'static Scheme,
+    sink: &mut dyn WriteCallbacks,
+    _source: &mut dyn ReadCallback,
+) -> Result<()> {
+    // (1) Establish the connection — plain TCP for `gopher`, implicit TLS for
+    //     `gophers` (the filter chain installs the TLS filter for a
+    //     `PROTOPT_SSL` scheme).
+    let mut conn = connect_network_scheme(data, scheme).await?;
+
+    // The two schemes differ only in the descriptor they advertise; pick the
+    // matching handler so `scheme()` reports the correct identity. Both share
+    // `gopher_do`, so the post-DO drive below is identical.
+    let handler: Box<dyn Protocol> = if scheme.is_ssl() {
+        Box::new(Gophers)
+    } else {
+        Box::new(Gopher)
+    };
+
+    // (2) GOPHER has no greeting/login phase (`connect` defaults to a no-op).
+    handler.connect(data, &mut conn).await?;
+
+    // (3) DO phase: send the selector and stream the response to the client.
+    let result: Result<()> = async {
+        let xfer = handler.do_it(data, &mut conn).await?;
+        if xfer.direction == TransferDirection::Download {
+            stream_body_to_sink(data, &mut conn, sink, &[], xfer.expected_size).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    // (4) Finalize then best-effort tear-down. A transfer-phase error takes
+    //     precedence over the `done` result (curl: `result = done(); if(!result)
+    //     result = status;`), so the driver returns `result.and(done)`.
+    //     `CurlError` is `Copy`, so `result` is still readable after the move
+    //     into `done`. GOPHER uses the default no-op `done`, which would
+    //     otherwise mask a `do_it`/stream error as success.
+    let premature = result.is_err();
+    let done = handler.done(data, &mut conn, result, premature).await;
+    let _ = handler.disconnect(data, &mut conn, done.is_err()).await;
+    result.and(done)
 }
 
 // ===========================================================================

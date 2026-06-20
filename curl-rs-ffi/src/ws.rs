@@ -82,7 +82,6 @@ use std::cell::RefCell;
 
 use libc::size_t;
 
-use curl_rs_lib::error::CurlError;
 use curl_rs_lib::Easy;
 
 use crate::block_on;
@@ -111,7 +110,8 @@ thread_local! {
     /// thread (mirrors the C `&ws->recvframe`).
     ///
     /// Its address is stable for the lifetime of the thread, which is what lets
-    /// [`store_frame`] and [`meta_ptr`] return a `*const curl_ws_frame` that
+    /// [`store_frame`] (and the test-only `meta_ptr`) return a
+    /// `*const curl_ws_frame` that
     /// stays valid until the next WebSocket call overwrites the slot — the
     /// "valid until the next ws call" lifetime documented for `curl_ws_recv`'s
     /// `metap` out-parameter and for `curl_ws_meta`.
@@ -138,8 +138,12 @@ fn store_frame(frame: curl_ws_frame) -> *const curl_ws_frame {
 /// Returns a stable pointer to the thread's current WebSocket frame metadata
 /// without modifying it.
 ///
-/// Used by [`curl_ws_meta`]. The pointer follows the same lifetime rules as the
-/// one returned by [`store_frame`].
+/// The pointer follows the same lifetime rules as the one returned by
+/// [`store_frame`]. This is a test-only observer: production `curl_ws_meta`
+/// reads the live frame from the handle's WebSocket connection ([`Easy::ws_meta`])
+/// and publishes it via [`store_frame`], so it never needs a read-without-write
+/// path.
+#[cfg(test)]
 fn meta_ptr() -> *const curl_ws_frame {
     WS_FRAME.with(|cell| cell.as_ptr() as *const curl_ws_frame)
 }
@@ -246,28 +250,34 @@ pub unsafe extern "C" fn curl_ws_recv(
     };
 
     // Drive the core WebSocket receive to completion under the synchronous C
-    // contract (AAP §0.4.4). The core gates this on a `CONNECT_ONLY` connection
-    // exactly as curl's `curl_ws_recv` requires one.
-    let result = block_on(async move { easy.recv(dst) });
+    // contract (AAP §0.4.4). The core gates this on a retained `CONNECT_ONLY`
+    // WebSocket connection exactly as curl's `curl_ws_recv` requires one; an
+    // easy handle with no attached ws connection reports
+    // `CURLE_UNSUPPORTED_PROTOCOL`, matching curl.
+    let result = block_on(async move { easy.ws_recv(dst).await });
 
     match result {
-        Ok(n) => {
-            // Publish the frame metadata in the handle-owned (thread-local)
-            // slot and report it through `metap`, mirroring curl's
-            // `update_meta` + `*metap = &ws->recvframe; *nread = ...`.
+        Ok((n, meta)) => {
+            // Publish the decoded frame metadata in the handle-owned
+            // (thread-local) slot and report it through `metap`, mirroring
+            // curl's `update_meta` + `*metap = &ws->recvframe; *nread = ...`.
+            // The core's `WsFrameMeta` maps field-for-field onto the `#[repr(C)]`
+            // `curl_ws_frame` (`age`/`flags` as `c_int`, `offset`/`bytesleft` as
+            // `curl_off_t`, `len` as `size_t`); the core guarantees
+            // `meta.len == n` (it returns `recvframe.len`).
             let frame = curl_ws_frame {
-                age: 0,
-                flags: 0,
-                offset: 0,
-                bytesleft: 0,
-                len: n,
+                age: meta.age,
+                flags: meta.flags,
+                offset: meta.offset,
+                bytesleft: meta.bytesleft,
+                len: meta.len,
             };
-            let meta = store_frame(frame);
+            let frame_ptr = store_frame(frame);
             if !metap.is_null() {
                 // SAFETY: `metap` is non-NULL and points at a writable
-                // `const curl_ws_frame *`; `meta` is a stable thread-local
+                // `const curl_ws_frame *`; `frame_ptr` is a stable thread-local
                 // address valid until the next ws call.
-                unsafe { *metap = meta };
+                unsafe { *metap = frame_ptr };
             }
             if !recv.is_null() {
                 // SAFETY: `recv` is non-NULL and points at a writable `size_t`.
@@ -358,9 +368,10 @@ pub unsafe extern "C" fn curl_ws_send(
 
     // Drive the core WebSocket send to completion under the synchronous C
     // contract (AAP §0.4.4). The frame `flags`/`fragsize` are honored by the
-    // core encoder for non-raw frames; the core gates the write on a
-    // `CONNECT_ONLY` connection exactly as curl does.
-    let result = block_on(async move { easy.send(src) });
+    // core encoder for non-raw frames; the core gates the write on a retained
+    // `CONNECT_ONLY` WebSocket connection exactly as curl does (a handle with no
+    // attached ws connection reports `CURLE_UNSUPPORTED_PROTOCOL`).
+    let result = block_on(async move { easy.ws_send(src, flags, fragsize).await });
 
     match result {
         Ok(n) => {
@@ -414,32 +425,12 @@ pub unsafe extern "C" fn curl_ws_start_frame(
         return CURLcode::CURLE_FAILED_INIT;
     }
 
-    // Forward to the core WebSocket frame encoder.
-    result_to_code(ws_start_frame_core(easy, flags, frame_len))
-}
-
-/// Buffer a frame header on the core WebSocket encoder (the synchronous half of
-/// [`curl_ws_start_frame`]).
-///
-/// Mirrors the tail of `lib/ws.c:curl_ws_start_frame` (after the raw-mode
-/// guard): the encoder buffers a header for `frame_len` payload bytes carrying
-/// `flags`, and errors when there is no associated WebSocket connection or a
-/// previous frame is still open — both reported by curl as
-/// [`CURLE_SEND_ERROR`](CURLcode::CURLE_SEND_ERROR).
-///
-/// As with the core's own `Easy::send`/`Easy::recv`, the encoder is wired in as
-/// the connection and protocol layers come online; until a handle carries a live
-/// WebSocket connection this is curl's "no associated connection" path, so it
-/// reports [`CurlError::SendError`]. `flags` and `frame_len` are the header
-/// parameters the encoder consumes once wired (the binding below mirrors the
-/// not-yet-wired-transport handling in `Easy::recv`/`Easy::send`).
-fn ws_start_frame_core(
-    easy: &mut Easy,
-    flags: c_uint,
-    frame_len: curl_off_t,
-) -> curl_rs_lib::error::Result<()> {
-    let _ = (easy, flags, frame_len);
-    Err(CurlError::SendError)
+    // Forward to the core WebSocket frame encoder. The core buffers a header for
+    // `frame_len` payload bytes carrying `flags`; with no attached WebSocket
+    // connection (no `ws_state`) it reports [`CurlError::SendError`], exactly the
+    // `CURLE_SEND_ERROR` curl yields for a missing connection or a still-open
+    // previous frame.
+    result_to_code(easy.ws_start_frame(flags, frame_len))
 }
 
 // =============================================================================
@@ -474,7 +465,27 @@ pub unsafe extern "C" fn curl_ws_meta(curl: *mut CURL) -> *const curl_ws_frame {
         return ptr::null();
     }
 
-    meta_ptr()
+    // QA F5-MINOR-2: frame metadata exists only within an active WebSocket
+    // context. curl gates `curl_ws_meta` on `data->conn` plus the per-connection
+    // `WS_CONN` meta being present; the Rust analog is a handle that retains a
+    // WebSocket connection ([`Easy::ws_meta`] returns `Some` only then). A handle
+    // with no ws context — a freshly `curl_easy_init`'d handle, or one used for a
+    // non-ws transfer — therefore returns NULL, exactly as curl does (the prior
+    // implementation incorrectly returned a non-NULL slot for any non-raw handle).
+    //
+    // With a ws context, publish the connection's current `recvframe` in the
+    // handle-owned (thread-local) slot and return its stable address (valid until
+    // the next ws call), mirroring curl's `return &data->conn->ws->recvframe`.
+    match easy.ws_meta() {
+        Some(meta) => store_frame(curl_ws_frame {
+            age: meta.age,
+            flags: meta.flags,
+            offset: meta.offset,
+            bytesleft: meta.bytesleft,
+            len: meta.len,
+        }),
+        None => ptr::null(),
+    }
 }
 
 // =============================================================================
@@ -732,16 +743,19 @@ mod tests {
     }
 
     #[test]
-    fn meta_non_raw_returns_stable_thread_owned_pointer() {
+    fn meta_without_ws_context_is_null() {
+        // QA F5-MINOR-2: a freshly initialized handle has no retained WebSocket
+        // connection, so `curl_ws_meta` must return NULL (matching curl, which
+        // gates on `data->conn` + the per-connection `WS_CONN` meta). The prior
+        // implementation incorrectly returned a non-NULL thread-local slot for
+        // any non-raw handle; this is the regression guard for that fix.
         let handle = make_handle();
-        // SAFETY: live handle (non-raw by default).
-        let p1 = unsafe { curl_ws_meta(handle) };
-        // SAFETY: live handle.
-        let p2 = unsafe { curl_ws_meta(handle) };
-        assert!(!p1.is_null());
-        // The handle-owned (thread-local) metadata pointer is stable across
-        // calls — the "valid until the next ws call" contract.
-        assert_eq!(p1, p2);
+        // SAFETY: live handle (non-raw by default, no ws connection attached).
+        let p = unsafe { curl_ws_meta(handle) };
+        assert!(
+            p.is_null(),
+            "curl_ws_meta on a handle with no active WebSocket context must be NULL"
+        );
         // SAFETY: `handle` is live and not yet freed.
         unsafe { drop_handle(handle) };
     }

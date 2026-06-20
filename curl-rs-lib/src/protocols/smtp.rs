@@ -49,8 +49,12 @@ use crate::conn::{
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
 use crate::protocols::pingpong::{tls_config_from_easy, PingPong, PingPongProtocol};
-use crate::protocols::{Protocol, ProtocolTransfer, Scheme, TransferDirection};
-use crate::setopt::StrId;
+use crate::protocols::{
+    connect_network_scheme, Protocol, ProtocolTransfer, Scheme, TransferDirection, SCHEME_SMTP,
+    SCHEME_SMTPS,
+};
+use crate::setopt::{HttpReq, StrId};
+use crate::transfer::{ReadCallback, ReadStep, UploadReader, WriteCallbacks};
 use crate::url::{CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_URLDECODE};
 
 // ===========================================================================
@@ -193,6 +197,17 @@ pub struct SmtpConn {
     /// this flag is unset; the flag makes that idempotent, so a future engine
     /// that *does* call `connect` first will not trigger a second handshake.
     session_established: bool,
+    /// The mail message body buffered by the transfer driver from the upload
+    /// read-callback (`-T`/`CURLOPT_UPLOAD`), staged here for `do_it` to send in
+    /// the `DATA` phase.
+    ///
+    /// curl decides "this is a mail send" from `data->state.upload` (or a MIME
+    /// post) and streams the body from the read function during the `DATA`
+    /// phase. The [`Protocol::do_it`] signature has no access to the upload
+    /// `source`, so [`perform_smtp`] reads the body up front and parks it here;
+    /// `do_it` consumes it (via [`Option::take`]) when present, falling back to
+    /// the in-memory `copypostfields` buffer (`-d`) otherwise.
+    staged_upload: Option<Vec<u8>>,
 }
 
 /// Per-request SMTP state (`struct SMTP` in `smtp.c`).
@@ -1097,21 +1112,34 @@ impl Protocol for SmtpProtocol {
                         .collect()
                 })
                 .unwrap_or_default();
-            // The message body is taken from the safe `copypostfields` buffer;
-            // raw `postfields` pointers are an FFI concern and are not
-            // dereferenced in the safe core.
-            let body = data.set.copypostfields.clone().unwrap_or_default();
-            let has_body = data.set.copypostfields.is_some() || data.set.postfields.is_some();
+            // curl selects a mail send (vs. a command-only exchange) from
+            // `data->state.upload` (set by `-T`/`CURLOPT_UPLOAD`) or a MIME post,
+            // *not* from the presence of POST data. Mirror that: `-T` sets the
+            // request method to PUT (C `data->state.upload`).
+            let upload_mode = data.set.method == HttpReq::Put;
+            // The in-memory `-d` body (`copypostfields`); raw `postfields`
+            // pointers are an FFI concern and are not dereferenced in the safe
+            // core. Captured up front so the `data` borrow is released before the
+            // connection is borrowed for I/O.
+            let postfields_body = data.set.copypostfields.clone();
+            let has_postfields = postfields_body.is_some() || data.set.postfields.is_some();
+
+            // Acquire the connection state and detach the ping-pong engine so it
+            // is disjoint from `smtpc` (the response/SASL callback target). The
+            // upload body parked by `perform_smtp` (read from the `-T` source)
+            // is taken here, ahead of the in-memory `-d` buffer.
+            let mut smtpc = take_smtp_conn(conn);
+            let staged_upload = smtpc.staged_upload.take();
+            let mut pp = std::mem::take(&mut smtpc.pp);
 
             // A mail transfer requires upload data and at least one recipient
             // (C: `(upload || MIME) && mail_rcpt`); otherwise this is a
             // command-only exchange (VRFY/EXPN/NOOP/RSET/HELP).
+            let has_body = upload_mode || has_postfields;
             let do_mail = has_body && !rcpt_raw.is_empty();
-
-            // Acquire the connection state and detach the ping-pong engine so it
-            // is disjoint from `smtpc` (the response/SASL callback target).
-            let mut smtpc = take_smtp_conn(conn);
-            let mut pp = std::mem::take(&mut smtpc.pp);
+            // The message body: the staged `-T` upload takes precedence over the
+            // in-memory `-d` buffer (a request uses one or the other).
+            let body = staged_upload.or(postfields_body).unwrap_or_default();
 
             // Run the exchange in a sub-scope so we always restore state below.
             let outcome: Result<TransferDirection> = async {
@@ -1235,6 +1263,114 @@ impl Protocol for SmtpProtocol {
     }
 }
 
+// ===========================================================================
+// `perform_smtp` — the SMTP/SMTPS transfer-engine seam
+// ===========================================================================
+
+/// Drain the upload read-callback `source` to end-of-input, returning the full
+/// message body.
+///
+/// SMTP buffers the whole message before `MAIL FROM` so the `SIZE=` extension
+/// can be honored and the body dot-stuffed in one pass (the existing
+/// [`run_mail_transaction`] takes a `&[u8]`). The length is unannounced
+/// (`UploadReader::new(None, …)`), so the reader stops at the first zero-length
+/// read; `PAUSE` is unsupported on this path (mapped to an error by the reader),
+/// so the `Paused` arm is unreachable.
+///
+/// # Errors
+///
+/// [`CurlError::AbortedByCallback`] if the source aborts, or
+/// [`CurlError::ReadError`] on a malformed callback return.
+fn read_upload_to_end(source: &mut dyn ReadCallback) -> Result<Vec<u8>> {
+    let mut reader = UploadReader::new(None, false);
+    let mut body = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    // Loop while the source yields data; `Eof`/`Paused` end the `while let`
+    // (PAUSE is unsupported here and is mapped to an error by the reader).
+    while let ReadStep::Data(n) = reader.read(&mut buf, source)? {
+        body.extend_from_slice(&buf[..n]);
+    }
+    Ok(body)
+}
+
+/// Drive an `smtp://` / `smtps://` transfer end-to-end, the SMTP analog of
+/// [`ftp::perform_ftp`](crate::protocols::ftp::perform_ftp): establish the
+/// control connection (implicit TLS for `smtps`, the connection-filter chain
+/// otherwise), run the greeting → `EHLO`/`HELO` → optional `STARTTLS` →
+/// authentication session, then the DO phase — either a full mail transaction
+/// (`MAIL FROM` → `RCPT TO` → `DATA` → message → final `250`) when an upload
+/// body and recipients are configured, or a command exchange
+/// (`VRFY`/`EXPN`/`NOOP`/`RSET`/`HELP`) otherwise — and finally a best-effort
+/// `QUIT` teardown.
+///
+/// SMTP carries no downloadable body: the mail transaction's response codes are
+/// consumed and validated inside [`SmtpProtocol::do_it`], and a command-only
+/// exchange's reply is logged, so no bytes flow to `sink` (matching curl, where
+/// `smtp_do` performs the whole operation and the generic transfer loop moves no
+/// body for SMTP). When an upload is configured (`-T`/`CURLOPT_UPLOAD`), the
+/// message body is read from `source` here and parked in the connection state
+/// for `do_it` to send during the `DATA` phase; otherwise the in-memory `-d`
+/// buffer (`copypostfields`) is used.
+///
+/// # Errors
+///
+/// Any read-callback error while buffering the upload body, or any
+/// connection-establishment, session, authentication, or mail-transaction error
+/// surfaced by the SMTP handler.
+pub(crate) async fn perform_smtp(
+    data: &mut Easy,
+    _sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+) -> Result<()> {
+    // Resolve the concrete scheme descriptor (`smtps` adds `PROTOPT_SSL`).
+    let is_smtps = data
+        .info
+        .scheme
+        .as_ref()
+        .and_then(|s| s.to_str().ok())
+        .is_some_and(|s| s.eq_ignore_ascii_case("smtps"));
+    let scheme: &'static Scheme = if is_smtps { &SCHEME_SMTPS } else { &SCHEME_SMTP };
+
+    // Buffer the mail message body from the upload read-callback up front, before
+    // any socket is opened. curl selects a mail send from `data->state.upload`
+    // (set by `-T`/`CURLOPT_UPLOAD`) and streams the body from the read function
+    // during the `DATA` phase; the [`Protocol::do_it`] signature has no access to
+    // the upload `source`, so the body is read here and handed to `do_it` via the
+    // connection state. A read failure short-circuits before connecting.
+    let staged_upload: Option<Vec<u8>> = if data.set.method == HttpReq::Put {
+        Some(read_upload_to_end(source)?)
+    } else {
+        None
+    };
+
+    // (1) Establish the (optionally TLS) control connection.
+    let mut conn = connect_network_scheme(data, scheme).await?;
+
+    // (2) Per-connection setup + the connect-phase session (greeting / EHLO /
+    //     STARTTLS / AUTH). `SmtpProtocol::do_it` re-checks the session, so a
+    //     handler that already established it in `connect` is idempotent.
+    let handler = SmtpProtocol::new(scheme);
+    handler.setup_connection(data, &mut conn).await?;
+
+    // Park the buffered upload body in the freshly-allocated connection state so
+    // `do_it` sends it during the `DATA` phase. `connect` preserves the field.
+    if let Some(body) = staged_upload {
+        let mut smtpc = take_smtp_conn(&mut conn);
+        smtpc.staged_upload = Some(body);
+        conn.set_proto_state(smtpc);
+    }
+
+    handler.connect(data, &mut conn).await?;
+
+    // (3) The DO phase runs the whole mail transaction / command exchange.
+    let result = handler.do_it(data, &mut conn).await.map(|_| ());
+
+    // (4) Finalize (`done` propagates the status) then best-effort `QUIT`.
+    let premature = result.is_err();
+    let done = handler.done(data, &mut conn, result, premature).await;
+    let _ = handler.disconnect(data, &mut conn, done.is_err()).await;
+    done
+}
 
 // ===========================================================================
 // Response parsing — free helpers for the `PingPongProtocol` impl

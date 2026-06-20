@@ -46,7 +46,10 @@
 use crate::conn::{BoxFuture, Connection, Curl_conn_recv, Curl_conn_send, FIRSTSOCKET};
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
-use crate::protocols::{Protocol, ProtocolTransfer, Scheme, TransferDirection, SCHEME_TELNET};
+use crate::protocols::{
+    connect_network_scheme, Protocol, ProtocolTransfer, Scheme, TransferDirection, SCHEME_TELNET,
+};
+use crate::transfer::{ReadCallback, WriteCallbacks};
 use crate::util::sendf;
 
 /// TELNET command bytes, option codes and sub-option qualifiers, ported
@@ -1191,6 +1194,49 @@ impl Protocol for Telnet {
         // engine state is local to `do_it`, so there is nothing to tear down.
         Box::pin(async move { Ok(()) })
     }
+}
+
+/// Drive a `telnet://` session end-to-end — [F5-CRIT-8].
+///
+/// This is the production engine seam for TELNET, the analog of `telnet.c`'s
+/// `telnet_do`. Before this driver existed the recognized `telnet` scheme fell
+/// through to `CURLE_UNSUPPORTED_PROTOCOL` in
+/// [`perform_transfer`](super::perform_transfer), so no socket was ever opened.
+///
+/// TELNET has no request/response body in the curl sense: [`do_it`](Telnet::do_it)
+/// (`telnet_do`) relays the local stdin to the socket and the decoded socket
+/// output to stdout, negotiating options only *after* the peer initiates (so it
+/// never "speaks telnet" to a non-telnet server), and returns when the server
+/// closes the connection. The client `sink`/`source` are therefore unused — the
+/// session performs its own terminal I/O exactly as the C handler does.
+///
+/// # Errors
+///
+/// Any connection or session error. A session error takes precedence over the
+/// `done` result (`result.and(done)`), so the default no-op `done` — which
+/// ignores its status argument — cannot mask a real error.
+pub(crate) async fn perform_telnet(
+    data: &mut Easy,
+    scheme: &'static Scheme,
+    _sink: &mut dyn WriteCallbacks,
+    _source: &mut dyn ReadCallback,
+) -> Result<()> {
+    // (1) Establish the plain-TCP connection over the filter chain.
+    let mut conn = connect_network_scheme(data, scheme).await?;
+    let handler = Telnet::new();
+
+    // (2) TELNET has no greeting/login phase (`connect` defaults to a no-op);
+    //     call it for parity with the other protocol drivers.
+    handler.connect(data, &mut conn).await?;
+
+    // (3) DO phase: run the interactive relay to completion.
+    let result = handler.do_it(data, &mut conn).await.map(|_xfer| ());
+
+    // (4) Finalize then best-effort tear-down.
+    let premature = result.is_err();
+    let done = handler.done(data, &mut conn, result, premature).await;
+    let _ = handler.disconnect(data, &mut conn, done.is_err()).await;
+    result.and(done)
 }
 
 #[cfg(test)]

@@ -84,7 +84,7 @@ use std::sync::OnceLock;
 use crate::conn::{BoxFuture, Connection};
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
-use crate::transfer::{ReadCallback, WriteCallbacks};
+use crate::transfer::{ClientWriteType, ClientWriter, ReadCallback, WriteCallbacks};
 
 // The redirect-reason enum is owned by the transfer engine (curl's `followtype`,
 // `lib/transfer.rs`); re-export it so the [`Protocol::follow`] hook and protocol
@@ -1284,6 +1284,239 @@ pub fn scheme_handler(scheme_name: &str) -> Option<Box<dyn Protocol>> {
     Some(handler)
 }
 
+// ===========================================================================
+// Shared network-scheme connection setup + body streaming.
+//
+// These helpers factor out the connection-setup and body-delivery boilerplate
+// every single-socket TCP protocol's `perform_*` driver repeats — the same
+// resolve → build connection → (TLS) → connect sequence that `ftp::perform_ftp`
+// and `http::perform_http` open with, and the same `Curl_conn_recv` → client
+// writer loop FTP's `run_download_body` uses. Centralizing them keeps each
+// protocol driver focused on its protocol-specific DO phase and body framing,
+// and keeps the connection-filter-chain wiring identical across protocols
+// (AAP §0.4.3 connection-filter chain; §0.5 "drive over the conn chain like the
+// http/ftp/ssh seams").
+// ===========================================================================
+
+/// Resolve the request URL's host/port and establish a single-socket
+/// connection for a network `scheme`, returning the connected
+/// [`Connection`] ready for the protocol handler's `connect`/`do_it`.
+///
+/// This is the shared analog of the opening of `ftp::perform_ftp` /
+/// `http::perform_http`: it prefers a pre-parsed `CURLOPT_CURLU` handle (else
+/// parses the stored URL string with curl's scheme-guessing + default-port
+/// fallback), strips IPv6 brackets from the host, resolves addresses through the
+/// system resolver, builds the [`Connection`] with the scheme's
+/// [`SchemeDescriptor`], installs the happy-eyeballs connect filter, and — for a
+/// `PROTOPT_SSL` scheme (`smtps`/`imaps`/`pop3s`/`gophers`/`mqtts`/`ldaps`/…) —
+/// the implicit-TLS filter, then drives the connection to completion. A plain
+/// scheme that may later upgrade in-band (SMTP `STARTTLS`, IMAP `STARTTLS`,
+/// POP3 `STLS`) is connected without a TLS filter; the handler installs it
+/// mid-session.
+///
+/// # Errors
+///
+/// * [`CurlError::UrlMalformat`] when the URL has no parseable host.
+/// * Any DNS-resolution or connection-establishment error.
+pub(crate) async fn connect_network_scheme(
+    data: &mut Easy,
+    scheme: &'static Scheme,
+) -> Result<Connection> {
+    use crate::conn::connect::{eyeballs_factory, tls_factory, SetupConfig};
+    use crate::conn::{
+        establish_connection, ConnSetup, SchemeDescriptor, CURL_CF_SSL_DISABLE,
+        CURL_CF_SSL_ENABLE, FIRSTSOCKET, TRNSPRT_TCP,
+    };
+    use crate::dns::{self, DnsCache, IpVersion, ResolveParams};
+    use crate::protocols::pingpong::tls_config_from_easy;
+    use crate::url::{CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_GUESS_SCHEME, CURLU_URLDECODE};
+
+    let verbose = data.set.verbose;
+
+    // (1) Resolve the request URL: prefer a pre-parsed `CURLOPT_CURLU` handle
+    //     (deposited by the FFI layer), else parse the stored URL string.
+    let url = if let Some(uh) = data.set.uh.clone() {
+        uh
+    } else {
+        let url_str = data.url().ok_or(CurlError::UrlMalformat)?.to_string();
+        let mut parsed = CurlUrl::new();
+        parsed
+            .set(
+                CurlUPart::Url,
+                Some(&url_str),
+                CURLU_GUESS_SCHEME | CURLU_DEFAULT_PORT,
+            )
+            .map_err(|_| CurlError::UrlMalformat)?;
+        parsed
+    };
+
+    // (2) Host (stripped of any IPv6 brackets for DNS/identity) and port.
+    let host_bracketed = url.get(CurlUPart::Host, CURLU_URLDECODE).unwrap_or_default();
+    if host_bracketed.is_empty() {
+        return Err(CurlError::UrlMalformat);
+    }
+    let host = host_bracketed
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(&host_bracketed)
+        .to_string();
+    let port = url
+        .get(CurlUPart::Port, 0)
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(scheme.default_port);
+
+    let ipver = IpVersion::from_raw(i64::from(data.set.ipver));
+
+    // (3) Resolve the endpoint's addresses (system resolver).
+    let addrs = {
+        let mut cache = DnsCache::new();
+        let mut errbuf: Option<String> = None;
+        let mut params = ResolveParams::new(&host, port);
+        params.ip_version = ipver;
+        params.verbose = verbose;
+        let entry = dns::resolve(&mut cache, &params, &mut errbuf).await?;
+        entry.addrs.clone()
+    };
+
+    // (4) Build the connection + its filter chain. A `PROTOPT_SSL` scheme
+    //     installs the implicit-TLS filter now; a plain scheme stays a bare TCP
+    //     chain (any STARTTLS-style upgrade is the handler's job mid-session).
+    let desc = SchemeDescriptor::new(scheme.name, scheme.default_port, scheme.flags, scheme.protocol);
+    let mut conn = Connection::new(format!("{host}:{port}"), TRNSPRT_TCP, desc).with_verbose(verbose);
+    conn.set_remote(host.clone(), port);
+    // This single-shot path opens exactly one fresh connection per transfer and
+    // does not borrow from the connection pool, so the connection keeps its
+    // `Connection::new` default id of `-1`. curl's first connection is id 0
+    // (`cpool->next_connection_id` starts at 0), and some protocols derive
+    // wire-visible state from it — IMAP's command-tag letter is
+    // `'A' + (connection_id % 26)`, so an unassigned `-1` would yield `'Z'`
+    // instead of the `'A001'` curl emits (and the test-suite oracles expect).
+    // Assign id 0 to match curl's first-connection identity. (The field is set
+    // directly rather than via the `PoolConn::set_connection_id` trait method to
+    // avoid pulling a connection-pool trait into the protocols layer.)
+    conn.connection_id = 0;
+
+    let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, addrs);
+    let (ssl_mode, dispatch) = if scheme.is_ssl() {
+        // These line/command protocols negotiate no ALPN; offer none.
+        let tls = tls_config_from_easy(data);
+        let pinned = data
+            .set
+            .str(crate::setopt::StrId::SslPinnedPublicKey)
+            .map(String::from);
+        let ssl = tls_factory(tls, host.clone(), port, pinned, Vec::new());
+        (
+            CURL_CF_SSL_ENABLE,
+            ConnSetup::Default(SetupConfig::new(CURL_CF_SSL_ENABLE, true, eyeballs).with_ssl(ssl)),
+        )
+    } else {
+        (
+            CURL_CF_SSL_DISABLE,
+            ConnSetup::Default(SetupConfig::new(CURL_CF_SSL_DISABLE, false, eyeballs)),
+        )
+    };
+    establish_connection(&mut conn, FIRSTSOCKET, ssl_mode, dispatch, true).await?;
+    Ok(conn)
+}
+
+/// Stream an already-delimited response body from a single-socket connection to
+/// the client `sink`, the shared analog of FTP's `run_download_body`: read
+/// `FIRSTSOCKET` through a [`ClientWriter`] (which honors `CURLOPT_HEADER` and
+/// content decoding) until either `expected` bytes have been delivered (when the
+/// protocol knows the size up front) or the peer closes the connection, then
+/// flush a zero-length end-of-stream so the writer finalizes any content
+/// decoder. Returns the number of body bytes delivered.
+///
+/// `prefix` carries any body bytes already buffered by the protocol's
+/// command/response engine (the ping-pong "overflow", or a fixed-size literal's
+/// leading bytes); they are delivered first, before any further socket read.
+///
+/// # Errors
+///
+/// Any transport error from [`Curl_conn_recv`](crate::conn::Curl_conn_recv), or
+/// a client write error.
+pub(crate) async fn stream_body_to_sink(
+    data: &mut Easy,
+    conn: &mut Connection,
+    sink: &mut dyn WriteCallbacks,
+    prefix: &[u8],
+    expected: Option<u64>,
+) -> Result<u64> {
+    use crate::conn::{Curl_conn_recv, FIRSTSOCKET};
+
+    let mut writer = ClientWriter::with_options(data.set.include_header, false);
+    let mut total: u64 = 0;
+
+    // Deliver the buffered prefix first, bounded by `expected` if known.
+    let mut prefix_used = prefix;
+    if let Some(limit) = expected {
+        let take = (limit as usize).min(prefix_used.len());
+        prefix_used = &prefix_used[..take];
+    }
+    if !prefix_used.is_empty() {
+        total += prefix_used.len() as u64;
+        let done = expected.is_some_and(|limit| total >= limit);
+        if done {
+            writer.write(
+                ClientWriteType::BODY.union(ClientWriteType::EOS),
+                prefix_used,
+                sink,
+            )?;
+            return Ok(total);
+        }
+        writer.write(ClientWriteType::BODY, prefix_used, sink)?;
+    } else if expected == Some(0) {
+        // Known-empty body: still flush a zero-length end-of-stream.
+        writer.write(
+            ClientWriteType::BODY.union(ClientWriteType::EOS),
+            &[],
+            sink,
+        )?;
+        return Ok(0);
+    }
+
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        if let Some(limit) = expected {
+            if total >= limit {
+                // All known bytes delivered: flush end-of-stream and stop
+                // without reading further (anything after belongs to the
+                // protocol's trailing handshake, read by `done`).
+                writer.write(
+                    ClientWriteType::BODY.union(ClientWriteType::EOS),
+                    &[],
+                    sink,
+                )?;
+                break;
+            }
+        }
+        // Bound each read so a known-size body never consumes trailing
+        // protocol bytes (e.g. an IMAP literal's closing `)` + tagged status).
+        let want = match expected {
+            Some(limit) => ((limit - total) as usize).min(buf.len()),
+            None => buf.len(),
+        };
+        let n = match Curl_conn_recv(conn, FIRSTSOCKET, &mut buf[..want]).await {
+            Ok(0) => {
+                // Peer closed: flush end-of-stream and stop.
+                writer.write(
+                    ClientWriteType::BODY.union(ClientWriteType::EOS),
+                    &[],
+                    sink,
+                )?;
+                break;
+            }
+            Ok(n) => n,
+            Err(CurlError::Again) => continue,
+            Err(e) => return Err(e),
+        };
+        total += n as u64;
+        writer.write(ClientWriteType::BODY, &buf[..n], sink)?;
+    }
+    Ok(total)
+}
+
 /// Drive a fully-preflighted transfer for `data` to completion, delivering
 /// response body/header bytes to `sink` and pulling any upload body from
 /// `source`. This is the engine entry [`crate::easy::Easy::perform_with`]
@@ -1372,6 +1605,141 @@ pub(crate) async fn perform_transfer(
     #[cfg(feature = "sftp")]
     if scheme_name == "sftp" {
         return ssh::perform_sftp(data, sink, source).await;
+    }
+
+    // The line-based mail protocols (`smtp`/`smtps`, `imap`/`imaps`,
+    // `pop3`/`pop3s`) are driven end-to-end by their handlers over the
+    // ping-pong command engine plus the connection-filter chain (plain TCP with
+    // an in-band `STARTTLS`/`STLS` upgrade, or implicit TLS for the `s`-schemes):
+    // the greeting → capability → optional TLS upgrade → authentication session,
+    // the DO phase (SMTP `MAIL`/`RCPT`/`DATA` or a `VRFY`/`EXPN` command; POP3
+    // `RETR`/`LIST` with dot-unstuffed body; IMAP `SELECT`/`FETCH`/`APPEND` with
+    // a `{size}` literal body), and the `QUIT`/`LOGOUT` teardown. This wires the
+    // mail seam whose absence produced QA findings F5-CRIT-1/2/3 (every mail
+    // scheme returned `UnsupportedProtocol` before a socket opened).
+    #[cfg(feature = "smtp")]
+    if matches!(scheme_name.as_str(), "smtp" | "smtps") {
+        return smtp::perform_smtp(data, sink, source).await;
+    }
+    #[cfg(feature = "imap")]
+    if matches!(scheme_name.as_str(), "imap" | "imaps") {
+        return imap::perform_imap(data, sink, source).await;
+    }
+    #[cfg(feature = "pop3")]
+    if matches!(scheme_name.as_str(), "pop3" | "pop3s") {
+        return pop3::perform_pop3(data, sink, source).await;
+    }
+
+    // `ws`/`wss` are driven end-to-end by the WebSocket seam in the HTTP engine
+    // ([`http::perform_ws`]): the opening handshake is an ordinary HTTP/1.1 `GET`
+    // with the `Upgrade: websocket` / `Sec-WebSocket-*` headers (curl's
+    // `Curl_protocol_ws.do_it == Curl_http`), after which the `101 Switching
+    // Protocols` response installs the RFC 6455 framing engine on the live
+    // connection. A `CURLOPT_CONNECT_ONLY` transfer hands the connection to the
+    // easy handle for the `curl_ws_*` API; a plain `curl ws://…` continues the
+    // download by reading frames. This wires the WebSocket seam whose absence
+    // produced QA finding F5-CRIT-4 (every `ws`/`wss` scheme returned
+    // `UnsupportedProtocol` before a socket opened, and the exported `curl_ws_*`
+    // symbols were functionally dead).
+    #[cfg(all(feature = "websockets", feature = "http"))]
+    if matches!(scheme_name.as_str(), "ws" | "wss") {
+        return http::perform_ws(data, scheme, sink, source).await;
+    }
+
+    // `dict` is driven end-to-end by the DICT engine ([`dict::perform_dict`]):
+    // a single plain-TCP scheme (default port 2628) with no login phase — open
+    // the connection, issue the `DEFINE`/`MATCH`/raw command, and stream the
+    // look-up response to EOF. This wires the seam whose absence produced QA
+    // finding F5-CRIT-5 (every `dict://` transfer returned `UnsupportedProtocol`
+    // before a socket opened).
+    #[cfg(feature = "dict")]
+    if scheme_name == "dict" {
+        return dict::perform_dict(data, sink, source).await;
+    }
+
+    // `gopher`/`gophers` are driven end-to-end by the GOPHER engine
+    // ([`gopher::perform_gopher`]): open the connection (plain TCP, or implicit
+    // TLS for `gophers` via the filter chain), send the selector line, and
+    // stream the menu/file response to EOF. This wires the seam whose absence
+    // produced QA finding F5-CRIT-6 (every `gopher`/`gophers` transfer returned
+    // `UnsupportedProtocol` before a socket opened).
+    #[cfg(feature = "gopher")]
+    if matches!(scheme_name.as_str(), "gopher" | "gophers") {
+        return gopher::perform_gopher(data, scheme, sink, source).await;
+    }
+
+    // `rtsp` is driven end-to-end by the RTSP engine ([`rtsp::perform_rtsp`]):
+    // open the connection, initialize the `CSeq` counters, send the request
+    // (`OPTIONS`/`DESCRIBE`/`SETUP`/`PLAY`/… plus an optional request body for
+    // `ANNOUNCE`/`SET_PARAMETER`), read the `RTSP/1.0` response (status line +
+    // headers + optional `Content-Length` body, with interleaved-RTP demux), and
+    // validate the response `CSeq`. This wires the seam whose absence produced QA
+    // finding F5-CRIT-10 (every `rtsp://` transfer returned `UnsupportedProtocol`
+    // before a socket opened).
+    #[cfg(feature = "rtsp")]
+    if scheme_name == "rtsp" {
+        return rtsp::perform_rtsp(data, sink, source).await;
+    }
+
+    // `ldap`/`ldaps` are driven end-to-end by the LDAP engine
+    // ([`ldap::perform_ldap`]): open the connection (plain TCP for `ldap` —
+    // `PROTOPT_SSL_REUSE`, implicit TLS for `ldaps` — `PROTOPT_SSL`), bind,
+    // issue the RFC 4515 search parsed from the URL, assemble the LDIF result,
+    // unbind, and stream the LDIF body to the client. This wires the seam whose
+    // absence produced QA finding F5-CRIT-12 (every `ldap`/`ldaps` transfer
+    // returned `UnsupportedProtocol` before a socket opened).
+    #[cfg(feature = "ldap")]
+    if matches!(scheme_name.as_str(), "ldap" | "ldaps") {
+        return ldap::perform_ldap(data, scheme, sink, source).await;
+    }
+
+    // `smb`/`smbs` are driven end-to-end by the SMB engine ([`smb::perform_smb`]):
+    // buffer any upload body up front, open the connection (plain TCP for `smb` —
+    // `PROTOPT_CONN_REUSE`, implicit TLS for `smbs` — `PROTOPT_SSL`), validate the
+    // share in the URL path, then run the full CIFS exchange (NEGOTIATE →
+    // SESSION_SETUP/NTLMv1 → TREE_CONNECT → open → read/write → close →
+    // TREE_DISCONNECT) and deliver the downloaded body. This wires the seam whose
+    // absence produced QA finding F5-CRIT-11 (every `smb`/`smbs` transfer returned
+    // `UnsupportedProtocol` before a socket opened). The handler is gated on both
+    // `smb` and `ntlm` (the C `!CURL_DISABLE_SMB && USE_CURL_NTLM_CORE` rule); when
+    // `ntlm` is off the scheme stays registered but falls through to the stub.
+    #[cfg(all(feature = "smb", feature = "ntlm"))]
+    if matches!(scheme_name.as_str(), "smb" | "smbs") {
+        return smb::perform_smb(data, scheme, sink, source).await;
+    }
+
+    // `mqtt`/`mqtts` are driven end-to-end by the MQTT engine
+    // ([`mqtt::perform_mqtt`]): open the connection (plain TCP for `mqtt` —
+    // implicit TLS for `mqtts`), run CONNECT/CONNACK, then either SUBSCRIBE +
+    // stream the published body (download) or PUBLISH + DISCONNECT (upload, from
+    // `-d`/`CURLOPT_POSTFIELDS`). This wires the seam whose absence produced QA
+    // finding F5-CRIT-9 (every `mqtt`/`mqtts` transfer returned
+    // `UnsupportedProtocol` before a socket opened).
+    #[cfg(feature = "mqtt")]
+    if matches!(scheme_name.as_str(), "mqtt" | "mqtts") {
+        return mqtt::perform_mqtt(data, scheme, sink, source).await;
+    }
+
+    // `telnet` is driven end-to-end by the TELNET engine
+    // ([`telnet::perform_telnet`]): open the connection and run the interactive
+    // stdin↔socket↔stdout relay, negotiating options only after the peer does.
+    // This wires the seam whose absence produced QA finding F5-CRIT-8 (every
+    // `telnet://` transfer returned `UnsupportedProtocol` before a socket
+    // opened).
+    #[cfg(feature = "telnet")]
+    if scheme_name == "telnet" {
+        return telnet::perform_telnet(data, scheme, sink, source).await;
+    }
+
+    // `tftp` is driven end-to-end by the TFTP engine ([`tftp::perform_tftp`]):
+    // curl's one datagram protocol resolves the endpoint, binds an ephemeral UDP
+    // socket, and runs the lock-step RRQ/WRQ state machine directly (it does not
+    // use the TCP connection-filter seam). This wires the seam whose absence
+    // produced QA finding F5-CRIT-7 (every `tftp://` transfer returned
+    // `UnsupportedProtocol` before a datagram was sent).
+    #[cfg(feature = "tftp")]
+    if scheme_name == "tftp" {
+        return tftp::perform_tftp(data, scheme, sink, source).await;
     }
 
     // Every other recognized network scheme's end-to-end drive over the `conn`

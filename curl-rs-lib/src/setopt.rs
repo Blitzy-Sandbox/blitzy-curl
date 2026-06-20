@@ -1289,7 +1289,14 @@ impl Default for UserDefined {
             upload_flags: 0,
             gssapi_delegation: 0,
             http_follow_mode: 0,
-            rtspreq: 0,
+            // curl initialises the RTSP request to OPTIONS, not NONE
+            // (`set->rtspreq = RTSPREQ_OPTIONS;` in `Curl_init_userdefined`,
+            // lib/url.c:367). The internal value equals the public
+            // `CURL_RTSPREQ_OPTIONS` (1), since `set_rtsp_request` is identity.
+            // Preserving this default is required for RTSP behavioral parity
+            // (e.g. `curl rtsp://host/` issues OPTIONS without an explicit
+            // `CURLOPT_RTSP_REQUEST`).
+            rtspreq: CURL_RTSPREQ_OPTIONS as u8,
 
             maxredirs: 30,
 

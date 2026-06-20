@@ -54,7 +54,11 @@
 use crate::conn::{BoxFuture, Connection, Curl_conn_send, FIRSTSOCKET};
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
-use crate::protocols::{Protocol, ProtocolTransfer, Scheme, TransferDirection, SCHEME_DICT};
+use crate::protocols::{
+    connect_network_scheme, stream_body_to_sink, Protocol, ProtocolTransfer, Scheme,
+    TransferDirection, SCHEME_DICT,
+};
+use crate::transfer::{ReadCallback, WriteCallbacks};
 use crate::url::{CurlUPart, CurlUrl, CURLU_URLDECODE};
 use crate::version;
 
@@ -206,7 +210,11 @@ fn parse_dict_path(path: &str) -> Option<DictRequest> {
 /// `CLIENT` line, the command, and a trailing `QUIT`, each CRLF-terminated
 /// (C `dict_do`'s `"CLIENT " LIBCURL_NAME " " LIBCURL_VERSION "\r\n…QUIT\r\n"`).
 fn wrap_request(command: &str) -> String {
-    let (name, ver) = (version::NAME, version::VERSION);
+    // The `CLIENT` line is sent verbatim to the DICT server, so it must match
+    // curl's wire bytes exactly (AAP G6): C emits the wire product name
+    // `LIBCURL_NAME` ("libcurl"), NOT the rewrite's consumer-facing identity
+    // `version::NAME` ("curl-rs"). See `version::LIBCURL_NAME`.
+    let (name, ver) = (version::LIBCURL_NAME, version::VERSION);
     format!("CLIENT {name} {ver}\r\n{command}\r\nQUIT\r\n")
 }
 
@@ -306,6 +314,79 @@ impl Protocol for DictHandler {
             Ok(ProtocolTransfer::new(TransferDirection::Download))
         })
     }
+}
+
+// ===========================================================================
+// Transfer-engine driver (C `Curl_do` → `Curl_done` for a `dict://` transfer).
+// ===========================================================================
+
+/// Drive a `dict://` transfer end-to-end, the DICT analog of
+/// [`pop3::perform_pop3`](crate::protocols::pop3::perform_pop3) and the seam
+/// [`perform_transfer`](crate::protocols::perform_transfer) dispatches every
+/// `dict` scheme to. DICT has a single (plain-TCP, default port 2628) scheme
+/// with no TLS variant and no login phase, so the drive is the minimal
+/// connect → DO → stream → done shape:
+///
+/// 1. Open the connection-filter chain (plain TCP) with
+///    [`connect_network_scheme`].
+/// 2. [`DictHandler::do_it`](Protocol::do_it) issues the `DEFINE`/`MATCH`/raw
+///    command (C `dict_do`) and reports a [`TransferDirection::Download`] (or
+///    [`TransferDirection::None`] for the raw-path-without-`/` case, where curl
+///    sends nothing and the transfer carries no body).
+/// 3. For a download, [`stream_body_to_sink`] reads the look-up response off the
+///    socket and writes it to the client `sink` until the server closes the
+///    connection (DICT has no length framing; C
+///    `Curl_xfer_setup_recv(data, FIRSTSOCKET, -1)` reads to EOF).
+/// 4. [`done`](Protocol::done) and [`disconnect`](Protocol::disconnect) finalize
+///    the transfer (both no-ops for DICT — there is no `QUIT` chatter).
+///
+/// This is the wiring whose absence produced QA finding **F5-CRIT-5** (every
+/// `dict://` transfer returned `UnsupportedProtocol` before a socket opened).
+///
+/// # Errors
+///
+/// Propagates any connection-setup, request-send, body-streaming, or finalize
+/// error as the corresponding [`CurlError`].
+pub(crate) async fn perform_dict(
+    data: &mut Easy,
+    sink: &mut dyn WriteCallbacks,
+    _source: &mut dyn ReadCallback,
+) -> Result<()> {
+    // DICT has exactly one scheme descriptor (no implicit-TLS variant).
+    let scheme: &'static Scheme = &SCHEME_DICT;
+
+    // (1) Establish the plain-TCP connection over the filter chain.
+    let mut conn = connect_network_scheme(data, scheme).await?;
+
+    // (2) DICT has no greeting/login phase (`connect` defaults to a no-op);
+    //     call it for parity with the other protocol drivers.
+    let handler = DictHandler::new();
+    handler.connect(data, &mut conn).await?;
+
+    // (3) DO phase: issue the request and stream the response body to the
+    //     client. Body movement is fenced so a failure still runs `done`.
+    let result: Result<()> = async {
+        let xfer = handler.do_it(data, &mut conn).await?;
+        if xfer.direction == TransferDirection::Download {
+            // DICT responses have no length framing — read until the server
+            // closes (`expected = None`); there is no engine-buffered prefix.
+            stream_body_to_sink(data, &mut conn, sink, &[], xfer.expected_size).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    // (4) Finalize then best-effort tear-down. A transfer-phase error takes
+    //     precedence over the `done` result (curl: `result = done(); if(!result)
+    //     result = status;`), so the driver returns `result.and(done)` — the
+    //     transfer error when `result` failed, otherwise the `done` outcome.
+    //     `CurlError` is `Copy`, so `result` is still readable after the move
+    //     into `done`. This matters because DICT uses the default no-op `done`,
+    //     which would otherwise mask a `do_it`/stream error as success.
+    let premature = result.is_err();
+    let done = handler.done(data, &mut conn, result, premature).await;
+    let _ = handler.disconnect(data, &mut conn, done.is_err()).await;
+    result.and(done)
 }
 
 // ===========================================================================
@@ -538,12 +619,21 @@ mod tests {
     #[test]
     fn wrap_request_frames_with_client_and_quit() {
         let framed = wrap_request("DEFINE foldoc curl");
+        // The wire `CLIENT` line carries the on-the-wire product name
+        // `LIBCURL_NAME` ("libcurl") — NOT the consumer-facing `version::NAME`
+        // ("curl-rs") — so it byte-matches C `dict_do` (AAP G6).
         let expected = format!(
             "CLIENT {} {}\r\nDEFINE foldoc curl\r\nQUIT\r\n",
-            version::NAME,
+            version::LIBCURL_NAME,
             version::VERSION
         );
         assert_eq!(framed, expected);
+        // Pin the exact oracle bytes so a regression in either constant is
+        // caught here, not only at runtime against a live server.
+        assert_eq!(
+            framed,
+            "CLIENT libcurl 8.19.0-DEV\r\nDEFINE foldoc curl\r\nQUIT\r\n"
+        );
         // Structural invariants regardless of the version string.
         assert!(framed.starts_with("CLIENT "));
         assert!(framed.ends_with("\r\nQUIT\r\n"));

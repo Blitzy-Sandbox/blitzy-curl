@@ -56,8 +56,12 @@ use crate::conn::{BoxFuture, Connection, TRNSPRT_UDP};
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
 use crate::protocols::{Protocol, ProtocolTransfer, Scheme, TransferDirection, SCHEME_TFTP};
-use crate::transfer::uc_to_curlcode;
-use crate::url::{CurlUPart, CurlUrl, CURLU_GUESS_SCHEME, CURLU_URLDECODE};
+use crate::setopt::HttpReq;
+use crate::transfer::{
+    uc_to_curlcode, ClientWriteType, ClientWriter, ReadCallback, ReadStep, UploadReader,
+    WriteCallbacks,
+};
+use crate::url::{CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_GUESS_SCHEME, CURLU_URLDECODE};
 use crate::util::sendf::{failf, infof};
 use crate::util::timediff::ms_to_duration;
 use crate::util::timeval::{curlx_now, curlx_timediff, CurlTime};
@@ -1214,7 +1218,7 @@ impl TftpConn {
 /// Abstracting the socket behind this trait keeps [`run_transfer`] independent
 /// of Tokio so the full lock-step protocol can be exercised against an
 /// in-memory mock. [`UdpTftpIo`] is the production implementation.
-pub trait TftpIo {
+pub trait TftpIo: Send {
     /// Send one datagram to the server (or the pinned transfer-ID peer).
     fn send_packet<'a>(&'a mut self, buf: &'a [u8]) -> BoxFuture<'a, Result<()>>;
 
@@ -1315,7 +1319,7 @@ impl TftpIo for UdpTftpIo {
 /// The destination for downloaded body bytes (the engine's `DATA` payload
 /// writer). In production this bridges to curl's write callback; in tests it is
 /// a simple buffer.
-pub trait TftpDataSink {
+pub trait TftpDataSink: Send {
     /// Append `buf` to the download body.
     ///
     /// # Errors
@@ -1327,7 +1331,7 @@ pub trait TftpDataSink {
 
 /// The source of upload body bytes (the engine's `DATA` payload reader). In
 /// production this bridges to curl's read callback; in tests it is a buffer.
-pub trait TftpDataSource {
+pub trait TftpDataSource: Send {
     /// Read up to `buf.len()` bytes into `buf`, returning the number read (`0`
     /// at end of input).
     ///
@@ -1479,6 +1483,221 @@ impl Protocol for TftpHandler {
             Ok(ProtocolTransfer::new(TransferDirection::Download))
         })
     }
+}
+
+// =============================================================================
+// Client bridge: adapt the engine's data traits to curl's read/write callbacks
+// =============================================================================
+
+/// Bridges the engine's [`TftpDataSink`] to the client write stack on the `RRQ`
+/// (download) path.
+///
+/// Each `DATA` block is delivered as a body write through a [`ClientWriter`],
+/// which honors `CURLOPT_HEADER` (a no-op for TFTP — the protocol carries no
+/// headers) and content decoding, exactly as `tftp.c` delivers received data
+/// via `Curl_client_write(data, CLIENTWRITE_BODY, …)`.
+struct ClientTftpSink<'a> {
+    writer: ClientWriter,
+    sink: &'a mut dyn WriteCallbacks,
+}
+
+impl TftpDataSink for ClientTftpSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> Result<()> {
+        self.writer.write(ClientWriteType::BODY, buf, self.sink)
+    }
+}
+
+impl ClientTftpSink<'_> {
+    /// Flush a zero-length end-of-stream so the body writer finalizes any
+    /// content decoder, mirroring the final client write curl performs at the
+    /// end of a transfer. `self.writer` and `self.sink` are disjoint fields, so
+    /// borrowing both here is sound.
+    fn finish(&mut self) -> Result<()> {
+        self.writer.write(
+            ClientWriteType::BODY.union(ClientWriteType::EOS),
+            &[],
+            self.sink,
+        )
+    }
+}
+
+/// Bridges the engine's [`TftpDataSource`] to the client read callback on the
+/// `WRQ` (upload) path.
+///
+/// Each block is filled from an [`UploadReader`] over the client read callback —
+/// the analog of `tftp.c` pulling the next `DATA` block from the read callback.
+/// TFTP's lock-step engine has no notion of pausing, so a paused or exhausted
+/// source both report end-of-input (`Ok(0)`), which the engine treats as the
+/// final (possibly short) block.
+struct ClientTftpSource<'a> {
+    reader: UploadReader,
+    source: &'a mut dyn ReadCallback,
+}
+
+impl TftpDataSource for ClientTftpSource<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        match self.reader.read(buf, self.source)? {
+            ReadStep::Data(n) => Ok(n),
+            ReadStep::Eof | ReadStep::Paused => Ok(0),
+        }
+    }
+}
+
+/// Drive a `tftp://` transfer end-to-end over UDP — [F5-CRIT-7].
+///
+/// TFTP is curl's one datagram protocol, so — unlike every other network
+/// scheme — it does *not* use the TCP connection-filter seam
+/// ([`connect_network_scheme`](super::connect_network_scheme)). It resolves the
+/// server endpoint, binds an ephemeral UDP socket via [`UdpTftpIo::connect`],
+/// and drives the lock-step [`run_transfer`] state machine directly: the async
+/// analog of `tftp.c`'s `tftp_connect` + `tftp_multi_statemach`. Before this
+/// driver existed the recognized `tftp` scheme fell through to
+/// `CURLE_UNSUPPORTED_PROTOCOL` in [`perform_transfer`](super::perform_transfer),
+/// so no datagram was ever sent.
+///
+/// Downloads (`RRQ`) stream each `DATA` block to the client write stack;
+/// uploads (`WRQ`, selected by `CURLOPT_UPLOAD`) pull each block from the client
+/// read callback. Both adapters are always constructed; the unused side of a
+/// given direction is simply never exercised by the engine.
+///
+/// # Errors
+///
+/// A malformed URL or empty file name ([`CurlError::UrlMalformat`] /
+/// [`CurlError::TftpIllegal`]), a resolve failure
+/// ([`CurlError::CouldntResolveHost`]), a socket bind failure
+/// ([`CurlError::CouldntConnect`]), or any transport/protocol error surfaced by
+/// [`run_transfer`].
+pub(crate) async fn perform_tftp(
+    data: &mut Easy,
+    scheme: &'static Scheme,
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+) -> Result<()> {
+    use crate::dns::{self, DnsCache, IpVersion, ResolveParams};
+
+    let verbose = data.set.verbose;
+    // `-T`/`CURLOPT_UPLOAD` selects the `WRQ` path (setopt maps both UPLOAD and
+    // PUT to `HttpReq::Put`), matching how the SMB and mail drivers detect an
+    // upload.
+    let upload = data.set.method == HttpReq::Put;
+
+    // (1) Resolve the request URL into host + port. The scheme's well-known
+    //     port (69) is the default when the URL omits one.
+    let url_str = data.url().ok_or(CurlError::UrlMalformat)?.to_string();
+    let mut url = CurlUrl::new();
+    url.set(
+        CurlUPart::Url,
+        Some(&url_str),
+        CURLU_GUESS_SCHEME | CURLU_DEFAULT_PORT,
+    )
+    .map_err(|_| CurlError::UrlMalformat)?;
+    let host_bracketed = url.get(CurlUPart::Host, CURLU_URLDECODE).unwrap_or_default();
+    if host_bracketed.is_empty() {
+        return Err(CurlError::UrlMalformat);
+    }
+    let host = host_bracketed
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(&host_bracketed)
+        .to_string();
+    let port = url
+        .get(CurlUPart::Port, 0)
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(scheme.default_port);
+
+    // (2) Resolve the endpoint with the system resolver, honoring `-4`/`-6`.
+    //     The first resolved address is the initial RRQ/WRQ destination; the
+    //     server's reply pins the transfer-ID peer inside `UdpTftpIo`.
+    let ipver = IpVersion::from_raw(i64::from(data.set.ipver));
+    let server: SocketAddr = {
+        let mut cache = DnsCache::new();
+        let mut errbuf: Option<String> = None;
+        let mut params = ResolveParams::new(&host, port);
+        params.ip_version = ipver;
+        params.verbose = verbose;
+        let entry = dns::resolve(&mut cache, &params, &mut errbuf).await?;
+        entry
+            .addrs
+            .addrs
+            .first()
+            .copied()
+            .ok_or(CurlError::CouldntResolveHost)?
+    };
+
+    // (3) Build the immutable request from the URL + options. `from_url` strips
+    //     the leading `/` and any `;mode=` suffix, URL-decodes the file name,
+    //     and rejects an empty name. (`do_it` validated the download shape; the
+    //     real upload flag is supplied here.)
+    let blksize = data.set.tftp_blksize;
+    let no_options = data.set.tftp_no_options;
+    let prefer_ascii = data.set.prefer_ascii;
+    let infilesize = data.set.filesize;
+    let req =
+        TftpRequest::from_url(&url_str, blksize, no_options, prefer_ascii, infilesize, upload)?;
+
+    // (4) Bind the ephemeral UDP socket for the server's address family.
+    let mut io = UdpTftpIo::connect(server).await?;
+
+    // (5) Overall transfer deadline. curl's `tftp_set_timeouts` derives both the
+    //     retransmission budget and the drop-dead time from `Curl_timeleft_ms`:
+    //     a set `CURLOPT_TIMEOUT` bounds the whole transfer, while *no* timeout
+    //     uses the hard-coded 15-second budget (`retry_max` 3, `retry_time` 5 s
+    //     — the wire-visible retransmission cadence). `run_transfer` folds the
+    //     overall deadline and the retry budget into one `timeleft_ms` (a `0`
+    //     would set a deadline of "now" and time out immediately), so mirror the
+    //     C logic exactly: the user timeout when set (`data.set.timeout` is in
+    //     ms), else 15 000 ms — which yields the same `retry_max` 3 / `retry_time`
+    //     5 s and a sane upper bound.
+    let timeleft_ms = if data.set.timeout > 0 {
+        data.set.timeout
+    } else {
+        15_000
+    };
+
+    // (6) Build the client-bridging sink/source and drive the state machine.
+    let total_len = if infilesize >= 0 {
+        Some(infilesize as u64)
+    } else {
+        None
+    };
+    let mut tftp_sink = ClientTftpSink {
+        writer: ClientWriter::new(),
+        sink,
+    };
+    let mut tftp_source = ClientTftpSource {
+        reader: UploadReader::new(total_len, false),
+        source,
+    };
+    let mut errbuf: Option<String> = None;
+
+    let result = run_transfer(
+        req,
+        &mut io,
+        &mut tftp_sink,
+        &mut tftp_source,
+        timeleft_ms,
+        verbose,
+        &mut errbuf,
+    )
+    .await;
+
+    // On a successful download, flush the end-of-stream marker so the body
+    // writer finalizes any content decoder (the analog of curl's final client
+    // write). The upload path writes nothing to the sink.
+    if result.is_ok() && !upload {
+        tftp_sink.finish()?;
+    }
+
+    // Surface any engine failure message in verbose mode. (The bridge to the
+    // C `CURLOPT_ERRORBUFFER` slot belongs to the FFI layer.)
+    if result.is_err() {
+        if let Some(msg) = &errbuf {
+            infof(verbose, msg);
+        }
+    }
+
+    result
 }
 
 // =============================================================================
