@@ -31,8 +31,19 @@
 //!   (`lib/http_proxy.c` `dynhds_add_custom`). This is **not** the `CONNECT`
 //!   tunnel filter (that lives in [`crate::conn`] and [`crate::proxy`]).
 //!
-//! The remaining engines — `h2`, `h3`, and the proxy-connect helpers — are
-//! authored by sibling migration steps and declared here as they land.
+//! * [`h2`] — the HTTP/2 protocol engine (`lib/http2.c`): the `h2`-crate client
+//!   handshake (spawned connection-driver task), the request mapping that reuses
+//!   [`h1`] and translates to HTTP/2 pseudo-headers, and the stream
+//!   request/response lifecycle with flow control, multiplexing, trailers, and
+//!   GOAWAY/RST handling. Gated by the `http2` Cargo feature (default on), in
+//!   lockstep with [`crate::version`]'s `HTTP2` capability (AAP §0.7.3).
+//!
+//! * [`h3`] — the HTTP/3 protocol engine over `quinn` + `h3` (`lib/vquic/*`),
+//!   gated by the `http3` Cargo feature, in lockstep with [`crate::version`]'s
+//!   `HTTP3` capability (AAP §0.7.3).
+//!
+//! The remaining engines — the proxy-connect helpers — are authored by sibling
+//! migration steps and declared here as they land.
 //!
 //! # Memory safety
 //!
@@ -54,4 +65,13 @@
 pub mod aws_sigv4;
 pub mod chunks;
 pub mod h1;
+#[cfg(feature = "http2")]
+pub mod h2;
 pub mod proxy;
+
+/// HTTP/3 over QUIC (`lib/vquic/*`), on the pure-Rust `quinn` + `h3` stack.
+/// curl `HTTP3` / `USE_HTTP3`. Gated by the `http3` feature (default ON); this
+/// `http` module is itself gated on the `http` feature, so [`h3`] compiles only
+/// when both are enabled and can always reach the shared [`h1`] helpers.
+#[cfg(feature = "http3")]
+pub mod h3;

@@ -128,25 +128,25 @@ pub mod http;
 #[cfg(any(feature = "ftp", feature = "imap", feature = "pop3", feature = "smtp"))]
 pub mod pingpong;
 
-// /// FTP / FTPS (`lib/ftp.c`). curl `CURL_DISABLE_FTP`.
-// #[cfg(feature = "ftp")]
-// pub mod ftp;
+/// FTP / FTPS (`lib/ftp.c`). curl `CURL_DISABLE_FTP`.
+#[cfg(feature = "ftp")]
+pub mod ftp;
 
 /// FTP `LIST` response parser (`lib/ftplistparser.c`); part of the FTP feature.
 #[cfg(feature = "ftp")]
 pub mod ftp_list;
 
 // /// IMAP / IMAPS (`lib/imap.c`). curl `CURL_DISABLE_IMAP`.
-// #[cfg(feature = "imap")]
-// pub mod imap;
+#[cfg(feature = "imap")]
+pub mod imap;
 
-// /// POP3 / POP3S (`lib/pop3.c`). curl `CURL_DISABLE_POP3`.
-// #[cfg(feature = "pop3")]
-// pub mod pop3;
+/// POP3 / POP3S (`lib/pop3.c`). curl `CURL_DISABLE_POP3`.
+#[cfg(feature = "pop3")]
+pub mod pop3;
 
-// /// SMTP / SMTPS (`lib/smtp.c`). curl `CURL_DISABLE_SMTP`.
-// #[cfg(feature = "smtp")]
-// pub mod smtp;
+/// SMTP / SMTPS (`lib/smtp.c`). curl `CURL_DISABLE_SMTP`.
+#[cfg(feature = "smtp")]
+pub mod smtp;
 
 /// RTSP (`lib/rtsp.c`). curl `CURL_DISABLE_RTSP`.
 #[cfg(feature = "rtsp")]
@@ -186,27 +186,24 @@ pub mod smb;
 #[cfg(feature = "dict")]
 pub mod dict;
 
-// /// FILE (`lib/file.c`). curl `CURL_DISABLE_FILE`.
-// #[cfg(feature = "file")]
-// pub mod file;
+/// FILE (`lib/file.c`). curl `CURL_DISABLE_FILE`.
+#[cfg(feature = "file")]
+pub mod file;
 
 /// LDAP / LDAPS (`lib/ldap.c`, `lib/openldap.c`). curl `CURL_DISABLE_LDAP`.
 #[cfg(feature = "ldap")]
 pub mod ldap;
 
-// /// The SSH family — SFTP and SCP (`lib/vssh/`). Compiled when either SSH-based
-// /// scheme is enabled. curl `USE_SSH` (`CURL_DISABLE_*` per scheme).
-// ///
-// /// Construction-order staging: the `ssh` module root (`ssh/mod.rs`) is present
-// /// and complete, but it forward-declares its `scp` and `sftp` submodules whose
-// /// source files (`ssh/scp.rs`, `ssh/sftp.rs`) are authored in a later step. Per
-// /// the staging convention above, `pub mod ssh;` stays commented until those
-// /// submodule files land — re-enable it (and the SCP/SFTP `scheme_handler` arms
-// /// below) at that moment. Until then `scp`/`sftp` remain registered schemes in
-// /// `SCHEME_TABLE` and dispatch to the stub handler, exactly like the other
-// /// not-yet-completed protocols above.
-// #[cfg(any(feature = "scp", feature = "sftp"))]
-// pub mod ssh;
+/// The SSH family — SFTP and SCP (`lib/vssh/`). Compiled when either SSH-based
+/// scheme is enabled. curl `USE_SSH` (`CURL_DISABLE_*` per scheme).
+///
+/// The `ssh` module root (`ssh/mod.rs`) owns the SSH transport, host-key
+/// verification, user authentication and the connection lifecycle, and
+/// forward-declares its `scp` and `sftp` submodules (`ssh/scp.rs`,
+/// `ssh/sftp.rs`); the SCP/SFTP `scheme_handler` arms below dispatch `scp` /
+/// `sftp` URLs to `ssh::scp_handler` / `ssh::sftp_handler`.
+#[cfg(any(feature = "scp", feature = "sftp"))]
+pub mod ssh;
 
 // ===========================================================================
 // `PROTOPT_*` — per-scheme capability flags (C `Curl_scheme.flags`).
@@ -1187,6 +1184,11 @@ pub fn scheme_handler(scheme_name: &str) -> Option<Box<dyn Protocol>> {
     }
 
     let handler: Box<dyn Protocol> = match scheme.name {
+        // FTP / FTPS share the single `ftp::FtpHandler`, distinguished by the
+        // scheme descriptor it carries (`ftps` adds `PROTOPT_SSL`). The Rust
+        // analog of `Curl_handler_ftp` / `Curl_handler_ftps` (`lib/ftp.c`).
+        #[cfg(feature = "ftp")]
+        "ftp" | "ftps" => Box::new(ftp::FtpHandler::new(scheme)),
         // TFTP has a full handler (`lib/tftp.c`).
         #[cfg(feature = "tftp")]
         "tftp" => Box::new(tftp::TftpHandler::new()),
@@ -1197,14 +1199,25 @@ pub fn scheme_handler(scheme_name: &str) -> Option<Box<dyn Protocol>> {
         // MQTT / MQTTS are fully implemented (`lib/mqtt.c` analog).
         #[cfg(feature = "mqtt")]
         "mqtt" | "mqtts" => Box::new(mqtt::MqttProtocol::new(scheme)),
-        // SCP / SFTP — the pure-Rust `russh`-backed engines (`lib/vssh/`). Staged
-        // off together with `pub mod ssh;` above until `ssh/scp.rs` and
-        // `ssh/sftp.rs` land; `scp`/`sftp` fall through to the stub handler in the
-        // meantime (they stay registered in `SCHEME_TABLE`).
-        // #[cfg(feature = "scp")]
-        // "scp" => ssh::scp_handler(),
-        // #[cfg(feature = "sftp")]
-        // "sftp" => ssh::sftp_handler(),
+        // IMAP / IMAPS share the single `imap::ImapHandler`, distinguished by
+        // the scheme descriptor it carries (`lib/imap.c` analog).
+        #[cfg(feature = "imap")]
+        "imap" | "imaps" => Box::new(imap::ImapHandler::new(scheme)),
+        // SMTP / SMTPS are fully implemented (`lib/smtp.c` analog): the
+        // ping-pong command engine + SASL authentication + STARTTLS upgrade.
+        #[cfg(feature = "smtp")]
+        "smtp" | "smtps" => Box::new(smtp::SmtpProtocol::new(scheme)),
+        // FILE is fully implemented (`lib/file.c` analog) — the only
+        // `PROTOPT_NONETWORK` scheme; it reads/writes the local filesystem.
+        #[cfg(feature = "file")]
+        "file" => Box::new(file::FileProtocol::new()),
+        // SCP / SFTP — the pure-Rust `russh`-backed engines (`lib/vssh/`). The
+        // Rust analog of `Curl_handler_scp` / `Curl_handler_sftp`; each builds on
+        // the shared SSH transport in `ssh/mod.rs`.
+        #[cfg(feature = "scp")]
+        "scp" => ssh::scp_handler(),
+        #[cfg(feature = "sftp")]
+        "sftp" => ssh::sftp_handler(),
         // Every other recognized scheme falls back to the self-contained stub
         // until its dedicated handler is wired in.
         _ => Box::new(StubProtocol { scheme }),

@@ -305,11 +305,73 @@ impl PingPong {
         conn: &mut Connection,
         args: fmt::Arguments<'_>,
     ) -> Result<()> {
+        // Format the bare command eagerly into an owned `String`, *consuming*
+        // `args` before any `.await`, then delegate to [`send_command`]. This
+        // keeps the convenient `format_args!` API while ensuring the actual
+        // awaited future never holds the non-`Send` `fmt::Arguments` (nor the
+        // hidden `[core::fmt::rt::Argument; N]` array it borrows) across an
+        // await — a requirement for any caller whose future must be `Send`
+        // (e.g. a `Protocol` implementation returning a `BoxFuture<… + Send>`).
+        let cmd = fmt::format(args);
+        self.send_command(data, conn, &cmd).await
+    }
+
+    /// Stage and send a complete command line, taking the already-formatted
+    /// command **by value** (without the trailing CRLF, which the engine
+    /// appends). This is the `Send`-compatible counterpart to [`sendf`]:
+    /// because the command is an owned [`String`] (which is `Send`), the
+    /// returned future is `Send` and can therefore be awaited inside a
+    /// [`crate::conn::filters::BoxFuture`] (e.g. a protocol's `connect`/`do_it`
+    /// future). `sendf`'s `fmt::Arguments<'_>` parameter is `!Send` and cannot
+    /// cross an `.await` in such a context, so protocol engines must use this
+    /// method instead.
+    ///
+    /// Mirrors C `Curl_pp_sendf`/`Curl_pp_vsendf`: stages the command in the
+    /// send buffer with a `CRLF` terminator, performs one non-blocking send, and
+    /// records any un-sent tail for a later [`flushsend`](Self::flushsend).
+    pub async fn send_cmd(
+        &mut self,
+        data: &Easy,
+        conn: &mut Connection,
+        cmd: String,
+    ) -> Result<()> {
+        // `send_cmd` keeps its owned-`String` signature for callers that already
+        // hold an owned command (e.g. the IMAP engine); the staging/send logic
+        // lives in the `&str` core `send_command`, to which it delegates.
+        self.send_command(data, conn, &cmd).await
+    }
+
+    /// Send an already-formatted, **bare** command (no line terminator) to a
+    /// ping-pong server. This is the `Send`-safe core of [`sendf`].
+    ///
+    /// Callers pass the bare command with no line terminator; this method
+    /// appends the protocol CRLF itself.
+    ///
+    /// The send is made never to block: the underlying [`Curl_conn_send`] is
+    /// awaited, and a `CURLE_AGAIN`-equivalent (would-block) result is treated
+    /// as "zero bytes written", leaving the whole command buffered for a later
+    /// [`flushsend`](PingPong::flushsend). A partial write is likewise retained.
+    ///
+    /// Unlike [`sendf`], this takes a `&str` rather than [`fmt::Arguments`], so
+    /// the returned future is `Send` and may be awaited from within a `Send`
+    /// future (the protocol engines' `BoxFuture<… + Send>` flows).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CurlError::TooLarge`] if the command plus CRLF would exceed
+    /// [`DYN_PINGPPONG_CMD`] (the C dynbuf cap), or any transport error
+    /// surfaced by [`Curl_conn_send`].
+    pub async fn send_command(
+        &mut self,
+        data: &Easy,
+        conn: &mut Connection,
+        cmd_str: &str,
+    ) -> Result<()> {
         debug_assert_eq!(self.sendleft, 0, "Curl_pp_sendf with a pending send");
         debug_assert_eq!(self.sendsize, 0, "Curl_pp_sendf with a pending send");
 
-        // Format the bare command (no terminator yet).
-        let mut cmd = fmt::format(args).into_bytes();
+        // The bare command (no terminator yet).
+        let mut cmd = cmd_str.as_bytes().to_vec();
 
         // Enforce the command-buffer cap on the full command + CRLF, mirroring
         // the C dynbuf which fails such an over-long append with CURLE_TOO_LARGE.
