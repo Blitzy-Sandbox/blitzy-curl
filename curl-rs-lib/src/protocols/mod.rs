@@ -156,9 +156,11 @@ pub mod rtsp;
 #[cfg(feature = "mqtt")]
 pub mod mqtt;
 
-// /// WebSocket `ws` / `wss` (`lib/ws.c`). curl `CURL_DISABLE_WEBSOCKETS`.
-// #[cfg(feature = "websockets")]
-// pub mod ws;
+/// WebSocket `ws` / `wss` (`lib/ws.c`). curl
+/// `!CURL_DISABLE_WEBSOCKETS && !CURL_DISABLE_HTTP`: WebSockets bootstrap over an
+/// HTTP/1.1 `Upgrade` handshake, so the engine requires the `http` subtree.
+#[cfg(all(feature = "websockets", feature = "http"))]
+pub mod ws;
 
 /// TELNET (`lib/telnet.c`). curl `CURL_DISABLE_TELNET`.
 #[cfg(feature = "telnet")]
@@ -1211,6 +1213,13 @@ pub fn scheme_handler(scheme_name: &str) -> Option<Box<dyn Protocol>> {
         // `PROTOPT_NONETWORK` scheme; it reads/writes the local filesystem.
         #[cfg(feature = "file")]
         "file" => Box::new(file::FileProtocol::new()),
+        // WS / WSS share the single `ws::WsHandler`, distinguished by the scheme
+        // descriptor it carries (`wss` adds `PROTOPT_SSL`). The Rust analog of
+        // `Curl_protocol_ws` (`lib/ws.c`): the opening handshake is delegated to
+        // the HTTP/1.1 engine, then the connection is handed to the WebSocket
+        // frame codec. Requires `http` because WebSockets layer over HTTP.
+        #[cfg(all(feature = "websockets", feature = "http"))]
+        "ws" | "wss" => Box::new(ws::WsHandler::new(scheme)),
         // SCP / SFTP — the pure-Rust `russh`-backed engines (`lib/vssh/`). The
         // Rust analog of `Curl_handler_scp` / `Curl_handler_sftp`; each builds on
         // the shared SSH transport in `ssh/mod.rs`.
