@@ -1,0 +1,51 @@
+# =============================================================================
+# cargo-audit configuration — the `cargo audit` security gate (AAP §0.8.1)
+# =============================================================================
+#
+# `cargo audit` reads this file from `.cargo/audit.toml` by default. It is the
+# RustSec advisory-database gate listed in AAP §0.8.1 ("Security — `cargo audit`
+# — Zero critical CVEs; cert validation on by default confirmed").
+#
+# This file is the cargo-audit-side counterpart of the `[advisories].ignore`
+# list in `deny.toml` (the `cargo deny check` gate). Both tools scan the SAME
+# committed `Cargo.lock`, so any advisory exception MUST be recorded in BOTH
+# places with the SAME written justification; otherwise the two gates disagree.
+# Keep the `ignore` list below in lockstep with `deny.toml` line-for-line.
+#
+# Policy (mirrors deny.toml): every disclosed advisory fails the gate unless it
+# is (a) NOT a critical CVE, (b) tied to a mandated/pinned transitive dependency
+# with no fixed release available, and (c) accompanied by the written
+# justification + reachability analysis below.
+# =============================================================================
+
+[advisories]
+# Advisories explicitly accepted by policy. Each entry is justified here AND in
+# deny.toml. Removing the underlying dependency or upgrading to a fixed release
+# MUST also remove the corresponding entry from both files.
+ignore = [
+    # -------------------------------------------------------------------------
+    # RUSTSEC-2023-0071 — "Marvin Attack" timing side-channel in the `rsa` crate
+    # during RSA *decryption* (PKCS#1 v1.5). CVSS 5.9 (MEDIUM) — NOT a critical
+    # CVE, so it is outside the AAP §0.8.1 "zero critical CVEs" bar.
+    #
+    # No fixed release exists: the advisory's `patched` set is empty because a
+    # constant-time fix requires a larger RustCrypto/RSA refactor that has not
+    # shipped. Upgrading cannot resolve it.
+    #
+    # Dependency path (transitive, not a direct/declared dependency):
+    #   rsa 0.10.0-rc.18  <-  russh 0.61.2 (+ ssh-key 0.7.0-rc.10)  <-  curl-rs-lib
+    # `russh` is the AAP §0.6.2-mandated pure-Rust SSH backend (replacing
+    # libssh/libssh2) used only by the SFTP/SCP protocol engines.
+    #
+    # Reachability analysis: the Marvin oracle requires an attacker to (1) submit
+    # many chosen RSA ciphertexts for *decryption* and (2) measure server-side
+    # decryption timing. curl-rs is an SSH *client*: it performs RSA *signature
+    # verification* of the server host key and RSA *signing* with the user's
+    # private key — it never RSA-decrypts attacker-chosen ciphertexts, so the
+    # client never exposes the decryption timing oracle this advisory describes.
+    # The vulnerable code path is therefore not reachable in the client role.
+    #
+    # Remove this entry when RustCrypto/RSA ships a constant-time release and the
+    # `russh` dependency tree picks it up.
+    "RUSTSEC-2023-0071",
+]

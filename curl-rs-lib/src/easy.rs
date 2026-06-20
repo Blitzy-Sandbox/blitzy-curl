@@ -72,7 +72,7 @@ use crate::getinfo::{self, CurlInfo, Info, InfoValue};
 use crate::headers::HeaderCollector;
 use crate::options::CurlOption;
 use crate::setopt::{self, CDataPtr, OptionValue, StrId, UserDefined};
-use crate::transfer::uc_to_curlcode;
+use crate::transfer::{uc_to_curlcode, ReadCallback, WriteCallbacks};
 use crate::url::{CurlUPart, CurlUrl, CURLU_GUESS_SCHEME};
 
 // ===========================================================================
@@ -756,37 +756,128 @@ impl Easy {
     /// `curl_easy_perform` via an internal multi handle that it drives to
     /// completion; the asynchronous equivalent here awaits the transfer future.
     ///
-    /// # Current behaviour and the protocol-drive seam
+    /// # Client output/input
     ///
-    /// Within this module's dependency closure no scheme handler is registered
-    /// (the per-protocol engines and the connection/transfer drive live in the
-    /// `conn`/`protocols` layer, wired in as those modules come online). So this
-    /// method performs the faithful preflight curl does before dispatch — it
-    /// resolves and validates the URL and records the effective URL and scheme
-    /// (see [`pre_perform`](Easy::pre_perform)) — and then reports
-    /// [`CurlError::UnsupportedProtocol`], exactly as curl's
-    /// `Curl_get_scheme_handler` returning `NULL` does for a scheme with no
-    /// handler. When the protocol layer lands, the drive is invoked here (via the
-    /// transfer engine, e.g. [`crate::transfer::run`]) after the same preflight,
-    /// so the contract — preflight, then transfer — is forward-compatible.
+    /// This convenience entry uses curl's *default* client callbacks: response
+    /// body bytes are written to `stdout` (curl's default `CURLOPT_WRITEFUNCTION`
+    /// of `fwrite` to `stdout`), header bytes are delivered only when
+    /// `CURLOPT_HEADER` folds them into the output, and an upload body is read
+    /// from `stdin` (the default `CURLOPT_READFUNCTION`). Front-ends that
+    /// register their own callbacks — the CLI's write/header/read handlers, or a
+    /// libcurl consumer's `CURLOPT_WRITEFUNCTION`/`CURLOPT_READFUNCTION` bridged
+    /// at the FFI boundary — call [`perform_with`](Easy::perform_with) directly
+    /// with their own sink/source.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`perform_with`](Easy::perform_with): a
+    /// preflight failure (notably [`CurlError::UrlMalformat`]), the protocol
+    /// handler's connect/transfer error, or [`CurlError::UnsupportedProtocol`]
+    /// for a scheme with no registered handler.
+    pub async fn perform(&mut self) -> Result<()> {
+        // curl's default client I/O (see the doc above). These owned sinks live
+        // only for the duration of the transfer.
+        let mut sink = DefaultClientOutput::new(self.set.include_header);
+        let mut source = DefaultClientInput;
+        self.perform_with(&mut sink, &mut source).await
+    }
+
+    /// Drive a single transfer to completion, delivering response body/header
+    /// bytes to `sink` and pulling any upload body from `source`.
+    ///
+    /// This is the sink-explicit form of [`perform`](Easy::perform) — the seam
+    /// the FFI and CLI front-ends use to route a transfer through the *user's*
+    /// registered callbacks (`CURLOPT_WRITEFUNCTION` / `CURLOPT_READFUNCTION` /
+    /// `CURLOPT_HEADERFUNCTION`). The FFI crate supplies a sink that invokes the
+    /// stored C function pointers (the only place that raw-pointer call is
+    /// allowed); the CLI supplies a Rust-native sink; tests supply collecting
+    /// doubles.
+    ///
+    /// It performs curl's pre-dispatch preflight (URL resolution/validation,
+    /// recording the effective URL and scheme — see
+    /// [`pre_perform`](Easy::pre_perform)) and then hands off to the protocol
+    /// engine ([`crate::protocols::perform_transfer`]), which dispatches on the
+    /// scheme to the registered handler and drives the byte movement.
     ///
     /// # Errors
     ///
     /// * Any error from [`pre_perform`](Easy::pre_perform) (URL resolution /
     ///   validation), notably [`CurlError::UrlMalformat`].
-    /// * [`CurlError::UnsupportedProtocol`] once preflight succeeds, until the
-    ///   protocol drive is wired in.
-    pub async fn perform(&mut self) -> Result<()> {
+    /// * The protocol handler's connect/do/transfer error.
+    /// * [`CurlError::UnsupportedProtocol`] for a scheme whose handler is not
+    ///   compiled in, or whose end-to-end network drive is not yet wired.
+    pub async fn perform_with(
+        &mut self,
+        sink: &mut dyn WriteCallbacks,
+        source: &mut dyn ReadCallback,
+    ) -> Result<()> {
         // Preflight: resolve/validate the URL and populate the effective-URL and
         // scheme info. Any failure here short-circuits exactly as curl's
         // pre-dispatch checks do.
         self.pre_perform()?;
 
-        // No protocol handler is registered in this layer's dependency closure;
-        // report UNSUPPORTED_PROTOCOL, mirroring curl's `Curl_get_scheme_handler`
-        // returning NULL. The protocol-drive seam (see the doc above) replaces
-        // this line once `conn`/`protocols` are wired in.
-        Err(CurlError::UnsupportedProtocol)
+        // Dispatch on the resolved scheme and drive the transfer (curl's
+        // connect → do → transfer → done for a single easy handle). FILE — the
+        // only `PROTOPT_NONETWORK` scheme — is driven end-to-end; recognized
+        // network schemes whose `conn`/exchange drive is not yet wired report
+        // `UnsupportedProtocol`, exactly as curl's missing-handler path does.
+        crate::protocols::perform_transfer(self, sink, source).await
+    }
+}
+
+/// curl's default `CURLOPT_WRITEFUNCTION` / `CURLOPT_HEADERFUNCTION`: response
+/// body bytes are written to `stdout`, and header bytes are delivered to the
+/// same output only when `CURLOPT_HEADER` is set (curl writes headers to the
+/// body output in that case). Used by [`Easy::perform`] when no front-end sink
+/// is supplied.
+struct DefaultClientOutput {
+    /// `CURLOPT_HEADER`: whether header bytes are written alongside the body.
+    include_header: bool,
+}
+
+impl DefaultClientOutput {
+    /// Build the default output sink, honoring the handle's `CURLOPT_HEADER`.
+    fn new(include_header: bool) -> Self {
+        Self { include_header }
+    }
+}
+
+impl WriteCallbacks for DefaultClientOutput {
+    fn write_body(&mut self, data: &[u8]) -> usize {
+        use std::io::Write;
+        // A short write (fewer bytes than supplied) fails the transfer with
+        // `CURLE_WRITE_ERROR`, exactly as curl's `cw_out_cb_write` does; on an
+        // I/O error report `0` taken so the engine raises that error.
+        match std::io::stdout().write_all(data) {
+            Ok(()) => data.len(),
+            Err(_) => 0,
+        }
+    }
+
+    fn write_header(&mut self, data: &[u8]) -> Option<usize> {
+        if !self.include_header {
+            // No header sink configured: curl silently consumes header bytes
+            // (`cw_get_writefunc` yields a NULL callback).
+            return None;
+        }
+        use std::io::Write;
+        match std::io::stdout().write_all(data) {
+            Ok(()) => Some(data.len()),
+            Err(_) => Some(0),
+        }
+    }
+}
+
+/// curl's default `CURLOPT_READFUNCTION`: an upload body is read from `stdin`.
+/// Used by [`Easy::perform`] when no front-end source is supplied.
+struct DefaultClientInput;
+
+impl ReadCallback for DefaultClientInput {
+    fn read(&mut self, buf: &mut [u8]) -> usize {
+        use std::io::Read;
+        // End-of-input (`0`) on EOF or error, matching a `CURLOPT_READFUNCTION`
+        // returning `0` to signal the upload is complete.
+        std::io::stdin().read(buf).unwrap_or(0)
     }
 }
 
@@ -1050,6 +1141,170 @@ mod tests {
     async fn perform_without_url_is_url_malformat() {
         let mut e = Easy::new();
         assert_eq!(e.perform().await.unwrap_err(), CurlError::UrlMalformat);
+    }
+
+    // ---- perform_with: end-to-end FILE (PROTOPT_NONETWORK) drive ---------
+    //
+    // These exercise the public transfer entry point — `perform_with` →
+    // `crate::protocols::perform_transfer` → the FILE handler's
+    // connect/do_it/run_download/run_upload — proving a `file://` transfer runs
+    // through the real protocol-dispatch + transfer drive (not the old
+    // unconditional `UnsupportedProtocol`). The CLI and FFI front-ends drive the
+    // same path with their own sinks/sources.
+
+    /// A [`WriteCallbacks`] sink that accumulates body and header bytes — the
+    /// Rust-native analog of a `CURLOPT_WRITEFUNCTION` collecting output.
+    #[derive(Default)]
+    struct CollectSink {
+        body: Vec<u8>,
+        headers: Vec<u8>,
+    }
+
+    impl WriteCallbacks for CollectSink {
+        fn write_body(&mut self, data: &[u8]) -> usize {
+            self.body.extend_from_slice(data);
+            data.len()
+        }
+        fn write_header(&mut self, data: &[u8]) -> Option<usize> {
+            self.headers.extend_from_slice(data);
+            Some(data.len())
+        }
+    }
+
+    /// A [`ReadCallback`] upload source serving bytes from an in-memory buffer
+    /// (the analog of a `CURLOPT_READFUNCTION` over a fixed payload).
+    struct SliceSource {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl ReadCallback for SliceSource {
+        fn read(&mut self, buf: &mut [u8]) -> usize {
+            let n = (self.data.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            n
+        }
+    }
+
+    /// An empty upload source (no bytes), for download transfers.
+    struct NoSource;
+    impl ReadCallback for NoSource {
+        fn read(&mut self, _buf: &mut [u8]) -> usize {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn perform_with_drives_file_download_into_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.txt");
+        std::fs::write(&path, b"hello from file").unwrap();
+
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("file://{}", path.display()))),
+        )
+        .unwrap();
+
+        let mut sink = CollectSink::default();
+        let mut source = NoSource;
+        // The public transfer entry point drives the FILE handler end-to-end.
+        e.perform_with(&mut sink, &mut source).await.unwrap();
+
+        assert_eq!(sink.body, b"hello from file");
+        // Post-transfer info recorded by the handler (`file_do`).
+        assert!(e.info.filetime > 0, "filetime recorded for --remote-time");
+        // Preflight still populated the effective URL / scheme.
+        match e.getinfo(CurlInfo::Scheme).unwrap() {
+            InfoValue::Str(Some(s)) => assert_eq!(s.to_str().unwrap(), "FILE"),
+            other => panic!("expected scheme string, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn perform_drives_file_download_to_default_output() {
+        // The argument-free `perform()` uses the default stdout sink; it must
+        // succeed for a readable file (bytes go to the process stdout).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.txt");
+        std::fs::write(&path, b"to stdout").unwrap();
+
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("file://{}", path.display()))),
+        )
+        .unwrap();
+        e.perform().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn perform_with_file_upload_writes_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upload.txt");
+
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("file://{}", path.display()))),
+        )
+        .unwrap();
+        // CURLOPT_UPLOAD → method PUT, the upload signal the FILE handler reads.
+        e.setopt(CurlOption::CURLOPT_UPLOAD, OptionValue::Long(1))
+            .unwrap();
+
+        let mut sink = CollectSink::default();
+        let mut source = SliceSource {
+            data: b"payload bytes".to_vec(),
+            pos: 0,
+        };
+        e.perform_with(&mut sink, &mut source).await.unwrap();
+
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(written, b"payload bytes");
+    }
+
+    #[tokio::test]
+    async fn perform_with_missing_file_maps_to_couldnt_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.txt");
+
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("file://{}", path.display()))),
+        )
+        .unwrap();
+
+        let mut sink = CollectSink::default();
+        let mut source = NoSource;
+        // A missing file fails at connect with CURLE_FILE_COULDNT_READ_FILE,
+        // exactly as curl's `file_connect` does.
+        assert_eq!(
+            e.perform_with(&mut sink, &mut source).await.unwrap_err(),
+            CurlError::FileCouldntReadFile
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_with_unknown_scheme_is_unsupported() {
+        // A recognized network scheme whose end-to-end drive is not yet wired
+        // still reports UnsupportedProtocol (the keystone-remaining path).
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some("http://example.com/".to_string())),
+        )
+        .unwrap();
+
+        let mut sink = CollectSink::default();
+        let mut source = NoSource;
+        assert_eq!(
+            e.perform_with(&mut sink, &mut source).await.unwrap_err(),
+            CurlError::UnsupportedProtocol
+        );
     }
 
     // ---- reset -----------------------------------------------------------

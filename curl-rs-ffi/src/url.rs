@@ -795,6 +795,7 @@ mod tests {
 
         // SAFETY: two distinct live handles, each freed once.
         unsafe { curl_url_cleanup(u) };
+        // SAFETY: controlled test invocation of `curl_url_cleanup`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         unsafe { curl_url_cleanup(u2) };
 
         // Duplicating NULL yields NULL.

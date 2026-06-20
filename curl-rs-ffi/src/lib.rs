@@ -78,6 +78,15 @@
 // ---------------------------------------------------------------------------
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
+// AAP §0.7.1 hard rule: "every `unsafe` block carries a `// SAFETY:` comment
+// that states the upheld invariant." This crate is the only one permitted
+// `unsafe`, so we enforce the rule here mechanically: `undocumented_unsafe_blocks`
+// (a clippy `restriction`-group lint, off by default) is turned on crate-wide so
+// that any `unsafe { … }` lacking an immediately-preceding `// SAFETY:` comment
+// is reported, and `cargo clippy -- -D warnings` (the AAP §0.8.1 Lint gate)
+// promotes it to a hard error. This keeps the safety-documentation invariant
+// from silently regressing as new FFI shims are added.
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 use std::cell::RefCell;
 

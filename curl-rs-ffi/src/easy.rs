@@ -337,6 +337,130 @@ pub unsafe extern "C" fn curl_easy_reset(handle: *mut CURL) {
 // Exported symbol 5 / 13 — curl_easy_perform  (the canonical block_on bridge)
 // =============================================================================
 
+/// Bridges a libcurl consumer's `CURLOPT_WRITEFUNCTION` / `CURLOPT_HEADERFUNCTION`
+/// (and their `WRITEDATA` / `HEADERDATA` userdata) to the core's
+/// [`WriteCallbacks`](core::transfer::WriteCallbacks) sink, so a transfer driven
+/// by [`core::Easy::perform_with`] delivers bytes to the C callbacks.
+///
+/// Function pointers and userdata are held as integer addresses (`usize`) rather
+/// than raw pointers so the bridge is [`Send`] — the core's multi handle runs
+/// transfers on a multi-thread runtime that requires it (and a stored address is
+/// the same safe representation the core uses for its `CCallback`). The addresses
+/// are cast back to the C-ABI function-pointer type at the call site.
+///
+/// When a function address is `0` (the option was never set) the bridge
+/// reproduces curl's default: body bytes are written to `stdout`, and header
+/// bytes are silently consumed (curl installs no default header callback).
+struct CWriteBridge {
+    /// `CURLOPT_WRITEFUNCTION` address, or `0` for curl's default (→ stdout).
+    write_fn: usize,
+    /// `CURLOPT_WRITEDATA` opaque userdata, passed through to the callback.
+    write_data: usize,
+    /// `CURLOPT_HEADERFUNCTION` address, or `0` for "no header sink".
+    header_fn: usize,
+    /// `CURLOPT_HEADERDATA` opaque userdata, passed through to the callback.
+    header_data: usize,
+}
+
+impl core::transfer::WriteCallbacks for CWriteBridge {
+    fn write_body(&mut self, data: &[u8]) -> usize {
+        let addr = self.write_fn;
+        if addr == 0 {
+            // Default `CURLOPT_WRITEFUNCTION`: `fwrite` to stdout. A short write
+            // is reported as `0` taken, which the engine maps to
+            // `CURLE_WRITE_ERROR`.
+            use std::io::Write;
+            return match std::io::stdout().write_all(data) {
+                Ok(()) => data.len(),
+                Err(_) => 0,
+            };
+        }
+        // SAFETY: `addr` is a non-zero `curl_write_callback` address previously
+        // stored by `curl_easy_setopt(CURLOPT_WRITEFUNCTION, ...)`, so its ABI
+        // matches the transmuted signature. `data` is a valid slice; we pass its
+        // pointer with curl's `(ptr, size = 1, nmemb = len)` convention and the
+        // callback does not retain it. `write_data` is the opaque userdata the
+        // caller associated via `CURLOPT_WRITEDATA`. The returned count (or a
+        // `CURL_WRITEFUNC_*` sentinel) is forwarded verbatim to the engine.
+        let cb: unsafe extern "C" fn(*mut c_char, size_t, size_t, *mut c_void) -> size_t =
+            unsafe { std::mem::transmute(addr) };
+        // SAFETY: see the preceding comment; the call upholds the C contract.
+        unsafe {
+            cb(
+                data.as_ptr() as *mut c_char,
+                1,
+                data.len(),
+                self.write_data as *mut c_void,
+            )
+        }
+    }
+
+    fn write_header(&mut self, data: &[u8]) -> Option<usize> {
+        let addr = self.header_fn;
+        if addr == 0 {
+            // No `CURLOPT_HEADERFUNCTION`: curl silently consumes header bytes.
+            return None;
+        }
+        // SAFETY: as in `write_body`, `addr` is a non-zero `curl_write_callback`
+        // address stored by `curl_easy_setopt(CURLOPT_HEADERFUNCTION, ...)`; the
+        // ABI matches, `data` is a valid transient slice, and `header_data` is
+        // the caller's `CURLOPT_HEADERDATA` userdata.
+        let cb: unsafe extern "C" fn(*mut c_char, size_t, size_t, *mut c_void) -> size_t =
+            unsafe { std::mem::transmute(addr) };
+        // SAFETY: see the preceding comment; the call upholds the C contract.
+        let n = unsafe {
+            cb(
+                data.as_ptr() as *mut c_char,
+                1,
+                data.len(),
+                self.header_data as *mut c_void,
+            )
+        };
+        Some(n)
+    }
+}
+
+/// Bridges a libcurl consumer's `CURLOPT_READFUNCTION` (and `READDATA` userdata)
+/// to the core's [`ReadCallback`](core::transfer::ReadCallback) source. Stores
+/// the address as `usize` for the same [`Send`] reason as [`CWriteBridge`]; a
+/// `0` address reproduces curl's default of reading the upload body from stdin.
+struct CReadBridge {
+    /// `CURLOPT_READFUNCTION` address, or `0` for curl's default (← stdin).
+    read_fn: usize,
+    /// `CURLOPT_READDATA` opaque userdata, passed through to the callback.
+    read_data: usize,
+}
+
+impl core::transfer::ReadCallback for CReadBridge {
+    fn read(&mut self, buf: &mut [u8]) -> usize {
+        let addr = self.read_fn;
+        if addr == 0 {
+            // Default `CURLOPT_READFUNCTION`: `fread` from stdin; a read error or
+            // EOF yields `0`, signaling end-of-input.
+            use std::io::Read;
+            return std::io::stdin().read(buf).unwrap_or(0);
+        }
+        // SAFETY: `addr` is a non-zero `curl_read_callback` address previously
+        // stored by `curl_easy_setopt(CURLOPT_READFUNCTION, ...)`, so its ABI
+        // matches the transmuted signature. `buf` is a valid mutable slice; we
+        // pass it with curl's `(ptr, size = 1, nmemb = len)` convention and the
+        // callback fills up to `len` bytes, returning the count (or a
+        // `CURL_READFUNC_*` sentinel), forwarded verbatim. `read_data` is the
+        // caller's `CURLOPT_READDATA` userdata.
+        let cb: unsafe extern "C" fn(*mut c_char, size_t, size_t, *mut c_void) -> size_t =
+            unsafe { std::mem::transmute(addr) };
+        // SAFETY: see the preceding comment; the call upholds the C contract.
+        unsafe {
+            cb(
+                buf.as_mut_ptr() as *mut c_char,
+                1,
+                buf.len(),
+                self.read_data as *mut c_void,
+            )
+        }
+    }
+}
+
 /// Perform a blocking transfer (`curl_easy_perform`, `include/curl/easy.h`).
 ///
 /// This is the canonical sync-over-async bridge (AAP §0.4.4): it drives the
@@ -365,10 +489,28 @@ pub unsafe extern "C" fn curl_easy_perform(handle: *mut CURL) -> CURLcode {
         None => return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT,
     };
 
+    // Bridge the consumer's registered C callbacks to the core's sink/source so
+    // the transfer routes body/header bytes to `CURLOPT_WRITEFUNCTION` /
+    // `HEADERFUNCTION` and pulls upload bytes from `CURLOPT_READFUNCTION`. The
+    // stored addresses (`CCallback`/`CDataPtr` are `usize` newtypes) are copied
+    // out by value, so the bridges hold no borrow of `easy`. A `0` address means
+    // the option was never set and the bridge falls back to curl's default
+    // (stdout / stdin), exactly as `Easy::perform` would.
+    let mut write_sink = CWriteBridge {
+        write_fn: easy.set.fwrite_func.0,
+        write_data: easy.set.out.0,
+        header_fn: easy.set.fwrite_header.0,
+        header_data: easy.set.writeheader.0,
+    };
+    let mut read_source = CReadBridge {
+        read_fn: easy.set.fread_func_set.0,
+        read_data: easy.set.in_set.0,
+    };
+
     // Drive the async transfer to completion synchronously. `block_on` runs the
     // future on this thread's current-thread runtime; `result_to_code` collapses
     // the `core::Result<()>` to the exact `CURLcode` the C caller expects.
-    result_to_code(block_on(easy.perform()))
+    result_to_code(block_on(easy.perform_with(&mut write_sink, &mut read_source)))
 }
 
 // =============================================================================
@@ -1289,6 +1431,92 @@ mod tests {
             assert_eq!(rc, CURLcode::CURLE_UNSUPPORTED_PROTOCOL);
             curl_easy_cleanup(h);
         }
+    }
+
+    /// A `CURLOPT_WRITEFUNCTION`-shaped C callback that appends the body chunk
+    /// (`size * nmemb` bytes — this engine always passes `size == 1`) into the
+    /// `Vec<u8>` registered as `CURLOPT_WRITEDATA`, exactly as a C consumer's
+    /// `fwrite`-style sink would, and returns the number of bytes taken.
+    unsafe extern "C" fn collect_write_cb(
+        ptr: *mut c_char,
+        size: size_t,
+        nmemb: size_t,
+        stream: *mut c_void,
+    ) -> size_t {
+        let len = size * nmemb;
+        // SAFETY: the engine passes a valid `(ptr, len)` body chunk via the
+        // `(buf, size = 1, nmemb = len)` convention, and `stream` is the live
+        // `&mut Vec<u8>` this test registered through `CURLOPT_WRITEDATA`, which
+        // outlives the synchronous `curl_easy_perform` call below.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
+            let sink = &mut *(stream as *mut Vec<u8>);
+            sink.extend_from_slice(bytes);
+        }
+        len
+    }
+
+    #[test]
+    fn perform_file_routes_body_to_c_write_callback() {
+        // End-to-end proof that `curl_easy_perform` drives a real transfer
+        // (`Easy::perform_with` → `perform_transfer` → the FILE handler) and that
+        // the body bytes reach a consumer-registered C `CURLOPT_WRITEFUNCTION`
+        // through the `CWriteBridge`/`block_on` bridge. The network-free `file://`
+        // handler keeps the test hermetic — the FFI analog of curl-rs-lib's
+        // `perform_with_drives_file_download_into_sink`.
+
+        // Build a unique temp path under the system temp dir (curl-rs-ffi has no
+        // `tempfile` dev-dependency, so construct one from std primitives).
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "curl_rs_ffi_perform_{}_{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"bytes via C callback").unwrap();
+
+        let url = CString::new(format!("file://{}", path.display())).unwrap();
+        let mut collected: Vec<u8> = Vec::new();
+
+        let h = curl_easy_init();
+        // SAFETY: `h` is a live handle; `url` outlives the copying setopt call;
+        // `collect_write_cb` is a valid `curl_write_callback`; and `collected`
+        // outlives the synchronous `curl_easy_perform` below (the userdata it
+        // points at is only touched during the call).
+        let rc = unsafe {
+            assert_eq!(
+                curl_easy_setopt(h, opt(core::CurlOption::CURLOPT_URL), url.as_ptr() as usize),
+                CURLcode::CURLE_OK
+            );
+            assert_eq!(
+                curl_easy_setopt(
+                    h,
+                    opt(core::CurlOption::CURLOPT_WRITEFUNCTION),
+                    collect_write_cb as *const () as usize,
+                ),
+                CURLcode::CURLE_OK
+            );
+            assert_eq!(
+                curl_easy_setopt(
+                    h,
+                    opt(core::CurlOption::CURLOPT_WRITEDATA),
+                    &mut collected as *mut Vec<u8> as usize,
+                ),
+                CURLcode::CURLE_OK
+            );
+            curl_easy_perform(h)
+        };
+
+        // The FILE transfer completed and the body reached our C callback.
+        assert_eq!(rc, CURLcode::CURLE_OK);
+        assert_eq!(collected, b"bytes via C callback");
+
+        // SAFETY: `h` is live and cleaned up exactly once.
+        unsafe { curl_easy_cleanup(h) };
+        let _ = std::fs::remove_file(&path);
     }
 
     // --- setopt: error paths -------------------------------------------------

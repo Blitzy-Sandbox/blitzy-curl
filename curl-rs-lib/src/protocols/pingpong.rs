@@ -65,12 +65,15 @@
 //! command lines and response codes.
 
 use std::fmt;
+use std::path::PathBuf;
 
 use crate::conn::{
     BoxFuture, Connection, Curl_conn_data_pending, Curl_conn_recv, Curl_conn_send, FIRSTSOCKET,
 };
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
+use crate::setopt::StrId;
+use crate::tls::TlsConfig;
 use crate::util::dynbuf::DYN_PINGPPONG_CMD;
 use crate::util::sendf;
 use crate::util::timeval::{self, CurlTime};
@@ -84,6 +87,68 @@ use crate::util::timeval::{self, CurlTime};
 /// `lib/urldata.h` — `60 * 1000`). This bounds the time a *single* server
 /// response may take to arrive, independent of any overall transfer timeout.
 const RESP_TIMEOUT: i64 = 60 * 1000;
+
+// ===========================================================================
+// Shared STARTTLS configuration
+// ===========================================================================
+
+/// Build a [`TlsConfig`] from the easy handle's SSL options, for a `STARTTLS`
+/// (or `STLS`) upgrade on a ping-pong protocol (FTP, IMAP, POP3, SMTP).
+///
+/// This is the single, shared translation of `data->set.ssl` onto the TLS
+/// backend used by **every** ping-pong protocol's explicit-TLS upgrade path, so
+/// that `imap://…` + `STARTTLS`, `pop3://…` + `STLS`, `smtp://…` + `STARTTLS`
+/// and `ftp://…` + `AUTH TLS` all honour the same handle options identically.
+/// It mirrors curl's mapping in the per-protocol `*_perform_upgrade_tls`
+/// functions, which each call `Curl_ssl_cfilter_add` with the connection's
+/// `ssl_config` derived from `data->set.ssl`:
+///
+/// * the verify flags — `CURLOPT_SSL_VERIFYPEER` / `_VERIFYHOST` /
+///   `_VERIFYSTATUS`,
+/// * the negotiated TLS version window — `CURLOPT_SSLVERSION` (min) and the
+///   already-shifted `CURLOPT_SSLVERSION` max byte,
+/// * the session-id cache toggle — `CURLOPT_SSL_SESSIONID_CACHE`,
+/// * the raw `CURLSSLOPT_*` bits — `CURLOPT_SSL_OPTIONS` (which also sets
+///   `native_ca_store` / `early_data` inside [`TlsConfig::set_ssl_options`]),
+/// * and the certificate / CA / cipher string options (`CURLOPT_CAINFO`,
+///   `_CAPATH`, `_CRLFILE`, `_ISSUERCERT`, `_SSL_CIPHER_LIST`,
+///   `_TLS13_CIPHERS`, `_SSLCERT`, `_SSLKEY`, `_KEYPASSWD`, `_SSLCERTTYPE`,
+///   `_SSLKEYTYPE`, `_PINNEDPUBLICKEY`).
+///
+/// Certificate validation stays **on by default** — the returned config starts
+/// from [`TlsConfig::default`], whose `verify_peer` / `verify_host` are `true`
+/// — so an upgraded channel is secure unless the user explicitly disabled
+/// validation (`--insecure` → `verifypeer = false`). This is what makes
+/// `--insecure`, `--cacert`, `--pinnedpubkey`, client certificates and TLS
+/// version pinning all take effect on a `STARTTLS` upgrade exactly as they do
+/// on an implicit-TLS (`imaps://`, `pop3s://`, `smtps://`, `ftps://`) connection.
+pub(crate) fn tls_config_from_easy(data: &Easy) -> TlsConfig {
+    let mut cfg = TlsConfig::default();
+    let p = &data.set.ssl.primary;
+
+    cfg.verify_peer = p.verifypeer;
+    cfg.verify_host = p.verifyhost;
+    cfg.verify_status = p.verifystatus;
+    cfg.version = u32::from(p.version);
+    cfg.version_max = p.version_max;
+    cfg.sessionid = p.cache_session;
+    cfg.set_ssl_options(u32::from(p.ssl_options));
+
+    cfg.ca_file = data.set.str(StrId::SslCafile).map(PathBuf::from);
+    cfg.ca_path = data.set.str(StrId::SslCapath).map(PathBuf::from);
+    cfg.crl_file = data.set.str(StrId::SslCrlfile).map(PathBuf::from);
+    cfg.issuer_cert = data.set.str(StrId::SslIssuercert).map(PathBuf::from);
+    cfg.cipher_list = data.set.str(StrId::SslCipherList).map(String::from);
+    cfg.cipher_list13 = data.set.str(StrId::SslCipher13List).map(String::from);
+    cfg.client_cert = data.set.str(StrId::Cert).map(PathBuf::from);
+    cfg.client_key = data.set.str(StrId::Key).map(PathBuf::from);
+    cfg.key_passwd = data.set.str(StrId::KeyPasswd).map(String::from);
+    cfg.cert_type = data.set.str(StrId::CertType).map(String::from);
+    cfg.key_type = data.set.str(StrId::KeyType).map(String::from);
+    cfg.pinned_pubkey = data.set.str(StrId::SslPinnedPublicKey).map(String::from);
+
+    cfg
+}
 
 /// The size of the stack read buffer used by [`PingPong::readresp`] for each
 /// `recv` (C `char buffer[900]`). When a read fills the whole buffer the engine
@@ -1077,5 +1142,130 @@ mod tests {
     fn pp_transfer_is_comparable() {
         assert_eq!(PpTransfer::Body, PpTransfer::Body);
         assert_ne!(PpTransfer::Body, PpTransfer::None);
+    }
+
+    // -----------------------------------------------------------------------
+    // tls_config_from_easy — the shared STARTTLS/STLS/AUTH-TLS config mapping
+    // used identically by IMAP, POP3, SMTP and FTP. These tests drive the real
+    // `curl_easy_setopt` path (`crate::setopt::apply`) and assert every handle
+    // SSL option lands in the upgrade's `TlsConfig`, which is what makes
+    // `--insecure`, `--cacert`/`--capath`, `--pinnedpubkey`, client
+    // certificates, cipher selection and the TLS version window take effect on
+    // an explicit-TLS upgrade exactly as on an implicit-TLS connection.
+    // -----------------------------------------------------------------------
+
+    use crate::setopt::{apply, CurlOption, OptionValue};
+    use crate::tls::config::{CURL_SSLVERSION_MAX_TLSV1_3, CURL_SSLVERSION_TLSV1_2};
+
+    /// Set a `char*` option through the public setopt path.
+    fn set_str_opt(data: &mut Easy, opt: CurlOption, value: &str) {
+        apply(&mut data.set, opt, OptionValue::Str(Some(value.to_string())))
+            .expect("string option should apply");
+    }
+
+    /// Set a `long` option through the public setopt path.
+    fn set_long_opt(data: &mut Easy, opt: CurlOption, value: i64) {
+        apply(&mut data.set, opt, OptionValue::Long(value)).expect("long option should apply");
+    }
+
+    #[test]
+    fn tls_config_from_easy_defaults_keep_validation_on() {
+        // A fresh handle must yield a STARTTLS config with certificate
+        // validation ON (the security mandate): this is why an upgrade is
+        // secure unless the user explicitly opts out.
+        let data = Easy::new();
+        let cfg = tls_config_from_easy(&data);
+        assert!(cfg.verify_peer, "verify_peer defaults ON");
+        assert!(cfg.verify_host, "verify_host defaults ON");
+        assert!(!cfg.verify_status, "verify_status defaults OFF");
+        assert!(cfg.ca_file.is_none());
+        assert!(cfg.pinned_pubkey.is_none());
+        assert!(cfg.client_cert.is_none());
+    }
+
+    #[test]
+    fn tls_config_from_easy_insecure_disables_verification() {
+        // `--insecure` => CURLOPT_SSL_VERIFYPEER 0 (+ VERIFYHOST 0). The upgrade
+        // config must reflect the relaxed verification, not a hardcoded default.
+        let mut data = Easy::new();
+        set_long_opt(&mut data, CurlOption::CURLOPT_SSL_VERIFYPEER, 0);
+        set_long_opt(&mut data, CurlOption::CURLOPT_SSL_VERIFYHOST, 0);
+        let cfg = tls_config_from_easy(&data);
+        assert!(!cfg.verify_peer, "--insecure disables peer verification");
+        assert!(!cfg.verify_host, "--insecure disables host verification");
+    }
+
+    #[test]
+    fn tls_config_from_easy_propagates_ca_pinned_and_status() {
+        // --cacert / --capath / --crlfile / issuer cert / --pinnedpubkey /
+        // --cert-status must all flow into the STARTTLS config.
+        let mut data = Easy::new();
+        set_str_opt(&mut data, CurlOption::CURLOPT_CAINFO, "/etc/ssl/ca.pem");
+        set_str_opt(&mut data, CurlOption::CURLOPT_CAPATH, "/etc/ssl/certs");
+        set_str_opt(&mut data, CurlOption::CURLOPT_CRLFILE, "/etc/ssl/crl.pem");
+        set_str_opt(&mut data, CurlOption::CURLOPT_ISSUERCERT, "/etc/ssl/issuer.pem");
+        set_str_opt(
+            &mut data,
+            CurlOption::CURLOPT_PINNEDPUBLICKEY,
+            "sha256//abcdefghijklmnopqrstuvwxyz0123456789ABCDEF0=",
+        );
+        set_long_opt(&mut data, CurlOption::CURLOPT_SSL_VERIFYSTATUS, 1);
+
+        let cfg = tls_config_from_easy(&data);
+        assert_eq!(cfg.ca_file.as_deref(), Some(std::path::Path::new("/etc/ssl/ca.pem")));
+        assert_eq!(cfg.ca_path.as_deref(), Some(std::path::Path::new("/etc/ssl/certs")));
+        assert_eq!(cfg.crl_file.as_deref(), Some(std::path::Path::new("/etc/ssl/crl.pem")));
+        assert_eq!(
+            cfg.issuer_cert.as_deref(),
+            Some(std::path::Path::new("/etc/ssl/issuer.pem"))
+        );
+        assert_eq!(
+            cfg.pinned_pubkey.as_deref(),
+            Some("sha256//abcdefghijklmnopqrstuvwxyz0123456789ABCDEF0=")
+        );
+        assert!(cfg.verify_status, "--cert-status propagates");
+    }
+
+    #[test]
+    fn tls_config_from_easy_propagates_client_cert_and_ciphers() {
+        // Client certificate / key / passphrase / types and cipher selection.
+        let mut data = Easy::new();
+        set_str_opt(&mut data, CurlOption::CURLOPT_SSLCERT, "/c/client.pem");
+        set_str_opt(&mut data, CurlOption::CURLOPT_SSLKEY, "/c/client.key");
+        set_str_opt(&mut data, CurlOption::CURLOPT_KEYPASSWD, "s3cr3t");
+        set_str_opt(&mut data, CurlOption::CURLOPT_SSLCERTTYPE, "PEM");
+        set_str_opt(&mut data, CurlOption::CURLOPT_SSLKEYTYPE, "PEM");
+        set_str_opt(
+            &mut data,
+            CurlOption::CURLOPT_SSL_CIPHER_LIST,
+            "ECDHE-RSA-AES128-GCM-SHA256",
+        );
+        set_str_opt(
+            &mut data,
+            CurlOption::CURLOPT_TLS13_CIPHERS,
+            "TLS_AES_128_GCM_SHA256",
+        );
+
+        let cfg = tls_config_from_easy(&data);
+        assert_eq!(cfg.client_cert.as_deref(), Some(std::path::Path::new("/c/client.pem")));
+        assert_eq!(cfg.client_key.as_deref(), Some(std::path::Path::new("/c/client.key")));
+        assert_eq!(cfg.key_passwd.as_deref(), Some("s3cr3t"));
+        assert_eq!(cfg.cert_type.as_deref(), Some("PEM"));
+        assert_eq!(cfg.key_type.as_deref(), Some("PEM"));
+        assert_eq!(cfg.cipher_list.as_deref(), Some("ECDHE-RSA-AES128-GCM-SHA256"));
+        assert_eq!(cfg.cipher_list13.as_deref(), Some("TLS_AES_128_GCM_SHA256"));
+    }
+
+    #[test]
+    fn tls_config_from_easy_propagates_tls_version_window() {
+        // --tlsv1.2 + --tls-max 1.3 selects a [min,max] version window that the
+        // upgrade config must carry (otherwise STARTTLS would ignore version
+        // pinning that an implicit-TLS connection would honour).
+        let mut data = Easy::new();
+        let arg = i64::from(CURL_SSLVERSION_TLSV1_2) | i64::from(CURL_SSLVERSION_MAX_TLSV1_3);
+        set_long_opt(&mut data, CurlOption::CURLOPT_SSLVERSION, arg);
+        let cfg = tls_config_from_easy(&data);
+        assert_eq!(cfg.version, CURL_SSLVERSION_TLSV1_2, "min TLS version propagates");
+        assert_eq!(cfg.version_max, CURL_SSLVERSION_MAX_TLSV1_3, "max TLS version propagates");
     }
 }

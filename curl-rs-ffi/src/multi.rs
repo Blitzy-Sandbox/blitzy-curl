@@ -1643,6 +1643,7 @@ mod tests {
         let easy = make_easy();
         // SAFETY: live handles.
         assert_eq!(
+            // SAFETY: controlled test invocation of `curl_multi_add_handle`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
             unsafe { curl_multi_add_handle(m, easy) },
             CURLMcode::CURLM_OK
         );
@@ -1856,6 +1857,7 @@ mod tests {
         // Associate the easy handle with the multi.
         // SAFETY: `m` and `easy` are live handles.
         assert_eq!(
+            // SAFETY: controlled test invocation of `curl_multi_add_handle`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
             unsafe { curl_multi_add_handle(m, easy) },
             CURLMcode::CURLM_OK
         );
@@ -1926,6 +1928,7 @@ mod tests {
             let mut timeout_ms: c_long = -2;
             // SAFETY: `m` live; `timeout_ms` is writable.
             assert_eq!(
+                // SAFETY: controlled test invocation of `curl_multi_timeout`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
                 unsafe { curl_multi_timeout(m, &mut timeout_ms) },
                 CURLMcode::CURLM_OK
             );
@@ -1948,6 +1951,7 @@ mod tests {
         // With no task running, removal swaps the real easy back into its box.
         // SAFETY: live handles; the handle was added.
         assert_eq!(
+            // SAFETY: controlled test invocation of `curl_multi_remove_handle`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
             unsafe { curl_multi_remove_handle(m, easy) },
             CURLMcode::CURLM_OK
         );

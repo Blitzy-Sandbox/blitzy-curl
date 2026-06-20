@@ -30,12 +30,24 @@
 //!   neither `0` nor `80`; for `0` (meaning "unset/default") and `80` the field
 //!   is dropped entirely. This is a deliberate upstream behavior, preserved
 //!   byte-for-byte by [`sasl_oauth_bearer_message`].
-//! * **Tokens and identities are inserted verbatim.** Matching curl, the bearer
-//!   token (curl's `STRING_BEARER` option value) and the `user`/`host` fields
-//!   are substituted without escaping, validation, or CR/LF filtering. curl
-//!   applies no such checks — these values originate from the application via
-//!   `curl_easy_setopt` or the command line and are trusted — and reproducing
-//!   the bytes exactly is required for parity.
+//! * **SASL identities/tokens are inserted verbatim.** Matching curl, the
+//!   bearer token (curl's `STRING_BEARER` option value) and the `user`/`host`
+//!   fields of the **SASL** `OAUTHBEARER`/`XOAUTH2` messages are substituted
+//!   without escaping. This is safe and parity-required because the SASL
+//!   messages are **base64-framed** by the SASL state machine before they reach
+//!   the wire, so an embedded control byte cannot escape the encoded blob and
+//!   the exact bytes are pinned by the regression suite.
+//! * **The HTTP `Authorization: Bearer` header value is validated.** Unlike the
+//!   base64-framed SASL messages, [`http_bearer_header`] writes the token
+//!   **directly** into the request header block (`<value>\r\n`). A token
+//!   carrying a CR (`0x0D`), LF (`0x0A`), or NUL (`0x00`) byte would therefore
+//!   terminate the header line early and inject attacker-controlled headers
+//!   (CWE-93 CRLF injection / CWE-20 improper input validation). curl's own
+//!   header machinery rejects such octets, so [`http_bearer_header`] rejects
+//!   them with [`CurlError::BadFunctionArgument`] before formatting. This does
+//!   not affect wire parity: a legitimate bearer token (an opaque
+//!   `token68`/JWT value) never contains these control bytes, so every
+//!   well-formed token still produces byte-identical output to curl.
 //!
 //! # Raw bytes, not base64
 //!
@@ -67,7 +79,34 @@
 //! (AAP §0.7.1). All buffers are owned `String` / `Vec<u8>` values; there is no
 //! manual allocation and no raw-pointer handling.
 
-use crate::error::Result;
+use crate::error::{CurlError, Result};
+
+/// The header-field-value octets that are illegal in an HTTP/1.x header line and
+/// would allow header injection (CWE-93) if substituted verbatim into a header
+/// value: carriage return, line feed, and NUL. A CR or LF would terminate the
+/// header line early (splicing in attacker-controlled headers / a request body),
+/// and a NUL is rejected by curl's header machinery and most servers.
+///
+/// This is intentionally the *minimal* injection-critical set (RFC 9110 forbids
+/// CR/LF/NUL in field values); other bytes such as obs-text (`0x80`–`0xFF`) are
+/// left untouched so legitimate values still reproduce curl's bytes exactly.
+const ILLEGAL_HEADER_VALUE_OCTETS: [u8; 3] = [b'\r', b'\n', b'\0'];
+
+/// Reject a string destined for an HTTP header **value** if it contains any
+/// injection-critical octet ([`ILLEGAL_HEADER_VALUE_OCTETS`]).
+///
+/// Returns [`CurlError::BadFunctionArgument`] — curl's `CURLE_BAD_FUNCTION_ARGUMENT`
+/// (43), the code curl uses for rejected option values — when `value` is unsafe,
+/// otherwise `Ok(())`.
+fn reject_header_value_injection(value: &str) -> Result<()> {
+    if value
+        .bytes()
+        .any(|b| ILLEGAL_HEADER_VALUE_OCTETS.contains(&b))
+    {
+        return Err(CurlError::BadFunctionArgument);
+    }
+    Ok(())
+}
 
 /// Build the HTTP **Bearer** `Authorization` header line.
 ///
@@ -81,9 +120,20 @@ use crate::error::Result;
 /// variant (`http_output_bearer` only ever writes the host `userpwd` slot), so
 /// there is intentionally no proxy counterpart here.
 ///
-/// The `token` is inserted **verbatim**, matching curl, which performs no
-/// escaping or validation of the bearer value (it is the trusted
-/// `CURLOPT_XOAUTH2_BEARER` / `--oauth2-bearer` value).
+/// # Input validation (CWE-93 / CWE-20)
+///
+/// Because the returned value is written **directly** into the request header
+/// block, the `token` is validated before formatting: a token containing a CR
+/// (`0x0D`), LF (`0x0A`), or NUL (`0x00`) byte is rejected with
+/// [`CurlError::BadFunctionArgument`], preventing CRLF header injection. Every
+/// other byte is preserved verbatim, so a well-formed bearer token (an opaque
+/// `token68`/JWT value, which never contains these control octets) produces
+/// byte-identical output to curl.
+///
+/// # Errors
+///
+/// Returns [`CurlError::BadFunctionArgument`] if `token` contains a CR, LF, or
+/// NUL byte.
 ///
 /// # Examples
 ///
@@ -92,9 +142,15 @@ use crate::error::Result;
 ///     http_bearer_header("mytoken").unwrap(),
 ///     "Authorization: Bearer mytoken\r\n",
 /// );
+/// // A token carrying a CRLF sequence is rejected, not spliced into headers.
+/// assert!(http_bearer_header("tok\r\nX-Injected: 1").is_err());
 /// ```
 pub fn http_bearer_header(token: &str) -> Result<String> {
-    // Mirrors curl's `curl_maprintf("Authorization: Bearer %s\r\n", bearer)`.
+    // Guard the injection-critical octets before formatting (see the function
+    // docs / CWE-93). A legitimate token passes through unchanged, so this
+    // mirrors curl's `curl_maprintf("Authorization: Bearer %s\r\n", bearer)`
+    // byte-for-byte for every well-formed value.
+    reject_header_value_injection(token)?;
     Ok(format!("Authorization: Bearer {token}\r\n"))
 }
 
@@ -224,9 +280,10 @@ mod tests {
     }
 
     #[test]
-    fn http_bearer_header_inserts_token_verbatim() {
-        // curl performs no escaping/validation; an empty token still yields the
-        // literal prefix followed by CRLF.
+    fn http_bearer_header_inserts_wellformed_token_verbatim() {
+        // A well-formed token carries no injection-critical octet, so it is
+        // passed through unchanged (byte-identical to curl). An empty token
+        // still yields the literal prefix followed by CRLF.
         assert_eq!(http_bearer_header("").unwrap(), "Authorization: Bearer \r\n");
 
         // A realistic JWT (dots, dashes, underscores) is passed through untouched.
@@ -235,6 +292,39 @@ mod tests {
             http_bearer_header(jwt).unwrap(),
             format!("Authorization: Bearer {jwt}\r\n"),
         );
+    }
+
+    #[test]
+    fn http_bearer_header_rejects_crlf_injection() {
+        // CWE-93: a token carrying CRLF must NOT be spliced into the header
+        // block. Each injection-critical octet (CR, LF, NUL) is rejected with
+        // CURLE_BAD_FUNCTION_ARGUMENT and never reaches the formatted output.
+        for malicious in [
+            "tok\r\nX-Injected: evil",       // full CRLF sequence
+            "tok\rX-Injected: evil",         // bare CR
+            "tok\nX-Injected: evil",         // bare LF
+            "tok\r\n\r\nGET /admin HTTP/1.1", // request-splitting attempt
+            "tok\0nul",                      // embedded NUL
+        ] {
+            assert_eq!(
+                http_bearer_header(malicious).unwrap_err(),
+                CurlError::BadFunctionArgument,
+                "token {malicious:?} must be rejected, not formatted",
+            );
+        }
+    }
+
+    #[test]
+    fn reject_header_value_injection_accepts_safe_rejects_unsafe() {
+        // Safe values (incl. high-bit obs-text and whitespace that is legal in
+        // a field value) are accepted unchanged.
+        assert!(reject_header_value_injection("ordinary-token_123").is_ok());
+        assert!(reject_header_value_injection("with spaces and\ttab").is_ok());
+        assert!(reject_header_value_injection("héllo-\u{00ff}").is_ok());
+        // Each injection-critical octet is rejected.
+        assert!(reject_header_value_injection("a\rb").is_err());
+        assert!(reject_header_value_injection("a\nb").is_err());
+        assert!(reject_header_value_injection("a\0b").is_err());
     }
 
     // ---- Phase B: SASL OAUTHBEARER -----------------------------------------

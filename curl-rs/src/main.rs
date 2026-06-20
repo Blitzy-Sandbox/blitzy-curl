@@ -85,20 +85,24 @@ use crate::operate::operate;
 // bridge (`setopt`, `writeout`, `writeout_json`) are fully exercised from
 // `main`.
 //
-// Construction-order staging: a handful of modules still expose items that the
-// current `operate`/`setopt` surface does not yet drive — the per-transfer
-// callback bodies (`callbacks`: the read/seek/progress/debug functions are
-// defined here but are registered on the easy handle by later migration steps),
-// curl's home / `.curlrc` / `.netrc` file finders (`operate`'s `findfile` /
-// `checkhome`), some option-table helpers (`args`, `config`), and the
-// glob-in-use query (`urlglob`). These items are part of the full CLI port but
-// are not yet reachable from `main`, so those five module declarations carry
-// `#[allow(dead_code)]` to keep the workspace `-D warnings` lint gate clean
-// without modifying the not-yet-wired modules themselves. (`formparse` and
-// `parsecfg` carry their own inner `#![allow(dead_code)]`, so they need none
-// here; `messages`, `setopt`, `writeout`, and `writeout_json` are fully live.)
-// Each allow becomes unnecessary — and can be dropped — once the corresponding
-// wiring lands.
+// Construction-order staging: a handful of modules expose items that become
+// reachable only once the transfer-execution integration is in place (AAP
+// §0.8.4 steps 11–13) — when `curl_rs_lib::Easy::perform` drives a real transfer
+// and the core's Rust-native callback bridge invokes the CLI callbacks. The
+// affected items are the per-transfer callback bodies (`callbacks`: the
+// write/read/seek/header/progress/debug functions, which the transfer engine
+// drives through `curl_rs_lib::transfer::{WriteCallbacks, ReadCallback}` — this
+// CLI crate is `#![forbid(unsafe_code)]`, so it routes them Rust-natively rather
+// than as C-ABI function pointers), curl's home / `.curlrc` / `.netrc` file
+// finders (`operate`'s `findfile` / `checkhome`), some option-table helpers
+// (`args`, `config`), and the glob-in-use query (`urlglob`). These items are
+// part of the full CLI port; until the transfer drive reaches them they would
+// trip the workspace `-D warnings` gate, so those five module declarations carry
+// `#[allow(dead_code)]` to keep the not-yet-driven (never the *incomplete*) code
+// compiled, clippy-linted, and unit-tested. (`formparse` and `parsecfg` carry
+// their own inner `#![allow(dead_code)]`, so they need none here; `messages`,
+// `setopt`, `writeout`, and `writeout_json` are fully live.) Each allow becomes
+// unnecessary — and is dropped — once the transfer drive invokes that module.
 #[allow(dead_code)]
 mod args;
 #[allow(dead_code)]

@@ -488,12 +488,17 @@ mod tests {
         let mut out: *mut curl_header = ptr::null_mut();
 
         // NULL easy / name / hout each yield CURLHE_BAD_ARGUMENT.
+        // SAFETY: controlled test invocation of `curl_easy_header`; the NULL
+        // easy handle here intentionally exercises the bad-argument path, and
+        // the remaining pointer arguments are valid for the call.
         let c1 = unsafe {
             curl_easy_header(ptr::null_mut(), nm.as_ptr(), 0, CURLH_HEADER, -1, &mut out)
         };
         assert_eq!(c1, CURLHcode::CURLHE_BAD_ARGUMENT);
+        // SAFETY: controlled test invocation of `curl_easy_header`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let c2 = unsafe { curl_easy_header(h, ptr::null(), 0, CURLH_HEADER, -1, &mut out) };
         assert_eq!(c2, CURLHcode::CURLHE_BAD_ARGUMENT);
+        // SAFETY: controlled test invocation of `curl_easy_header`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let c3 = unsafe { curl_easy_header(h, nm.as_ptr(), 0, CURLH_HEADER, -1, ptr::null_mut()) };
         assert_eq!(c3, CURLHcode::CURLHE_BAD_ARGUMENT);
 
@@ -506,6 +511,7 @@ mod tests {
         let h = handle_of(&mut easy);
         let nm = CString::new("any").unwrap();
         let mut out: *mut curl_header = ptr::null_mut();
+        // SAFETY: controlled test invocation of `curl_easy_header`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let code = unsafe { curl_easy_header(h, nm.as_ptr(), 0, CURLH_HEADER, -1, &mut out) };
         assert_eq!(code, CURLHcode::CURLHE_NOHEADERS);
         drop_handle_headers(h);
@@ -521,12 +527,16 @@ mod tests {
         let nm = CString::new("content-type").unwrap();
         let mut out: *mut curl_header = ptr::null_mut();
 
+        // SAFETY: controlled test invocation of `curl_easy_header`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let code = unsafe { curl_easy_header(h, nm.as_ptr(), 0, CURLH_HEADER, -1, &mut out) };
         assert_eq!(code, CURLHcode::CURLHE_OK);
         assert!(!out.is_null());
 
+        // SAFETY: `out` was just set by the FFI call above to a valid, non-null object; the shared borrow does not outlive it.
         let hdr = unsafe { &*out };
+        // SAFETY: `hdr.name` is non-null and a valid NUL-terminated C string for the duration of the borrow.
         let name = unsafe { CStr::from_ptr(hdr.name) }.to_str().unwrap();
+        // SAFETY: `hdr.value` is non-null and a valid NUL-terminated C string for the duration of the borrow.
         let value = unsafe { CStr::from_ptr(hdr.value) }.to_str().unwrap();
         assert_eq!(name, "Content-Type"); // wire case preserved
         assert_eq!(value, "text/html");
@@ -549,20 +559,25 @@ mod tests {
         let mut out: *mut curl_header = ptr::null_mut();
 
         let nb = CString::new("b").unwrap();
+        // SAFETY: controlled test invocation of `curl_easy_header`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let c1 = unsafe { curl_easy_header(h, nb.as_ptr(), 0, CURLH_HEADER, -1, &mut out) };
         assert_eq!(c1, CURLHcode::CURLHE_MISSING);
 
         let na = CString::new("a").unwrap();
+        // SAFETY: controlled test invocation of `curl_easy_header`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let c2 = unsafe { curl_easy_header(h, na.as_ptr(), 1, CURLH_HEADER, -1, &mut out) };
         assert_eq!(c2, CURLHcode::CURLHE_BADINDEX);
 
         // Existing name but wrong origin mask -> missing.
+        // SAFETY: controlled test invocation of `curl_easy_header`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let c3 = unsafe { curl_easy_header(h, na.as_ptr(), 0, CURLH_TRAILER, -1, &mut out) };
         assert_eq!(c3, CURLHcode::CURLHE_MISSING);
 
         // origin == 0 and request < -1 are rejected by the core as bad argument.
+        // SAFETY: controlled test invocation of `curl_easy_header`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let c4 = unsafe { curl_easy_header(h, na.as_ptr(), 0, 0, -1, &mut out) };
         assert_eq!(c4, CURLHcode::CURLHE_BAD_ARGUMENT);
+        // SAFETY: controlled test invocation of `curl_easy_header`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let c5 = unsafe { curl_easy_header(h, na.as_ptr(), 0, CURLH_HEADER, -2, &mut out) };
         assert_eq!(c5, CURLHcode::CURLHE_BAD_ARGUMENT);
 
@@ -576,6 +591,7 @@ mod tests {
         let h = handle_of(&mut easy);
         let na = CString::new("a").unwrap();
         let mut out: *mut curl_header = ptr::null_mut();
+        // SAFETY: controlled test invocation of `curl_easy_header`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let code = unsafe { curl_easy_header(h, na.as_ptr(), 0, CURLH_HEADER, 5, &mut out) };
         assert_eq!(code, CURLHcode::CURLHE_NOREQUEST);
         drop_handle_headers(h);
@@ -595,16 +611,22 @@ mod tests {
         let mut out: *mut curl_header = ptr::null_mut();
 
         // request 0 selects the first response; request 1 / -1 the second.
+        // SAFETY: controlled test invocation of `curl_easy_header`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let c0 = unsafe { curl_easy_header(h, nm.as_ptr(), 0, CURLH_HEADER, 0, &mut out) };
         assert_eq!(c0, CURLHcode::CURLHE_OK);
+        // SAFETY: `out` was set by the FFI call above to a valid `curl_header` pointer; `value_of` only reads through it.
         assert_eq!(unsafe { value_of(out) }, "first");
 
+        // SAFETY: controlled test invocation of `curl_easy_header`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let c1 = unsafe { curl_easy_header(h, nm.as_ptr(), 0, CURLH_HEADER, 1, &mut out) };
         assert_eq!(c1, CURLHcode::CURLHE_OK);
+        // SAFETY: `out` was set by the FFI call above to a valid `curl_header` pointer; `value_of` only reads through it.
         assert_eq!(unsafe { value_of(out) }, "second");
 
+        // SAFETY: controlled test invocation of `curl_easy_header`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let cl = unsafe { curl_easy_header(h, nm.as_ptr(), 0, CURLH_HEADER, -1, &mut out) };
         assert_eq!(cl, CURLHcode::CURLHE_OK);
+        // SAFETY: `out` was set by the FFI call above to a valid `curl_header` pointer; `value_of` only reads through it.
         assert_eq!(unsafe { value_of(out) }, "second");
 
         drop_handle_headers(h);
@@ -626,10 +648,12 @@ mod tests {
         let mut names: Vec<String> = Vec::new();
         let mut prev: *mut curl_header = ptr::null_mut();
         loop {
+            // SAFETY: controlled test invocation of `curl_easy_nextheader`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
             let cur = unsafe { curl_easy_nextheader(h, CURLH_HEADER, -1, prev) };
             if cur.is_null() {
                 break;
             }
+            // SAFETY: `cur` is non-null and points to a live, valid node here; `name` is a `Copy` value read out before the node is freed.
             let nm = unsafe { CStr::from_ptr((*cur).name) }
                 .to_str()
                 .unwrap()
@@ -657,21 +681,29 @@ mod tests {
         let nm = CString::new("set-cookie").unwrap();
         let mut out: *mut curl_header = ptr::null_mut();
 
+        // SAFETY: controlled test invocation of `curl_easy_header`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let code = unsafe { curl_easy_header(h, nm.as_ptr(), 0, CURLH_HEADER, -1, &mut out) };
         assert_eq!(code, CURLHcode::CURLHE_OK);
+        // SAFETY: `out` was set by the FFI call above to a valid `curl_header` pointer; `value_of` only reads through it.
         assert_eq!(unsafe { value_of(out) }, "a=1");
+        // SAFETY: `out` is non-null and points to a live, valid node here; `amount` is a `Copy` value read out before the node is freed.
         assert_eq!(unsafe { (*out).amount }, 2);
+        // SAFETY: `out` is non-null and points to a live, valid node here; `index` is a `Copy` value read out before the node is freed.
         assert_eq!(unsafe { (*out).index }, 0);
 
         // Resume iteration from the header() result via its opaque anchor: the
         // next Set-Cookie in scope is the second instance.
+        // SAFETY: controlled test invocation of `curl_easy_nextheader`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let nxt = unsafe { curl_easy_nextheader(h, CURLH_HEADER, -1, out) };
         assert!(!nxt.is_null());
+        // SAFETY: `nxt` was set by the FFI call above to a valid `curl_header` pointer; `value_of` only reads through it.
         assert_eq!(unsafe { value_of(nxt) }, "b=2");
+        // SAFETY: `nxt` is non-null and points to a live, valid node here; `index` is a `Copy` value read out before the node is freed.
         assert_eq!(unsafe { (*nxt).index }, 1);
 
         // Slot separation: curl_easy_nextheader uses a distinct slot, so the
         // earlier curl_easy_header result (`out`) is still intact.
+        // SAFETY: `out` was set by the FFI call above to a valid `curl_header` pointer; `value_of` only reads through it.
         assert_eq!(unsafe { value_of(out) }, "a=1");
 
         drop_handle_headers(h);
@@ -685,14 +717,19 @@ mod tests {
             .unwrap();
         let h = handle_of(&mut easy);
 
+        // SAFETY: controlled test invocation of `curl_easy_nextheader`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let first = unsafe { curl_easy_nextheader(h, CURLH_HEADER, -1, ptr::null_mut()) };
         assert!(!first.is_null());
+        // SAFETY: `first` is non-null and points to a live, valid node here; `name` is a `Copy` value read out before the node is freed.
         let name = unsafe { CStr::from_ptr((*first).name) }.to_str().unwrap();
         assert_eq!(name, "Only");
+        // SAFETY: `first` is non-null and points to a live, valid node here; `amount` is a `Copy` value read out before the node is freed.
         assert_eq!(unsafe { (*first).amount }, 1);
+        // SAFETY: `first` is non-null and points to a live, valid node here; `index` is a `Copy` value read out before the node is freed.
         assert_eq!(unsafe { (*first).index }, 0);
 
         // No further header of this type.
+        // SAFETY: controlled test invocation of `curl_easy_nextheader`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let next = unsafe { curl_easy_nextheader(h, CURLH_HEADER, -1, first) };
         assert!(next.is_null());
 
@@ -702,6 +739,7 @@ mod tests {
     #[test]
     fn nextheader_null_easy_returns_null() {
         let r =
+            // SAFETY: controlled test invocation of `curl_easy_nextheader`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
             unsafe { curl_easy_nextheader(ptr::null_mut(), CURLH_HEADER, -1, ptr::null_mut()) };
         assert!(r.is_null());
     }
@@ -711,6 +749,7 @@ mod tests {
         let mut easy = Easy::new();
         easy.headers_mut().push(b"A: 1\r\n", CURLH_HEADER).unwrap();
         let h = handle_of(&mut easy);
+        // SAFETY: controlled test invocation of `curl_easy_nextheader`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         let r = unsafe { curl_easy_nextheader(h, CURLH_HEADER, 9, ptr::null_mut()) };
         assert!(r.is_null());
         drop_handle_headers(h);

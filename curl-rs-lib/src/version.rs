@@ -255,7 +255,7 @@ pub mod version_bits {
 /// hard-coded here (rather than read from each crate at runtime, which would
 /// force this otherwise dependency-free module to import every backend) and
 /// mirror the exact pins in the workspace `Cargo.toml` (AAP §0.6.1):
-/// rustls 0.23.36, h2 0.4, quinn 0.11.9 + h3 0.0.7, russh 0.61.2, flate2 1
+/// rustls 0.23.36, h2 0.4.15, quinn 0.11.9 + h3 0.0.8, russh 0.61.2, flate2 1
 /// (zlib-compatible), brotli 8 (Brotli format 1.1.0), zstd 0.13 (Zstandard
 /// 1.5.6), idna 1, publicsuffix 2.
 ///
@@ -302,16 +302,18 @@ mod backend {
     /// [`super::pack_16_8`] per the `nghttp2_ver_num` field documentation.
     pub const H2_MAJOR: u32 = 0;
     pub const H2_MINOR: u32 = 4;
-    pub const H2_PATCH: u32 = 7;
+    pub const H2_PATCH: u32 = 15;
     /// HTTP/2 raw version (no prefix) — matches `nghttp2_info::version_str`,
-    /// which the C `version_info.nghttp2_version` stores verbatim.
-    pub const H2_VERSION_RAW: &str = "0.4.7";
+    /// which the C `version_info.nghttp2_version` stores verbatim. Kept in
+    /// lockstep with the `h2` pin in the workspace manifest / `Cargo.lock`.
+    pub const H2_VERSION_RAW: &str = "0.4.15";
     /// HTTP/2 banner token — names the Rust backend (`h2`) in the nghttp2 slot.
-    pub const H2_TOKEN: &str = "h2/0.4.7";
+    pub const H2_TOKEN: &str = "h2/0.4.15";
 
     /// QUIC / HTTP/3 slot — the combined quinn + h3 token, mirroring curl's
-    /// single `Curl_quic_ver()` string in the QUIC slot.
-    pub const QUIC_TOKEN: &str = "quinn/0.11.9 h3/0.0.7";
+    /// single `Curl_quic_ver()` string in the QUIC slot. Kept in lockstep with
+    /// the `quinn` and `h3` pins in the workspace manifest / `Cargo.lock`.
+    pub const QUIC_TOKEN: &str = "quinn/0.11.9 h3/0.0.8";
 
     /// SSH slot — the russh token (replaces libssh/libssh2). Stored in
     /// `libssh_version`, which curl fills with a name-prefixed string.
@@ -466,12 +468,14 @@ fn build_banner() -> String {
     #[cfg(any(feature = "scp", feature = "sftp"))]
     push_token(&mut out, backend::SSH_TOKEN);
 
-    // 10. HTTP/2 (h2, in the nghttp2 slot) — requires HTTP.
-    #[cfg(feature = "http")]
+    // 10. HTTP/2 (h2, in the nghttp2 slot) — requires HTTP/2 support (the `h2`
+    //     backend, features `http` + `http2`).
+    #[cfg(all(feature = "http", feature = "http2"))]
     push_token(&mut out, backend::H2_TOKEN);
 
-    // 11. QUIC / HTTP/3 (quinn + h3) — requires HTTP.
-    #[cfg(feature = "http")]
+    // 11. QUIC / HTTP/3 (quinn + h3) — requires HTTP/3 support (the `quinn`+`h3`
+    //     backend, features `http` + `http3`).
+    #[cfg(all(feature = "http", feature = "http3"))]
     push_token(&mut out, backend::QUIC_TOKEN);
 
     out
@@ -597,8 +601,12 @@ fn build_feature_names() -> Vec<&'static str> {
         ("AsynchDNS", true),
         ("brotli", cfg!(feature = "brotli")),
         ("HSTS", cfg!(feature = "http")),
-        ("HTTP2", cfg!(feature = "http")),
-        ("HTTP3", cfg!(feature = "http")),
+        // HTTP2/HTTP3 must be gated on their own backend features (`h2`,
+        // `quinn`+`h3`), not just `http`: `runtests` selects feature-gated tests
+        // from this list, so a reduced-feature build must not advertise a
+        // protocol version it cannot actually serve.
+        ("HTTP2", cfg!(all(feature = "http", feature = "http2"))),
+        ("HTTP3", cfg!(all(feature = "http", feature = "http3"))),
         ("HTTPS-proxy", cfg!(feature = "http")),
         ("IDN", cfg!(feature = "idn")),
         ("IPv6", true),
@@ -739,9 +747,9 @@ pub struct VersionInfo {
     /// Numeric HTTP/2 (nghttp2-slot) version, `(MAJOR << 16) | (MINOR << 8) |
     /// PATCH`, for the `h2` backend; `0` when the `http` feature is off.
     pub nghttp2_ver_num: u32,
-    /// HTTP/2 backend version string, raw (e.g. `"0.4.7"`); `None` when off.
+    /// HTTP/2 backend version string, raw (e.g. `"0.4.15"`); `None` when off.
     pub nghttp2_version: Option<&'static str>,
-    /// QUIC/HTTP-3 library string (e.g. `"quinn/0.11.9 h3/0.0.7"`); `None` when
+    /// QUIC/HTTP-3 library string (e.g. `"quinn/0.11.9 h3/0.0.8"`); `None` when
     /// the `http` feature is off.
     pub quic_version: Option<&'static str>,
     /// Built-in default CA bundle path; `None` (rustls uses bundled roots).
@@ -805,15 +813,24 @@ fn build_version_info() -> VersionInfo {
         (0, None)
     };
 
-    // HTTP/2 (nghttp2 slot) + QUIC/HTTP-3 — both require HTTP (feature `http`).
-    let (nghttp2_ver_num, nghttp2_version, quic_version) = if cfg!(feature = "http") {
+    // HTTP/2 (nghttp2 slot) — requires HTTP/2 support (the `h2` backend,
+    // features `http` + `http2`). QUIC/HTTP-3 (quic slot) — requires HTTP/3
+    // support (the `quinn`+`h3` backend, features `http` + `http3`). Each slot is
+    // gated on its own backend feature so the reported backend versions stay in
+    // lockstep with the `HTTP2`/`HTTP3` capability names and `CURL_VERSION_*`
+    // bits — a reduced-feature build never reports a backend it did not compile.
+    let (nghttp2_ver_num, nghttp2_version) = if cfg!(all(feature = "http", feature = "http2")) {
         (
             pack_16_8(backend::H2_MAJOR, backend::H2_MINOR, backend::H2_PATCH),
             Some(backend::H2_VERSION_RAW),
-            Some(backend::QUIC_TOKEN),
         )
     } else {
-        (0, None, None)
+        (0, None)
+    };
+    let quic_version = if cfg!(all(feature = "http", feature = "http3")) {
+        Some(backend::QUIC_TOKEN)
+    } else {
+        None
     };
 
     // SSH (russh) — only when SCP/SFTP support is built.
@@ -931,6 +948,109 @@ mod tests {
         assert_eq!(version_bits::CURL_VERSION_ZSTD, 1 << 26);
         assert_eq!(version_bits::CURL_VERSION_HSTS, 1 << 28);
         assert_eq!(version_bits::CURL_VERSION_THREADSAFE, 1 << 30);
+    }
+
+    #[test]
+    fn http2_http3_reporting_tracks_backend_features() {
+        // Feature/capability lockstep (AAP Cross-file D): the HTTP2/HTTP3
+        // capability name, the `CURL_VERSION_HTTP2`/`HTTP3` bit, the backend
+        // version string and the banner token must ALL be present exactly when
+        // the corresponding backend feature is compiled in — never when only
+        // `http` is on. Both sides of each assertion use the same `cfg!`, so
+        // this test holds under ANY feature combination (default or reduced),
+        // proving the gating can never drift. `runtests` selects HTTP/2 and
+        // HTTP/3 tests from these signals, so they must not over-advertise.
+        let want_h2 = cfg!(all(feature = "http", feature = "http2"));
+        let want_h3 = cfg!(all(feature = "http", feature = "http3"));
+
+        let names = feature_names();
+        assert_eq!(names.contains(&"HTTP2"), want_h2, "HTTP2 capability name");
+        assert_eq!(names.contains(&"HTTP3"), want_h3, "HTTP3 capability name");
+
+        let bits = feature_bits();
+        assert_eq!(
+            bits & version_bits::CURL_VERSION_HTTP2 != 0,
+            want_h2,
+            "CURL_VERSION_HTTP2 bit"
+        );
+        assert_eq!(
+            bits & version_bits::CURL_VERSION_HTTP3 != 0,
+            want_h3,
+            "CURL_VERSION_HTTP3 bit"
+        );
+
+        let info = version_info();
+        assert_eq!(info.nghttp2_version.is_some(), want_h2, "nghttp2 version string");
+        assert_eq!((info.nghttp2_ver_num != 0), want_h2, "nghttp2_ver_num");
+        assert_eq!(info.quic_version.is_some(), want_h3, "quic version string");
+
+        // Banner tokens follow the same gate.
+        assert_eq!(version().contains("h2/"), want_h2, "banner h2 token");
+        assert_eq!(version().contains(" h3/"), want_h3, "banner h3 token");
+    }
+
+    #[test]
+    fn incomplete_auth_capabilities_are_never_advertised() {
+        // GSS-API / Kerberos / SPNEGO (the `gssapi` feature) and gsasl/SCRAM
+        // (the `gsasl` feature) are intentionally INCOMPLETE seams in this
+        // rewrite: the krb5 credential steps return `NotBuiltIn`, the SOCKS5
+        // GSS-API negotiation is a stub that fails with `CURLPX_GSSAPI`, and only
+        // SCRAM-SHA-256 is implemented. curl's hard rule (AAP §0.7.3) is that a
+        // capability must NEVER be advertised unless fully implemented — and the
+        // `runtests` feature detector selects tests from exactly these signals.
+        //
+        // Therefore version reporting must never list these capability names nor
+        // set their `CURL_VERSION_*` bits, REGARDLESS of whether the
+        // `gssapi`/`gsasl` Cargo features are compiled in. This test uses no
+        // `cfg!`, so it holds unconditionally and guards against a future build
+        // flipping a feature and silently over-advertising an incomplete seam.
+        let names = feature_names();
+        for forbidden in [
+            "GSS-API",
+            "GSS-Negotiate",
+            "Kerberos",
+            "Kerberos5",
+            "SPNEGO",
+            "gsasl",
+        ] {
+            assert!(
+                !names.contains(&forbidden),
+                "incomplete capability must not be advertised: {forbidden}"
+            );
+        }
+
+        let bits = feature_bits();
+        assert_eq!(
+            bits & version_bits::CURL_VERSION_GSSAPI,
+            0,
+            "CURL_VERSION_GSSAPI must stay clear"
+        );
+        assert_eq!(
+            bits & version_bits::CURL_VERSION_KERBEROS5,
+            0,
+            "CURL_VERSION_KERBEROS5 must stay clear"
+        );
+        assert_eq!(
+            bits & version_bits::CURL_VERSION_KERBEROS4,
+            0,
+            "CURL_VERSION_KERBEROS4 must stay clear"
+        );
+        assert_eq!(
+            bits & version_bits::CURL_VERSION_SPNEGO,
+            0,
+            "CURL_VERSION_SPNEGO must stay clear"
+        );
+        assert_eq!(
+            bits & version_bits::CURL_VERSION_GSASL,
+            0,
+            "CURL_VERSION_GSASL must stay clear"
+        );
+
+        // The gsasl backend version string is likewise never populated.
+        assert!(
+            version_info().gsasl_version.is_none(),
+            "gsasl_version must be None (libgsasl not linked)"
+        );
     }
 
     #[test]
@@ -1195,14 +1315,14 @@ mod tests {
             assert_eq!(info.libssh_version, Some("russh/0.61.2"));
             assert_eq!(info.brotli_version, Some("brotli/1.1.0"));
             assert_eq!(info.zstd_version, Some("zstd/1.5.6"));
-            assert_eq!(info.nghttp2_version, Some("0.4.7"));
-            assert_eq!(info.quic_version, Some("quinn/0.11.9 h3/0.0.7"));
+            assert_eq!(info.nghttp2_version, Some("0.4.15"));
+            assert_eq!(info.quic_version, Some("quinn/0.11.9 h3/0.0.8"));
             // Numeric packing (hex literals avoid identity/erasing-op lints):
             //   brotli/zstd: (MAJOR << 24) | (MINOR << 12) | PATCH
             //   nghttp2:     (MAJOR << 16) | (MINOR << 8)  | PATCH
             assert_eq!(info.brotli_ver_num, 0x0100_1000); // 1.1.0
             assert_eq!(info.zstd_ver_num, 0x0100_5006); // 1.5.6
-            assert_eq!(info.nghttp2_ver_num, 0x0000_0407); // 0.4.7
+            assert_eq!(info.nghttp2_ver_num, 0x0000_040F); // 0.4.15
         }
 
         #[test]
@@ -1211,7 +1331,7 @@ mod tests {
             // backends substituted and unavailable slots omitted.
             let expected = "curl-rs/8.19.0-DEV rustls/0.23.36 zlib/1.3.1 \
                  brotli/1.1.0 zstd/1.5.6 idna/1.0.3 libpsl/0.21.5 russh/0.61.2 \
-                 h2/0.4.7 quinn/0.11.9 h3/0.0.7";
+                 h2/0.4.15 quinn/0.11.9 h3/0.0.8";
             assert_eq!(version(), expected);
         }
     }

@@ -179,6 +179,7 @@ pub unsafe extern "C" fn curl_slist_free_all(list: *mut curl_slist) {
         // Capturing `next` first lets us advance after freeing `cur` without
         // touching freed memory.
         let next: *mut curl_slist = unsafe { (*cur).next };
+        // SAFETY: `cur` is non-null and points to a live, valid node here; `data` is a `Copy` value read out before the node is freed.
         let data: *mut c_char = unsafe { (*cur).data };
 
         if !data.is_null() {
@@ -231,6 +232,7 @@ pub(crate) unsafe fn raw_to_core(list: *const curl_slist) -> SList {
         // SAFETY: `cur` is a non-null node of a valid chain per the `# Safety`
         // contract, so reading its `Copy` `data`/`next` fields is sound.
         let data: *mut c_char = unsafe { (*cur).data };
+        // SAFETY: `cur` is non-null and points to a live, valid node here; `next` is a `Copy` value read out before the node is freed.
         let next: *const curl_slist = unsafe { (*cur).next };
 
         if data.is_null() {

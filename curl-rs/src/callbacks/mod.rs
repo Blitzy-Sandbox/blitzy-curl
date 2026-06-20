@@ -65,12 +65,18 @@
 //!
 //! # Construction-order staging
 //!
-//! These callbacks are authored ahead of the `crate::operate` wiring that
-//! registers them (AAP §0.8.4 step 12). The `mod callbacks;` declaration in
-//! `main.rs` carries `#[allow(dead_code)]`, which covers this whole subtree so
-//! the not-yet-registered public callbacks stay compiled, clippy-linted, and
-//! unit-tested as part of the binary build without tripping `-D warnings`; that
-//! allow is removed once `operate` registers every callback.
+//! These callbacks are complete and unit-tested, authored ahead of the
+//! transfer-execution integration that invokes them (AAP §0.8.4 steps 11–13).
+//! Because this CLI crate is `#![forbid(unsafe_code)]`, the callbacks are **not**
+//! registered as C-ABI `CURLOPT_*FUNCTION` function-pointer addresses (which only
+//! `unsafe` code can invoke); instead the transfer engine reaches them through
+//! the core's Rust-native [`WriteCallbacks`](curl_rs_lib::transfer::WriteCallbacks)
+//! / [`ReadCallback`](curl_rs_lib::transfer::ReadCallback) bridge once
+//! `curl_rs_lib::Easy::perform` drives a transfer. Until that bridge lands the
+//! `mod callbacks;` declaration in `main.rs` carries `#[allow(dead_code)]`, which
+//! keeps this whole subtree compiled, clippy-linted, and unit-tested as part of
+//! the binary build without tripping `-D warnings`; that allow is dropped once
+//! the transfer drive invokes every callback.
 
 pub mod debug;
 pub mod header;

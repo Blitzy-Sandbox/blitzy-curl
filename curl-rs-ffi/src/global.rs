@@ -869,6 +869,7 @@ pub unsafe extern "C" fn curl_strequal(s1: *const c_char, s2: *const c_char) -> 
         // SAFETY: both are non-NULL (checked) and the caller guarantees valid
         // NUL-terminated C strings for the duration of the call.
         let c1 = unsafe { CStr::from_ptr(s1) };
+        // SAFETY: `s2` is non-null and a valid NUL-terminated C string for the duration of the borrow.
         let c2 = unsafe { CStr::from_ptr(s2) };
         // `strcasecompare` over the NUL-stripped bytes reproduces curl's
         // `casecompare` (equal length + ASCII-case-insensitive match).
@@ -900,6 +901,7 @@ pub unsafe extern "C" fn curl_strnequal(s1: *const c_char, s2: *const c_char, n:
         // SAFETY: both are non-NULL (checked) and the caller guarantees valid
         // NUL-terminated C strings for the duration of the call.
         let c1 = unsafe { CStr::from_ptr(s1) };
+        // SAFETY: `s2` is non-null and a valid NUL-terminated C string for the duration of the borrow.
         let c2 = unsafe { CStr::from_ptr(s2) };
         // `strncasecompare` reproduces curl's `ncasecompare` semantics over the
         // NUL-stripped bytes, including the NUL-terminated edge handling.
@@ -1004,12 +1006,14 @@ mod tests {
         // trace: NULL config and a comma-separated list are both accepted.
         // SAFETY: NULL is supported; the CString outlives the call.
         assert_eq!(
+            // SAFETY: controlled test invocation of `curl_global_trace`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
             unsafe { curl_global_trace(ptr::null()) },
             CURLcode::CURLE_OK
         );
         let cfg = CString::new("all,http/2,ssl").unwrap();
         // SAFETY: `cfg` is a valid NUL-terminated C string for the call.
         assert_eq!(
+            // SAFETY: controlled test invocation of `curl_global_trace`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
             unsafe { curl_global_trace(cfg.as_ptr()) },
             CURLcode::CURLE_OK
         );
@@ -1362,14 +1366,18 @@ mod tests {
         // SAFETY: all are valid C strings for the calls.
         assert_eq!(unsafe { curl_strequal(a.as_ptr(), b.as_ptr()) }, 1);
         // Different content → 0.
+        // SAFETY: controlled test invocation of `curl_strequal`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         assert_eq!(unsafe { curl_strequal(a.as_ptr(), c.as_ptr()) }, 0);
         // Different length (prefix) → 0.
+        // SAFETY: controlled test invocation of `curl_strequal`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         assert_eq!(unsafe { curl_strequal(a.as_ptr(), pre.as_ptr()) }, 0);
         // Both NULL → 1.
         // SAFETY: NULL pointers are explicitly supported.
         assert_eq!(unsafe { curl_strequal(ptr::null(), ptr::null()) }, 1);
         // One NULL → 0.
+        // SAFETY: controlled test invocation of `curl_strequal`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         assert_eq!(unsafe { curl_strequal(a.as_ptr(), ptr::null()) }, 0);
+        // SAFETY: controlled test invocation of `curl_strequal`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         assert_eq!(unsafe { curl_strequal(ptr::null(), a.as_ptr()) }, 0);
     }
 
@@ -1384,19 +1392,25 @@ mod tests {
         // SAFETY: all are valid C strings for the calls.
         assert_eq!(unsafe { curl_strnequal(abc.as_ptr(), abx.as_ptr(), 3) }, 1);
         // First 4 chars differ ('D' vs 'x') → 0.
+        // SAFETY: controlled test invocation of `curl_strnequal`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         assert_eq!(unsafe { curl_strnequal(abc.as_ptr(), abx.as_ptr(), 4) }, 0);
         // n == 0 with two non-NULL strings → 1 (compared nothing).
+        // SAFETY: controlled test invocation of `curl_strnequal`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         assert_eq!(unsafe { curl_strnequal(abc.as_ptr(), abx.as_ptr(), 0) }, 1);
         // "ab" vs "abc" within n=3: shorter string ends first → 0.
+        // SAFETY: controlled test invocation of `curl_strnequal`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         assert_eq!(unsafe { curl_strnequal(ab.as_ptr(), abc2.as_ptr(), 3) }, 0);
         // "ab" vs "abc" within n=2: equal prefix → 1.
+        // SAFETY: controlled test invocation of `curl_strnequal`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         assert_eq!(unsafe { curl_strnequal(ab.as_ptr(), abc2.as_ptr(), 2) }, 1);
         // Both NULL with non-zero n → 1.
         // SAFETY: NULL pointers are explicitly supported.
         assert_eq!(unsafe { curl_strnequal(ptr::null(), ptr::null(), 5) }, 1);
         // Both NULL with n == 0 → 0.
+        // SAFETY: controlled test invocation of `curl_strnequal`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         assert_eq!(unsafe { curl_strnequal(ptr::null(), ptr::null(), 0) }, 0);
         // One NULL → 0.
+        // SAFETY: controlled test invocation of `curl_strnequal`: the handle and pointer arguments are valid for this call (NULL only where the bad-argument path is intentionally exercised).
         assert_eq!(unsafe { curl_strnequal(abc.as_ptr(), ptr::null(), 3) }, 0);
     }
 }

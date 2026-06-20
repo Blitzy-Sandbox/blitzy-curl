@@ -56,6 +56,45 @@
 //! the workspace, never for this user-facing trace. This is the documented,
 //! chosen mechanism.
 //!
+//! # Sensitive-data handling — no redaction, by curl parity (CWE-532 review)
+//!
+//! This callback **intentionally performs no redaction** of credential-bearing
+//! headers (`Authorization`, `Proxy-Authorization`, `Cookie`/`Set-Cookie`,
+//! bearer tokens, `WWW-Authenticate` challenges) or of request/response
+//! bodies. It renders every traced byte verbatim. This is the **correct,
+//! required** behavior, not an oversight, for three reasons:
+//!
+//! 1. **Byte-for-byte parity is mandatory (AAP §0.8.2 / §0.7.3).** curl's
+//!    `-v` / `--trace` / `--trace-ascii` output is diffed byte-for-byte by the
+//!    unmodified curl 8.x regression suite (e.g. the `tests/data` definitions
+//!    that assert exact `> Authorization: ...` / `< Set-Cookie: ...` trace
+//!    lines). curl itself emits these lines unredacted; introducing redaction
+//!    here would *diverge* from curl, corrupt the diffed bytes, and fail the
+//!    binary success condition. The behavioral-preservation rules forbid any
+//!    change to observable trace output beyond what memory safety requires.
+//!
+//! 2. **Trace output is an explicit, local debugging opt-in — not a network or
+//!    log channel.** It is produced only when the user passes `-v` / `--trace*`
+//!    and is written to the user's own terminal (`-`/`%`) or to a file the user
+//!    named. It is never transmitted over the network and is never enabled by
+//!    default. The user has deliberately requested the full wire bytes precisely
+//!    *so they can see* the headers, including auth — redacting them would
+//!    defeat the documented purpose of `--trace` (debugging authentication and
+//!    cookie exchanges is one of its primary uses).
+//!
+//! 3. **This matches curl's documented behavior and threat model.** curl's man
+//!    page warns that trace files can contain private data (passwords, cookies,
+//!    tokens) and that the user is responsible for handling them; the
+//!    responsibility for protecting a user-requested trace dump rests with the
+//!    user/operator, exactly as in upstream curl. Callers that must avoid
+//!    persisting secrets should not enable tracing (or should direct it to a
+//!    protected sink).
+//!
+//! In short: **redaction is deliberately absent to preserve curl parity.** Any
+//! future requirement to scrub secrets from traces must be implemented as an
+//! explicit, opt-in mode that is OFF by default (so the parity suite is
+//! unaffected when it is not requested), never as unconditional redaction here.
+//!
 //! # Output-stream resolution
 //!
 //! curl resolves the trace target once from `global->trace_dump`: `"-"` selects

@@ -37,8 +37,6 @@
 //! C ORACLE (read-only reference): `lib/smtp.c`, `lib/smtp.h`,
 //! `lib/curl_sasl.h`.
 
-use std::path::PathBuf;
-
 use crate::auth::sasl::{
     decode_mech, Sasl, SaslParams, SaslProgress, SaslProto, SASL_AUTH_DEFAULT, SASL_AUTH_NONE,
     SASL_FLAG_BASE64,
@@ -50,10 +48,9 @@ use crate::conn::{
 };
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
-use crate::protocols::pingpong::{PingPong, PingPongProtocol};
+use crate::protocols::pingpong::{tls_config_from_easy, PingPong, PingPongProtocol};
 use crate::protocols::{Protocol, ProtocolTransfer, Scheme, TransferDirection};
 use crate::setopt::StrId;
-use crate::tls::TlsConfig;
 use crate::url::{CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_URLDECODE};
 
 // ===========================================================================
@@ -425,42 +422,6 @@ fn local_domain() -> String {
         }
     }
     "localhost".to_string()
-}
-
-/// Build a [`TlsConfig`] from the easy handle's SSL options, for the
-/// `STARTTLS` upgrade.
-///
-/// Mirrors curl's mapping of `data->set.ssl` onto the TLS backend: the verify
-/// flags (`CURLOPT_SSL_VERIFYPEER`/`VERIFYHOST`/`VERIFYSTATUS`), the version
-/// window, the raw `CURLSSLOPT_*` bits, and the certificate/CA/cipher string
-/// options. Certificate validation stays **on by default** (the [`TlsConfig`]
-/// defaults), so `STARTTLS` is secure unless the user explicitly disabled it.
-fn tls_config_from_easy(data: &Easy) -> TlsConfig {
-    let mut cfg = TlsConfig::default();
-    let p = &data.set.ssl.primary;
-
-    cfg.verify_peer = p.verifypeer;
-    cfg.verify_host = p.verifyhost;
-    cfg.verify_status = p.verifystatus;
-    cfg.version = u32::from(p.version);
-    cfg.version_max = p.version_max;
-    cfg.sessionid = p.cache_session;
-    cfg.set_ssl_options(u32::from(p.ssl_options));
-
-    cfg.ca_file = data.set.str(StrId::SslCafile).map(PathBuf::from);
-    cfg.ca_path = data.set.str(StrId::SslCapath).map(PathBuf::from);
-    cfg.crl_file = data.set.str(StrId::SslCrlfile).map(PathBuf::from);
-    cfg.issuer_cert = data.set.str(StrId::SslIssuercert).map(PathBuf::from);
-    cfg.cipher_list = data.set.str(StrId::SslCipherList).map(String::from);
-    cfg.cipher_list13 = data.set.str(StrId::SslCipher13List).map(String::from);
-    cfg.client_cert = data.set.str(StrId::Cert).map(PathBuf::from);
-    cfg.client_key = data.set.str(StrId::Key).map(PathBuf::from);
-    cfg.key_passwd = data.set.str(StrId::KeyPasswd).map(String::from);
-    cfg.cert_type = data.set.str(StrId::CertType).map(String::from);
-    cfg.key_type = data.set.str(StrId::KeyType).map(String::from);
-    cfg.pinned_pubkey = data.set.str(StrId::SslPinnedPublicKey).map(String::from);
-
-    cfg
 }
 
 /// Drive [`PingPong::readresp`] to a complete response, returning the numeric

@@ -1053,6 +1053,7 @@ unsafe fn build_post_node(form: &FormInfo, ctype: Option<&[u8]>) -> Option<*mut 
         if p.is_null() {
             // SAFETY: free the owned name allocated above (if any).
             if name_owned {
+                // SAFETY: `name_ptr` was allocated by this crate above and is freed exactly once here.
                 unsafe { free_owned(name_ptr) };
             }
             return None;
@@ -1353,11 +1354,17 @@ unsafe fn free_post_chain(form: *mut curl_httppost) {
         // Copy out every field we need before any free, so no read touches freed
         // memory. SAFETY: `cur` is a live node of the chain.
         let next = unsafe { (*cur).next };
+        // SAFETY: `cur` is non-null and points to a live, valid node here; `more` is a `Copy` value read out before the node is freed.
         let more = unsafe { (*cur).more };
+        // SAFETY: `cur` is non-null and points to a live, valid node here; `flags` is a `Copy` value read out before the node is freed.
         let flags = unsafe { (*cur).flags };
+        // SAFETY: `cur` is non-null and points to a live, valid node here; `name` is a `Copy` value read out before the node is freed.
         let name = unsafe { (*cur).name };
+        // SAFETY: `cur` is non-null and points to a live, valid node here; `contents` is a `Copy` value read out before the node is freed.
         let contents = unsafe { (*cur).contents };
+        // SAFETY: `cur` is non-null and points to a live, valid node here; `contenttype` is a `Copy` value read out before the node is freed.
         let contenttype = unsafe { (*cur).contenttype };
+        // SAFETY: `cur` is non-null and points to a live, valid node here; `showfilename` is a `Copy` value read out before the node is freed.
         let showfilename = unsafe { (*cur).showfilename };
 
         if !more.is_null() {
@@ -1520,6 +1527,7 @@ unsafe fn c_post_to_core(c: *const curl_httppost) -> Option<Box<core::mime::Http
     // recurse into the additional files and the next sibling
     // SAFETY: `more`/`next` are NULL or live sub-chains.
     hp.more = unsafe { c_post_to_core(cn.more) };
+    // SAFETY: `cn.next` is NULL or a live `curl_httppost` sub-chain owned by this crate (read only).
     hp.next = unsafe { c_post_to_core(cn.next) };
 
     Some(Box::new(hp))
@@ -1627,6 +1635,7 @@ mod tests {
         // SAFETY: `arg` is the `&mut Vec<u8>` the test handed to curl_formget;
         // `buf`/`len` describe a readable chunk per the callback contract.
         let sink = unsafe { &mut *(arg as *mut Vec<u8>) };
+        // SAFETY: `buf as *const u8` points to at least `len` initialized, readable bytes for the duration of the borrow.
         let chunk = unsafe { slice::from_raw_parts(buf as *const u8, len) };
         sink.extend_from_slice(chunk);
         len

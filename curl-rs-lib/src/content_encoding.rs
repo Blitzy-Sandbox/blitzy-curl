@@ -243,7 +243,7 @@ impl ContentEncoding {
 /// * After the underlying stream signals completion, subsequent
 ///   [`write`](Unencoder::write) calls are accepted and ignored (trailing bytes
 ///   past a self-terminating stream are tolerated, as in curl).
-pub trait Unencoder {
+pub trait Unencoder: Send {
     /// The canonical curl name of this decoder (for tracing/introspection).
     fn name(&self) -> &'static str;
 

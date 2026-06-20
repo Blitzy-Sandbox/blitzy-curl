@@ -262,7 +262,12 @@ impl std::ops::BitOrAssign for ClientWriteType {
 /// Returning any value other than the supplied length (and not a sentinel) is a
 /// short write and fails the transfer with [`CurlError::WriteError`], matching
 /// `cw_out_cb_write` in `lib/cw-out.c`.
-pub trait WriteCallbacks {
+///
+/// The [`Send`] supertrait lets a transfer that uses a sink be spawned on the
+/// multi handle's multi-thread Tokio runtime (`curl_multi_perform`); a front-end
+/// that bridges raw C callbacks holds the function/userdata as integer addresses
+/// (which are `Send`) and casts them back at the call site.
+pub trait WriteCallbacks: Send {
     /// Deliver body bytes (`CURLOPT_WRITEFUNCTION`, default writes to the chosen
     /// output / stdout). A body sink is always considered present.
     fn write_body(&mut self, data: &[u8]) -> usize;
@@ -809,7 +814,10 @@ impl Default for ClientWriter {
 // ===========================================================================
 
 /// The user-supplied upload source (`CURLOPT_READFUNCTION`).
-pub trait ReadCallback {
+///
+/// The [`Send`] supertrait lets a transfer that uses a source be spawned on the
+/// multi handle's multi-thread Tokio runtime (see [`WriteCallbacks`]).
+pub trait ReadCallback: Send {
     /// Fill `buf` with up to `buf.len()` bytes of upload data and return the
     /// count, `0` to signal end-of-input, or one of the sentinels
     /// [`CURL_READFUNC_ABORT`] / [`CURL_READFUNC_PAUSE`]. Returning more than

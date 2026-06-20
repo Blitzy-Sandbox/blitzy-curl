@@ -42,11 +42,11 @@ use crate::conn::connect::tls_factory;
 use crate::conn::{BoxFuture, Connection, Curl_conn_connect, Curl_conn_is_ssl, FIRSTSOCKET};
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
-use crate::protocols::pingpong::{PingPong, PingPongProtocol};
+use crate::protocols::pingpong::{tls_config_from_easy, PingPong, PingPongProtocol};
 use crate::protocols::{
     Protocol, ProtocolTransfer, Scheme, TransferDirection, SCHEME_POP3, SCHEME_POP3S,
 };
-use crate::tls::TlsConfig;
+use crate::setopt::StrId;
 use crate::url::{CurlUPart, CurlUrl, CURLU_GUESS_SCHEME, CURLU_NON_SUPPORT_SCHEME};
 use crate::util::md5;
 use crate::util::sendf;
@@ -1268,17 +1268,23 @@ impl Pop3Conn {
             let host = conn.remote_host.clone();
             let port = conn.remote_port;
 
-            // Translate the handle's TLS settings (validation on by default).
-            let mut tls_config = TlsConfig::new();
-            tls_config.verify_peer = data.set.ssl.primary.verifypeer;
-            tls_config.verify_host = data.set.ssl.primary.verifyhost;
-            tls_config.verify_status = data.set.ssl.primary.verifystatus;
-            tls_config.version = u32::from(data.set.ssl.primary.version);
-            tls_config.version_max = data.set.ssl.primary.version_max;
+            // Translate the handle's full TLS settings (validation on by
+            // default) via the shared ping-pong mapping, so `STLS` honours the
+            // same handle options as SMTP/IMAP/FTP explicit-TLS upgrades and as
+            // an implicit `pop3s://` connection: `--insecure`, `--cacert`,
+            // `--pinnedpubkey`, client certificates, cipher and TLS-version
+            // selection all take effect (previously only the verify flags and
+            // version window were propagated).
+            let tls_config = tls_config_from_easy(data);
+            // The public-key pin (`CURLOPT_PINNEDPUBLICKEY`) is enforced by the
+            // TLS filter via this explicit argument (the pin check runs in
+            // `tls::connect`), exactly as SMTP/IMAP/FTP thread it — this is what
+            // makes `--pinnedpubkey` take effect on the `STLS` upgrade.
+            let pinned = data.set.str(StrId::SslPinnedPublicKey).map(String::from);
 
             // POP3-over-TLS uses no ALPN. Add the filter at the chain top so it
             // wraps the existing TCP transport (C `Curl_ssl_cfilter_add`).
-            let factory = tls_factory(tls_config, host, port, None, Vec::new());
+            let factory = tls_factory(tls_config, host, port, pinned, Vec::new());
             conn.cfilter[FIRSTSOCKET].add_filter(factory());
         }
 

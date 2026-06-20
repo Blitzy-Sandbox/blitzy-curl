@@ -34,16 +34,19 @@
 //!   curl's `CURL_DISABLE_IPFS` build, an `ipfs://` / `ipns://` URL is passed
 //!   through [`proto_token`] unchanged (it resolves to the no-match scheme
 //!   `"?"`), so the transfer fails cleanly rather than being rewritten.
-//! * **Function-pointer callbacks** (`gen_cb_setopts` /
-//!   `gen_trace_setopts` write/read/seek/header/progress/debug callbacks, the
-//!   `sockopt`/`opensocket` callbacks) live in `crate::callbacks` — a module
-//!   that is neither part of this file's locked dependency set nor present in
-//!   the workspace yet. This module therefore programs every safe **data-only**
-//!   half it can (the user-data pointers, `CURLOPT_NOPROGRESS`,
-//!   `CURLOPT_VERBOSE`, …) and defers the `*FUNCTION` registrations to the
-//!   integration layer (`operate.rs`), documented inline at each site. The
-//!   validation guidance explicitly permits options that are "intentionally
-//!   deferred with justification".
+//! * **Function-pointer callbacks** (the `gen_cb_setopts` /
+//!   `gen_trace_setopts` write/read/seek/header/progress/debug callbacks) are
+//!   implemented and unit-tested in [`crate::callbacks`]. This module programs
+//!   every safe **data-only** half (the user-data pointers, `CURLOPT_NOPROGRESS`,
+//!   `CURLOPT_VERBOSE`, …); it does **not** register the matching `*FUNCTION`
+//!   halves through the C-ABI setter, because that setter stores a raw
+//!   function-pointer address that only `unsafe` code can invoke and this crate
+//!   is `#![forbid(unsafe_code)]` (AAP §0.7.1). The callback bodies instead reach
+//!   the transfer through the core's Rust-native
+//!   [`WriteCallbacks`](curl_rs_lib::transfer::WriteCallbacks) /
+//!   [`ReadCallback`](curl_rs_lib::transfer::ReadCallback) bridge as part of the
+//!   transfer-execution integration (AAP §0.8.4 steps 11–13); see
+//!   [`gen_cb_setopts`] for the per-site detail.
 //!
 //! # TLS (AAP §0.8.1)
 //!
@@ -1142,17 +1145,31 @@ fn gen_trace_setopts(global: &GlobalConfig, easy: &mut Easy) -> Result<(), CurlE
 
 /// Wires the transfer callbacks' data pointers and progress mode.
 ///
-/// Port of `gen_cb_setopts()`. The write/read/seek/header/progress/debug
-/// **function pointers** (`tool_write_cb`, `tool_read_cb`, `tool_seek_cb`,
-/// `tool_header_cb`, `tool_progress_cb`, `tool_readbusy_cb`) are defined in the
-/// deferred `crate::callbacks` module — not part of this file's locked
-/// dependency set and not yet present in the workspace — so they are registered
-/// by the integration layer (`operate.rs`), not here. This function programs
-/// every safe **data-only** half: the user-data pointers (all of which are the
-/// per-transfer record, curl's `per`) and `CURLOPT_NOPROGRESS` for the stdin
-/// read-busy case. Holding the per-transfer address as an opaque
-/// [`CDataPtr`](curl_rs_lib::setopt::CDataPtr) is a safe operation; only the
-/// FFI/integration layer ever dereferences it, and `per` outlives the transfer.
+/// Port of `gen_cb_setopts()`. This function programs every safe **data-only**
+/// half: the user-data pointers (all of which are the per-transfer record,
+/// curl's `per`) and `CURLOPT_NOPROGRESS` for the stdin read-busy case. Holding
+/// the per-transfer address as an opaque
+/// [`CDataPtr`](curl_rs_lib::setopt::CDataPtr) is a safe operation.
+///
+/// # Where the matching function-pointer halves are registered
+///
+/// The write/read/seek/header/progress/debug **callback bodies**
+/// (`crate::callbacks::write::write_cb`, `read::tool_read_cb`,
+/// `seek::tool_seek_cb`, `header::tool_header_cb`, `progress::tool_progress_cb`,
+/// `debug::tool_debug_cb`) are fully implemented and unit-tested in the
+/// [`crate::callbacks`] module — they are present in the workspace. They are
+/// **not** registered through the C-ABI `CURLOPT_*FUNCTION` setter here for a
+/// structural reason: that setter stores a raw function-pointer address
+/// ([`CCallback`](curl_rs_lib::setopt::CCallback), a `usize`) that only an
+/// `unsafe` call site can later invoke, and this CLI crate is
+/// `#![forbid(unsafe_code)]` (AAP §0.7.1), so it cannot produce such an address.
+/// Instead these callbacks reach the transfer through the core's Rust-native
+/// callback bridge — the [`WriteCallbacks`](curl_rs_lib::transfer::WriteCallbacks)
+/// / [`ReadCallback`](curl_rs_lib::transfer::ReadCallback) trait surface the
+/// transfer engine drives — which is established as part of the
+/// transfer-execution integration (AAP §0.8.4 steps 11–13). Until that bridge
+/// is in place the function halves are intentionally left unset here rather than
+/// registered through an `unsafe` C-ABI shim that the AAP forbids.
 fn gen_cb_setopts(
     global: &GlobalConfig,
     per: &PerTransfer,
@@ -1167,10 +1184,13 @@ fn gen_cb_setopts(
     my_setopt(easy, O::CURLOPT_SEEKDATA, OptionValue::Ptr(per_ptr))?;
     my_setopt(easy, O::CURLOPT_HEADERDATA, OptionValue::Ptr(per_ptr))?;
 
-    // NOTE (deferred): the matching CURLOPT_WRITEFUNCTION / READFUNCTION /
-    // SEEKFUNCTION / HEADERFUNCTION / XFERINFOFUNCTION registrations require
-    // the `crate::callbacks` function pointers and are performed by the
-    // integration layer once that module lands.
+    // The matching CURLOPT_WRITEFUNCTION / READFUNCTION / SEEKFUNCTION /
+    // HEADERFUNCTION / XFERINFOFUNCTION / DEBUGFUNCTION halves are not set here:
+    // the `crate::callbacks` bodies are present and tested, but they cannot be
+    // registered as C-ABI function-pointer addresses from this
+    // `#![forbid(unsafe_code)]` crate. They are routed to the transfer through
+    // the core's Rust-native WriteCallbacks/ReadCallback bridge as part of the
+    // transfer-execution integration (see this function's doc comment).
 
     let progress_bar =
         global.progressmode == abi::CURL_PROGRESS_BAR && !global.noprogress && !global.silent;

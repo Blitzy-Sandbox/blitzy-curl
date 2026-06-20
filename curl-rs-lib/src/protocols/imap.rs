@@ -77,12 +77,11 @@ use crate::conn::{
 };
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
-use crate::protocols::pingpong::{PingPong, PingPongProtocol, PpTransfer};
+use crate::protocols::pingpong::{tls_config_from_easy, PingPong, PingPongProtocol, PpTransfer};
 use crate::protocols::{
     Protocol, ProtocolTransfer, Scheme, TransferDirection, CURLPROTO_IMAPS, DEFAULT_PORT_IMAPS,
 };
 use crate::setopt::{HttpReq, StrId};
-use crate::tls::TlsConfig;
 use crate::url::{CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_URLDECODE};
 use crate::util::dynbuf::DYN_IMAP_CMD;
 use crate::util::timeval::curlx_now;
@@ -1674,12 +1673,23 @@ async fn perform_upgrade_tls(
     conn: &mut Connection,
 ) -> Result<()> {
     if !Curl_conn_is_ssl(conn, FIRSTSOCKET) {
-        // curl's default TLS configuration keeps certificate validation ON by
-        // default (`verify_peer`/`verify_host`), satisfying the security
+        // Build the upgrade's TLS config from the easy handle's SSL options —
+        // the same shared mapping SMTP/POP3/FTP use for their explicit-TLS
+        // upgrades (C derives the connection `ssl_config` from `data->set.ssl`
+        // before calling `Curl_ssl_cfilter_add`). This propagates `--insecure`
+        // (`verifypeer`), a custom CA (`--cacert`/`--capath`), a pinned key
+        // (`--pinnedpubkey`), client certificates and the TLS version window to
+        // the STARTTLS handshake. Certificate validation stays ON by default
+        // (the helper starts from `TlsConfig::default`), satisfying the security
         // mandate. IMAP advertises no ALPN protocol, so the list is empty.
         let host = conn.remote_host.clone();
         let port = conn.remote_port;
-        let cf = create_tls_filter(TlsConfig::default(), host, port, None, Vec::new());
+        // The public-key pin (`CURLOPT_PINNEDPUBLICKEY`) is enforced by the TLS
+        // filter through this explicit argument (the pin check runs in
+        // `tls::connect`), exactly as SMTP/FTP thread it; passing it here is what
+        // makes `--pinnedpubkey` actually take effect on the STARTTLS handshake.
+        let pinned = data.set.str(StrId::SslPinnedPublicKey).map(String::from);
+        let cf = create_tls_filter(tls_config_from_easy(data), host, port, pinned, Vec::new());
         Curl_conn_cf_add(conn, FIRSTSOCKET, cf);
         // C: `conn->scheme = &Curl_scheme_imaps`. The freshly-added filter
         // already makes `Curl_conn_is_ssl` report true; update the descriptor so

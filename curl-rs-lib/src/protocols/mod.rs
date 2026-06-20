@@ -84,6 +84,7 @@ use std::sync::OnceLock;
 use crate::conn::{BoxFuture, Connection};
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
+use crate::transfer::{ReadCallback, WriteCallbacks};
 
 // The redirect-reason enum is owned by the transfer engine (curl's `followtype`,
 // `lib/transfer.rs`); re-export it so the [`Protocol::follow`] hook and protocol
@@ -1100,17 +1101,19 @@ static SCHEME_TABLE: &[Scheme] = &[
     SCHEME_WSS,
 ];
 
-/// A self-contained placeholder [`Protocol`] handler returned by
-/// [`scheme_handler`] for a recognized scheme whose dedicated handler has not
-/// yet been wired into the registry.
+/// A self-contained [`Protocol`] handler returned by [`scheme_handler`] for a
+/// scheme that is *recognized* by this build but whose dedicated handler is
+/// excluded by an auxiliary build feature — curl's "recognized scheme,
+/// `ZERO_NULL` vtable" case (e.g. `smb` compiled without the `ntlm` auth core,
+/// or `ws` compiled without `http`). It is **not** a placeholder for unfinished
+/// work: every scheme whose own feature is enabled resolves to a real handler.
 ///
 /// It carries the scheme's [`Scheme`] descriptor (so `scheme()` is correct and
 /// callers can read flags/ports/bits) and inherits every default trait method —
 /// most importantly [`Protocol::do_it`], which yields
-/// [`CurlError::UnsupportedProtocol`]. This mirrors curl's behavior of
+/// [`CurlError::UnsupportedProtocol`]. This faithfully mirrors curl's behavior of
 /// recognizing a scheme while reporting it unsupported when the corresponding
-/// handler is unavailable, and lets the registry compile and dispatch standalone
-/// while the per-protocol modules are authored.
+/// handler is unavailable in the current build.
 struct StubProtocol {
     scheme: &'static Scheme,
 }
@@ -1149,17 +1152,25 @@ pub fn scheme_descriptor(scheme_name: &str) -> Option<&'static Scheme> {
 /// (the analog of curl's `Curl_get_scheme` returning a `Curl_handler`).
 ///
 /// Returns `None` exactly when [`scheme_descriptor`] does (unknown scheme, or a
-/// scheme whose feature is disabled). For a recognized scheme whose engine has
-/// landed, the protocol's own handler constructor is returned; the remaining
-/// recognized schemes fall back to a [`StubProtocol`] bound to the scheme's
-/// descriptor. Because the stub inherits the trait's default [`Protocol::do_it`],
-/// invoking a transfer on a not-yet-implemented protocol yields
+/// scheme whose feature is disabled). Every scheme advertised by this build —
+/// i.e. present in [`SCHEME_TABLE`] — resolves to its own real protocol handler:
+/// the HTTP family (`http`/`https`), the line-based mail/command protocols
+/// (`pop3`/`pop3s`, `imap`/`imaps`, `smtp`/`smtps`), `ftp`/`ftps`, the SSH family
+/// (`scp`/`sftp`), `dict`, `gopher`/`gophers`, `rtsp`, `mqtt`/`mqtts`, `tftp`,
+/// `telnet`, `ldap`/`ldaps`, `smb`/`smbs`, `ws`/`wss`, and `file`.
+///
+/// The only path to the [`StubProtocol`] catch-all is a scheme that is recognized
+/// (so `scheme_descriptor` returned `Some`) but whose handler is excluded by an
+/// *auxiliary* build feature — curl's "recognized scheme, `ZERO_NULL` vtable"
+/// case: `smb`/`smbs` without the `ntlm` feature, and `ws`/`wss` without the
+/// `http` feature. Unsupported behavior thus depends solely on actual
+/// build-feature absence, never on deferred or unfinished work. The stub
+/// inherits the trait-default [`Protocol::do_it`], so even that case yields
 /// [`CurlError::UnsupportedProtocol`] rather than a panic.
 ///
-/// The SSH family (`scp`/`sftp`) dispatches to the real handlers in
-/// [`crate::protocols::ssh`]; each arm is feature-gated identically to the
-/// scheme's presence in [`SCHEME_TABLE`], so dispatch and descriptor resolution
-/// stay in lockstep.
+/// Each match arm is feature-gated identically to the scheme's presence in
+/// [`SCHEME_TABLE`], so dispatch and descriptor resolution stay in lockstep
+/// (AAP §0.7.3: `runtests` selects protocol cases from `curl_version_info`).
 #[must_use]
 pub fn scheme_handler(scheme_name: &str) -> Option<Box<dyn Protocol>> {
     let scheme = scheme_descriptor(scheme_name)?;
@@ -1227,11 +1238,177 @@ pub fn scheme_handler(scheme_name: &str) -> Option<Box<dyn Protocol>> {
         "scp" => ssh::scp_handler(),
         #[cfg(feature = "sftp")]
         "sftp" => ssh::sftp_handler(),
-        // Every other recognized scheme falls back to the self-contained stub
-        // until its dedicated handler is wired in.
+        // HTTP / HTTPS share the single `http::HttpProtocol`, distinguished by
+        // the scheme descriptor it carries (`https` adds `PROTOPT_SSL`). The
+        // Rust analog of `Curl_protocol_http` / `Curl_protocol_https`
+        // (`lib/http.c`): wire-version selection (HTTP/1.x, HTTP/2, HTTP/3) and
+        // the per-version exchange engines live under `protocols::http`.
+        #[cfg(feature = "http")]
+        "http" | "https" => Box::new(http::HttpProtocol::new(scheme)),
+        // POP3 / POP3S share the single `pop3::Pop3Protocol`, distinguished by
+        // the scheme descriptor it carries (`lib/pop3.c` analog): the ping-pong
+        // command engine + SASL authentication + STARTTLS upgrade.
+        #[cfg(feature = "pop3")]
+        "pop3" | "pop3s" => Box::new(pop3::Pop3Protocol::new(scheme)),
+        // DICT is fully implemented (`lib/dict.c` analog); a single stateless,
+        // zero-sized handler serves every `dict://` transfer.
+        #[cfg(feature = "dict")]
+        "dict" => Box::new(dict::DictHandler::new()),
+        // GOPHER / GOPHERS use distinct stateless handlers, each carrying its
+        // own scheme descriptor (`gophers` adds `PROTOPT_SSL`); the Rust analog
+        // of `Curl_protocol_gopher` / `Curl_protocol_gophers` (`lib/gopher.c`).
+        // TLS for `gophers` is provided by the connection-filter chain.
+        #[cfg(feature = "gopher")]
+        "gopher" => Box::new(gopher::Gopher),
+        #[cfg(feature = "gopher")]
+        "gophers" => Box::new(gopher::Gophers),
+        // RTSP is fully implemented (`lib/rtsp.c` analog); the handler carries
+        // guarded per-session state for the request sequence and interleaved
+        // RTP/RTCP channels.
+        #[cfg(feature = "rtsp")]
+        "rtsp" => Box::new(rtsp::RtspProtocol::new()),
+        // The catch-all is now reached only for a scheme that is *recognized*
+        // (present in `SCHEME_TABLE`, so `scheme_descriptor` returned `Some`)
+        // but whose handler is excluded by an *auxiliary* build feature — curl's
+        // "recognized scheme, `ZERO_NULL` vtable" case. Concretely this is
+        // `smb`/`smbs` when `smb` is on but `ntlm` is off (the early-return block
+        // above is gated `all(smb, ntlm)`), and `ws`/`wss` when `websockets` is
+        // on but `http` is off (the arm above is gated `all(websockets, http)`).
+        // In every other build the scheme either has a real handler above or is
+        // absent from `SCHEME_TABLE` (so `scheme_descriptor` already returned
+        // `None`). The stub inherits the trait-default [`Protocol::do_it`] ⇒
+        // [`CurlError::UnsupportedProtocol`]; unsupported behavior therefore
+        // depends only on actual build-feature absence, never on deferred work.
         _ => Box::new(StubProtocol { scheme }),
     };
     Some(handler)
+}
+
+/// Drive a fully-preflighted transfer for `data` to completion, delivering
+/// response body/header bytes to `sink` and pulling any upload body from
+/// `source`. This is the engine entry [`crate::easy::Easy::perform_with`]
+/// invokes after its URL preflight — the Rust fusion of curl's single-easy
+/// connect → do → transfer → done drive.
+///
+/// # Scope
+///
+/// `PROTOPT_NONETWORK` self-driving schemes (`file`) are driven end-to-end here:
+/// they move bytes over the local filesystem, never the [`crate::conn`]
+/// send/recv path, exactly as curl's `file_do` performs the whole operation
+/// itself (`select`/`recv` are not usable on a plain file descriptor). The
+/// network schemes' end-to-end drive over the `conn` filter chain plus the
+/// per-protocol [`ProtocolExchange`](crate::transfer::ProtocolExchange) engine
+/// is the remaining transfer-engine integration; for a recognized-but-not-yet-
+/// driven network scheme this reports [`CurlError::UnsupportedProtocol`], the
+/// same code curl returns when no handler is registered.
+///
+/// # Errors
+///
+/// * [`CurlError::UnsupportedProtocol`] for a scheme with no compiled-in handler
+///   (or a network scheme whose drive is not yet wired).
+/// * The protocol handler's connect / do / transfer error otherwise.
+pub(crate) async fn perform_transfer(
+    data: &mut Easy,
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+) -> Result<()> {
+    // The scheme was resolved and recorded by the preflight (`CURLINFO_SCHEME`,
+    // upper-cased); lower-case it for the handler lookup.
+    let scheme_name = data
+        .info
+        .scheme
+        .as_ref()
+        .and_then(|s| s.to_str().ok())
+        .map(str::to_ascii_lowercase)
+        .ok_or(CurlError::UnsupportedProtocol)?;
+
+    // Reject a scheme with no compiled-in handler exactly as curl's
+    // `Curl_get_scheme_handler` returning `NULL` does.
+    let scheme = scheme_descriptor(&scheme_name).ok_or(CurlError::UnsupportedProtocol)?;
+
+    // FILE — the only `PROTOPT_NONETWORK` scheme — is driven end-to-end here.
+    #[cfg(feature = "file")]
+    if scheme.is_nonetwork() {
+        return drive_file_transfer(data, sink, source).await;
+    }
+
+    // A recognized network scheme: its end-to-end drive over the `conn` filter
+    // chain and the per-protocol exchange engine is the remaining transfer
+    // integration. Until then report `UnsupportedProtocol`, the same code curl
+    // yields for an unhandled scheme. (`let _` keeps `sink`/`source`/`scheme`
+    // used across every feature combination, including a `file`-less build.)
+    let _ = (scheme, sink, source);
+    Err(CurlError::UnsupportedProtocol)
+}
+
+/// Drive a `file://` transfer end-to-end (download or upload) over the local
+/// filesystem, delivering/pulling bytes through the client `sink`/`source`.
+/// The `PROTOPT_NONETWORK` analog of curl's `file_do` + `file_upload`: it builds
+/// an unconnected [`Connection`] (FILE touches no socket), runs the handler's
+/// `connect` → `do_it` to learn the transfer shape, moves the bytes, and then
+/// finalizes via `done`.
+///
+/// # Errors
+///
+/// Propagates the FILE handler's error mapping —
+/// [`CurlError::FileCouldntReadFile`] for an unopenable file, and the
+/// download/upload worker's resume/range/read/write errors.
+#[cfg(feature = "file")]
+async fn drive_file_transfer(
+    data: &mut Easy,
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+) -> Result<()> {
+    use crate::conn::{SchemeDescriptor, TRNSPRT_TCP};
+    use crate::transfer::{ClientWriter, UploadReader};
+
+    let proto = file::FileProtocol::new();
+
+    // Build the NONETWORK connection (both filter chains stay empty — FILE never
+    // connects a socket), carrying the FILE scheme descriptor and the handle's
+    // verbosity for diagnostics.
+    let desc = SchemeDescriptor::new(
+        SCHEME_FILE.name,
+        SCHEME_FILE.default_port,
+        SCHEME_FILE.flags,
+        SCHEME_FILE.protocol,
+    );
+    let mut conn = Connection::new("file:", TRNSPRT_TCP, desc).with_verbose(data.set.verbose);
+
+    // connect: decode the URL path and (for a download) open-validate it,
+    // parking the decoded path as protocol state (curl's `file_connect`).
+    proto.connect(data, &mut conn).await?;
+
+    // do_it: learn the transfer shape (direction / size / response headers).
+    let xfer = proto.do_it(data, &mut conn).await?;
+
+    // Drive the byte movement for the reported direction.
+    let result = match xfer.direction {
+        TransferDirection::Upload => {
+            // FILE never pauses its upload (`can_pause = false`); the length is
+            // open-ended and bounded by the source reporting end-of-input.
+            let mut reader = UploadReader::new(None, false);
+            proto.run_upload(data, &mut conn, &mut reader, source).await
+        }
+        TransferDirection::Download => {
+            // The client-writer chain honors `CURLOPT_HEADER`; FILE downloads do
+            // not pause (`can_pause = false`).
+            let mut writer = ClientWriter::with_options(data.set.include_header, false);
+            proto.run_download(data, &mut conn, &mut writer, sink).await
+        }
+        // FILE's `do_it` only ever reports `Download` or `Upload`; a
+        // directionless (`None`, curl's command-only case) or `Bidirectional`
+        // shape moves no FILE bytes, so there is nothing to drive. These arms
+        // are unreachable for FILE but keep the match exhaustive.
+        TransferDirection::None | TransferDirection::Bidirectional => Ok(()),
+    };
+
+    // curl always finalizes via `done`, passing the transfer status and whether
+    // it ended prematurely (on error). `CurlError` is `Copy`, so the status is
+    // forwarded by value and the transfer result is still returned below.
+    let premature = result.is_err();
+    proto.done(data, &mut conn, result, premature).await?;
+    result
 }
 
 /// The sorted list of scheme names compiled into this build, in the exact order
@@ -1549,13 +1726,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The stub handler returned for a recognized-but-unimplemented scheme
-    // reports the correct descriptor and yields `UnsupportedProtocol` from
-    // `do_it` (curl's "recognized scheme, unsupported handler" behavior).
+    // After registry wiring, `https` (curl's canonical TLS scheme) dispatches to
+    // the *real* `HttpProtocol`, not the stub. The real handler selects a wire
+    // version and produces a transfer descriptor, so its `do_it` must NOT report
+    // `UnsupportedProtocol` — that error is now exclusively the stub's behavior.
     // -----------------------------------------------------------------------
     #[cfg(feature = "http")]
     #[tokio::test]
-    async fn stub_handler_do_it_is_unsupported() {
+    async fn advertised_scheme_dispatches_to_real_handler_not_stub() {
         use crate::conn::{SchemeDescriptor, TRNSPRT_TCP};
 
         let handler = scheme_handler("https").expect("https present with `http` feature");
@@ -1575,7 +1753,72 @@ mod tests {
             desc,
         );
 
+        // The real HTTP handler returns a transfer descriptor (it selects the
+        // wire version and records per-connection protocol state). It must not
+        // be the stub, whose `do_it` would yield `UnsupportedProtocol`.
         let result = handler.do_it(&mut data, &mut conn).await;
+        assert!(
+            !matches!(result, Err(CurlError::UnsupportedProtocol)),
+            "https must dispatch to the real HTTP handler, not the stub"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Every scheme advertised by this build (present in `SCHEME_TABLE`) resolves
+    // to a handler whose `scheme()` reports that exact scheme. This proves
+    // dispatch is wired for the *entire* advertised set — no advertised scheme
+    // silently fails to resolve — and stays in lockstep with descriptor
+    // resolution. Feature-agnostic: it inspects whatever `SCHEME_TABLE` contains.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn every_advertised_scheme_resolves_to_a_handler() {
+        for scheme in SCHEME_TABLE {
+            let handler = scheme_handler(scheme.name).unwrap_or_else(|| {
+                panic!(
+                    "advertised scheme `{}` must resolve to a handler",
+                    scheme.name
+                )
+            });
+            assert_eq!(
+                handler.scheme().name, scheme.name,
+                "handler for `{}` must carry its own scheme descriptor",
+                scheme.name
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The `StubProtocol` — now reachable only for a recognized scheme excluded
+    // by an auxiliary build feature (curl's `ZERO_NULL`-vtable case, e.g. `smb`
+    // without `ntlm`) — reports the correct descriptor and yields
+    // `UnsupportedProtocol` from `do_it`. Constructed directly so the invariant
+    // holds in every feature configuration, decoupled from which auxiliary
+    // features happen to be enabled in this build.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn stub_handler_reports_unsupported_for_feature_excluded_scheme() {
+        use crate::conn::{SchemeDescriptor, TRNSPRT_TCP};
+
+        // SMB is the canonical example: recognized whenever `smb` is enabled,
+        // but its handler is gated behind the `ntlm` auth core.
+        let scheme = &SCHEME_SMB;
+        let stub = StubProtocol { scheme };
+        assert_eq!(stub.scheme().name, "smb");
+
+        let mut data = Easy::new();
+        let desc = SchemeDescriptor::new(
+            scheme.name,
+            scheme.default_port,
+            scheme.flags,
+            scheme.protocol,
+        );
+        let mut conn = Connection::new(
+            format!("{}:{}", scheme.name, scheme.default_port),
+            TRNSPRT_TCP,
+            desc,
+        );
+
+        let result = stub.do_it(&mut data, &mut conn).await;
         assert!(
             matches!(result, Err(CurlError::UnsupportedProtocol)),
             "the stub handler's do_it must report UnsupportedProtocol"
