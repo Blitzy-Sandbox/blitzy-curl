@@ -239,7 +239,13 @@ enum Ack {
 /// * [`info`](ScpReporter::info) mirrors curl's `infof` (verbose-only log).
 /// * [`fail`](ScpReporter::fail) mirrors curl's `failf` (records the first
 ///   failure into the error buffer and always logs).
-trait ScpReporter {
+// `Send` is required so the SCP data-plane futures (`run_download`/`run_upload`),
+// which hold a `&mut dyn ScpReporter` across `.await`s, stay `Send` — the
+// transfer engine drives them from `perform_transfer`, whose future is spawned
+// on the multi-thread Multi runtime (`Handle::spawn` requires `Send`). The only
+// implementor, `ConnReporter`, is `Send` (it holds `&mut Option<String>` + a
+// `bool`).
+trait ScpReporter: Send {
     /// Emit a verbose informational diagnostic.
     fn info(&mut self, msg: &str);
     /// Record and emit a failure diagnostic.
@@ -663,19 +669,26 @@ impl<C: ScpChannel> ScpSession<C> {
 // ===========================================================================
 
 /// Open a session channel on the connection's authenticated `russh` session and
-/// `exec` the SCP `cmd`. The connection's [`SshConn`] is borrowed only for the
-/// open; the returned channel is owned, so the caller regains mutable access to
-/// `conn` (e.g. for diagnostics) afterwards.
+/// `exec` the SCP `cmd`. The returned channel is owned, so the caller regains
+/// access to `conn` (e.g. for diagnostics) afterwards.
+///
+/// `conn` is taken by **mutable** reference and the session handle is reached by
+/// `&mut` (`proto_state_mut` → `&mut SshConn` → `&mut Handle`). This is what
+/// keeps the future `Send` for the multi-thread Multi runtime: `&mut Connection`,
+/// `&mut SshConn`, and `&mut Handle` are all `Send` (their referents are `Send`),
+/// and `channel_open_session(&self)` reborrows to a `&Handle`, which is `Send`
+/// because `russh`'s `Handle` is `Sync` (its tokio mpsc `Sender`/`Receiver` are
+/// `Send + Sync`). A captured **shared** `&Connection` would instead be `!Send`
+/// (because `Connection` is `!Sync`) and would poison the whole transfer future.
 async fn open_exec_channel(
-    conn: &Connection,
+    conn: &mut Connection,
     cmd: &str,
 ) -> Result<russh::Channel<russh::client::Msg>> {
-    let opened = {
-        let sshc = conn.proto_state_ref::<SshConn>().ok_or(CurlError::Ssh)?;
-        let handle = sshc.handle.as_ref().ok_or(CurlError::Ssh)?;
-        handle.channel_open_session().await
+    let channel = {
+        let sshc = conn.proto_state_mut::<SshConn>().ok_or(CurlError::Ssh)?;
+        let handle = sshc.handle.as_mut().ok_or(CurlError::Ssh)?;
+        handle.channel_open_session().await.map_err(map_ssh_err)?
     };
-    let channel = opened.map_err(map_ssh_err)?;
     channel
         .exec(true, cmd.as_bytes().to_vec())
         .await

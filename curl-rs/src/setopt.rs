@@ -425,12 +425,17 @@ fn url_proto_and_rewrite(url: &str) -> &'static str {
 /// Port of `ssh_setopts()`. Sets the private/public key files, the host-key
 /// MD5/SHA256 fingerprints, and SSH compression. Unless verification is
 /// disabled (`--insecure`), it also points `CURLOPT_SSH_KNOWNHOSTS` at the
-/// user's `known_hosts`: if no path was supplied and none is found and no host
-/// fingerprint was given, curl fails initialization (`errorf` + return);
-/// otherwise it warns. The C code's caching of the discovered path back into
-/// `config->knownhosts` is an optimization that cannot be reproduced through
-/// the immutable [`OperationConfig`] borrow and is therefore omitted (it does
-/// not affect behavior).
+/// user's `known_hosts`: an explicit `--knownhosts` path takes precedence,
+/// otherwise the per-user default is discovered with
+/// [`crate::operate::findfile`]`(".ssh/known_hosts", 0)` — the same finder
+/// table curl's `findfile(".ssh/known_hosts", FALSE)` walks (honoring
+/// `CURL_HOME` / `XDG_CONFIG_HOME` / `HOME` precedence). If no path was
+/// supplied and none is found and no host fingerprint was given, curl fails
+/// initialization (`errorf` + return); otherwise it warns. The C code's
+/// caching of the discovered path back into `config->knownhosts` is an
+/// optimization that cannot be reproduced through the immutable
+/// [`OperationConfig`] borrow and is therefore omitted (it does not affect
+/// behavior).
 fn ssh_setopts(
     global: &GlobalConfig,
     config: &OperationConfig,
@@ -467,13 +472,22 @@ fn ssh_setopts(
     }
 
     if !config.insecure_ok {
-        if let Some(known) = config.knownhosts.as_deref() {
-            set_str(easy, O::CURLOPT_SSH_KNOWNHOSTS, Some(known))?;
+        // Mirror config2setopts.c:
+        //     char *known = config->knownhosts;
+        //     if(!known)
+        //       known = findfile(".ssh/known_hosts", FALSE);
+        // An explicit `--knownhosts` wins; otherwise probe the per-user default
+        // `~/.ssh/known_hosts` through the same finder table curl uses (which
+        // honors CURL_HOME / XDG_CONFIG_HOME / HOME precedence). When neither a
+        // supplied path nor a discovered file exists, curl fails init unless a
+        // host fingerprint (md5/sha256) was given, in which case it only warns.
+        let known = config
+            .knownhosts
+            .clone()
+            .or_else(|| crate::operate::findfile(".ssh/known_hosts", 0));
+        if let Some(known) = known {
+            set_str(easy, O::CURLOPT_SSH_KNOWNHOSTS, Some(known.as_str()))?;
         } else if config.hostpubmd5.is_none() && config.hostpubsha256.is_none() {
-            // curl additionally probes "~/.ssh/known_hosts" via findfile()
-            // before giving up; that filesystem search belongs to the
-            // (deferred) tool_findfile port. With neither an explicit
-            // known_hosts nor a host fingerprint, curl fails initialization.
             errorf(global, "Could not find a known_hosts file");
             return Err(CurlError::from_code(codes::CURLE_FAILED_INIT));
         } else {

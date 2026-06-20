@@ -75,14 +75,21 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use crate::conn::{BoxFuture, Connection, Curl_conn_connect, FIRSTSOCKET};
+use crate::conn::connect::{eyeballs_factory, SetupConfig};
+use crate::conn::{
+    establish_connection, BoxFuture, ConnSetup, Connection, Curl_conn_connect, SchemeDescriptor,
+    CURL_CF_SSL_DISABLE, FIRSTSOCKET, TRNSPRT_TCP,
+};
+use crate::dns::{self, DnsCache, IpVersion, ResolveParams, ResolvedAddrs};
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
 use crate::protocols::{
-    Protocol, ProtocolTransfer, Scheme, CURLPROTO_SCP, CURLPROTO_SFTP, SCHEME_SCP, SCHEME_SFTP,
+    Protocol, ProtocolTransfer, Scheme, TransferDirection, CURLPROTO_SCP, CURLPROTO_SFTP,
+    SCHEME_SCP, SCHEME_SFTP,
 };
 use crate::setopt::StrId;
-use crate::url::{CurlUPart, CurlUrl, CURLU_GUESS_SCHEME, CURLU_URLDECODE};
+use crate::transfer::{ClientWriter, ReadCallback, WriteCallbacks};
+use crate::url::{CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_GUESS_SCHEME, CURLU_URLDECODE};
 use crate::util::sendf;
 
 use russh::client::{self, AuthResult, Config, Handle, Handler, KeyboardInteractiveAuthResponse};
@@ -1543,6 +1550,173 @@ fn install_ssh_disconnect_hook(conn: &mut Connection, dead: bool) {
             }
         })
     }));
+}
+
+// ===========================================================================
+// Transfer-engine entry points — the SSH analogs of `http::perform_http` and
+// `ftp::perform_ftp`. These are the seam that `protocols::perform_transfer`
+// dispatches `scp://` / `sftp://` to (QA F4-CRIT-3): they build the plain-TCP
+// connection + happy-eyeballs filter chain (russh layers its own transport
+// crypto over the raw bytes — no rustls filter, the `CURL_CF_SSL_DISABLE`
+// contract), bring up and authenticate the SSH session (host-key verification
+// included), drive the data plane with the caller's client `sink`/`source`, then
+// finalize and tear down.
+// ===========================================================================
+
+/// Resolve the SSH control endpoint's addresses via the system resolver (SSH has
+/// no DoH path of its own), mirroring `ftp::resolve_ftp_addrs`.
+async fn resolve_ssh_addrs(
+    host: &str,
+    port: u16,
+    ipver: IpVersion,
+    verbose: bool,
+) -> Result<ResolvedAddrs> {
+    let mut cache = DnsCache::new();
+    let mut errbuf: Option<String> = None;
+    let mut params = ResolveParams::new(host, port);
+    params.ip_version = ipver;
+    params.verbose = verbose;
+    let entry = dns::resolve(&mut cache, &params, &mut errbuf).await?;
+    Ok(entry.addrs.clone())
+}
+
+/// Build and connect the plain-TCP [`Connection`] for an SSH scheme (`scp`/
+/// `sftp`), carrying the scheme descriptor and the happy-eyeballs filter chain.
+///
+/// SSH never installs a TLS filter (`CURL_CF_SSL_DISABLE`): `russh` negotiates
+/// its own transport encryption over the raw socket bytes (AAP G2). On return the
+/// `FIRSTSOCKET` chain is connected and ready for [`connect_ssh_session`].
+async fn build_ssh_connection(data: &mut Easy, scheme: &'static Scheme) -> Result<Connection> {
+    let verbose = data.set.verbose;
+
+    // Resolve the request URL: prefer a pre-parsed `CURLOPT_CURLU` handle
+    // (deposited by the FFI layer), else parse the stored URL string with curl's
+    // scheme guessing and default-port fallback.
+    let url = if let Some(uh) = data.set.uh.clone() {
+        uh
+    } else {
+        let url_str = data.url().ok_or(CurlError::UrlMalformat)?.to_string();
+        let mut parsed = CurlUrl::new();
+        parsed
+            .set(
+                CurlUPart::Url,
+                Some(&url_str),
+                CURLU_GUESS_SCHEME | CURLU_DEFAULT_PORT,
+            )
+            .map_err(|_| CurlError::UrlMalformat)?;
+        parsed
+    };
+
+    // Host (stripped of any IPv6 brackets for DNS/identity) and port (default 22).
+    let host_bracketed = url.get(CurlUPart::Host, CURLU_URLDECODE).unwrap_or_default();
+    if host_bracketed.is_empty() {
+        return Err(CurlError::UrlMalformat);
+    }
+    let host = host_bracketed
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(&host_bracketed)
+        .to_string();
+    let port = url
+        .get(CurlUPart::Port, 0)
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(scheme.default_port);
+
+    let ipver = IpVersion::from_raw(i64::from(data.set.ipver));
+    let addrs = resolve_ssh_addrs(&host, port, ipver, verbose).await?;
+
+    let desc = SchemeDescriptor::new(scheme.name, scheme.default_port, scheme.flags, scheme.protocol);
+    let mut conn =
+        Connection::new(format!("{host}:{port}"), TRNSPRT_TCP, desc).with_verbose(verbose);
+    conn.set_remote(host, port);
+
+    // Plain TCP + happy-eyeballs; no TLS filter (russh owns transport crypto).
+    let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, addrs);
+    let dispatch = ConnSetup::Default(SetupConfig::new(CURL_CF_SSL_DISABLE, false, eyeballs));
+    establish_connection(&mut conn, FIRSTSOCKET, CURL_CF_SSL_DISABLE, dispatch, true).await?;
+    Ok(conn)
+}
+
+/// Drive an `scp://` transfer end-to-end (QA F4-CRIT-3) — the SCP analog of
+/// `ftp::perform_ftp`.
+///
+/// Builds the plain-TCP connection, brings up + authenticates the SSH session
+/// (host-key verification per `--hostpubmd5`/`--hostpubsha256`/known_hosts), then
+/// runs the SCP data plane: an `scp -f` download streams the announced bytes into
+/// the client `sink`, an `scp -t` upload streams `CURLOPT_INFILESIZE` bytes from
+/// the client `source`. The byte movement and channel teardown happen in
+/// [`scp::run_download`] / [`scp::run_upload`].
+#[cfg(feature = "scp")]
+pub(crate) async fn perform_scp(
+    data: &mut Easy,
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+) -> Result<()> {
+    let handler = ScpHandler;
+    let mut conn = build_ssh_connection(data, &SCHEME_SCP).await?;
+
+    // Per-connection setup (decode URL path/creds) then bring up + authenticate
+    // the SSH transport (C `ssh_setup_connection` + `ssh_connect`).
+    handler.setup_connection(data, &mut conn).await?;
+    handler.connect(data, &mut conn).await?;
+
+    // Classify the transfer (C `scp_doing`) and drive the matching data plane
+    // with the caller's client callbacks.
+    let result = match scp::do_it(data, &mut conn).await {
+        Ok(xfer) => match xfer.direction {
+            TransferDirection::Upload => scp::run_upload(data, &mut conn, source).await,
+            // Download (and any non-upload classification) streams to the sink.
+            _ => {
+                let mut writer = ClientWriter::with_options(data.set.include_header, false);
+                scp::run_download(data, &mut conn, &mut writer, sink).await
+            }
+        },
+        Err(e) => Err(e),
+    };
+
+    // Finalize (C `scp_done`) then best-effort session teardown; the transfer
+    // result is authoritative, with any finalize error surfaced only when the
+    // transfer itself succeeded (`CurlError` is `Copy`).
+    let premature = result.is_err();
+    let done = scp::done(data, &mut conn, result, premature).await;
+    let _ = handler.disconnect(data, &mut conn, result.is_err()).await;
+    result.and(done)
+}
+
+/// Drive an `sftp://` transfer end-to-end (QA F4-CRIT-3) — the SFTP analog of
+/// `ftp::perform_ftp`.
+///
+/// Builds the plain-TCP connection, brings up + authenticates the SSH session and
+/// starts the SFTP subsystem ([`SftpHandler::connect`]), then runs the SFTP DO
+/// phase ([`sftp::run_do`]: QUOTE → FILETIME → upload/listing/download) with the
+/// caller's client `sink`/`source`, and finalizes via [`sftp::done`] (POSTQUOTE).
+#[cfg(feature = "sftp")]
+pub(crate) async fn perform_sftp(
+    data: &mut Easy,
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+) -> Result<()> {
+    let handler = SftpHandler;
+    let mut conn = build_ssh_connection(data, &SCHEME_SFTP).await?;
+
+    // Per-connection setup then bring up + authenticate the SSH transport and
+    // start the SFTP subsystem (C `ssh_setup_connection` + `ssh_connect` +
+    // `SSH_SFTP_INIT`/`REALPATH`).
+    handler.setup_connection(data, &mut conn).await?;
+    handler.connect(data, &mut conn).await?;
+
+    // Drive the SFTP DO phase with the caller's client callbacks (the genuine
+    // data plane; `sftp::do_it` is the engine classifier and pumps nothing).
+    let result = sftp::run_do(data, &mut conn, sink, source).await;
+
+    // Finalize (C `sftp_done`: POSTQUOTE + close) then best-effort teardown. The
+    // transfer result is authoritative; a finalize/POSTQUOTE error is surfaced
+    // only when the transfer itself succeeded.
+    let premature = result.is_err();
+    let done = sftp::done(data, &mut conn, result, premature).await;
+    let _ = handler.disconnect(data, &mut conn, result.is_err()).await;
+    result.and(done)
 }
 
 // ===========================================================================

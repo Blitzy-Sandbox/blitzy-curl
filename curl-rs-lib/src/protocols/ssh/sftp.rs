@@ -380,12 +380,14 @@ fn format_long_entry(name: &str, attrs: &FileAttributes) -> String {
 // Data-plane seams (default: process standard streams; see module docs)
 // ---------------------------------------------------------------------------
 
-/// Default download sink: writes body and header bytes to the process's
-/// standard output, mirroring curl's default write callback (`fwrite` to
-/// `stdout`) used when no `CURLOPT_WRITEFUNCTION`/`WRITEDATA` override is
-/// installed. This is the same staging seam the sibling `telnet` engine uses;
-/// the FFI write-callback bridge replaces it once `easy::perform` drives the
-/// data plane.
+/// Header-line sink for QUOTE/`statvfs` *command output* (the `pwd` "257" line
+/// and the `statvfs` block) — the SFTP analog of curl writing these via
+/// `Curl_client_write(CLIENTWRITE_HEADER)`. The file-transfer data plane
+/// (`do_download`/`do_upload`/`do_listing`) no longer uses this: it threads the
+/// caller-supplied [`WriteCallbacks`]/[`ReadCallback`] (the real `-o`/`-T` /
+/// `CURLOPT_*FUNCTION` targets) down from [`run_do`]. This staging seam remains
+/// only for the QUOTE-command informational lines, which curl emits on the
+/// header stream (default `stdout`) and which are outside the F4 transfer scope.
 struct StdoutSink;
 
 impl WriteCallbacks for StdoutSink {
@@ -413,20 +415,6 @@ impl WriteCallbacks for StdoutSink {
             }
             Err(_) => None,
         }
-    }
-}
-
-/// Default upload source: reads from the process's standard input, mirroring
-/// curl's default read callback (`fread` from the input stream) used when no
-/// `CURLOPT_READFUNCTION`/`READDATA` override is installed. Same staging seam as
-/// [`StdoutSink`].
-struct StdinSource;
-
-impl ReadCallback for StdinSource {
-    fn read(&mut self, buf: &mut [u8]) -> usize {
-        use std::io::Read;
-        // A read error is treated as end-of-input for this default seam.
-        std::io::stdin().read(buf).unwrap_or(0)
     }
 }
 
@@ -840,14 +828,19 @@ fn parse_quote_command(
 ///
 /// Returns the number of bytes delivered. A premature EOF (or read error) when a
 /// definite size was expected maps to [`CurlError::PartialFile`], matching curl.
-/// The pump is generic over both the reader and the sink so it can be unit-tested
-/// with an in-memory source/sink — and so that, when the concrete sink is `Send`
-/// (e.g. [`StdoutSink`]), the resulting future is `Send` as the protocol
-/// `BoxFuture` requires.
-async fn pump_download<R, S>(reader: &mut R, maxdownload: i64, sink: &mut S) -> Result<u64>
+/// The pump is generic over the file reader so it can be unit-tested with an
+/// in-memory source; the sink is the caller-supplied client write-callback chain
+/// ([`WriteCallbacks`]) — the real `-o file` / `CURLOPT_WRITEFUNCTION` target
+/// threaded down from [`run_do`], not a hardcoded stdout stub. `dyn
+/// WriteCallbacks` is `Send` (the trait's supertrait), so the resulting future
+/// is `Send` as the protocol `BoxFuture` requires.
+async fn pump_download<R>(
+    reader: &mut R,
+    maxdownload: i64,
+    sink: &mut dyn WriteCallbacks,
+) -> Result<u64>
 where
     R: AsyncRead + Unpin,
-    S: WriteCallbacks,
 {
     let bounded = maxdownload >= 0;
     let limit = if bounded {
@@ -900,13 +893,18 @@ where
 /// the number of bytes written. The buffered writer is flushed before returning;
 /// the caller is responsible for the final close (shutdown).
 ///
-/// Generic over both the file writer and the read source so it can be unit-tested
-/// with in-memory endpoints and so the future is `Send` when the concrete source
-/// is `Send` (e.g. [`StdinSource`]).
-async fn pump_upload<W, S>(file: &mut W, reader: &mut UploadReader, src: &mut S) -> Result<u64>
+/// Generic over the file writer so it can be unit-tested with an in-memory
+/// endpoint; the source is the caller-supplied client read-callback
+/// ([`ReadCallback`]) — the real `-T file` / `CURLOPT_READFUNCTION` source
+/// threaded down from [`run_do`], not a hardcoded stdin stub. `dyn ReadCallback`
+/// is `Send` (the trait's supertrait), so the future is `Send`.
+async fn pump_upload<W>(
+    file: &mut W,
+    reader: &mut UploadReader,
+    src: &mut dyn ReadCallback,
+) -> Result<u64>
 where
     W: AsyncWrite + Unpin,
-    S: ReadCallback,
 {
     let mut total: u64 = 0;
     let mut buf = vec![0u8; SFTP_SEND_CHUNK];
@@ -1021,20 +1019,51 @@ pub(super) async fn init_subsystem(data: &mut Easy, conn: &mut Connection) -> Re
     }
 }
 
-/// Run the SFTP DO phase and describe the resulting transfer — the Rust analog
-/// of the C `sftp_doing` state machine (`ssh_state_sftp_quote_init` through the
-/// download/upload/readdir initialization).
+/// Classify the SFTP DO phase — the Rust analog of the C `sftp_doing` entry that
+/// resolves the working path and records it on the per-request state.
 ///
-/// Because the data plane is the `russh-sftp` file handle (not the raw socket),
-/// the whole exchange is performed inline here and the returned
-/// [`ProtocolTransfer`] carries [`TransferDirection::None`]: the transfer engine
-/// has no socket bytes to pump afterwards (the same inline model the `telnet`
-/// engine uses).
-///
-/// The owned [`SftpSession`] is moved out of [`SshConn`] for the inline work so
-/// no `&Connection` borrow is held across an `.await`, then moved back for
-/// [`done`]/`disconnect` regardless of outcome.
+/// Because the SFTP data plane is the `russh-sftp` file handle (not the raw
+/// socket), the byte movement is performed by [`run_do`] (which threads the
+/// caller's [`WriteCallbacks`]/[`ReadCallback`] through `do_download` /
+/// `do_upload` / `do_listing`), not by the transfer engine. This classifier
+/// therefore reports [`TransferDirection::None`]: there are no socket bytes for
+/// the engine to pump afterwards (the same inline model the `telnet` engine
+/// uses). It is retained as the [`crate::protocols::Protocol::do_it`] hook for
+/// API symmetry with the other handlers; the runtime transfer is driven by
+/// [`run_do`] from [`perform_sftp`](super::perform_sftp).
 pub(super) async fn do_it(data: &mut Easy, conn: &mut Connection) -> Result<ProtocolTransfer> {
+    // Resolve the working path now that the home directory is known
+    // (C `Curl_getworkingpath` with the SFTP `/~` → home substitution) and
+    // record it on the per-request state (C `sshp->path`), so `done`'s
+    // POSTQUOTE/path handling sees the resolved path.
+    let homedir = conn
+        .proto_state_ref::<SshConn>()
+        .and_then(|s| s.homedir.clone())
+        .unwrap_or_default();
+    let working_path = get_working_path(data, conn, Some(&homedir))?;
+    if let Some(sshc) = conn.proto_state_mut::<SshConn>() {
+        sshc.request.path = working_path;
+    }
+
+    Ok(ProtocolTransfer::new(TransferDirection::None))
+}
+
+/// Drive the SFTP DO phase end-to-end with the caller-supplied client `sink`
+/// (download / directory listing) and `source` (upload) — the genuine SFTP
+/// transfer entry point invoked by [`perform_sftp`](super::perform_sftp).
+///
+/// This is the data-plane analog of FTP's `run_do_phase`: it resolves the
+/// working path, records it on the per-request state, moves the owned
+/// [`SftpSession`] out of [`SshConn`] (so no `&Connection` borrow is held across
+/// an `.await`), runs the [`do_sequence`] exchange (QUOTE → FILETIME →
+/// upload/listing/download) with the real `sink`/`source`, then moves the
+/// session back regardless of outcome for [`done`]/`disconnect`.
+pub(super) async fn run_do(
+    data: &mut Easy,
+    conn: &mut Connection,
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+) -> Result<()> {
     let verbose = data.set.verbose;
 
     // Resolve the working path now that the home directory is known
@@ -1066,6 +1095,8 @@ pub(super) async fn do_it(data: &mut Easy, conn: &mut Connection) -> Result<Prot
         &homedir,
         verbose,
         &mut errbuf,
+        sink,
+        source,
     )
     .await;
 
@@ -1080,6 +1111,7 @@ pub(super) async fn do_it(data: &mut Easy, conn: &mut Connection) -> Result<Prot
 /// pre-transfer QUOTE list, fetch the file time when requested, then branch to
 /// upload / directory-listing / download exactly as the C `SSH_SFTP_TRANS_INIT`
 /// does.
+#[allow(clippy::too_many_arguments)]
 async fn do_sequence(
     session: &SftpSession,
     data: &mut Easy,
@@ -1087,7 +1119,9 @@ async fn do_sequence(
     homedir: &str,
     verbose: bool,
     errbuf: &mut Option<String>,
-) -> Result<ProtocolTransfer> {
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+) -> Result<()> {
     // 1. Pre-transfer QUOTE commands (C `ssh_state_sftp_quote_init`). The SFTP
     //    backend does NOT process `prequote` (verified: zero references in
     //    `lib/vssh/libssh2.c`); POSTQUOTE runs in `done`.
@@ -1117,18 +1151,20 @@ async fn do_sequence(
     }
 
     // 3. TRANS_INIT branch: upload (PUT), else directory listing (trailing '/'),
-    //    else single-file download.
+    //    else single-file download. The client `sink`/`source` (the real
+    //    `-o`/`-T` / `CURLOPT_*FUNCTION` targets) are threaded straight through
+    //    so the bytes reach the configured output/input rather than a stub.
     if data.set.method == HttpReq::Put {
-        do_upload(session, data, working_path, verbose, errbuf).await?;
+        do_upload(session, data, working_path, verbose, errbuf, source).await?;
     } else if working_path.ends_with('/') {
-        do_listing(session, data, working_path, verbose, errbuf).await?;
+        do_listing(session, data, working_path, verbose, errbuf, sink).await?;
     } else {
-        do_download(session, data, working_path, verbose, errbuf).await?;
+        do_download(session, data, working_path, verbose, errbuf, sink).await?;
     }
 
-    // The bytes have already been delivered inline; the engine has nothing to
-    // pump over the socket.
-    Ok(ProtocolTransfer::new(TransferDirection::None))
+    // The bytes have already been delivered inline through the client callbacks;
+    // the transfer engine has nothing to pump over the socket.
+    Ok(())
 }
 
 /// Finalize an SFTP transfer — the Rust analog of `sftp_done` →
@@ -1549,6 +1585,7 @@ async fn do_listing(
     path: &str,
     verbose: bool,
     errbuf: &mut Option<String>,
+    sink: &mut dyn WriteCallbacks,
 ) -> Result<()> {
     // C `ssh_state_sftp_readdir_init`: a no-body request (`--head`/`-I`) lists
     // nothing — the download size is set to "unknown" and the state stops.
@@ -1576,17 +1613,17 @@ async fn do_listing(
     };
 
     let list_only = data.set.list_only;
-    let mut sink = StdoutSink;
 
     // `ReadDir` is a fully-buffered iterator that already filters `.`/`..`, so
     // it is iterated synchronously while `read_link` is awaited per symlink. SFTP
-    // has no content encoding, so each line goes straight to `write_body`.
+    // has no content encoding, so each line goes straight to `write_body` on the
+    // caller-supplied client sink (the real `-o file`/`stdout` target).
     for entry in read_dir {
         let name = entry.file_name();
         if list_only {
             // C: write the filename, then a newline (CLIENTWRITE_BODY x2).
-            write_body_all(&mut sink, name.as_bytes())?;
-            write_body_all(&mut sink, b"\n")?;
+            write_body_all(sink, name.as_bytes())?;
+            write_body_all(sink, b"\n")?;
         } else {
             let attrs = entry.metadata();
             let mut line = format_long_entry(&name, &attrs);
@@ -1610,7 +1647,7 @@ async fn do_listing(
             }
             // C `SSH_SFTP_READDIR_BOTTOM`: append "\n" and write the whole line.
             line.push('\n');
-            write_body_all(&mut sink, line.as_bytes())?;
+            write_body_all(sink, line.as_bytes())?;
         }
     }
 
@@ -1620,7 +1657,7 @@ async fn do_listing(
 /// Hand a complete buffer to a write callback's body stream, enforcing curl's
 /// write-callback contract: a return value below the offered length (other than
 /// a pause, which the inline seam never issues) is a [`CurlError::WriteError`].
-fn write_body_all<S: WriteCallbacks>(sink: &mut S, data: &[u8]) -> Result<()> {
+fn write_body_all(sink: &mut dyn WriteCallbacks, data: &[u8]) -> Result<()> {
     if sink.write_body(data) != data.len() {
         return Err(CurlError::WriteError);
     }
@@ -1641,6 +1678,7 @@ async fn do_download(
     path: &str,
     verbose: bool,
     errbuf: &mut Option<String>,
+    sink: &mut dyn WriteCallbacks,
 ) -> Result<()> {
     // C `ssh_state_sftp_download_init`: open read-only.
     let mut file = match session
@@ -1712,8 +1750,7 @@ async fn do_download(
             .map_err(|_| CurlError::Ssh)?;
     }
 
-    let mut sink = StdoutSink;
-    let result = pump_download(&mut file, plan.maxdownload, &mut sink).await;
+    let result = pump_download(&mut file, plan.maxdownload, sink).await;
 
     // C `ssh_state_sftp_close`: close the handle regardless of transfer outcome.
     if file.shutdown().await.is_err() {
@@ -1789,6 +1826,7 @@ async fn do_upload(
     path: &str,
     verbose: bool,
     errbuf: &mut Option<String>,
+    source: &mut dyn ReadCallback,
 ) -> Result<()> {
     let remote_append = data.set.remote_append;
 
@@ -1873,15 +1911,14 @@ async fn do_upload(
     let infilesize = data.set.filesize;
 
     // C: a positive resume (non-append) advances the *input* past `resume_from`
-    // bytes, then seeks the remote handle. The inline default seam has no seek
-    // callback, so always read-and-discard from the input (the C fallback path).
+    // bytes, then seeks the remote handle. The client read source carries no seek
+    // hook here, so always read-and-discard from the source (the C fallback path).
     if resume_from > 0 && !remote_append {
-        let mut src = StdinSource;
         let mut scratch = vec![0u8; RESUME_SCRATCH];
         let mut passed: i64 = 0;
         while passed < resume_from {
             let want = ((resume_from - passed) as usize).min(RESUME_SCRATCH);
-            let n = src.read(&mut scratch[..want]);
+            let n = source.read(&mut scratch[..want]);
             // C: a zero read (or an over-read / READFUNC_ABORT) is fatal.
             if n == 0 || n > want {
                 diag(errbuf, verbose, "Failed to read data");
@@ -1909,8 +1946,7 @@ async fn do_upload(
     };
 
     let mut reader = UploadReader::new(remaining, false);
-    let mut src = StdinSource;
-    let result = pump_upload(&mut file, &mut reader, &mut src).await;
+    let result = pump_upload(&mut file, &mut reader, source).await;
 
     // C `ssh_state_sftp_close`: close the handle regardless of transfer outcome.
     if file.shutdown().await.is_err() {

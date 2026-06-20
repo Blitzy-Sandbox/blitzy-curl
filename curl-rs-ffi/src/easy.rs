@@ -270,7 +270,18 @@ pub unsafe extern "C" fn curl_easy_cleanup(handle: *mut CURL) {
     // and has not been freed, so reconstructing the unique owning `Box` is sound.
     // Dropping it runs the deterministic teardown and frees the allocation
     // exactly once.
-    drop(unsafe { Box::from_raw(handle as *mut core::Easy) });
+    let easy = unsafe { Box::from_raw(handle as *mut core::Easy) };
+
+    // Drop the handle and then drive the bridge runtime so any detached async
+    // teardown tasks the drop signalled run to completion now, while the runtime
+    // is healthy. An `sftp://`/`scp://` handle owns a russh SSH session whose
+    // run-loop is a detached task; dropping the handle closes its channels but
+    // does not run it to exit. Left alive, it would be reaped when the
+    // per-thread runtime is torn down at thread exit, where russh's
+    // `ChannelCloseOnDrop` re-enters `tokio::spawn` with no runtime context and
+    // panics. Draining here reaps those tasks first. See
+    // `crate::drop_and_drain`.
+    crate::drop_and_drain(easy);
 }
 
 // =============================================================================

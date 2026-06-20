@@ -1344,6 +1344,36 @@ pub(crate) async fn perform_transfer(
         return http::perform_http(data, sink, source).await;
     }
 
+    // `ftp`/`ftps` are driven end-to-end by the FTP engine: the control-channel
+    // filter chain (plain TCP, or implicit TLS for `ftps://` with the `AUTH TLS`
+    // upgrade handled mid-login), the login state machine, and the DO phase
+    // (CWD → `PASV`/`PORT` data-channel negotiation → `TYPE`/`SIZE`/`REST` →
+    // `RETR`/`STOR`/`APPE`/`LIST`/`NLST` → body movement over the secondary
+    // socket). This wires the FTP/FTPS seam whose absence produced QA findings
+    // F4-CRIT-1/2/4 (every FTP/FTPS scheme returned `UnsupportedProtocol`
+    // before a socket opened).
+    #[cfg(feature = "ftp")]
+    if matches!(scheme_name.as_str(), "ftp" | "ftps") {
+        return ftp::perform_ftp(data, sink, source).await;
+    }
+
+    // `scp`/`sftp` are driven end-to-end by the SSH engine (the `russh` transport
+    // plus the `russh-sftp` subsystem): the plain-TCP filter chain (russh layers
+    // its own transport crypto over the raw bytes — no rustls filter), the SSH
+    // handshake with host-key verification and authentication, and the data plane
+    // (the SCP exec channel, or the SFTP open/stat/seek + read/write loop). This
+    // wires the SFTP/SCP seam whose absence produced QA finding F4-CRIT-3 (every
+    // SSH scheme returned `UnsupportedProtocol` before a socket opened) and, with
+    // it, F4-MAJOR-2 (host-key verification now actually runs).
+    #[cfg(feature = "scp")]
+    if scheme_name == "scp" {
+        return ssh::perform_scp(data, sink, source).await;
+    }
+    #[cfg(feature = "sftp")]
+    if scheme_name == "sftp" {
+        return ssh::perform_sftp(data, sink, source).await;
+    }
+
     // Every other recognized network scheme's end-to-end drive over the `conn`
     // filter chain and its per-protocol exchange engine is the remaining
     // transfer integration. Until then report `UnsupportedProtocol`, the same

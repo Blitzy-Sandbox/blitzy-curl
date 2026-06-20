@@ -1841,6 +1841,19 @@ mod feat {
     pub fn libssh2() -> bool {
         false
     }
+    /// Whether the `russh` SSH backend is built in (i.e. the `scp`/`sftp`
+    /// protocols are available). curl gates `--hostpubsha256` on
+    /// `feature_libssh2` (which also implies a libssh2 new enough to support
+    /// SHA256 host-key hashing); `russh` *always* supports SHA256 host-key
+    /// fingerprints, so the faithful capability gate here is simply "is the SSH
+    /// backend present?" — true whenever SCP or SFTP is compiled in. Keeping
+    /// this distinct from [`libssh2`] preserves `--version`/feature reporting
+    /// parity (the backend is reported as `russh`, never `libssh2`).
+    pub fn ssh() -> bool {
+        version::protocols()
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("scp") || p.eq_ignore_ascii_case("sftp"))
+    }
     /// `feature_ech` (Encrypted Client Hello). Not supported.
     pub fn ech() -> bool {
         false
@@ -3649,7 +3662,13 @@ fn opt_string(global: &mut GlobalConfig, id: OptId, nextarg: &str) -> Result<(),
             }
         }
         OptId::Hostpubsha256 => {
-            if !feat::libssh2() {
+            // C gates `--hostpubsha256` on `feature_libssh2` (a libssh2 new
+            // enough to hash host keys with SHA256). This build's `russh`
+            // backend *always* supports SHA256 host-key fingerprints — the
+            // `verify_host_key` SHA256 path honors `CURLOPT_SSH_HOST_PUBLIC_KEY_
+            // SHA256` and rejects on mismatch — so the faithful capability gate
+            // is SSH-backend presence rather than the (always-false) libssh2 bit.
+            if !feat::ssh() {
                 return Err(ParameterError::LibcurlDoesntSupport);
             }
             getstr(&mut global.operations[idx].hostpubsha256, nextarg, false)?;

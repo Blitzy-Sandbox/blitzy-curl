@@ -47,11 +47,12 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use curl_rs_lib::error::{codes, CurlMError, CurlShError};
 use curl_rs_lib::multi::{self, CurlMInfo, SharedEasy};
+use curl_rs_lib::transfer::{ReadCallback, WriteCallbacks};
 use curl_rs_lib::share::{LockData, ShareSetting};
 use curl_rs_lib::{
     CurlCode, CurlError, CurlInfo, CurlOption, Easy, InfoValue, Multi, OptionValue, Share,
@@ -891,7 +892,12 @@ fn checkhome(home: &str, fname: &str, dotscore: bool) -> Option<String> {
 /// omitted: it requires the C password database (and thus `unsafe`/`libc`),
 /// which this crate forbids. The `HOME`/`CURL_HOME`/`XDG_CONFIG_HOME` lookups
 /// cover the practical cases.
-fn findfile(fname: &str, dotscore: i32) -> Option<String> {
+///
+/// Exposed `pub(crate)` so the SSH preflight ([`crate::setopt`]) can reuse the
+/// exact same finder table to default `CURLOPT_SSH_KNOWNHOSTS` to
+/// `~/.ssh/known_hosts`, mirroring `config2setopts.c`'s
+/// `findfile(".ssh/known_hosts", FALSE)` call.
+pub(crate) fn findfile(fname: &str, dotscore: i32) -> Option<String> {
     if fname.is_empty() {
         return None;
     }
@@ -1809,6 +1815,142 @@ fn pre_transfer(per: &mut PerTransfer) -> CurlCode {
     result
 }
 
+// ===========================================================================
+// CLI transfer-I/O bridge — the Rust-native `WriteCallbacks` / `ReadCallback`
+// adapters that route a `curl_rs_lib::Easy::perform_with` transfer through the
+// CLI's `write_cb` / `tool_read_cb` handlers (`src/tool_cb_wrt.c` /
+// `src/tool_cb_rea.c`), and thus to `-o` / `-T` files — and the default
+// stdout / stdin — WITHOUT `unsafe`.
+//
+// This is the transfer-execution integration the callback layer
+// (`crate::callbacks`) was authored ahead of (AAP §0.8.4 steps 11–13). Because
+// this crate is `#![forbid(unsafe_code)]`, the CLI cannot register the C-ABI
+// `CURLOPT_*FUNCTION` halves — storing and invoking a raw function-pointer
+// address needs `unsafe`, which only the FFI crate (`curl-rs-ffi`,
+// `CWriteBridge`/`CReadBridge`) is allowed to do. The CLI instead supplies
+// these Rust-native sinks, which the core invokes by safe trait dispatch.
+// ===========================================================================
+
+/// Transfer state shared between the write sink and the read source for the
+/// duration of one [`Easy::perform_with`](curl_rs_lib::Easy::perform_with).
+///
+/// Both directions need `&mut PerTransfer` (its `outs` body sink, `infile`
+/// upload source, and upload counters) and `&mut GlobalConfig` (the per-operation
+/// flags, the busy-read coordination flag, and warning output). The transfer
+/// engine invokes the sink and the source **sequentially on the one
+/// current-thread runtime** — never concurrently — so the [`Mutex`] is always
+/// uncontended. It exists solely to satisfy the [`Send`] bound the callback
+/// traits carry (a `RefCell` would be `!Send` and a bare split borrow cannot be
+/// shared by two trait objects); it never arbitrates real contention.
+struct CliIoState<'a> {
+    per: &'a mut PerTransfer,
+    global: &'a mut GlobalConfig,
+}
+
+/// The CLI body/header write sink — curl's `CURLOPT_WRITEFUNCTION` /
+/// `CURLOPT_HEADERFUNCTION` destination, expressed as the core's
+/// [`WriteCallbacks`](curl_rs_lib::transfer::WriteCallbacks) trait.
+struct CliWriteSink<'a> {
+    state: &'a Mutex<CliIoState<'a>>,
+}
+
+impl WriteCallbacks for CliWriteSink<'_> {
+    fn write_body(&mut self, data: &[u8]) -> usize {
+        // Sequential, uncontended lock (see `CliIoState`). `write_cb` is the
+        // Rust port of curl's `tool_write_cb`: it lazily opens the `-o` file (or
+        // writes stdout when none is set), enforces the write-size / binary-to-tty
+        // guards, accounts the bytes, and returns curl's byte-count /
+        // `CURL_WRITEFUNC_*` convention verbatim — which is exactly what the
+        // engine's client-writer expects from `write_body`.
+        let mut st = self.state.lock().expect("CLI I/O bridge mutex poisoned");
+        let CliIoState { per, global } = &mut *st;
+        crate::callbacks::write::write_cb(data, per, global)
+    }
+
+    fn write_header(&mut self, _data: &[u8]) -> Option<usize> {
+        // curl's default path configures no separate header destination (no
+        // `-D` / `--dump-header`), so curl installs a NULL header callback and
+        // the bytes are silently consumed. Returning `None` models that NULL
+        // callback exactly — identical to the core's `DefaultClientOutput`
+        // behavior this sink replaces, so plain downloads are byte-for-byte
+        // unchanged. `-i` / `-I` still surface headers because the client-writer
+        // routes them onto the *body* stream (reaching `write_body`) when
+        // `CURLOPT_HEADER` is set.
+        //
+        // The `-D` / `-J` / `--etag-save` header sink (`tool_header_cb`) reads the
+        // in-flight handle's response code and scheme via `curl_easy_getinfo`;
+        // exposing that live `getinfo` to a Rust-native sink without `unsafe` is
+        // the remaining header-path piece of the transfer-execution integration
+        // and is unrelated to the FTP/SSH body+upload flows wired here.
+        None
+    }
+}
+
+/// The CLI upload read source — curl's `CURLOPT_READFUNCTION`, expressed as the
+/// core's [`ReadCallback`](curl_rs_lib::transfer::ReadCallback) trait.
+struct CliReadSource<'a> {
+    state: &'a Mutex<CliIoState<'a>>,
+}
+
+impl ReadCallback for CliReadSource<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> usize {
+        // Sequential, uncontended lock (see `CliIoState`). `tool_read_cb` is the
+        // Rust port of curl's `tool_read_cb`: it pulls upload bytes from the `-T`
+        // file (`per.infile`) — or stdin when none is open — honoring the timeout
+        // throttle and the `CURLOPT_INFILESIZE` cap, and yields curl's byte-count
+        // / `CURL_READFUNC_*` convention through `ReadResult::to_curl_return`,
+        // which is the contract `read` returns to the engine.
+        let mut st = self.state.lock().expect("CLI I/O bridge mutex poisoned");
+        let CliIoState { per, global } = &mut *st;
+        crate::callbacks::read::tool_read_cb(buf, per, global).to_curl_return()
+    }
+}
+
+/// Drive one transfer through [`Easy::perform_with`](curl_rs_lib::Easy::perform_with),
+/// bridging body output and upload input to the CLI callbacks so `-o` / `-T`
+/// files (and the default stdout / stdin) are honored.
+///
+/// This replaces a bare [`Easy::perform`](curl_rs_lib::Easy::perform), whose
+/// built-in sink/source are hardwired to stdout/stdin and therefore bypass the
+/// CLI's `-o` output file and `-T` upload file. It is the seam curl's
+/// `tool_operate.c` reaches implicitly when libcurl invokes the registered
+/// `CURLOPT_WRITEFUNCTION` / `CURLOPT_READFUNCTION`.
+///
+/// # Handle / borrow handling
+///
+/// The real [`Easy`] handle is moved out of `per` (leaving a default
+/// placeholder) so it can drive `perform_with` while the sink/source hold the
+/// rest of `per` — and `global` — through the shared [`CliIoState`]. The
+/// placeholder left in `per.easy` is touched only by `write_cb`'s busy-read
+/// unpause (`Easy::pause`), which is inert here: a blocking file / stdin read
+/// never reports `EAGAIN`, so the busy flag is never set and that branch never
+/// runs. The real handle — carrying every `info` / `state` field the transfer
+/// updated — is restored into `per.easy` before this returns, so the subsequent
+/// `post_per_transfer` `getinfo` reads observe the true transfer result.
+async fn perform_with_cli_io(
+    per: &mut PerTransfer,
+    global: &mut GlobalConfig,
+) -> Result<(), CurlError> {
+    // Move the real handle out (leaving `Easy::default()`) so `perform_with`
+    // borrows it disjointly from the `per` the bridge holds. `Easy` has no custom
+    // `Drop`, so dropping the placeholder on restore is a benign field-wise drop.
+    let mut easy = std::mem::take(&mut per.easy);
+    let result = {
+        let state = Mutex::new(CliIoState {
+            per: &mut *per,
+            global: &mut *global,
+        });
+        let mut sink = CliWriteSink { state: &state };
+        let mut source = CliReadSource { state: &state };
+        easy.perform_with(&mut sink, &mut source).await
+        // `sink`, `source`, and `state` drop here, releasing the `per` / `global`
+        // reborrows before the handle is restored below.
+    };
+    // Restore the real handle for `post_per_transfer` (getinfo / cleanup).
+    per.easy = easy;
+    result
+}
+
 impl Driver {
     /// Runs every queued transfer one at a time (C `serial_transfers`).
     ///
@@ -1848,8 +1990,14 @@ impl Driver {
                     // queued; `returncode` keeps its prior value.
                     break;
                 }
-                // Drive the async core to completion (curl `curl_easy_perform`).
-                let perform = self.transfers.front_mut().unwrap().easy.perform().await;
+                // Drive the async core to completion (curl `curl_easy_perform`),
+                // routing body output and upload input through the CLI callbacks
+                // (`-o` / `-T` files, default stdout / stdin) via the Rust-native
+                // I/O bridge rather than the core's stdout/stdin defaults.
+                let perform = {
+                    let per = self.transfers.front_mut().unwrap();
+                    perform_with_cli_io(per, global).await
+                };
                 result = match perform {
                     Ok(()) => codes::CURLE_OK,
                     Err(e) => e.code(),

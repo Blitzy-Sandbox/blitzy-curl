@@ -268,6 +268,69 @@ pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     })
 }
 
+/// Drop a value, then **drive this thread's bridge runtime** so any detached
+/// async teardown tasks the drop signalled run to completion before control
+/// returns — preventing those tasks from being reaped (and panicking) when the
+/// per-thread runtime is later torn down at thread exit.
+///
+/// # Why this is needed
+///
+/// Tearing down an easy handle (`curl_easy_cleanup`) reclaims and drops a
+/// [`core::Easy`](curl_rs_lib::Easy), which transitively drops any live
+/// connection it still owns. An `sftp://` / `scp://` handle owns a russh SSH
+/// session. russh runs its session as a **detached** task — the run-loop is
+/// `tokio::spawn`ed at connect (`russh/src/client/mod.rs`) and its `JoinHandle`
+/// is stored on russh's `Handle`, whose `Drop` only logs (it never aborts or
+/// joins the task). russh-sftp likewise drives the SFTP subsystem on its own
+/// spawned worker. Dropping our [`core::Easy`] drops russh's `Handle` and the
+/// SFTP session handle, which **closes** those tasks' command/request channels
+/// but does not itself run the tasks to exit.
+///
+/// Those tasks then sit idle (the per-thread bridge runtime is not being driven
+/// after `curl_easy_perform`'s [`block_on`] returned) until the runtime is
+/// dropped at thread exit. Current-thread runtime shutdown *reaps* still-live
+/// tasks, dropping the `Channel`s they hold; russh's `ChannelCloseOnDrop::drop`
+/// then calls [`tokio::spawn`] for a best-effort channel-close — and spawning
+/// during runtime shutdown panics with *"The Tokio context thread-local
+/// variable has been destroyed"*. (The CLI never hit this: its
+/// `#[tokio::main]` runtime stays active across the handle drop and drives those
+/// tasks to exit as part of normal shutdown.)
+///
+/// # How it fixes the root cause
+///
+/// The value is dropped **inside** a [`block_on`] (so the runtime context is
+/// live: any `Drop`-spawned cleanup, such as the `ChannelCloseOnDrop` spawn,
+/// registers on the healthy runtime instead of panicking). The drop closes the
+/// detached tasks' channels, so they are now ready to observe EOF and exit. We
+/// then [`yield_now`](tokio::task::yield_now) repeatedly: each yield hands
+/// control back to the current-thread executor, which polls those ready tasks.
+/// Their exit paths require **no I/O-readiness wait** — russh's `run_inner`
+/// receiver-closed branch just sets `disconnected` and `break`s, and the
+/// best-effort channel-close is an in-memory mpsc send plus an
+/// immediately-ready loopback write — so cooperative yields are sufficient to
+/// drive them to completion here, while the runtime is healthy. Once they have
+/// exited, no live task survives to thread exit, so the eventual runtime drop
+/// has nothing to reap and cannot re-enter `tokio::spawn` without a context.
+///
+/// The yield count is a generous fixed bound (teardown needs only a handful of
+/// rounds), so cleanup can never hang on a stuck task, and for a non-SSH handle
+/// — which has no such detached teardown task — the loop simply finds nothing
+/// ready and returns in microseconds.
+pub(crate) fn drop_and_drain<T>(value: T) {
+    block_on(async move {
+        // Drop inside the live runtime context so best-effort `Drop`-spawned
+        // cleanups register on the healthy runtime rather than panicking.
+        drop(value);
+        // Hand control to the executor so the now-closed detached teardown
+        // tasks (russh session run-loop + russh-sftp worker + the best-effort
+        // channel-close spawn) are polled to exit *now*. Bounded so a stuck
+        // task can never hang `curl_easy_cleanup`.
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     //! Unit tests for the sync-over-async bridge. They exercise [`super::block_on`]
