@@ -1,307 +1,302 @@
-//! `curl-rs` — the command-line binary of the curl → Rust workspace.
+// curl-rs — the command-line binary crate root and process entrypoint.
+//
+// SPDX-License-Identifier: curl
+//
+// This module is the Rust reimplementation of curl's CLI entrypoint. The
+// original C sources are
+//   Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+// and are licensed under the curl license (https://curl.se/docs/copyright.html).
+//
+// It is the behavioral port of one C translation unit of the `src/` CLI tree:
+//   * `src/tool_main.c` / `src/tool_main.h` — the process `main()`: stderr
+//     initialization (`tool_init_stderr`), the standard-descriptor guard
+//     (`main_checkfds`), the `SIGPIPE` disposition, global construction
+//     (`globalconf_init` -> `curl_global_init`), the call to `operate()`, the
+//     teardown (`globalconf_free` -> `curl_global_cleanup`), and the
+//     `return (int)result;` exit-code contract.
+//
+// The Windows-only paths (`win32_init`, `--dump-module-paths`, `wmain` /
+// `_UNICODE`, the trailing `fflush(NULL)`), the `__VMS` `vms_special_exit`, the
+// `__AMIGA__` stack cookie, and the `CURL_MEMDEBUG` `memory_tracking_init` have
+// no Rust analog and are intentionally omitted: Rust's standard library and
+// ownership model subsume them (AAP §0.3.2; agent brief "OUT OF SCOPE").
+
+#![forbid(unsafe_code)]
+
+//! `curl-rs` — a memory-safe Rust reimplementation of the `curl` command-line
+//! tool, and a drop-in replacement for it.
 //!
-//! This is the Rust reimplementation of curl's CLI entrypoint
-//! (`src/tool_main.c`). It is a thin front-end over the safe async core
-//! ([`curl_rs_lib`]): it parses curl-compatible command-line options, drives the
-//! requested transfers, and maps the result to curl's process exit code.
+//! As a **binary crate**, this file (`main.rs`) is the crate root: it has no
+//! `lib.rs`. It declares the full CLI module tree and contains the process
+//! [`main`] entrypoint. The binary is a thin, safe front-end over the
+//! asynchronous core library [`curl_rs_lib`]; all of the transfer, protocol,
+//! TLS, and option-setter machinery lives there, and **every `unsafe` block in
+//! the workspace is confined to the separate `curl-rs-ffi` crate**. The
+//! crate-level `#![forbid(unsafe_code)]` attribute above makes that guarantee
+//! compiler-enforced for the entire CLI crate (AAP §0.7.1).
+//!
+//! # Relationship to `src/tool_main.c`
+//!
+//! [`run`] reproduces the control flow of curl's `main()` (`src/tool_main.c`,
+//! the `#ifndef UNITTESTS` body) step for step:
+//!
+//! | curl `main()` (C)                        | `curl-rs` ([`run`] / [`main`])               |
+//! |------------------------------------------|----------------------------------------------|
+//! | `tool_init_stderr()`                     | `messages::init_stderr()`                    |
+//! | `main_checkfds()`                        | documented no-op (see [`run`])               |
+//! | `signal(SIGPIPE, SIG_IGN)`               | Rust std default (see [`run`])               |
+//! | `globalconf_init()` (config + lib init)  | [`GlobalConfig::new`] + [`global_init`]      |
+//! | `operate(argc, argv)`                    | [`operate`]`(&mut global, args).await`       |
+//! | `globalconf_free()` (lib cleanup + free) | [`global_cleanup`] + `GlobalConfig::globalconf_free` |
+//! | `return (int)result;`                    | [`std::process::exit`]`(code)`               |
 //!
 //! # Runtime model (AAP §0.4.4)
 //!
-//! The CLI runs on a lightweight single-threaded Tokio runtime
+//! The CLI runs on a lightweight **single-threaded** Tokio runtime
 //! (`#[tokio::main(flavor = "current_thread")]`), which is sufficient for the
-//! one-shot transfers the command-line tool performs; the multi-threaded runtime
-//! is reserved for the `curl_multi_*` path inside `curl-rs-lib`.
+//! one-shot transfers a command-line invocation performs. The multi-threaded
+//! runtime is reserved for the `curl_multi_*` path inside [`curl_rs_lib`] (used
+//! only by `--parallel`), so this crate enables only Tokio's `rt` + `macros`
+//! features.
 //!
-//! # Foundation checkpoint scope
+//! # Exit-code contract
 //!
-//! At this checkpoint the binary provides the complete, parity-faithful
-//! *front-end*: option parsing, the `--version` banner (sourced from
-//! [`curl_rs_lib::version`]), curl's usage diagnostics, verbose-logging
-//! initialization, and curl's exit-code contract. The transfer **engine**
-//! itself (the easy/multi/transfer machinery and the per-protocol handlers) is
-//! authored in later migration steps (AAP §0.8.4 steps 4–12); until a protocol
-//! handler is linked in, an attempted transfer reports curl's standard
-//! `CURLE_NOT_BUILT_IN` result and returns the matching exit code. No flag name,
-//! semantic, or default is altered, and no flag absent from curl 8.x is added
-//! (AAP §0.8.2). There are no placeholder/stub markers anywhere in this file.
+//! curl's CLI returns the underlying `CURLcode` as the process exit status
+//! (`return (int)result;`). [`operate`] yields that numeric [`CurlCode`]
+//! directly, and [`main`] delivers it verbatim via [`std::process::exit`] so
+//! that distinct errors keep distinct codes — they are never collapsed by `?`
+//! or by `anyhow`.
 
-use std::process::ExitCode;
+use std::ffi::OsString;
+use std::io::Write as _;
 
-use clap::Parser;
 use curl_rs_lib::error::codes;
-use curl_rs_lib::version;
+use curl_rs_lib::{global_cleanup, global_init, CurlCode};
 
-// `--write-out`'s JSON renderer (`%{json}` / `%{header_json}`). The module is a
-// complete, self-tested port of `src/tool_writeout_json.c`, but its callers —
-// the `--write-out` variable table in `operate`/`writeout` — are authored in a
-// later migration step (AAP §0.8.4 step 11). Declaring it here keeps it
-// compiled, clippy-linted, and unit-tested as part of the binary now;
-// `allow(dead_code)` keeps its not-yet-wired public renderers from tripping the
-// workspace `-D warnings` gate and is removed once `operate` calls into it. This
-// mirrors the construction-order staging allows already used in `curl-rs-lib`.
-#[allow(dead_code)]
-mod writeout_json;
+use crate::config::GlobalConfig;
+use crate::operate::operate;
 
-// `urlglob` — curl's URL-globbing engine (port of `src/tool_urlglob.c`). It is a
-// dependency-free leaf module (it relies only on `curl-rs-lib`), so it is staged
-// into the binary now to be compiled, clippy-linted, and unit-tested as part of
-// the build, following the same `allow(dead_code)` construction-order staging as
-// `writeout_json` above. The `allow(dead_code)` is removed once `operate`/`config`
-// drive it (`config::State` already names `crate::urlglob::UrlGlob`).
-#[allow(dead_code)]
-mod urlglob;
-
-// CLI option-parsing closure — staged together because they form one mutually
-// dependent group (`messages → config → {args, formparse, urlglob}`, and
-// `args`/`formparse`/`parsecfg` all consume `config`/`messages`). They are ports
-// of `src/tool_msgs.c`, `tool_cfgable.*`, `tool_getparam.c`, `tool_formparse.c`,
-// and `tool_parsecfg.c` respectively. Their public surfaces are driven by
-// `operate` (the operation driver), which lands in a later migration step
-// (AAP §0.8.4 step 12); staging them now keeps the whole option front-end
-// compiled, clippy-linted, and unit-tested as part of the binary build. The
-// `#[allow(dead_code)]` on the not-yet-fully-wired modules follows the same
-// construction-order staging convention as `writeout_json`/`urlglob` above
-// (`formparse` and `parsecfg` already carry their own inner `#![allow(dead_code)]`
-// and so need no outer allow); the allows are removed once `operate` drives them.
+// -- CLI module tree ---------------------------------------------------------
+//
+// Every sibling source file plus the `callbacks/` subfolder is declared here so
+// the binary crate is complete. Each module ports the curl `src/tool_*.c`
+// translation unit named in its own header. With [`operate`] wired into [`run`]
+// below, the diagnostics facility (`messages`) and the option / `--write-out`
+// bridge (`setopt`, `writeout`, `writeout_json`) are fully exercised from
+// `main`.
+//
+// Construction-order staging: a handful of modules still expose items that the
+// current `operate`/`setopt` surface does not yet drive — the per-transfer
+// callback bodies (`callbacks`: the read/seek/progress/debug functions are
+// defined here but are registered on the easy handle by later migration steps),
+// curl's home / `.curlrc` / `.netrc` file finders (`operate`'s `findfile` /
+// `checkhome`), some option-table helpers (`args`, `config`), and the
+// glob-in-use query (`urlglob`). These items are part of the full CLI port but
+// are not yet reachable from `main`, so those five module declarations carry
+// `#[allow(dead_code)]` to keep the workspace `-D warnings` lint gate clean
+// without modifying the not-yet-wired modules themselves. (`formparse` and
+// `parsecfg` carry their own inner `#![allow(dead_code)]`, so they need none
+// here; `messages`, `setopt`, `writeout`, and `writeout_json` are fully live.)
+// Each allow becomes unnecessary — and can be dropped — once the corresponding
+// wiring lands.
 #[allow(dead_code)]
 mod args;
 #[allow(dead_code)]
+mod callbacks;
+#[allow(dead_code)]
 mod config;
 mod formparse;
-#[allow(dead_code)]
 mod messages;
-mod parsecfg;
-// `setopt` (port of `src/config2setopts.c` plus `tool_setopt.c`'s `setopt_bad`)
-// translates a parsed `OperationConfig` into `curl_rs_lib::Easy` option calls,
-// and `writeout` (port of `src/tool_writeout.c`) renders `--write-out`. Both are
-// driven by `operate` (the operation driver, AAP §0.8.4 step 11/12), which lands
-// in a later migration step, so they are staged with the same construction-order
-// `#[allow(dead_code)]` as the option front-end above to keep them compiled,
-// clippy-linted, and unit-tested as part of the binary build.
-#[allow(dead_code)]
-mod setopt;
-#[allow(dead_code)]
-mod writeout;
-// The operation driver (port of `src/tool_operate.c` + folded helpers). Staged
-// like the other not-yet-wired front-end modules; `run()` will call
-// `operate::operate` once the transfer engine lands.
 #[allow(dead_code)]
 mod operate;
-// The transfer callbacks (ports of `src/tool_cb_*.c`): the write/read/seek/
-// header/progress/debug callbacks the CLI installs on each transfer. Their
-// registration against the easy handle is performed by the integration layer
-// (`operate`) once it lands (AAP §0.8.4 step 12), so the module is staged with
-// the same construction-order `#[allow(dead_code)]` as the other not-yet-wired
-// modules above to keep each callback compiled, clippy-linted, and unit-tested
-// as part of the binary build; the allow is removed once `operate` registers
-// them.
+mod parsecfg;
+mod setopt;
 #[allow(dead_code)]
-mod callbacks;
+mod urlglob;
+mod writeout;
+mod writeout_json;
 
-/// curl-rs — a memory-safe Rust reimplementation of the `curl` command-line
-/// tool.
+/// `CURL_GLOBAL_DEFAULT` — the `CURL_GLOBAL_*` bitmask curl's CLI passes to
+/// `curl_global_init` (`src/tool_cfgable.c`: `globalconf_init` calls
+/// `curl_global_init(CURL_GLOBAL_DEFAULT)`).
 ///
-/// The option model is derived one-to-one from curl 8.x; flag names, short
-/// aliases, semantics, and defaults are immutable (AAP §0.8.2). This foundation
-/// front-end wires the universally-applicable options; the full ~282-entry
-/// option table is filled in alongside the transfer engine in a later step.
-#[derive(Debug, Parser)]
-#[command(
-    name = "curl-rs",
-    bin_name = "curl-rs",
-    about = "curl-rs — a memory-safe Rust reimplementation of curl.",
-    // `--version` is handled manually below so the banner matches curl's exact
-    // `curl_version()` multi-line format rather than clap's single line.
-    disable_version_flag = true
-)]
-struct Cli {
-    /// URL(s) to work with.
-    #[arg(value_name = "URL")]
-    urls: Vec<String>,
+/// `CURL_GLOBAL_DEFAULT == CURL_GLOBAL_ALL == CURL_GLOBAL_SSL | CURL_GLOBAL_WIN32
+/// == 3` (`include/curl/curl.h`). The canonical `CURL_GLOBAL_*` constants live
+/// in the FFI crate (`curl-rs-ffi`), which this binary must **not** depend on:
+/// the workspace dependency graph is strictly one-directional — the CLI and FFI
+/// leaf crates depend only on `curl-rs-lib`, never on each other (AAP §0.4). The
+/// value is therefore reproduced here as a private literal. [`global_init`]
+/// accepts any bitmask (the rustls-based core has no per-flag subsystem to
+/// toggle), so passing the canonical default keeps observable behavior
+/// identical to curl's.
+const CURL_GLOBAL_DEFAULT: i64 = 3;
 
-    /// Write output to <file> instead of stdout (curl `-o, --output`).
-    #[arg(short = 'o', long = "output", value_name = "FILE")]
-    output: Vec<String>,
-
-    /// Silent mode — do not show progress meter or error messages
-    /// (curl `-s, --silent`).
-    #[arg(short = 's', long = "silent")]
-    silent: bool,
-
-    /// Make the operation more talkative (curl `-v, --verbose`).
-    #[arg(short = 'v', long = "verbose")]
-    verbose: bool,
-
-    /// Show version number and quit (curl `-V, --version`).
-    #[arg(short = 'V', long = "version")]
-    version: bool,
-}
-
-/// Process entrypoint. Parses arguments and returns curl's exit code.
+/// Installs the process-wide [`tracing`] subscriber used for **internal library
+/// diagnostics**, writing to `stderr`.
 ///
-/// curl's CLI returns the underlying `CURLcode` as the process exit status; the
-/// async runtime is the current-thread flavor per AAP §0.4.4.
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
-    run(Cli::parse()).await
-}
-
-/// Drives the parsed command-line configuration and returns the process exit
-/// code, kept separate from [`main`] so the control flow is unit-testable and
-/// the runtime attribute stays on a minimal shim.
-async fn run(cli: Cli) -> ExitCode {
-    // `-v/--verbose` turns on structured logging to stderr. Initialization is
-    // best-effort: a failure (e.g. a subscriber already set) must never abort
-    // the program, matching curl's tolerance for diagnostics setup.
-    if cli.verbose {
-        init_verbose_logging();
-        tracing::debug!(
-            urls = cli.urls.len(),
-            outputs = cli.output.len(),
-            silent = cli.silent,
-            "curl-rs invoked"
-        );
-    }
-
-    // `-V/--version`: print the full banner and the Protocols/Features lines,
-    // exactly mirroring curl's `--version` layout, then exit successfully.
-    if cli.version {
-        print_version();
-        return ExitCode::SUCCESS;
-    }
-
-    // No URL: emit curl's usage hint (unless silenced) and return curl's
-    // "failed to initialize" exit code (2), exactly as the C tool does when no
-    // URL is supplied.
-    if cli.urls.is_empty() {
-        if !cli.silent {
-            eprintln!("curl-rs: try 'curl-rs --help' for more information");
-        }
-        return exit_code(codes::CURLE_FAILED_INIT);
-    }
-
-    // A transfer was requested. The transfer engine and per-protocol handlers
-    // are not yet linked into this foundation build, so report curl's standard
-    // `CURLE_NOT_BUILT_IN` diagnostic for each requested URL and return the
-    // matching exit code. This is curl's genuine result code for functionality
-    // omitted at build time — not a placeholder.
-    let mut last = codes::CURLE_OK;
-    for url in &cli.urls {
-        if !cli.silent {
-            eprintln!(
-                "curl-rs: ({}) the transfer engine is not built into this libcurl: {url}",
-                codes::CURLE_NOT_BUILT_IN
-            );
-        }
-        last = codes::CURLE_NOT_BUILT_IN;
-    }
-    exit_code(last)
-}
-
-/// Initializes the verbose (`-v`) logging subscriber, writing human-readable
-/// events to stderr. Idempotent and non-fatal: a second call (or a subscriber
-/// installed elsewhere) is silently ignored via `try_init`.
-fn init_verbose_logging() {
+/// # Why this is silent by default
+///
+/// The user-facing `-v` / `--trace` / `--trace-ascii` output is **not** routed
+/// through `tracing`: `callbacks::debug` writes those bytes directly to the
+/// resolved trace stream because curl's regression suite diffs them
+/// byte-for-byte, and `tracing`'s own framing (levels, spans, timestamps) would
+/// corrupt that output (AAP §0.7.3, §0.8.2). This subscriber therefore exists
+/// only so that internal diagnostic events emitted elsewhere in the workspace
+/// have a sink, and it defaults to `LevelFilter::OFF` so it never pollutes the
+/// `stderr` the suite inspects. A developer can opt in by setting `RUST_LOG`
+/// (e.g. `RUST_LOG=debug`); the value is parsed as a `LevelFilter`.
+///
+/// Initialization is best-effort and non-fatal: a second call, or a subscriber
+/// already installed by a test, is ignored via `try_init`, mirroring curl's
+/// tolerance of diagnostics setup. `tracing-subscriber` is built here without
+/// its `env-filter` feature, so the lightweight `LevelFilter` parse is used
+/// rather than a full `EnvFilter` (which keeps the dependency set minimal).
+fn init_tracing() {
     use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::fmt;
 
+    // Default OFF (no output) unless RUST_LOG names a level — this guarantees
+    // curl's observable stderr is unaffected in normal use.
+    let level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|raw| raw.parse::<LevelFilter>().ok())
+        .unwrap_or(LevelFilter::OFF);
+
+    // `with_target(false)` keeps any opted-in line free of module-path noise;
+    // the writer is `stderr`, matching curl's diagnostic stream.
     let _ = fmt()
         .with_writer(std::io::stderr)
-        .with_max_level(LevelFilter::DEBUG)
+        .with_max_level(level)
         .with_target(false)
         .try_init();
 }
 
-/// Prints the `--version` output: the `curl_version()`-equivalent banner
-/// followed by curl's `Release-Date:`, `Protocols:`, and `Features:` lines, all
-/// sourced from [`curl_rs_lib::version`] so the CLI and library never disagree.
-fn print_version() {
-    println!("{}", version::version());
-    // curl prints `[unreleased]` for in-development (`-DEV`) builds; the
-    // baseline is `8.19.0-DEV` (`include/curl/curlver.h`).
-    println!("Release-Date: [unreleased]");
-    println!("Protocols: {}", version::protocols().join(" "));
-    println!("Features: {}", version::feature_names().join(" "));
+/// Performs startup, drives [`operate`], tears down, and returns curl's numeric
+/// [`CurlCode`] exit status.
+///
+/// Factored out of [`main`] so the control flow is independent of the
+/// `#[tokio::main]` attribute and can be exercised by unit tests. This is the
+/// Rust analog of the `#ifndef UNITTESTS` body of curl's `main()`
+/// (`src/tool_main.c`); each step is annotated with its C counterpart.
+async fn run(args: Vec<OsString>) -> CurlCode {
+    // C: `tool_init_stderr()` — point the diagnostic stream at `stderr` before
+    // anything can emit a warning or error.
+    messages::init_stderr();
+
+    // Internal-diagnostics sink (see `init_tracing`); silent unless `RUST_LOG`
+    // is set, so curl's observable `stderr` is unaffected.
+    init_tracing();
+
+    // C: `main_checkfds()` ensures fds 0/1/2 are open by opening `/dev/null`
+    // onto any closed standard descriptor, so the first sockets curl opens are
+    // never mistaken for stdin/stdout/stderr. That trick manipulates raw
+    // integer fds via `fcntl`/`pipe`, which cannot be done without `unsafe` —
+    // and this crate is `#![forbid(unsafe_code)]`. Rust's standard library
+    // already provides the `Stdin`/`Stdout`/`Stderr` handles regardless of the
+    // OS fd state, so this is a deliberate, documented no-op rather than an
+    // `unsafe` re-implementation.
+
+    // C: `signal(SIGPIPE, SIG_IGN)`. The Rust standard library already installs
+    // `SIG_IGN` for `SIGPIPE` during runtime startup (so a broken pipe surfaces
+    // as a write error instead of terminating the process), which matches curl
+    // exactly. No action — and no `unsafe` signal handling — is needed here.
+
+    // C: `globalconf_init()` part 1 — allocate the global configuration with
+    // curl's defaults and one initial operation block. This cannot fail.
+    let mut global = GlobalConfig::new();
+
+    // C: `globalconf_init()` part 2 — `curl_global_init(CURL_GLOBAL_DEFAULT)`.
+    // "Call this before _any_ libcurl usage." On failure curl prints
+    // "error initializing curl library" and returns without running a transfer.
+    // `curl_rs_lib::global_init` is idempotent and currently infallible, but its
+    // `Result` contract is honored so any future failure maps to curl's
+    // `CURLE_FAILED_INIT` exactly as the C tool does.
+    if global_init(CURL_GLOBAL_DEFAULT).is_err() {
+        messages::errorf(&global, "error initializing curl library");
+        return codes::CURLE_FAILED_INIT;
+    }
+
+    // C: `operate(argc, argv)` — the operation driver owns *all* of argument
+    // parsing (including `--help` / `--version` / `.curlrc`), option
+    // application, and the serial/parallel transfer loops, and returns curl's
+    // numeric result code. `args` is the full argv (program name at index 0),
+    // exactly as C passes `argv`.
+    let result = operate(&mut global, args).await;
+
+    // C: `globalconf_free()` — `curl_global_cleanup()` then release the CLI
+    // configuration. The order mirrors curl (library teardown first). In Rust
+    // the two are independent and the owned data also drops automatically, but
+    // the explicit calls keep the C teardown call site one-to-one.
+    global_cleanup();
+    global.globalconf_free();
+
+    result
 }
 
-/// Converts a curl `CURLcode` integer into a process [`ExitCode`], mirroring the
-/// C tool's contract of returning the `CURLcode` as the exit status. Values are
-/// clamped into the single-byte exit-status range, matching the platform's
-/// 8-bit exit code (curl's codes all fall well within `0..=255`).
-fn exit_code(curlcode: i32) -> ExitCode {
-    ExitCode::from(u8::try_from(curlcode).unwrap_or(u8::MAX))
+/// Process entrypoint — the Rust analog of curl's `main()` (`src/tool_main.c`).
+///
+/// Runs on Tokio's current-thread runtime (AAP §0.4.4), collects the full argv
+/// (via [`std::env::args_os`], preserving non-UTF-8 bytes the way curl tolerates
+/// arbitrary argv), drives [`run`], flushes the standard streams, and exits with
+/// curl's numeric result code.
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    // Collect argv as `OsString`s: curl reads argv as raw C strings, and
+    // `args_os` preserves bytes that are not valid UTF-8 (which `operate` then
+    // converts losslessly for option parsing). Index 0 is the program name,
+    // matching C's `argv[0]`.
+    let args: Vec<OsString> = std::env::args_os().collect();
+
+    let code: CurlCode = run(args).await;
+
+    // C performs a final `fflush(NULL)` (under `_WIN32`); flush the standard
+    // streams unconditionally here so no buffered output is lost before the
+    // process exits via `process::exit` (which does not run destructors).
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+
+    // C: `return (int)result;`. `process::exit` delivers the full integer code
+    // as the process exit status (the OS masks it to 8 bits exactly as it does
+    // for the C tool, and curl's codes all fall well within `0..=255`). All
+    // meaningful teardown ran inside `run`, so bypassing destructor unwinding
+    // here is safe and reproduces curl's contract precisely.
+    std::process::exit(code);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A bare `curl-rs` invocation with no URL must return curl's
-    /// "failed to initialize" exit code (2), the same as the C tool.
+    /// Builds an argv vector (program name first, as `operate` expects).
+    fn argv(parts: &[&str]) -> Vec<OsString> {
+        parts.iter().map(OsString::from).collect()
+    }
+
+    /// `--version` is an informational request: `operate` renders the version
+    /// banner and returns `CURLE_OK` (0). The leading `-q` disables `.curlrc`
+    /// so the result never depends on a config file in the test environment.
     #[tokio::test(flavor = "current_thread")]
-    async fn no_url_returns_failed_init() {
-        let cli = Cli {
-            urls: vec![],
-            output: vec![],
-            silent: true,
-            verbose: false,
-            version: false,
-        };
+    async fn version_request_exits_ok() {
         assert_eq!(
-            format!("{:?}", run(cli).await),
-            format!("{:?}", exit_code(2))
+            run(argv(&["curl-rs", "-q", "--version"])).await,
+            codes::CURLE_OK
         );
     }
 
-    /// `--version` always succeeds (exit 0) regardless of other flags.
+    /// `--help` is likewise informational and exits successfully (0).
     #[tokio::test(flavor = "current_thread")]
-    async fn version_flag_succeeds() {
-        let cli = Cli {
-            urls: vec![],
-            output: vec![],
-            silent: false,
-            verbose: false,
-            version: true,
-        };
+    async fn help_request_exits_ok() {
         assert_eq!(
-            format!("{:?}", run(cli).await),
-            format!("{:?}", ExitCode::SUCCESS)
+            run(argv(&["curl-rs", "-q", "--help"])).await,
+            codes::CURLE_OK
         );
     }
 
-    /// A requested transfer in the foundation build maps to curl's
-    /// `CURLE_NOT_BUILT_IN` exit code (4), the genuine result for build-time
-    /// omitted functionality.
-    #[tokio::test(flavor = "current_thread")]
-    async fn transfer_request_reports_not_built_in() {
-        let cli = Cli {
-            urls: vec!["https://example.com/".to_string()],
-            output: vec![],
-            silent: true,
-            verbose: false,
-            version: false,
-        };
-        assert_eq!(
-            format!("{:?}", run(cli).await),
-            format!("{:?}", exit_code(codes::CURLE_NOT_BUILT_IN))
-        );
-    }
-
-    /// The CLI parser must accept curl's universal short flags without error.
+    /// The local `CURL_GLOBAL_DEFAULT` literal equals curl's canonical
+    /// `CURL_GLOBAL_ALL` (`CURL_GLOBAL_SSL | CURL_GLOBAL_WIN32 == 3`), keeping
+    /// the value the CLI passes to `global_init` identical to curl's.
     #[test]
-    fn parses_curl_universal_flags() {
-        let cli = Cli::try_parse_from([
-            "curl-rs",
-            "-s",
-            "-v",
-            "-o",
-            "out.txt",
-            "https://example.com/",
-        ])
-        .expect("curl-compatible flags parse");
-        assert!(cli.silent);
-        assert!(cli.verbose);
-        assert_eq!(cli.output, vec!["out.txt".to_string()]);
-        assert_eq!(cli.urls, vec!["https://example.com/".to_string()]);
+    fn global_default_matches_curl() {
+        assert_eq!(CURL_GLOBAL_DEFAULT, 1 | 2);
     }
 }
