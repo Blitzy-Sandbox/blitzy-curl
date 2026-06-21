@@ -659,6 +659,17 @@ pub struct ClientWriter {
     /// Set once an end-of-stream body write has flushed the decoder, so the
     /// decoder is finalized at most once.
     eos_seen: bool,
+    /// Whether a `Content-Encoding` response header installed later via
+    /// [`set_content_encoding`](Self::set_content_encoding) should actually be
+    /// *decoded*. Mirrors curl's gate
+    /// `data->set.str[STRING_ENCODING] && !data->set.http_ce_skip`: curl only
+    /// auto-decompresses a `Content-Encoding` body when the user opted in
+    /// (`--compressed` / `CURLOPT_ACCEPT_ENCODING`) and content decoding is not
+    /// disabled (`CURLOPT_HTTP_CONTENT_DECODING`). An *unsolicited*
+    /// `Content-Encoding` is passed through raw. Defaults to `true` so non-HTTP
+    /// callers (whose responses never carry `Content-Encoding`) are unaffected;
+    /// the HTTP engine sets it to the computed gate before driving the transfer.
+    content_decoding_enabled: bool,
 }
 
 impl std::fmt::Debug for ClientWriter {
@@ -681,6 +692,7 @@ impl ClientWriter {
             decoder: UnencodingStack::new(),
             out: CwOut::new(false, true),
             eos_seen: false,
+            content_decoding_enabled: true,
         }
     }
 
@@ -696,6 +708,7 @@ impl ClientWriter {
             decoder: UnencodingStack::new(),
             out: CwOut::new(include_header, can_pause),
             eos_seen: false,
+            content_decoding_enabled: true,
         }
     }
 
@@ -716,6 +729,7 @@ impl ClientWriter {
             decoder: UnencodingStack::from_content_encoding(enclist, decoding_enabled)?,
             out: CwOut::new(include_header, can_pause),
             eos_seen: false,
+            content_decoding_enabled: decoding_enabled,
         })
     }
 
@@ -742,6 +756,7 @@ impl ClientWriter {
             decoder,
             out,
             eos_seen,
+            content_decoding_enabled: _,
         } = self;
 
         // Stage 1+2: content-decode (body only; headers/meta pass through) and
@@ -770,6 +785,16 @@ impl ClientWriter {
     pub fn set_content_encoding(&mut self, enclist: &str, decoding_enabled: bool) -> Result<()> {
         self.decoder = UnencodingStack::from_content_encoding(enclist, decoding_enabled)?;
         Ok(())
+    }
+
+    /// Set whether a `Content-Encoding` response header installed later via
+    /// [`set_content_encoding`](Self::set_content_encoding) should be decoded.
+    /// See [`content_decoding_enabled`](Self::content_decoding_enabled): the
+    /// HTTP engine sets this to `CURLOPT_ACCEPT_ENCODING is set &&
+    /// !CURLOPT_HTTP_CONTENT_DECODING-disabled` so that an *unsolicited*
+    /// `Content-Encoding` body is passed through raw (curl's behavior).
+    pub fn set_content_decoding_enabled(&mut self, enabled: bool) {
+        self.content_decoding_enabled = enabled;
     }
 
     /// Clear the pause and replay the buffered chain in arrival order
@@ -2013,7 +2038,12 @@ pub async fn drive_transfer<P: ProtocolExchange>(
                     progress.set_download_size(sz);
                 }
                 if let Some(enc) = content_encoding {
-                    writer.set_content_encoding(&enc, true)?;
+                    // Only auto-decode when the user opted in (curl gates this on
+                    // `CURLOPT_ACCEPT_ENCODING` being set and content decoding not
+                    // disabled). An unsolicited `Content-Encoding` is recognized
+                    // but left raw so the still-encoded bytes pass through.
+                    let dec = writer.content_decoding_enabled;
+                    writer.set_content_encoding(&enc, dec)?;
                 }
                 // Headers are finished; subsequent writes are body bytes.
                 request.header = false;

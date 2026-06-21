@@ -340,6 +340,25 @@ pub struct Easy {
     /// the "active WebSocket context" that gates `curl_ws_meta` (a NULL result
     /// outside it — QA F5-MINOR-2) and backs `curl_ws_send`/`curl_ws_recv`.
     ws_state: Option<WsConnState>,
+    /// The per-handle cookie jar (curl's `data->cookies`), lazily created by the
+    /// transfer engine when the cookie engine is active and no shared jar is
+    /// attached via `CURLOPT_SHARE`. Held on the handle so in-memory cookies
+    /// captured on one transfer carry to the next transfer on the same handle
+    /// (e.g. multiple URLs in one invocation), matching curl. When a cookie
+    /// share is attached the engine uses that shared jar instead and this stays
+    /// `None`. Reset to `None` by [`duphandle`](Easy::duphandle) (a duplicated
+    /// handle starts with an empty jar, like curl's empty caches).
+    #[cfg(feature = "cookies")]
+    cookie_jar: Option<std::sync::Arc<std::sync::Mutex<crate::cookie::CookieJar>>>,
+    /// The per-handle HSTS store (curl's `data->hsts`), lazily created by the
+    /// transfer engine when the HSTS engine is active and no shared store is
+    /// attached via `CURLOPT_SHARE`. Held on the handle so an `http→https`
+    /// upgrade learned on one transfer carries to the next transfer on the same
+    /// handle, matching curl. When an HSTS share is attached the engine uses
+    /// that shared store instead and this stays `None`. Reset to `None` by
+    /// [`duphandle`](Easy::duphandle).
+    #[cfg(feature = "hsts")]
+    hsts_store: Option<std::sync::Arc<std::sync::Mutex<crate::hsts::HstsStore>>>,
 }
 
 // `Easy` is `Debug` (formerly derived) but the retained-connection fields hold
@@ -376,6 +395,10 @@ impl Easy {
             response_headers: HeaderCollector::new(),
             connect_only_conn: None,
             ws_state: None,
+            #[cfg(feature = "cookies")]
+            cookie_jar: None,
+            #[cfg(feature = "hsts")]
+            hsts_store: None,
         }
     }
 }
@@ -514,7 +537,63 @@ impl Easy {
             // `curl_easy_duphandle` starts with empty caches and no `data->conn`).
             connect_only_conn: None,
             ws_state: None,
+            // A duplicated handle starts with an empty per-handle cookie jar
+            // (curl's `curl_easy_duphandle` starts with empty caches); a shared
+            // jar, if any, is carried by the duplicated `CURLOPT_SHARE`.
+            #[cfg(feature = "cookies")]
+            cookie_jar: None,
+            // A duplicated handle starts with an empty per-handle HSTS store
+            // (curl's `curl_easy_duphandle` starts with empty caches); a shared
+            // store, if any, is carried by the duplicated `CURLOPT_SHARE`.
+            #[cfg(feature = "hsts")]
+            hsts_store: None,
         }
+    }
+
+    /// Resolve the HSTS store to use for this transfer (curl's `data->hsts`).
+    ///
+    /// When a `CURLOPT_SHARE` carrying `CURL_LOCK_DATA_HSTS` is attached, curl
+    /// points `data->hsts` at the share's store so every easy handle using the
+    /// share reads and writes the same HSTS policies; this returns that shared
+    /// store. Otherwise it returns a per-handle store, created on first use and
+    /// retained on the handle so an upgrade learned on one transfer persists to
+    /// the next on the same handle. The returned `Arc` is a cheap clone of the
+    /// store handle, not a copy of the entries.
+    #[cfg(feature = "hsts")]
+    pub(crate) fn hsts_store_handle(
+        &mut self,
+    ) -> std::sync::Arc<std::sync::Mutex<crate::hsts::HstsStore>> {
+        if let Some(shared) = self.set.share.as_ref().and_then(crate::share::Share::hsts) {
+            return shared;
+        }
+        self.hsts_store
+            .get_or_insert_with(|| {
+                std::sync::Arc::new(std::sync::Mutex::new(crate::hsts::HstsStore::new()))
+            })
+            .clone()
+    }
+
+    /// Resolve the cookie jar to use for this transfer (curl's `data->cookies`).
+    ///
+    /// When a `CURLOPT_SHARE` carrying `CURL_LOCK_DATA_COOKIE` is attached, curl
+    /// points `data->cookies` at the share's jar so every easy handle using the
+    /// share reads and writes the same cookies; this returns that shared jar.
+    /// Otherwise it returns a per-handle jar, created on first use and retained
+    /// on the handle so cookies captured on one transfer persist to the next on
+    /// the same handle (e.g. multiple URLs in one CLI invocation). The returned
+    /// `Arc` is a cheap clone of the jar handle, not a copy of the cookies.
+    #[cfg(feature = "cookies")]
+    pub(crate) fn cookie_jar_handle(
+        &mut self,
+    ) -> std::sync::Arc<std::sync::Mutex<crate::cookie::CookieJar>> {
+        if let Some(shared) = self.set.share.as_ref().and_then(crate::share::Share::cookies) {
+            return shared;
+        }
+        self.cookie_jar
+            .get_or_insert_with(|| {
+                std::sync::Arc::new(std::sync::Mutex::new(crate::cookie::CookieJar::new()))
+            })
+            .clone()
     }
 
     /// Deep-copy a [`UserDefined`] for [`duphandle`](Easy::duphandle).
