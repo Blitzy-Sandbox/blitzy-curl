@@ -1430,13 +1430,36 @@ fn setopt_post(
             }
             if let Some(root) = config.mimeroot.as_ref() {
                 let mime = crate::formparse::build_mime(easy, root)?;
-                per.mimepost = Some(mime);
-                // Attach by opaque address; PerTransfer owns the Mime so the
-                // pointer remains valid for the transfer (curl's
-                // `my_setopt_mimepost(curl, CURLOPT_MIMEPOST, config->mimepost)`).
-                let mp = CDataPtr(per.mimepost.as_ref().expect("mimepost was just stored")
-                    as *const curl_rs_lib::Mime as usize);
-                my_setopt(easy, O::CURLOPT_MIMEPOST, OptionValue::Ptr(mp))?;
+                // curl's C tool attaches the live MIME tree by opaque pointer via
+                // `my_setopt_mimepost(curl, CURLOPT_MIMEPOST, config->mimepost)`,
+                // and the library streams it through a read callback. The
+                // `#![forbid(unsafe_code)]` library core, however, cannot follow
+                // that opaque tree pointer. The memory-safe, wire-identical
+                // equivalent serializes the MIME tree *eagerly* into an owned
+                // `multipart/form-data` byte body (`Mime::into_form_body`, which
+                // performs curl's exact `into_top_part` + `multipart/form-data`
+                // header-prepare + readback) and hands the library that body
+                // together with the matching `Content-Type` (boundary included)
+                // via `Easy::set_mime_body`. The produced request — POST method,
+                // `multipart/form-data; boundary=…` Content-Type, `Content-Length`,
+                // and the encoded parts — is byte-for-byte identical to curl's;
+                // only the body's memory ownership differs (the AAP G1 mandate).
+                //
+                // The boundary is read (`boundary_str`, `&self`) *before*
+                // `into_form_body` (which consumes the tree) so the `boundary=`
+                // parameter announced in the Content-Type matches the delimiter
+                // used to frame the body. `boundary_str()` yields the boundary
+                // without the leading `--` wire-delimiter prefix, exactly the
+                // form required by the `Content-Type` parameter. The tree is not
+                // retained (`per.mimepost` stays `None`): it has been fully
+                // serialized into the owned body above, so it need not outlive
+                // this call.
+                let content_type = format!(
+                    "multipart/form-data; boundary={}",
+                    String::from_utf8_lossy(mime.boundary_str())
+                );
+                let body = mime.into_form_body()?;
+                easy.set_mime_body(body, content_type);
             }
         }
         _ => {}
@@ -2114,8 +2137,21 @@ mod tests {
         };
 
         assert!(setopt_post(&g, &config, &mut per, &mut easy).is_ok());
-        // The built `Mime` is owned by `PerTransfer` and attached via MIMEPOST.
-        assert!(per.mimepost.is_some());
+        // The memory-safe path serializes the `-F` MIME tree eagerly into an
+        // owned `multipart/form-data` body programmed onto the easy handle (via
+        // `Easy::set_mime_body`); the transient tree is consumed by
+        // serialization rather than retained by opaque pointer, so
+        // `per.mimepost` is left `None`.
+        assert!(per.mimepost.is_none());
+        // The matching multipart Content-Type (with the generated boundary) is
+        // now programmed on the handle — proving the body was constructed.
+        let ct = easy
+            .mime_content_type()
+            .expect("a multipart Content-Type must be programmed for -F");
+        assert!(
+            ct.starts_with("multipart/form-data; boundary="),
+            "unexpected Content-Type: {ct}"
+        );
     }
 
     // ---- end-to-end smoke of config2setopts -------------------------------

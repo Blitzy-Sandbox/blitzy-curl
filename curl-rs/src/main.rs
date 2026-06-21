@@ -110,6 +110,7 @@ mod callbacks;
 #[allow(dead_code)]
 mod config;
 mod formparse;
+mod help;
 mod messages;
 #[allow(dead_code)]
 mod operate;

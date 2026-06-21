@@ -471,6 +471,36 @@ impl Easy {
         &mut self.response_headers
     }
 
+    /// Attach a pre-serialized `multipart/form-data` request body and its
+    /// `Content-Type` (the `CURLOPT_MIMEPOST` effect, by value).
+    ///
+    /// This is the safe-core counterpart to `CURLOPT_MIMEPOST`: where the C ABI
+    /// stores an opaque `curl_mime *` that the `#![forbid(unsafe_code)]` core
+    /// cannot dereference, the caller (the CLI's `-F` handler, or the FFI shim)
+    /// serializes the MIME tree via [`Mime::to_bytes`](crate::mime::Mime::to_bytes)
+    /// and hands the engine the finished body plus its boundary-bearing
+    /// `Content-Type`. The request method is switched to the MIME-post family and
+    /// `no_body` is cleared, exactly as `CURLOPT_MIMEPOST` does, so the transfer
+    /// engine frames and streams the body (`build_request_body` returns it and the
+    /// HTTP/1 builder emits the `Content-Type` header unless the application set
+    /// its own).
+    pub fn set_mime_body(&mut self, body: Vec<u8>, content_type: String) {
+        self.set.mime_body = Some(body);
+        self.set.mime_content_type = Some(content_type);
+        self.set.method = crate::setopt::HttpReq::PostMime;
+        self.set.opt_no_body = false;
+    }
+
+    /// The `Content-Type` programmed alongside a multipart body by
+    /// [`set_mime_body`](Easy::set_mime_body) — e.g.
+    /// `multipart/form-data; boundary=…` for a `-F`/`CURLOPT_MIMEPOST` request,
+    /// or `None` when no multipart body is configured. Read-only introspection
+    /// used by the request builder (and exposed for the CLI/FFI seams).
+    #[must_use]
+    pub fn mime_content_type(&self) -> Option<&str> {
+        self.set.mime_content_type.as_deref()
+    }
+
     /// Whether either transfer direction is currently paused.
     ///
     /// Reflects the pause bits set by [`pause`](Easy::pause)
@@ -814,7 +844,11 @@ impl Easy {
 
             // The MIME tree is deep-copied by the FFI/MIME layer; the core never
             // aliases the opaque handle (curl's `dupset` sets `mimepostp = NULL`).
+            // The derived serialized body is likewise not inherited — the dup
+            // must re-attach its own MIME post, consistent with the NULL reset.
             mimepost: CDataPtr::NULL,
+            mime_body: None,
+            mime_content_type: None,
             // dup does not inherit the share handle (curl keeps `data->share`
             // separate from `data->set`, so the clone starts share-less).
             share: None,

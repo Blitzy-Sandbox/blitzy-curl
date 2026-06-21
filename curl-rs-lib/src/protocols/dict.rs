@@ -212,8 +212,8 @@ fn parse_dict_path(path: &str) -> Option<DictRequest> {
 fn wrap_request(command: &str) -> String {
     // The `CLIENT` line is sent verbatim to the DICT server, so it must match
     // curl's wire bytes exactly (AAP G6): C emits the wire product name
-    // `LIBCURL_NAME` ("libcurl"), NOT the rewrite's consumer-facing identity
-    // `version::NAME` ("curl-rs"). See `version::LIBCURL_NAME`.
+    // `LIBCURL_NAME` ("libcurl"), the on-the-wire product token. See
+    // `version::LIBCURL_NAME`.
     let (name, ver) = (version::LIBCURL_NAME, version::VERSION);
     format!("CLIENT {name} {ver}\r\n{command}\r\nQUIT\r\n")
 }
@@ -620,8 +620,8 @@ mod tests {
     fn wrap_request_frames_with_client_and_quit() {
         let framed = wrap_request("DEFINE foldoc curl");
         // The wire `CLIENT` line carries the on-the-wire product name
-        // `LIBCURL_NAME` ("libcurl") — NOT the consumer-facing `version::NAME`
-        // ("curl-rs") — so it byte-matches C `dict_do` (AAP G6).
+        // `LIBCURL_NAME` ("libcurl"), the on-the-wire product token, so it
+        // byte-matches C `dict_do` (AAP G6).
         let expected = format!(
             "CLIENT {} {}\r\nDEFINE foldoc curl\r\nQUIT\r\n",
             version::LIBCURL_NAME,

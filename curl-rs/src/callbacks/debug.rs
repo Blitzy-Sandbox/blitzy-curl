@@ -659,42 +659,61 @@ pub fn tool_debug_cb(
     let is_std_stream = matches!(target, TraceTarget::Stdout | TraceTarget::Stderr);
     let show_data_alert = !global.isatty || !is_std_stream;
 
-    // Acquire the resolved writer. stdout/stderr are locked for the duration of
-    // the write; the file is the cached `global.trace_stream`. The lock guards
-    // are declared here so they outlive the `&mut dyn Write` borrow below.
-    let stdout = io::stdout();
-    let stderr = io::stderr();
-    let mut stdout_lock;
-    let mut stderr_lock;
-    let out: &mut dyn Write = match target {
-        TraceTarget::Stdout => {
-            stdout_lock = stdout.lock();
-            &mut stdout_lock
-        }
+    // Render to the resolved destination. Write/flush errors are ignored: a
+    // trace-stream failure must never abort the transfer (curl ignores these
+    // returns too).
+    match target {
+        // Default `-v` and `--trace %` resolve to curl's `tool_stderr`, which
+        // `--stderr <file>`/`--stderr -` redirects (`src/tool_cb_dbg.c` sets
+        // `output = tool_stderr`). Route through the diagnostic sink — not the
+        // raw process `stderr` — so the trace follows `--stderr` exactly as in
+        // curl. Render into a buffer first, then emit it atomically through the
+        // sink (which locks and flushes on each write).
         TraceTarget::Stderr => {
-            stderr_lock = stderr.lock();
-            &mut stderr_lock
+            let mut buf: Vec<u8> = Vec::new();
+            let _ = render_trace(
+                &mut buf,
+                &timebuf,
+                &idsbuf,
+                tracetype,
+                infotype,
+                data,
+                show_data_alert,
+            );
+            crate::messages::emit_raw(&buf);
         }
-        TraceTarget::File => match global.trace_stream.as_mut() {
-            Some(file) => file,
-            // Unreachable: a `File` target implies the stream is open. Skip the
-            // write rather than panic inside a trace callback.
-            None => return 0,
-        },
-    };
-
-    // Render and flush. Write/flush errors are ignored: a trace-stream failure
-    // must never abort the transfer (curl ignores these returns too).
-    let _ = render_trace(
-        out,
-        &timebuf,
-        &idsbuf,
-        tracetype,
-        infotype,
-        data,
-        show_data_alert,
-    );
-    let _ = out.flush();
+        // `--trace -` / `--trace-ascii -`: the process standard output, locked
+        // for the duration of the write.
+        TraceTarget::Stdout => {
+            let mut lock = io::stdout().lock();
+            let _ = render_trace(
+                &mut lock,
+                &timebuf,
+                &idsbuf,
+                tracetype,
+                infotype,
+                data,
+                show_data_alert,
+            );
+            let _ = lock.flush();
+        }
+        // A file named by `--trace`/`--trace-ascii`, cached on
+        // `global.trace_stream`.
+        TraceTarget::File => {
+            if let Some(file) = global.trace_stream.as_mut() {
+                let _ = render_trace(
+                    file,
+                    &timebuf,
+                    &idsbuf,
+                    tracetype,
+                    infotype,
+                    data,
+                    show_data_alert,
+                );
+                let _ = file.flush();
+            }
+        }
+    }
     0
 }
 

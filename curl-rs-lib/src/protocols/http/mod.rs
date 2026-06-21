@@ -108,7 +108,10 @@ pub mod h3;
 // Imports — strictly limited to this file's declared dependencies.
 // ---------------------------------------------------------------------------
 
-use crate::conn::{BoxFuture, Connection, Curl_conn_get_alpn_negotiated};
+use crate::conn::{
+    BoxFuture, Connection, Curl_conn_get_alpn_negotiated, Curl_conn_get_ip_info,
+    Curl_conn_get_remote_addr,
+};
 use crate::easy::Easy;
 use crate::error::Result;
 // `CurlError` is used by the version selector (to reject an explicit
@@ -138,7 +141,8 @@ use crate::conn::{
     FIRSTSOCKET, TRNSPRT_TCP,
 };
 use crate::dns::{self, load_host_pairs, DnsCache, IpVersion, ResolveParams, ResolvedAddrs};
-use crate::progress::Progress;
+use crate::headers::CURLH_HEADER;
+use crate::progress::{Progress, Timer};
 use crate::protocols::pingpong::tls_config_from_easy;
 use crate::protocols::{SCHEME_HTTP, SCHEME_HTTPS};
 use crate::request::Request;
@@ -532,6 +536,55 @@ fn is_redirect_status(status: i32) -> bool {
     (300..400).contains(&status)
 }
 
+/// Whether an HTTP response code is a terminal `CURLOPT_FAILONERROR` failure,
+/// reimplementing curl's `http_should_fail()` (`lib/http.c`). The caller has
+/// already established that `CURLOPT_FAILONERROR` (`-f`/`--fail`) is set, so this
+/// only decides the per-status rules:
+///
+/// * any code `< 400` never fails;
+/// * a `416 Range Not Satisfiable` answer to a resumed `GET` is *not* a failure
+///   (the file is presumably already fully downloaded — curl's
+///   `state.resume_from && httpreq == GET && httpcode == 416` exception);
+/// * any code `>= 400` other than `401`/`407` is always terminal;
+/// * a `401`/`407` with no corresponding credential configured is terminal
+///   (curl's `!aptr.user` / `!proxy_user_passwd` checks);
+/// * a `401`/`407` that survives after credentials were supplied is terminal —
+///   curl returns `state.authproblem`, which for this engine's single-shot,
+///   preemptive-`Basic` auth (there is no `401`-retry negotiation loop) means a
+///   repeated challenge could not be satisfied, i.e. a failure.
+///
+/// `resume` is `state.resume_from != 0`, `is_get` is `method == GET`, and
+/// `has_user`/`has_proxy_user` mirror whether host/proxy credentials are set.
+fn http_should_fail(
+    code: i32,
+    resume: bool,
+    is_get: bool,
+    has_user: bool,
+    has_proxy_user: bool,
+) -> bool {
+    if code < 400 {
+        return false;
+    }
+    if resume && is_get && code == 416 {
+        return false;
+    }
+    if code != 401 && code != 407 {
+        return true;
+    }
+    if code == 401 && !has_user {
+        return true;
+    }
+    if code == 407 && !has_proxy_user {
+        return true;
+    }
+    // Residual `401`/`407` after credentials were provided: curl returns
+    // `data->state.authproblem`. With single-shot preemptive Basic and no auth
+    // re-negotiation loop, a still-challenging response means authentication did
+    // not succeed, so this is a failure — matching curl's terminal outcome for
+    // the non-negotiating case.
+    true
+}
+
 /// Map a `HttpReq` request kind to the redirect-logic [`HttpMethod`]. `HEAD`
 /// (`CURLOPT_NOBODY`) is represented as `GET` in `data.set.method`, so the
 /// rewrite rules see it as a non-POST method, exactly as curl does.
@@ -586,6 +639,16 @@ struct HopSink<'s> {
     /// The last captured `Alt-Svc` header value (alt-svc cache).
     #[cfg(feature = "alt-svc")]
     alt_svc: Option<String>,
+    /// The raw `name: value` header lines (with their CRLF terminators) of the
+    /// current response block, for populating the libcurl `HeaderCollector` after
+    /// the transfer. Reset on each status line so only the final block's headers
+    /// remain (curl's `curl_easy_header()` default reads the most recent request).
+    /// The status line itself is excluded (it is not a `name: value` header).
+    headers: Vec<Vec<u8>>,
+    /// The current response block's `Content-Type` value (trimmed, bytes), for
+    /// `CURLINFO_CONTENT_TYPE`. Reset on each status line so a redirect block's
+    /// value does not leak into the final one.
+    content_type: Option<Vec<u8>>,
     /// Memoized body-suppression decision (computed once the first body byte
     /// arrives — by then all headers, including the status line, have been seen).
     suppress_body: Option<bool>,
@@ -604,6 +667,8 @@ impl<'s> HopSink<'s> {
             sts: None,
             #[cfg(feature = "alt-svc")]
             alt_svc: None,
+            headers: Vec::new(),
+            content_type: None,
             suppress_body: None,
         }
     }
@@ -619,18 +684,30 @@ impl<'s> HopSink<'s> {
             return;
         }
         // A status line begins a (possibly new) response block. Update the status
-        // and reset the per-block `Location` so a 1xx/redirect block's value does
-        // not leak into the final one.
+        // and reset the per-block `Location`, captured header lines, and
+        // `Content-Type` so a 1xx/redirect block's values do not leak into the
+        // final one (curl's header API and `CURLINFO_CONTENT_TYPE` reflect the
+        // most recent request's response block).
         if let Some(rest) = line.strip_prefix("HTTP/") {
             if let Some(code) = parse_status_code(rest) {
                 self.status = code;
                 self.location = None;
+                self.headers.clear();
+                self.content_type = None;
             }
             return;
         }
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim();
             let value = value.trim();
+            // Store the raw header line (with its CRLF terminator) for the libcurl
+            // `HeaderCollector` / `%header{}` write-out, and capture `Content-Type`
+            // for `CURLINFO_CONTENT_TYPE`. Done for every real header (not just the
+            // recognized ones below) so the store mirrors the full response block.
+            self.headers.push(raw.to_vec());
+            if name.eq_ignore_ascii_case("content-type") {
+                self.content_type = Some(value.as_bytes().to_vec());
+            }
             if name.eq_ignore_ascii_case("location") {
                 self.location = Some(value.to_string());
             } else if cfg!(feature = "cookies") && name.eq_ignore_ascii_case("set-cookie") {
@@ -681,6 +758,22 @@ impl WriteCallbacks for HopSink<'_> {
     fn write_header(&mut self, data: &[u8]) -> Option<usize> {
         self.note_header(data);
         self.inner.write_header(data)
+    }
+
+    // The trace, progress, and diagnostic channels are per-transfer concerns the
+    // redirect decorator does not interpret — forward them verbatim to the
+    // application sink so every hop's verbose trace, progress meter, and
+    // diagnostic output reach the front-end unchanged.
+    fn debug(&mut self, infotype: crate::transfer::DebugInfoType, data: &[u8]) {
+        self.inner.debug(infotype, data);
+    }
+
+    fn progress(&mut self, dltotal: i64, dlnow: i64, ultotal: i64, ulnow: i64) -> i32 {
+        self.inner.progress(dltotal, dlnow, ultotal, ulnow)
+    }
+
+    fn write_diag(&mut self, bytes: &[u8]) {
+        self.inner.write_diag(bytes);
     }
 }
 
@@ -1543,6 +1636,12 @@ async fn perform_http_hop(
     follow_enabled: bool,
     sink: &mut dyn WriteCallbacks,
 ) -> Result<HopResult> {
+    // The operation start for this hop, captured before DNS resolution and
+    // connection setup so the transfer timings (`CURLINFO_*_TIME`) measure from
+    // the true beginning of work — curl's `Curl_pgrsStartNow` reference point.
+    // The name-lookup and connect milestones below are recorded relative to it,
+    // and it is threaded into `drive_one` to seed `Progress`.
+    let op_start = Instant::now();
     let verbose = data.set.verbose;
     let httpwant = data.set.httpwant;
     let ipver = IpVersion::from_raw(i64::from(data.set.ipver));
@@ -1611,6 +1710,8 @@ async fn perform_http_hop(
         }
     };
     let addrs = resolve_addrs(data, &dial_host, dial_port, ipver, verbose).await?;
+    // CURLINFO_NAMELOOKUP_TIME milestone: name resolution for this hop is done.
+    let t_resolved = Instant::now();
 
     // (4) Build the connection and its filter chain. The SETUP meta-filter
     //     assembles the chain in curl's canonical order:
@@ -1744,6 +1845,65 @@ async fn perform_http_hop(
 
     let dispatch = ConnSetup::Default(setup);
     establish_connection(&mut conn, FIRSTSOCKET, ssl_mode, dispatch, true).await?;
+    // CURLINFO_CONNECT_TIME milestone: the TCP (and, for https, the TLS) handshake
+    // is complete. curl's `CONNECT_TIME`/`APPCONNECT_TIME` are measured from the
+    // operation start (they include the name-lookup phase), so both deltas are
+    // relative to `op_start`.
+    let t_connected = Instant::now();
+
+    // Publish the connection-derived `data->info` fields now that the socket is
+    // up, mirroring curl's per-connection info store (`Curl_conn_get_ip_quadruple`
+    // → `data->info.primary` / `conn->primary`). These back `CURLINFO_PRIMARY_IP`
+    // / `PRIMARY_PORT` / `LOCAL_IP` / `LOCAL_PORT` (`%{remote_ip}`, `%{remote_port}`,
+    // `%{local_ip}`, `%{local_port}`) and `CURLINFO_NUM_CONNECTS` (`%{num_connects}`).
+    // Recorded before the transfer drive so the values are present even if the
+    // body transfer later fails. The same chain query (`Curl_conn_get_ip_info`)
+    // that the socket filter answers via `getpeername`/`getsockname` is used — the
+    // peer source is identical to the `* Connected to …` trace above.
+    if let Some((_is_ipv6, quad)) = Curl_conn_get_ip_info(&conn, FIRSTSOCKET) {
+        data.info.primary_ip = CString::new(quad.remote_ip).ok();
+        data.info.local_ip = CString::new(quad.local_ip).ok();
+        data.info.primary_port = i64::from(quad.remote_port);
+        data.info.local_port = i64::from(quad.local_port);
+        data.info.primary_has_ports = true;
+    }
+    data.info.num_connects += 1;
+
+    // Transfer-phase timings that are known at connect time (curl's
+    // `Curl_pgrsTime(TIMER_NAMELOOKUP/CONNECT/APPCONNECT)`). `connect_time`
+    // includes the name-lookup phase (measured from `op_start`), matching curl.
+    // For an https hop the TLS handshake completes inside `establish_connection`,
+    // so `APPCONNECT_TIME` shares the connect instant.
+    data.info.namelookup_time_us = t_resolved.saturating_duration_since(op_start).as_micros() as i64;
+    let connect_us = t_connected.saturating_duration_since(op_start).as_micros() as i64;
+    data.info.connect_time_us = connect_us;
+    if is_https {
+        data.info.appconnect_time_us = connect_us;
+    }
+
+    // CURLINFO_TEXT connection trace (`-v`): emit the `* Trying …` /
+    // `* Connected to …` lines curl prints once the socket is connected. The
+    // connected peer address is queried from the chain (`Curl_conn_get_remote_addr`,
+    // the same source as `CURLINFO_PRIMARY_IP`). A `SocketAddr`'s `Display`
+    // already brackets IPv6 and appends `:port`, matching curl's
+    // `"  Trying [%s]:%d..."` / `"  Trying %s:%d..."` exactly, while the
+    // `Connected to %s (%s) port %u` line pairs the request host (curl's
+    // `conn->host.dispname`) with the bare peer IP and port. The front-end's
+    // `tool_debug_cb` adds the `* ` line-start marker. Each datum ends in `\n`
+    // so the renderer treats it as a complete line.
+    if verbose {
+        if let Some(peer) = Curl_conn_get_remote_addr(&conn, FIRSTSOCKET) {
+            let trying = format!("  Trying {peer}...\n");
+            sink.debug(crate::transfer::DebugInfoType::Text, trying.as_bytes());
+            let connected = format!(
+                "Connected to {} ({}) port {}\n",
+                host,
+                peer.ip(),
+                peer.port()
+            );
+            sink.debug(crate::transfer::DebugInfoType::Text, connected.as_bytes());
+        }
+    }
 
     // (6) Select the wire version (forced option, else negotiated ALPN) and
     //     build + drive the matching exchange, capturing the hop outcome.
@@ -1769,13 +1929,21 @@ async fn perform_http_hop(
                 );
                 h1::build_request(&inputs)?
             };
+            // CURLINFO_HEADER_OUT: when verbose, emit the fully serialized
+            // request head (request line + header block + terminating CRLF) as a
+            // single event before the exchange begins. curl's `tool_debug_cb`
+            // splits it on newlines and renders each line with the `> ` prefix
+            // (`Curl_debug(…, CURLINFO_HEADER_OUT, …)` in `Curl_http`).
+            if verbose {
+                hop_sink.debug(crate::transfer::DebugInfoType::HeaderOut, &plan.head);
+            }
             let mut exchange = h1::H1Exchange::new(
                 h1::ConnByteStream::new(&mut conn),
                 plan,
                 data.set.http09_allowed,
                 false,
             );
-            let result = drive_one(data, &mut exchange, &mut hop_sink).await;
+            let result = drive_one(data, &mut exchange, &mut hop_sink, op_start).await;
             let keepalive = exchange.keepalive();
             drop(exchange);
             h1::apply_connection_reuse(&mut conn, keepalive);
@@ -1808,7 +1976,7 @@ async fn perform_http_hop(
                 let mut h2conn =
                     self::h2::h2_client_handshake(io, self::h2::H2Settings::default()).await?;
                 let mut exchange = h2conn.start_exchange(req, h2_body, h2_no_body).await?;
-                let result = drive_one(data, &mut exchange, &mut hop_sink).await;
+                let result = drive_one(data, &mut exchange, &mut hop_sink, op_start).await;
                 h2conn.close();
                 result
             }
@@ -1825,11 +1993,25 @@ async fn perform_http_hop(
     };
     drive_result?;
 
+    // CURLINFO_HTTP_VERSION (`%{http_version}`): set from the authoritative wire
+    // version actually used for this hop. The h1 `Request` struct does not carry
+    // the version, so `drive_one` left `data.info.http_version` at `0`; override
+    // it here with curl's internal 10/11/20/30 encoding (`map_http_version`
+    // translates it to the public `CURL_HTTP_VERSION_*` value the queries return).
+    data.info.http_version = match version {
+        HttpVersion::Http10 => 10,
+        HttpVersion::Http11 => 11,
+        HttpVersion::H2 => 20,
+        HttpVersion::H3 => 30,
+    };
+
     // Hand the captured per-hop facts to the orchestrator (ends the `sink`
     // borrow held by `HopSink`).
     let HopSink {
         status,
         location,
+        headers,
+        content_type,
         #[cfg(feature = "cookies")]
         set_cookies,
         #[cfg(feature = "hsts")]
@@ -1838,6 +2020,26 @@ async fn perform_http_hop(
         alt_svc,
         ..
     } = hop_sink;
+
+    // CURLINFO_CONTENT_TYPE (`%{content_type}`, `%header{Content-Type}` via the
+    // store below): the final response block's `Content-Type`, captured by
+    // `HopSink` while observing the headers. `None`/un-encodable → unset.
+    data.info.content_type = content_type.and_then(|v| CString::new(v).ok());
+
+    // Populate the libcurl header store (`HeaderCollector`) with the final
+    // response block's header lines so `curl_easy_header()` (AAP §0.7.2) and the
+    // CLI's `%header{name}` write-out can read them back. The status line is not
+    // a `name: value` header and `HopSink` already excluded it (curl's header API
+    // stores only real headers); any residually malformed line is skipped via the
+    // discarded `push` error. `pre_perform` reset the collector at transfer start,
+    // so these are exactly this transfer's response headers.
+    {
+        let collector = data.headers_mut();
+        for line in &headers {
+            let _ = collector.push(line, CURLH_HEADER);
+        }
+    }
+
     Ok(HopResult {
         status,
         location,
@@ -1875,6 +2077,10 @@ async fn perform_http3(
     verbose: bool,
 ) -> Result<()> {
     use crate::protocols::http::h3::{build_h3_request, h3_alpn, Http3Session};
+
+    // Operation start for the transfer timings, captured before resolve/connect
+    // and threaded into `drive_one` to seed `Progress` (see `perform_http_hop`).
+    let op_start = Instant::now();
 
     // HTTP/3 is https-only (curl rejects `--http3` on a cleartext URL).
     let scheme = url.get(CurlUPart::Scheme, 0).unwrap_or_default();
@@ -1990,7 +2196,7 @@ async fn perform_http3(
         offset += sent;
     }
 
-    let result = drive_one(data, &mut exchange, sink).await;
+    let result = drive_one(data, &mut exchange, sink, op_start).await;
     session.close();
     result
 }
@@ -2035,6 +2241,10 @@ pub(crate) async fn perform_ws(
     source: &mut dyn ReadCallback,
 ) -> Result<()> {
     use crate::protocols::ws::{ws_inject_request_headers, WsConnState};
+
+    // Operation start for the handshake transfer timings, captured before
+    // resolve/connect and threaded into `drive_one` to seed `Progress`.
+    let op_start = Instant::now();
 
     // (1) Inject the WebSocket Upgrade request headers (curl's `Curl_ws_request`),
     //     each only if the user has not already supplied it.
@@ -2109,7 +2319,7 @@ pub(crate) async fn perform_ws(
             data.set.http09_allowed,
             false,
         );
-        drive_one(data, &mut exchange, sink).await?;
+        drive_one(data, &mut exchange, sink, op_start).await?;
         exchange.take_rbuf()
     };
 
@@ -2175,6 +2385,13 @@ async fn drive_one<P: ProtocolExchange>(
     data: &mut Easy,
     exchange: &mut P,
     sink: &mut dyn WriteCallbacks,
+    // The hop's operation-start instant, captured by the caller *before* DNS
+    // resolution and connection setup. Seeding [`Progress`] with it (rather than
+    // `Instant::now()` here, after the connection is already up) makes the
+    // recorded `CURLINFO_TOTAL_TIME` / `CURLINFO_STARTTRANSFER_TIME` measure from
+    // the true start of the operation — matching curl's `Curl_pgrsStartNow`,
+    // which is called at transfer start, not after connect.
+    op_start: Instant,
 ) -> Result<()> {
     let mut request = Request::new();
     // Seed `no_body` from the easy handle, mirroring curl's `Curl_req_hard_reset`
@@ -2184,7 +2401,16 @@ async fn drive_one<P: ProtocolExchange>(
     // `size = Some(n)` but `bytecount = 0` and wrongly report `CURLE_PARTIAL_FILE`.
     // With `no_body = true` that check short-circuits, matching curl.
     request.no_body = data.set.opt_no_body;
-    let mut progress = Progress::new(Instant::now());
+    let mut progress = Progress::new(op_start);
+    // Anchor the operation and single-transfer clocks at `op_start` so the
+    // cumulative phase milestones (`Timer::PreTransfer` / `Timer::StartTransfer`,
+    // recorded inside `drive_transfer`) accumulate `(now − op_start)` exactly as
+    // curl's `Curl_pgrsTime(TIMER_*)` does relative to `t_startsingle`. Without
+    // an anchored single-start the phase deltas would collapse to the minimal one
+    // microsecond. (`StartOp` also re-bases the queue clock; harmless for a
+    // single transfer.)
+    progress.time(Timer::StartOp, op_start);
+    progress.time(Timer::StartSingle, op_start);
     let mut writer = ClientWriter::with_options(data.set.include_header, false);
     // curl only auto-decompresses a `Content-Encoding` response body when the
     // user opted in via `--compressed` / `CURLOPT_ACCEPT_ENCODING` (so
@@ -2203,7 +2429,25 @@ async fn drive_one<P: ProtocolExchange>(
         low_speed_limit: data.set.low_speed_limit,
         low_speed_time: u32::from(data.set.low_speed_time),
     };
-    drive_transfer(
+    // Build the `CURLOPT_FAILONERROR` (`-f`/`--fail`) predicate once, before the
+    // byte loop. It is `Some` only when failonerror is set; the closure captures
+    // `Copy` flags (so it borrows nothing from `data`, leaving `data` free to
+    // mutate afterward) and is `Send + Sync` for the multi-handle spawn. The
+    // HTTP-specific should-fail rules live in `http_should_fail`, so the generic
+    // `drive_transfer` loop stays protocol-agnostic — curl likewise confines
+    // `http_should_fail()` to `lib/http.c`.
+    let fail_closure = data.set.http_fail_on_error.then(|| {
+        let resume = data.set.set_resume_from != 0;
+        let is_get = data.set.method == HttpReq::Get;
+        let has_user = data.set.str(StrId::Username).is_some();
+        let has_proxy_user = data.set.str(StrId::Proxyusername).is_some();
+        move |code: i32| http_should_fail(code, resume, is_get, has_user, has_proxy_user)
+    });
+    let fail_ref: Option<&(dyn Fn(i32) -> bool + Send + Sync)> = fail_closure
+        .as_ref()
+        .map(|c| c as &(dyn Fn(i32) -> bool + Send + Sync));
+
+    let outcome = drive_transfer(
         TransferParts {
             exchange,
             request: &mut request,
@@ -2215,8 +2459,9 @@ async fn drive_one<P: ProtocolExchange>(
         },
         None,
         None,
+        fail_ref,
     )
-    .await?;
+    .await;
 
     // Record the post-transfer `data->info` store so `curl_easy_getinfo`
     // (CURLINFO_RESPONSE_CODE / SIZE_DOWNLOAD / SIZE_UPLOAD / HTTP_VERSION) and
@@ -2226,10 +2471,35 @@ async fn drive_one<P: ProtocolExchange>(
     // defaults even after a fully successful transfer (e.g. `%{http_code}` would
     // report `000`). The Easy-handle `Info` has no `record_progress` helper (that
     // lives on the typestate `TransferInfo`), so the fields are set directly.
+    //
+    // This runs REGARDLESS of `outcome`: curl sets `data->info.httpcode` while
+    // processing the response headers, independent of the failonerror abort, so a
+    // `-f` transfer that fails with `CURLE_HTTP_RETURNED_ERROR` must still expose
+    // the real status — `%{http_code}` and the CLI's `"The requested URL returned
+    // error: <code>"` message both read it back via `CURLINFO_RESPONSE_CODE`.
     data.info.response_code = i64::from(request.httpcode);
     data.info.http_version = i64::from(request.httpversion);
     data.info.size_download = progress.download_size();
     data.info.size_upload = progress.upload_size();
+
+    // Finalize the elapsed-time accounting and publish the transfer-phase timings
+    // and header byte count to `data->info`, mirroring curl's `Curl_pgrsDone` /
+    // `Curl_pgrsUpdate` at end of transfer. `calc(now, true)` recomputes
+    // `timespent = now − op_start` (the `req_done` flag forces a final sample),
+    // which `CURLINFO_TOTAL_TIME[_T]` reads back. `Timer::PreTransfer` and
+    // `Timer::StartTransfer` were captured inside `drive_transfer`; here we copy
+    // their accumulated values across so `%{time_total}`, `%{time_starttransfer}`
+    // and `%{time_pretransfer}` reflect the real transfer (they were previously
+    // left at `0`). `header_size` is the running inbound-header byte total curl
+    // exposes as `CURLINFO_HEADER_SIZE` (`%{size_header}`).
+    progress.calc(Instant::now(), true);
+    data.info.total_time_us = progress.total_time().as_micros();
+    data.info.starttransfer_time_us = progress.starttransfer_time().as_micros();
+    data.info.pretransfer_time_us = progress.pretransfer_time().as_micros();
+    data.info.header_size = request.headerbytecount as i64;
+
+    // Surface any transfer error only after the info store is recorded.
+    outcome?;
     Ok(())
 }
 
@@ -2305,6 +2575,15 @@ fn upload_is_chunked(data: &Easy) -> bool {
 ///   announced `Transfer-Encoding: chunked`, else sized).
 /// * Otherwise (GET/HEAD/DELETE without data) -> no body; `source` is untouched.
 fn build_request_body(data: &Easy, source: &mut dyn ReadCallback) -> Result<h1::RequestBody> {
+    // CURLOPT_MIMEPOST (`-F`/`--form`): the engine streams the pre-serialized
+    // `multipart/form-data` body produced from the MIME tree. It is a known,
+    // sized body (curl frames multipart with `Content-Length` when the size is
+    // known), so it is delivered as `Sized`. The matching `Content-Type:
+    // multipart/form-data; boundary=…` header is emitted by the request builder
+    // from `set.mime_content_type` (see `make_inputs`).
+    if let Some(body) = data.set.mime_body.as_ref() {
+        return Ok(h1::RequestBody::Sized(body.clone()));
+    }
     if let Some(fields) = data.set.copypostfields.as_ref() {
         return Ok(h1::RequestBody::Sized(fields.clone()));
     }
@@ -2635,7 +2914,12 @@ fn make_inputs<'a>(
         proxy_connection_keepalive: hop.proxy_connection_keepalive,
         cookie: hop.cookie.as_deref(),
         body,
-        content_type: None,
+        // `CURLOPT_MIMEPOST` (`-F`): the `multipart/form-data; boundary=…`
+        // Content-Type derived from the MIME tree. `None` for every other method,
+        // so the HTTP/1 builder's `application/x-www-form-urlencoded` default for
+        // a plain `-d` POST is unaffected; the builder only applies this when the
+        // application did not supply its own `Content-Type` header.
+        content_type: data.set.mime_content_type.as_deref(),
         content_length,
         chunked,
         disable_expect: false,

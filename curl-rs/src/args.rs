@@ -4042,7 +4042,13 @@ pub fn get_parameter(
                 singleopt = true; // do not loop anymore after this
             } else if a.id == OptId::Help {
                 // --help is special: rendering is performed by the caller
-                // (operate.rs / build_cli); we only signal the request.
+                // (operate.rs → crate::help::tool_help). Capture the optional
+                // category argument exactly as C does
+                // (`tool_help((nextarg && *nextarg) ? nextarg : NULL)`): a
+                // present, non-empty token becomes the category, otherwise the
+                // default page is requested. The outer parse loop stops on this
+                // `Err`, so the captured token is never reprocessed as a URL.
+                global.help_category = cur_nextarg.filter(|s| !s.is_empty()).map(str::to_string);
                 err = Err(ParameterError::HelpRequested);
                 break;
             } else if cur_nextarg.is_none() {

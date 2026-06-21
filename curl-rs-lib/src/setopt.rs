@@ -730,8 +730,21 @@ pub struct UserDefined {
     pub postfields: Option<CDataPtr>,
     /// `CURLOPT_HTTPPOST` legacy multipart form (opaque `curl_httppost *`).
     pub httppost: CDataPtr,
-    /// `CURLOPT_MIMEPOST` MIME post object (opaque `curl_mime *`).
+    /// `CURLOPT_MIMEPOST` MIME post object (opaque `curl_mime *`). Retained for
+    /// C-ABI parity (the FFI layer stores the caller's `curl_mime *` here); the
+    /// safe core cannot deref it, so the *serialized* form below is what the
+    /// transfer engine consumes.
     pub mimepost: CDataPtr,
+    /// The serialized `multipart/form-data` request body produced from the MIME
+    /// tree (`Mime::to_bytes`), owned so the `#![forbid(unsafe_code)]` core can
+    /// stream it without dereferencing the opaque `mimepost` pointer. Set via
+    /// [`Easy::set_mime_body`](crate::easy::Easy::set_mime_body) on the direct
+    /// (CLI) path and by the FFI shim on the C-ABI path.
+    pub mime_body: Option<Vec<u8>>,
+    /// The `Content-Type` header value for [`mime_body`](Self::mime_body), e.g.
+    /// `multipart/form-data; boundary=…`, applied unless the application supplied
+    /// its own `Content-Type` (curl's `Curl_mime_contenttype` behavior).
+    pub mime_content_type: Option<String>,
 
     // ---- callback function pointers ----------------------------------------
     /// `CURLOPT_WRITEFUNCTION` body writer.
@@ -1163,6 +1176,8 @@ impl Default for UserDefined {
             postfields: None,
             httppost: CDataPtr::NULL,
             mimepost: CDataPtr::NULL,
+            mime_body: None,
+            mime_content_type: None,
 
             // Callback pointers — all NULL; curl substitutes built-in
             // fwrite/fread shims at transfer time when these stay unset.

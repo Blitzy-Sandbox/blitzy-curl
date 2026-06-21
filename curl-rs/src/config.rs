@@ -757,6 +757,14 @@ pub struct GlobalConfig {
     pub isatty: bool,
     /// `--trace-config` has been used (C `trace_set`).
     pub trace_set: bool,
+
+    /// The optional category argument captured for a pending `-h`/`--help`
+    /// request (C passes `(nextarg && *nextarg) ? nextarg : NULL` to
+    /// `tool_help`). `None` means the bare `--help`/`-h` default page; `Some`
+    /// holds the category token (e.g. `"all"`, `"http"`, `"category"`, or a
+    /// `-`-prefixed option name). Consumed by the `HelpRequested` arm in
+    /// `operate.rs`.
+    pub help_category: Option<String>,
 }
 
 impl GlobalConfig {

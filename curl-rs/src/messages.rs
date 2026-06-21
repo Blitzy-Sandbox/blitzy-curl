@@ -218,6 +218,17 @@ fn write_to_sink(bytes: &[u8]) {
     let _ = lock_sink().write_diagnostic(bytes);
 }
 
+/// Writes raw, pre-rendered bytes to the active diagnostic stream (the one
+/// `--stderr` controls), without adding any `curl: `/`Warning: ` prefix.
+///
+/// This is the analog of curl's direct `curl_mfprintf(tool_stderr, …)` writes
+/// (e.g. the "Cannot comply. This curl was built without built-in manual"
+/// message in `tool_help.c`'s option-help branch). Like the other sink writers
+/// it swallows I/O errors, matching curl's unchecked diagnostic writes.
+pub(crate) fn emit_raw(bytes: &[u8]) {
+    write_to_sink(bytes);
+}
+
 /// Initializes the diagnostic stream to the process `stderr`.
 ///
 /// Mirrors `tool_init_stderr()` (`src/tool_stderr.c`), called once near process
@@ -502,7 +513,7 @@ fn format_help(msg: Option<&str>) -> Vec<u8> {
 /// auto-detection is intentionally not reproduced; in the test harness `stdin`
 /// is not a terminal, so curl's own detection also fails and returns `79`,
 /// keeping wrap output identical in the environment that matters for parity.
-fn terminal_columns() -> usize {
+pub(crate) fn terminal_columns() -> usize {
     if let Ok(columns) = std::env::var("COLUMNS") {
         if let Some(num) = parse_columns(&columns) {
             // curl: honored only when num > 20.

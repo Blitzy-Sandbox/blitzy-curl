@@ -985,6 +985,38 @@ impl Mime {
         top.flags |= MIME_BODY_ONLY;
         top
     }
+
+    /// Serialize this multipart into the HTTP request **body only** — the
+    /// `multipart/form-data` payload that follows the request header block,
+    /// with no top-level `Content-Type` line in the bytes (that header is
+    /// announced separately on the request, built from
+    /// [`boundary_str`](Mime::boundary_str)).
+    ///
+    /// This is the memory-safe equivalent of curl streaming a
+    /// `CURLOPT_MIMEPOST` tree through its read callback. The tree is wrapped
+    /// in a synthetic `MIME_BODY_ONLY` top part (exactly as curl's MIMEPOST
+    /// handling does — see [`into_top_part`](Mime::into_top_part)), its part
+    /// headers are prepared with the `multipart/form-data` strategy
+    /// ([`MimeStrategy::Form`]), and the whole body is read back into one owned
+    /// buffer. The produced bytes are byte-for-byte identical to curl's
+    /// streamed body; only the memory ownership differs (eager owned `Vec<u8>`
+    /// vs. curl's lazy callback stream), satisfying the AAP G1 mandate at the
+    /// `#![forbid(unsafe_code)]` library boundary, which cannot follow the
+    /// opaque MIMEPOST tree pointer.
+    ///
+    /// Read [`boundary_str`](Mime::boundary_str) (to build the request's
+    /// `Content-Type: multipart/form-data; boundary=…`) *before* calling this,
+    /// since it consumes the tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CurlError::ReadError`] if a file or callback part cannot be
+    /// read while assembling the body, or any encoder error.
+    pub fn into_form_body(self) -> Result<Vec<u8>> {
+        let mut top = self.into_top_part();
+        top.prepare_headers(Some(b"multipart/form-data"), None, MimeStrategy::Form, false)?;
+        top.to_bytes()
+    }
 }
 
 // =============================================================================
@@ -2415,6 +2447,40 @@ mod tests {
         ]
         .concat();
         assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn into_form_body_is_body_only_and_byte_exact() {
+        // `Mime::into_form_body` is the production entry point the CLI/FFI use to
+        // turn a `-F` MIME tree into the request body. It must produce exactly
+        // the body-only multipart payload — identical to the proven `form_body`
+        // helper and to the byte-exact expectation — with NO top-level
+        // `Content-Type` line embedded in the bytes (that header is announced
+        // separately on the request via `boundary_str`).
+        let build = || {
+            let mut mime = Mime::with_boundary(b"BOUNDARY");
+            mime.addpart()
+                .set_name(Some(b"field".as_slice()))
+                .unwrap()
+                .set_data(b"value")
+                .unwrap();
+            mime
+        };
+        let expected = [
+            b"--BOUNDARY\r\n".as_slice(),
+            b"Content-Disposition: form-data; name=\"field\"\r\n",
+            b"\r\n",
+            b"value",
+            b"\r\n--BOUNDARY--\r\n",
+        ]
+        .concat();
+        // Byte-exact against the canonical expectation.
+        let got = build().into_form_body().expect("serialization succeeds");
+        assert_eq!(got, expected);
+        // And identical to the established body-only helper.
+        assert_eq!(got, form_body(build()));
+        // No top-level Content-Type line leaks into the body (it is body-only).
+        assert!(!contains(&got, b"Content-Type: multipart/form-data"));
     }
 
     #[test]

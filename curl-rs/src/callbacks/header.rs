@@ -727,9 +727,18 @@ pub fn tool_header_cb(buffer: &[u8], per: &mut PerTransfer, global: &mut GlobalC
         )
     };
 
-    // ---- --dump-header (-D): write raw header bytes to the heads file -------
-    // curl: `if(per->config->headerfile && heads->stream) { ... }`.
-    if headerfile.is_some() && per.heads.stream.is_some() {
+    // ---- --dump-header (-D): write raw header bytes to the heads sink -------
+    // curl: `if(per->config->headerfile && heads->stream) { ... }`. In curl
+    // `heads->stream` is *always* non-NULL once `-D <target>` is given — a file
+    // for a path, `stdout` for `-`, `stderr` for `%`. This port cannot store the
+    // process std streams in `heads.stream` (an `Option<File>`), so those two
+    // targets carry `stream == None` (plus `to_stderr` for `%`); the C guard's
+    // `heads->stream` therefore maps to "a `-D` target is configured", i.e.
+    // `headerfile.is_some()`. `write_to_sink` then routes to the file, stdout, or
+    // stderr exactly as curl's `fwrite(…, heads->stream)` would. (Previously this
+    // also required `heads.stream.is_some()`, which silently dropped `-D -` and
+    // `-D %` — only the regular-file case wrote anything.)
+    if headerfile.is_some() {
         let rc = write_to_sink(&mut per.heads, buffer);
         if rc != cb {
             // curl: `if(rc != nmemb) return rc;` — a short write aborts.

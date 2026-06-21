@@ -56,23 +56,24 @@ use std::sync::OnceLock;
 // Version identity constants
 // =============================================================================
 
-/// The product name token that prefixes the version banner.
-///
-/// Upstream libcurl uses `LIBCURL_NAME` (`"libcurl"`). This rewrite reports its
-/// own identity, `"curl-rs"`, so consumers can tell the Rust implementation
-/// apart from the C original — it does not claim to be C-curl.
-pub const NAME: &str = "curl-rs";
-
-/// The wire-protocol product name, exactly as defined by the `LIBCURL_NAME`
+/// The libcurl product-name token, exactly as defined by the `LIBCURL_NAME`
 /// macro in `lib/urldata.h` (`"libcurl"`).
 ///
-/// This is distinct from [`NAME`]: [`NAME`] is the **consumer-facing** identity
-/// reported by `curl_version()` / `curl --version` (deliberately `"curl-rs"` so
-/// downstreams can recognize the Rust implementation), whereas `LIBCURL_NAME` is
-/// the **on-the-wire** product token that some protocols transmit verbatim to a
-/// remote peer (e.g. the DICT `CLIENT` line — C `dict_do` emits
-/// `"CLIENT " LIBCURL_NAME " " LIBCURL_VERSION`). Wire bytes must match curl 8.x
-/// byte-for-byte (AAP G6), so the literal `"libcurl"` is preserved here.
+/// This is the **product identity reported by `curl_version()` / `curl
+/// --version`**: the version banner's first token is `libcurl/<VERSION>`,
+/// byte-for-byte matching C `libcurl`. That parity is load-bearing —
+/// `tests/runtests.pl` parses the binary's `--version` line 1 to drive
+/// version/backend test selection, requiring it to begin `curl <ver> (...)` and
+/// to contain a `libcurl/<ver>` substring (AAP G4/G6/§0.7.3). The banner must
+/// therefore NOT carry a bespoke `curl-rs` identity.
+///
+/// `LIBCURL_NAME` is ALSO the **on-the-wire** product token that some protocols
+/// transmit verbatim to a remote peer (e.g. the DICT `CLIENT` line — C
+/// `dict_do` emits `"CLIENT " LIBCURL_NAME " " LIBCURL_VERSION`); wire bytes
+/// must match curl 8.x byte-for-byte (AAP G6), so the literal `"libcurl"` is
+/// preserved here. The CLI's `curl <VERSION> (<os>) ` prefix (C `CURL_ID`,
+/// `src/tool_version.h`) is prepended by the binary in `curl-rs/src/operate.rs`,
+/// never in this banner.
 pub const LIBCURL_NAME: &str = "libcurl";
 
 /// The human-readable libcurl version string, exactly as defined by
@@ -445,9 +446,12 @@ fn push_token(out: &mut String, token: &str) {
 fn build_banner() -> String {
     let mut out = String::with_capacity(160);
 
-    // 1. Product identity. Built from NAME/VERSION so it never drifts from the
-    //    canonical constants. This is the FIRST token and gets no leading space.
-    out.push_str(NAME);
+    // 1. Product identity. The banner IS the libcurl version string (the C
+    //    `curl_version()` analog), so the FIRST token is `libcurl/<VERSION>` —
+    //    built from LIBCURL_NAME/VERSION so it never drifts from the canonical
+    //    constants. It gets no leading space. The CLI prepends the `curl
+    //    <VERSION> (<os>) ` identity (C `CURL_ID`) separately, in operate.rs.
+    out.push_str(LIBCURL_NAME);
     out.push('/');
     out.push_str(VERSION);
 
@@ -911,8 +915,8 @@ mod tests {
 
     #[test]
     fn version_constants_match_curlver_h() {
-        // Authority: include/curl/curlver.h.
-        assert_eq!(NAME, "curl-rs");
+        // Authority: include/curl/curlver.h + lib/urldata.h (LIBCURL_NAME).
+        assert_eq!(LIBCURL_NAME, "libcurl");
         assert_eq!(VERSION, "8.19.0-DEV");
         assert_eq!(VERSION_NUM, 0x0008_1300);
         assert_eq!(VERSION_MAJOR, 8);
@@ -1066,12 +1070,14 @@ mod tests {
     }
 
     #[test]
-    fn banner_starts_with_project_identity() {
+    fn banner_starts_with_libcurl_identity() {
         let v = version();
-        // First token is the project identity, not C-curl/libcurl.
-        assert!(v.starts_with("curl-rs/8.19.0-DEV"), "banner: {v}");
-        assert!(!v.starts_with("curl/"), "banner: {v}");
-        assert!(!v.starts_with("libcurl/"), "banner: {v}");
+        // The banner is the C `curl_version()` analog: its first token is the
+        // libcurl identity `libcurl/<VERSION>`, NOT a bespoke `curl-rs/` token
+        // (AAP G4/§0.7.3 — `tests/runtests.pl` requires a `libcurl/` substring
+        // on the `--version` line). The CLI prepends `curl <ver> (<os>) ` itself.
+        assert!(v.starts_with("libcurl/8.19.0-DEV"), "banner: {v}");
+        assert!(!v.starts_with("curl-rs/"), "banner: {v}");
         // TLS (rustls) is mandatory, so its token is always present.
         assert!(v.contains("rustls/0.23.36"), "banner: {v}");
         // Cached: repeated calls hand back the identical static buffer.
@@ -1341,7 +1347,7 @@ mod tests {
         fn banner_is_exact_default_field_order() {
             // Field order mirrors curl_version() in lib/version.c, with Rust
             // backends substituted and unavailable slots omitted.
-            let expected = "curl-rs/8.19.0-DEV rustls/0.23.36 zlib/1.3.1 \
+            let expected = "libcurl/8.19.0-DEV rustls/0.23.36 zlib/1.3.1 \
                  brotli/1.1.0 zstd/1.5.6 idna/1.0.3 libpsl/0.21.5 russh/0.61.2 \
                  h2/0.4.15 quinn/0.11.9 h3/0.0.8";
             assert_eq!(version(), expected);

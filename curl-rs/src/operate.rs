@@ -52,12 +52,14 @@ use std::time::{Duration, Instant};
 
 use curl_rs_lib::error::{codes, CurlMError, CurlShError};
 use curl_rs_lib::multi::{self, CurlMInfo, SharedEasy};
-use curl_rs_lib::transfer::{ReadCallback, WriteCallbacks};
+use curl_rs_lib::progress::CURL_PROGRESSFUNC_CONTINUE;
+use curl_rs_lib::transfer::{DebugInfoType, ReadCallback, WriteCallbacks};
 use curl_rs_lib::share::{LockData, ShareSetting};
 use curl_rs_lib::{
     CurlCode, CurlError, CurlInfo, CurlOption, Easy, InfoValue, Multi, OptionValue, Share,
 };
 
+use crate::callbacks::debug::CurlInfoType;
 use crate::callbacks::ProgressData;
 use crate::config::{FailMode, GlobalConfig, HttpReq, OperationConfig};
 use crate::setopt;
@@ -388,27 +390,20 @@ impl PerTransfer {
 // --- writeout trait impls --------------------------------------------------
 
 impl HeaderSource for PerTransfer {
-    /// Yields the received response headers in order (C `hdrcbdata.headlist`),
-    /// splitting each stored `"name: value"` line into the name/value pair the
-    /// `%{header_json}` renderer expects. Lines without a colon are skipped,
-    /// matching curl's header parser, which never stores a malformed header.
+    /// Yields the received response headers in order, reading the libcurl header
+    /// store (`curl_easy_header()` / `HeaderCollector`) on the easy handle — the
+    /// same source curl's `%header{}` / `%{header_json}` write-out consults
+    /// (`tool_writeout.c` calls `curl_easy_header`). The store is populated by the
+    /// transfer engine with the final response block's `name: value` headers (the
+    /// status line is excluded), already split into name/value pairs with original
+    /// case and order preserved, so no re-parsing is needed here.
     fn response_headers(&self) -> Vec<HeaderField<'_>> {
-        self.hdrcbdata
-            .headlist
+        self.easy
+            .headers()
             .iter()
-            .filter_map(|line| {
-                let colon = line.iter().position(|&b| b == b':')?;
-                let name = &line[..colon];
-                // Skip the colon and a single optional leading space, exactly
-                // as curl's header tokenizer does.
-                let mut vstart = colon + 1;
-                if line.get(vstart) == Some(&b' ') {
-                    vstart += 1;
-                }
-                Some(HeaderField {
-                    name,
-                    value: &line[vstart..],
-                })
+            .map(|(name, value)| HeaderField {
+                name: name.as_bytes(),
+                value: value.as_bytes(),
             })
             .collect()
     }
@@ -1005,22 +1000,22 @@ fn time2str(seconds: i64) -> String {
 // URL/upload patterns) into queued [`PerTransfer`]s on the [`Driver`].
 // ===========================================================================
 
-/// Writes a pre-formatted diagnostic line to the process **stderr**, gated like
+/// Writes a pre-formatted diagnostic line to the diagnostic stream, gated like
 /// curl's glob error stream `(!global->silent || global->showerror) ?
 /// tool_stderr : NULL`.
 ///
-/// Used for the URL/upload glob parse errors, whose text
-/// ([`GlobError::to_stderr_string`](crate::urlglob::GlobError::to_stderr_string))
-/// already carries the `curl: (N) ` prefix and a caret line that must **not**
-/// be word-wrapped — so it bypasses [`crate::messages`]'s wrapping `errorf`.
+/// Used for the URL/upload glob parse errors and the final `curl: (N) <msg>`
+/// transfer-result line, whose text already carries the `curl: (N) ` prefix (and
+/// for glob errors, a caret line) that must **not** be word-wrapped — so it
+/// bypasses [`crate::messages`]'s wrapping `errorf`.
 ///
-/// NOTE: unlike curl this does not follow a `--stderr <file>` redirection for
-/// the rare glob-error path; the observable gating (silent / show-error) is
-/// preserved.
+/// The bytes are emitted through [`crate::messages::emit_raw`], so the write
+/// follows any `--stderr <file>` / `--stderr -` redirection
+/// (curl's `tool_stderr`) exactly as curl does, while preserving the observable
+/// silent / show-error gating.
 fn write_gated_err(global: &GlobalConfig, line: &str) {
     if !global.silent || global.showerror {
-        use std::io::Write as _;
-        let _ = std::io::stderr().lock().write_all(line.as_bytes());
+        crate::messages::emit_raw(line.as_bytes());
     }
 }
 
@@ -1308,6 +1303,18 @@ impl Driver {
                 if r != codes::CURLE_OK {
                     return r;
                 }
+            }
+
+            // Initialize the `-#` progress-bar display state for this transfer
+            // (C `progressbarinit` in `single_transfer`): zero the counters,
+            // thread the `--continue-at` resume offset, size the bar to the
+            // terminal, and bind its output to stderr. Only meaningful in bar
+            // mode; the built-in meter and the silent path do not use it.
+            if global.progressmode == CURL_PROGRESS_BAR {
+                crate::callbacks::progress::progressbarinit(
+                    &mut per.progressbar,
+                    &global.operations[config_idx],
+                );
             }
 
             // (9) Resolve this iteration's URL (from the glob, or the literal).
@@ -1867,22 +1874,76 @@ impl WriteCallbacks for CliWriteSink<'_> {
         crate::callbacks::write::write_cb(data, per, global)
     }
 
-    fn write_header(&mut self, _data: &[u8]) -> Option<usize> {
-        // curl's default path configures no separate header destination (no
-        // `-D` / `--dump-header`), so curl installs a NULL header callback and
-        // the bytes are silently consumed. Returning `None` models that NULL
-        // callback exactly — identical to the core's `DefaultClientOutput`
-        // behavior this sink replaces, so plain downloads are byte-for-byte
-        // unchanged. `-i` / `-I` still surface headers because the client-writer
-        // routes them onto the *body* stream (reaching `write_body`) when
-        // `CURLOPT_HEADER` is set.
-        //
-        // The `-D` / `-J` / `--etag-save` header sink (`tool_header_cb`) reads the
-        // in-flight handle's response code and scheme via `curl_easy_getinfo`;
-        // exposing that live `getinfo` to a Rust-native sink without `unsafe` is
-        // the remaining header-path piece of the transfer-execution integration
-        // and is unrelated to the FTP/SSH body+upload flows wired here.
-        None
+    fn write_header(&mut self, data: &[u8]) -> Option<usize> {
+        // curl registers `tool_header_cb` as `CURLOPT_HEADERFUNCTION`
+        // unconditionally (`config2setopts.c`'s `gen_cb_setopts`). It writes the
+        // `-D`/`--dump-header` file, honors `-J`/`--remote-header-name` and
+        // `--etag-save`, counts `%{num_headers}`, and echoes the response header
+        // block onto the body stream for `-i`/`--include`. The getinfo-dependent
+        // paths (`-J`/etag/`-i`) read the in-flight handle's response code and
+        // scheme; during `perform_with_cli_io` the real handle is moved out, so
+        // those paths read the default placeholder and gracefully no-op when
+        // their flags are unset — leaving the plain `-D` dump (the common case),
+        // which needs only `config.headerfile` and the pre-opened
+        // `per.heads.stream`, fully functional. Returning `Some(n)` reports the
+        // bytes consumed (curl's `CURLOPT_HEADERFUNCTION` byte-count contract),
+        // replacing the previous NULL-callback stand-in.
+        let mut st = self.state.lock().expect("CLI I/O bridge mutex poisoned");
+        let CliIoState { per, global } = &mut *st;
+        Some(crate::callbacks::header::tool_header_cb(data, per, global))
+    }
+
+    fn debug(&mut self, infotype: DebugInfoType, data: &[u8]) {
+        // CURLOPT_DEBUGFUNCTION: route the engine's trace events to curl's
+        // `tool_debug_cb`, which renders the `-v` plain trace (the `* `/`> `/`< `
+        // line prefixes) or the `--trace`/`--trace-ascii` hex/ascii dump to the
+        // resolved trace stream (stderr by default, stdout for `--trace -`, or the
+        // named file). The core's `DebugInfoType` shares curl's `curl_infotype`
+        // integer values, so the CLI enum is recovered directly from the raw id.
+        let Some(it) = CurlInfoType::from_raw(infotype.as_raw()) else {
+            return;
+        };
+        let mut st = self.state.lock().expect("CLI I/O bridge mutex poisoned");
+        let CliIoState { global, .. } = &mut *st;
+        // The easy handle is moved out for the duration of `perform_with_cli_io`;
+        // `tool_debug_cb` consults it only for the `--trace-ids` xfer/conn ids,
+        // which degrade to an empty prefix when the handle is absent — so passing
+        // `None` is correct and never suppresses the trace itself.
+        let _ = crate::callbacks::debug::tool_debug_cb(None, it, data, global);
+    }
+
+    fn progress(&mut self, dltotal: i64, dlnow: i64, ultotal: i64, ulnow: i64) -> i32 {
+        // Progress dispatch mirrors curl's `gen_cb_setopts` gating
+        // (`config2setopts.c`): the `-#` bar is installed only when
+        // `progressmode == CURL_PROGRESS_BAR` and progress is not suppressed,
+        // while `NOPROGRESS = noprogress || silent` hides progress entirely.
+        //   * suppressed (`-s` / `--no-progress-meter`) → return `0`: draw nothing
+        //     and tell the engine to suppress its built-in meter too;
+        //   * `-#` bar mode → draw the bar via `tool_progress_cb` and return `0`
+        //     so the engine suppresses its built-in meter;
+        //   * otherwise → return `CURL_PROGRESSFUNC_CONTINUE` so the engine renders
+        //     its built-in meter (curl's default `% Total …` display).
+        let mut st = self.state.lock().expect("CLI I/O bridge mutex poisoned");
+        let CliIoState { per, global } = &mut *st;
+        if global.silent || global.noprogress {
+            return 0;
+        }
+        if global.progressmode == CURL_PROGRESS_BAR {
+            let config = &mut global.operations[per.config_idx];
+            crate::callbacks::progress::tool_progress_cb(
+                per, config, dltotal, dlnow, ultotal, ulnow,
+            );
+            return 0;
+        }
+        CURL_PROGRESSFUNC_CONTINUE
+    }
+
+    fn write_diag(&mut self, bytes: &[u8]) {
+        // The engine renders its built-in progress meter (and the trailing
+        // newline) and hands the bytes here. Route them through the diagnostic
+        // sink so a `--stderr <file>` redirection is honored — curl writes the
+        // meter to `tool_stderr`, which `--stderr` retargets.
+        crate::messages::emit_raw(bytes);
     }
 }
 
@@ -2684,6 +2745,39 @@ fn unsupported_protocol_message(per: &PerTransfer) -> Option<String> {
     Some(format!("Protocol \"{scheme}\" not supported"))
 }
 
+/// Reconstructs the host curl names in its resolver failure
+/// `"Could not resolve host: <host>"` (`CURLE_COULDNT_RESOLVE_HOST`).
+///
+/// curl's resolver latches that exact text into `CURLOPT_ERRORBUFFER` via
+/// `failf(data, "Could not resolve %s: %s", "host", conn->host.dispname)`
+/// (lib/hostip.c L1586, lib/url.c L3171). The engine's errorbuffer→handle
+/// bridge is the documented foundation limitation noted in
+/// [`PerTransfer::error_message`] (the library's `CURLOPT_ERRORBUFFER` is a raw
+/// pointer the `#![forbid(unsafe_code)]` core cannot write), so the offending
+/// host is recovered here from the request URL — the same `CURLUPART_HOST` the
+/// URL API (and `%{url.host}`) reports, parsed with the identical flags as
+/// [`unsupported_protocol_message`] — to produce byte-identical diagnostic text.
+///
+/// Returns [`None`] when there is no input URL or it cannot be parsed (the
+/// caller then falls back to the static [`CurlError::description`] text).
+fn resolve_failure_host(per: &PerTransfer) -> Option<String> {
+    use curl_rs_lib::url::{CurlUPart, CurlUrl, CURLU_GUESS_SCHEME, CURLU_NON_SUPPORT_SCHEME};
+    let url = per.url.as_deref()?;
+    let mut uh = CurlUrl::new();
+    uh.set(
+        CurlUPart::Url,
+        Some(url),
+        CURLU_GUESS_SCHEME | CURLU_NON_SUPPORT_SCHEME,
+    )
+    .ok()?;
+    let host = uh.get(CurlUPart::Host, 0).ok()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
 /// Returns the HTTP/FTP response code reported for the transfer
 /// (`CURLINFO_RESPONSE_CODE`), or `0` when unavailable.
 fn getinfo_response(per: &PerTransfer) -> i64 {
@@ -2789,10 +2883,40 @@ fn post_check_result(global: &GlobalConfig, per: &PerTransfer, result: CurlCode)
     let config = &global.operations[per.config_idx];
     if !config.synthetic_error && result != codes::CURLE_OK && (!global.silent || global.showerror)
     {
-        let msg = per
-            .error_message()
-            .map(str::to_string)
-            .unwrap_or_else(|| CurlError::from_code(result).description().to_string());
+        let msg = per.error_message().map(str::to_string).unwrap_or_else(|| {
+            if result == codes::CURLE_HTTP_RETURNED_ERROR {
+                // `-f`/`--fail`: curl's library latches the message
+                // `"The requested URL returned error: <code>"` into
+                // `CURLOPT_ERRORBUFFER` via `failf()` on the failonerror abort
+                // (lib/http.c). The engine's errorbuffer→handle bridge is a
+                // documented foundation limitation, so reconstruct the identical
+                // text from the recorded response code (`CURLINFO_RESPONSE_CODE`,
+                // populated by the driver even on the aborted transfer) — the same
+                // wording the `--fail-with-body` branch below emits, instead of the
+                // generic static description "HTTP response code said error".
+                format!(
+                    "The requested URL returned error: {}",
+                    getinfo_response(per)
+                )
+            } else if result == codes::CURLE_COULDNT_RESOLVE_HOST {
+                // Name resolution failure: curl's resolver latches
+                // `"Could not resolve host: <host>"` into `CURLOPT_ERRORBUFFER`
+                // via `failf(data, "Could not resolve %s: %s", "host",
+                // conn->host.dispname)` (lib/hostip.c, lib/url.c). Owing to the
+                // same documented errorbuffer→handle foundation limitation,
+                // reconstruct the identical text — including the offending host
+                // recovered from the request URL — instead of the generic static
+                // description "Could not resolve hostname". (The proxy variant
+                // `CURLE_COULDNT_RESOLVE_PROXY` names the *proxy* host, not the
+                // URL host, so it intentionally keeps the generic description.)
+                match resolve_failure_host(per) {
+                    Some(host) => format!("Could not resolve host: {host}"),
+                    None => CurlError::from_code(result).description().to_string(),
+                }
+            } else {
+                CurlError::from_code(result).description().to_string()
+            }
+        });
         write_gated_err(global, &format!("curl: ({result}) {msg}\n"));
         if result == codes::CURLE_PEER_FAILED_VERIFICATION {
             write_gated_err(global, CURL_CA_CERT_ERRORMSG);
@@ -3273,6 +3397,19 @@ fn feature_ssls_export() -> bool {
         .any(|f| f.eq_ignore_ascii_case("SSLS-EXPORT"))
 }
 
+/// CLI product-name token printed at the start of the `--version` line — the
+/// Rust analog of C `CURL_NAME` (`"curl"`, `src/tool_version.h`). Distinct from
+/// the library banner's `libcurl/...` token; together they form curl's
+/// canonical `curl <ver> (<os>) libcurl/<ver> ...` first line.
+const CURL_NAME: &str = "curl";
+
+/// Build target triple reported in the `--version` `(<os>)` field — the Rust
+/// analog of C `CURL_OS` / the autoconf `OS` define. Emitted by
+/// `curl-rs/build.rs` from Cargo's `TARGET` (e.g. `x86_64-unknown-linux-gnu`),
+/// so it honestly reflects the build target. `tests/runtests.pl` only requires
+/// a non-empty `(...)` token here; the value itself is not version-parsed.
+const CURL_OS: &str = env!("CURL_RS_OS");
+
 /// Prints the `--version` banner, `Release-Date:`, `Protocols:`, and
 /// `Features:` lines (C `tool_version_info`, `src/tool_help.c`).
 ///
@@ -3280,8 +3417,23 @@ fn feature_ssls_export() -> bool {
 /// never disagree. The feature list is sorted case-insensitively, matching
 /// curl's `qsort(..., struplocompare4sort)` before printing.
 fn tool_version_info() {
-    // The banner already carries the `curl <version>` prefix (C `CURL_ID`).
-    println!("{}", curl_rs_lib::version::version());
+    // C `tool_version_info` prints `CURL_ID "%s\n", curl_version()` where
+    // `CURL_ID = CURL_NAME " " CURL_VERSION " (" CURL_OS ") "`
+    // (`src/tool_version.h`). The library banner (`curl_version()` analog)
+    // already begins `libcurl/<VERSION>`; here we prepend the `curl <VERSION>
+    // (<os>) ` identity so line 1 reads
+    // `curl <ver> (<os>) libcurl/<ver> <backends>` — the exact shape
+    // `tests/runtests.pl` parses (its `/^curl ([^ ]*)/` capture plus the
+    // required `libcurl/<ver>` substring) to extract `$CURLVERSION` /
+    // `$CURLVERNUM` / `$libcurl` and drive version/backend test selection
+    // (AAP §0.7.3). `CURL_VERSION` is libcurl's version (C defines
+    // `CURL_VERSION` as `LIBCURL_VERSION`), sourced from the single canonical
+    // `curl_rs_lib::version::VERSION`.
+    println!(
+        "{CURL_NAME} {} ({CURL_OS}) {}",
+        curl_rs_lib::version::VERSION,
+        curl_rs_lib::version::version()
+    );
     // curl prints the release timestamp; an in-development (`-DEV`) build has
     // none, so curl emits `[unreleased]` (matches `main.rs::print_version`).
     println!("Release-Date: [unreleased]");
@@ -3512,8 +3664,13 @@ pub async fn operate(global: &mut GlobalConfig, args: Vec<OsString>) -> CurlCode
                 // errors map to their exact `CURLcode`.
                 result = codes::CURLE_OK;
                 match err {
-                    // clap already printed the help text during parsing.
-                    Pe::HelpRequested => {}
+                    // Render the categorized option help (C `tool_help`),
+                    // honoring the optional category captured during parsing
+                    // (`--help`, `-h`, `--help all`, `--help category`,
+                    // `--help <category>`).
+                    Pe::HelpRequested => {
+                        crate::help::tool_help(global.help_category.as_deref());
+                    }
                     // The built-in manual is not bundled in this build.
                     Pe::ManualRequested => {
                         warnf!(global, "built-in manual was disabled at build-time");

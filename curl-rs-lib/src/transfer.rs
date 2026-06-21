@@ -277,6 +277,87 @@ pub trait WriteCallbacks: Send {
     /// header bytes (`cw_get_writefunc` yields a `NULL` callback). Returns
     /// `Some(n)` otherwise, with the same convention as [`Self::write_body`].
     fn write_header(&mut self, data: &[u8]) -> Option<usize>;
+
+    /// Deliver a trace/debug event (`CURLOPT_DEBUGFUNCTION`).
+    ///
+    /// The engine calls this — only while `CURLOPT_VERBOSE` is set — for the
+    /// connection progress text ([`DebugInfoType::Text`]), the serialized
+    /// request head ([`DebugInfoType::HeaderOut`]), and each response status /
+    /// header line ([`DebugInfoType::HeaderIn`]), mirroring the `Curl_debug`
+    /// call sites in libcurl. A front-end (the `curl` CLI's `tool_debug_cb`)
+    /// renders the `* `/`> `/`< ` verbose trace or the `--trace`/`--trace-ascii`
+    /// hex/ascii dump. The default *consumes* the event, modelling curl's
+    /// `NULL` `CURLOPT_DEBUGFUNCTION` (no trace destination configured).
+    fn debug(&mut self, _infotype: DebugInfoType, _data: &[u8]) {}
+
+    /// Deliver a progress tick (`CURLOPT_XFERINFOFUNCTION` / `Curl_pgrsUpdate`).
+    ///
+    /// Called once per progress update with the current download/upload totals
+    /// and byte counters (curl's argument order). The return value uses curl's
+    /// progress-callback convention exactly:
+    ///
+    /// * [`CURL_PROGRESSFUNC_CONTINUE`] — continue and let the engine draw the
+    ///   built-in meter (the engine renders it via
+    ///   [`Progress::render_meter`](crate::progress::Progress::render_meter) and
+    ///   hands the bytes to [`Self::write_diag`]);
+    /// * `0` — continue but *suppress* the built-in meter (the front-end drew
+    ///   its own progress, e.g. the `-#` bar);
+    /// * any other value — abort the transfer with
+    ///   [`CurlError::AbortedByCallback`].
+    ///
+    /// The default returns [`CURL_PROGRESSFUNC_CONTINUE`] (no front-end progress
+    /// renderer), so the built-in-meter decision is left entirely to the engine.
+    fn progress(&mut self, _dltotal: i64, _dlnow: i64, _ultotal: i64, _ulnow: i64) -> i32 {
+        CURL_PROGRESSFUNC_CONTINUE
+    }
+
+    /// Write already-rendered diagnostic bytes — the built-in progress meter
+    /// line ([`Progress::render_meter`](crate::progress::Progress::render_meter))
+    /// and its trailing newline — to the front-end's error stream.
+    ///
+    /// The engine never writes to a process stream itself (the core is a
+    /// library); it renders the meter and hands the bytes here so the front-end
+    /// routes them to its diagnostic stream, honoring a `--stderr <file>`
+    /// redirection. The default *discards* the bytes (no diagnostic stream
+    /// configured), matching the behavior of a sink with no error destination.
+    fn write_diag(&mut self, _bytes: &[u8]) {}
+}
+
+/// The kind of a [`WriteCallbacks::debug`] trace event — the core's mirror of
+/// curl's `curl_infotype` (`include/curl/curl.h`).
+///
+/// The discriminants match curl's `CURLINFO_*` integer values exactly so a
+/// front-end can map this onto its own `curl_infotype` (the CLI's
+/// `tool_debug_cb`) by the raw `i32` with no translation table. The engine emits
+/// only [`Text`](DebugInfoType::Text), [`HeaderOut`](DebugInfoType::HeaderOut),
+/// and [`HeaderIn`](DebugInfoType::HeaderIn) today (the request/response trace);
+/// the `DATA_*` / `SSL_DATA_*` variants exist for parity with the C enum and so
+/// the type can carry every event a future body-trace emits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(i32)]
+pub enum DebugInfoType {
+    /// Informational text (`CURLINFO_TEXT`): the `* …` connection-progress lines.
+    Text = 0,
+    /// An inbound header line (`CURLINFO_HEADER_IN`): the `< …` response trace.
+    HeaderIn = 1,
+    /// The outbound request head (`CURLINFO_HEADER_OUT`): the `> …` request trace.
+    HeaderOut = 2,
+    /// Inbound body data (`CURLINFO_DATA_IN`).
+    DataIn = 3,
+    /// Outbound body data (`CURLINFO_DATA_OUT`).
+    DataOut = 4,
+    /// Inbound TLS handshake/record bytes (`CURLINFO_SSL_DATA_IN`).
+    SslDataIn = 5,
+    /// Outbound TLS handshake/record bytes (`CURLINFO_SSL_DATA_OUT`).
+    SslDataOut = 6,
+}
+
+impl DebugInfoType {
+    /// The raw libcurl `curl_infotype` integer value of this event kind.
+    #[must_use]
+    pub fn as_raw(self) -> i32 {
+        self as i32
+    }
 }
 
 /// The kind of an output buffer node / a single delivery to [`CwOut`], mirroring
@@ -1981,11 +2062,24 @@ pub struct TransferParts<'a, P: ProtocolExchange> {
 /// `progress_cb` is the optional `CURLOPT_XFERINFOFUNCTION` adapter; `rate_limit`
 /// applies `CURLOPT_MAX_RECV_SPEED_LARGE` throttling via a Tokio timer.
 ///
+/// `fail_on_error` is the optional `CURLOPT_FAILONERROR` (`-f`/`--fail`)
+/// predicate: once the response status and headers are known, it is consulted
+/// with the response status code; returning `true` aborts the transfer *before*
+/// any body is delivered, latching curl's `"The requested URL returned error:
+/// <code>"` message and surfacing [`CurlError::HttpReturnedError`]. This is the
+/// engine-level reimagining of curl's `http_should_fail()` check at the status
+/// line (`lib/http.c`): the predicate (built by the HTTP driver) carries the
+/// HTTP-specific should-fail rules — the `401`/`407` auth and `416` resume
+/// exceptions — so the generic loop stays protocol-agnostic. It is `None` for
+/// non-HTTP protocols and whenever `-f` was not requested, leaving behavior
+/// unchanged.
+///
 /// # Errors
 ///
 /// Surfaces any [`CurlError`] from the protocol, the client-writer chain
 /// (`WriteError`/`TooLarge`), the progress checks (`AbortedByCallback`,
-/// `OperationTimedout`), or the final short-read check (`PartialFile`).
+/// `OperationTimedout`), the final short-read check (`PartialFile`), or
+/// [`CurlError::HttpReturnedError`] when `fail_on_error` rejects the status.
 pub async fn drive_transfer<P: ProtocolExchange>(
     parts: TransferParts<'_, P>,
     // `+ Send`: the transfer future is spawned on the multi-thread multi-handle
@@ -1996,6 +2090,11 @@ pub async fn drive_transfer<P: ProtocolExchange>(
     // is `Send` because it crosses the same spawn boundary.
     mut progress_cb: Option<&mut (dyn FnMut(i64, i64, i64, i64) -> i32 + Send)>,
     mut rate_limit: Option<&mut RateLimit>,
+    // `+ Send + Sync`: a shared `&dyn` reference is `Send` only when the referent
+    // is `Sync`. The predicate is alive across the loop's `.await` points, so the
+    // whole future must stay `Send` for the multi-handle spawn. The HTTP driver's
+    // closure captures only `Copy` flags, so it satisfies both bounds.
+    fail_on_error: Option<&(dyn Fn(i32) -> bool + Send + Sync)>,
 ) -> Result<()> {
     let TransferParts {
         exchange,
@@ -2011,6 +2110,22 @@ pub async fn drive_transfer<P: ProtocolExchange>(
     // elapsed-milliseconds figure (curl reads `progress.t_startsingle`).
     let started = Instant::now();
 
+    // CURLINFO_PRETRANSFER_TIME: the moment just before the request is issued and
+    // the response loop begins — curl records `Curl_pgrsTime(TIMER_PRETRANSFER)`
+    // here, accumulating `(now − t_startsingle)`. The single-start was anchored at
+    // the operation's `op_start` by the caller, so this captures the full
+    // connect+setup time, feeding `%{time_pretransfer}`.
+    progress.time(Timer::PreTransfer, started);
+
+    // Whether the engine has drawn at least one built-in progress-meter line via
+    // `write_diag`. When set, the engine emits the final trailing newline at
+    // end-of-transfer (curl's `Curl_pgrsDone` prints `\n` once the meter has been
+    // shown). It stays `false` when the front-end draws its own progress (the
+    // `-#` bar, whose `progress` hook returns `0`), so the front-end owns that
+    // newline instead — exactly mirroring curl's `progress.callback` gate in
+    // `Curl_pgrsDone`.
+    let mut meter_drawn = false;
+
     loop {
         let now = Instant::now();
         // Overall transfer timeout (CURLOPT_TIMEOUT). curl emits a precise
@@ -2024,9 +2139,25 @@ pub async fn drive_transfer<P: ProtocolExchange>(
         match exchange.next_event().await? {
             ResponseEvent::Status(code) => {
                 request.httpcode = code;
+                // CURLINFO_STARTTRANSFER_TIME: the first response byte (the status
+                // line) has arrived — curl records `Curl_pgrsTime(TIMER_STARTTRANSFER)`
+                // at this point, accumulating `(now − t_startsingle)` exactly once
+                // per single transfer (the milestone self-guards against repeats).
+                // This feeds `%{time_starttransfer}`; for a delayed response (e.g.
+                // a server `/delay/N`) it captures the full time-to-first-byte.
+                progress.time(Timer::StartTransfer, Instant::now());
             }
             ResponseEvent::Header(line) => {
                 request.headerbytecount += line.len() as u64;
+                // CURLINFO_HEADER_IN: while verbose, route each raw inbound line
+                // to the debug callback for the `< …` trace. h1's `finish_head`
+                // emits one `Header` event per line — the status line, every
+                // header, and the terminating blank line — so per-line delivery
+                // matches `tool_debug_cb`'s TRACE_PLAIN expectation exactly
+                // (`Curl_debug(…, CURLINFO_HEADER_IN, line, len)` per line).
+                if errbuf.is_verbose() {
+                    write_cb.debug(DebugInfoType::HeaderIn, &line);
+                }
                 writer.write(ClientWriteType::HEADER, &line, write_cb)?;
             }
             ResponseEvent::HeadersComplete {
@@ -2047,16 +2178,47 @@ pub async fn drive_transfer<P: ProtocolExchange>(
                 }
                 // Headers are finished; subsequent writes are body bytes.
                 request.header = false;
+
+                // CURLOPT_FAILONERROR (`-f`/`--fail`): curl checks
+                // `http_should_fail()` at the status line and, on a terminal
+                // `>= 400`, fails the transfer *before* the body is delivered
+                // (lib/http.c) — the body never reaches the client write callback
+                // and the message `"The requested URL returned error: <code>"`
+                // is latched via `failf()`. Mirror that here, now that the status
+                // code is known: returning the error short-circuits the loop
+                // before any `ResponseEvent::Body` is processed, so the body is
+                // suppressed exactly as curl does. The predicate already encodes
+                // the `401`/`407`/`416` exceptions and is `None` unless `-f` was
+                // requested, so non-failing transfers are untouched.
+                if let Some(should_fail) = fail_on_error {
+                    if should_fail(request.httpcode) {
+                        errbuf.failf(format_args!(
+                            "The requested URL returned error: {}",
+                            request.httpcode
+                        ));
+                        return Err(CurlError::HttpReturnedError);
+                    }
+                }
             }
             ResponseEvent::Body(chunk) => {
                 request.bytecount += chunk.len() as u64;
                 progress.set_download_counter(request.bytecount as i64);
+                // CURLINFO_DATA_IN: while verbose, report received body bytes to
+                // the debug callback. curl's `tool_debug_cb` summarizes these as a
+                // single `{ [N bytes data]` line (rather than dumping them) when
+                // the body is not on an interactive tty — matching
+                // `Curl_debug(…, CURLINFO_DATA_IN, …)` on the receive path.
+                if errbuf.is_verbose() {
+                    write_cb.debug(DebugInfoType::DataIn, &chunk);
+                }
                 writer.write(ClientWriteType::BODY, &chunk, write_cb)?;
 
                 // Advance the progress accounting and enforce the low-speed
-                // abort (Curl_pgrsUpdate + Curl_pgrsCheck). The user progress
-                // callback is invoked separately just below.
-                progress.check(
+                // abort (Curl_pgrsUpdate + Curl_pgrsCheck). `show` is curl's
+                // `showprogress` signal — true when the built-in meter is due to
+                // redraw this tick. The user progress callbacks are invoked just
+                // below.
+                let show = progress.check(
                     now,
                     false,
                     writer.is_paused(),
@@ -2065,17 +2227,39 @@ pub async fn drive_transfer<P: ProtocolExchange>(
                     None,
                 )?;
 
-                // CURLOPT_XFERINFOFUNCTION: invoke the user callback with the
-                // current byte counts. A return other than 0 /
+                let dltotal = request.size.unwrap_or(0).max(0);
+                let dlnow = request.bytecount as i64;
+                let ulnow = request.writebytecount as i64;
+
+                // CURLOPT_XFERINFOFUNCTION (parameter bridge — used by `run()`
+                // and the unit tests). A return other than 0 /
                 // CURL_PROGRESSFUNC_CONTINUE aborts the transfer (matching
                 // Progress::dispatch's contract).
                 if let Some(f) = progress_cb.as_deref_mut() {
-                    let dltotal = request.size.unwrap_or(0).max(0);
-                    let dlnow = request.bytecount as i64;
-                    let ulnow = request.writebytecount as i64;
                     let r = f(dltotal, dlnow, 0, ulnow);
                     if r != CURL_PROGRESSFUNC_CONTINUE && r != 0 {
                         return Err(CurlError::AbortedByCallback);
+                    }
+                }
+
+                // Sink progress hook — the `curl` CLI's `-#` bar / built-in
+                // meter, routed through the write-callback sink. The return value
+                // selects who draws progress, following curl's
+                // CURL_PROGRESSFUNC_CONTINUE contract exactly:
+                //   * CONTINUE → the front-end drew nothing; the engine renders
+                //     the built-in meter and ships the bytes via `write_diag`;
+                //   * 0        → the front-end drew its own progress (`-#` bar),
+                //     so the engine suppresses the built-in meter;
+                //   * anything else → abort the transfer.
+                let verdict = write_cb.progress(dltotal, dlnow, 0, ulnow);
+                if verdict != CURL_PROGRESSFUNC_CONTINUE && verdict != 0 {
+                    return Err(CurlError::AbortedByCallback);
+                }
+                if verdict == CURL_PROGRESSFUNC_CONTINUE && show {
+                    let meter = progress.render_meter();
+                    if !meter.is_empty() {
+                        write_cb.write_diag(meter.as_bytes());
+                        meter_drawn = true;
                     }
                 }
 
@@ -2098,6 +2282,38 @@ pub async fn drive_transfer<P: ProtocolExchange>(
                     write_cb,
                 )?;
                 request.eos_written = true;
+
+                // Final progress tick (Curl_pgrsDone → Curl_pgrsUpdate with the
+                // `final` flag). Finalize the timing, give the front-end its last
+                // progress call (so the `-#` bar draws its terminal 100% frame),
+                // and — for the built-in meter — draw the final line followed by
+                // the single trailing newline curl prints once the meter has been
+                // shown.
+                let _ = progress.check(
+                    now,
+                    true,
+                    writer.is_paused(),
+                    limits.low_speed_limit,
+                    limits.low_speed_time,
+                    None,
+                )?;
+                let dltotal = request.size.unwrap_or(0).max(0);
+                let dlnow = request.bytecount as i64;
+                let ulnow = request.writebytecount as i64;
+                let verdict = write_cb.progress(dltotal, dlnow, 0, ulnow);
+                if verdict != CURL_PROGRESSFUNC_CONTINUE && verdict != 0 {
+                    return Err(CurlError::AbortedByCallback);
+                }
+                if verdict == CURL_PROGRESSFUNC_CONTINUE {
+                    let meter = progress.render_meter();
+                    if !meter.is_empty() {
+                        write_cb.write_diag(meter.as_bytes());
+                        meter_drawn = true;
+                    }
+                }
+                if meter_drawn {
+                    write_cb.write_diag(b"\n");
+                }
                 break;
             }
         }
@@ -2266,7 +2482,7 @@ impl Transfer<Transferring> {
             limits: &limits,
             errbuf: &mut self.data.errbuf,
         };
-        drive_transfer(parts, progress_cb, None).await?;
+        drive_transfer(parts, progress_cb, None, None).await?;
 
         // Record the post-transfer info store (Curl_pgrsUpdate → data->info).
         self.data.info.record_progress(&self.data.progress);
@@ -2343,7 +2559,7 @@ pub trait TransferHandle {
 /// Propagates any [`CurlError`] from [`drive_transfer`].
 pub async fn run<H: TransferHandle>(handle: &mut H) -> Result<()> {
     let parts = handle.parts();
-    drive_transfer(parts, None, None).await
+    drive_transfer(parts, None, None, None).await
 }
 
 // ===========================================================================
@@ -3603,7 +3819,7 @@ mod tests {
             limits: &limits,
             errbuf,
         };
-        drive_transfer(parts, None, None).await
+        drive_transfer(parts, None, None, None).await
     }
 
     #[tokio::test]
@@ -3766,7 +3982,9 @@ mod tests {
             limits: &limits,
             errbuf: &mut errbuf,
         };
-        drive_transfer(parts, Some(&mut cbfn), None).await.unwrap();
+        drive_transfer(parts, Some(&mut cbfn), None, None)
+            .await
+            .unwrap();
         assert!(
             calls.load(std::sync::atomic::Ordering::Relaxed) >= 1,
             "progress callback invoked at least once"
@@ -3802,7 +4020,7 @@ mod tests {
             limits: &limits,
             errbuf: &mut errbuf,
         };
-        let err = drive_transfer(parts, Some(&mut cbfn), None)
+        let err = drive_transfer(parts, Some(&mut cbfn), None, None)
             .await
             .unwrap_err();
         assert_eq!(err, CurlError::AbortedByCallback);

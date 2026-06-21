@@ -677,6 +677,22 @@ impl HeaderCollector {
         self.stored.is_empty()
     }
 
+    /// Iterates over every collected header as a `(name, value)` pair in arrival
+    /// order.
+    ///
+    /// This is the simple "all stored response headers" view that the CLI's
+    /// `%header{}` / `%{header_json}` write-out consumes — curl walks the same
+    /// store via `curl_easy_nextheader(easy, CURLH_HEADER, -1, prev)`. The richer
+    /// per-origin / per-request selection (and the C-visible borrowed `Header`)
+    /// remains available through [`header`](Self::header) /
+    /// [`nextheader`](Self::nextheader); this accessor avoids the output-slot
+    /// round-trip when the caller only needs an in-order Rust iteration.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.stored
+            .iter()
+            .map(|hs| (hs.name.as_str(), hs.value.as_str()))
+    }
+
     /// Name/value of the most recently pushed header, if any (the analog of
     /// reading curl's `data->state.prevhead`).
     #[must_use]

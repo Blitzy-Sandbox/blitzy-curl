@@ -483,23 +483,21 @@ fn leak_cstr_array(items: &[&str]) -> *const *const c_char {
 ///
 /// The returned `char *` points at a **static**, process-lifetime string that
 /// the caller must NOT free (curl documents this; the non-`const` return type is
-/// purely historical). The banner is sourced from `core::version()` — e.g.
-/// `"curl-rs/8.19.0-DEV rustls/0.23.36 …"` — and its product-name prefix
-/// (`core::version::NAME`, `"curl-rs"`) is rewritten to `"libcurl"` so the
-/// banner reads `"libcurl/8.19.0-DEV …"`, matching the C `libcurl` identity the
-/// test suite and ABI consumers expect. The `CString` is created once and cached
-/// in a `OnceLock`; the returned pointer aliases that cached, never-freed buffer.
+/// purely historical). The banner is sourced verbatim from `core::version()` —
+/// e.g. `"libcurl/8.19.0-DEV rustls/0.23.36 …"`. Its first token is already the
+/// libcurl identity `libcurl/<VERSION>` (see `core::version::LIBCURL_NAME`),
+/// matching the C `libcurl` identity the test suite and ABI consumers expect, so
+/// no product-name rewrite is performed here. The `CString` is created once and
+/// cached in a `OnceLock`; the returned pointer aliases that cached, never-freed
+/// buffer.
 #[no_mangle]
 pub extern "C" fn curl_version() -> *mut c_char {
     static BANNER: OnceLock<CString> = OnceLock::new();
     let banner = BANNER.get_or_init(|| {
-        let raw = core::version::version();
-        // Rewrite the leading product name ("curl-rs") to "libcurl" for ABI
-        // parity; if the banner ever lacks that prefix, fall back verbatim.
-        let text = match raw.strip_prefix(core::version::NAME) {
-            Some(rest) => format!("libcurl{rest}"),
-            None => raw.to_string(),
-        };
+        // `core::version()` is the libcurl banner (its first token is already
+        // `libcurl/<VERSION>`, matching C `curl_version()`), so it is returned
+        // verbatim — no product-name rewrite is needed.
+        let text = core::version::version().to_string();
         // The banner is curated ASCII with no interior NUL; the fallback keeps
         // `curl_version` infallible even in the impossible error case.
         CString::new(text).unwrap_or_else(|_| {
