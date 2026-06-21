@@ -538,6 +538,7 @@ mod tests {
         assert_eq!(base64url_encode(&too_big), Err(CurlError::TooLarge));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn encode_allows_input_exactly_at_cap() {
         // curl uses a strict `>` comparison, so an input of exactly the cap is
@@ -553,6 +554,7 @@ mod tests {
     // ---------------------------------------------------------------------
     // Round-trip and independent cross-check over pseudo-random buffers.
     // ---------------------------------------------------------------------
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn round_trip_random_buffers() {
         let mut rng = Lcg(0x1234_5678_9ABC_DEF0);

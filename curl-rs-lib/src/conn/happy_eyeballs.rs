@@ -1203,6 +1203,7 @@ mod tests {
     /// Successive attempts start exactly one stagger apart (200 ms), and the
     /// overall connect deadline yields `CURLE_OPERATION_TIMEDOUT`. Three slow
     /// IPv4 attempts start at 0/200/400 ms, then the 1 s deadline fires.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
     async fn stagger_is_200ms_and_deadline_times_out() {
         let stats = Stats::new();
@@ -1258,6 +1259,7 @@ mod tests {
     /// a real `UnixListener` is bound and the filter connects to it, promoting
     /// the `"UNIX"` socket filter as its `next`.
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn unix_transport_single_attempt() {
         let path = std::env::temp_dir().join(format!(

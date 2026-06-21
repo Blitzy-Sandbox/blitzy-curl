@@ -2303,6 +2303,7 @@ mod tests {
 
     // ---- Transport (real loopback sockets) ----------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn udp_io_roundtrip_and_tid_pin() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();

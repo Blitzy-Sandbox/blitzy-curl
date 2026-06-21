@@ -199,6 +199,7 @@ mod tests {
     /// The helper is socket-kind agnostic: a UDP socket toggles just as well as
     /// a TCP one, confirming the generic `AsFd`/`AsSocket` bound is satisfied by
     /// any standard socket handle.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn works_on_udp_socket() {
         let sock = UdpSocket::bind("127.0.0.1:0").expect("bind udp");

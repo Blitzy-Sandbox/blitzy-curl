@@ -144,6 +144,32 @@ jobs:
         # Gate 4 (Memory core): zero undefined behavior in the safe core. Scoped
         # to curl-rs-lib and deliberately excludes curl-rs-ffi, whose unsafe FFI
         # boundary is exercised by AddressSanitizer below.
+        #
+        # MIRIFLAGS=-Zmiri-disable-isolation: a small set of safe-core unit tests
+        # exercise hermetic, loopback/temp-only host I/O (e.g. the alt-svc / HSTS /
+        # cookie / netrc jar round-trips call std::fs to a tempfile). Miri runs with
+        # host isolation ON by default, under which the very first such test aborts
+        # the whole test binary with "unsupported operation: `open` not available
+        # when isolation is enabled" (exit 1, no `test result:` line). Disabling
+        # isolation lets those hermetic-I/O tests run so the gate reaches a clean
+        # completion. The runtime is hermetic (no network egress; only loopback +
+        # tempdir), so this does not weaken the UB check.
+        #
+        # The remaining handful of tests that are Miri-incompatible *by construction*
+        # — not by any memory defect — are gated at the source with
+        # `#[cfg_attr(miri, ignore)]`: foreign-function tests (aws-lc/ring + zstd C
+        # cannot be interpreted by Miri), unsupported socket operations (AF_UNIX,
+        # raw UDP sockets, setsockopt on an unconnected socket), large-data
+        # pure-Rust tests that are pathologically slow under byte-by-byte
+        # interpretation (PSL/cookie/base64-at-cap/compression/cert parsing), and a
+        # couple of host-environment-sensitive cases (Miri's libc `strerror_r`
+        # shim text differs from glibc; a paused-time stagger assertion). Those
+        # attributes are no-ops under a normal `cargo test`, so Gate 3 still runs
+        # every test; under Miri they are reported as `ignored`. Each such test is
+        # marked at its source site with `#[cfg_attr(miri, ignore)]`, so the full
+        # set is discoverable via `git grep -n 'cfg_attr(miri, ignore)' curl-rs-lib`.
+        env:
+          MIRIFLAGS: '-Zmiri-disable-isolation'
         run: cargo +nightly miri test -p curl-rs-lib
 
       - name: 'addresssanitizer (FFI crate)'

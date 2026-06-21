@@ -167,6 +167,7 @@ mod tests {
     /// `2` is `ENOENT` on POSIX. Assert a recognizable substring rather than an
     /// exact, locale-/platform-dependent string so the test stays portable.
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn enoent_message_is_recognizable() {
         let msg = curlx_strerror(2);
@@ -182,6 +183,7 @@ mod tests {
 
     /// An out-of-range / unrecognized code must still yield a non-empty
     /// fallback matching curl's `"Unknown error N"` shape.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn unknown_code_has_non_empty_fallback() {
         let msg = curlx_strerror(999_999);

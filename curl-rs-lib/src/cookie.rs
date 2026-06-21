@@ -1958,6 +1958,7 @@ mod tests {
 
     // ---- Set-Cookie parsing & storing ------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn add_basic_cookie_and_match() {
         let mut jar = CookieJar::new();
@@ -1979,6 +1980,7 @@ mod tests {
         assert_eq!(jar.match_for("www.example.com", "/", false, NOW), "");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn domain_attribute_enables_tailmatch() {
         let mut jar = CookieJar::new();
@@ -2016,6 +2018,7 @@ mod tests {
         assert_eq!(jar.num_cookies(), 0);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn secure_cookie_withheld_over_insecure() {
         let mut jar = CookieJar::new();
@@ -2056,6 +2059,7 @@ mod tests {
         assert_eq!(jar.num_cookies(), 0);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn max_age_zero_expires_immediately() {
         let mut jar = CookieJar::new();
@@ -2075,6 +2079,7 @@ mod tests {
         assert_eq!(jar.num_cookies(), 0);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn max_age_persistent_cookie() {
         let mut jar = CookieJar::new();
@@ -2097,6 +2102,7 @@ mod tests {
         assert_eq!(jar.match_for("example.com", "/", false, NOW + 3601), "");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn expires_in_the_past_is_pruned() {
         let mut jar = CookieJar::new();
@@ -2180,6 +2186,7 @@ mod tests {
 
     // ---- prefixes ---------------------------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn secure_prefix_requires_secure_flag() {
         let mut jar = CookieJar::new();
@@ -2210,6 +2217,7 @@ mod tests {
         assert_eq!(jar.num_cookies(), 1);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn host_prefix_requires_secure_root_path_no_domain() {
         let mut jar = CookieJar::new();
@@ -2255,6 +2263,7 @@ mod tests {
 
     // ---- matching order & limits -----------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn longest_path_is_sent_first() {
         let mut jar = CookieJar::new();
@@ -2284,6 +2293,7 @@ mod tests {
         assert_eq!(jar.match_for("example.com", "/foo", false, NOW), "a=2; a=1");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn send_amount_is_capped() {
         let mut jar = CookieJar::new();
@@ -2304,6 +2314,7 @@ mod tests {
         assert_eq!(list.len(), MAX_COOKIE_SEND_AMOUNT);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn header_length_is_capped() {
         let mut jar = CookieJar::new();
@@ -2329,6 +2340,7 @@ mod tests {
 
     // ---- replacement ------------------------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn identical_cookie_replaces_in_place() {
         let mut jar = CookieJar::new();
@@ -2356,6 +2368,7 @@ mod tests {
         assert_eq!(jar.match_for("example.com", "/", false, NOW), "a=2");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn live_cookie_not_overwritten_by_file_cookie() {
         let mut jar = CookieJar::new();
@@ -2390,6 +2403,7 @@ mod tests {
 
     // ---- public suffix ----------------------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn public_suffix_tld_is_rejected_in_all_builds() {
         let mut jar = CookieJar::new();
@@ -2410,6 +2424,7 @@ mod tests {
     }
 
     #[cfg(feature = "psl")]
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn multi_label_public_suffix_is_rejected_with_psl() {
         let mut jar = CookieJar::new();
@@ -2503,6 +2518,7 @@ mod tests {
         assert!(parse_netscape("example.com\tTRUE", true, false).is_none());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn write_to_string_has_banner_and_newest_first() {
         let mut jar = CookieJar::new();
@@ -2547,6 +2563,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn save_writes_atomically_and_reloads() {
         let dir = std::env::temp_dir();
@@ -2580,6 +2597,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn export_list_emits_lines_with_domain() {
         let mut jar = CookieJar::new();
@@ -2601,6 +2619,7 @@ mod tests {
 
     // ---- CURLOPT_COOKIELIST verbs ----------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn cookie_list_command_verbs() {
         let mut jar = CookieJar::new();
@@ -2689,6 +2708,7 @@ mod tests {
         assert!(CookieJar::secure_context("ws", "::1"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn url_convenience_store_and_match() {
         use crate::url::{CurlUPart, CurlUrl};

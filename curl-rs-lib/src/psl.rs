@@ -364,6 +364,7 @@ mod tests {
 
     // ---- Tests that hold regardless of the `psl` feature ------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn exact_match_is_accepted() {
         let psl = Psl::builtin();
@@ -375,6 +376,7 @@ mod tests {
         assert!(psl.is_cookie_domain_acceptable("Example.COM", "example.com"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn empty_cookie_domain_is_rejected() {
         let psl = Psl::builtin();
@@ -383,6 +385,7 @@ mod tests {
         assert!(!psl.is_cookie_domain_acceptable("example.com", "..."));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn non_suffix_is_rejected() {
         let psl = Psl::builtin();
@@ -394,6 +397,7 @@ mod tests {
         assert!(!psl.is_cookie_domain_acceptable("com", "example.com"));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn empty_domain_is_not_a_public_suffix() {
         let psl = Psl::builtin();
@@ -401,6 +405,7 @@ mod tests {
         assert!(!psl.is_public_suffix("."));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn global_returns_a_shared_instance() {
         let a = Psl::global();
@@ -408,6 +413,7 @@ mod tests {
         assert!(std::ptr::eq(a, b));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn host_within_domain_boundaries() {
         assert!(host_within_domain("www.example.com", "example.com"));
@@ -424,6 +430,7 @@ mod tests {
         assert!(!host_within_domain("example.com", ""));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn strip_leading_dots_removes_all_leading_dots() {
         assert_eq!(strip_leading_dots(".co.uk"), "co.uk");
@@ -436,12 +443,14 @@ mod tests {
     // ---- Tests specific to the enabled Public Suffix List -----------------
 
     #[cfg(feature = "psl")]
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn builtin_list_is_loaded() {
         assert!(Psl::builtin().is_loaded());
     }
 
     #[cfg(feature = "psl")]
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn is_public_suffix_recognizes_known_and_starred_suffixes() {
         let psl = Psl::builtin();
@@ -462,6 +471,7 @@ mod tests {
     }
 
     #[cfg(feature = "psl")]
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn rejects_public_suffix_cookie_domains() {
         let psl = Psl::builtin();
@@ -483,6 +493,7 @@ mod tests {
     /// the expected jar must be accepted. This exercises the `*.ck` wildcard,
     /// the `!www.ck` exception, and the `*.compute-1.amazonaws.com` private rule.
     #[cfg(feature = "psl")]
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test1136_psl_cookie_parity() {
         use std::collections::BTreeSet;
@@ -514,6 +525,7 @@ mod tests {
     }
 
     #[cfg(feature = "psl")]
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn from_bytes_parses_and_validates_custom_lists() {
         let data = b"// ===BEGIN ICANN DOMAINS===\ncom\nuk\nco.uk\n";
@@ -530,12 +542,14 @@ mod tests {
     // ---- Tests specific to the conservative no-`libpsl` fallback ----------
 
     #[cfg(not(feature = "psl"))]
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn fallback_handle_reports_not_loaded() {
         assert!(!Psl::builtin().is_loaded());
     }
 
     #[cfg(not(feature = "psl"))]
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn fallback_treats_single_label_as_public_suffix() {
         let psl = Psl::builtin();
@@ -549,6 +563,7 @@ mod tests {
     }
 
     #[cfg(not(feature = "psl"))]
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn fallback_cookie_acceptance_matches_bad_domain() {
         let psl = Psl::builtin();

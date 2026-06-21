@@ -1103,6 +1103,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn unsharing_psl_is_bad_option_but_clears_the_bit() {
         // curl quirk: CURLSHOPT_UNSHARE has no CURL_LOCK_DATA_PSL case, so it
@@ -1252,6 +1253,7 @@ mod tests {
     // -- capability-gated resources: PSL -------------------------------------
 
     #[cfg(feature = "psl")]
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn psl_sharing_allocates_the_list() {
         let share = Share::new();

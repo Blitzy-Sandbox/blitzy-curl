@@ -257,6 +257,7 @@ mod tests {
 
     // ---- needs_idn: feature-agnostic trigger detection -------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn needs_idn_false_for_ascii() {
         assert!(!needs_idn("example.com"));
@@ -268,6 +269,7 @@ mod tests {
         assert!(!needs_idn("")); // empty == ASCII (matches Curl_is_ASCII_name)
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn needs_idn_true_for_non_ascii() {
         assert!(needs_idn(&aao_se()));
@@ -278,6 +280,7 @@ mod tests {
 
     // ---- to_ascii: ASCII passthrough is feature-agnostic -----------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn to_ascii_ascii_passthrough_preserves_case_and_form() {
         // curl never runs ASCII names through libidn2, so case and form are
@@ -300,6 +303,7 @@ mod tests {
         // ß (U+00DF) — only exercised by the feature-on conversion vectors.
         const SHARP_S: char = '\u{df}';
 
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn to_ascii_known_vectors_match_curl() {
             // tests/data/test1448, test2046, test2047, test962-967, ...
@@ -321,6 +325,7 @@ mod tests {
             assert_eq!(to_ascii("\u{4e2d}\u{6587}.com").unwrap(), "xn--fiq228c.com");
         }
 
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn to_ascii_normalizes_unicode_separators() {
             // U+3002 ideographic full stop is treated as a label separator,
@@ -336,6 +341,7 @@ mod tests {
             );
         }
 
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn to_ascii_round_trips_with_from_ascii() {
             let ace = to_ascii(&aao_se()).unwrap();
@@ -343,6 +349,7 @@ mod tests {
             assert_eq!(from_ascii(&ace).unwrap(), aao_se());
         }
 
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn to_ascii_too_long_label_is_malformat() {
             // tests/data/test1035: an over-long IDN host => CURLE_URL_MALFORMAT.
@@ -353,6 +360,7 @@ mod tests {
             assert_eq!(to_ascii(&host), Err(CurlError::UrlMalformat));
         }
 
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn to_ascii_blank_name_is_malformat() {
             // tests/data/test763: ZERO WIDTH SPACE + ZERO WIDTH NON-JOINER map
@@ -362,6 +370,7 @@ mod tests {
             assert_eq!(to_ascii("\u{00ad}"), Err(CurlError::UrlMalformat));
         }
 
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn from_ascii_decodes_ace() {
             assert_eq!(from_ascii("xn--4cab6c.se").unwrap(), aao_se());
@@ -371,11 +380,13 @@ mod tests {
             );
         }
 
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn from_ascii_plain_ascii_is_returned() {
             assert_eq!(from_ascii("example.com").unwrap(), "example.com");
         }
 
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn from_ascii_malformed_ace_is_malformat() {
             // A truncated/invalid Punycode label cannot be decoded.
@@ -415,6 +426,7 @@ mod tests {
 
     // ---- Error-code parity with curl -------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn mapped_error_codes_match_curl_integers() {
         // CURLE_URL_MALFORMAT == 3, CURLE_NOT_BUILT_IN == 4.

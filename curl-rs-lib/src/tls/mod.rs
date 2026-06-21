@@ -798,6 +798,7 @@ mod tests {
 
     // ---- (d) extract_spki_der ---------------------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn extract_spki_matches_independent_rcgen_spki() {
         use rcgen::PublicKeyData;
@@ -930,6 +931,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connect_completes_handshake_negotiates_alpn_and_roundtrips() {
         let (cert, key) = self_signed_localhost();
@@ -976,6 +978,7 @@ mod tests {
         assert_eq!(&echoed, b"hello");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connect_with_trusted_ca_succeeds() {
         let (ca_pem, leaf_der, leaf_key) = ca_and_leaf();
@@ -1010,6 +1013,7 @@ mod tests {
         assert_eq!(&echoed, b"ping");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connect_rejects_untrusted_cert() {
         let (cert, key) = self_signed_localhost();
@@ -1037,6 +1041,7 @@ mod tests {
         let _ = server.await;
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connect_rejects_pinned_pubkey_mismatch() {
         let (cert, key) = self_signed_localhost();
@@ -1068,6 +1073,7 @@ mod tests {
         let _ = server.await;
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connect_accepts_matching_pinned_pubkey() {
         use crate::util::base64::base64_encode;

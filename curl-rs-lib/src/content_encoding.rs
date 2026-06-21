@@ -1018,6 +1018,7 @@ mod tests {
         assert_eq!(decode_byte_by_byte("gzip", &comp).unwrap(), data);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn deflate_zlib_round_trip() {
         let data = sample();
@@ -1047,6 +1048,7 @@ mod tests {
     }
 
     #[cfg(feature = "zstd")]
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn zstd_round_trip() {
         let data = sample();

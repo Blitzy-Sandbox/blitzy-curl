@@ -1269,6 +1269,7 @@ mod tests {
 
     // ---- (c) verifier selection / config building -------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn default_config_builds_with_webpki_roots() {
         let c = TlsConfig::default();
@@ -1290,6 +1291,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn verify_host_false_builds() {
         let c = TlsConfig {
@@ -1313,6 +1315,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn cainfo_blob_builds_custom_roots() {
         let (cert_pem, _key) = self_signed();
@@ -1323,6 +1326,7 @@ mod tests {
         assert!(c.build_client_config(&[], None).is_ok());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn cainfo_file_builds_custom_roots() {
         let (cert_pem, _key) = self_signed();
@@ -1334,6 +1338,7 @@ mod tests {
         assert!(c.build_client_config(&[], None).is_ok());
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn cainfo_blob_overrides_file() {
         // Valid blob + bogus file → blob wins → Ok (file ignored).
@@ -1372,6 +1377,7 @@ mod tests {
 
     // ---- (e) client auth: both-or-error -----------------------------------
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn client_auth_only_cert_errors() {
         let c = TlsConfig {
@@ -1384,6 +1390,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn client_auth_only_key_errors() {
         let c = TlsConfig {
@@ -1396,6 +1403,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn client_auth_matching_pair_ok() {
         let (cert_pem, key_pem) = self_signed();

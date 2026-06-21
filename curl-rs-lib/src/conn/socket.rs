@@ -2727,6 +2727,7 @@ mod tests {
     /// Connect the TCP filter to a local listener and exchange bytes, exercising
     /// the async-collapsed `connect`, `send`, `recv`, and the post-connect
     /// queries (C: `cf_tcp_connect`/`cf_socket_send`/`cf_socket_recv`).
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn tcp_connect_send_recv_roundtrip() {
         run(async {
@@ -2782,6 +2783,7 @@ mod tests {
     /// UNIX-domain round-trip (C: the `Curl_cft_unix` filter / `TRNSPRT_UNIX`),
     /// realising `CURLOPT_UNIX_SOCKET_PATH`.
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn unix_connect_send_recv_roundtrip() {
         run(async {
@@ -2882,6 +2884,7 @@ mod tests {
     /// (C: `socks_proxy_cf_connect`, socks.c L1215). This validates the adapter
     /// bridging `recv`/`send` ↔ `AsyncRead`/`AsyncWrite` and the filter wiring.
     #[cfg(feature = "proxy")]
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn socks5_filter_negotiates_through_cfstream() {
         run(async {
