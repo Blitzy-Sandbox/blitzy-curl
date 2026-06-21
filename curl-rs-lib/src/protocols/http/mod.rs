@@ -483,6 +483,12 @@ struct HopInputs {
     proxy_connection_keepalive: bool,
     /// `CURLOPT_REQUEST_TARGET`-style request-target override (forward proxy), if any.
     request_target_override: Option<String>,
+    /// The reactive-auth seed (Digest/NTLM/`--anyauth` credentials + wanted scheme
+    /// mask), or `None` when no challenge-response auth applies to this hop. When
+    /// present, the HTTP/1.1 hop driver runs a challenge-response retry loop on
+    /// the kept-alive connection (curl's `data->state.authhost` negotiation).
+    /// Deposited cross-host-gated exactly like [`authorization`](Self::authorization).
+    auth: Option<auth_engine::AuthInputs>,
 }
 
 impl HopInputs {
@@ -500,6 +506,7 @@ impl HopInputs {
             allowed_to_host: true,
             proxy_connection_keepalive: false,
             request_target_override: None,
+            auth: None,
         }
     }
 }
@@ -610,17 +617,39 @@ fn parse_status_code(after_http: &str) -> Option<i32> {
     parts.next()?.parse::<i32>().ok()
 }
 
+/// How a hop's response body is routed to the application sink, decided once
+/// (memoized) when the first body byte arrives — by then the status line and all
+/// headers have been observed.
+///
+/// * [`Forward`](BodyDisposition::Forward) — write through to the application
+///   (the normal terminal case).
+/// * [`Discard`](BodyDisposition::Discard) — drop silently: a `3xx` body that
+///   `-L` will follow (curl discards intermediate redirect bodies).
+/// * [`BufferAuth`](BodyDisposition::BufferAuth) — buffer a `401`/`407` body
+///   *during auth negotiation* so it can be either discarded (if the request is
+///   re-issued with credentials) or flushed (if the challenge is terminal and
+///   the error page is the real answer). This reproduces curl's behavior of
+///   suppressing intermediate auth-probe bodies while still delivering the body
+///   of a final, unanswerable `401`/`407`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BodyDisposition {
+    Forward,
+    Discard,
+    BufferAuth,
+}
+
 /// A [`WriteCallbacks`] decorator wrapping the application's sink for one hop.
 ///
 /// It transparently forwards every header line and (final-hop) body byte to the
 /// inner sink, while *observing* the bytes to capture the status code and the
 /// orchestration-relevant headers (`Location`, `Set-Cookie`,
-/// `Strict-Transport-Security`, `Alt-Svc`). When the hop is a redirect that will
-/// be followed (`follow_enabled && 3xx && Location present`), the response body
-/// is *suppressed* (not forwarded), so only the final response's body reaches
-/// the application — matching curl's `-L` behavior of discarding intermediate
-/// `3xx` bodies. Headers are always forwarded (so `-i`/`-D` observe every hop,
-/// as curl does).
+/// `Strict-Transport-Security`, `Alt-Svc`, `WWW-Authenticate`). When the hop is
+/// a redirect that will be followed (`follow_enabled && 3xx && Location
+/// present`), the response body is *suppressed* (not forwarded), so only the
+/// final response's body reaches the application — matching curl's `-L` behavior
+/// of discarding intermediate `3xx` bodies. During HTTP auth negotiation a
+/// `401`/`407` body is *buffered* (see [`BodyDisposition`]). Headers are always
+/// forwarded (so `-i`/`-D` observe every hop, as curl does).
 struct HopSink<'s> {
     /// The application's real sink (body + header callbacks).
     inner: &'s mut dyn WriteCallbacks,
@@ -649,13 +678,34 @@ struct HopSink<'s> {
     /// `CURLINFO_CONTENT_TYPE`. Reset on each status line so a redirect block's
     /// value does not leak into the final one.
     content_type: Option<Vec<u8>>,
-    /// Memoized body-suppression decision (computed once the first body byte
-    /// arrives — by then all headers, including the status line, have been seen).
-    suppress_body: Option<bool>,
+    /// The `WWW-Authenticate` (host) / `Proxy-Authenticate` (proxy) challenge
+    /// values from the current response block, in order, for the auth controller
+    /// to parse on a `401`/`407`. Reset on each status line so only the current
+    /// block's challenges are considered (curl's `Curl_http_input_auth` per
+    /// response).
+    www_authenticate: Vec<String>,
+    /// Whether this hop is part of an HTTP auth negotiation (a controller is
+    /// active). When set, a `401`/`407` body is buffered rather than forwarded
+    /// (see [`BodyDisposition::BufferAuth`]).
+    auth_negotiating: bool,
+    /// The buffered body of a `401`/`407` captured under
+    /// [`BodyDisposition::BufferAuth`], pending the retry/terminal decision.
+    auth_body_buf: Vec<u8>,
+    /// Memoized body-routing decision (computed once the first body byte arrives
+    /// — by then all headers, including the status line, have been seen).
+    disposition: Option<BodyDisposition>,
 }
 
 impl<'s> HopSink<'s> {
-    fn new(inner: &'s mut dyn WriteCallbacks, follow_enabled: bool) -> Self {
+    /// Wrap the application's sink, marking whether an HTTP auth negotiation is in
+    /// progress. When `auth_negotiating` is set, a `401`/`407` body is buffered
+    /// rather than forwarded (see [`BodyDisposition`]); otherwise it behaves as a
+    /// plain forwarding/redirect-suppressing decorator.
+    fn with_auth(
+        inner: &'s mut dyn WriteCallbacks,
+        follow_enabled: bool,
+        auth_negotiating: bool,
+    ) -> Self {
         HopSink {
             inner,
             follow_enabled,
@@ -669,7 +719,10 @@ impl<'s> HopSink<'s> {
             alt_svc: None,
             headers: Vec::new(),
             content_type: None,
-            suppress_body: None,
+            www_authenticate: Vec::new(),
+            auth_negotiating,
+            auth_body_buf: Vec::new(),
+            disposition: None,
         }
     }
 
@@ -694,6 +747,7 @@ impl<'s> HopSink<'s> {
                 self.location = None;
                 self.headers.clear();
                 self.content_type = None;
+                self.www_authenticate.clear();
             }
             return;
         }
@@ -710,6 +764,15 @@ impl<'s> HopSink<'s> {
             }
             if name.eq_ignore_ascii_case("location") {
                 self.location = Some(value.to_string());
+            } else if name.eq_ignore_ascii_case("www-authenticate")
+                || name.eq_ignore_ascii_case("proxy-authenticate")
+            {
+                // Collect every auth challenge in the current response block for
+                // the auth controller (curl's `Curl_http_input_auth` consumes
+                // each `WWW-Authenticate`/`Proxy-Authenticate` line). Multiple
+                // schemes may also appear comma-separated on one line; the
+                // controller's `parse_auth_header` handles that split.
+                self.www_authenticate.push(value.to_string());
             } else if cfg!(feature = "cookies") && name.eq_ignore_ascii_case("set-cookie") {
                 #[cfg(feature = "cookies")]
                 self.set_cookies.push(value.to_string());
@@ -734,24 +797,88 @@ impl<'s> HopSink<'s> {
     fn should_suppress(&self) -> bool {
         self.follow_enabled && is_redirect_status(self.status) && self.location.is_some()
     }
+
+    /// Decide how this hop's body is routed (called once at the first body byte).
+    /// A followed redirect is discarded; a `401`/`407` while an auth negotiation
+    /// is active is buffered; everything else is forwarded.
+    fn decide_disposition(&self) -> BodyDisposition {
+        if self.should_suppress() {
+            return BodyDisposition::Discard;
+        }
+        if self.auth_negotiating && (self.status == 401 || self.status == 407) {
+            return BodyDisposition::BufferAuth;
+        }
+        BodyDisposition::Forward
+    }
+
+    /// Reset the per-attempt observable state before re-issuing the request on
+    /// the same connection during auth negotiation. Keeps the inner sink, the
+    /// `follow_enabled`/`auth_negotiating` flags; clears the status, captured
+    /// headers/challenges, and the memoized body disposition + buffer.
+    fn reset_for_retry(&mut self) {
+        self.status = 0;
+        self.location = None;
+        self.headers.clear();
+        self.content_type = None;
+        self.www_authenticate.clear();
+        self.auth_body_buf.clear();
+        self.disposition = None;
+        #[cfg(feature = "cookies")]
+        self.set_cookies.clear();
+        #[cfg(feature = "hsts")]
+        {
+            self.sts = None;
+        }
+        #[cfg(feature = "alt-svc")]
+        {
+            self.alt_svc = None;
+        }
+    }
+
+    /// Discard any buffered auth-probe body (the request is being re-issued with
+    /// credentials, so the intermediate `401`/`407` error page is not delivered).
+    fn discard_auth_body(&mut self) {
+        self.auth_body_buf.clear();
+    }
+
+    /// Flush a buffered auth body to the application sink — used when a
+    /// `401`/`407` turns out to be terminal (the challenge could not be answered),
+    /// so curl delivers the server's error page as the real response body.
+    fn flush_auth_body(&mut self) {
+        if self.auth_body_buf.is_empty() {
+            return;
+        }
+        let buf = std::mem::take(&mut self.auth_body_buf);
+        let mut off = 0;
+        while off < buf.len() {
+            let n = self.inner.write_body(&buf[off..]);
+            if n == 0 {
+                break;
+            }
+            off += n;
+        }
+    }
 }
 
 impl WriteCallbacks for HopSink<'_> {
     fn write_body(&mut self, data: &[u8]) -> usize {
-        let suppress = match self.suppress_body {
-            Some(b) => b,
+        let disposition = match self.disposition {
+            Some(d) => d,
             None => {
-                let b = self.should_suppress();
-                self.suppress_body = Some(b);
-                b
+                let d = self.decide_disposition();
+                self.disposition = Some(d);
+                d
             }
         };
-        if suppress {
+        match disposition {
             // Pretend the bytes were consumed so the transfer driver does not
-            // treat the discard as a short write.
-            data.len()
-        } else {
-            self.inner.write_body(data)
+            // treat the discard/buffer as a short write.
+            BodyDisposition::Discard => data.len(),
+            BodyDisposition::BufferAuth => {
+                self.auth_body_buf.extend_from_slice(data);
+                data.len()
+            }
+            BodyDisposition::Forward => self.inner.write_body(data),
         }
     }
 
@@ -1120,7 +1247,14 @@ mod altsvc_engine {
 /// implementations already live in [`crate::auth`].
 mod auth_engine {
     use super::{Easy, StrId};
-    use crate::auth::{basic::http_basic_header, CURLAUTH_BASIC};
+    use crate::auth::basic::http_basic_header;
+    use crate::auth::bearer::http_bearer_header;
+    use crate::auth::digest::{input_digest, output_digest, DigestData};
+    use crate::auth::ntlm::NtlmHandshake;
+    use crate::auth::{
+        build_auth_mask, parse_auth_header, pick_one_auth, AuthState, CURLAUTH_BASIC,
+        CURLAUTH_BEARER, CURLAUTH_DIGEST, CURLAUTH_NEGOTIATE, CURLAUTH_NTLM,
+    };
     use crate::netrc::{self, CurlNetrcOption};
     use std::path::Path;
 
@@ -1130,34 +1264,265 @@ mod auth_engine {
         password: String,
     }
 
-    /// The preemptive `Authorization: Basic` *value* (`"Basic <base64>"`) for
-    /// the transfer's resolved credentials, or `None` when no credentials apply
-    /// or Basic is not in the `CURLOPT_HTTPAUTH` mask.
+    /// Reduce a full `"[Proxy-]Authorization: <scheme> …\r\n"` header line to the
+    /// bare *value* (`"<scheme> …"`) the h1 request builder expects — it adds the
+    /// `Authorization` field name and the terminating CRLF itself (h1.rs:749).
+    fn reduce_to_value(line: &str) -> String {
+        line.strip_prefix("Authorization: ")
+            .or_else(|| line.strip_prefix("Proxy-Authorization: "))
+            .unwrap_or(line)
+            .trim_end_matches(['\r', '\n'])
+            .to_string()
+    }
+
+    /// The preemptive `Authorization` *value* for the transfer's resolved
+    /// credentials, or `None` when no preemptive header applies.
+    ///
+    /// Only the two *challenge-free* schemes are ever sent preemptively, and only
+    /// when the `CURLOPT_HTTPAUTH` mask names **exactly** that one scheme — curl's
+    /// `Curl_http_output_auth` keys on `authhost.picked`, which equals the wanted
+    /// mask before any challenge is seen:
+    ///
+    /// * `CURLOPT_HTTPAUTH == CURLAUTH_BEARER` (`--oauth2-bearer`) → emit
+    ///   `Bearer <token>` (no `-u` credentials required). This is what makes
+    ///   `--oauth2-bearer` work on every wire version (the F8 AUTH-2 fix; the
+    ///   header is reused verbatim by HTTP/1.1, HTTP/2 and HTTP/3).
+    /// * `CURLOPT_HTTPAUTH == CURLAUTH_BASIC` (the default, or `--basic`) → emit
+    ///   `Basic <base64>` for the resolved credentials.
+    ///
+    /// Every multi-scheme mask (`--anyauth`) and every challenge-requiring scheme
+    /// (`--digest`/`--ntlm`/`--negotiate`) returns `None` here and is driven
+    /// reactively by [`HttpAuthController`] after the server's `401` — so
+    /// `--anyauth` no longer downgrades to a preemptive Basic (the F8 AUTH-5
+    /// root cause) and instead picks the strongest scheme the server offers.
     ///
     /// `host` is the *origin* host the transfer starts against — the `.netrc`
     /// machine the lookup keys on (curl resolves credentials once against the
     /// initial host, then governs cross-host forwarding separately).
-    pub(super) fn preemptive_basic(data: &Easy, host: &str) -> Option<String> {
-        let creds = resolve(data, host)?;
+    pub(super) fn preemptive_value(data: &Easy, host: &str) -> Option<String> {
+        let auth = data.set.httpauth;
 
-        // Only Basic is sent preemptively; every other scheme requires a server
-        // challenge first (auth depth, F8). The default `CURLOPT_HTTPAUTH` is
-        // exactly `CURLAUTH_BASIC`, so this gate passes for the common case and
-        // correctly suppresses preemptive Basic under `--digest`/`--ntlm`/etc.
-        if data.set.httpauth & CURLAUTH_BASIC == 0 {
-            return None;
+        // Bearer: a single-scheme `--oauth2-bearer` request. The token is sent
+        // without waiting for a challenge and needs no `-u` credentials.
+        if auth == CURLAUTH_BEARER {
+            let token = data.set.str(StrId::Bearer)?;
+            let line = http_bearer_header(token).ok()?;
+            return Some(reduce_to_value(&line));
         }
 
-        // Reuse the parity-faithful Basic encoder (`http_output_basic`), then
-        // reduce its full header line ("Authorization: Basic <b64>\r\n") to the
-        // *value* the h1 request builder expects (it adds the field name).
-        let line = http_basic_header(&creds.user, &creds.password, false).ok()?;
-        let value = line
-            .strip_prefix("Authorization: ")
-            .unwrap_or(&line)
-            .trim_end_matches(['\r', '\n'])
-            .to_string();
-        Some(value)
+        // Basic: the default scheme (or explicit `--basic`). Requires resolved
+        // credentials. A multi-scheme mask (anyauth) is intentionally excluded by
+        // the exact-equality test so it does not pre-send Basic.
+        if auth == CURLAUTH_BASIC {
+            let creds = resolve(data, host)?;
+            let line = http_basic_header(&creds.user, &creds.password, false).ok()?;
+            return Some(reduce_to_value(&line));
+        }
+
+        None
+    }
+
+    /// Whether the wanted `CURLOPT_HTTPAUTH` mask requires the reactive
+    /// challenge-response controller rather than a single preemptive header.
+    ///
+    /// `true` when any challenge-requiring scheme (Digest, NTLM, Negotiate) is
+    /// wanted, **or** more than one scheme is wanted (`--anyauth`), since the
+    /// final scheme can then only be chosen after the server's `401` advertises
+    /// what it supports. A single `CURLAUTH_BASIC`/`CURLAUTH_BEARER` mask is
+    /// challenge-free and handled by [`preemptive_value`].
+    fn needs_reactive(want: u32) -> bool {
+        const REACTIVE: u32 = CURLAUTH_DIGEST | CURLAUTH_NTLM | CURLAUTH_NEGOTIATE;
+        let scheme_bits = want & (CURLAUTH_BASIC | CURLAUTH_BEARER | REACTIVE);
+        (want & REACTIVE) != 0 || scheme_bits.count_ones() > 1
+    }
+
+    /// The immutable per-transfer seed for a reactive [`HttpAuthController`]:
+    /// resolved credentials, the optional bearer token, and the wanted scheme
+    /// mask. Deposited on each in-scope hop (cross-host-gated exactly like the
+    /// preemptive `Authorization` value) so the hop driver can run the
+    /// challenge-response loop on the kept-alive connection.
+    #[derive(Clone)]
+    pub(super) struct AuthInputs {
+        user: String,
+        password: String,
+        bearer: Option<String>,
+        want: u32,
+    }
+
+    /// Build the reactive-auth seed for the origin host, or `None` when reactive
+    /// auth does not apply (a challenge-free single scheme, or no credentials at
+    /// all to attempt with). A `--negotiate -u :` request with no usable
+    /// credential returns `None`, leaving curl's existing graceful
+    /// `CURLE_NOT_BUILT_IN` (already produced at `setopt` time) untouched.
+    pub(super) fn resolve_auth_inputs(data: &Easy, host: &str) -> Option<AuthInputs> {
+        let want = data.set.httpauth;
+        if !needs_reactive(want) {
+            return None;
+        }
+        let bearer = data.set.str(StrId::Bearer).map(str::to_string);
+        let (user, password) = match resolve(data, host) {
+            Some(c) => (c.user, c.password),
+            None => (String::new(), String::new()),
+        };
+        // Need at least one credential or a bearer token to attempt anything.
+        if user.is_empty() && password.is_empty() && bearer.is_none() {
+            return None;
+        }
+        Some(AuthInputs {
+            user,
+            password,
+            bearer,
+            want,
+        })
+    }
+
+    /// A per-host HTTP authentication controller driving the challenge-response
+    /// schemes (Digest, NTLM) and multi-scheme selection (`--anyauth`) across the
+    /// retries of a single hop — curl's `data->state.authhost` plus the
+    /// per-connection Digest/NTLM state, scoped to one connection.
+    ///
+    /// One instance is created per hop from [`AuthInputs`]; it is driven by
+    /// [`on_challenge`](Self::on_challenge) on every `401` and produces the next
+    /// request's `Authorization` value, or `None` to stop (no acceptable scheme,
+    /// rejected credentials, or the multi-pass scheme completed).
+    pub(super) struct HttpAuthController {
+        state: AuthState,
+        digest: DigestData,
+        ntlm: NtlmHandshake,
+        user: String,
+        password: String,
+        bearer: Option<String>,
+    }
+
+    impl HttpAuthController {
+        /// Create a controller seeded with the wanted scheme mask and credentials.
+        pub(super) fn new(inputs: AuthInputs) -> Self {
+            HttpAuthController {
+                state: AuthState::new(inputs.want),
+                digest: DigestData::new(),
+                ntlm: NtlmHandshake::new(),
+                user: inputs.user,
+                password: inputs.password,
+                bearer: inputs.bearer,
+            }
+        }
+
+        /// Process a response's `WWW-Authenticate` challenges and return the next
+        /// request's `Authorization` *value*, or `None` to stop.
+        ///
+        /// `method` is the request verb (e.g. `"GET"`) and `target` the origin-form
+        /// request target (e.g. `"/digest"`) — both needed to compute the Digest
+        /// response hash (`HA2 = MD5(method:uri)`), matching the bytes actually
+        /// written on the wire by the h1 builder.
+        pub(super) fn on_challenge(
+            &mut self,
+            challenges: &[String],
+            method: &str,
+            target: &str,
+        ) -> Option<String> {
+            // (1) Fold every challenge into the auth state (ORs the advertised
+            //     `avail` bits) and detect a rejected Basic/Bearer (the creds or
+            //     token we already sent were refused → curl gives up).
+            let mut authproblem = false;
+            for value in challenges {
+                let parsed = parse_auth_header(&mut self.state, value);
+                authproblem |= parsed.authproblem;
+            }
+            if authproblem {
+                return None;
+            }
+
+            // (2) Pick the single strongest acceptable scheme curl would
+            //     (Negotiate > Bearer > Digest > NTLM > Basic), honoring the
+            //     bearer mask. `pick_one_auth` clears `avail` afterward, exactly
+            //     as curl's `pickoneauth`.
+            let mask = build_auth_mask(self.bearer.is_some());
+            if !pick_one_auth(&mut self.state, mask) {
+                return None;
+            }
+
+            // (3) Emit the header for the picked scheme.
+            self.produce_header(method, target, challenges)
+        }
+
+        /// Produce the `Authorization` value for the currently picked scheme.
+        fn produce_header(
+            &mut self,
+            method: &str,
+            target: &str,
+            challenges: &[String],
+        ) -> Option<String> {
+            match self.state.picked {
+                CURLAUTH_BASIC => {
+                    let line = http_basic_header(&self.user, &self.password, false).ok()?;
+                    Some(reduce_to_value(&line))
+                }
+                CURLAUTH_BEARER => {
+                    let token = self.bearer.as_deref()?;
+                    let line = http_bearer_header(token).ok()?;
+                    Some(reduce_to_value(&line))
+                }
+                CURLAUTH_DIGEST => {
+                    // Feed the Digest challenge (records the nonce; a stale-less
+                    // re-challenge after a prior response errors → bad creds, stop).
+                    self.feed_digest(challenges)?;
+                    let out = output_digest(
+                        &mut self.digest,
+                        false,
+                        self.state.iestyle,
+                        method.as_bytes(),
+                        target.as_bytes(),
+                        self.user.as_bytes(),
+                        self.password.as_bytes(),
+                    )
+                    .ok()?;
+                    out.header.map(|line| reduce_to_value(&line))
+                }
+                CURLAUTH_NTLM => {
+                    // Advance the NTLM handshake with the server's challenge
+                    // (bare `NTLM` → queue Type-1; `NTLM <type2>` → ready Type-3).
+                    self.feed_ntlm(challenges)?;
+                    let out = self.ntlm.output(false, &self.user, &self.password).ok()?;
+                    out.header.map(|line| reduce_to_value(&line))
+                }
+                // Negotiate is not built in (no SPNEGO backend) and is masked out
+                // at `setopt` time; AWS SigV4 is signed elsewhere. Neither is
+                // driven by this loop.
+                _ => None,
+            }
+        }
+
+        /// Feed the Digest challenge to the decoder. Returns `None` (stop) if the
+        /// challenge is malformed or a stale-less re-challenge signals bad creds.
+        fn feed_digest(&mut self, challenges: &[String]) -> Option<()> {
+            for value in challenges {
+                let v = value.trim_start();
+                if v.len() >= 6 && v.as_bytes()[..6].eq_ignore_ascii_case(b"Digest") {
+                    // `input_digest` requires the raw value to start with the
+                    // `Digest` scheme token, which it does here.
+                    input_digest(&mut self.digest, v.as_bytes()).ok()?;
+                    return Some(());
+                }
+            }
+            // Digest was picked but no Digest challenge is present: stop.
+            None
+        }
+
+        /// Advance the NTLM handshake with the server's challenge. Returns `None`
+        /// (stop) if the handshake errors (e.g. the server rejected Type-3).
+        fn feed_ntlm(&mut self, challenges: &[String]) -> Option<()> {
+            for value in challenges {
+                let v = value.trim_start();
+                if v.len() >= 4 && v.as_bytes()[..4].eq_ignore_ascii_case(b"NTLM") {
+                    self.ntlm.input(v).ok()?;
+                    return Some(());
+                }
+            }
+            // NTLM was picked but no NTLM challenge present: feed a bare token to
+            // (re)start the handshake from Type-1.
+            self.ntlm.input("NTLM").ok()?;
+            Some(())
+        }
     }
 
     /// Resolve the host credentials: explicit `-u` first, then `.netrc` (when
@@ -1458,8 +1823,11 @@ pub(crate) async fn perform_http(
     // enabled, `.netrc`. Basic is emitted preemptively (curl's default scheme)
     // against the *origin* host below; the origin host is also the gate for
     // cross-host credential forwarding on redirects (`--location-trusted`).
-    let (_oh_scheme, _oh_https, origin_host, _oh_port) = http_url_parts(&url)?;
-    let preemptive_basic = auth_engine::preemptive_basic(data, &origin_host);
+    let (oh_scheme, _oh_https, origin_host, oh_port) = http_url_parts(&url)?;
+    let preemptive_auth = auth_engine::preemptive_value(data, &origin_host);
+    // Reactive-auth seed (Digest/NTLM/`--anyauth`): `None` for the challenge-free
+    // single-scheme cases handled by `preemptive_auth` above.
+    let reactive_auth = auth_engine::resolve_auth_inputs(data, &origin_host);
 
     let final_result: Result<()> = loop {
         // Before connecting, upgrade `http`→`https` for an HSTS-known host (curl
@@ -1481,22 +1849,37 @@ pub(crate) async fn perform_http(
             HttpReq::Get | HttpReq::Head => h1::RequestBody::None,
         };
 
+        // Credentials may be sent to this hop only when its URL shares the SAME
+        // origin as the first request — identical scheme, host, AND port — or
+        // when `--location-trusted` (`CURLOPT_UNRESTRICTED_AUTH`) permits keeping
+        // them across origins. curl compares all three components (the
+        // CVE-2022-27774 hardening): a different port or scheme is a different
+        // origin and MUST strip credentials, so matching on host alone would leak
+        // credentials to a same-host / different-port (or scheme-changed) redirect
+        // target. This single decision governs BOTH the preemptive `Authorization`
+        // value and the reactive-auth seed, so a redirect to a different origin
+        // strips both unless explicitly trusted — preserving the F8 "auth across
+        // redirects" PASS and matching reference curl 8.x exactly.
+        let auth_allowed_this_host = (cur_host.eq_ignore_ascii_case(&origin_host)
+            && cur_port == oh_port
+            && cur_scheme.eq_ignore_ascii_case(&oh_scheme))
+            || redirect_cfg.allow_auth_to_other_hosts;
+
         let hop_inputs = HopInputs {
             method,
             no_body,
-            // Emit the preemptive Basic header to the origin host, and to a
-            // redirect target only when `--location-trusted`
-            // (`CURLOPT_UNRESTRICTED_AUTH`) permits keeping credentials across
-            // hosts — matching curl's `Curl_auth_allowed_to_host` gate (the h1
-            // builder emits `Authorization` unconditionally on this value, so the
-            // cross-host decision is made here).
-            authorization: match preemptive_basic.as_deref() {
-                Some(v)
-                    if cur_host.eq_ignore_ascii_case(&origin_host)
-                        || redirect_cfg.allow_auth_to_other_hosts =>
-                {
-                    Some(v.to_string())
-                }
+            // Emit the preemptive Basic/Bearer header (the h1 builder emits
+            // `Authorization` unconditionally on this value, so the cross-host
+            // decision is made here).
+            authorization: match preemptive_auth.as_deref() {
+                Some(v) if auth_allowed_this_host => Some(v.to_string()),
+                _ => None,
+            },
+            // Reactive challenge-response auth (Digest/NTLM/`--anyauth`) seed,
+            // gated identically. Rebuilt per hop from the resolved credentials so
+            // the per-connection Digest/NTLM state starts fresh on each hop.
+            auth: match &reactive_auth {
+                Some(seed) if auth_allowed_this_host => Some(seed.clone()),
                 _ => None,
             },
             proxy_authorization: None,
@@ -1668,11 +2051,11 @@ async fn perform_http_hop(
     //     request still targets the origin (curl keeps `conn->host` = origin,
     //     `conn->http_proxy.host` = proxy). `--noproxy`/`NO_PROXY` is honored by
     //     `proxy_for_target`, which returns `None` when the host is bypassed.
-    // A forward HTTP proxy injects `Proxy-Authorization`/`Proxy-Connection` into
-    // the request shape, so the per-hop inputs become mutable here. Only the
-    // `proxy` feature mutates them, so the rebind is gated to avoid an
-    // `unused_mut` lint when the feature is off.
-    #[cfg(feature = "proxy")]
+    // The per-hop inputs become mutable here: a forward HTTP proxy injects
+    // `Proxy-Authorization`/`Proxy-Connection`, and the HTTP/1.1 reactive-auth
+    // loop rewrites `authorization` across challenge-response retries. Both the
+    // proxy feature and the auth loop mutate `hop`, so the rebind is
+    // unconditional (the auth loop is always compiled).
     let mut hop = hop;
     #[cfg(feature = "proxy")]
     let proxy_cfg = {
@@ -1737,7 +2120,16 @@ async fn perform_http_hop(
         let only_http_10 = httpwant == CURL_HTTP_VERSION_1_0;
         let alpn = alpn_protocols(want_h2, true, false, only_http_10, data.set.ssl_enable_alpn);
         let tls = tls_config_from_easy(data);
-        Some(tls_factory(tls, host_ace.clone(), port, None, alpn))
+        // `CURLOPT_PINNEDPUBLICKEY` (`--pinnedpubkey`): the SPKI pin set the
+        // target TLS filter enforces post-handshake (`tls::connect` →
+        // `config::verify_pinned_pubkey`, mapping a mismatch to
+        // `CURLE_SSL_PINNEDPUBKEYNOTMATCH`). This MUST be threaded through to the
+        // factory — passing `None` here silently disables the pin (a fail-open
+        // security-control bypass). curl enforces the pin independently of CA
+        // validation, so it applies even under `--insecure`; the post-handshake
+        // check in `tls::connect` runs regardless of `verify_peer`.
+        let pinned_pubkey = data.set.str(StrId::SslPinnedPublicKey).map(str::to_string);
+        Some(tls_factory(tls, host_ace.clone(), port, pinned_pubkey, alpn))
     } else {
         None
     };
@@ -1790,11 +2182,18 @@ async fn perform_http_hop(
                     let palpn =
                         alpn_protocols(false, true, false, false, data.set.ssl_enable_alpn);
                     let ptls = px.tls.clone().unwrap_or_else(|| tls_config_from_easy(data));
+                    // `CURLOPT_PROXY_PINNEDPUBLICKEY` (`--proxy-pinnedpubkey`): the
+                    // SPKI pin enforced against the HTTPS *proxy* leaf certificate
+                    // (curl pins the proxy connection separately from the target).
+                    // As with the target pin above, `None` here would silently
+                    // disable proxy pinning.
+                    let proxy_pinned_pubkey =
+                        data.set.str(StrId::SslPinnedPublicKeyProxy).map(str::to_string);
                     setup = setup.with_ssl_proxy(tls_proxy_factory(
                         ptls,
                         px.host.clone(),
                         px.port,
-                        None,
+                        proxy_pinned_pubkey,
                         palpn,
                     ));
                 }
@@ -1908,45 +2307,131 @@ async fn perform_http_hop(
     // (6) Select the wire version (forced option, else negotiated ALPN) and
     //     build + drive the matching exchange, capturing the hop outcome.
     let version = select_http_version(data, &conn)?;
-    let mut hop_sink = HopSink::new(sink, follow_enabled);
+    // A reactive-auth controller drives the HTTP/1.1 challenge-response loop
+    // (Digest/NTLM/`--anyauth`). It applies only to the h1 path: NTLM is a
+    // connection-oriented scheme curl forces onto HTTP/1.1, and the cleartext
+    // mail/Digest test endpoints all negotiate over h1; HTTP/2 and HTTP/3 keep
+    // the single preemptive attempt (which still carries Basic/Bearer).
+    let mut auth_controller = match version {
+        HttpVersion::Http10 | HttpVersion::Http11 => {
+            hop.auth.take().map(auth_engine::HttpAuthController::new)
+        }
+        _ => None,
+    };
+    // When auth negotiation is active, a `401`/`407` body is buffered rather than
+    // streamed to the application, so an intermediate auth-probe error page is
+    // not delivered when the request is about to be re-issued with credentials.
+    let mut hop_sink = HopSink::with_auth(sink, follow_enabled, auth_controller.is_some());
     let drive_result = match version {
         HttpVersion::Http10 | HttpVersion::Http11 => {
             let http_minor = if version == HttpVersion::Http10 { 0 } else { 1 };
             let custom_headers = collect_custom_headers(data);
-            let plan = {
-                let inputs = make_inputs(
-                    data,
+
+            // Challenge-response retry loop on the kept-alive connection (curl's
+            // `data->state.authhost` negotiation). Without a controller this runs
+            // exactly once — the historical single-shot path, unchanged. With a
+            // controller, a `401` carrying a `WWW-Authenticate` we can answer
+            // re-issues the request on the SAME connection with the computed
+            // `Authorization` header, capped at `MAX_AUTH_ATTEMPTS` retries
+            // (curl's `Curl_auth_allowed` round budget) so a persistently
+            // challenging server cannot loop forever.
+            const MAX_AUTH_ATTEMPTS: u32 = 10;
+            let mut attempt: u32 = 0;
+            let result = loop {
+                // The request body is re-sent on each auth attempt (curl rewinds
+                // and resends), so clone the buffered body per iteration; the
+                // GET/HEAD case clones `RequestBody::None` (free).
+                let plan = {
+                    let inputs = make_inputs(
+                        data,
+                        url,
+                        &conn,
+                        &custom_headers,
+                        &host_ace,
+                        port,
+                        is_https,
+                        false,
+                        body.clone(),
+                        http_minor,
+                        &hop,
+                    );
+                    h1::build_request(&inputs)?
+                };
+                // CURLINFO_HEADER_OUT: when verbose, emit the fully serialized
+                // request head (request line + header block + terminating CRLF)
+                // as a single event before the exchange begins. curl's
+                // `tool_debug_cb` splits it on newlines and renders each line with
+                // the `> ` prefix (`Curl_debug(…, CURLINFO_HEADER_OUT, …)`).
+                if verbose {
+                    hop_sink.debug(crate::transfer::DebugInfoType::HeaderOut, &plan.head);
+                }
+                // On a retry (`attempt > 0`) the connection is being reused, which
+                // forbids the HTTP/0.9 no-status-line fallback (curl's reused-conn
+                // rule). The first attempt on a fresh connection passes `false`.
+                let mut exchange = h1::H1Exchange::new(
+                    h1::ConnByteStream::new(&mut conn),
+                    plan,
+                    data.set.http09_allowed,
+                    attempt > 0,
+                );
+                let result = drive_one(data, &mut exchange, &mut hop_sink, op_start).await;
+                let keepalive = exchange.keepalive();
+                drop(exchange);
+                h1::apply_connection_reuse(&mut conn, keepalive);
+
+                // A transport/protocol error ends the hop immediately.
+                if result.is_err() {
+                    break result;
+                }
+
+                // Reactive auth: on a `401` over a still-reusable connection, ask
+                // the controller for the next `Authorization` value and retry on
+                // the same connection. Any other status (or no controller, or a
+                // closed connection, or the attempt budget exhausted) is terminal.
+                let Some(controller) = auth_controller.as_mut() else {
+                    break result;
+                };
+                attempt += 1;
+                if !keepalive || hop_sink.status != 401 || attempt >= MAX_AUTH_ATTEMPTS {
+                    break result;
+                }
+                // Compute the verb and origin-form target the Digest response
+                // hashes over — identical to the bytes the h1 builder writes.
+                let method = h1::resolve_http_method(
+                    hop.method,
+                    hop.no_body,
+                    data.set.str(StrId::Customrequest),
+                    false,
+                    hop.method == HttpReq::Put,
+                )?;
+                let target = h1::request_target(
                     url,
                     &conn,
-                    &custom_headers,
-                    &host_ace,
-                    port,
-                    is_https,
+                    hop.request_target_override.as_deref(),
                     false,
-                    body,
-                    http_minor,
-                    &hop,
-                );
-                h1::build_request(&inputs)?
+                    data.set.prefer_ascii,
+                )?;
+                match controller.on_challenge(
+                    &hop_sink.www_authenticate,
+                    method.method.as_str(),
+                    &target,
+                ) {
+                    Some(next) => {
+                        // Re-issue on the same connection with the new credential;
+                        // drop the buffered probe body and reset the per-attempt
+                        // observable state.
+                        hop.authorization = Some(next);
+                        hop_sink.discard_auth_body();
+                        hop_sink.reset_for_retry();
+                    }
+                    // No acceptable scheme / rejected credentials / scheme done:
+                    // the current response is the real answer.
+                    None => break result,
+                }
             };
-            // CURLINFO_HEADER_OUT: when verbose, emit the fully serialized
-            // request head (request line + header block + terminating CRLF) as a
-            // single event before the exchange begins. curl's `tool_debug_cb`
-            // splits it on newlines and renders each line with the `> ` prefix
-            // (`Curl_debug(…, CURLINFO_HEADER_OUT, …)` in `Curl_http`).
-            if verbose {
-                hop_sink.debug(crate::transfer::DebugInfoType::HeaderOut, &plan.head);
-            }
-            let mut exchange = h1::H1Exchange::new(
-                h1::ConnByteStream::new(&mut conn),
-                plan,
-                data.set.http09_allowed,
-                false,
-            );
-            let result = drive_one(data, &mut exchange, &mut hop_sink, op_start).await;
-            let keepalive = exchange.keepalive();
-            drop(exchange);
-            h1::apply_connection_reuse(&mut conn, keepalive);
+            // Deliver the body of a terminal `401`/`407` (an unanswerable
+            // challenge's error page) that was buffered during negotiation.
+            hop_sink.flush_auth_body();
             result
         }
         HttpVersion::H2 => {
@@ -2178,7 +2663,13 @@ async fn perform_http3(
     let tls = std::sync::Arc::try_unwrap(tls_arc).unwrap_or_else(|arc| (*arc).clone());
 
     // Connect, send the request, push any body, then drive the response.
-    let session = Http3Session::connect(addr, host, tls).await?;
+    // `--pinnedpubkey` (`CURLOPT_PINNEDPUBLICKEY`) is enforced post-handshake
+    // over HTTP/3 exactly as it is for HTTP/1.1 and HTTP/2, so a wrong pin
+    // aborts the connection (`CURLE_SSL_PINNEDPUBKEYNOTMATCH`) on every wire
+    // version — including under `--insecure`, which curl enforces independently
+    // of CA validation.
+    let h3_pin = data.set.str(StrId::SslPinnedPublicKey);
+    let session = Http3Session::connect(addr, host, tls, h3_pin).await?;
     let mut exchange = session.send_request(req).await?;
 
     // Push the request body (POST or PUT) on the QUIC send stream. Decoupled

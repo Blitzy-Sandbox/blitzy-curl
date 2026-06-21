@@ -217,6 +217,66 @@ jobs:
           fi
           echo 'OK: 100 curl_* symbols match lib/libcurl.def exactly'
 
+      - name: 'no C-TLS linkage (precise nm + NEEDED gate)'
+        # Gate (AAP 0.8.2): TLS is rustls *exclusively* — the produced
+        # libcurl-compatible library MUST NOT link, statically or dynamically,
+        # any C TLS protocol stack (OpenSSL/BoringSSL/LibreSSL, GnuTLS, mbedTLS,
+        # wolfSSL, Schannel, Apple Secure Transport), nor a C SSH / HTTP-2/3
+        # stack, nor a system libcurl. Two complementary, *precise* checks:
+        #
+        #   (1) NEEDED check  — catches *dynamic* C-TLS linkage (e.g. an OpenSSL
+        #       build NEEDs libssl.so/libcrypto.so).
+        #   (2) defined-symbol check — catches *static* C-TLS linkage (the C TLS
+        #       API would appear as DEFINED text symbols compiled into the lib).
+        #
+        # PRECISION (fixes QA INFO-1): the naive `nm -D | grep SSL_` substring
+        # match yields a FALSE POSITIVE on the four `OPENSSL_memory_{alloc,free,
+        # get_size,realloc}` hooks, which are WEAK-UNDEFINED (`w`, no address)
+        # allocator overrides emitted by the statically-linked aws-lc-sys — the
+        # sanctioned rustls crypto *primitives* provider, NOT a TLS protocol
+        # stack, imposing no runtime C-TLS dependency. This gate therefore scans
+        # DEFINED symbols only (`--defined-only` + a defined symbol-type filter)
+        # and explicitly excludes the `OPENSSL_memory` substring, so the aws-lc
+        # primitives never trip it while a real C-TLS symbol still fails the run.
+        # This job runs on ubuntu-latest (ELF); uses readelf + nm -D.
+        run: |
+          set -euo pipefail
+          lib="$(find target/release -maxdepth 1 -type f \
+            \( -name 'libcurl_rs_ffi.so' -o -name 'libcurl.so' \) -print -quit)"
+          if [ -z "${lib}" ]; then
+            echo 'ERROR: no produced cdylib found under target/release' >&2
+            exit 1
+          fi
+          echo "inspecting: ${lib}"
+
+          # (1) Dynamic-linkage (DT_NEEDED) gate. Forbid any C TLS/SSH/HTTP-2/3
+          # protocol library and any system libcurl among the NEEDED entries.
+          forbidden='libssl|libcrypto|libgnutls|libmbedtls|libmbedx509|libmbedcrypto|libwolfssl|libssh2?\.|libnghttp2|libngtcp2|libnghttp3|libcurl\.so'
+          needed="$(readelf -d "${lib}" | sed -nE 's/.*\(NEEDED\).*\[(.*)\]/\1/p')"
+          echo "NEEDED:"; echo "${needed}" | sed 's/^/  /'
+          if echo "${needed}" | grep -wE "${forbidden}"; then
+            echo 'ERROR: forbidden C-TLS/SSH/HTTP or system-libcurl NEEDED entry — rustls must be the exclusive TLS backend (AAP 0.8.2)' >&2
+            exit 1
+          fi
+          echo 'OK: no forbidden C-TLS/SSH NEEDED libraries'
+
+          # (2) Static-linkage (defined-symbol) gate. Scan DEFINED dynamic
+          # symbols only and match C TLS protocol-stack API names. The
+          # OPENSSL_memory_* exclusion + defined-type filter prevent the
+          # INFO-1 aws-lc weak-undefined false positive.
+          ctls="$(nm -D --defined-only "${lib}" \
+            | awk '$2 ~ /^[TtDdBbRrVv]$/ { print $2" "$3 }' \
+            | grep -vE '(OPENSSL_memory)' \
+            | grep -E '\b(SSL_|SSL_CTX_|SSLv[0-9]|TLS_method|TLSv1|EVP_[A-Za-z]|BIO_|X509_|PEM_read|PEM_write|d2i_X509|RSA_(new|public|private|sign)|ASN1_|gnutls_|mbedtls_|wolfSSL_|wolfTLS|SecureTransport|sectransp|schannel_)' \
+            || true)"
+          if [ -n "${ctls}" ]; then
+            echo 'ERROR: DEFINED C-TLS protocol symbols exported by the library:' >&2
+            echo "${ctls}" | sed 's/^/  /' >&2
+            echo 'rustls must be the exclusive TLS backend; no C TLS stack may be linked (AAP 0.8.2)' >&2
+            exit 1
+          fi
+          echo 'OK: zero DEFINED C-TLS protocol symbols (aws-lc OPENSSL_memory weak-undef hooks correctly excluded)'
+
   # Gate 7 (AAP 0.8.1): Coverage. Require >=80% line coverage on the protocol
   # engines (curl-rs-lib/src/protocols/) and the transfer engine
   # (curl-rs-lib/src/transfer.rs). Host-agnostic; runs on linux-x86_64.

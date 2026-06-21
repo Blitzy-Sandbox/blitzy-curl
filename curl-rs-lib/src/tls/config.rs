@@ -46,6 +46,7 @@
 // `hostname.rs`).
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Once};
 
@@ -161,9 +162,12 @@ pub struct TlsConfig {
     pub verify_status: bool,
     /// `CURLOPT_CAINFO` — path to a PEM bundle of trusted CA certificates.
     pub ca_file: Option<std::path::PathBuf>,
-    /// `CURLOPT_CAPATH` — directory of hashed CA certificates. Tracked for
-    /// parity; rustls consumes a single bundle, so a directory is not loaded
-    /// here (documented divergence).
+    /// `CURLOPT_CAPATH` — directory of OpenSSL `c_rehash`-hashed CA
+    /// certificates (`<subject-hash>.0`). Loaded as an **additive** trust
+    /// source alongside [`ca_file`](Self::ca_file)/[`ca_info_blob`](Self::ca_info_blob)
+    /// by [`load_capath_into`](Self::load_capath_into); the hashed entries are
+    /// enumerated and every readable PEM certificate is added as a trust anchor
+    /// (symlinks are followed), matching curl's `--capath` semantics.
     pub ca_path: Option<std::path::PathBuf>,
     /// `CURLOPT_CAINFO_BLOB` — in-memory PEM CA bundle. **Overrides**
     /// [`ca_file`](Self::ca_file) when both are set.
@@ -639,32 +643,111 @@ fn webpki_root_store() -> RootCertStore {
 }
 
 impl TlsConfig {
-    /// Builds the custom root store for the explicit-CA verifier path (case 3).
+    /// Builds the custom root store for the explicit-CA verifier path (case 3),
+    /// combining the two additive trust sources curl supports together:
     ///
-    /// `CURLOPT_CAINFO_BLOB` overrides `CURLOPT_CAINFO` when both are set — the
-    /// blob's PEM bytes are used and the file is ignored, matching curl's
-    /// `ssl_cafile = blob ? NULL : cafile`. An unreadable file, an unparseable
-    /// bundle, or a bundle with no certificates yields
-    /// `CURLE_SSL_CACERT_BADFILE`.
+    /// * **`CURLOPT_CAINFO` / `CURLOPT_CAINFO_BLOB`** — a single PEM *bundle*.
+    ///   The blob overrides the file when both are set (curl's
+    ///   `ssl_cafile = blob ? NULL : cafile`). This source is **strict**: when a
+    ///   bundle is configured, an unreadable file, an unparseable bundle, or a
+    ///   bundle containing no certificates yields `CURLE_SSL_CACERT_BADFILE`,
+    ///   preserving the `--cacert <garbage>` → exit 77 contract.
+    /// * **`CURLOPT_CAPATH`** — an OpenSSL `c_rehash`-style *directory* of hashed
+    ///   CA certificates (`<subject-hash>.0`, often symlinks to the real PEM).
+    ///   This source is **additive and lenient** per entry (see
+    ///   [`load_capath_into`](Self::load_capath_into)), exactly as OpenSSL
+    ///   consumes a hashed directory.
+    ///
+    /// curl allows `--cacert` and `--capath` simultaneously, so both sources are
+    /// loaded and merged here (deduplicated by DER so a cert reachable through
+    /// both a file and a hash symlink is added once). The combined store must
+    /// contain at least one anchor; an entirely empty result maps to
+    /// `CURLE_SSL_CACERT_BADFILE` so verification can never silently trust no
+    /// one.
     fn build_explicit_root_store(&self) -> crate::error::Result<RootCertStore> {
-        let pem_bytes: Vec<u8> = if let Some(blob) = &self.ca_info_blob {
-            blob.clone()
-        } else if let Some(path) = &self.ca_file {
-            std::fs::read(path).map_err(|_| CurlError::SslCacertBadfile)?
-        } else {
-            // This method is only invoked when at least one CA source is set.
-            return Err(CurlError::SslCacertBadfile);
-        };
-
-        let certs = parse_pem_certs(&pem_bytes)?;
-        if certs.is_empty() {
-            return Err(CurlError::SslCacertBadfile);
-        }
         let mut roots = RootCertStore::empty();
-        for cert in certs {
-            roots.add(cert).map_err(|_| CurlError::SslCacertBadfile)?;
+        // Deduplicate by raw DER across both sources: a `c_rehash` directory
+        // typically symlinks `<hash>.0 -> ca.crt`, so the same anchor can be
+        // discovered via `--cacert ca.crt` *and* `--capath dir/<hash>.0`.
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+
+        // --- Source A: the PEM bundle (blob overrides file) — STRICT. ---
+        let bundle: Option<Vec<u8>> = if let Some(blob) = &self.ca_info_blob {
+            Some(blob.clone())
+        } else if let Some(path) = &self.ca_file {
+            Some(std::fs::read(path).map_err(|_| CurlError::SslCacertBadfile)?)
+        } else {
+            None
+        };
+        if let Some(pem_bytes) = bundle {
+            let certs = parse_pem_certs(&pem_bytes)?;
+            if certs.is_empty() {
+                return Err(CurlError::SslCacertBadfile);
+            }
+            for cert in certs {
+                if seen.insert(cert.as_ref().to_vec()) {
+                    roots.add(cert).map_err(|_| CurlError::SslCacertBadfile)?;
+                }
+            }
+        }
+
+        // --- Source B: the CApath hashed directory — ADDITIVE / LENIENT. ---
+        if let Some(dir) = &self.ca_path {
+            self.load_capath_into(dir, &mut roots, &mut seen)?;
+        }
+
+        // At least one trust anchor must have survived from either source.
+        if roots.is_empty() {
+            return Err(CurlError::SslCacertBadfile);
         }
         Ok(roots)
+    }
+
+    /// Loads every certificate found in an OpenSSL-style hashed CA directory
+    /// (`CURLOPT_CAPATH` / `--capath`) into `roots`, deduplicating by DER against
+    /// `seen` and returning the number of *new* anchors added.
+    ///
+    /// OpenSSL names entries by subject hash with a numeric suffix
+    /// (`c9fa81df.0`) — usually a symlink to the underlying PEM — and the same
+    /// directory may also hold CRL files (`<hash>.r0`), sub-directories, and
+    /// unrelated files. This loader therefore mirrors OpenSSL's lazy hashed-dir
+    /// consumption: it is **lenient per entry** — a file that is unreadable or is
+    /// not a PEM certificate is silently skipped, never fatal — while an
+    /// unreadable *directory* is a genuine setup error
+    /// (`CURLE_SSL_CACERT_BADFILE`). `std::fs` follows symlinks, so the
+    /// `c_rehash` hash links resolve to their targets transparently.
+    fn load_capath_into(
+        &self,
+        dir: &Path,
+        roots: &mut RootCertStore,
+        seen: &mut HashSet<Vec<u8>>,
+    ) -> crate::error::Result<usize> {
+        let entries = std::fs::read_dir(dir).map_err(|_| CurlError::SslCacertBadfile)?;
+        let mut added = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // `metadata` follows symlinks (the `c_rehash` links point at the real
+            // PEM); only regular files are candidate certificate sources. Skip
+            // sub-directories and dangling links rather than failing.
+            match std::fs::metadata(&path) {
+                Ok(md) if md.is_file() => {}
+                _ => continue,
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            // Lenient parse: keep whatever certificates decode, drop the rest
+            // (CRLs, keys, junk). A non-PEM file simply yields nothing.
+            let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&bytes)
+                .filter_map(Result::ok)
+                .collect();
+            for cert in certs {
+                if seen.insert(cert.as_ref().to_vec()) && roots.add(cert).is_ok() {
+                    added += 1;
+                }
+            }
+        }
+        Ok(added)
     }
 
     /// Builds the default trust store (case 4): the bundled `webpki-roots` plus
@@ -729,8 +812,9 @@ impl TlsConfig {
     /// 1. `!verify_peer` → accept-all [`NoServerVerify`] (the only insecure path).
     /// 2. `native_ca_store` → documented `webpki-roots` fallback (no native-certs
     ///    dependency).
-    /// 3. `ca_info_blob` or `ca_file` → custom [`RootCertStore`] (+ optional CRL),
-    ///    blob overriding file.
+    /// 3. `ca_info_blob` / `ca_file` / `ca_path` → custom [`RootCertStore`]
+    ///    (+ optional CRL): a PEM bundle (blob overriding file) and/or a
+    ///    `c_rehash` directory, merged and deduplicated.
     /// 4. otherwise → bundled `webpki-roots` + `SSL_CERT_FILE` passthrough.
     fn build_verifier(
         &self,
@@ -761,8 +845,10 @@ impl TlsConfig {
             WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
                 .build()
                 .map_err(|_| CurlError::SslCacertBadfile)?
-        } else if self.ca_info_blob.is_some() || self.ca_file.is_some() {
-            // (2d.3) Explicit CA bundle (+ optional CRL); blob overrides file.
+        } else if self.ca_info_blob.is_some() || self.ca_file.is_some() || self.ca_path.is_some() {
+            // (2d.3) Explicit CA trust (+ optional CRL): a PEM bundle
+            // (`--cacert`/blob, blob overriding file) and/or a `c_rehash`
+            // directory (`--capath`), merged and deduplicated.
             let roots = self.build_explicit_root_store()?;
             let crls = self.load_crls()?;
             let builder =

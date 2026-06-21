@@ -553,14 +553,14 @@ where
 
     // Post-handshake pinned-public-key check (`Curl_pin_peer_pubkey`). rustls
     // exposes no pre-handshake hook, so this necessarily runs after the
-    // handshake succeeds: extract the leaf certificate's SubjectPublicKeyInfo
-    // and delegate the comparison to `config::verify_pinned_pubkey`.
+    // handshake succeeds. Delegated to the shared [`verify_leaf_pin`] helper so
+    // the TCP (TLS-over-stream) path here and the QUIC/HTTP-3 path
+    // (`protocols::http::perform_http3`) enforce the pin identically.
     if let Some(pin) = pinned_pubkey {
         let leaf = peer_certificates
             .first()
             .ok_or(CurlError::SslPinnedpubkeynotmatch)?;
-        let spki = extract_spki_der(leaf.as_ref()).ok_or(CurlError::SslPinnedpubkeynotmatch)?;
-        config::verify_pinned_pubkey(pin, &spki)?;
+        verify_leaf_pin(pin, leaf.as_ref())?;
     }
 
     Ok(TlsConnection {
@@ -568,6 +568,26 @@ where
         alpn,
         peer_certificates,
     })
+}
+
+/// Verify a peer **leaf** certificate against a `--pinnedpubkey`
+/// (`CURLOPT_PINNEDPUBLICKEY`) SPKI pin, reproducing curl's
+/// `Curl_pin_peer_pubkey`.
+///
+/// `leaf_der` is the DER encoding of the peer's end-entity certificate;
+/// `pinned` is the `sha256//<base64>` (or file) pin specification. The leaf's
+/// SubjectPublicKeyInfo is extracted and compared (constant-time, inside
+/// [`config::verify_pinned_pubkey`]); a mismatch — or a leaf whose SPKI cannot
+/// be parsed — maps to [`CurlError::SslPinnedpubkeynotmatch`]
+/// (`CURLE_SSL_PINNEDPUBKEYNOTMATCH`, exit 90).
+///
+/// This is exposed at crate scope so every transport that completes a TLS/QUIC
+/// handshake (TCP TLS in [`connect`], QUIC in the HTTP/3 engine) enforces the
+/// pin through one code path, and so the pin is enforced **independently of CA
+/// validation** — curl applies it even under `--insecure`.
+pub(crate) fn verify_leaf_pin(pinned: &str, leaf_der: &[u8]) -> crate::error::Result<()> {
+    let spki = extract_spki_der(leaf_der).ok_or(CurlError::SslPinnedpubkeynotmatch)?;
+    config::verify_pinned_pubkey(pinned, &spki)
 }
 
 // =============================================================================

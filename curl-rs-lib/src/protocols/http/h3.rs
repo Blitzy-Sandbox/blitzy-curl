@@ -66,6 +66,11 @@ use http::{HeaderMap, Method, Request, StatusCode, Uri};
 
 use h3::error::{ConnectionError as H3ConnectionError, StreamError as H3StreamError};
 
+// Needed for the post-handshake `--pinnedpubkey` enforcement: quinn surfaces
+// the negotiated peer certificate chain as `Vec<CertificateDer>` via
+// `Connection::peer_identity()`.
+use rustls::pki_types::CertificateDer;
+
 use crate::conn::{
     BoxFuture, Connection, Curl_conn_get_current_host, Curl_conn_get_remote_addr, FIRSTSOCKET,
     TRNSPRT_QUIC,
@@ -442,11 +447,22 @@ impl Http3Session {
     /// * [`CurlError::QuicConnectError`] — the QUIC handshake failed.
     /// * [`CurlError::PeerFailedVerification`] — the server certificate did not
     ///   verify.
+    /// * [`CurlError::SslPinnedpubkeynotmatch`] — a `--pinnedpubkey`
+    ///   (`CURLOPT_PINNEDPUBLICKEY`) pin was supplied and the peer leaf
+    ///   certificate's SPKI did not match it.
     /// * [`CurlError::Http3`] — the HTTP/3 control stream could not be set up.
+    ///
+    /// `pinned_pubkey` is the optional `sha256//<base64>` SPKI pin; when set it
+    /// is enforced post-handshake against the QUIC peer's leaf certificate via
+    /// the shared [`crate::tls::verify_leaf_pin`] helper — the same enforcement
+    /// the TCP TLS path applies — so HTTP/3 is not a fail-open pinning bypass.
+    /// curl enforces the pin independently of CA validation, so this runs even
+    /// under `--insecure`.
     pub async fn connect(
         addr: SocketAddr,
         server_name: &str,
         tls: rustls::ClientConfig,
+        pinned_pubkey: Option<&str>,
     ) -> Result<Self> {
         let bind = wildcard_bind_addr(&addr);
         let mut endpoint =
@@ -459,6 +475,21 @@ impl Http3Session {
         let quinn_conn = connecting
             .await
             .map_err(|e| map_connection_error(&e, true))?;
+
+        // Post-handshake `--pinnedpubkey` enforcement (`Curl_pin_peer_pubkey`).
+        // quinn surfaces the negotiated peer certificate chain via
+        // `peer_identity()`, which (for the rustls QUIC backend) downcasts to the
+        // peer `CertificateDer` vector. The leaf is fed to the shared pin
+        // verifier; a missing/unparseable identity when a pin was requested is a
+        // verification failure (fail-closed), never a silent accept.
+        if let Some(pin) = pinned_pubkey {
+            let leaf_der: Vec<u8> = quinn_conn
+                .peer_identity()
+                .and_then(|id| id.downcast::<Vec<CertificateDer<'static>>>().ok())
+                .and_then(|certs| certs.first().map(|c| c.as_ref().to_vec()))
+                .ok_or(CurlError::SslPinnedpubkeynotmatch)?;
+            crate::tls::verify_leaf_pin(pin, &leaf_der)?;
+        }
 
         let h3_conn = h3_quinn::Connection::new(quinn_conn);
         let (driver, send_request): (H3DriverConnection, H3SendRequest) = h3::client::new(h3_conn)
@@ -1144,7 +1175,7 @@ mod tests {
             .expect("at least one address");
 
         let tls = default_rustls_client_config().expect("rustls config");
-        let session = Http3Session::connect(addr, &host, tls)
+        let session = Http3Session::connect(addr, &host, tls, None)
             .await
             .expect("h3 connect");
 
