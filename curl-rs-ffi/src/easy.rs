@@ -472,6 +472,74 @@ impl core::transfer::ReadCallback for CReadBridge {
     }
 }
 
+/// Builds the [`CWriteBridge`] / [`CReadBridge`] pair for a transfer the multi
+/// handle drives on its own runtime, bridging the consumer's registered C
+/// callbacks (`CURLOPT_WRITEFUNCTION` / `HEADERFUNCTION` / `READFUNCTION` and
+/// their userdata) to the core's sink/source seam.
+///
+/// `curl_easy_perform` builds the bridges inline on the calling thread, but a
+/// multi-driven transfer runs inside a task spawned on the multi handle's
+/// multi-thread runtime ([`curl_multi_perform`](crate::multi::curl_multi_perform)),
+/// so the bridge factory must be `Send + Sync` and own no borrow of the handle.
+/// The callback function/userdata are stored as integer addresses (`usize`) —
+/// the same `Send` representation the bridges use — and rebuilt into fresh
+/// bridges per transfer in [`make`](core::transfer::MultiIoProvider::make). This
+/// is what makes a multi-driven transfer deliver body bytes to the user's write
+/// callback (and honor its abort return) and pull upload bytes from the read
+/// callback, instead of falling back to stdout/stdin (QA F11-PERF Issue #6).
+///
+/// The FFI's [`curl_multi_add_handle`](crate::multi::curl_multi_add_handle)
+/// registers one of these on the easy handle (via
+/// [`core::Easy::set_multi_io_provider`]) at add time, snapshotting the
+/// callbacks configured up to that point — the curl-documented order is
+/// `setopt` then `add_handle` then `perform`.
+pub(crate) struct CBridgeProvider {
+    write_fn: usize,
+    write_data: usize,
+    header_fn: usize,
+    header_data: usize,
+    read_fn: usize,
+    read_data: usize,
+}
+
+impl CBridgeProvider {
+    /// Snapshot the easy handle's stored C-callback addresses (the same fields
+    /// [`curl_easy_perform`] copies into its inline bridges). Reads only the
+    /// `usize` newtypes in `data->set`, so the result borrows nothing.
+    pub(crate) fn from_easy(easy: &core::Easy) -> Self {
+        Self {
+            write_fn: easy.set.fwrite_func.0,
+            write_data: easy.set.out.0,
+            header_fn: easy.set.fwrite_header.0,
+            header_data: easy.set.writeheader.0,
+            read_fn: easy.set.fread_func_set.0,
+            read_data: easy.set.in_set.0,
+        }
+    }
+}
+
+impl core::transfer::MultiIoProvider for CBridgeProvider {
+    fn make(
+        &self,
+    ) -> (
+        Box<dyn core::transfer::WriteCallbacks>,
+        Box<dyn core::transfer::ReadCallback>,
+    ) {
+        (
+            Box::new(CWriteBridge {
+                write_fn: self.write_fn,
+                write_data: self.write_data,
+                header_fn: self.header_fn,
+                header_data: self.header_data,
+            }),
+            Box::new(CReadBridge {
+                read_fn: self.read_fn,
+                read_data: self.read_data,
+            }),
+        )
+    }
+}
+
 /// Perform a blocking transfer (`curl_easy_perform`, `include/curl/easy.h`).
 ///
 /// This is the canonical sync-over-async bridge (AAP §0.4.4): it drives the

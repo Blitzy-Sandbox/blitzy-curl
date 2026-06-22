@@ -746,6 +746,10 @@ fn body_has_bytes(body: &RequestBody) -> bool {
     match body {
         RequestBody::None => false,
         RequestBody::Sized(b) | RequestBody::Chunked(b) => !b.is_empty(),
+        // The h2 path materializes a streamed body to a buffered one before it
+        // reaches the codec (see `materialize_streaming_body`), so this is not
+        // observed at runtime; a known-zero size carries no bytes.
+        RequestBody::Streaming { size, .. } => *size != Some(0),
     }
 }
 
@@ -853,6 +857,9 @@ impl H2Exchange {
         let bytes = match core::mem::take(&mut self.body) {
             RequestBody::None => Vec::new(),
             RequestBody::Sized(b) | RequestBody::Chunked(b) => b,
+            // A streamed body is materialized to a buffered body before the h2
+            // codec runs (`materialize_streaming_body`); unreachable here.
+            RequestBody::Streaming { .. } => Vec::new(),
         };
         let mut off = 0;
         while off < bytes.len() {

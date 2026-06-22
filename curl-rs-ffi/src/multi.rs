@@ -567,6 +567,20 @@ pub unsafe extern "C" fn curl_multi_add_handle(multi: *mut CURLM, easy: *mut CUR
     // passed to `CURLOPT_CURLU` stays valid until the transfer is performed.
     unsafe { crate::easy::resolve_curlu(&mut real) };
 
+    // Register a Send + Sync bridge factory so the multi-driven transfer routes
+    // body/header bytes to this handle's `CURLOPT_WRITEFUNCTION`/`HEADERFUNCTION`
+    // and pulls upload bytes from `CURLOPT_READFUNCTION`, exactly as the easy
+    // interface does in [`crate::easy::curl_easy_perform`]. Without this, a
+    // multi-driven transfer falls back to the core's default stdout/stdin sink —
+    // the user's write callback never fires and its abort (return 0) is ignored
+    // (QA F11-PERF Issue #6). The provider snapshots the callbacks configured up
+    // to this add (curl's documented `setopt` -> `add_handle` -> `perform`
+    // order); it stores only `usize` addresses, so it borrows nothing from
+    // `real`. Build it into a local first because the borrow of `real` for
+    // `from_easy` must end before the `&mut real` method receiver is taken.
+    let provider = crate::easy::CBridgeProvider::from_easy(&real);
+    real.set_multi_io_provider(Arc::new(provider));
+
     let shared = shared_easy(real);
 
     // Hand a clone to the core; it takes ownership of its clone (enlisting it in
@@ -1727,15 +1741,19 @@ mod tests {
         let m = curl_multi_init();
         // Installing then clearing the socket/timer callbacks (NULL arg = clear)
         // must both succeed.
-        // SAFETY: `m` live; NULL function pointer clears the callback.
+        // SAFETY: `m` live; NULL function pointer clears the callback. The option
+        // ids are the public `CURLMOPT_*` integers (`CURLOPTTYPE_<kind> +
+        // ordinal`), not bare ordinals — passing the bare ordinal would be
+        // rejected as CURLM_UNKNOWN_OPTION (QA F11-PERF Issue #2 L1).
         unsafe {
-            // CURLMOPT_SOCKETFUNCTION (1) cleared.
-            assert_eq!(curl_multi_setopt(m, 1, 0usize), CURLMcode::CURLM_OK);
-            // CURLMOPT_TIMERFUNCTION (4) cleared.
-            assert_eq!(curl_multi_setopt(m, 4, 0usize), CURLMcode::CURLM_OK);
-            // CURLMOPT_SOCKETDATA (2) / CURLMOPT_TIMERDATA (5).
-            assert_eq!(curl_multi_setopt(m, 2, 0usize), CURLMcode::CURLM_OK);
-            assert_eq!(curl_multi_setopt(m, 5, 0usize), CURLMcode::CURLM_OK);
+            // CURLMOPT_SOCKETFUNCTION (FUNCTIONPOINT + 1 = 20001) cleared.
+            assert_eq!(curl_multi_setopt(m, 20001, 0usize), CURLMcode::CURLM_OK);
+            // CURLMOPT_TIMERFUNCTION (FUNCTIONPOINT + 4 = 20004) cleared.
+            assert_eq!(curl_multi_setopt(m, 20004, 0usize), CURLMcode::CURLM_OK);
+            // CURLMOPT_SOCKETDATA (OBJECTPOINT + 2 = 10002) / CURLMOPT_TIMERDATA
+            // (OBJECTPOINT + 5 = 10005).
+            assert_eq!(curl_multi_setopt(m, 10002, 0usize), CURLMcode::CURLM_OK);
+            assert_eq!(curl_multi_setopt(m, 10005, 0usize), CURLMcode::CURLM_OK);
             assert_eq!(curl_multi_cleanup(m), CURLMcode::CURLM_OK);
         }
     }

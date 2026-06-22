@@ -208,6 +208,18 @@ pub trait PoolConn: ConnShutdown {
     /// ConnShutdown>`, **not** a trait up-cast), so it compiles at the project's
     /// MSRV where `dyn`-to-`dyn` up-casting is not yet stable.
     fn into_shutdown(self: Box<Self>) -> Box<dyn ConnShutdown>;
+
+    /// Convert this owned pooled connection into a `Box<dyn Any>` so the caller
+    /// can downcast it back to the concrete connection type for **by-value
+    /// checkout** ([`ConnectionPool::checkout`]).
+    ///
+    /// The cache stores connections type-erased as `Box<dyn PoolConn>`; reuse
+    /// requires recovering the concrete `Connection` to drive a fresh transfer
+    /// over it. As with [`into_shutdown`](PoolConn::into_shutdown), the
+    /// `self: Box<Self>` receiver keeps the method object-safe and the concrete
+    /// impl simply returns `self` (an unsizing coercion to `Box<dyn Any>`, not a
+    /// `dyn`-to-`dyn` up-cast), so it compiles at the project's MSRV.
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any>;
 }
 
 /// `true` when the connection is carrying at least one transfer — the C
@@ -912,6 +924,86 @@ impl ConnectionPool {
         result
     }
 
+    /// Check out a reusable idle connection for `destination`, removing it from
+    /// the pool and returning it **by value** for a fresh transfer.
+    ///
+    /// This is the production reuse entry point (curl's `Curl_cpool_get_conn` /
+    /// the reuse half of `ConnectionExists`): the cache locates the bundle whose
+    /// key equals `destination` and returns the first connection that is
+    /// reusable — not currently carrying a transfer ([`conn_in_use`] is false),
+    /// not marked to close ([`PoolConn::marked_close`]), not flagged no-reuse
+    /// ([`PoolConn::no_reuse`]) — and for which the caller's `matcher` predicate
+    /// (curl's `Curl_cpool_conn_match_cb`, comparing option-level reuse
+    /// eligibility) returns `true`. The match is removed via [`remove_conn`]
+    /// (decrementing `num_conn`, dropping an emptied bundle) and handed back as a
+    /// `Box<dyn PoolConn>` the caller downcasts via [`PoolConn::into_any`].
+    /// Returns `None` when no eligible connection exists.
+    ///
+    /// Runs under the caller's [`Mutex`] guard, exactly like [`find`](Self::find).
+    pub fn checkout(
+        &mut self,
+        destination: &str,
+        mut matcher: impl FnMut(&dyn PoolConn) -> bool,
+    ) -> Option<Box<dyn PoolConn>> {
+        let mut found: Option<i64> = None;
+        if let Some(bundle) = self.find_bundle(destination) {
+            for conn in &bundle.conns {
+                if conn_in_use(conn.as_ref()) || conn.marked_close() || conn.no_reuse() {
+                    continue;
+                }
+                if matcher(conn.as_ref()) {
+                    found = Some(conn.connection_id());
+                    break;
+                }
+            }
+        }
+        self.remove_conn(found?)
+    }
+
+    /// Return a keep-alive-eligible connection to the pool after a transfer
+    /// completes, so the next transfer to the same `destination` can reuse it
+    /// (curl's `Curl_cpool_add` + `Curl_cpool_conn_now_idle`).
+    ///
+    /// The connection is added under its own `destination` key (assigning its
+    /// stable id via [`add`](Self::add)), then [`conn_now_idle`](Self::conn_now_idle)
+    /// stamps its `lastused` and enforces the idle ceiling: with `maxconnects`
+    /// the explicit `CURLOPT_MAXCONNECTS` cap, the oldest idle connection is
+    /// evicted (queued for shutdown, drainable via [`take_discards`](Self::take_discards))
+    /// when the pool would exceed it. `running` is passed as `0` here because the
+    /// synchronous easy/CLI reuse path has no concurrently running transfers to
+    /// derive the `running * 4` default from; an explicit `maxconnects` (curl's
+    /// default 5, propagated from the handle) governs the cap.
+    pub fn checkin(&mut self, conn: Box<dyn PoolConn>, maxconnects: u32, now: CurlTime) {
+        // Preserve an already-assigned stable id: curl assigns `connection_id`
+        // ONCE, when the connection is first cached, and reuse keeps it (the
+        // "Reusing existing" path never re-ids). A connection returning to the
+        // pool after a transfer (id >= 0) is re-inserted without reassignment; a
+        // never-pooled connection (id < 0) is given the next id by `add`.
+        let existing = conn.connection_id();
+        let id = if existing >= 0 {
+            self.insert_keep_id(conn);
+            existing
+        } else {
+            // `add` assigns `self.next_connection_id` then post-increments, so
+            // the id just assigned is the pre-increment value.
+            let new_id = self.next_connection_id;
+            let _ = self.add(conn);
+            new_id
+        };
+        self.conn_now_idle(id, maxconnects, 0, now);
+    }
+
+    /// Re-insert a connection that already carries a pool-assigned id (a reused
+    /// connection being checked back in) WITHOUT reassigning it, preserving
+    /// curl's "assign `connection_id` once" semantics. This is the id-preserving
+    /// counterpart of [`add`](Self::add): same bundle insert and `num_conn`
+    /// increment, but no id mutation.
+    fn insert_keep_id(&mut self, conn: Box<dyn PoolConn>) {
+        let dest = conn.destination().to_string();
+        self.add_bundle(&dest).add(conn);
+        self.num_conn += 1;
+    }
+
     /// Terminate a connection: remove it from the pool and queue it for graceful
     /// shutdown (the C `Curl_conn_terminate`, L635-685).
     ///
@@ -1320,6 +1412,9 @@ mod tests {
                 .upkeep_calls += 1;
         }
         fn into_shutdown(self: Box<Self>) -> Box<dyn ConnShutdown> {
+            self
+        }
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
             self
         }
     }

@@ -1749,4 +1749,51 @@ impl PoolConn for Connection {
         // the project MSRV.
         self
     }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        // Unsizing coercion `Box<Connection> -> Box<dyn Any>`; lets
+        // [`pool_checkout`] recover the concrete `Connection` for by-value reuse.
+        self
+    }
+}
+
+/// Check out a reusable idle [`Connection`] for `key` from the shared pool,
+/// returning it **by value** for a fresh transfer, or `None` if the pool holds
+/// no eligible connection.
+///
+/// This is the production driver of connection reuse (the QA F11-PERF Issue 3
+/// fix). It runs [`cache::ConnectionPool::checkout`] under the pool lock and
+/// downcasts the type-erased `Box<dyn PoolConn>` back to the concrete
+/// `Connection` via [`cache::PoolConn::into_any`]. `key` is the connection's
+/// `destination` (the scheme-aware reuse key the HTTP connect path stores). The
+/// `|_| true` matcher accepts any connection in the keyed bundle: the key
+/// already encodes scheme + dial target + remote target, and per-request
+/// headers/credentials never bind to a kept-alive HTTP/1.x socket, so any
+/// connection under the same key is reuse-eligible. The caller is responsible
+/// for the final liveness probe ([`Curl_conn_is_alive`]) before driving I/O.
+pub fn pool_checkout(pool: &cache::SharedPool, key: &str) -> Option<Connection> {
+    let boxed = cache::do_locked(pool, |p| p.checkout(key, |_| true))?;
+    boxed
+        .into_any()
+        .downcast::<Connection>()
+        .ok()
+        .map(|b| *b)
+}
+
+/// Return a keep-alive-eligible [`Connection`] to the shared pool after a
+/// transfer completes, so a subsequent transfer to the same destination reuses
+/// it (the QA F11-PERF Issue 3 fix, check-in half).
+///
+/// Runs [`cache::ConnectionPool::checkin`] under the pool lock with the handle's
+/// `CURLOPT_MAXCONNECTS` cap, then drains and drops any connections the idle
+/// ceiling evicted: dropping a [`cache::DiscardedConn`] runs the connection's
+/// `Drop`, closing its socket promptly (the synchronous easy/CLI reuse path has
+/// no asynchronous shutdown registry to hand them to).
+pub fn pool_checkin(pool: &cache::SharedPool, conn: Connection, maxconnects: u32) {
+    let now = timeval::curlx_now();
+    cache::do_locked(pool, |p| {
+        p.checkin(Box::new(conn), maxconnects, now);
+        // Drop evicted connections (close their sockets) — see doc above.
+        let _evicted = p.take_discards();
+    });
 }

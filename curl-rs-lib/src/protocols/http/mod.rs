@@ -109,17 +109,30 @@ pub mod h3;
 // ---------------------------------------------------------------------------
 
 use crate::conn::{
-    BoxFuture, Connection, Curl_conn_get_alpn_negotiated, Curl_conn_get_ip_info,
-    Curl_conn_get_remote_addr, Curl_conn_is_alive,
+    BoxFuture, Connection, Curl_conn_cf_adjust_pollset, Curl_conn_get_alpn_negotiated,
+    Curl_conn_get_first_socket, Curl_conn_get_ip_info, Curl_conn_get_remote_addr, Curl_conn_is_alive,
 };
 use crate::easy::Easy;
 use crate::error::Result;
+// `CURL_POLL_*` socket-interest flags, used by [`report_socket_to_observer`] to
+// translate a connection's [`Pollset`] (read/write interest) into the
+// `CURL_POLL_IN`/`OUT`/`INOUT`/`NONE` value an event-loop consumer expects from
+// `CURLMOPT_SOCKETFUNCTION`. `CURL_POLL_REMOVE` is emitted by the multi handle
+// on transfer completion, not here.
+use crate::multi::{CURL_POLL_IN, CURL_POLL_INOUT, CURL_POLL_NONE, CURL_POLL_OUT};
 // `CurlError` is used by the version selector (to reject an explicit
 // `--http3`/`--http3-only` with `CURLE_NOT_BUILT_IN` when HTTP/3 is compiled
 // out) and by the transfer driver [`perform_http`] (URL/scheme rejection,
 // resolve/connect failures). It is therefore imported unconditionally.
 use crate::error::CurlError;
 use crate::protocols::{Protocol, ProtocolTransfer, Scheme, TransferDirection};
+// `CURLOPT_MAX_RECV_SPEED_LARGE` / `CURLOPT_MAX_SEND_SPEED_LARGE` (the CLI's
+// `--limit-rate`) are enforced by constructing a [`RateLimit`] from the stored
+// caps and threading it into the transfer driver. The receive cap is applied in
+// [`crate::transfer::drive_transfer`]'s response loop; the send cap is applied
+// in the streaming request-body send path. `Direction` itself is only consumed
+// inside `drive_transfer`, so only the constructor type is imported here.
+use crate::ratelimit::RateLimit;
 // ALPN wire-byte constants, compared against the negotiated protocol so this
 // module and `crate::tls` never drift. `h3` is selected by transport (QUIC),
 // not by TLS-ALPN, so `ALPN_H3` is intentionally not used here; `http/1.1`
@@ -1370,7 +1383,7 @@ mod auth_engine {
     /// final scheme can then only be chosen after the server's `401` advertises
     /// what it supports. A single `CURLAUTH_BASIC`/`CURLAUTH_BEARER` mask is
     /// challenge-free and handled by [`preemptive_value`].
-    fn needs_reactive(want: u32) -> bool {
+    pub(super) fn needs_reactive(want: u32) -> bool {
         const REACTIVE: u32 = CURLAUTH_DIGEST | CURLAUTH_NTLM | CURLAUTH_NEGOTIATE;
         let scheme_bits = want & (CURLAUTH_BASIC | CURLAUTH_BEARER | REACTIVE);
         (want & REACTIVE) != 0 || scheme_bits.count_ones() > 1
@@ -1880,7 +1893,8 @@ pub(crate) async fn perform_http(
     if matches!(httpwant, CURL_HTTP_VERSION_3 | CURL_HTTP_VERSION_3ONLY) {
         let (_scheme, _is_https, host, port) = http_url_parts(&url)?;
         let hop = HopInputs::single_shot(data);
-        let body = build_request_body(data, source)?;
+        // HTTP/3 has no incremental upload path; build the buffered body.
+        let body = build_request_body(data, source, false)?;
         return perform_http3(data, &url, &host, port, ipver, &hop, body, sink, verbose).await;
     }
     #[cfg(not(feature = "http3"))]
@@ -1892,7 +1906,7 @@ pub(crate) async fn perform_http(
     // (3) Buffer the request body ONCE up front. It is cloned into each hop so
     //     a method-preserving redirect (307/308) can re-send it; the driver only
     //     reads the response, so `source` is consumed here exactly once.
-    let base_body = build_request_body(data, source)?;
+    let base_body = build_request_body(data, source, true)?;
 
     // Redirect orchestration state. `-L`/`--location` is the only switch that
     // enables following (`http_follow_mode != 0`); without it the loop runs the
@@ -2024,7 +2038,20 @@ pub(crate) async fn perform_http(
             request_target_override: None,
         };
 
-        let hop = match perform_http_hop(data, &url, hop_inputs, body, follow_enabled, sink).await
+        // Thread the upload source through so a streamed body is pulled
+        // incrementally by the codec. A reborrow per iteration keeps `source`
+        // available; only a single-pass (streamed) hop actually consumes it, and
+        // the streaming gate guarantees the redirect loop runs a single hop.
+        let hop = match perform_http_hop(
+            data,
+            &url,
+            hop_inputs,
+            body,
+            follow_enabled,
+            sink,
+            Some(&mut *source),
+        )
+        .await
         {
             Ok(hop) => hop,
             Err(err) => break Err(err),
@@ -2172,6 +2199,59 @@ async fn http_connect_hop(
             (h, p, rh, p)
         }
     };
+
+    // ---- Connection reuse: check out an idle keep-alive connection (Issue 3) ---
+    // The scheme-aware reuse key is also stored as the connection's `destination`
+    // (the pool bundle key), so check-in keys identically. A direct vs a proxied
+    // route (`dial` != `remote`) and `http` vs `https` never share a connection.
+    let reuse_key = format!(
+        "{}|{}:{}|{}:{}",
+        if is_https { "https" } else { "http" },
+        dial_host,
+        dial_port,
+        remote_host,
+        remote_port
+    );
+    // `CURLOPT_FRESH_CONNECT` forces a new connection; `CURLOPT_FORBID_REUSE`
+    // forbids reuse in both directions. Otherwise consult the pool first.
+    if !data.set.reuse_fresh && !data.set.reuse_forbid {
+        let pool = data.conn_pool_handle();
+        if let Some(mut reused) = crate::conn::pool_checkout(&pool, &reuse_key) {
+            // Final liveness probe (curl's `Curl_conn_is_alive`): reuse only a
+            // connection that is still open AND carries no unexpected pending
+            // bytes — a server FIN / TLS close-notify / stray data makes a
+            // supposedly-idle keep-alive socket unsafe to reuse.
+            let (alive, pending) = Curl_conn_is_alive(&mut reused);
+            if alive && !pending {
+                // Reuse milestones: this hop performed no DNS lookup or TCP/TLS
+                // connect, so name-lookup and connect times collapse to "now".
+                let reuse_us =
+                    Instant::now().saturating_duration_since(op_start).as_micros() as i64;
+                data.info.namelookup_time_us = reuse_us;
+                data.info.connect_time_us = reuse_us;
+                if is_https {
+                    data.info.appconnect_time_us = reuse_us;
+                }
+                // `-v`: match curl's exact reuse trace (lib/url.c L3540,
+                // `infof "Reusing existing %s: connection%s with host %s"` where
+                // `%s` is the lowercase scheme name `conn->given->name`). curl
+                // omits the `* Trying`/`* Connected to` lines on reuse. The
+                // `(upgraded to SSL)` middle `%s` is empty here: the reuse key
+                // matches scheme, so a reused connection's TLS state already
+                // matches the request (no plaintext→SSL upgrade case).
+                if verbose {
+                    let scheme_name = if is_https { "https" } else { "http" };
+                    let line =
+                        format!("Reusing existing {scheme_name}: connection with host {host}\n");
+                    sink.debug(crate::transfer::DebugInfoType::Text, line.as_bytes());
+                }
+                return Ok(reused);
+            }
+            // Dead or unexpected pending data: `reused` is dropped here (closing
+            // its socket); fall through to establish a fresh connection.
+        }
+    }
+
     let addrs = resolve_addrs(data, &dial_host, dial_port, ipver, verbose).await?;
     // CURLINFO_NAMELOOKUP_TIME milestone: name resolution for this hop is done.
     let t_resolved = Instant::now();
@@ -2180,8 +2260,11 @@ async fn http_connect_hop(
     //     assembles the chain in curl's canonical order:
     //     eyeballs → socks → ssl_proxy → http_proxy(CONNECT) → ssl(target).
     let desc = http_scheme_descriptor(is_https);
-    let mut conn = Connection::new(format!("{dial_host}:{dial_port}"), TRNSPRT_TCP, desc)
-        .with_verbose(verbose);
+    // The connection's `destination` is the scheme-aware reuse key (the pool
+    // bundle key), NOT a bare host:port: the actual dial target comes from the
+    // resolved `addrs`/eyeballs and `set_remote`, while `destination` exists
+    // solely to key connection reuse (check-in uses `conn.destination()`).
+    let mut conn = Connection::new(reuse_key.clone(), TRNSPRT_TCP, desc).with_verbose(verbose);
     conn.set_remote(remote_host, remote_port);
 
     let ssl_mode = if is_https {
@@ -2387,6 +2470,41 @@ async fn http_connect_hop(
     Ok(conn)
 }
 
+/// Report this hop's connected socket and its current poll interest to the easy
+/// handle's [`crate::transfer::SocketObserver`], if one is installed.
+///
+/// This is the **production driver of `CURLMOPT_SOCKETFUNCTION`**. The async
+/// core owns the real I/O on Tokio's reactor, but a libevent-style event-loop
+/// consumer driving `curl_multi_socket_action` still needs to learn *which* fd
+/// is in play and in *which* direction — exactly the contract curl's
+/// `lib/multi_ev.c` upholds. The multi handle installs a per-task observer in
+/// `spawn_pending`; here we translate the connection's [`Pollset`]
+/// (`want_read`/`want_write`) into the matching `CURL_POLL_*` value and report
+/// it. The owning multi diffs this against the last reported interest and fires
+/// the C socket callback only on a real change; `CURL_POLL_REMOVE` is emitted by
+/// the multi when the transfer completes (it owns the fd map), not here.
+///
+/// A no-op when no observer is installed (the easy/CLI single-transfer path) or
+/// when the chain has no socket yet (`fd < 0`), so it is safe to call after
+/// every (re)connect.
+fn report_socket_to_observer(data: &Easy, conn: &Connection) {
+    let Some(observer) = data.socket_observer() else {
+        return;
+    };
+    let fd = Curl_conn_get_first_socket(conn);
+    if fd < 0 {
+        return;
+    }
+    let ps = Curl_conn_cf_adjust_pollset(conn, FIRSTSOCKET);
+    let what = match (ps.want_read, ps.want_write) {
+        (true, true) => CURL_POLL_INOUT,
+        (true, false) => CURL_POLL_IN,
+        (false, true) => CURL_POLL_OUT,
+        (false, false) => CURL_POLL_NONE,
+    };
+    observer.on_socket(fd, what);
+}
+
 /// Execute a single HTTP request/response hop and report the captured outcome.
 ///
 /// This is the historical single-shot engine (connect → build → drive), lifted
@@ -2413,6 +2531,11 @@ async fn perform_http_hop(
     body: h1::RequestBody,
     follow_enabled: bool,
     sink: &mut dyn WriteCallbacks,
+    // The upload read source, threaded in for a [`h1::RequestBody::Streaming`]
+    // body so the codec pulls it incrementally (bounded-memory upload, QA Issue
+    // #5). `None` for buffered bodies and GET/HEAD; consumed exactly once since
+    // streaming is gated to single-pass uploads.
+    mut source: Option<&mut dyn ReadCallback>,
 ) -> Result<HopResult> {
     // The operation start for this hop, captured before DNS resolution and
     // connection setup so the transfer timings (`CURLINFO_*_TIME`) measure from
@@ -2466,6 +2589,10 @@ async fn perform_http_hop(
         sink,
     )
     .await?;
+    // Report the freshly-connected socket + its poll interest to the multi
+    // handle's socket observer (if any), driving `CURLMOPT_SOCKETFUNCTION` for
+    // event-loop consumers. No-op on the easy/CLI path (no observer installed).
+    report_socket_to_observer(data, &conn);
 
     // (6) Select the wire version (forced option, else negotiated ALPN) and
     //     build + drive the matching exchange, capturing the hop outcome.
@@ -2545,6 +2672,12 @@ async fn perform_http_hop(
                 } else {
                     body.clone()
                 };
+                // Whether this attempt sends a streamed (incrementally read)
+                // body, captured before `attempt_body` is moved into the request
+                // inputs. The auth-negotiation probe suppresses the body to an
+                // empty `Sized`, so a probe is never streamed.
+                let attempt_is_streaming =
+                    matches!(attempt_body, h1::RequestBody::Streaming { .. });
                 let plan = {
                     let inputs = make_inputs(
                         data,
@@ -2584,6 +2717,18 @@ async fn perform_http_hop(
                 // body and the chunked-not-last rejection (curl's `is_transfer`
                 // path, gated on `data.set.http_transfer_encoding`).
                 exchange.set_transfer_decoding(data.set.http_transfer_encoding);
+                // Install the upload source for a streamed body so the codec
+                // pulls it incrementally (bounded-memory upload, QA Issue #5),
+                // paced by the send-direction rate limiter
+                // (`CURLOPT_MAX_SEND_SPEED_LARGE` / `--limit-rate`, QA Issue #4
+                // send half). Streaming is gated to provably single-pass uploads,
+                // so the loop runs exactly once and the source is taken once.
+                if attempt_is_streaming {
+                    if let Some(src) = source.take() {
+                        let rate = build_rate_limit(0, data.set.max_send_speed);
+                        exchange.set_upload_source(src, rate);
+                    }
+                }
                 let result = drive_one(data, &mut exchange, &mut hop_sink, op_start).await;
                 let keepalive = exchange.keepalive();
                 drop(exchange);
@@ -2626,6 +2771,10 @@ async fn perform_http_hop(
                             &mut hop_sink,
                         )
                         .await?;
+                        // Re-established connection (retry) — report the new
+                        // socket to the multi's observer so the event-loop
+                        // consumer tracks the fd change.
+                        report_socket_to_observer(data, &conn);
                         conn_is_fresh = true;
                         continue;
                     }
@@ -2727,6 +2876,9 @@ async fn perform_http_hop(
                                 &mut hop_sink,
                             )
                             .await?;
+                            // Re-established connection (auth resend) — report
+                            // the new socket to the multi's observer.
+                            report_socket_to_observer(data, &conn);
                             conn_is_fresh = true;
                         }
                     }
@@ -2744,6 +2896,13 @@ async fn perform_http_hop(
             #[cfg(feature = "http2")]
             {
                 let custom_headers = collect_custom_headers(data);
+                // HTTP/2 sends a buffered body; if this upload was selected for
+                // streaming on the (version-agnostic) build path but the hop
+                // negotiated h2, materialize it from the source here so the h2
+                // codec sees a buffered body (unchanged h2 behavior, no
+                // regression). `source` is otherwise consumed only by the h1
+                // branch, which does not run for an h2 hop.
+                let body = materialize_streaming_body(body, source.take())?;
                 let (req, h2_body, h2_no_body) = {
                     let inputs = make_inputs(
                         data,
@@ -2830,6 +2989,26 @@ async fn perform_http_hop(
             let _ = collector.push(line, CURLH_HEADER);
         }
     }
+
+    // ---- Connection reuse: check the connection back in (Issue 3) -----------
+    // A keep-alive-eligible HTTP/1.x connection is returned to the handle's pool
+    // so the next transfer to the same destination reuses it. `drive_one`'s
+    // `apply_connection_reuse` already set `conn.is_closed()` from the response's
+    // keep-alive signal (`Connection: close`, HTTP/1.0 without keep-alive, a
+    // half-closed socket, …), so `!conn.is_closed()` is precisely curl's reuse
+    // eligibility. HTTP/2 and HTTP/3 connections are NOT pooled here: the h2 path
+    // takes the socket filter out of the chain and closes the session, leaving
+    // the `Connection` spent. `CURLOPT_FORBID_REUSE` closes instead of pooling.
+    if !data.set.reuse_forbid
+        && matches!(version, HttpVersion::Http10 | HttpVersion::Http11)
+        && !conn.is_closed()
+    {
+        conn.bits.in_cpool = true;
+        let pool = data.conn_pool_handle();
+        let maxconnects = data.set.maxconnects;
+        crate::conn::pool_checkin(&pool, conn, maxconnects);
+    }
+    // Otherwise `conn` drops at function end, closing its socket.
 
     Ok(HopResult {
         status,
@@ -2983,6 +3162,9 @@ async fn perform_http3(
     let bytes = match h3_body {
         h1::RequestBody::Sized(b) | h1::RequestBody::Chunked(b) => b,
         h1::RequestBody::None => Vec::new(),
+        // The HTTP/3 body is built with `allow_stream = false`, so a streamed
+        // body never reaches this path; handled for exhaustiveness only.
+        h1::RequestBody::Streaming { .. } => Vec::new(),
     };
     let mut offset = 0;
     while offset < bytes.len() {
@@ -3089,7 +3271,8 @@ pub(crate) async fn perform_ws(
     //     the sink under `--include`. Any bytes the server already pushed after
     //     the head are returned as the exchange's leftovers.
     let custom_headers = collect_custom_headers(data);
-    let body = build_request_body(data, source)?;
+    // The WebSocket handshake carries no upload body; build the buffered body.
+    let body = build_request_body(data, source, false)?;
     // The WebSocket Upgrade is a single HTTP/1.1 hop (no redirect following), so
     // the per-hop overrides are the single-shot defaults sourced from `data.set`.
     let hop = HopInputs::single_shot(data);
@@ -3173,6 +3356,32 @@ async fn ws_cli_recv_loop(
 // `perform_http` helpers
 // ---------------------------------------------------------------------------
 
+/// Builds the transfer rate limiter from the handle's configured speed caps,
+/// or `None` when both directions are unlimited.
+///
+/// `recv` is `CURLOPT_MAX_RECV_SPEED_LARGE` and `send` is
+/// `CURLOPT_MAX_SEND_SPEED_LARGE` (the CLI surfaces both through `--limit-rate`,
+/// which sets the two symmetrically). A value of `0` disables that direction's
+/// cap, exactly as libcurl treats an unset/zeroed `curl_off_t` speed limit.
+///
+/// Returning `None` when neither direction is capped keeps the unlimited fast
+/// path free of any per-tick rate accounting — the transfer driver's throttle
+/// branch is `if let Some(rl) = …`, so an absent limiter is a true no-op.
+///
+/// `setopt` already rejects negative caps with `CURLE_BAD_FUNCTION_ARGUMENT`
+/// (so the stored values are non-negative here); the defensive `.max(0)` clamp
+/// makes [`RateLimit::set_recv_limit`]/[`RateLimit::set_send_limit`] infallible
+/// regardless, so their `Result` can be discarded.
+fn build_rate_limit(recv: i64, send: i64) -> Option<RateLimit> {
+    if recv <= 0 && send <= 0 {
+        return None;
+    }
+    let mut rl = RateLimit::new(Instant::now());
+    let _ = rl.set_recv_limit(recv.max(0));
+    let _ = rl.set_send_limit(send.max(0));
+    Some(rl)
+}
+
 /// Run the transfer-engine byte loop for a prepared `exchange`, delivering the
 /// response through the client `sink`. Bundles the per-transfer state
 /// ([`Request`]/[`Progress`]/[`ClientWriter`]/[`ErrorBuffer`]/[`TransferLimits`])
@@ -3244,6 +3453,17 @@ async fn drive_one<P: ProtocolExchange>(
         .as_ref()
         .map(|c| c as &(dyn Fn(i32) -> bool + Send + Sync));
 
+    // Build the receive/send rate limiter from `CURLOPT_MAX_RECV_SPEED_LARGE` /
+    // `CURLOPT_MAX_SEND_SPEED_LARGE` (`--limit-rate`). The limiter borrows
+    // nothing from `data` (the caps are `Copy` `i64`s), so `data` stays free to
+    // mutate after the transfer (the post-transfer `data->info` store below).
+    // The receive cap is enforced inside `drive_transfer`'s response loop via
+    // this `Some(&mut rl)`; the send cap is carried for the streaming
+    // request-body send path. `None` on the unlimited path preserves the fast,
+    // accounting-free transfer.
+    let mut rate_limit = build_rate_limit(data.set.max_recv_speed, data.set.max_send_speed);
+    let rate_ref = rate_limit.as_mut();
+
     let outcome = drive_transfer(
         TransferParts {
             exchange,
@@ -3255,7 +3475,7 @@ async fn drive_one<P: ProtocolExchange>(
             errbuf: &mut errbuf,
         },
         None,
-        None,
+        rate_ref,
         fail_ref,
     )
     .await;
@@ -3376,14 +3596,30 @@ fn upload_is_chunked(data: &Easy) -> bool {
     })
 }
 
-/// Buffer the request body for the transfer:
+/// Build the request body for the transfer:
 ///
 /// * `CURLOPT_COPYPOSTFIELDS` / `-d` -> a sized body of the copied bytes.
+/// * `CURLOPT_MIMEPOST` / `-F` -> the pre-serialized multipart body (sized).
 /// * An upload (`CURLOPT_UPLOAD` / `-T`, `method == Put`) or a `CURLOPT_POST`
-///   without copied fields -> the source read fully (chunked if the application
-///   announced `Transfer-Encoding: chunked`, else sized).
+///   without copied fields ->
+///     * a [`h1::RequestBody::Streaming`] body (read incrementally, bounded
+///       memory) when `allow_stream` is set and the upload is provably
+///       single-pass — a known size (`CURLOPT_INFILESIZE[_LARGE]`), no
+///       redirect-following, and no reactive auth — so the source is read
+///       straight through exactly once (QA F11-PERF Issue #5);
+///     * otherwise the source is read **fully** into a buffered `Chunked`/`Sized`
+///       body (the proven path), so a resend across an auth challenge, a 307/308
+///       redirect, or a missing size stays correct.
 /// * Otherwise (GET/HEAD/DELETE without data) -> no body; `source` is untouched.
-fn build_request_body(data: &Easy, source: &mut dyn ReadCallback) -> Result<h1::RequestBody> {
+///
+/// `allow_stream` is `true` only on the HTTP/1.x path; the HTTP/3 and WebSocket
+/// callers pass `false` because those codecs send the buffered body directly and
+/// have no streaming upload path.
+fn build_request_body(
+    data: &Easy,
+    source: &mut dyn ReadCallback,
+    allow_stream: bool,
+) -> Result<h1::RequestBody> {
     // CURLOPT_MIMEPOST (`-F`/`--form`): the engine streams the pre-serialized
     // `multipart/form-data` body produced from the MIME tree. It is a known,
     // sized body (curl frames multipart with `Content-Length` when the size is
@@ -3398,14 +3634,69 @@ fn build_request_body(data: &Easy, source: &mut dyn ReadCallback) -> Result<h1::
     }
     let reads_source = data.set.method == HttpReq::Put || data.set.method == HttpReq::Post;
     if reads_source {
+        let chunked = upload_is_chunked(data);
+        // Stream the upload (bounded memory) only when it is provably
+        // single-pass, so the source is never re-read:
+        //   * `known_size` — `CURLOPT_INFILESIZE[_LARGE]` is set (a regular `-T`
+        //     file; the CLI seeds it from the file size). An unknown size keeps
+        //     the buffered path (which still derives the length).
+        //   * `!follow_enabled` — without `-L` the redirect loop runs a single
+        //     hop, so the body is never re-sent to a redirect target.
+        //   * `!needs_reactive` — Digest/NTLM/Negotiate/`--anyauth` re-send the
+        //     body on a `401`/`407` challenge (and enable the reused-connection
+        //     retry); a challenge-free Basic/Bearer/no-auth upload is sent once.
+        // When any condition fails, fall back to the buffered read (unchanged
+        // behavior), so redirected, reactive-auth, or unknown-size uploads keep
+        // their proven resend/rewind semantics.
+        let known_size = data.set.filesize >= 0;
+        let follow_enabled = data.set.http_follow_mode != 0;
+        let streaming_ok =
+            allow_stream && known_size && !follow_enabled && !auth_engine::needs_reactive(data.set.httpauth);
+        if streaming_ok {
+            return Ok(h1::RequestBody::Streaming {
+                size: Some(data.set.filesize as u64),
+                chunked,
+            });
+        }
         let bytes = read_full_upload(source)?;
-        return Ok(if upload_is_chunked(data) {
+        return Ok(if chunked {
             h1::RequestBody::Chunked(bytes)
         } else {
             h1::RequestBody::Sized(bytes)
         });
     }
     Ok(h1::RequestBody::None)
+}
+
+/// Collapse a [`h1::RequestBody::Streaming`] body back into a buffered
+/// `Sized`/`Chunked` body by reading the upload `source` fully.
+///
+/// Only the HTTP/1.x codec sends a body incrementally; the HTTP/2 and HTTP/3
+/// engines send a buffered body. Because the body is built once, up front,
+/// before the per-hop wire version is known (it can be HTTP/2 over a negotiated
+/// HTTPS connection), an upload that qualified for streaming may still be routed
+/// to the h2 path. This helper restores the proven buffered behavior there with
+/// no regression: a non-`Streaming` body is returned unchanged; a `Streaming`
+/// body is materialized from the source (or to an empty body when no source is
+/// available, which cannot occur for a genuine `Streaming` body).
+fn materialize_streaming_body(
+    body: h1::RequestBody,
+    source: Option<&mut dyn ReadCallback>,
+) -> Result<h1::RequestBody> {
+    match body {
+        h1::RequestBody::Streaming { chunked, .. } => {
+            let bytes = match source {
+                Some(s) => read_full_upload(s)?,
+                None => Vec::new(),
+            };
+            Ok(if chunked {
+                h1::RequestBody::Chunked(bytes)
+            } else {
+                h1::RequestBody::Sized(bytes)
+            })
+        }
+        other => Ok(other),
+    }
 }
 
 /// Read the upload source to end-of-input into one buffer. A buffered request
@@ -3690,9 +3981,13 @@ async fn doh_probe_post(req: DohProbeRequest) -> Result<Vec<u8>> {
 fn suppress_upload_body(body: &h1::RequestBody) -> h1::RequestBody {
     match body {
         h1::RequestBody::None => h1::RequestBody::None,
-        h1::RequestBody::Sized(_) | h1::RequestBody::Chunked(_) => {
-            h1::RequestBody::Sized(Vec::new())
-        }
+        // A streamed body is never paired with reactive auth (the engine gates
+        // streaming off whenever `needs_reactive`), so this arm is not reached on
+        // the auth-negotiation probe; it is handled for exhaustiveness and yields
+        // the same empty `Content-Length: 0` probe body as the buffered cases.
+        h1::RequestBody::Sized(_)
+        | h1::RequestBody::Chunked(_)
+        | h1::RequestBody::Streaming { .. } => h1::RequestBody::Sized(Vec::new()),
     }
 }
 
@@ -3714,6 +4009,18 @@ fn make_inputs<'a>(
         h1::RequestBody::Sized(b) => (Some(b.len() as i64), false),
         h1::RequestBody::Chunked(_) => (None, true),
         h1::RequestBody::None => (None, false),
+        // A streamed body carries its framing metadata directly: a known size
+        // advertises `Content-Length` (the head builder uses `content_length`,
+        // not the body bytes, so an empty-payload `Streaming` still emits the
+        // correct header — wire parity), while a chunked stream advertises
+        // `Transfer-Encoding: chunked` with no `Content-Length`.
+        h1::RequestBody::Streaming { size, chunked } => {
+            if *chunked {
+                (None, true)
+            } else {
+                (size.map(|s| s as i64), false)
+            }
+        }
     };
     h1::RequestInputs {
         url,
@@ -4177,8 +4484,183 @@ mod tests {
             h1::RequestBody::Sized(v) => assert!(v.is_empty()),
             _ => panic!("expected empty Sized"),
         }
+        // A streamed body suppresses to an empty Sized probe as well (the
+        // exhaustive arm; not reached at runtime since streaming is gated off
+        // for reactive auth, but it must collapse to a body-less probe).
+        match suppress_upload_body(&h1::RequestBody::Streaming {
+            size: Some(123),
+            chunked: false,
+        }) {
+            h1::RequestBody::Sized(v) => assert!(v.is_empty()),
+            _ => panic!("expected empty Sized"),
+        }
     }
 
+    // ---- Streaming-upload gate (QA F11-PERF Issue #5 / Issue #4 send half) ----
+
+    /// A [`ReadCallback`] upload source that records how many times it was read,
+    /// so a test can assert that the streaming path does **not** consume the
+    /// source up front (it is pulled later by the codec) while the buffered path
+    /// does.
+    struct CountingReader {
+        data: Vec<u8>,
+        pos: usize,
+        reads: usize,
+    }
+    impl CountingReader {
+        fn new(data: &[u8]) -> Self {
+            Self {
+                data: data.to_vec(),
+                pos: 0,
+                reads: 0,
+            }
+        }
+    }
+    impl ReadCallback for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> usize {
+            self.reads += 1;
+            let n = (self.data.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            n
+        }
+    }
+
+    /// An upload with a known size, no redirect-following, and no reactive auth
+    /// is streamed: `build_request_body` returns a `Streaming` body carrying the
+    /// size and does **not** read the source up front.
+    #[test]
+    fn build_request_body_streams_single_pass_without_reading_source() {
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Put;
+        data.set.filesize = 1000; // CURLOPT_INFILESIZE[_LARGE]
+        data.set.http_follow_mode = 0; // no -L
+                                       // httpauth defaults to CURLAUTH_BASIC (not reactive).
+        let mut src = CountingReader::new(b"unused-up-front");
+        let body = build_request_body(&data, &mut src, true).unwrap();
+        assert!(
+            matches!(
+                body,
+                h1::RequestBody::Streaming {
+                    size: Some(1000),
+                    chunked: false
+                }
+            ),
+            "expected Streaming{{1000, !chunked}}, got {body:?}"
+        );
+        assert_eq!(src.reads, 0, "source must not be consumed up front");
+    }
+
+    /// An explicit `Transfer-Encoding: chunked` upload still streams, as a
+    /// chunked `Streaming` body.
+    #[test]
+    fn build_request_body_streams_chunked_with_te_header() {
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Put;
+        data.set.filesize = 50;
+        let mut list = SList::default();
+        list.append("Transfer-Encoding: chunked").unwrap();
+        data.set.headers = Some(list);
+        let mut src = CountingReader::new(b"x");
+        let body = build_request_body(&data, &mut src, true).unwrap();
+        assert!(matches!(
+            body,
+            h1::RequestBody::Streaming {
+                chunked: true,
+                ..
+            }
+        ));
+        assert_eq!(src.reads, 0);
+    }
+
+    /// An unknown upload size falls back to the buffered path (the source is
+    /// read fully), so the length can still be derived — no regression.
+    #[test]
+    fn build_request_body_buffers_when_size_unknown() {
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Put;
+        data.set.filesize = -1; // unknown (e.g. `-T -` from stdin)
+        let mut src = CountingReader::new(b"hello");
+        let body = build_request_body(&data, &mut src, true).unwrap();
+        assert!(matches!(body, h1::RequestBody::Sized(ref v) if v == b"hello"));
+        assert!(src.reads > 0, "buffered path must read the source");
+    }
+
+    /// Redirect-following (`-L`) keeps the buffered path so the body can be
+    /// re-sent to a redirect target.
+    #[test]
+    fn build_request_body_buffers_when_follow_enabled() {
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Put;
+        data.set.filesize = 5;
+        data.set.http_follow_mode = 1; // -L
+        let mut src = CountingReader::new(b"hello");
+        let body = build_request_body(&data, &mut src, true).unwrap();
+        assert!(matches!(body, h1::RequestBody::Sized(_)));
+        assert!(src.reads > 0);
+    }
+
+    /// Reactive auth (Digest/NTLM/Negotiate/`--anyauth`) re-sends the body on a
+    /// challenge, so it keeps the buffered path.
+    #[test]
+    fn build_request_body_buffers_under_reactive_auth() {
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Put;
+        data.set.filesize = 5;
+        data.set.httpauth = crate::auth::CURLAUTH_DIGEST; // reactive
+        let mut src = CountingReader::new(b"hello");
+        let body = build_request_body(&data, &mut src, true).unwrap();
+        assert!(matches!(body, h1::RequestBody::Sized(_)));
+        assert!(src.reads > 0);
+    }
+
+    /// The HTTP/3 and WebSocket callers pass `allow_stream = false`, so they
+    /// always get a buffered body (those codecs have no streaming path).
+    #[test]
+    fn build_request_body_buffers_when_stream_disallowed() {
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Put;
+        data.set.filesize = 5;
+        let mut src = CountingReader::new(b"hello");
+        let body = build_request_body(&data, &mut src, false).unwrap();
+        assert!(matches!(body, h1::RequestBody::Sized(_)));
+        assert!(src.reads > 0);
+    }
+
+    /// `materialize_streaming_body` reads the source fully for a `Streaming`
+    /// body (the h2/h3 fallback) and passes any other body through unchanged.
+    #[test]
+    fn materialize_streaming_body_reads_source_for_streaming() {
+        // Streaming (sized) → buffered Sized with the source bytes.
+        let mut src = CountingReader::new(b"streamed-bytes");
+        let out = materialize_streaming_body(
+            h1::RequestBody::Streaming {
+                size: Some(14),
+                chunked: false,
+            },
+            Some(&mut src),
+        )
+        .unwrap();
+        assert!(matches!(out, h1::RequestBody::Sized(ref v) if v == b"streamed-bytes"));
+        assert!(src.reads > 0);
+
+        // Streaming (chunked) → buffered Chunked.
+        let mut src2 = CountingReader::new(b"abc");
+        let out2 = materialize_streaming_body(
+            h1::RequestBody::Streaming {
+                size: None,
+                chunked: true,
+            },
+            Some(&mut src2),
+        )
+        .unwrap();
+        assert!(matches!(out2, h1::RequestBody::Chunked(ref v) if v == b"abc"));
+
+        // A non-streaming body passes through untouched.
+        let passthrough =
+            materialize_streaming_body(h1::RequestBody::Sized(b"x".to_vec()), None).unwrap();
+        assert!(matches!(passthrough, h1::RequestBody::Sized(ref v) if v == b"x"));
+    }
 
     // ---- HopSink response-routing core (Issue #4 redirect/body delivery) ----
 

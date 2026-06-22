@@ -125,6 +125,40 @@ pub fn create_output_file(
     config: &OperationConfig,
     global: &GlobalConfig,
 ) -> bool {
+    // Delegate to the `global`-free core, then emit any failure warning through
+    // the CLI message layer (gated on `--silent` inside `warnf!`). Splitting the
+    // warning out of the core lets the parallel `-Z` I/O path — which runs on a
+    // multi worker thread with no `&GlobalConfig` in reach — reuse the identical
+    // open/clobber/numbered-fallback logic and *defer* the warning to the driver
+    // thread (see `operate::ParallelIoCell`). The observable behavior of this
+    // wrapper is unchanged, so the serial path and its tests are unaffected.
+    match create_output_file_inner(outs, config.file_clobber_mode) {
+        Ok(()) => true,
+        // A programming error (empty filename) already tripped a debug-assert in
+        // the core; fail silently in release exactly as before.
+        Err(None) => false,
+        Err(Some(msg)) => {
+            crate::warnf!(global, "{}", msg);
+            false
+        }
+    }
+}
+
+/// `global`-free core of [`create_output_file`]: opens the file named in
+/// `outs.filename` under the given clobber `mode`, applying curl's
+/// clobber/no-clobber/numbered-fallback policy.
+///
+/// Returns `Ok(())` with `outs` updated to hold the open file, or `Err(msg)`
+/// where `msg` is curl's exact open-failure warning (`Some`) — to be emitted by
+/// the caller through its message layer — or `None` for the empty-filename
+/// programming-error case (no warning, matching the original silent release
+/// behavior). Carrying no `&OperationConfig`/`&GlobalConfig` lets a `Send` sink
+/// running on a multi worker thread reuse this for `-Z` parallel output and
+/// defer the warning to the driver thread.
+pub(crate) fn create_output_file_inner(
+    outs: &mut OutStruct,
+    mode: FileClobberMode,
+) -> Result<(), Option<String>> {
     // C: `const char *fname = outs->filename; DEBUGASSERT(fname && *fname);`.
     // Capture the *original* name up front — the numbered fallback may reassign
     // `outs.filename`, but the failure warning must still report the original
@@ -133,14 +167,14 @@ pub fn create_output_file(
         Some(name) if !name.is_empty() => name.to_owned(),
         _ => {
             debug_assert!(false, "create_output_file called with no/empty filename");
-            return false;
+            return Err(None);
         }
     };
 
     // C: clobber is allowed for CLOBBER_ALWAYS, or for CLOBBER_DEFAULT unless the
     // filename came from a Content-Disposition header.
-    let clobber_allowed = config.file_clobber_mode == FileClobberMode::Always
-        || (config.file_clobber_mode == FileClobberMode::Default && !outs.is_cd_filename);
+    let clobber_allowed = mode == FileClobberMode::Always
+        || (mode == FileClobberMode::Default && !outs.is_cd_filename);
 
     let opened: io::Result<File> = if clobber_allowed {
         // C: curlx_fopen(fname, "wb") — create/truncate/overwrite.
@@ -160,7 +194,7 @@ pub fn create_output_file(
             // CLOBBER_NEVER: retry with numbered suffixes while the target keeps
             // already existing (C's `errno == EEXIST || errno == EISDIR` guard).
             Err(err)
-                if config.file_clobber_mode == FileClobberMode::Never
+                if mode == FileClobberMode::Never
                     && err.kind() == io::ErrorKind::AlreadyExists =>
             {
                 open_numbered_fallback(outs, &fname, err)
@@ -179,13 +213,12 @@ pub fn create_output_file(
             outs.stream = Some(file);
             outs.bytes = 0;
             outs.init = 0;
-            true
+            Ok(())
         }
         Err(err) => {
             // C:96-100 — `warnf("Failed to open the file %s: %s", fname,
             // strerror(errno))`. The OS message is `io::Error`'s `Display`.
-            crate::warnf!(global, "Failed to open the file {fname}: {err}");
-            false
+            Err(Some(format!("Failed to open the file {fname}: {err}")))
         }
     }
 }
@@ -256,7 +289,7 @@ fn open_numbered_fallback(
 /// returns `0` (`!= buffer.len()`), triggering the same abort. The exact partial
 /// count on error is irrelevant — only equality with the input length is
 /// observed by the caller.
-fn write_to_sink(outs: &mut OutStruct, buffer: &[u8]) -> usize {
+pub(crate) fn write_to_sink(outs: &mut OutStruct, buffer: &[u8]) -> usize {
     let result = if let Some(file) = outs.stream.as_mut() {
         file.write_all(buffer)
     } else if outs.to_stderr {
@@ -275,7 +308,7 @@ fn write_to_sink(outs: &mut OutStruct, buffer: &[u8]) -> usize {
 /// Mirrors C's `fflush(outs->stream)`; std retries the underlying `EINTR`
 /// internally, so a single flush matches C's `do { } while(errno == EINTR)`
 /// loop.
-fn flush_sink(outs: &mut OutStruct) -> io::Result<()> {
+pub(crate) fn flush_sink(outs: &mut OutStruct) -> io::Result<()> {
     if let Some(file) = outs.stream.as_mut() {
         file.flush()
     } else if outs.to_stderr {
@@ -298,7 +331,7 @@ fn flush_sink(outs: &mut OutStruct) -> io::Result<()> {
 /// because the header module is not among this file's permitted dependencies and
 /// the documented dependency direction is header→write (header consumes this
 /// module's exports), so calling back the other way would invert it.
-fn write_buffered_headers(hdrcbdata: &mut HdrCbData, outs: &mut OutStruct) -> bool {
+pub(crate) fn write_buffered_headers(hdrcbdata: &mut HdrCbData, outs: &mut OutStruct) -> bool {
     let mut failed = false;
     for line in &hdrcbdata.headlist {
         // C compares `strlen(h->data)` against the `fwrite` return; the stored

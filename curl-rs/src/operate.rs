@@ -45,6 +45,7 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read as _};
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -53,15 +54,21 @@ use std::time::{Duration, Instant};
 use curl_rs_lib::error::{codes, CurlMError, CurlShError};
 use curl_rs_lib::multi::{self, CurlMInfo, SharedEasy};
 use curl_rs_lib::progress::CURL_PROGRESSFUNC_CONTINUE;
-use curl_rs_lib::transfer::{DebugInfoType, ReadCallback, WriteCallbacks};
+use curl_rs_lib::transfer::{
+    DebugInfoType, MultiIoProvider, ReadCallback, WriteCallbacks, CURL_WRITEFUNC_ERROR,
+};
+use curl_rs_lib::conn::{cache::new_shared_pool, SharedPool};
 use curl_rs_lib::share::{LockData, ShareSetting};
 use curl_rs_lib::{
     CurlCode, CurlError, CurlInfo, CurlOption, Easy, InfoValue, Multi, OptionValue, Share,
 };
 
 use crate::callbacks::debug::CurlInfoType;
+use crate::callbacks::write::{
+    create_output_file_inner, flush_sink, write_buffered_headers, write_to_sink,
+};
 use crate::callbacks::ProgressData;
-use crate::config::{FailMode, GlobalConfig, HttpReq, OperationConfig};
+use crate::config::{FailMode, FileClobberMode, GlobalConfig, HttpReq, OperationConfig};
 use crate::setopt;
 use crate::urlglob;
 use crate::writeout::our_write_out;
@@ -297,6 +304,20 @@ pub struct PerTransfer {
     /// `true` when this transfer is skipped without running (C `per->skip`),
     /// e.g. `--skip-existing` matched a local file.
     pub skip: bool,
+    /// In parallel (`-Z`) mode, the shared cell holding this transfer's output /
+    /// upload state ([`outs`](Self::outs), [`heads`](Self::heads),
+    /// [`hdrcbdata`](Self::hdrcbdata), [`infile`](Self::infile) and the upload
+    /// counters) while the multi handle drives it on a worker thread; `None` in
+    /// serial mode. The body/header bytes and `-T` upload cannot be routed
+    /// through the serial [`CliWriteSink`]/[`CliReadSource`] (which borrow `self`
+    /// and are `!Send`), so [`add_parallel_transfers`](Driver::add_parallel_transfers)
+    /// moves the relevant fields into this `Send` cell, registers a
+    /// [`ParallelIoProvider`] on the easy handle, and
+    /// [`check_finished`](Driver::check_finished) moves the final state back
+    /// before `post_per_transfer`. Without this, a multi-driven CLI transfer
+    /// falls back to the core's default stdout sink and `-o` files stay empty
+    /// (QA F11-PERF Issue #6 / `-Z`).
+    pub parallel_io: Option<Arc<Mutex<ParallelIoCell>>>,
 }
 
 impl PerTransfer {
@@ -357,6 +378,7 @@ impl PerTransfer {
             added: false,
             abort: false,
             skip: false,
+            parallel_io: None,
         }
     }
 
@@ -515,6 +537,12 @@ struct Driver {
     /// `true` once [`speedstore`](Self::speedstore) has wrapped at least once,
     /// so the oldest sample is valid (C `indexwrapped`).
     indexwrapped: bool,
+    /// One connection-reuse pool shared across every transfer of this operation
+    /// (the QA F11-PERF Issue 3 fix). curl shares the multi handle's connection
+    /// cache across all transfers; the CLI mirrors that by injecting this pool
+    /// into each [`PerTransfer`]'s [`Easy`] (every glob iteration uses a fresh
+    /// handle), so keep-alive connections are reused across e.g. `"/get[1-10]"`.
+    conn_pool: SharedPool,
 }
 
 impl Driver {
@@ -538,6 +566,9 @@ impl Driver {
             }; SPEEDCNT],
             speedindex: 0,
             indexwrapped: false,
+            // One shared connection cache for the whole operation (Issue 3),
+            // sized for a handful of distinct destinations.
+            conn_pool: new_shared_pool(8),
         }
     }
 
@@ -1437,6 +1468,11 @@ impl Driver {
                 global.state.uploadfile = None;
             }
 
+            // Share one connection-reuse pool across every transfer of this
+            // operation (Issue 3): each glob iteration builds a fresh handle, so
+            // without this they could not reuse keep-alive connections. curl
+            // shares the multi handle's connection cache the same way.
+            per.easy.set_conn_pool(self.conn_pool.clone());
             self.transfers.push_back(per);
             *added = true;
             break;
@@ -2021,6 +2057,316 @@ async fn perform_with_cli_io(
     result
 }
 
+// ===========================================================================
+// Parallel (`-Z`) transfer I/O — a `Send` sink/source for multi-driven CLI
+// transfers (QA F11-PERF Issue #6 / `-Z`).
+//
+// The serial `CliWriteSink`/`CliReadSource` borrow `&mut PerTransfer` +
+// `&mut GlobalConfig` and are therefore `!Send` and non-`'static`; they cannot
+// be handed to the core's multi handle, which drives each transfer as a task on
+// a multi-thread Tokio runtime (AAP §0.4.4) and so requires an owned,
+// `Send + 'static` sink/source via
+// [`MultiIoProvider::make`](curl_rs_lib::transfer::MultiIoProvider). With no
+// provider registered, a multi-driven transfer falls back to the core's default
+// stdout sink — so `curl-rs -Z -o file` writes the body to stdout and leaves the
+// `-o` file empty.
+//
+// The fix moves the per-transfer output/upload state out of `PerTransfer` into a
+// `Send` [`ParallelIoCell`] (mirroring how the serial path moves the `Easy`
+// handle out for the duration of `perform_with`).
+// [`add_parallel_transfers`](Driver::add_parallel_transfers) builds the cell,
+// registers a [`ParallelIoProvider`] on the easy handle, then hands the easy to
+// the multi; [`check_finished`](Driver::check_finished) moves the final state
+// back into `PerTransfer` before `post_per_transfer` so `-o`/`-D`/`--write-out`
+// observe the true result. The write/read logic mirrors `tool_write_cb` /
+// `tool_header_cb` / `tool_read_cb`, reusing their low-level primitives
+// (`create_output_file_inner`, `write_to_sink`, `flush_sink`,
+// `write_buffered_headers`). The getinfo-gated header paths (etag,
+// `Content-Disposition` rename, the `-i` header echo) read the easy handle's
+// scheme/response code; because the handle is moved into the multi task — just
+// as the serial path moves it out for `perform_with` — those reads yield no
+// scheme and the paths degrade to no-ops identically in both modes. The
+// observable behaviors that remain (the `-D` header dump and `%{num_headers}`
+// counting) are ported faithfully.
+// ===========================================================================
+
+/// Owned, `Send` output/upload state for one parallel (`-Z`) transfer, moved out
+/// of [`PerTransfer`] while the multi handle drives the transfer on a worker
+/// thread and moved back on completion (see the module section comment above).
+///
+/// The transfer engine invokes the write sink and the read source **sequentially
+/// on the one task driving this transfer** — never concurrently — so the
+/// [`Mutex`] wrapping this cell is always uncontended (the same property the
+/// serial [`CliIoState`] relies on); it exists only to provide the `Send + Sync`
+/// shared ownership the [`MultiIoProvider`] contract requires and to let the
+/// driver thread reclaim the final state.
+pub struct ParallelIoCell {
+    /// Body output sink (moved from [`PerTransfer::outs`]).
+    outs: OutStruct,
+    /// `-D`/`--dump-header` sink (moved from [`PerTransfer::heads`]).
+    heads: OutStruct,
+    /// Header-callback linkage (moved from [`PerTransfer::hdrcbdata`]); consulted
+    /// by [`write_buffered_headers`](crate::callbacks::write::write_buffered_headers).
+    hdrcbdata: HdrCbData,
+    /// `%{num_headers}` running count (restored to [`PerTransfer::num_headers`]).
+    num_headers: i64,
+    /// Whether the previous header line was blank (restored to
+    /// [`PerTransfer::was_last_header_empty`]).
+    was_last_header_empty: bool,
+    /// `-T` upload source (moved from [`PerTransfer::infile`]); `None` uploads
+    /// from stdin.
+    infile: Option<File>,
+    /// Configured upload size, or `-1` when unknown (caps the read).
+    uploadfilesize: i64,
+    /// Upload bytes consumed so far (restored to [`PerTransfer::uploadedsofar`]).
+    uploadedsofar: i64,
+    /// `global.isatty` snapshot — the binary-output-to-terminal guard.
+    isatty: bool,
+    /// `--output -`/binary opt-in snapshot (`OperationConfig::terminal_binary_ok`).
+    terminal_binary_ok: bool,
+    /// `--no-buffer` snapshot — flush after every write.
+    nobuffer: bool,
+    /// `--clobber`/`--no-clobber` snapshot for the lazy file open.
+    file_clobber_mode: FileClobberMode,
+    /// Whether a `-D`/`--dump-header` target is configured (`headerfile.is_some()`).
+    dump_headers: bool,
+    /// Whether `--write-out` is set (gates `%{num_headers}` counting).
+    count_headers: bool,
+    /// Set when the binary-to-terminal guard fired, replayed into
+    /// `OperationConfig::synthetic_error` on the driver thread.
+    synthetic_error: bool,
+    /// Warnings deferred from the worker thread (file-open / header-write
+    /// failures), replayed through the CLI message layer on the driver thread.
+    deferred_warnings: Vec<String>,
+}
+
+/// The [`MultiIoProvider`] the CLI registers on a parallel transfer's easy
+/// handle: each call to [`make`](MultiIoProvider::make) hands the multi-driven
+/// transfer a fresh sink/source pair backed by the shared [`ParallelIoCell`].
+struct ParallelIoProvider {
+    cell: Arc<Mutex<ParallelIoCell>>,
+}
+
+impl MultiIoProvider for ParallelIoProvider {
+    fn make(&self) -> (Box<dyn WriteCallbacks>, Box<dyn ReadCallback>) {
+        (
+            Box::new(ParallelWriteSink {
+                cell: Arc::clone(&self.cell),
+            }),
+            Box::new(ParallelReadSource {
+                cell: Arc::clone(&self.cell),
+            }),
+        )
+    }
+}
+
+/// The body/header write sink for a multi-driven CLI transfer — the `Send`
+/// analogue of [`CliWriteSink`] operating on a moved-out [`ParallelIoCell`].
+struct ParallelWriteSink {
+    cell: Arc<Mutex<ParallelIoCell>>,
+}
+
+impl WriteCallbacks for ParallelWriteSink {
+    fn write_body(&mut self, data: &[u8]) -> usize {
+        // Mirror of `write_body_impl` (`tool_write_cb`), operating on the cell's
+        // moved-out `outs`/`hdrcbdata` and config snapshot. The uncontended lock
+        // (see `ParallelIoCell`) yields the same single-threaded access the
+        // serial path has.
+        let mut guard = self.cell.lock().expect("parallel I/O cell mutex poisoned");
+        let c = &mut *guard;
+        let bytes = data.len();
+
+        // Null sink (`-o /dev/null`): discard, first, before any side effect.
+        if c.outs.out_null {
+            return bytes;
+        }
+
+        // Refuse binary output to a terminal early in a transfer (defer the
+        // warning to the driver thread; flag the synthetic error like C).
+        if c.isatty && c.outs.bytes < 2000 && !c.terminal_binary_ok && data.contains(&0) {
+            c.deferred_warnings.push(
+                "Binary output can mess up your terminal. Use \"--output -\" to tell \
+                 curl to output it to your terminal anyway, or consider \"--output \
+                 <FILE>\" to save to a file."
+                    .to_string(),
+            );
+            c.synthetic_error = true;
+            return CURL_WRITEFUNC_ERROR;
+        }
+
+        // Lazily open the `-o` file on the first body byte (curl's
+        // `!outs->stream`), reusing the `global`-free open core and deferring any
+        // failure warning.
+        if c.outs.stream.is_none() && c.outs.filename.is_some() {
+            match create_output_file_inner(&mut c.outs, c.file_clobber_mode) {
+                Ok(()) => {}
+                Err(None) => return CURL_WRITEFUNC_ERROR,
+                Err(Some(msg)) => {
+                    c.deferred_warnings.push(msg);
+                    return CURL_WRITEFUNC_ERROR;
+                }
+            }
+        }
+
+        // Flush any buffered response headers before the first body byte.
+        if !c.hdrcbdata.headlist.is_empty() {
+            let ParallelIoCell {
+                hdrcbdata, outs, ..
+            } = c;
+            if write_buffered_headers(hdrcbdata, outs) {
+                return CURL_WRITEFUNC_ERROR;
+            }
+        }
+
+        let rc = write_to_sink(&mut c.outs, data);
+        if bytes == rc {
+            c.outs.bytes += bytes as u64;
+        }
+        if c.nobuffer && flush_sink(&mut c.outs).is_err() {
+            return CURL_WRITEFUNC_ERROR;
+        }
+        rc
+    }
+
+    fn write_header(&mut self, data: &[u8]) -> Option<usize> {
+        // Mirror of the non-getinfo-gated subset of `tool_header_cb`: the `-D`
+        // dump and `%{num_headers}` counting. The etag / Content-Disposition /
+        // `-i` echo paths are scheme-gated on `getinfo`, which yields no scheme
+        // for the moved-out handle — so they no-op identically to the serial
+        // moved-handle path and are intentionally omitted here.
+        let mut guard = self.cell.lock().expect("parallel I/O cell mutex poisoned");
+        let c = &mut *guard;
+        let cb = data.len();
+
+        if c.dump_headers {
+            let rc = write_to_sink(&mut c.heads, data);
+            if rc != cb {
+                return Some(rc); // short write aborts (curl `rc != nmemb`)
+            }
+            if flush_sink(&mut c.heads).is_err() {
+                c.deferred_warnings
+                    .push("Failed writing header data".to_string());
+                return Some(CURL_WRITEFUNC_ERROR);
+            }
+        }
+
+        if c.count_headers {
+            if data.contains(&b':') {
+                if c.was_last_header_empty {
+                    c.num_headers = 0;
+                }
+                c.was_last_header_empty = false;
+                c.num_headers += 1;
+            } else if matches!(data.first().copied(), Some(b'\r') | Some(b'\n')) {
+                c.was_last_header_empty = true;
+            }
+        }
+
+        Some(cb)
+    }
+
+    fn progress(&mut self, _dltotal: i64, _dlnow: i64, _ultotal: i64, _ulnow: i64) -> i32 {
+        // In parallel mode curl draws a single aggregate bar (the driver's
+        // `progress_meter`), never per-transfer meters. Return `0` to suppress
+        // the engine's built-in meter for this transfer (the engine still runs;
+        // it just draws nothing), regardless of the forced `NOPROGRESS=0` that
+        // `add_parallel_transfers` sets to feed the aggregate counters.
+        0
+    }
+}
+
+/// The `-T` upload read source for a multi-driven CLI transfer — the `Send`
+/// analogue of [`CliReadSource`] operating on a moved-out [`ParallelIoCell`].
+struct ParallelReadSource {
+    cell: Arc<Mutex<ParallelIoCell>>,
+}
+
+impl ReadCallback for ParallelReadSource {
+    fn read(&mut self, buf: &mut [u8]) -> usize {
+        // Mirror of `tool_read_cb` for the common blocking-source case: pull from
+        // the `-T` file (or stdin), capped at `uploadfilesize`. The timeout
+        // throttle and the `EAGAIN`/`readbusy` pause apply only to non-blocking
+        // sources, which a `-T` file / stdin never is — exactly the inert case
+        // the serial path documents — so they are omitted.
+        let mut guard = self.cell.lock().expect("parallel I/O cell mutex poisoned");
+        let c = &mut *guard;
+
+        // Done check: never upload past the configured size.
+        if c.uploadfilesize != -1 && c.uploadedsofar >= c.uploadfilesize {
+            return 0;
+        }
+
+        let raw = match c.infile.as_mut() {
+            Some(file) => file.read(buf).unwrap_or(0),
+            None => io::stdin().read(buf).unwrap_or(0),
+        };
+
+        // Upload-size cap: never hand the engine more than the original size.
+        let rc = if c.uploadfilesize != -1 && c.uploadedsofar + (raw as i64) > c.uploadfilesize {
+            (c.uploadfilesize - c.uploadedsofar).max(0) as usize
+        } else {
+            raw
+        };
+        c.uploadedsofar += rc as i64;
+        rc
+    }
+}
+
+/// Moves a parallel transfer's output/upload state out of `per` into a new
+/// [`ParallelIoCell`], snapshotting the read-only config the sink/source consult.
+/// Returns the shared cell; the caller registers a [`ParallelIoProvider`] over a
+/// clone on the easy handle and stores the other clone in
+/// [`PerTransfer::parallel_io`] for [`reattach_parallel_io`] to reclaim.
+fn detach_parallel_io(per: &mut PerTransfer, global: &GlobalConfig) -> Arc<Mutex<ParallelIoCell>> {
+    let cfg = &global.operations[per.config_idx];
+    let cell = ParallelIoCell {
+        outs: std::mem::take(&mut per.outs),
+        heads: std::mem::take(&mut per.heads),
+        hdrcbdata: std::mem::take(&mut per.hdrcbdata),
+        num_headers: per.num_headers,
+        was_last_header_empty: per.was_last_header_empty,
+        infile: per.infile.take(),
+        uploadfilesize: per.uploadfilesize,
+        uploadedsofar: per.uploadedsofar,
+        isatty: global.isatty,
+        terminal_binary_ok: cfg.terminal_binary_ok,
+        nobuffer: cfg.nobuffer,
+        file_clobber_mode: cfg.file_clobber_mode,
+        dump_headers: cfg.headerfile.is_some(),
+        count_headers: cfg.writeout.is_some(),
+        synthetic_error: false,
+        deferred_warnings: Vec::new(),
+    };
+    Arc::new(Mutex::new(cell))
+}
+
+/// Moves a finished parallel transfer's output/upload state back from its
+/// [`ParallelIoCell`] into `per` (so `post_per_transfer`, `--write-out`, and
+/// cleanup observe the true result), folds the deferred `synthetic_error` into
+/// the operation config, and replays any warnings the worker thread deferred. A
+/// no-op when the transfer was not parallel (`parallel_io` is `None`).
+fn reattach_parallel_io(per: &mut PerTransfer, global: &mut GlobalConfig) {
+    let Some(cell_arc) = per.parallel_io.take() else {
+        return;
+    };
+    let config_idx = per.config_idx;
+    let mut guard = cell_arc.lock().expect("parallel I/O cell mutex poisoned");
+    let c = &mut *guard;
+    per.outs = std::mem::take(&mut c.outs);
+    per.heads = std::mem::take(&mut c.heads);
+    per.hdrcbdata = std::mem::take(&mut c.hdrcbdata);
+    per.num_headers = c.num_headers;
+    per.was_last_header_empty = c.was_last_header_empty;
+    per.infile = c.infile.take();
+    per.uploadedsofar = c.uploadedsofar;
+    if c.synthetic_error {
+        global.operations[config_idx].synthetic_error = true;
+    }
+    for w in c.deferred_warnings.drain(..) {
+        warnf!(global, "{}", w);
+    }
+}
+
 impl Driver {
     /// Runs every queued transfer one at a time (C `serial_transfers`).
     ///
@@ -2359,6 +2705,21 @@ impl Driver {
             // emits progress (today the stub reports none, so the aggregate bar
             // renders zero-progress lines exactly as a finished run would).
 
+            // Route this transfer's body/header output and `-T` upload through a
+            // `Send` cell so `-o`/`-D`/`--write-out`/`-T` work while the multi
+            // handle drives the transfer on a worker thread (QA F11-PERF Issue
+            // #6 / `-Z`). Without a provider the core falls back to its default
+            // stdout sink, so the body would leak to stdout and the `-o` file
+            // would stay empty. The serial path is untouched; this only runs for
+            // parallel transfers.
+            let cell = detach_parallel_io(&mut self.transfers[i], global);
+            self.transfers[i]
+                .easy
+                .set_multi_io_provider(Arc::new(ParallelIoProvider {
+                    cell: Arc::clone(&cell),
+                }));
+            self.transfers[i].parallel_io = Some(cell);
+
             // Hand the easy handle to the multi as a shared wrapper, keeping a
             // clone so the finished message can be matched back via Arc::ptr_eq.
             let easy = std::mem::take(&mut self.transfers[i].easy);
@@ -2458,6 +2819,15 @@ impl Driver {
                 // If other references survive (unexpected), the handle keeps its
                 // default value — post_per_transfer degrades gracefully.
             }
+
+            // Move the parallel transfer's output/upload state back from its
+            // `Send` cell into `per` before `post_per_transfer` reads it (QA
+            // F11-PERF Issue #6 / `-Z`); folds the deferred binary-output guard
+            // into the op config and replays any worker-thread warnings. A no-op
+            // for the serial path (`parallel_io` is `None`). Runs on both the
+            // retry and completion paths so a retried transfer's state is back in
+            // `per`, ready to be re-detached by the next add_parallel_transfers.
+            reattach_parallel_io(&mut self.transfers[i], global);
 
             let (rc, retry, delay) = post_per_transfer(global, &mut self.transfers[i], tres);
             tres = rc;

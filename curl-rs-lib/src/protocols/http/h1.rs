@@ -54,14 +54,16 @@
 //! Tokio and contains no `unsafe` and no raw pointers.
 
 use core::time::Duration;
+use std::time::Instant;
 
 use crate::conn::{Connection, Curl_conn_recv, Curl_conn_send, FIRSTSOCKET};
 use crate::error::{CurlError, Result};
 use crate::headers::DynHds;
+use crate::ratelimit::{Direction, RateLimit};
 use crate::setopt::HttpReq;
 use crate::transfer::{
     self, redirect_method, ClientWriteType, Connection as ByteStream, HttpMethod, PostRedir,
-    ProtocolExchange, ResponseEvent,
+    ProtocolExchange, ReadCallback, ResponseEvent, CURL_READFUNC_ABORT, CURL_READFUNC_PAUSE,
 };
 use crate::url::{CurlUPart, CurlUrl};
 
@@ -465,6 +467,25 @@ pub enum RequestBody {
     /// (un-chunked) bytes; the codec frames them via
     /// [`super::chunks::encode_chunked`] when sending.
     Chunked(Vec<u8>),
+    /// A body **streamed** incrementally from the upload read source rather than
+    /// buffered in memory. Carries only the framing *metadata* — the known body
+    /// `size` (advertised via `Content-Length` when `chunked` is `false`) and
+    /// whether the application requested `Transfer-Encoding: chunked`. The actual
+    /// bytes are pulled, ~64 KiB at a time, from the
+    /// [`upload_source`](H1Exchange::upload_source) the engine installs on the
+    /// exchange (see [`H1Exchange::set_upload_source`]), so a multi-gigabyte
+    /// upload uses bounded memory (QA F11-PERF Issue #5). The engine selects this
+    /// variant only when the upload is provably single-pass — a known size, no
+    /// redirect-following, and no reactive auth — so the source is never re-read.
+    Streaming {
+        /// The total body length, when known. `Some(n)` advertises
+        /// `Content-Length: n`; `None` is only valid together with `chunked`.
+        size: Option<u64>,
+        /// `true` when the application announced `Transfer-Encoding: chunked`
+        /// (each ~64 KiB read is framed as one chunk; a terminal `0\r\n\r\n`
+        /// closes the body). `false` sends the raw bytes under `Content-Length`.
+        chunked: bool,
+    },
 }
 
 /// How the **response** body is delimited on the wire — the result of curl's
@@ -1091,13 +1112,23 @@ struct ParsedHead {
 /// [`ResponseEvent::HeadersComplete`] and the transfer writer chain decodes it.
 /// This codec only **de-frames** the body (Content-Length, chunked, or
 /// close-delimited).
-pub struct H1Exchange<C: ByteStream> {
+pub struct H1Exchange<'u, C: ByteStream> {
     /// The underlying byte stream (connection adapter or test mock).
     conn: C,
     /// The serialized request head (request line + headers + CRLF).
     head: Vec<u8>,
     /// The request body to send after the head.
     body: RequestBody,
+    /// The upload read source for a [`RequestBody::Streaming`] body, installed
+    /// by the engine via [`set_upload_source`](Self::set_upload_source). `None`
+    /// for buffered (`Sized`/`Chunked`) bodies and GET/HEAD. The borrow lives on
+    /// the engine's transfer stack frame for the duration of the exchange; it is
+    /// only ever read once (the engine gates streaming to single-pass uploads).
+    upload_source: Option<&'u mut dyn ReadCallback>,
+    /// The send-direction rate limiter for a streaming upload
+    /// (`CURLOPT_MAX_SEND_SPEED_LARGE` / `--limit-rate`), applied between chunks.
+    /// `None` when the upload is unthrottled. QA F11-PERF Issue #4 (send half).
+    upload_rate: Option<RateLimit>,
     /// Whether `Expect: 100-continue` was announced.
     expect_100: bool,
     /// How long to wait for the interim `100` before sending the body anyway.
@@ -1149,7 +1180,7 @@ pub struct H1Exchange<C: ByteStream> {
     pending_error: Option<CurlError>,
 }
 
-impl<C: ByteStream> H1Exchange<C> {
+impl<'u, C: ByteStream> H1Exchange<'u, C> {
     /// Build an exchange from a prepared [`RequestPlan`] over the byte stream
     /// `conn`.
     ///
@@ -1162,6 +1193,8 @@ impl<C: ByteStream> H1Exchange<C> {
             conn,
             head: plan.head,
             body: plan.body,
+            upload_source: None,
+            upload_rate: None,
             expect_100: plan.expect_100,
             expect_100_timeout: plan.expect_100_timeout,
             no_body: plan.no_body,
@@ -1192,6 +1225,24 @@ impl<C: ByteStream> H1Exchange<C> {
     /// Left off for the WebSocket upgrade path (a 101 carries no decodable body).
     pub(crate) fn set_transfer_decoding(&mut self, enabled: bool) {
         self.transfer_decoding = enabled;
+    }
+
+    /// Install the upload read `source` (and optional send-rate `rate`) that a
+    /// [`RequestBody::Streaming`] body pulls from when the request body is sent.
+    ///
+    /// The engine calls this for an upload it has determined is provably
+    /// single-pass (known size, no redirect-following, no reactive auth), so the
+    /// source is read straight through exactly once with no rewind. For buffered
+    /// bodies it is never called and the source stays untouched. `rate` carries
+    /// `CURLOPT_MAX_SEND_SPEED_LARGE` / `--limit-rate` for the send direction;
+    /// `None` leaves the upload unthrottled.
+    pub(crate) fn set_upload_source(
+        &mut self,
+        source: &'u mut dyn ReadCallback,
+        rate: Option<RateLimit>,
+    ) {
+        self.upload_source = Some(source);
+        self.upload_rate = rate;
     }
 
     /// The parsed response status code (valid once the head has been read).
@@ -1275,7 +1326,7 @@ impl<C: ByteStream> H1Exchange<C> {
         Ok(())
     }
 
-    /// Send the request body (sized verbatim, or chunk-framed).
+    /// Send the request body (sized verbatim, chunk-framed, or streamed).
     async fn send_body_now(&mut self) -> Result<()> {
         let body = core::mem::take(&mut self.body);
         match body {
@@ -1285,7 +1336,80 @@ impl<C: ByteStream> H1Exchange<C> {
                 let framed = super::chunks::encode_chunked(&bytes, None);
                 send_all(&mut self.conn, &framed).await
             }
+            RequestBody::Streaming { chunked, .. } => self.stream_upload(chunked).await,
         }
+    }
+
+    /// Stream the request body incrementally from the installed
+    /// [`upload_source`](Self::upload_source), in ~64 KiB reads, rather than
+    /// buffering it in memory. This is the bounded-memory upload path (QA
+    /// F11-PERF Issue #5): a multi-gigabyte `-T` upload sends with a flat
+    /// resident set instead of materializing the whole file.
+    ///
+    /// When `chunked` is `true` each read is framed as one `Transfer-Encoding:
+    /// chunked` chunk (hex length, the data, then a terminal `0\r\n\r\n` at
+    /// EOF); otherwise the raw bytes are written under the `Content-Length` the
+    /// head already advertised. Between writes the send-direction rate limiter
+    /// (`CURLOPT_MAX_SEND_SPEED_LARGE` / `--limit-rate`, QA Issue #4 send half)
+    /// paces the upload using curl's windowed `wait_time`.
+    ///
+    /// The engine installs the source only for a provably single-pass upload
+    /// (known size, no redirect-following, no reactive auth), so the source is
+    /// read straight through exactly once; a mid-stream
+    /// [`CURL_READFUNC_PAUSE`] cannot be honored on a one-shot stream and is a
+    /// read error (matching the buffered `read_full_upload`), and
+    /// [`CURL_READFUNC_ABORT`] aborts the transfer.
+    async fn stream_upload(&mut self, chunked: bool) -> Result<()> {
+        // Heap buffer (not a stack array) so the 64 KiB block does not bloat the
+        // size of this async fn's future.
+        let mut buf = vec![0u8; super::chunks::CURL_CHUNKED_MAXLEN];
+        let mut sent_total: u64 = 0;
+        loop {
+            // Pull the next block from the upload source. The source borrow is
+            // released as soon as the synchronous read returns, before the body
+            // bytes are written to the connection (which reborrows `self.conn`).
+            let n = {
+                let source = self
+                    .upload_source
+                    .as_deref_mut()
+                    .ok_or(CurlError::ReadError)?;
+                source.read(&mut buf)
+            };
+            match n {
+                0 => break,
+                CURL_READFUNC_ABORT => return Err(CurlError::AbortedByCallback),
+                CURL_READFUNC_PAUSE => return Err(CurlError::ReadError),
+                n if n <= buf.len() => {
+                    if chunked {
+                        // Frame this read as one chunk (hex length + CRLF + data
+                        // + CRLF); the terminal zero-length chunk is sent at EOF.
+                        let mut framed = Vec::with_capacity(n + 16);
+                        framed.extend_from_slice(format!("{n:x}\r\n").as_bytes());
+                        framed.extend_from_slice(&buf[..n]);
+                        framed.extend_from_slice(b"\r\n");
+                        send_all(&mut self.conn, &framed).await?;
+                    } else {
+                        send_all(&mut self.conn, &buf[..n]).await?;
+                    }
+                    sent_total += n as u64;
+                    // Pace the upload between writes (curl's windowed rate
+                    // limiter), mirroring the download throttle in the transfer
+                    // engine. Unlimited transfers carry no limiter (`None`).
+                    if let Some(rl) = self.upload_rate.as_mut() {
+                        let delay = rl.wait_time(Direction::Upload, sent_total, Instant::now());
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                }
+                _ => return Err(CurlError::ReadError),
+            }
+        }
+        if chunked {
+            // Terminal zero-length chunk closes the chunked body.
+            send_all(&mut self.conn, b"0\r\n\r\n").await?;
+        }
+        Ok(())
     }
 
     /// Wait (bounded by [`Self::expect_100_timeout`]) for an interim response
@@ -1704,7 +1828,7 @@ impl<C: ByteStream> H1Exchange<C> {
     }
 }
 
-impl<C: ByteStream> ProtocolExchange for H1Exchange<C> {
+impl<'u, C: ByteStream> ProtocolExchange for H1Exchange<'u, C> {
     async fn next_event(&mut self) -> Result<ResponseEvent> {
         if !self.sent {
             self.start().await?;
@@ -2738,7 +2862,7 @@ mod tests {
     }
 
     /// Drive an exchange to completion, collecting every event.
-    async fn drive_all<C: ByteStream>(ex: &mut H1Exchange<C>) -> Result<Vec<ResponseEvent>> {
+    async fn drive_all<C: ByteStream>(ex: &mut H1Exchange<'_, C>) -> Result<Vec<ResponseEvent>> {
         let mut events = Vec::new();
         loop {
             let ev = ex.next_event().await?;

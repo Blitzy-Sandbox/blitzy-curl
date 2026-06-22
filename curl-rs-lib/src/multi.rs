@@ -344,50 +344,57 @@ impl std::fmt::Debug for CurlMsg {
 
 /// The multi-handle option selectors, equivalent to C's `CURLMoption`.
 ///
-/// The discriminants match `include/curl/multi.h` exactly so the FFI variadic
-/// `curl_multi_setopt` shim can map a raw tag straight to this enum and then
-/// build the corresponding [`MultiOption`] payload.
+/// The discriminants match `include/curl/multi.h` exactly: each selector is
+/// `CURLOPTTYPE_<kind> + ordinal`, where the type bases are
+/// `CURLOPTTYPE_LONG = 0`, `CURLOPTTYPE_OBJECTPOINT = 10000`,
+/// `CURLOPTTYPE_FUNCTIONPOINT = 20000`, and `CURLOPTTYPE_OFF_T = 30000`
+/// (`include/curl/curl.h`). This is the actual integer a C caller passes to
+/// `curl_multi_setopt`, so the FFI variadic shim can map a raw tag straight to
+/// this enum (via [`from_raw`](CurlMOption::from_raw)) and then build the
+/// corresponding [`MultiOption`] payload. Using bare ordinals here would reject
+/// every non-`LONG` option as `CURLM_UNKNOWN_OPTION` (only `LONG` options, whose
+/// base is `0`, would coincidentally match) — see QA F11-PERF Issue #2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(i32)]
 pub enum CurlMOption {
-    /// `CURLMOPT_SOCKETFUNCTION` (1).
-    SocketFunction = 1,
-    /// `CURLMOPT_SOCKETDATA` (2).
-    SocketData = 2,
-    /// `CURLMOPT_PIPELINING` (3).
+    /// `CURLMOPT_SOCKETFUNCTION` — `CURLOPTTYPE_FUNCTIONPOINT + 1` (20001).
+    SocketFunction = 20001,
+    /// `CURLMOPT_SOCKETDATA` — `CURLOPTTYPE_OBJECTPOINT + 2` (10002).
+    SocketData = 10002,
+    /// `CURLMOPT_PIPELINING` — `CURLOPTTYPE_LONG + 3` (3).
     Pipelining = 3,
-    /// `CURLMOPT_TIMERFUNCTION` (4).
-    TimerFunction = 4,
-    /// `CURLMOPT_TIMERDATA` (5).
-    TimerData = 5,
-    /// `CURLMOPT_MAXCONNECTS` (6).
+    /// `CURLMOPT_TIMERFUNCTION` — `CURLOPTTYPE_FUNCTIONPOINT + 4` (20004).
+    TimerFunction = 20004,
+    /// `CURLMOPT_TIMERDATA` — `CURLOPTTYPE_OBJECTPOINT + 5` (10005).
+    TimerData = 10005,
+    /// `CURLMOPT_MAXCONNECTS` — `CURLOPTTYPE_LONG + 6` (6).
     MaxConnects = 6,
-    /// `CURLMOPT_MAX_HOST_CONNECTIONS` (7).
+    /// `CURLMOPT_MAX_HOST_CONNECTIONS` — `CURLOPTTYPE_LONG + 7` (7).
     MaxHostConnections = 7,
-    /// `CURLMOPT_MAX_PIPELINE_LENGTH` (8) — retained but inert.
+    /// `CURLMOPT_MAX_PIPELINE_LENGTH` — `CURLOPTTYPE_LONG + 8` (8); inert.
     MaxPipelineLength = 8,
-    /// `CURLMOPT_CONTENT_LENGTH_PENALTY_SIZE` (9) — retained but inert.
-    ContentLengthPenaltySize = 9,
-    /// `CURLMOPT_CHUNK_LENGTH_PENALTY_SIZE` (10) — retained but inert.
-    ChunkLengthPenaltySize = 10,
-    /// `CURLMOPT_PIPELINING_SITE_BL` (11) — retained but inert.
-    PipeliningSiteBl = 11,
-    /// `CURLMOPT_PIPELINING_SERVER_BL` (12) — retained but inert.
-    PipeliningServerBl = 12,
-    /// `CURLMOPT_MAX_TOTAL_CONNECTIONS` (13).
+    /// `CURLMOPT_CONTENT_LENGTH_PENALTY_SIZE` — `CURLOPTTYPE_OFF_T + 9` (30009); inert.
+    ContentLengthPenaltySize = 30009,
+    /// `CURLMOPT_CHUNK_LENGTH_PENALTY_SIZE` — `CURLOPTTYPE_OFF_T + 10` (30010); inert.
+    ChunkLengthPenaltySize = 30010,
+    /// `CURLMOPT_PIPELINING_SITE_BL` — `CURLOPTTYPE_OBJECTPOINT + 11` (10011); inert.
+    PipeliningSiteBl = 10011,
+    /// `CURLMOPT_PIPELINING_SERVER_BL` — `CURLOPTTYPE_OBJECTPOINT + 12` (10012); inert.
+    PipeliningServerBl = 10012,
+    /// `CURLMOPT_MAX_TOTAL_CONNECTIONS` — `CURLOPTTYPE_LONG + 13` (13).
     MaxTotalConnections = 13,
-    /// `CURLMOPT_PUSHFUNCTION` (14).
-    PushFunction = 14,
-    /// `CURLMOPT_PUSHDATA` (15).
-    PushData = 15,
-    /// `CURLMOPT_MAX_CONCURRENT_STREAMS` (16).
+    /// `CURLMOPT_PUSHFUNCTION` — `CURLOPTTYPE_FUNCTIONPOINT + 14` (20014).
+    PushFunction = 20014,
+    /// `CURLMOPT_PUSHDATA` — `CURLOPTTYPE_OBJECTPOINT + 15` (10015).
+    PushData = 10015,
+    /// `CURLMOPT_MAX_CONCURRENT_STREAMS` — `CURLOPTTYPE_LONG + 16` (16).
     MaxConcurrentStreams = 16,
-    /// `CURLMOPT_NETWORK_CHANGED` (17).
+    /// `CURLMOPT_NETWORK_CHANGED` — `CURLOPTTYPE_LONG + 17` (17).
     NetworkChanged = 17,
-    /// `CURLMOPT_NOTIFYFUNCTION` (18).
-    NotifyFunction = 18,
-    /// `CURLMOPT_NOTIFYDATA` (19).
-    NotifyData = 19,
+    /// `CURLMOPT_NOTIFYFUNCTION` — `CURLOPTTYPE_FUNCTIONPOINT + 18` (20018).
+    NotifyFunction = 20018,
+    /// `CURLMOPT_NOTIFYDATA` — `CURLOPTTYPE_OBJECTPOINT + 19` (10019).
+    NotifyData = 10019,
 }
 
 impl CurlMOption {
@@ -401,26 +408,28 @@ impl CurlMOption {
     /// an unrecognized value.
     #[must_use]
     pub const fn from_raw(value: i32) -> Option<CurlMOption> {
+        // Values are the public `CURLMOPT_*` integers (`CURLOPTTYPE_<kind> +
+        // ordinal`); see the enum doc. Keep this in lockstep with the variants.
         match value {
-            1 => Some(CurlMOption::SocketFunction),
-            2 => Some(CurlMOption::SocketData),
+            20001 => Some(CurlMOption::SocketFunction),
+            10002 => Some(CurlMOption::SocketData),
             3 => Some(CurlMOption::Pipelining),
-            4 => Some(CurlMOption::TimerFunction),
-            5 => Some(CurlMOption::TimerData),
+            20004 => Some(CurlMOption::TimerFunction),
+            10005 => Some(CurlMOption::TimerData),
             6 => Some(CurlMOption::MaxConnects),
             7 => Some(CurlMOption::MaxHostConnections),
             8 => Some(CurlMOption::MaxPipelineLength),
-            9 => Some(CurlMOption::ContentLengthPenaltySize),
-            10 => Some(CurlMOption::ChunkLengthPenaltySize),
-            11 => Some(CurlMOption::PipeliningSiteBl),
-            12 => Some(CurlMOption::PipeliningServerBl),
+            30009 => Some(CurlMOption::ContentLengthPenaltySize),
+            30010 => Some(CurlMOption::ChunkLengthPenaltySize),
+            10011 => Some(CurlMOption::PipeliningSiteBl),
+            10012 => Some(CurlMOption::PipeliningServerBl),
             13 => Some(CurlMOption::MaxTotalConnections),
-            14 => Some(CurlMOption::PushFunction),
-            15 => Some(CurlMOption::PushData),
+            20014 => Some(CurlMOption::PushFunction),
+            10015 => Some(CurlMOption::PushData),
             16 => Some(CurlMOption::MaxConcurrentStreams),
             17 => Some(CurlMOption::NetworkChanged),
-            18 => Some(CurlMOption::NotifyFunction),
-            19 => Some(CurlMOption::NotifyData),
+            20018 => Some(CurlMOption::NotifyFunction),
+            10019 => Some(CurlMOption::NotifyData),
             _ => None,
         }
     }
@@ -701,6 +710,57 @@ struct Completion {
     result: Result<(), CurlError>,
 }
 
+/// A socket-interest report sent from a driving Tokio task back to the
+/// [`Multi`] over the dedicated socket-event channel.
+///
+/// The async transfer task owns the real I/O on the Tokio reactor and cannot
+/// touch the `Multi` directly (it lives on another thread). When the connection
+/// layer learns the transfer's socket and its read/write interest
+/// (`crate::protocols::http::report_socket_to_observer`), it reports it by value
+/// via a [`TaskSocketObserver`]; the `Multi` drains these during reaping and
+/// fires `CURLMOPT_SOCKETFUNCTION` on its own thread — the production driver of
+/// curl's `lib/multi_ev.c` socket-callback contract (AAP §0.7.4, QA F11-PERF
+/// Issue #2 Layer 2). `CURL_POLL_REMOVE` is emitted by the `Multi` itself when
+/// the transfer completes or is removed (it owns the per-transfer fd map), not
+/// reported by the task.
+struct SocketEvent {
+    /// The [`ManagedTransfer::mid`] of the reporting transfer, so the `Multi`
+    /// records which fds belong to which transfer (for `CURL_POLL_REMOVE`).
+    mid: u64,
+    /// The transfer's socket descriptor (`curl_socket_t`), or `< 0` if none.
+    fd: i64,
+    /// The reported I/O interest — a `CURL_POLL_IN`/`OUT`/`INOUT`/`NONE` value.
+    what: i32,
+}
+
+/// The per-task [`SocketObserver`](crate::transfer::SocketObserver) the
+/// [`Multi`] installs on each easy handle before its transfer task runs.
+///
+/// It is the bridge from the connection layer (which discovers the real socket)
+/// back to the `Multi`: each `on_socket` report is forwarded — tagged with the
+/// transfer's `mid` — over the socket-event channel. The `Multi` drains the
+/// channel on its owning thread and invokes the C socket callback there, so the
+/// callback never runs on a Tokio worker thread (matching curl's single-thread
+/// multi contract).
+struct TaskSocketObserver {
+    /// The [`ManagedTransfer::mid`] this observer reports for.
+    mid: u64,
+    /// The sending half of the `Multi`'s socket-event channel.
+    socket_tx: UnboundedSender<SocketEvent>,
+}
+
+impl crate::transfer::SocketObserver for TaskSocketObserver {
+    fn on_socket(&self, fd: i64, what: i32) {
+        // If the receiver is gone (the Multi was dropped) the send fails and the
+        // report is simply discarded — there is nothing left to drive.
+        let _ = self.socket_tx.send(SocketEvent {
+            mid: self.mid,
+            fd,
+            what,
+        });
+    }
+}
+
 /// The outcome of one blocking wait inside [`poll`](Multi::poll) /
 /// [`wait`](Multi::wait): which `select!` arm fired.
 enum PollOutcome {
@@ -806,6 +866,17 @@ pub struct Multi {
     /// The last I/O interest (`CURL_POLL_*`) reported to the socket callback for
     /// each socket, used to diff changes (mirrors `lib/multi_ev.c`).
     socket_interest: HashMap<CurlSocket, i32>,
+    /// The sending half of the socket-interest channel, cloned into each spawned
+    /// task's [`TaskSocketObserver`]. See [`SocketEvent`].
+    socket_tx: UnboundedSender<SocketEvent>,
+    /// The receiving half of the socket-interest channel, drained in
+    /// [`drain_socket_events`](Multi::drain_socket_events).
+    socket_rx: UnboundedReceiver<SocketEvent>,
+    /// The set of socket descriptors currently reported by each running
+    /// transfer, keyed by [`ManagedTransfer::mid`]. Used to emit
+    /// `CURL_POLL_REMOVE` for every fd of a transfer when it completes or is
+    /// removed (curl removes a finished transfer's sockets from the pollset).
+    task_sockets: HashMap<u64, Vec<CurlSocket>>,
     /// The last timeout value reported to the timer callback, for the
     /// change-detection in [`update_timer`](Multi::update_timer) (`-1` initially,
     /// meaning "no timer set"; mirrors curl's `last_timeout_ms`).
@@ -835,6 +906,7 @@ impl Multi {
     #[must_use]
     pub fn new() -> Self {
         let (tx, rx) = unbounded_channel();
+        let (socket_tx, socket_rx) = unbounded_channel();
         Multi {
             transfers: Vec::new(),
             next_mid: 1,
@@ -862,6 +934,9 @@ impl Multi {
             max_concurrent_streams: 100,
             socket_data: HashMap::new(),
             socket_interest: HashMap::new(),
+            socket_tx,
+            socket_rx,
+            task_sockets: HashMap::new(),
             last_timeout_ms: -1,
             in_callback: false,
             dead: false,
@@ -963,6 +1038,14 @@ impl Multi {
             // ignored because no transfer with this mid remains.
             join.abort();
         }
+        // Tell an event-loop consumer to stop watching this transfer's
+        // socket(s) with CURL_POLL_REMOVE before the transfer disappears
+        // (curl removes a removed handle's sockets from the pollset). The
+        // `removed` transfer is no longer in `self.transfers`, so pass its easy
+        // handle directly. Any socket report still queued for this `mid` is
+        // harmlessly dropped by the next `drain_socket_events` (its `mid` is
+        // gone from `self.transfers`).
+        self.clear_task_sockets(removed.mid, Some(&removed.easy));
         // Drop any pending completion message belonging to the removed handle.
         self.msgs
             .retain(|m| !Arc::ptr_eq(&m.easy_handle, easy));
@@ -999,6 +1082,7 @@ impl Multi {
             let easy = Arc::clone(&self.transfers[idx].easy);
             let mid = self.transfers[idx].mid;
             let tx = self.tx.clone();
+            let socket_tx = self.socket_tx.clone();
             let join = handle.spawn(async move {
                 // The transfer engine (shared with curl_easy_perform via
                 // Easy::perform → crate::transfer) runs here. The async Mutex is
@@ -1006,6 +1090,16 @@ impl Multi {
                 // exclusive access to its handle for the duration of the run.
                 let result = {
                     let mut guard = easy.lock().await;
+                    // Install the socket observer so the connection layer reports
+                    // this transfer's real fd + interest back to the Multi,
+                    // driving CURLMOPT_SOCKETFUNCTION for event-loop consumers
+                    // (AAP §0.7.4, QA F11-PERF Issue #2 Layer 2). The observer is
+                    // installed under the same lock that guards the run, so it is
+                    // in place before any connection is established.
+                    guard.set_socket_observer(Arc::new(TaskSocketObserver {
+                        mid,
+                        socket_tx,
+                    }));
                     guard.perform().await
                 };
                 // If the receiver is gone (the Multi was dropped) the send fails
@@ -1029,11 +1123,70 @@ impl Multi {
     ///
     /// [`pending_completions`]: Multi::pending_completions
     fn reap_completions(&mut self) {
+        // Process socket-interest reports first so a transfer's fd is recorded
+        // (and CURLMOPT_SOCKETFUNCTION fired with CURL_POLL_IN/OUT) BEFORE its
+        // completion emits the matching CURL_POLL_REMOVE. A task enqueues its
+        // socket report (during perform) before its completion, and an unbounded
+        // send is immediately visible to `try_recv`; so if a completion is
+        // visible here, the socket event that preceded it is too — making the
+        // IN-then-REMOVE pairing race-free.
+        self.drain_socket_events();
         while let Some(completion) = self.pending_completions.pop_front() {
             self.apply_completion(completion);
         }
         while let Ok(completion) = self.rx.try_recv() {
             self.apply_completion(completion);
+        }
+    }
+
+    /// Drain the socket-event channel, firing `CURLMOPT_SOCKETFUNCTION` for each
+    /// reported interest change on the multi's own thread.
+    ///
+    /// This is the production path that makes the socket callback fire with a
+    /// real fd (QA F11-PERF Issue #2 Layer 2): a spawned transfer's connection
+    /// layer reports its socket via the [`TaskSocketObserver`]; here we record
+    /// the fd under the transfer's `mid` (so completion/removal can emit
+    /// `CURL_POLL_REMOVE`) and call
+    /// [`note_socket_interest`](Multi::note_socket_interest), which diffs against
+    /// the last interest and invokes the C callback only on a real change —
+    /// exactly curl's `lib/multi_ev.c` contract. A report for a transfer no
+    /// longer managed (already removed) is dropped: its fds were torn down with
+    /// `CURL_POLL_REMOVE` already.
+    fn drain_socket_events(&mut self) {
+        while let Ok(event) = self.socket_rx.try_recv() {
+            if event.fd < 0 {
+                continue;
+            }
+            let Some(pos) = self.transfers.iter().position(|t| t.mid == event.mid) else {
+                continue;
+            };
+            let easy = Arc::clone(&self.transfers[pos].easy);
+            // Record the fd for this transfer (scoped so the `task_sockets`
+            // borrow is released before `note_socket_interest` takes `&mut self`).
+            {
+                let fds = self.task_sockets.entry(event.mid).or_default();
+                if !fds.contains(&event.fd) {
+                    fds.push(event.fd);
+                }
+            }
+            let _ = self.note_socket_interest(event.fd, Some(&easy), event.what);
+        }
+    }
+
+    /// Emit `CURL_POLL_REMOVE` for every socket a transfer reported, and forget
+    /// them. Called when the transfer completes
+    /// ([`apply_completion`](Multi::apply_completion)) or is removed
+    /// ([`remove_handle`](Multi::remove_handle)) so an event-loop consumer stops
+    /// watching the fd — mirroring curl removing a finished transfer's sockets
+    /// from the pollset.
+    fn clear_task_sockets(&mut self, mid: u64, easy: Option<&SharedEasy>) {
+        // `remove` returns the owned Vec, so no `task_sockets` borrow is held
+        // across the `clear_socket_interest` calls (which take `&mut self`).
+        let Some(fds) = self.task_sockets.remove(&mid) else {
+            return;
+        };
+        for fd in fds {
+            let _ = self.clear_socket_interest(fd, easy);
         }
     }
 
@@ -1061,6 +1214,11 @@ impl Multi {
         self.transfers[idx].state = MultiState::Completed;
         self.transfers[idx].join = None;
         let easy = Arc::clone(&self.transfers[idx].easy);
+        // The transfer is done: tell an event-loop consumer to stop watching its
+        // socket(s) with CURL_POLL_REMOVE, matching curl's pollset teardown at
+        // transfer completion (AAP §0.7.4). No-op when no socket was reported
+        // (no observer, or a transfer that never reached connect).
+        self.clear_task_sockets(completion.mid, Some(&easy));
         let was_empty = self.msgs.is_empty();
         self.msgs.push_back(CurlMsg {
             msg: CurlMsgType::Done,
@@ -1675,6 +1833,22 @@ impl Multi {
         // First reap anything already finished so readiness is reported without
         // an unnecessary sleep.
         self.reap_completions();
+        // Start any just-added (Init) transfers before waiting. curl_multi_poll
+        // observes transfers that are already progressing on their sockets; our
+        // transfers progress on the Tokio runtime, and a transfer only begins
+        // making progress — and can therefore signal completion to wake this
+        // wait — once it is spawned. Without this, a poll-before-perform drive
+        // loop (e.g. `do { curl_multi_poll(...); curl_multi_perform(...); }`)
+        // would wait on a not-yet-started transfer and stall for the entire
+        // timeout, once per transfer (QA F11-PERF Issue #2 timing facet). This
+        // is idempotent: spawn_pending only starts transfers still in `Init`.
+        let spawn_code = self.spawn_pending();
+        if !spawn_code.is_ok() {
+            return (spawn_code, 0);
+        }
+        // Reap again: a previously-spawned transfer may have completed while we
+        // were setting up, so an already-finished multi need not sleep at all.
+        self.reap_completions();
         let running = self.running_count();
         let have_extra = !extra_fds.is_empty();
         // curl_multi_wait returns immediately when there is nothing to wait on;
@@ -1693,7 +1867,30 @@ impl Multi {
         // ready entry's `revents` and returns how many external fds were ready.
         let (outcome, ext_ready) = {
             let rx = &mut self.rx;
-            handle.block_on(wait_with_extra(extra_fds, wakeup, rx, duration))
+            if tokio::runtime::Handle::try_current().is_ok() {
+                // We are already inside a Tokio runtime — e.g. the CLI's
+                // `#[tokio::main(flavor = "current_thread")]` runtime driving
+                // `-Z/--parallel`. Calling `Handle::block_on` on this thread
+                // would panic with "Cannot start a runtime from within a
+                // runtime" (QA F11-PERF Issue #1). Drive the wait on a scoped
+                // helper thread that is not itself running a runtime; the multi
+                // runtime's `Handle` enters its own context there. The future is
+                // built and polled entirely on that thread (it never crosses the
+                // boundary); only `Send` state is captured by the closure — the
+                // `Handle` (Send + Sync), the `&mut [Waitfd]` (Waitfd: Send), the
+                // `&mut UnboundedReceiver<Completion>` (Completion: Send) and the
+                // `Arc<Notify>` — so the borrow-checked scoped thread is sound
+                // and is joined before `poll_core` returns.
+                std::thread::scope(|s| {
+                    s.spawn(|| handle.block_on(wait_with_extra(extra_fds, wakeup, rx, duration)))
+                        .join()
+                        .expect("multi poll wait helper thread panicked")
+                })
+            } else {
+                // No ambient runtime (the FFI `curl_multi_poll`/`wait` path):
+                // block directly on this thread, as before.
+                handle.block_on(wait_with_extra(extra_fds, wakeup, rx, duration))
+            }
         };
         // Internal-socket activity surfaces as a completion arriving; add the
         // application descriptors the wait reported ready (already in `revents`).
@@ -1736,6 +1933,13 @@ impl Multi {
         self.transfers.clear();
         self.msgs.clear();
         self.pending_completions.clear();
+        // Forget per-transfer socket tracking. We intentionally do NOT fire the
+        // socket callback with CURL_POLL_REMOVE here: cleanup runs from `Drop`,
+        // and invoking a user C callback during teardown (when its captured
+        // state may already be gone) is unsafe. Live transfers emit
+        // CURL_POLL_REMOVE on completion / `remove_handle` before this point.
+        self.task_sockets.clear();
+        self.socket_interest.clear();
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_background();
         }
@@ -2075,14 +2279,28 @@ mod tests {
 
     #[test]
     fn option_enum_round_trips() {
-        for raw in 1..=19 {
-            if let Some(option) = CurlMOption::from_raw(raw) {
-                assert_eq!(option.as_raw(), raw, "round-trip failed for {raw}");
-            }
+        // The full set of public `CURLMOPT_*` integers (`CURLOPTTYPE_<kind> +
+        // ordinal`, see the enum doc). Every one must round-trip exactly, and
+        // anything else must be rejected as unknown.
+        const ALL: &[i32] = &[
+            20001, 10002, 3, 20004, 10005, 6, 7, 8, 30009, 30010, 10011, 10012, 13, 20014, 10015,
+            16, 17, 20018, 10019,
+        ];
+        for &raw in ALL {
+            let option = CurlMOption::from_raw(raw)
+                .unwrap_or_else(|| panic!("expected a known multi option for {raw}"));
+            assert_eq!(option.as_raw(), raw, "round-trip failed for {raw}");
         }
-        // A couple of explicit anchors from include/curl/multi.h.
-        assert_eq!(CurlMOption::SocketFunction.as_raw(), 1);
-        assert_eq!(CurlMOption::from_raw(19), Some(CurlMOption::NotifyData));
+        // Explicit anchors from include/curl/multi.h: function-pointer options
+        // live in the FUNCTIONPOINT (20000) band and object-pointer options in
+        // the OBJECTPOINT (10000) band — not bare ordinals (QA Issue #2 L1).
+        assert_eq!(CurlMOption::SocketFunction.as_raw(), 20001);
+        assert_eq!(CurlMOption::TimerFunction.as_raw(), 20004);
+        assert_eq!(CurlMOption::from_raw(10019), Some(CurlMOption::NotifyData));
+        // Bare ordinals that used to (incorrectly) resolve must now be unknown,
+        // except where a LONG option legitimately occupies that integer.
+        assert_eq!(CurlMOption::from_raw(1), None);
+        assert_eq!(CurlMOption::from_raw(19), None);
         assert_eq!(CurlMOption::from_raw(9999), None);
     }
 

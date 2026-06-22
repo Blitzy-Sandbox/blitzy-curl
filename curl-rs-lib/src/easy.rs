@@ -74,7 +74,7 @@ use crate::headers::HeaderCollector;
 use crate::options::CurlOption;
 use crate::protocols::ws::{WsConnState, WsFrameMeta};
 use crate::setopt::{self, CDataPtr, OptionValue, StrId, UserDefined};
-use crate::transfer::{uc_to_curlcode, ReadCallback, WriteCallbacks};
+use crate::transfer::{uc_to_curlcode, MultiIoProvider, ReadCallback, WriteCallbacks};
 use crate::url::{CurlUPart, CurlUrl, CURLU_GUESS_SCHEME};
 
 // ===========================================================================
@@ -371,6 +371,48 @@ pub struct Easy {
     /// `failf` sites whose exact text differs from the static code description
     /// populate this today (e.g. the decompression-bomb diagnostic).
     last_error: Option<String>,
+    /// The front-end's factory for a multi-driven transfer's write sink and read
+    /// source (curl has no analog — this bridges the synchronous easy-path
+    /// sink/source seam to a transfer spawned on the multi handle's runtime).
+    ///
+    /// `None` for a handle driven only via `curl_easy_perform` (which supplies
+    /// its sink/source directly to [`perform_with`](Easy::perform_with)) or one
+    /// never wired by a front-end. When set — the FFI's `curl_multi_add_handle`
+    /// registers a bridge to the stored C callbacks; the CLI's `-Z` path
+    /// registers a sink targeting the transfer's `--output` — [`perform`](Easy::perform)
+    /// uses it so a multi-driven transfer routes body bytes to
+    /// `CURLOPT_WRITEFUNCTION` and pulls upload bytes from `CURLOPT_READFUNCTION`
+    /// exactly as the easy path does (QA F11-PERF Issue #6). Reset to `None` by
+    /// [`duphandle`](Easy::duphandle): a duplicated handle is re-wired by the
+    /// front-end when it is next added to a multi.
+    multi_io_provider: Option<std::sync::Arc<dyn MultiIoProvider>>,
+    /// The socket-interest observer for a multi-driven transfer (QA F11-PERF
+    /// Issue #2, §0.7.4), or `None` for a handle driven via `curl_easy_perform`
+    /// or not yet added to a multi.
+    ///
+    /// Installed by the multi handle in its task-spawn path (so it covers every
+    /// front-end uniformly — FFI, CLI `-Z`, and direct library use); the HTTP
+    /// connection setup calls [`SocketObserver::on_socket`] with the established
+    /// socket's fd and `CURL_POLL_*` interest, which the owning
+    /// [`Multi`](crate::multi::Multi) forwards to the consumer's
+    /// `CURLMOPT_SOCKETFUNCTION`. Reset to `None` by [`duphandle`](Easy::duphandle)
+    /// and re-installed when the duplicated handle is next driven through a multi.
+    socket_observer: Option<std::sync::Arc<dyn crate::transfer::SocketObserver>>,
+
+    /// The connection-reuse pool consulted by the HTTP connect path before
+    /// opening a fresh socket, and to which keep-alive-eligible connections are
+    /// returned on completion (the QA F11-PERF Issue 3 fix — curl's connection
+    /// cache / `conncache`).
+    ///
+    /// Each handle owns a private pool by default (`new`/`duphandle`), so
+    /// repeated `curl_easy_perform` calls on one handle reuse the same socket
+    /// (the `reuse.c` parity case). The CLI replaces it via
+    /// [`set_conn_pool`](Easy::set_conn_pool) with one pool shared across all
+    /// transfers of an operation, so a URL glob such as `"/get[1-10]"` — where
+    /// each iteration uses a fresh handle — still reuses connections, exactly as
+    /// curl shares the multi handle's cache. `Arc<Mutex<…>>` makes it safe to
+    /// consult from the per-transfer task on any runtime thread.
+    conn_pool: crate::conn::SharedPool,
 }
 
 // `Easy` is `Debug` (formerly derived) but the retained-connection fields hold
@@ -412,6 +454,11 @@ impl Easy {
             #[cfg(feature = "hsts")]
             hsts_store: None,
             last_error: None,
+            multi_io_provider: None,
+            socket_observer: None,
+            // A fresh per-handle connection-reuse pool: repeated performs on
+            // this handle reuse connections; the CLI may inject a shared one.
+            conn_pool: crate::conn::cache::new_shared_pool(4),
         }
     }
 
@@ -616,6 +663,15 @@ impl Easy {
             hsts_store: None,
             // A duplicated handle carries no latched failure diagnostic.
             last_error: None,
+            // A duplicated handle carries no multi-IO provider; the front-end
+            // re-registers one when the duplicate is next added to a multi.
+            multi_io_provider: None,
+            // Likewise no socket observer; the multi re-installs one when the
+            // duplicate is next driven through the multi interface.
+            socket_observer: None,
+            // A duplicated handle gets its OWN fresh reuse pool — curl's
+            // `curl_easy_duphandle` does not share the source's connection cache.
+            conn_pool: crate::conn::cache::new_shared_pool(4),
         }
     }
 
@@ -984,11 +1040,83 @@ impl Easy {
     /// handler's connect/transfer error, or [`CurlError::UnsupportedProtocol`]
     /// for a scheme with no registered handler.
     pub async fn perform(&mut self) -> Result<()> {
-        // curl's default client I/O (see the doc above). These owned sinks live
-        // only for the duration of the transfer.
+        // When a front-end has registered a multi-IO provider (the FFI bridging
+        // the consumer's `CURLOPT_WRITEFUNCTION`/`READFUNCTION`, or the CLI's
+        // `-Z` output sink), use it so a multi-driven transfer — whose task
+        // spawns on the multi handle's runtime and calls this method — routes
+        // body bytes to the user's write callback (honoring its abort return)
+        // and pulls upload bytes from the read callback, exactly as the easy
+        // path does (QA F11-PERF Issue #6). The `Arc` is cloned first so the
+        // field borrow is released before `perform_with` takes `&mut self`.
+        if let Some(provider) = self.multi_io_provider.clone() {
+            let (mut sink, mut source) = provider.make();
+            return self.perform_with(&mut *sink, &mut *source).await;
+        }
+        // No provider: curl's default client I/O (see the doc above). These
+        // owned sinks live only for the duration of the transfer.
         let mut sink = DefaultClientOutput::new();
         let mut source = DefaultClientInput;
         self.perform_with(&mut sink, &mut source).await
+    }
+
+    /// Register the front-end's factory for a multi-driven transfer's write sink
+    /// and read source (see [`MultiIoProvider`](crate::transfer::MultiIoProvider)).
+    ///
+    /// Called by a front-end before the handle is driven through the multi
+    /// interface: the FFI's `curl_multi_add_handle` registers a bridge to the
+    /// stored C callbacks, and the CLI's `-Z/--parallel` path registers a sink
+    /// targeting the transfer's `--output`. [`perform`](Easy::perform) then
+    /// routes a multi-driven transfer's body/upload bytes through these instead
+    /// of curl's stdout/stdin defaults (QA F11-PERF Issue #6).
+    pub fn set_multi_io_provider(&mut self, provider: std::sync::Arc<dyn MultiIoProvider>) {
+        self.multi_io_provider = Some(provider);
+    }
+
+    /// Install the socket-interest observer for a multi-driven transfer (see
+    /// [`SocketObserver`](crate::transfer::SocketObserver)).
+    ///
+    /// Called by the multi handle in its task-spawn path before driving the
+    /// transfer, so the HTTP connection setup can report the established
+    /// socket's fd and `CURL_POLL_*` interest back to the owning
+    /// [`Multi`](crate::multi::Multi) for delivery to `CURLMOPT_SOCKETFUNCTION`
+    /// (QA F11-PERF Issue #2, §0.7.4). A handle driven via `curl_easy_perform`
+    /// never has one installed, so the easy path reports nothing.
+    pub fn set_socket_observer(
+        &mut self,
+        observer: std::sync::Arc<dyn crate::transfer::SocketObserver>,
+    ) {
+        self.socket_observer = Some(observer);
+    }
+
+    /// The installed socket-interest observer, if this handle is being driven
+    /// through the multi interface (see
+    /// [`set_socket_observer`](Easy::set_socket_observer)). The HTTP engine
+    /// consults this once a connection's socket is established to report the fd
+    /// and its I/O interest; `None` on the easy path means no report is made.
+    #[must_use]
+    pub fn socket_observer(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::transfer::SocketObserver>> {
+        self.socket_observer.clone()
+    }
+
+    /// A cloned handle to this easy's connection-reuse pool (an
+    /// `Arc<Mutex<ConnectionPool>>`), for the HTTP connect path to check
+    /// connections out of and back into (QA F11-PERF Issue 3). Cloning the
+    /// `Arc` releases the borrow on the handle so the connect path can hold the
+    /// pool across `.await` points without borrowing `Easy`.
+    #[must_use]
+    pub fn conn_pool_handle(&self) -> crate::conn::SharedPool {
+        self.conn_pool.clone()
+    }
+
+    /// Replace this handle's connection-reuse pool with a shared one (QA
+    /// F11-PERF Issue 3). The CLI calls this so every transfer of an operation
+    /// — including each iteration of a URL glob, which uses a fresh handle —
+    /// shares one cache and reuses keep-alive connections, mirroring how curl
+    /// shares the multi handle's connection cache across its transfers.
+    pub fn set_conn_pool(&mut self, pool: crate::conn::SharedPool) {
+        self.conn_pool = pool;
     }
 
     /// Drive a single transfer to completion, delivering response body/header

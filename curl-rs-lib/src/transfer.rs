@@ -932,6 +932,63 @@ pub trait ReadCallback: Send {
     fn read(&mut self, buf: &mut [u8]) -> usize;
 }
 
+/// Builds the per-transfer write sink and read source for a transfer that the
+/// multi handle drives on its own Tokio runtime (`curl_multi_perform`).
+///
+/// `curl_easy_perform` runs on the caller's thread and can build a sink/source
+/// that borrows front-end state directly. A multi-driven transfer instead runs
+/// inside a task spawned on the multi handle's multi-thread runtime, so its
+/// sink/source must be `Send` and must not borrow the handle. A front-end
+/// (the FFI crate bridging raw `CURLOPT_WRITEFUNCTION`/`READFUNCTION` C
+/// callbacks, or the CLI driving `-Z/--parallel`) registers an implementor on
+/// the easy handle via [`Easy::set_multi_io_provider`](crate::Easy::set_multi_io_provider);
+/// [`Easy::perform`](crate::Easy::perform) then calls [`make`](MultiIoProvider::make)
+/// to obtain the same user-callback sink/source the easy path would use, so a
+/// transfer delivers body bytes to `CURLOPT_WRITEFUNCTION` (and honors its
+/// abort return) and pulls upload bytes from `CURLOPT_READFUNCTION` regardless
+/// of whether it is driven through the easy or multi interface (QA F11-PERF
+/// Issue #6). Without a provider, `perform` falls back to curl's defaults
+/// (stdout / stdin).
+///
+/// `make` returns freshly-owned trait objects each call (a transfer must not
+/// share sink state with another), and both are `Send` so the spawned task can
+/// hold them across `.await` points.
+pub trait MultiIoProvider: Send + Sync {
+    /// Construct the `(write sink, read source)` pair for one transfer.
+    fn make(&self) -> (Box<dyn WriteCallbacks>, Box<dyn ReadCallback>);
+}
+
+/// A sink for a multi-driven transfer's **socket-interest** notifications, so a
+/// `curl_multi` event-loop consumer's `CURLMOPT_SOCKETFUNCTION` learns which file
+/// descriptor to watch and in which direction (QA F11-PERF Issue #2, §0.7.4).
+///
+/// libcurl's multi interface tells an external event loop which sockets to poll
+/// via the socket callback; the loop then drives readiness back in through
+/// `curl_multi_socket_action`. In this async re-architecture the per-transfer
+/// Tokio task owns the real I/O on the runtime's reactor, so the connection
+/// layer cannot itself reach the [`Multi`](crate::multi::Multi) (it lives on
+/// another thread). Instead, when a handle is driven through the multi
+/// interface, the multi installs an observer on the easy handle via
+/// [`Easy::set_socket_observer`](crate::Easy::set_socket_observer); the
+/// connection setup then reports the established socket's descriptor and I/O
+/// interest through [`on_socket`](SocketObserver::on_socket). The observer
+/// forwards the event to the owning `Multi`, which invokes the consumer's
+/// `CURLMOPT_SOCKETFUNCTION` with curl-equivalent `CURL_POLL_*` semantics. The
+/// internal Tokio reactor remains the actual I/O driver — the callback is the
+/// observability/contract surface event loops depend on, not the driver.
+///
+/// Implementors must be `Send + Sync` because the observer is held by the easy
+/// handle while it is driven on the multi handle's multi-thread runtime, and is
+/// invoked from the transfer task.
+pub trait SocketObserver: Send + Sync {
+    /// Report that the transfer's socket `fd` now wants the I/O directions in
+    /// `what` (a `CURL_POLL_*` value: `IN`/`OUT`/`INOUT` to watch, or
+    /// `NONE`/`REMOVE` to stop watching). The owning multi diffs this against the
+    /// last reported interest and fires `CURLMOPT_SOCKETFUNCTION` only on a real
+    /// change, mirroring `lib/multi_ev.c`.
+    fn on_socket(&self, fd: i64, what: i32);
+}
+
 /// The result of pulling one block of upload data through [`UploadReader::read`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadStep {
