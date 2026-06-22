@@ -59,7 +59,7 @@ use std::time::Duration;
 use crate::conn::filters::{
     BoxFuture, CfState, ConnectionFilter, FilterChain, FilterData, CF_TYPE_SSL,
 };
-use crate::conn::happy_eyeballs::create_ip_happy_filter;
+use crate::conn::happy_eyeballs::create_ip_happy_filter_with_timeout;
 use crate::conn::haproxy::create_haproxy_filter;
 use crate::conn::https_connect::{
     create_tls_filter, create_tls_proxy_filter, Curl_cf_https_setup, H3ConnectorFn,
@@ -740,15 +740,27 @@ impl ConnectionFilter for SetupFilter {
 /// (`crate::conn::happy_eyeballs::create_ip_happy_filter`). The `transport` tag
 /// (TCP/UDP/QUIC/…) is captured here, which is why [`SetupFilter`] need not
 /// store it separately.
+///
+/// `connect_timeout_ms` arms the race's overall connect deadline
+/// (`CURLOPT_CONNECTTIMEOUT(_MS)` / `--connect-timeout`); `<= 0` means no connect
+/// deadline. Wiring it here is what makes the configured connect timeout
+/// effective — without it a black-hole peer would hang the connect indefinitely.
 #[must_use]
 pub fn eyeballs_factory(
     transport: u8,
     ip_version: IpVersion,
     happy_eyeballs_timeout_ms: i64,
+    connect_timeout_ms: i64,
     addrs: ResolvedAddrs,
 ) -> FilterFactory {
     Box::new(move || {
-        create_ip_happy_filter(transport, ip_version, happy_eyeballs_timeout_ms, addrs)
+        create_ip_happy_filter_with_timeout(
+            transport,
+            ip_version,
+            happy_eyeballs_timeout_ms,
+            connect_timeout_ms,
+            addrs,
+        )
     })
 }
 

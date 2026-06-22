@@ -1632,7 +1632,7 @@ async fn build_ssh_connection(data: &mut Easy, scheme: &'static Scheme) -> Resul
     conn.set_remote(host, port);
 
     // Plain TCP + happy-eyeballs; no TLS filter (russh owns transport crypto).
-    let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, addrs);
+    let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, data.set.connecttimeout, addrs);
     let dispatch = ConnSetup::Default(SetupConfig::new(CURL_CF_SSL_DISABLE, false, eyeballs));
     establish_connection(&mut conn, FIRSTSOCKET, CURL_CF_SSL_DISABLE, dispatch, true).await?;
     Ok(conn)
@@ -1894,5 +1894,104 @@ mod tests {
         assert_eq!(base64_string(b"").unwrap(), "");
         assert_eq!(base64_string(b"foo").unwrap(), "Zm9v");
     }
+
+    // ---- credential / key / working-path resolution (pure helpers) -------
+
+    use crate::options::CurlOption;
+    use crate::setopt::OptionValue;
+
+    fn ssh_conn(scheme: &Scheme) -> Connection {
+        let desc =
+            SchemeDescriptor::new(scheme.name, scheme.default_port, scheme.flags, scheme.protocol);
+        Connection::new(format!("{}:22", scheme.name), TRNSPRT_TCP, desc)
+    }
+
+    fn easy_with_url(url: &str) -> Easy {
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(url.to_string())),
+        )
+        .expect("set url");
+        e
+    }
+
+    #[test]
+    fn default_key_candidates_includes_home_then_bare() {
+        // With a home dir: the two ~/.ssh paths precede the bare fallbacks.
+        let with_home = default_key_candidates(Some("/home/bob"));
+        assert_eq!(
+            with_home,
+            vec![
+                "/home/bob/.ssh/id_rsa".to_string(),
+                "/home/bob/.ssh/id_dsa".to_string(),
+                "id_rsa".to_string(),
+                "id_dsa".to_string(),
+            ]
+        );
+        // Without a home dir: only the bare names remain.
+        assert_eq!(
+            default_key_candidates(None),
+            vec!["id_rsa".to_string(), "id_dsa".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_credentials_prefers_setopt_then_url() {
+        // setopt credentials win outright.
+        let mut e = easy_with_url("sftp://urluser:urlpass@host/dir");
+        e.setopt(
+            CurlOption::CURLOPT_USERNAME,
+            OptionValue::Str(Some("optuser".to_string())),
+        )
+        .unwrap();
+        e.setopt(
+            CurlOption::CURLOPT_PASSWORD,
+            OptionValue::Str(Some("optpass".to_string())),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_credentials(&e),
+            ("optuser".to_string(), "optpass".to_string())
+        );
+
+        // With no setopt credentials, the URL userinfo is used.
+        let e2 = easy_with_url("sftp://urluser:urlpass@host/dir");
+        assert_eq!(
+            resolve_credentials(&e2),
+            ("urluser".to_string(), "urlpass".to_string())
+        );
+    }
+
+    #[test]
+    fn get_working_path_scp_strips_home_relative_prefix() {
+        // SCP: a leading "/~/" is stripped (path becomes login-dir relative).
+        let conn = ssh_conn(&SCHEME_SCP);
+        let data = easy_with_url("scp://host/~/sub/file.txt");
+        assert_eq!(
+            get_working_path(&data, &conn, None).unwrap(),
+            "sub/file.txt"
+        );
+    }
+
+    #[test]
+    fn get_working_path_sftp_substitutes_homedir() {
+        // SFTP: "/~" is replaced by the captured home directory.
+        let conn = ssh_conn(&SCHEME_SFTP);
+        let data = easy_with_url("sftp://host/~/file.txt");
+        assert_eq!(
+            get_working_path(&data, &conn, Some("/home/bob")).unwrap(),
+            "/home/bob/file.txt"
+        );
+    }
+
+    #[test]
+    fn get_working_path_plain_path_is_unchanged() {
+        // A non home-relative path passes through verbatim.
+        let conn = ssh_conn(&SCHEME_SFTP);
+        let data = easy_with_url("sftp://host/etc/motd");
+        assert_eq!(get_working_path(&data, &conn, None).unwrap(), "/etc/motd");
+    }
 }
+
 

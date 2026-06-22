@@ -703,6 +703,113 @@ pub fn feature_bits() -> i32 {
 }
 
 // =============================================================================
+// curlinfo_capabilities() — the test-harness `CURL_DISABLE_*` capability table
+// =============================================================================
+
+/// Process-lifetime storage for the curlinfo capability table.
+static CURLINFO_CAPS: OnceLock<Vec<(&'static str, bool)>> = OnceLock::new();
+
+/// Builds the `(name, enabled)` capability table reported by the test harness's
+/// `curlinfo` helper (C `src/curlinfo.c`).
+///
+/// # Why this exists
+///
+/// `tests/runtests.pl` selects feature-gated tests from **two** sources: the
+/// `curl --version` capability line (covered by [`feature_names()`]), **and** a
+/// separate `curlinfo` helper that reports the `CURL_DISABLE_*` build gates
+/// which are deliberately *not* visible in `curl -V` (cookies, proxy, Mime,
+/// HTTP-auth, form-api, …). When `curlinfo` cannot be executed, the harness
+/// leaves every one of these `%feature` flags unset and **silently skips** the
+/// corresponding tests — making a "green" run untrustworthy (AAP §0.7.3).
+///
+/// The `curl-rs` binary therefore ships a `curlinfo` companion binary that
+/// prints this table verbatim, one `name: ON|OFF` line per entry, exactly as
+/// the harness's regex (`/([^:]*): ([ONF]*)/`) expects.
+///
+/// # Value derivation
+///
+/// The table mirrors `src/curlinfo.c` in the **same order and exact casing**
+/// (the harness matches these names against test `<features>` tags verbatim, so
+/// neither may drift). Each value is derived to stay truthful to the actual
+/// build:
+///
+/// * Feature-mapped gates derive from `cfg!(feature = "…")` so disabling a
+///   Cargo feature flips the reported capability in lockstep with the compiled
+///   behavior — `cookies`, `proxy`, `aws` (the `aws-sigv4` feature), and the
+///   HTTP-dependent `HTTP-auth`/`DoH` gates.
+/// * Always-compiled gates report `ON` (the C `CURL_DISABLE_*` macro is undefined
+///   in the default build and the corresponding behavior is non-optional here):
+///   `bindlocal`, `basic-auth`, `bearer-auth`, `digest`, `negotiate-auth`,
+///   `Mime`, `netrc`, `parsedate`, `shuffle-dns`, `typecheck`,
+///   `verbose-strings`, `wakeup`, `headers-api`, `form-api`, `sha512-256`,
+///   `--libcurl`, and `cert-status` (the CLI flag is supported).
+/// * Platform/width constants follow the build target: `xattr` is `ON` on Unix
+///   (curl's `USE_XATTR`, and `--xattr` is supported) and `OFF` on Windows;
+///   `large-time`/`large-size` are `ON` on 64-bit targets (`SIZEOF_*_T >= 5`);
+///   the two `win32-ca-*` entries are `OFF` off Windows.
+/// * Gates a default build does not enable report `OFF`: `override-dns`
+///   (needs `CURL_MEMDEBUG` + a fake/ares resolver) and `ssl-sessions`
+///   (`USE_SSLS_EXPORT`).
+///
+/// Because the default Cargo feature set equals curl's default build
+/// (AAP §0.6.2), a default `curl-rs` reports the same capabilities a default C
+/// `curlinfo` does, so the harness selects an identical subset of tests.
+fn build_curlinfo_capabilities() -> Vec<(&'static str, bool)> {
+    // `xattr` (C `USE_XATTR`) and the `win32-ca-*` entries are platform gated.
+    // Our build targets are Unix (Linux x86_64/aarch64, macOS x86_64/arm64),
+    // where xattr is available and the Windows CA-search paths never apply.
+    let xattr = cfg!(unix);
+    let win32_ca = cfg!(windows);
+    // `large-time`/`large-size` mirror `SIZEOF_TIME_T`/`SIZEOF_SIZE_T >= 5`:
+    // true on 64-bit (8-byte) targets.
+    let large = cfg!(target_pointer_width = "64");
+    vec![
+        ("bindlocal", true),
+        ("cookies", cfg!(feature = "cookies")),
+        ("basic-auth", true),
+        ("bearer-auth", true),
+        ("digest", true),
+        ("negotiate-auth", true),
+        ("aws", cfg!(feature = "aws-sigv4")),
+        ("DoH", cfg!(feature = "http")),
+        ("HTTP-auth", cfg!(feature = "http")),
+        ("Mime", true),
+        ("netrc", true),
+        ("parsedate", true),
+        ("proxy", cfg!(feature = "proxy")),
+        ("shuffle-dns", true),
+        ("typecheck", true),
+        ("verbose-strings", true),
+        ("wakeup", true),
+        ("headers-api", true),
+        ("xattr", xattr),
+        ("form-api", true),
+        ("large-time", large),
+        ("large-size", large),
+        ("sha512-256", true),
+        ("win32-ca-searchpath", win32_ca),
+        ("win32-ca-search-safe", win32_ca),
+        ("--libcurl", true),
+        ("override-dns", false),
+        ("ssl-sessions", false),
+        ("cert-status", true),
+    ]
+}
+
+/// Returns the `curlinfo` capability table — one `(name, enabled)` pair per
+/// `CURL_DISABLE_*`/build gate the test harness keys feature-gated selection on.
+///
+/// Built once and cached for the process lifetime. The companion `curlinfo`
+/// binary prints each entry as `"{name}: ON"` or `"{name}: OFF"`; see
+/// [`build_curlinfo_capabilities`] for the per-entry derivation and rationale.
+#[must_use]
+pub fn curlinfo_capabilities() -> &'static [(&'static str, bool)] {
+    CURLINFO_CAPS
+        .get_or_init(build_curlinfo_capabilities)
+        .as_slice()
+}
+
+// =============================================================================
 // VersionInfo — the safe mirror of struct curl_version_info_data
 // =============================================================================
 

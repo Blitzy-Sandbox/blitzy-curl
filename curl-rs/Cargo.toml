@@ -97,6 +97,26 @@ name = "curl-rs"
 path = "src/main.rs"
 
 # -----------------------------------------------------------------------------
+# Companion binary — the test-harness `curlinfo` capability probe.
+#
+# `tests/runtests.pl` execs `$CURLINFO` (`../src/curlinfo`, globalconfig.pm) and
+# reads one `name: ON|OFF` line per `CURL_DISABLE_*`/build gate — the gates that
+# are deliberately NOT shown in `curl -V` (cookies, proxy, Mime, HTTP-auth,
+# form-api, …). When this helper is absent the harness leaves those `%feature`
+# flags unset and SILENTLY SKIPS the corresponding tests, making a green run
+# untrustworthy (AAP §0.7.3). Shipping a `curlinfo`-equivalent is therefore a
+# G7 (test-suite-parity) requirement, mirroring the C `src/curlinfo.c` target
+# (`src/CMakeLists.txt` `add_executable(curlinfo …)`). The bin is named
+# `curlinfo` so the harness finds it at the canonical path; `src/bin/curlinfo.rs`
+# is the entrypoint and `default-run = "curl-rs"` keeps `cargo run` unambiguous.
+# The capability table itself is owned by `curl-rs-lib::version` so the values
+# stay in lockstep with the crate's compiled feature set.
+# -----------------------------------------------------------------------------
+[[bin]]
+name = "curlinfo"
+path = "src/bin/curlinfo.rs"
+
+# -----------------------------------------------------------------------------
 # Inherit the workspace-wide lint policy (root [workspace.lints], which the root
 # manifest invites every member to opt into). It enables
 # `unsafe_op_in_unsafe_fn = "deny"`. This CLI crate contains no `unsafe` of its

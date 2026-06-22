@@ -2037,6 +2037,59 @@ mod tests {
         assert_eq!(out, b"X\r\n");
     }
 
+    #[test]
+    fn dotstate_replays_failed_partial_match_as_body() {
+        // A CRLF that is NOT the end-of-body marker (it is followed by an
+        // ordinary body byte, not the `.`) must be replayed verbatim: those
+        // bytes are genuine message content, not framing. C `pop3_write`
+        // replays the matched prefix when the partial match fails.
+        let mut dot = DotState::default();
+        let mut out = Vec::new();
+        let done = dot.process(b"line1\r\nline2\r\n.\r\n", &mut out);
+        assert!(done, "terminating marker must complete the body");
+        // Both interior lines (with their CRLFs) are delivered intact.
+        assert_eq!(out, b"line1\r\nline2\r\n");
+    }
+
+    #[test]
+    fn dotstate_replays_lone_cr_prefix() {
+        // A bare CR (not followed by LF) advances the match to 1, then the next
+        // non-LF byte resets it; the single matched CR must be replayed as body.
+        let mut dot = DotState::default();
+        let mut out = Vec::new();
+        let done = dot.process(b"a\rb\r\n.\r\n", &mut out);
+        assert!(done);
+        assert_eq!(out, b"a\rb\r\n");
+    }
+
+    #[test]
+    fn dotstate_detects_marker_split_across_chunks() {
+        // The end-of-body marker `\r\n.\r\n` arrives split across three reads.
+        // Each partial read must withhold the in-progress marker (returning
+        // `false`) and only the final read that completes it returns `true`.
+        let mut dot = DotState::default();
+        let mut out = Vec::new();
+        assert!(!dot.process(b"data\r\n", &mut out), "mid-marker, not complete");
+        assert_eq!(out, b"data", "the partial CRLF is withheld, only body emitted");
+        assert!(!dot.process(b".", &mut out), "still mid-marker after the dot");
+        assert_eq!(out, b"data", "nothing more emitted while mid-marker");
+        assert!(dot.process(b"\r\n", &mut out), "final CRLF completes the marker");
+        // The marker's own leading CRLF is delivered as part of the message.
+        assert_eq!(out, b"data\r\n");
+    }
+
+    #[test]
+    fn dotstate_passes_through_body_without_marker() {
+        // A chunk with no marker bytes at all is emitted verbatim and reports
+        // "not complete" so the receiver keeps reading.
+        let mut dot = DotState::default();
+        let mut out = Vec::new();
+        let done = dot.process(b"plain body, no marker", &mut out);
+        assert!(!done, "no end-of-body marker present");
+        assert_eq!(out, b"plain body, no marker");
+    }
+
+
     // ---- percent-decoding (C `Curl_urldecode` stand-in) ------------------
 
     #[test]
@@ -2107,4 +2160,179 @@ mod tests {
         // Drained.
         assert!(handler.take_pending_body().is_empty());
     }
+
+    // ---- end-to-end session flow over a mock control connection ----------
+    //
+    // These drive the real async state machine (`connect` → greeting → `CAPA`
+    // → authentication, then `do_it` → command) against an in-memory filter
+    // pre-loaded with scripted server replies, exercising the wire-facing
+    // command construction and response dispatch that the pure-function tests
+    // above cannot reach.
+    mod flow {
+        use super::super::*;
+        use crate::conn::filters::{CfState, ConnectionFilter};
+        use crate::conn::{Connection, SchemeDescriptor, FIRSTSOCKET};
+        use crate::options::CurlOption;
+        use crate::setopt::OptionValue;
+        use std::sync::{Arc, Mutex};
+
+        const TRNSPRT_TCP: u8 = 3;
+
+        /// A connection filter that satisfies `send`/`recv` from in-memory
+        /// buffers; marked already-connected so I/O routes straight to it.
+        struct MockFilter {
+            state: CfState,
+            sent: Arc<Mutex<Vec<u8>>>,
+            recv_data: Arc<Mutex<Vec<u8>>>,
+        }
+
+        impl MockFilter {
+            fn new(recv_data: Arc<Mutex<Vec<u8>>>, sent: Arc<Mutex<Vec<u8>>>) -> Self {
+                Self {
+                    state: CfState {
+                        connected: true,
+                        ..Default::default()
+                    },
+                    sent,
+                    recv_data,
+                }
+            }
+        }
+
+        impl ConnectionFilter for MockFilter {
+            fn name(&self) -> &'static str {
+                "MOCK-POP3"
+            }
+            fn cf_state(&self) -> &CfState {
+                &self.state
+            }
+            fn cf_state_mut(&mut self) -> &mut CfState {
+                &mut self.state
+            }
+            fn send<'a>(&'a mut self, buf: &'a [u8], _eos: bool) -> BoxFuture<'a, Result<usize>> {
+                let sent = self.sent.clone();
+                let chunk = buf.to_vec();
+                Box::pin(async move {
+                    sent.lock().unwrap().extend_from_slice(&chunk);
+                    Ok(chunk.len())
+                })
+            }
+            fn recv<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxFuture<'a, Result<usize>> {
+                let queue = self.recv_data.clone();
+                Box::pin(async move {
+                    let mut guard = queue.lock().unwrap();
+                    let n = buf.len().min(guard.len());
+                    buf[..n].copy_from_slice(&guard[..n]);
+                    guard.drain(..n);
+                    Ok(n)
+                })
+            }
+        }
+
+        /// Build a mock POP3 control connection pre-loaded with the scripted
+        /// server replies, returning `(conn, sent)`. No proto-state is
+        /// installed — `connect` creates and installs the `Pop3Conn` itself.
+        fn make_pop3_conn(server: &[u8]) -> (Connection, Arc<Mutex<Vec<u8>>>) {
+            let scheme = &SCHEME_POP3;
+            let desc = SchemeDescriptor::new(
+                scheme.name,
+                scheme.default_port,
+                scheme.flags,
+                scheme.protocol,
+            );
+            let mut conn = Connection::new(
+                format!("{}:{}", scheme.name, scheme.default_port),
+                TRNSPRT_TCP,
+                desc,
+            );
+            conn.remote_host = "127.0.0.1".to_string();
+            let recv = Arc::new(Mutex::new(server.to_vec()));
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            conn.cfilter[FIRSTSOCKET].add_filter(Box::new(MockFilter::new(recv, sent.clone())));
+            (conn, sent)
+        }
+
+        fn with_url(url: &str) -> Easy {
+            let mut data = Easy::new();
+            data.setopt(
+                CurlOption::CURLOPT_URL,
+                OptionValue::Str(Some(url.to_string())),
+            )
+            .expect("set url");
+            data
+        }
+
+        fn sent_string(sent: &Arc<Mutex<Vec<u8>>>) -> String {
+            String::from_utf8(sent.lock().unwrap().clone()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn connect_cleartext_then_retr_marks_download() {
+            // Greeting → CAPA (-ERR ⇒ cleartext) → USER → PASS → then RETR.
+            // All replies are queued up front; the ping-pong engine buffers the
+            // pipelined overflow and replays it line-by-line, exactly as the C
+            // overflow-as-body path does.
+            let server = b"+OK POP3 server ready\r\n\
+                -ERR unknown command\r\n\
+                +OK user accepted\r\n\
+                +OK mailbox locked and ready\r\n\
+                +OK 12 octets\r\n";
+            let (mut conn, sent) = make_pop3_conn(server);
+            let mut data = with_url("pop3://bob:secret@127.0.0.1/1");
+
+            let handler = Pop3Protocol::new(&SCHEME_POP3);
+            handler.connect(&mut data, &mut conn).await.expect("connect");
+
+            let xfer = handler.do_it(&mut data, &mut conn).await.expect("do_it");
+            assert_eq!(xfer.direction, TransferDirection::Download);
+
+            let wire = sent_string(&sent);
+            assert!(wire.contains("CAPA\r\n"), "CAPA not sent: {wire:?}");
+            assert!(wire.contains("USER bob\r\n"), "USER wrong: {wire:?}");
+            assert!(wire.contains("PASS secret\r\n"), "PASS wrong: {wire:?}");
+            // The message id from the URL path is the RETR argument.
+            assert!(wire.contains("RETR 1\r\n"), "RETR wrong: {wire:?}");
+        }
+
+        #[tokio::test]
+        async fn connect_with_apop_greeting_authenticates_with_digest() {
+            // The greeting carries an RFC-1939 timestamp, so APOP is offered and
+            // (being preferred over cleartext) selected. The digest is
+            // MD5(timestamp ++ passwd); the RFC-1939 vector with password
+            // "tanstaaf" yields the well-known constant.
+            let server = b"+OK POP3 <1896.697170952@dbc.mtview.ca.us> ready\r\n\
+                -ERR unknown command\r\n\
+                +OK maildrop ready\r\n";
+            let (mut conn, sent) = make_pop3_conn(server);
+            let mut data = with_url("pop3://user:tanstaaf@127.0.0.1/");
+
+            let handler = Pop3Protocol::new(&SCHEME_POP3);
+            handler.connect(&mut data, &mut conn).await.expect("connect");
+
+            let wire = sent_string(&sent);
+            assert!(
+                wire.contains("APOP user c4c9334bac560ecc979e58001b3e22fb\r\n"),
+                "APOP digest line wrong: {wire:?}"
+            );
+            // Cleartext USER/PASS must NOT be used when APOP is selected.
+            assert!(!wire.contains("PASS "), "must not fall back to PASS: {wire:?}");
+        }
+
+        #[tokio::test]
+        async fn connect_pass_rejected_is_login_denied() {
+            // USER accepted, PASS rejected ⇒ the connect session fails with
+            // CURLE_LOGIN_DENIED (C `pop3_state_pass_resp`).
+            let server = b"+OK POP3 server ready\r\n\
+                -ERR unknown command\r\n\
+                +OK user accepted\r\n\
+                -ERR [AUTH] invalid password\r\n";
+            let (mut conn, _sent) = make_pop3_conn(server);
+            let mut data = with_url("pop3://bob:wrongpass@127.0.0.1/");
+
+            let handler = Pop3Protocol::new(&SCHEME_POP3);
+            let err = handler.connect(&mut data, &mut conn).await.unwrap_err();
+            assert_eq!(err, CurlError::LoginDenied);
+        }
+    }
+
 }

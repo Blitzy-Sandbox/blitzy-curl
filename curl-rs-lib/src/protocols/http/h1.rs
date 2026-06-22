@@ -67,6 +67,7 @@ use crate::url::{CurlUPart, CurlUrl};
 
 use super::chunks::ChunkedUnencoder;
 use super::proxy::{self, CustomHeaderContext};
+use crate::content_encoding::UnencodingStack;
 
 // ===========================================================================
 // Constants (oracle: lib/http.h, lib/urldata.h)
@@ -750,9 +751,21 @@ pub fn build_request(inputs: &RequestInputs<'_>) -> Result<RequestPlan> {
         hds.add("Authorization", auth)?;
     }
 
-    // H1_HD_RANGE.
+    // H1_HD_RANGE. Port of `http_range()` (lib/http.c): a byte range on a
+    // GET/HEAD *download* is sent as `Range: bytes=<range>` — the `bytes=`
+    // range-unit prefix is mandatory per RFC 7233 and curl always emits it.
+    // POST/PUT *uploads* use a `Content-Range` header instead (a distinct code
+    // path), so for non-download request kinds the raw range value is preserved
+    // here unchanged rather than being mislabeled with a `bytes=` unit.
     if let Some(range) = inputs.range {
-        hds.add("Range", range)?;
+        match inputs.method_kind {
+            HttpReq::Get | HttpReq::Head => {
+                hds.add("Range", &format!("bytes={range}"))?;
+            }
+            _ => {
+                hds.add("Range", range)?;
+            }
+        }
     }
 
     // H1_HD_USER_AGENT (only when non-empty, matching curl's guard).
@@ -898,7 +911,14 @@ pub fn build_request(inputs: &RequestInputs<'_>) -> Result<RequestPlan> {
     // tokens are emitted as a single header, and only when the application
     // supplied no `Connection:` of its own (the h1 path does not model curl's
     // interleaving of custom + internal `Connection:` values).
-    if !hds.contains("Connection") {
+    // When the application supplied its own `Connection:` value, curl MERGES the
+    // internal token(s) into it (`http_transfer_encoding` in `lib/http.c`
+    // rewrites the custom `Connection:` to append `TE`, e.g.
+    // `Connection: close, TE`) rather than emitting a duplicate header — so we
+    // splice the internal tokens onto the existing value and re-emit it (last,
+    // matching curl's emission order). With no custom `Connection:`, the tokens
+    // are emitted as a fresh `Connection:` header as before.
+    {
         let mut tokens: Vec<&str> = Vec::new();
         if inputs.te_gzip {
             tokens.push("TE");
@@ -907,7 +927,38 @@ pub fn build_request(inputs: &RequestInputs<'_>) -> Result<RequestPlan> {
             tokens.push("Upgrade");
         }
         if !tokens.is_empty() {
-            hds.add("Connection", &tokens.join(", "))?;
+            let internal = tokens.join(", ");
+            // Snapshot the application's `Connection:` values in order (cloned so
+            // the immutable borrow ends before the mutable `remove`/`add` below).
+            let existing: Vec<String> = hds
+                .iter()
+                .filter(|e| e.name().eq_ignore_ascii_case("Connection"))
+                .map(|e| e.value().to_string())
+                .collect();
+            if existing.is_empty() {
+                // No application `Connection:` — emit the internal token(s) as a
+                // fresh header (curl's `Connection: TE\r\n`).
+                hds.add("Connection", &internal)?;
+            } else {
+                // curl merges the internal token(s) into the FIRST application
+                // `Connection:` header and leaves any subsequent ones untouched
+                // (`Connection: this, TE` then `Connection: that`). An empty
+                // custom value (the `Header;` form) yields just the token(s)
+                // with no leading separator (`Connection: TE`).
+                hds.remove("Connection");
+                for (i, val) in existing.iter().enumerate() {
+                    if i == 0 {
+                        let merged = if val.is_empty() {
+                            internal.clone()
+                        } else {
+                            format!("{val}, {internal}")
+                        };
+                        hds.add("Connection", &merged)?;
+                    } else {
+                        hds.add("Connection", val)?;
+                    }
+                }
+            }
         }
     }
 
@@ -998,6 +1049,20 @@ struct ParsedHead {
     content_encoding: Option<String>,
     /// `true` if `Transfer-Encoding: chunked` is present.
     chunked: bool,
+    /// The non-`chunked` transfer codings (e.g. `gzip`, `deflate`) in the order
+    /// they were listed across the response's `Transfer-Encoding` header(s).
+    /// These drive the transfer-decode stack when the application opted into
+    /// transfer decoding (`CURLOPT_TRANSFER_ENCODING` / `--tr-encoding`); curl's
+    /// `CURL_CW_TRANSFER_DECODE` phase in `lib/content_encoding.c`. `chunked`
+    /// itself is excluded — this codec owns the chunked framing.
+    transfer_codings: Vec<String>,
+    /// `Some(i)` when a non-`chunked` transfer coding was listed *after*
+    /// `chunked` (RFC 9112 §6.1 forbids this — chunked must be the final
+    /// transfer coding). `i` is the index, in [`header_lines`], of the offending
+    /// `Transfer-Encoding` line. curl rejects such a response with
+    /// `CURLE_BAD_CONTENT_ENCODING` (61) after emitting the header lines that
+    /// *precede* the offending line (`Curl_build_unencoding_stack`).
+    te_violation_line: Option<usize>,
     /// `true` if a `Connection: close` token is present.
     connection_close: bool,
     /// `true` if a `Connection: keep-alive` token is present.
@@ -1065,6 +1130,23 @@ pub struct H1Exchange<C: ByteStream> {
     resp_minor: u8,
     /// Whether the connection may be kept alive for reuse after this response.
     keepalive: bool,
+    /// `true` when the application opted into transfer decoding
+    /// (`CURLOPT_TRANSFER_ENCODING` / `--tr-encoding`, i.e.
+    /// `data.set.http_transfer_encoding`). Gates both the transfer-decode of a
+    /// compressed `Transfer-Encoding` body and the chunked-not-last rejection,
+    /// exactly as curl gates its `is_transfer` branch on the same flag.
+    transfer_decoding: bool,
+    /// The transfer-decode stack (gzip/deflate/…) for a compressed
+    /// `Transfer-Encoding` response body, built from the non-`chunked` codings
+    /// in [`finish_head`](Self::finish_head) when [`transfer_decoding`] is set.
+    /// `None` means the de-framed body is delivered verbatim. Curl's
+    /// `CURL_CW_TRANSFER_DECODE` writer chain.
+    transfer_decoder: Option<UnencodingStack>,
+    /// A deferred error to surface after the queued header events drain — used
+    /// for the chunked-not-last rejection, where curl emits the header lines
+    /// preceding the offending `Transfer-Encoding` line and *then* fails with
+    /// `CURLE_BAD_CONTENT_ENCODING`.
+    pending_error: Option<CurlError>,
 }
 
 impl<C: ByteStream> H1Exchange<C> {
@@ -1095,7 +1177,21 @@ impl<C: ByteStream> H1Exchange<C> {
             status_code: 0,
             resp_minor: 0,
             keepalive: false,
+            transfer_decoding: false,
+            transfer_decoder: None,
+            pending_error: None,
         }
+    }
+
+    /// Opt into transfer decoding for this exchange (`CURLOPT_TRANSFER_ENCODING`
+    /// / `--tr-encoding`). When enabled, a compressed `Transfer-Encoding`
+    /// response body (e.g. `gzip`) is decoded after de-framing, and a response
+    /// listing a transfer coding after `chunked` is rejected with
+    /// `CURLE_BAD_CONTENT_ENCODING` — mirroring curl's `is_transfer` handling in
+    /// `lib/content_encoding.c` gated on `data.set.http_transfer_encoding`.
+    /// Left off for the WebSocket upgrade path (a 101 carries no decodable body).
+    pub(crate) fn set_transfer_decoding(&mut self, enabled: bool) {
+        self.transfer_decoding = enabled;
     }
 
     /// The parsed response status code (valid once the head has been read).
@@ -1156,25 +1252,25 @@ impl<C: ByteStream> H1Exchange<C> {
                     // Got the interim 100 → send the body, then read the real head.
                     self.send_body_now().await?;
                     let head = self.read_response_head().await?;
-                    self.finish_head(head);
+                    self.finish_head(head)?;
                 }
                 InterimOutcome::FinalResponse(head) => {
                     // The server answered without 100 (e.g. 417) → do not send
                     // the body; this is the final response.
-                    self.finish_head(head);
+                    self.finish_head(head)?;
                 }
                 InterimOutcome::TimedOut => {
                     // No interim within the window → send the body anyway (curl's
                     // behavior), then read the response.
                     self.send_body_now().await?;
                     let head = self.read_response_head().await?;
-                    self.finish_head(head);
+                    self.finish_head(head)?;
                 }
             }
         } else {
             self.send_body_now().await?;
             let head = self.read_response_head().await?;
-            self.finish_head(head);
+            self.finish_head(head)?;
         }
         Ok(())
     }
@@ -1291,21 +1387,96 @@ impl<C: ByteStream> H1Exchange<C> {
 
     /// Queue the status/header events and configure body framing from a parsed
     /// head.
-    fn finish_head(&mut self, head: ParsedHead) {
+    ///
+    /// # Errors
+    ///
+    /// [`CurlError::BadContentEncoding`] if `--tr-encoding` is in effect and the
+    /// transfer-decode stack cannot be built (curl's decompression-bomb guard).
+    /// The chunked-not-last rejection is *deferred* (queued via
+    /// [`pending_error`](Self::pending_error)) so the preceding header lines are
+    /// still delivered, matching curl's wire behavior.
+    fn finish_head(&mut self, head: ParsedHead) -> Result<()> {
         self.status_code = head.code;
         self.resp_minor = head.minor;
 
         self.pending.push_back(ResponseEvent::Status(head.code));
-        for line in &head.header_lines {
-            self.pending.push_back(ResponseEvent::Header(line.clone()));
-        }
-        self.pending.push_back(ResponseEvent::HeadersComplete {
-            content_length: head.content_length.and_then(|v| i64::try_from(v).ok()),
-            content_encoding: head.content_encoding.clone(),
-        });
 
+        // Chunked-not-last rejection (`--tr-encoding` only): curl writes the
+        // header lines that PRECEDE the offending `Transfer-Encoding` line, then
+        // fails the transfer with `CURLE_BAD_CONTENT_ENCODING` (61) — never
+        // emitting that line, the terminating blank line, the `HeadersComplete`
+        // event, or any body (`lib/content_encoding.c`
+        // `Curl_build_unencoding_stack`).
+        if self.transfer_decoding {
+            if let Some(bad) = head.te_violation_line {
+                for line in head.header_lines.iter().take(bad) {
+                    self.pending.push_back(ResponseEvent::Header(line.clone()));
+                }
+                self.body_done = true;
+                self.keepalive = false;
+                self.pending_error = Some(CurlError::BadContentEncoding);
+                return Ok(());
+            }
+        }
+
+        // Compute body framing first so the transfer-decode decision (which can
+        // override the framing) is settled BEFORE the `HeadersComplete` event is
+        // emitted. The transfer layer keys its short-read (`PartialFile`) check
+        // off the `content_length` reported here, so a transfer-decoded body
+        // must report an *unknown* length (curl's `k->ignore_cl = TRUE`).
         self.framing =
             response_body_framing(head.code, self.no_body, head.content_length, head.chunked);
+
+        // Transfer decoding (`--tr-encoding`): build the transfer-decode stack
+        // from the non-`chunked` transfer codings. This codec already handles
+        // the `chunked` framing above (`BodyFraming::Chunked`); the remaining
+        // codings (`gzip`, `deflate`, …) decode the de-framed body bytes. Gated
+        // on `data.set.http_transfer_encoding`, exactly as curl gates the
+        // `is_transfer` branch of `Curl_build_unencoding_stack`. There is no
+        // body to decode for a header-only framing (`HEAD`, 204/304, 1xx).
+        // `true` once the decompression-bomb guard trips (more than
+        // `MAX_ENCODE_STACK - 1` stacked codings). curl writes the full header
+        // block first — `Curl_build_unencoding_stack` runs at header-completion,
+        // *after* the headers have been emitted — then fails the transfer with
+        // the specific `failf` diagnostic. The error is therefore *deferred*
+        // (queued via [`pending_error`](Self::pending_error)) exactly like the
+        // chunked-not-last rejection above, so the headers still reach the client.
+        let mut encoding_bomb = false;
+        if self.transfer_decoding
+            && !head.transfer_codings.is_empty()
+            && !matches!(self.framing, BodyFraming::None)
+        {
+            let list = head.transfer_codings.join(", ");
+            // `--tr-encoding` is an explicit opt-in, so decoding is force-enabled
+            // (curl's `is_transfer && data->set.http_transfer_encoding`).
+            match UnencodingStack::from_content_encoding(&list, true) {
+                Ok(stack) => {
+                    if !stack.is_empty() {
+                        self.transfer_decoder = Some(stack);
+                    }
+                }
+                // Decompression-bomb guard → defer the `CURLE_BAD_CONTENT_ENCODING`
+                // (61) after the header block is written.
+                Err(CurlError::TooManyContentEncodings) => encoding_bomb = true,
+                Err(e) => return Err(e),
+            }
+        }
+
+        // curl ignores `Content-Length` for any transfer-coded body (RFC 7230
+        // §3.3.3: a present `Transfer-Encoding` makes `Content-Length` invalid)
+        // and sets `k->size = -1`. Report an unknown length so the transfer
+        // layer's short-read check is disabled; for a non-`chunked` coding it
+        // also `streamclose()`s, since the body is then delimited only by
+        // connection close (the encoded byte count is unreliable).
+        let mut report_content_length = head.content_length;
+        if self.transfer_decoder.is_some() {
+            report_content_length = None;
+            if matches!(self.framing, BodyFraming::ContentLength(_)) {
+                self.framing = BodyFraming::CloseDelimited;
+            }
+        }
+
+        // Configure per-framing read state from the FINAL framing.
         match self.framing {
             BodyFraming::ContentLength(len) => self.body_remaining = len,
             BodyFraming::Chunked => self.unchunker = Some(ChunkedUnencoder::new()),
@@ -1313,7 +1484,34 @@ impl<C: ByteStream> H1Exchange<C> {
             BodyFraming::CloseDelimited => {}
         }
 
+        for line in &head.header_lines {
+            self.pending.push_back(ResponseEvent::Header(line.clone()));
+        }
+        self.pending.push_back(ResponseEvent::HeadersComplete {
+            content_length: report_content_length.and_then(|v| i64::try_from(v).ok()),
+            content_encoding: head.content_encoding.clone(),
+        });
+
+        // Deferred decompression-bomb failure: the header block is now queued, so
+        // raise curl's `CURLE_BAD_CONTENT_ENCODING` (61) with the specific
+        // "more than 5 content encodings" diagnostic and deliver no body.
+        if encoding_bomb {
+            self.body_done = true;
+            self.keepalive = false;
+            self.pending_error = Some(CurlError::TooManyContentEncodings);
+            return Ok(());
+        }
+
         self.keepalive = self.compute_keepalive(&head);
+
+        // A non-`chunked` transfer coding forces connection close (curl's
+        // streamclose); chunked stays keep-alive-eligible since chunked framing
+        // is self-delimiting.
+        if self.transfer_decoder.is_some() && !matches!(self.framing, BodyFraming::Chunked) {
+            self.keepalive = false;
+        }
+
+        Ok(())
     }
 
     /// curl's keep-alive / connection-reuse decision for this response.
@@ -1341,6 +1539,87 @@ impl<C: ByteStream> H1Exchange<C> {
             BodyFraming::ContentLength(_) => self.read_body_content_length().await,
             BodyFraming::Chunked => self.read_body_chunked().await,
             BodyFraming::CloseDelimited => self.read_body_close().await,
+        }
+    }
+
+    /// Body event for a transfer-decoded response (`--tr-encoding`): read the
+    /// next de-framed chunk, feed it through the transfer-decode stack, and emit
+    /// the decoded output. Reads on (skips) chunks that produce no decoded bytes
+    /// (the decoder buffering input), and at end-of-body flushes the decoder's
+    /// buffered tail before the terminating [`ResponseEvent::End`]. Mirrors
+    /// curl's `CURL_CW_TRANSFER_DECODE` writer chain draining body writes.
+    async fn next_decoded_body_event(&mut self) -> Result<ResponseEvent> {
+        loop {
+            match self.read_body_chunk().await? {
+                Some(chunk) => {
+                    let mut out = Vec::new();
+                    {
+                        let dec = self
+                            .transfer_decoder
+                            .as_mut()
+                            .expect("transfer_decoder present");
+                        dec.write(true, &chunk, &mut |b| {
+                            out.extend_from_slice(b);
+                            Ok(())
+                        })?;
+                    }
+                    // The underlying framing can signal completion *together
+                    // with* the final data chunk: `read_body_chunked` sets
+                    // `body_done` and returns the last data in the SAME call when
+                    // the terminal `0`-chunk shares the buffer. Flush the
+                    // decoder's buffered tail now — otherwise `next_event` would
+                    // short-circuit on `body_done` and never call `finish`,
+                    // truncating the decoded body (the decoder may hold most of
+                    // its output until the stream's end, e.g. gzip's trailer).
+                    if self.body_done {
+                        {
+                            let dec = self
+                                .transfer_decoder
+                                .as_mut()
+                                .expect("transfer_decoder present");
+                            dec.finish(&mut |b| {
+                                out.extend_from_slice(b);
+                                Ok(())
+                            })?;
+                        }
+                        self.transfer_decoder = None;
+                        if !out.is_empty() {
+                            self.pending.push_back(ResponseEvent::End);
+                            return Ok(ResponseEvent::Body(out));
+                        }
+                        return Ok(ResponseEvent::End);
+                    }
+                    if !out.is_empty() {
+                        return Ok(ResponseEvent::Body(out));
+                    }
+                    // The decoder buffered this input without producing output
+                    // yet (e.g. a partial gzip member) — read the next chunk.
+                }
+                None => {
+                    // End of the de-framed body reported on its own read (e.g.
+                    // close-delimited framing): flush the decoder's buffered
+                    // tail. Any flushed bytes are delivered as a final `Body`
+                    // event, with `End` queued behind it.
+                    let mut out = Vec::new();
+                    {
+                        let dec = self
+                            .transfer_decoder
+                            .as_mut()
+                            .expect("transfer_decoder present");
+                        dec.finish(&mut |b| {
+                            out.extend_from_slice(b);
+                            Ok(())
+                        })?;
+                    }
+                    self.body_done = true;
+                    self.transfer_decoder = None;
+                    if !out.is_empty() {
+                        self.pending.push_back(ResponseEvent::End);
+                        return Ok(ResponseEvent::Body(out));
+                    }
+                    return Ok(ResponseEvent::End);
+                }
+            }
         }
     }
 
@@ -1434,8 +1713,20 @@ impl<C: ByteStream> ProtocolExchange for H1Exchange<C> {
         if let Some(ev) = self.pending.pop_front() {
             return Ok(ev);
         }
+        // Surface a deferred error (the chunked-not-last rejection) only after
+        // the queued header events have drained, so the preceding header lines
+        // reach the client first — matching curl's wire behavior.
+        if let Some(err) = self.pending_error.take() {
+            return Err(err);
+        }
         if self.body_done {
             return Ok(ResponseEvent::End);
+        }
+        // A compressed `Transfer-Encoding` body (`--tr-encoding`) is decoded
+        // through the transfer-decode stack; otherwise the de-framed body bytes
+        // are delivered verbatim.
+        if self.transfer_decoder.is_some() {
+            return self.next_decoded_body_event().await;
         }
         match self.read_body_chunk().await? {
             Some(chunk) => Ok(ResponseEvent::Body(chunk)),
@@ -1542,7 +1833,12 @@ fn header_has_token(value: &[u8], token: &[u8]) -> bool {
 /// (status line + headers + terminating blank line).
 fn parse_head_fields(head_bytes: &[u8]) -> ParsedHead {
     let mut head = ParsedHead::default();
-    for line in head_bytes.split_inclusive(|&c| c == b'\n') {
+    // Tracks whether a `chunked` transfer coding has been seen so far, in list
+    // order across all `Transfer-Encoding` header lines — curl's `has_chunked`
+    // in `Curl_build_unencoding_stack`. A subsequent non-`chunked` coding is a
+    // protocol violation (chunked must be last).
+    let mut seen_chunked = false;
+    for (line_index, line) in head_bytes.split_inclusive(|&c| c == b'\n').enumerate() {
         head.header_lines.push(line.to_vec());
         if let Some((name, value)) = parse_header_line(line) {
             if name.eq_ignore_ascii_case(b"content-length") {
@@ -1552,8 +1848,28 @@ fn parse_head_fields(head_bytes: &[u8]) -> ParsedHead {
                     }
                 }
             } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
-                if header_has_token(value, b"chunked") {
-                    head.chunked = true;
+                // Parse each coding token left-to-right (curl processes the
+                // comma list in order). `chunked` sets the framing and must be
+                // the LAST coding; any non-`chunked` coding seen after `chunked`
+                // is rejected with `CURLE_BAD_CONTENT_ENCODING` (RFC 9112 §6.1).
+                // Non-`chunked` codings are collected in order to build the
+                // transfer-decode stack (when `--tr-encoding` is in effect).
+                for tok in value.split(|&c| c == b',') {
+                    let t = trim_ascii_ws(tok);
+                    if t.is_empty() {
+                        continue;
+                    }
+                    if t.eq_ignore_ascii_case(b"chunked") {
+                        head.chunked = true;
+                        seen_chunked = true;
+                    } else {
+                        if seen_chunked && head.te_violation_line.is_none() {
+                            head.te_violation_line = Some(line_index);
+                        }
+                        if let Ok(s) = core::str::from_utf8(t) {
+                            head.transfer_codings.push(s.to_ascii_lowercase());
+                        }
+                    }
                 }
             } else if name.eq_ignore_ascii_case(b"content-encoding") {
                 if let Ok(s) = core::str::from_utf8(value) {

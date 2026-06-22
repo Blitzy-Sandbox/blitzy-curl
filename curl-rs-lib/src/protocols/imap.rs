@@ -240,6 +240,19 @@ pub struct Imapc {
     /// (the engine's own receive buffer is private). [`get_message`] reads its
     /// `+ ` continuation payload from here.
     resp_line: Vec<u8>,
+    /// Accumulated untagged data lines for a `LIST`/`SEARCH` transfer, captured
+    /// verbatim (including their trailing CRLF) as each `* …` data line is
+    /// matched in the `List`/`Search` state.
+    ///
+    /// Unlike a `FETCH` body — which arrives as a sized literal streamed off the
+    /// socket — a `LIST`/`SEARCH` listing has no up-front size: its body *is* the
+    /// set of untagged response lines, which the ping-pong engine consumes as
+    /// protocol lines during the DO dialogue. C `imap.c` writes each such line to
+    /// the client with `Curl_client_write(CLIENTWRITE_BODY, …)` as it is parsed;
+    /// this buffer is the Rust equivalent, drained to the client writer by
+    /// [`ImapHandler::transfer`] once the dialogue completes. Cleared at the
+    /// start of every `LIST`/`SEARCH` so a reused connection starts clean.
+    data_resp: Vec<u8>,
     /// Wire-ready command lines staged by the synchronous [`SaslProto`] methods,
     /// drained and sent by the async driver via [`PingPong::sendf`].
     staged: Vec<Vec<u8>>,
@@ -487,6 +500,7 @@ impl Imapc {
             mb_uidvalidity: None,
             download_size: None,
             resp_line: Vec::new(),
+            data_resp: Vec::new(),
             staged: Vec::new(),
         }
     }
@@ -1183,6 +1197,9 @@ impl Imapc {
             req.custom_params.as_deref(),
             req.mailbox.as_deref(),
         );
+        // Start a fresh listing body (a reused connection may carry data from a
+        // prior LIST/SEARCH on this handle).
+        self.data_resp.clear();
         self.send_command(data, conn, pp, cmd).await?;
         self.state = ImapState::List;
         Ok(())
@@ -1248,6 +1265,8 @@ impl Imapc {
             }
         };
         let cmd = self.cmd_search(&query);
+        // Start a fresh search body (clear any prior LIST/SEARCH listing).
+        self.data_resp.clear();
         self.send_command(data, conn, pp, cmd).await?;
         self.state = ImapState::Search;
         Ok(())
@@ -1360,9 +1379,16 @@ impl Imapc {
             // --- Do phase ------------------------------------------------------
             ImapState::List | ImapState::Search => {
                 if code == IMAP_RESP_UNTAGGED {
-                    // The untagged data lines are the listing/search body; the
-                    // engine delivers their bytes to the client writer
-                    // (integration), so here we simply keep reading.
+                    // The untagged `* …` data lines ARE the listing/search body.
+                    // A LIST/SEARCH response carries no up-front literal size, so
+                    // (unlike a sized FETCH body) these bytes are not streamed off
+                    // the socket by the transfer loop — they are consumed here as
+                    // protocol lines. Capture each one verbatim (with its trailing
+                    // CRLF, exactly as received in `resp_line`) so `transfer` can
+                    // hand them to the client writer once the dialogue completes.
+                    // Mirrors C `imap.c` writing each line with
+                    // `Curl_client_write(CLIENTWRITE_BODY, …)` as it is parsed.
+                    self.data_resp.extend_from_slice(&self.resp_line);
                     Ok(())
                 } else if code != IMAP_RESP_OK {
                     Err(CurlError::QuoteError)
@@ -2124,11 +2150,23 @@ pub(crate) async fn perform_imap(
                     };
                     stream_body_to_sink(data, &mut conn, sink, &prefix, Some(size)).await?;
                 } else {
-                    // A body transfer with no up-front literal size (e.g. a
-                    // LIST/SEARCH listing) is consumed within the DO dialogue;
-                    // flush a zero-length end-of-stream so the client writer
-                    // finalizes without a blocking socket read.
-                    stream_body_to_sink(data, &mut conn, sink, &[], Some(0)).await?;
+                    // A LIST/SEARCH listing has no up-front literal size: its body
+                    // is the set of untagged `* …` data lines captured verbatim
+                    // during the DO dialogue (`Imapc::data_resp`). Hand exactly
+                    // those bytes to the client writer — passing the listing as the
+                    // `prefix` with a matching `expected` size makes
+                    // `stream_body_to_sink` deliver them (with end-of-stream) and
+                    // perform NO socket read (the trailing tagged status is read by
+                    // `done`). An empty listing still flushes a zero-length
+                    // end-of-stream, preserving the prior finalize behavior.
+                    let listing = {
+                        let mut state = take_imap_conn(&mut conn)?;
+                        let body = std::mem::take(&mut state.proto.data_resp);
+                        conn.set_proto_state(state);
+                        body
+                    };
+                    let n = listing.len() as u64;
+                    stream_body_to_sink(data, &mut conn, sink, &listing, Some(n)).await?;
                 }
             }
             TransferDirection::Upload => {
@@ -2669,5 +2707,174 @@ mod tests {
         c2.resp_line = b"+ \r\n".to_vec();
         assert!(c2.get_message().unwrap().is_empty());
     }
+
+    // ---- end-to-end session flow over a mock control connection ----------
+    //
+    // These drive the real tagged-command state machine (`connect` → greeting
+    // → `CAPABILITY` → `LOGIN`, then `do_it` → `LIST`) against an in-memory
+    // filter pre-loaded with scripted server replies. Connection id 0 makes the
+    // command-tag letter `A`, so the tags are the deterministic `A001`, `A002`,
+    // `A003` sequence asserted below.
+    mod flow {
+        use super::super::*;
+        use crate::conn::filters::{CfState, ConnectionFilter};
+        use crate::conn::{Connection, SchemeDescriptor, FIRSTSOCKET};
+        use crate::options::CurlOption;
+        use crate::setopt::OptionValue;
+        use std::sync::{Arc, Mutex};
+
+        const TRNSPRT_TCP: u8 = 3;
+
+        struct MockFilter {
+            state: CfState,
+            sent: Arc<Mutex<Vec<u8>>>,
+            recv_data: Arc<Mutex<Vec<u8>>>,
+        }
+
+        impl MockFilter {
+            fn new(recv_data: Arc<Mutex<Vec<u8>>>, sent: Arc<Mutex<Vec<u8>>>) -> Self {
+                Self {
+                    state: CfState {
+                        connected: true,
+                        ..Default::default()
+                    },
+                    sent,
+                    recv_data,
+                }
+            }
+        }
+
+        impl ConnectionFilter for MockFilter {
+            fn name(&self) -> &'static str {
+                "MOCK-IMAP"
+            }
+            fn cf_state(&self) -> &CfState {
+                &self.state
+            }
+            fn cf_state_mut(&mut self) -> &mut CfState {
+                &mut self.state
+            }
+            fn send<'a>(&'a mut self, buf: &'a [u8], _eos: bool) -> BoxFuture<'a, Result<usize>> {
+                let sent = self.sent.clone();
+                let chunk = buf.to_vec();
+                Box::pin(async move {
+                    sent.lock().unwrap().extend_from_slice(&chunk);
+                    Ok(chunk.len())
+                })
+            }
+            fn recv<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxFuture<'a, Result<usize>> {
+                let queue = self.recv_data.clone();
+                Box::pin(async move {
+                    let mut guard = queue.lock().unwrap();
+                    let n = buf.len().min(guard.len());
+                    buf[..n].copy_from_slice(&guard[..n]);
+                    guard.drain(..n);
+                    Ok(n)
+                })
+            }
+        }
+
+        /// Build a mock IMAP control connection (connection id 0 ⇒ tag letter
+        /// `A`) pre-loaded with the scripted replies. No proto-state is
+        /// installed — `connect` creates the `ImapConn`.
+        fn make_imap_conn(server: &[u8]) -> (Connection, Arc<Mutex<Vec<u8>>>) {
+            let scheme = &SCHEME_IMAP;
+            let desc = SchemeDescriptor::new(
+                scheme.name,
+                scheme.default_port,
+                scheme.flags,
+                scheme.protocol,
+            );
+            let mut conn = Connection::new(
+                format!("{}:{}", scheme.name, scheme.default_port),
+                TRNSPRT_TCP,
+                desc,
+            );
+            conn.remote_host = "127.0.0.1".to_string();
+            conn.connection_id = 0; // ⇒ command-tag letter 'A'
+            let recv = Arc::new(Mutex::new(server.to_vec()));
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            conn.cfilter[FIRSTSOCKET].add_filter(Box::new(MockFilter::new(recv, sent.clone())));
+            (conn, sent)
+        }
+
+        fn with_url(url: &str) -> Easy {
+            let mut data = Easy::new();
+            data.setopt(
+                CurlOption::CURLOPT_URL,
+                OptionValue::Str(Some(url.to_string())),
+            )
+            .expect("set url");
+            data
+        }
+
+        fn sent_string(sent: &Arc<Mutex<Vec<u8>>>) -> String {
+            String::from_utf8(sent.lock().unwrap().clone()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn connect_runs_capability_then_cleartext_login() {
+            // Greeting → CAPABILITY (no AUTH= mechs, LOGIN not disabled) ⇒
+            // cleartext LOGIN. Tags are the deterministic A001/A002 sequence.
+            let server = b"* OK [CAPABILITY IMAP4rev1] server ready\r\n\
+                * CAPABILITY IMAP4rev1\r\n\
+                A001 OK CAPABILITY completed\r\n\
+                A002 OK LOGIN completed\r\n";
+            let (mut conn, sent) = make_imap_conn(server);
+            let mut data = with_url("imap://bob:secret@127.0.0.1/");
+
+            let handler = ImapHandler::new(&SCHEME_IMAP);
+            handler.connect(&mut data, &mut conn).await.expect("connect");
+
+            let wire = sent_string(&sent);
+            assert!(wire.contains("A001 CAPABILITY\r\n"), "CAPABILITY wrong: {wire:?}");
+            // LOGIN with plain-atom credentials (no quoting needed).
+            assert!(
+                wire.contains("A002 LOGIN bob secret\r\n"),
+                "LOGIN wrong: {wire:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn connect_then_do_it_root_list_sends_list_command() {
+            // After LOGIN, a root URL (no mailbox, no custom request) drives the
+            // default `LIST "" *` and consumes the untagged listing line.
+            let server = b"* OK [CAPABILITY IMAP4rev1] ready\r\n\
+                * CAPABILITY IMAP4rev1\r\n\
+                A001 OK done\r\n\
+                A002 OK LOGIN ok\r\n\
+                * LIST (\\HasNoChildren) \"/\" INBOX\r\n\
+                A003 OK LIST completed\r\n";
+            let (mut conn, sent) = make_imap_conn(server);
+            let mut data = with_url("imap://bob:secret@127.0.0.1/");
+
+            let handler = ImapHandler::new(&SCHEME_IMAP);
+            handler.connect(&mut data, &mut conn).await.expect("connect");
+            handler.do_it(&mut data, &mut conn).await.expect("do_it");
+
+            let wire = sent_string(&sent);
+            assert!(
+                wire.contains("A003 LIST \"\" *\r\n"),
+                "LIST command wrong: {wire:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn connect_login_rejected_is_login_denied() {
+            // A tagged `NO` to the LOGIN command ⇒ CURLE_LOGIN_DENIED
+            // (C `imap_state_login_resp`).
+            let server = b"* OK ready\r\n\
+                * CAPABILITY IMAP4rev1\r\n\
+                A001 OK done\r\n\
+                A002 NO [AUTHENTICATIONFAILED] invalid credentials\r\n";
+            let (mut conn, _sent) = make_imap_conn(server);
+            let mut data = with_url("imap://bob:wrongpass@127.0.0.1/");
+
+            let handler = ImapHandler::new(&SCHEME_IMAP);
+            let err = handler.connect(&mut data, &mut conn).await.unwrap_err();
+            assert_eq!(err, CurlError::LoginDenied);
+        }
+    }
+
 }
 

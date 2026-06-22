@@ -464,6 +464,20 @@ pub enum CurlError {
     /// `CURLE_BAD_CONTENT_ENCODING` (61).
     #[error("Unrecognized or bad HTTP Content or Transfer-Encoding")]
     BadContentEncoding,
+    /// The decompression-bomb guard tripped: a response advertised more than
+    /// `MAX_ENCODE_STACK - 1` (4) stacked content/transfer encodings
+    /// (`lib/content_encoding.c` `Curl_build_unencoding_stack`). This is a
+    /// distinct *cause* of `CURLE_BAD_CONTENT_ENCODING` (61) — it maps to the
+    /// same integer code, but carries curl's specific `failf` diagnostic
+    /// (`"Reject response due to more than 5 content encodings"`) so the
+    /// `curl: (61) …` line matches byte-for-byte. It is intentionally absent
+    /// from the `from_code` round-trip (integer 61 always decodes to the
+    /// generic [`BadContentEncoding`](Self::BadContentEncoding), matching
+    /// `curl_easy_strerror`), so it is excluded from the `ACTIVE` round-trip
+    /// fixture exactly like the [`AlreadyComplete`](Self::AlreadyComplete)
+    /// sentinel.
+    #[error("Reject response due to more than 5 content encodings")]
+    TooManyContentEncodings,
     /// `CURLE_FILESIZE_EXCEEDED` (63).
     #[error("Maximum file size exceeded")]
     FilesizeExceeded,
@@ -650,6 +664,9 @@ impl CurlError {
             CurlError::SslCipher => codes::CURLE_SSL_CIPHER,
             CurlError::PeerFailedVerification => codes::CURLE_PEER_FAILED_VERIFICATION,
             CurlError::BadContentEncoding => codes::CURLE_BAD_CONTENT_ENCODING,
+            // Same integer code as `BadContentEncoding` (61); the variant only
+            // distinguishes the diagnostic message (curl's `failf` text).
+            CurlError::TooManyContentEncodings => codes::CURLE_BAD_CONTENT_ENCODING,
             CurlError::FilesizeExceeded => codes::CURLE_FILESIZE_EXCEEDED,
             CurlError::UseSslFailed => codes::CURLE_USE_SSL_FAILED,
             CurlError::SendFailRewind => codes::CURLE_SEND_FAIL_REWIND,
@@ -758,6 +775,9 @@ impl CurlError {
             }
             CurlError::BadContentEncoding => {
                 "Unrecognized or bad HTTP Content or Transfer-Encoding"
+            }
+            CurlError::TooManyContentEncodings => {
+                "Reject response due to more than 5 content encodings"
             }
             CurlError::FilesizeExceeded => "Maximum file size exceeded",
             CurlError::UseSslFailed => "Requested SSL level failed",

@@ -453,15 +453,27 @@ impl DynHds {
         self.add(&bytes_to_string(name), &bytes_to_string(value))
     }
 
-    /// Serializes the set to HTTP/1 format — one `Name: Value\r\n` line per
-    /// entry, with no trailing empty line (curl's `Curl_dynhds_h1_dprint`).
+    /// Serializes the set to HTTP/1 format — one header line per entry, with no
+    /// trailing empty line.
+    ///
+    /// A non-empty value is written as `Name: Value\r\n`. An **empty** value is
+    /// written as `Name:\r\n` (no space after the colon) to reproduce curl's
+    /// wire output for an explicit empty/blank header (`-H "Name;"`): curl emits
+    /// `curlx_dyn_addf(req, "%.*s:\r\n", …)` for such a header
+    /// (`Curl_add_custom_headers`, `lib/http.c`), with no `SP` after the colon.
+    /// Internal request headers are never empty, so this branch only affects
+    /// user-supplied blank headers.
     #[must_use]
     pub fn to_h1_string(&self) -> String {
         let mut out = String::new();
         for e in &self.entries {
             out.push_str(&e.name);
-            out.push_str(": ");
-            out.push_str(&e.value);
+            if e.value.is_empty() {
+                out.push(':');
+            } else {
+                out.push_str(": ");
+                out.push_str(&e.value);
+            }
             out.push_str("\r\n");
         }
         out

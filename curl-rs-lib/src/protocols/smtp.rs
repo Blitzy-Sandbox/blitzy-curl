@@ -1882,4 +1882,190 @@ mod tests {
         };
         assert_eq!(c.get_message().expect("get_message"), b"");
     }
+
+    // ===================================================================
+    // Scripted-connection DO-phase coverage. Drive `SmtpProtocol::do_it`
+    // end-to-end over a mock control connection that satisfies recv/send from
+    // in-memory buffers, asserting the exact command sequence on the wire.
+    // Oracle: smtp_perform_* / smtp_state_*_resp (lib/smtp.c).
+    // ===================================================================
+    mod flow {
+        use super::super::*;
+        use crate::conn::filters::{CfState, ConnectionFilter};
+        use crate::conn::{Connection, SchemeDescriptor, FIRSTSOCKET};
+        use crate::slist::SList;
+        use std::sync::{Arc, Mutex};
+
+        const TRNSPRT_TCP: u8 = 3;
+
+        /// A connection filter that satisfies `send`/`recv` from in-memory
+        /// buffers; marked already-connected so `Curl_conn_connect`
+        /// short-circuits to success and I/O routes straight to it.
+        struct MockFilter {
+            state: CfState,
+            sent: Arc<Mutex<Vec<u8>>>,
+            recv_data: Arc<Mutex<Vec<u8>>>,
+        }
+
+        impl MockFilter {
+            fn new(recv_data: Arc<Mutex<Vec<u8>>>, sent: Arc<Mutex<Vec<u8>>>) -> Self {
+                Self {
+                    state: CfState {
+                        connected: true,
+                        ..Default::default()
+                    },
+                    sent,
+                    recv_data,
+                }
+            }
+        }
+
+        impl ConnectionFilter for MockFilter {
+            fn name(&self) -> &'static str {
+                "MOCK-SMTP"
+            }
+            fn cf_state(&self) -> &CfState {
+                &self.state
+            }
+            fn cf_state_mut(&mut self) -> &mut CfState {
+                &mut self.state
+            }
+            fn send<'a>(&'a mut self, buf: &'a [u8], _eos: bool) -> BoxFuture<'a, Result<usize>> {
+                let sent = self.sent.clone();
+                let chunk = buf.to_vec();
+                Box::pin(async move {
+                    sent.lock().unwrap().extend_from_slice(&chunk);
+                    Ok(chunk.len())
+                })
+            }
+            fn recv<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxFuture<'a, Result<usize>> {
+                let queue = self.recv_data.clone();
+                Box::pin(async move {
+                    let mut guard = queue.lock().unwrap();
+                    let n = buf.len().min(guard.len());
+                    buf[..n].copy_from_slice(&guard[..n]);
+                    guard.drain(..n);
+                    Ok(n)
+                })
+            }
+        }
+
+        /// Build a mock SMTP control connection pre-loaded with the scripted
+        /// server replies, returning `(conn, sent)`.
+        fn make_smtp_conn(server: &[u8]) -> (Connection, Arc<Mutex<Vec<u8>>>) {
+            let scheme = &SCHEME_SMTP;
+            let desc = SchemeDescriptor::new(
+                scheme.name,
+                scheme.default_port,
+                scheme.flags,
+                scheme.protocol,
+            );
+            let mut conn = Connection::new(
+                format!("{}:{}", scheme.name, scheme.default_port),
+                TRNSPRT_TCP,
+                desc,
+            );
+            conn.remote_host = "127.0.0.1".to_string();
+            let recv = Arc::new(Mutex::new(server.to_vec()));
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            conn.cfilter[FIRSTSOCKET].add_filter(Box::new(MockFilter::new(recv, sent.clone())));
+            // Install an SMTP proto-state with an initialized ping-pong engine so
+            // `do_it`'s `take_smtp_conn` finds a ready session container.
+            let mut smtpc = SmtpConn::default();
+            smtpc.pp.init(crate::util::timeval::curlx_now());
+            conn.set_proto_state(Box::new(smtpc));
+            (conn, sent)
+        }
+
+        fn rcpt_list(addrs: &[&str]) -> SList {
+            let mut l = SList::default();
+            for a in addrs {
+                l.append(a).unwrap();
+            }
+            l
+        }
+
+        fn sent_string(sent: &Arc<Mutex<Vec<u8>>>) -> String {
+            String::from_utf8(sent.lock().unwrap().clone()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn do_it_mail_send_runs_full_transaction() {
+            // Greeting → EHLO (SIZE advertised) → MAIL → RCPT → DATA → body → 250.
+            let server = b"220 mail.example.com ESMTP ready\r\n\
+                250-mail.example.com\r\n\
+                250-SIZE 10485760\r\n\
+                250 HELP\r\n\
+                250 2.1.0 Sender ok\r\n\
+                250 2.1.5 Recipient ok\r\n\
+                354 End data with <CR><LF>.<CR><LF>\r\n\
+                250 2.0.0 Ok: queued as ABC123\r\n";
+            let (mut conn, sent) = make_smtp_conn(server);
+
+            let mut data = Easy::new();
+            data.set.method = HttpReq::Put;
+            data.set.copypostfields = Some(b"Hello world\r\n".to_vec());
+            data.set.mail_rcpt = Some(rcpt_list(&["<rcpt@example.org>"]));
+
+            let handler = SmtpProtocol::new(&SCHEME_SMTP);
+            let xfer = handler.do_it(&mut data, &mut conn).await.expect("mail send");
+            assert_eq!(xfer.direction, TransferDirection::Upload);
+
+            let wire = sent_string(&sent);
+            assert!(wire.contains("EHLO "), "EHLO not sent: {wire:?}");
+            // SIZE is appended because the server advertised it and the body is
+            // non-empty; the null reverse-path is used (no CURLOPT_MAIL_FROM).
+            assert!(
+                wire.contains("MAIL FROM:<> SIZE=13\r\n"),
+                "MAIL line wrong: {wire:?}"
+            );
+            assert!(wire.contains("RCPT TO:<rcpt@example.org>\r\n"), "RCPT wrong: {wire:?}");
+            assert!(wire.contains("DATA\r\n"), "DATA not sent: {wire:?}");
+            // The dot-stuffed body plus the EOB terminator.
+            assert!(wire.contains("Hello world\r\n.\r\n"), "body/EOB wrong: {wire:?}");
+        }
+
+        #[tokio::test]
+        async fn do_it_command_path_issues_vrfy_per_recipient() {
+            // No upload body → the command (VRFY) path, one command per recipient.
+            let server = b"220 mail.example.com ESMTP\r\n\
+                250-mail.example.com\r\n\
+                250 HELP\r\n\
+                250 2.1.5 <vrfy@example.net> recognized\r\n";
+            let (mut conn, sent) = make_smtp_conn(server);
+
+            let mut data = Easy::new();
+            data.set.mail_rcpt = Some(rcpt_list(&["<vrfy@example.net>"]));
+
+            let handler = SmtpProtocol::new(&SCHEME_SMTP);
+            let xfer = handler.do_it(&mut data, &mut conn).await.expect("vrfy");
+            assert_eq!(xfer.direction, TransferDirection::Download);
+
+            let wire = sent_string(&sent);
+            assert!(wire.contains("VRFY vrfy@example.net\r\n"), "VRFY wrong: {wire:?}");
+            // No mail-send commands on the command path.
+            assert!(!wire.contains("DATA\r\n"));
+        }
+
+        #[tokio::test]
+        async fn do_it_rejected_recipient_without_allowfails_fails() {
+            // RCPT rejected (550) and CURLOPT_MAIL_RCPT_ALLOWFAILS off → fatal.
+            let server = b"220 mail.example.com ESMTP\r\n\
+                250-mail.example.com\r\n\
+                250 HELP\r\n\
+                250 2.1.0 Sender ok\r\n\
+                550 5.1.1 No such user\r\n";
+            let (mut conn, _sent) = make_smtp_conn(server);
+
+            let mut data = Easy::new();
+            data.set.method = HttpReq::Put;
+            data.set.copypostfields = Some(b"body\r\n".to_vec());
+            data.set.mail_rcpt = Some(rcpt_list(&["<nobody@example.org>"]));
+
+            let handler = SmtpProtocol::new(&SCHEME_SMTP);
+            let err = handler.do_it(&mut data, &mut conn).await.unwrap_err();
+            assert_eq!(err, CurlError::SendError);
+        }
+    }
+
 }

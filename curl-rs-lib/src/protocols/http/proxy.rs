@@ -313,13 +313,19 @@ pub fn parse_custom_header_line(line: &str) -> CustomHeader<'_> {
         }
         // C: `else if(!curlx_str_single(&ptr, ';'))` — a ';' delimiter.
         Some(&b';') => {
-            // C: `curlx_str_passblanks(&ptr);` then test `if(!*ptr)`.
-            let after = skip_blanks(&line[sep + 1..]);
-            if after.is_empty() {
-                // Quirk #2: `"Name;"` ⇒ send an empty header value.
+            // Quirk #2: a "blank header" (`-H "Name;"`) sends `Name:` with an
+            // empty value. The C oracle (`Curl_add_custom_headers`, lib/http.c)
+            // recognizes this *only* when the semicolon is immediately followed
+            // by the end of the string — the test chain is
+            // `curlx_str_single(&p, ';')` then `curlx_str_single(&p, '\0')`,
+            // i.e. NO trailing blanks are tolerated. So `"Name;"` is a blank
+            // header, but `"Name;  "` (semicolon + blanks) and `"Name;extra"`
+            // are NOT — they have no colon either, so curl skips them entirely.
+            if line[sep + 1..].is_empty() {
                 CustomHeader::Add { name, value: "" }
             } else {
-                // `"Name;extra"` — reserved for future use; ignored for now.
+                // `"Name; …"` / `"Name;extra"` — semicolon not at end-of-string
+                // and no colon present ⇒ curl ignores the line.
                 CustomHeader::Skip
             }
         }
@@ -814,14 +820,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_header_semicolon_with_trailing_blanks_sends_empty() {
-        assert_eq!(
-            parse_custom_header_line("X-Foo;   "),
-            CustomHeader::Add {
-                name: "X-Foo",
-                value: ""
-            }
-        );
+    fn parse_header_semicolon_with_trailing_blanks_is_ignored() {
+        // The blank-header form is recognized ONLY when the ';' is immediately
+        // at end-of-string (C: `curlx_str_single(&p, ';')` then
+        // `curlx_str_single(&p, '\0')` — no trailing blanks tolerated). So
+        // `"X-Foo;   "` is NOT a blank header; with no colon present curl skips
+        // the line entirely. This is exactly `tests/data/test4`'s `X-Test4;  `
+        // case, whose expected `<protocol>` emits no `X-Test4` line at all.
+        assert_eq!(parse_custom_header_line("X-Foo;   "), CustomHeader::Skip);
     }
 
     #[test]

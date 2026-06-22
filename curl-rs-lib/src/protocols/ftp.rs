@@ -1479,7 +1479,7 @@ impl FtpConn {
         // (TCP accept, then `upgrade_data_tls`), so the data-channel TLS handshake
         // is uniformly post-`150` regardless of passive/active. (Plaintext `ftp`
         // is unaffected — it never gets a TLS filter at all.)
-        let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, addrs);
+        let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, data.set.connecttimeout, addrs);
         let dispatch = ConnSetup::Default(SetupConfig::new(CURL_CF_SSL_DISABLE, false, eyeballs));
         establish_connection(conn, SECONDARYSOCKET, CURL_CF_SSL_DISABLE, dispatch, false).await
     }
@@ -2754,7 +2754,7 @@ pub(crate) async fn perform_ftp(
     let mut conn = Connection::new(format!("{host}:{port}"), TRNSPRT_TCP, desc).with_verbose(verbose);
     conn.set_remote(host.clone(), port);
 
-    let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, addrs);
+    let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, data.set.connecttimeout, addrs);
     let (ssl_mode, dispatch) = if is_ftps {
         // FTP control channels do not negotiate ALPN; offer none.
         let tls = tls_config_from_easy(data);
@@ -3073,6 +3073,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_pwd_entrypath_unescapes_doubled_quote() {
+        // RFC 959 §5.4: a literal double-quote inside the path name is doubled
+        // ("") on the wire; the parser must collapse it back to a single quote
+        // and continue scanning until the genuine closing quote.
+        assert_eq!(
+            parse_pwd_entrypath(b"257 \"/a\"\"b/c\" is current").as_deref(),
+            Some("/a\"b/c")
+        );
+    }
+
+    #[test]
+    fn parse_pwd_entrypath_rejects_unterminated_quote() {
+        // An opening quote with no closing quote yields no usable entry path.
+        assert!(parse_pwd_entrypath(b"257 \"/unterminated").is_none());
+    }
+
+    #[test]
+    fn parse_size_213_parses_and_rejects() {
+        // A well-formed `213 <size>` yields the byte count.
+        assert_eq!(parse_size_213(b"213 4096"), Some(4096));
+        // Surrounding/trailing tokens are ignored (only the first is parsed).
+        assert_eq!(parse_size_213(b"213 0 bytes"), Some(0));
+        // A non-numeric size token is rejected (caller proceeds open-ended).
+        assert_eq!(parse_size_213(b"213 unknown"), None);
+        // A negative value is rejected (sizes are non-negative).
+        assert_eq!(parse_size_213(b"213 -5"), None);
+        // No token after the code → None.
+        assert_eq!(parse_size_213(b"213"), None);
+    }
+
+
     // ---- ftp_endofresp final-vs-continuation -----------------------------
 
     #[test]
@@ -3297,4 +3329,173 @@ mod tests {
         // ftps carries PROTOPT_SSL (implicit TLS from the first byte).
         assert!(ftps.is_implicit_tls());
     }
+
+    // ---- DO-phase control-channel helpers --------------------------------
+    //
+    // These drive the transfer-phase command helpers (`cwd_navigate`,
+    // `send_type`/`send_size`/`send_rest`) over the mock control socket, plus
+    // the pure command-construction (`transfer_command`) and start-classifier
+    // (`check_transfer_start`) — the wire-facing logic the existing login/PASV
+    // tests above do not reach.
+
+    #[tokio::test]
+    async fn cwd_navigate_walks_each_directory_component() {
+        let recv = Arc::new(Mutex::new(
+            b"250 CWD ok\r\n250 CWD ok\r\n".to_vec(),
+        ));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.dirs = vec![
+            PathComp { name: "pub".to_string() },
+            PathComp { name: "files".to_string() },
+        ];
+
+        ftpc.cwd_navigate(&mut data, &mut conn).await.unwrap();
+        assert!(ftpc.cwddone, "cwd should be marked done");
+        let wire = sent_str(&sent);
+        assert!(wire.contains("CWD pub\r\n"), "first CWD wrong: {wire:?}");
+        assert!(wire.contains("CWD files\r\n"), "second CWD wrong: {wire:?}");
+    }
+
+    #[tokio::test]
+    async fn cwd_navigate_denied_is_remote_access_denied() {
+        let recv = Arc::new(Mutex::new(b"550 No such directory\r\n".to_vec()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.dirs = vec![PathComp { name: "missing".to_string() }];
+
+        let err = ftpc.cwd_navigate(&mut data, &mut conn).await.unwrap_err();
+        assert_eq!(err, CurlError::RemoteAccessDenied);
+        assert!(ftpc.cwdfail, "cwdfail flag should be set");
+    }
+
+    #[test]
+    fn transfer_command_builds_each_verb() {
+        let data = Easy::new();
+        let mut ftpc = FtpConn::new();
+        ftpc.file = Some("report.bin".to_string());
+
+        assert_eq!(
+            ftpc.transfer_command(&data, TransferKind::Retr).unwrap(),
+            "RETR report.bin"
+        );
+        assert_eq!(
+            ftpc.transfer_command(&data, TransferKind::Stor).unwrap(),
+            "STOR report.bin"
+        );
+        // A bare directory listing takes no path argument.
+        assert_eq!(
+            ftpc.transfer_command(&data, TransferKind::List).unwrap(),
+            "LIST"
+        );
+
+        // APPE is selected for an upload when CURLOPT_APPEND is set.
+        let mut data_app = Easy::new();
+        data_app.set.remote_append = true;
+        assert_eq!(
+            ftpc.transfer_command(&data_app, TransferKind::Stor).unwrap(),
+            "APPE report.bin"
+        );
+
+        // NLST is selected for a name-only listing (CURLOPT_DIRLISTONLY).
+        let mut data_nlst = Easy::new();
+        data_nlst.set.list_only = true;
+        assert_eq!(
+            ftpc.transfer_command(&data_nlst, TransferKind::List).unwrap(),
+            "NLST"
+        );
+    }
+
+    #[test]
+    fn check_transfer_start_classifies_reply_codes() {
+        let ftpc = FtpConn::new();
+        // 1xx preliminary replies open the data transfer.
+        assert!(ftpc.check_transfer_start(150, TransferKind::Retr).is_ok());
+        assert!(ftpc.check_transfer_start(125, TransferKind::List).is_ok());
+        // 550 on a download ⇒ file not found.
+        assert_eq!(
+            ftpc.check_transfer_start(550, TransferKind::Retr).unwrap_err(),
+            CurlError::RemoteFileNotFound
+        );
+        // Any other non-1xx download failure ⇒ generic RETR failure.
+        assert_eq!(
+            ftpc.check_transfer_start(500, TransferKind::Retr).unwrap_err(),
+            CurlError::FtpCouldntRetrFile
+        );
+        // Any non-1xx on an upload ⇒ upload failed.
+        assert_eq!(
+            ftpc.check_transfer_start(553, TransferKind::Stor).unwrap_err(),
+            CurlError::UploadFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn send_type_sets_transfertype_and_reports_failure() {
+        // Success: 200 ⇒ transfertype recorded.
+        let recv = Arc::new(Mutex::new(b"200 Type set to I\r\n".to_vec()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+
+        ftpc.send_type(&mut data, &mut conn, b'I').await.unwrap();
+        assert_eq!(ftpc.transfertype, b'I');
+        assert!(sent_str(&sent).contains("TYPE I\r\n"));
+
+        // Failure: a non-2xx reply ⇒ CURLE_FTP_COULDNT_SET_TYPE.
+        let recv2 = Arc::new(Mutex::new(b"504 Bad type\r\n".to_vec()));
+        let sent2 = Arc::new(Mutex::new(Vec::new()));
+        let mut conn2 = make_conn(recv2.clone(), sent2.clone());
+        let mut ftpc2 = FtpConn::new();
+        ftpc2.pp.init(timeval::curlx_now());
+        let err = ftpc2.send_type(&mut data, &mut conn2, b'A').await.unwrap_err();
+        assert_eq!(err, CurlError::FtpCouldntSetType);
+    }
+
+    #[tokio::test]
+    async fn send_size_records_known_filesize_on_213() {
+        let recv = Arc::new(Mutex::new(b"213 4096\r\n".to_vec()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+
+        ftpc.send_size(&mut data, &mut conn, "report.bin").await.unwrap();
+        assert_eq!(ftpc.known_filesize, 4096);
+        assert!(sent_str(&sent).contains("SIZE report.bin\r\n"));
+    }
+
+    #[tokio::test]
+    async fn send_rest_requires_350_else_fails() {
+        // 350 ⇒ resume accepted.
+        let recv = Arc::new(Mutex::new(b"350 Restart position accepted\r\n".to_vec()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+
+        ftpc.send_rest(&mut data, &mut conn, 1024).await.unwrap();
+        assert!(sent_str(&sent).contains("REST 1024\r\n"));
+
+        // A non-350 reply ⇒ CURLE_FTP_COULDNT_USE_REST.
+        let recv2 = Arc::new(Mutex::new(b"500 Not understood\r\n".to_vec()));
+        let sent2 = Arc::new(Mutex::new(Vec::new()));
+        let mut conn2 = make_conn(recv2.clone(), sent2.clone());
+        let mut ftpc2 = FtpConn::new();
+        ftpc2.pp.init(timeval::curlx_now());
+        let err = ftpc2.send_rest(&mut data, &mut conn2, 1024).await.unwrap_err();
+        assert_eq!(err, CurlError::FtpCouldntUseRest);
+    }
+
 }

@@ -2159,6 +2159,78 @@ mod tests {
         assert_eq!(expected_offset, 300);
     }
 
+    #[test]
+    fn decode_64bit_length_frame() {
+        // A payload larger than 65535 bytes uses the 64-bit (127) length marker;
+        // the decoder must parse the 10-byte head and stream the full payload.
+        let payload: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let mut state = WsConnState::new(false, false);
+        state.buffer_received(&server_frame(WSBIT_FIN | WSBIT_OPCODE_BIN, &payload));
+
+        let mut reassembled = Vec::new();
+        let mut out = [0u8; 4096];
+        loop {
+            let (n, meta) = decode_one(&mut state, &mut out).unwrap();
+            if n == 0 {
+                break;
+            }
+            reassembled.extend_from_slice(&out[..n]);
+            if meta.bytesleft == 0 {
+                break;
+            }
+        }
+        assert_eq!(reassembled.len(), 70_000, "64-bit-framed payload truncated");
+        assert_eq!(reassembled, payload);
+    }
+
+    #[test]
+    fn decode_rejects_oversized_control_frames() {
+        // A control frame (PING/PONG/CLOSE) may carry at most 125 payload bytes
+        // (RFC 6455 §5.5). A 126-byte control payload forces the 126 length
+        // marker, which the decoder must reject as a protocol violation — one
+        // dedicated guard per control opcode.
+        for opcode in [
+            WSBIT_OPCODE_PING,
+            WSBIT_OPCODE_PONG,
+            WSBIT_OPCODE_CLOSE,
+        ] {
+            let frame = server_frame(WSBIT_FIN | opcode, &[0u8; 126]);
+            let mut state = WsConnState::new(false, false);
+            state.buffer_received(&frame);
+            let mut out = [0u8; 256];
+            let err = decode_one(&mut state, &mut out).unwrap_err();
+            assert_eq!(
+                err,
+                CurlError::RecvError,
+                "oversized control frame (opcode {opcode:#x}) must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rejects_length_longer_than_63_bits() {
+        // A 64-bit length whose top bit is set (head[2] > 127) exceeds the 63-bit
+        // limit curl supports and must be rejected rather than mis-parsed.
+        let raw: &[u8] = &[
+            WSBIT_FIN | WSBIT_OPCODE_BIN,
+            127,
+            0x80, // high bit set → length > 2^63
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let mut state = WsConnState::new(false, false);
+        state.buffer_received(raw);
+        let mut out = [0u8; 64];
+        let err = decode_one(&mut state, &mut out).unwrap_err();
+        assert_eq!(err, CurlError::RecvError, "63-bit overflow must be rejected");
+    }
+
+
     // ----- auto-PONG behavior -----------------------------------------------
 
     #[test]
@@ -2200,4 +2272,265 @@ mod tests {
         assert_eq!(ws.scheme().name, "ws");
         assert_eq!(wss.scheme().name, "wss");
     }
+
+    // ===================================================================
+    // Pure frame-codec coverage: `firstbyte_to_flags`, `flags_to_firstbyte`,
+    // `WsEncoder::add_frame_head`/`encode_payload`, `WsDecoder::read_head`, and
+    // the RFC 6455 `Sec-WebSocket-Accept` SHA-1/base64 path. These exercise the
+    // deterministic codec branches (oracle: RFC 6455 + `lib/ws.c`).
+    // ===================================================================
+
+    #[test]
+    fn firstbyte_to_flags_data_frames_fin_and_fragmented() {
+        let text = CURLWS_TEXT as i32;
+        let bin = CURLWS_BINARY as i32;
+        let cont = CURLWS_CONT as i32;
+        // Final single-frame TEXT/BINARY messages.
+        assert_eq!(firstbyte_to_flags(WSBIT_FIN | WSBIT_OPCODE_TEXT, 0).unwrap(), text);
+        assert_eq!(firstbyte_to_flags(WSBIT_FIN | WSBIT_OPCODE_BIN, 0).unwrap(), bin);
+        // Non-final first fragments additionally carry CURLWS_CONT.
+        assert_eq!(firstbyte_to_flags(WSBIT_OPCODE_TEXT, 0).unwrap(), text | cont);
+        assert_eq!(firstbyte_to_flags(WSBIT_OPCODE_BIN, 0).unwrap(), bin | cont);
+    }
+
+    #[test]
+    fn firstbyte_to_flags_continuation_open_and_close() {
+        let cont = CURLWS_CONT as i32;
+        let open = (CURLWS_TEXT as i32) | cont;
+        // A non-final continuation keeps the running flag set unchanged.
+        assert_eq!(firstbyte_to_flags(WSBIT_OPCODE_CONT, open).unwrap(), open);
+        // The final continuation clears CURLWS_CONT, preserving the TEXT type bit.
+        assert_eq!(
+            firstbyte_to_flags(WSBIT_FIN | WSBIT_OPCODE_CONT, open).unwrap(),
+            CURLWS_TEXT as i32
+        );
+    }
+
+    #[test]
+    fn firstbyte_to_flags_rejects_invalid_fragmentation() {
+        // Continuation with no open message.
+        assert!(firstbyte_to_flags(WSBIT_OPCODE_CONT, 0).is_err());
+        // New data frame interrupting an open fragmented message.
+        let open = (CURLWS_TEXT as i32) | (CURLWS_CONT as i32);
+        let e = firstbyte_to_flags(WSBIT_FIN | WSBIT_OPCODE_TEXT, open).unwrap_err();
+        assert_eq!(e.0, CurlError::RecvError);
+        assert!(firstbyte_to_flags(WSBIT_FIN | WSBIT_OPCODE_BIN, open).is_err());
+    }
+
+    #[test]
+    fn firstbyte_to_flags_control_frames_and_errors() {
+        assert_eq!(
+            firstbyte_to_flags(WSBIT_FIN | WSBIT_OPCODE_CLOSE, 0).unwrap(),
+            CURLWS_CLOSE as i32
+        );
+        assert_eq!(
+            firstbyte_to_flags(WSBIT_FIN | WSBIT_OPCODE_PING, 0).unwrap(),
+            CURLWS_PING as i32
+        );
+        assert_eq!(
+            firstbyte_to_flags(WSBIT_FIN | WSBIT_OPCODE_PONG, 0).unwrap(),
+            CURLWS_PONG as i32
+        );
+        // Control frames must not be fragmented (FIN required).
+        assert!(firstbyte_to_flags(WSBIT_OPCODE_CLOSE, 0).is_err());
+        assert!(firstbyte_to_flags(WSBIT_OPCODE_PING, 0).is_err());
+        assert!(firstbyte_to_flags(WSBIT_OPCODE_PONG, 0).is_err());
+        // Reserved bits set and an unassigned opcode are both rejected.
+        assert!(firstbyte_to_flags(WSBIT_FIN | WSBIT_RSV1 | WSBIT_OPCODE_TEXT, 0).is_err());
+        assert!(firstbyte_to_flags(WSBIT_FIN | 0x03, 0).is_err());
+    }
+
+    #[test]
+    fn flags_to_firstbyte_data_and_offset_mask() {
+        // Final single-frame messages.
+        assert_eq!(flags_to_firstbyte(CURLWS_TEXT, false).unwrap(), WSBIT_FIN | WSBIT_OPCODE_TEXT);
+        assert_eq!(flags_to_firstbyte(CURLWS_BINARY, false).unwrap(), WSBIT_FIN | WSBIT_OPCODE_BIN);
+        // OFFSET is a delivery modifier and must not change the opcode decision.
+        assert_eq!(
+            flags_to_firstbyte(CURLWS_TEXT | CURLWS_OFFSET, false).unwrap(),
+            WSBIT_FIN | WSBIT_OPCODE_TEXT
+        );
+        // Non-final first fragments use the data opcode without FIN.
+        assert_eq!(flags_to_firstbyte(CURLWS_TEXT | CURLWS_CONT, false).unwrap(), WSBIT_OPCODE_TEXT);
+        assert_eq!(flags_to_firstbyte(CURLWS_BINARY | CURLWS_CONT, false).unwrap(), WSBIT_OPCODE_BIN);
+    }
+
+    #[test]
+    fn flags_to_firstbyte_continuation_state() {
+        // Mid-message, a final data flag becomes the closing continuation.
+        assert_eq!(flags_to_firstbyte(CURLWS_TEXT, true).unwrap(), WSBIT_FIN | WSBIT_OPCODE_CONT);
+        assert_eq!(flags_to_firstbyte(CURLWS_BINARY, true).unwrap(), WSBIT_FIN | WSBIT_OPCODE_CONT);
+        // Mid-message, a non-final data flag becomes a bare continuation.
+        assert_eq!(flags_to_firstbyte(CURLWS_TEXT | CURLWS_CONT, true).unwrap(), WSBIT_OPCODE_CONT);
+        // Empty flags close the open message; bare CONT continues it.
+        assert_eq!(flags_to_firstbyte(0, true).unwrap(), WSBIT_FIN | WSBIT_OPCODE_CONT);
+        assert_eq!(flags_to_firstbyte(CURLWS_CONT, true).unwrap(), WSBIT_OPCODE_CONT);
+    }
+
+    #[test]
+    fn flags_to_firstbyte_control_and_errors() {
+        assert_eq!(flags_to_firstbyte(CURLWS_CLOSE, false).unwrap(), WSBIT_FIN | WSBIT_OPCODE_CLOSE);
+        assert_eq!(flags_to_firstbyte(CURLWS_PING, false).unwrap(), WSBIT_FIN | WSBIT_OPCODE_PING);
+        assert_eq!(flags_to_firstbyte(CURLWS_PONG, false).unwrap(), WSBIT_FIN | WSBIT_OPCODE_PONG);
+        // No flags / bare CONT outside a fragmented message are usage errors.
+        assert_eq!(flags_to_firstbyte(0, false).unwrap_err().0, CurlError::BadFunctionArgument);
+        assert!(flags_to_firstbyte(CURLWS_CONT, false).is_err());
+        // Fragmented control frames are illegal.
+        assert!(flags_to_firstbyte(CURLWS_CLOSE | CURLWS_CONT, false).is_err());
+        assert!(flags_to_firstbyte(CURLWS_PING | CURLWS_CONT, false).is_err());
+        assert!(flags_to_firstbyte(CURLWS_PONG | CURLWS_CONT, false).is_err());
+        // An unknown flag combination is rejected.
+        assert!(flags_to_firstbyte(0x100, false).is_err());
+    }
+
+    #[test]
+    fn sec_websocket_accept_matches_rfc6455_example() {
+        // RFC 6455 §1.3 worked example.
+        let accept = sec_websocket_accept("dGhlIHNhbXBsZSBub25jZQ==").unwrap();
+        assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    #[test]
+    fn sha1_known_answer_vectors() {
+        // FIPS 180-1 classic vectors, surfaced through the public accept path is
+        // awkward, so assert the raw digest directly.
+        assert_eq!(
+            hex(&sha1(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(hex(&sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    }
+
+    #[test]
+    fn encoder_add_frame_head_length_tiers_set_mask_bit() {
+        let mask = [0xAA, 0xBB, 0xCC, 0xDD];
+        // Inline 7-bit length.
+        let mut enc = WsEncoder::default();
+        let mut out = Vec::new();
+        enc.add_frame_head(WSBIT_FIN | WSBIT_OPCODE_TEXT, 5, mask, &mut out).unwrap();
+        assert_eq!(out, vec![0x81, 5 | WSBIT_MASK, 0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(enc.payload_remain, 5);
+
+        // 16-bit extended length (126 marker).
+        let mut enc = WsEncoder::default();
+        let mut out = Vec::new();
+        enc.add_frame_head(WSBIT_FIN | WSBIT_OPCODE_BIN, 200, mask, &mut out).unwrap();
+        assert_eq!(&out[..4], &[0x82, 126 | WSBIT_MASK, 0x00, 0xC8]);
+
+        // 64-bit extended length (127 marker).
+        let mut enc = WsEncoder::default();
+        let mut out = Vec::new();
+        enc.add_frame_head(WSBIT_FIN | WSBIT_OPCODE_BIN, 70000, mask, &mut out).unwrap();
+        assert_eq!(out[0], 0x82);
+        assert_eq!(out[1], 127 | WSBIT_MASK);
+        assert_eq!(&out[2..10], &70000u64.to_be_bytes());
+    }
+
+    #[test]
+    fn encoder_add_frame_head_rejects_bad_frames() {
+        let mask = [1, 2, 3, 4];
+        // Negative payload length.
+        let mut enc = WsEncoder::default();
+        assert_eq!(
+            enc.add_frame_head(WSBIT_FIN | WSBIT_OPCODE_TEXT, -1, mask, &mut Vec::new()).unwrap_err().0,
+            CurlError::SendError
+        );
+        // A new frame while the previous payload is unsent.
+        let mut enc = WsEncoder::default();
+        enc.payload_remain = 3;
+        assert_eq!(
+            enc.add_frame_head(WSBIT_FIN | WSBIT_OPCODE_TEXT, 1, mask, &mut Vec::new()).unwrap_err().0,
+            CurlError::SendError
+        );
+        // An over-long control frame.
+        let mut enc = WsEncoder::default();
+        assert_eq!(
+            enc.add_frame_head(WSBIT_FIN | WSBIT_OPCODE_PING, 126, mask, &mut Vec::new()).unwrap_err().0,
+            CurlError::TooLarge
+        );
+    }
+
+    #[test]
+    fn encoder_encode_payload_masks_and_advances() {
+        let mask = [1, 2, 3, 4];
+        let mut enc = WsEncoder::default();
+        let mut out = Vec::new();
+        enc.add_frame_head(WSBIT_FIN | WSBIT_OPCODE_BIN, 5, mask, &mut out).unwrap();
+        out.clear(); // isolate the payload bytes
+        let n = enc.encode_payload(&[0x10, 0x20, 0x30, 0x40, 0x50], &mut out);
+        assert_eq!(n, 5);
+        // Each byte XORed with mask[i % 4].
+        assert_eq!(out, vec![0x10 ^ 1, 0x20 ^ 2, 0x30 ^ 3, 0x40 ^ 4, 0x50 ^ 1]);
+        assert_eq!(enc.payload_remain, 0);
+    }
+
+    #[test]
+    fn decoder_read_head_parses_length_tiers() {
+        // 7-bit inline length.
+        let mut dec = WsDecoder::new();
+        let mut buf = RecvBuf::new();
+        buf.extend(&[WSBIT_FIN | WSBIT_OPCODE_TEXT, 5]);
+        assert_eq!(dec.read_head(&mut buf).unwrap(), HeadStatus::Done);
+        assert_eq!(dec.payload_len, 5);
+        assert_eq!(dec.frame_flags, CURLWS_TEXT as i32);
+
+        // 16-bit extended length.
+        let mut dec = WsDecoder::new();
+        let mut buf = RecvBuf::new();
+        buf.extend(&[WSBIT_FIN | WSBIT_OPCODE_BIN, 126, 0x01, 0x00]);
+        assert_eq!(dec.read_head(&mut buf).unwrap(), HeadStatus::Done);
+        assert_eq!(dec.payload_len, 256);
+
+        // 64-bit extended length.
+        let mut dec = WsDecoder::new();
+        let mut buf = RecvBuf::new();
+        let mut bytes = vec![WSBIT_FIN | WSBIT_OPCODE_BIN, 127];
+        bytes.extend_from_slice(&70000u64.to_be_bytes());
+        buf.extend(&bytes);
+        assert_eq!(dec.read_head(&mut buf).unwrap(), HeadStatus::Done);
+        assert_eq!(dec.payload_len, 70000);
+    }
+
+    #[test]
+    fn decoder_read_head_needs_more_when_split() {
+        let mut dec = WsDecoder::new();
+        let mut buf = RecvBuf::new();
+        // Only the first byte arrives.
+        buf.extend(&[WSBIT_FIN | WSBIT_OPCODE_TEXT]);
+        assert_eq!(dec.read_head(&mut buf).unwrap(), HeadStatus::NeedMore);
+        // The length byte arrives in a later read; the head completes.
+        buf.extend(&[7]);
+        assert_eq!(dec.read_head(&mut buf).unwrap(), HeadStatus::Done);
+        assert_eq!(dec.payload_len, 7);
+    }
+
+    #[test]
+    fn decoder_read_head_rejects_protocol_violations() {
+        // A masked server→client frame is illegal.
+        let mut dec = WsDecoder::new();
+        let mut buf = RecvBuf::new();
+        buf.extend(&[WSBIT_FIN | WSBIT_OPCODE_TEXT, WSBIT_MASK | 1]);
+        assert_eq!(dec.read_head(&mut buf).unwrap_err().0, CurlError::RecvError);
+
+        // An over-long control frame (PING with a 126 length marker).
+        let mut dec = WsDecoder::new();
+        let mut buf = RecvBuf::new();
+        buf.extend(&[WSBIT_FIN | WSBIT_OPCODE_PING, 126]);
+        assert_eq!(dec.read_head(&mut buf).unwrap_err().0, CurlError::RecvError);
+
+        // A 64-bit length with the top bit set (>63 bits) is unsupported.
+        let mut dec = WsDecoder::new();
+        let mut buf = RecvBuf::new();
+        let mut bytes = vec![WSBIT_FIN | WSBIT_OPCODE_BIN, 127];
+        bytes.extend_from_slice(&[0x80, 0, 0, 0, 0, 0, 0, 0]);
+        buf.extend(&bytes);
+        assert_eq!(dec.read_head(&mut buf).unwrap_err().0, CurlError::RecvError);
+
+        // Reserved bits set in the first byte.
+        let mut dec = WsDecoder::new();
+        let mut buf = RecvBuf::new();
+        buf.extend(&[WSBIT_FIN | WSBIT_RSV1 | WSBIT_OPCODE_TEXT, 1]);
+        assert!(dec.read_head(&mut buf).is_err());
+    }
+
 }

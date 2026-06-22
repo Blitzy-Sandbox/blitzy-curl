@@ -369,6 +369,15 @@ impl PerTransfer {
         if !self.errorbuffer.is_empty() {
             return Some(self.errorbuffer.as_str());
         }
+        // Then the engine's Rust-native failure latch (the safe-core analogue of
+        // `CURLOPT_ERRORBUFFER`): the protocol drivers record the few `failf`
+        // diagnostics whose exact text differs from the static `CURLcode`
+        // description here (e.g. the decompression-bomb "more than 5 content
+        // encodings" message), so the `curl: (N) <msg>` line matches curl
+        // byte-for-byte. See `Easy::last_error`'s foundation-limitation note.
+        if let Some(msg) = self.easy.last_error() {
+            return Some(msg);
+        }
         // Otherwise surface the engine-written `CURLOPT_ERRORBUFFER` storage
         // that `config2setopts` programmed into the easy handle: it lives in the
         // co-located `sp` as a NUL-terminated C buffer. Decoding it here keeps

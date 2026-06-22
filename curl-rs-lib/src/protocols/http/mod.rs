@@ -110,7 +110,7 @@ pub mod h3;
 
 use crate::conn::{
     BoxFuture, Connection, Curl_conn_get_alpn_negotiated, Curl_conn_get_ip_info,
-    Curl_conn_get_remote_addr,
+    Curl_conn_get_remote_addr, Curl_conn_is_alive,
 };
 use crate::easy::Easy;
 use crate::error::Result;
@@ -691,8 +691,18 @@ struct HopSink<'s> {
     /// The buffered body of a `401`/`407` captured under
     /// [`BodyDisposition::BufferAuth`], pending the retry/terminal decision.
     auth_body_buf: Vec<u8>,
-    /// Memoized body-routing decision (computed once the first body byte arrives
-    /// — by then all headers, including the status line, have been seen).
+    /// Whether the current response block's end-of-headers blank line has been
+    /// observed (so subsequent body-stream writes are *real* body bytes, not
+    /// `CURLOPT_HEADER` header-merge bytes). Set when [`note_header`] sees the
+    /// blank line after a status line; reset when a new status line begins (1xx
+    /// interim, the redirect's own block) and on [`reset_for_retry`]. This gates
+    /// the body-routing decision so it is taken with the status fully known —
+    /// the analog of curl deciding `k->ignorebody` once the response head is
+    /// parsed, not while header bytes are still flowing onto the `-i` body stream.
+    headers_complete: bool,
+    /// Memoized body-routing decision (computed once the first *real* body byte
+    /// arrives — i.e. after [`headers_complete`](Self::headers_complete), by
+    /// which point the status line and all headers have been seen).
     disposition: Option<BodyDisposition>,
 }
 
@@ -722,6 +732,7 @@ impl<'s> HopSink<'s> {
             www_authenticate: Vec::new(),
             auth_negotiating,
             auth_body_buf: Vec::new(),
+            headers_complete: false,
             disposition: None,
         }
     }
@@ -734,6 +745,16 @@ impl<'s> HopSink<'s> {
         };
         let line = s.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
+            // The end-of-headers blank line: once a status line has been seen,
+            // the body follows. Marking the block's headers complete lets the
+            // first *real* body write take the redirect/auth disposition with the
+            // status fully known — and lets the `CURLOPT_HEADER` header-merge
+            // writes that arrive on the body stream *before* this point be
+            // forwarded verbatim (curl shows intermediate redirect headers under
+            // `-i`). A blank line before any status line (defensive) is ignored.
+            if self.status != 0 {
+                self.headers_complete = true;
+            }
             return;
         }
         // A status line begins a (possibly new) response block. Update the status
@@ -748,6 +769,11 @@ impl<'s> HopSink<'s> {
                 self.headers.clear();
                 self.content_type = None;
                 self.www_authenticate.clear();
+                // A fresh response block: its body boundary has not been reached
+                // yet. Reset so a prior block's blank line (a 1xx interim
+                // response, or the status line of the next hop arriving on a
+                // kept-alive connection) does not leave headers marked complete.
+                self.headers_complete = false;
             }
             return;
         }
@@ -822,6 +848,7 @@ impl<'s> HopSink<'s> {
         self.content_type = None;
         self.www_authenticate.clear();
         self.auth_body_buf.clear();
+        self.headers_complete = false;
         self.disposition = None;
         #[cfg(feature = "cookies")]
         self.set_cookies.clear();
@@ -862,6 +889,19 @@ impl<'s> HopSink<'s> {
 
 impl WriteCallbacks for HopSink<'_> {
     fn write_body(&mut self, data: &[u8]) -> usize {
+        // Before the end-of-headers blank line, any bytes arriving on the body
+        // stream are `CURLOPT_HEADER` (`-i`) header-merge bytes that `CwOut`
+        // routes to the body callback *before* delivering them on the header
+        // callback (so `note_header` has not yet parsed the status line). They
+        // are header content, not body — forward them verbatim and do NOT let
+        // them drive or prematurely memoize the body disposition. This is the
+        // analog of curl gating only true `CLIENTWRITE_BODY` writes with
+        // `k->ignorebody`: intermediate redirect *headers* always flow under
+        // `-i`, while the intermediate *body* is suppressed below. Without `-i`
+        // no body-stream write occurs until the body, so this branch is inert.
+        if !self.headers_complete {
+            return self.inner.write_body(data);
+        }
         let disposition = match self.disposition {
             Some(d) => d,
             None => {
@@ -1250,7 +1290,7 @@ mod auth_engine {
     use crate::auth::basic::http_basic_header;
     use crate::auth::bearer::http_bearer_header;
     use crate::auth::digest::{input_digest, output_digest, DigestData};
-    use crate::auth::ntlm::NtlmHandshake;
+    use crate::auth::ntlm::{NtlmHandshake, NtlmState};
     use crate::auth::{
         build_auth_mask, parse_auth_header, pick_one_auth, AuthState, CURLAUTH_BASIC,
         CURLAUTH_BEARER, CURLAUTH_DIGEST, CURLAUTH_NEGOTIATE, CURLAUTH_NTLM,
@@ -1392,6 +1432,17 @@ mod auth_engine {
         user: String,
         password: String,
         bearer: Option<String>,
+        /// Whether the auth handshake is still *negotiating* — curl's
+        /// `conn->bits.authneg`. While true, a POST/PUT request body is
+        /// suppressed (sent as `Content-Length: 0`) so the upload payload is not
+        /// transmitted before the credentials are accepted; the body rides only
+        /// the final, authenticated request. Starts `true` (a reactive controller
+        /// always opens with an empty-bodied probe — `--anyauth`/`--digest`/
+        /// `--ntlm` send no preemptive credential) and is updated after each
+        /// produced credential: a single-pass scheme (Basic/Bearer/Digest) or the
+        /// NTLM Type-3 authenticate message clears it (final); the NTLM Type-1
+        /// initial message keeps it set (still negotiating).
+        last_authneg: bool,
     }
 
     impl HttpAuthController {
@@ -1404,6 +1455,9 @@ mod auth_engine {
                 user: inputs.user,
                 password: inputs.password,
                 bearer: inputs.bearer,
+                // A reactive controller always opens by negotiating: the first
+                // request is an empty-bodied probe with no preemptive credential.
+                last_authneg: true,
             }
         }
 
@@ -1445,6 +1499,65 @@ mod auth_engine {
             self.produce_header(method, target, challenges)
         }
 
+        /// Whether the currently picked scheme is a connection-bound handshake
+        /// that has advanced past its opening message, so the *next* request must
+        /// be sent on the SAME connection. Only NTLM qualifies: once the server's
+        /// Type-2 challenge has been folded in (state [`NtlmState::Type2`]) the
+        /// Type-3 authenticate message is only valid on the connection that
+        /// carried the challenge. If that connection has been closed the
+        /// negotiation cannot complete on a fresh socket — curl fails the request
+        /// rather than silently restarting it. A *not-yet-started* NTLM exchange
+        /// (state [`NtlmState::None`]/[`NtlmState::Type1`], i.e. the Type-1
+        /// (re)start) is stateless and may freely reconnect, as may the stateless
+        /// Digest/Basic/Bearer schemes (`--anyauth`).
+        pub(super) fn requires_same_connection(&self) -> bool {
+            self.state.picked == CURLAUTH_NTLM
+                && matches!(self.ntlm.state(), NtlmState::Type2 | NtlmState::Type3)
+        }
+
+        /// Whether the auth handshake is still negotiating (curl's
+        /// `conn->bits.authneg`). The request body of a POST/PUT is suppressed
+        /// while this is true — see [`last_authneg`](Self::last_authneg). The
+        /// initial probe (before any challenge) negotiates; after a challenge it
+        /// reflects whether the just-produced credential was the scheme's final
+        /// message.
+        pub(super) fn is_negotiating(&self) -> bool {
+            self.last_authneg
+        }
+
+        /// Produce the FIRST request's `Authorization` value for a single reactive
+        /// scheme that opens its handshake WITHOUT a server challenge — curl's
+        /// preemptive first message. curl pre-picks the sole wanted scheme
+        /// (`authhost->picked == authhost->want`, a single bit) and, for NTLM,
+        /// emits the challenge-free Type-1 message on the very first request
+        /// (`--ntlm`), rather than waiting for a `401`. Digest must wait for the
+        /// server's nonce, and a multi-scheme mask (`--anyauth`, a multi-bit
+        /// `picked`) must observe the `401` before choosing — both yield `None`,
+        /// leaving the first request a credential-less (and, for uploads,
+        /// body-less) probe.
+        ///
+        /// Side effect when it returns `Some`: the NTLM handshake is advanced and
+        /// [`last_authneg`](Self::last_authneg) is set from whether the produced
+        /// message is final (a Type-1 opening message is still negotiating). The
+        /// matching Type-2 challenge that follows is folded by
+        /// [`on_challenge`](Self::on_challenge) on the `401`, which then emits the
+        /// Type-3 authenticate message on the SAME connection.
+        pub(super) fn initial_header(&mut self) -> Option<String> {
+            // Only a single, pre-picked NTLM scheme is sent preemptively. `picked`
+            // is seeded to `want` at construction, so a single `--ntlm` mask has
+            // `picked == CURLAUTH_NTLM` exactly; `--anyauth` (multi-bit) and single
+            // `--digest` (`CURLAUTH_DIGEST`) do not match and fall through.
+            if self.state.picked == CURLAUTH_NTLM {
+                // Type-1 is challenge-free: `output` with no prior server input
+                // yields it (curl's `Curl_auth_create_ntlm_type1_message`).
+                let out = self.ntlm.output(false, &self.user, &self.password).ok()?;
+                // The Type-1 opening message is still negotiating.
+                self.last_authneg = !out.done;
+                return out.header.map(|line| reduce_to_value(&line));
+            }
+            None
+        }
+
         /// Produce the `Authorization` value for the currently picked scheme.
         fn produce_header(
             &mut self,
@@ -1455,11 +1568,15 @@ mod auth_engine {
             match self.state.picked {
                 CURLAUTH_BASIC => {
                     let line = http_basic_header(&self.user, &self.password, false).ok()?;
+                    // Basic is single-pass: the credential is final.
+                    self.last_authneg = false;
                     Some(reduce_to_value(&line))
                 }
                 CURLAUTH_BEARER => {
                     let token = self.bearer.as_deref()?;
                     let line = http_bearer_header(token).ok()?;
+                    // Bearer is single-pass: the token is final.
+                    self.last_authneg = false;
                     Some(reduce_to_value(&line))
                 }
                 CURLAUTH_DIGEST => {
@@ -1476,6 +1593,8 @@ mod auth_engine {
                         self.password.as_bytes(),
                     )
                     .ok()?;
+                    // Digest is single-pass: the response is final.
+                    self.last_authneg = false;
                     out.header.map(|line| reduce_to_value(&line))
                 }
                 CURLAUTH_NTLM => {
@@ -1483,6 +1602,10 @@ mod auth_engine {
                     // (bare `NTLM` → queue Type-1; `NTLM <type2>` → ready Type-3).
                     self.feed_ntlm(challenges)?;
                     let out = self.ntlm.output(false, &self.user, &self.password).ok()?;
+                    // NTLM is multi-pass: the Type-1 initial message is still
+                    // negotiating (`out.done == false`); only the Type-3
+                    // authenticate message is final (`out.done == true`).
+                    self.last_authneg = !out.done;
                     out.header.map(|line| reduce_to_value(&line))
                 }
                 // Negotiate is not built in (no SPNEGO backend) and is masked out
@@ -1992,71 +2115,28 @@ pub(crate) async fn perform_http(
     final_result
 }
 
-/// Execute a single HTTP request/response hop and report the captured outcome.
-///
-/// This is the historical single-shot engine (connect → build → drive), lifted
-/// into a helper so the redirect orchestrator in [`perform_http`] can invoke it
-/// once per hop. The response sink is wrapped in a [`HopSink`] so the hop's
-/// status line, `Location`, `Set-Cookie`, `Strict-Transport-Security`, and
-/// `Alt-Svc` headers are captured for the orchestrator while every header is
-/// still forwarded to the real sink (so `-i`/`-D` observe every hop); an
-/// intermediate 3xx body is suppressed so only the final response body reaches
-/// the caller, matching curl `-L`.
-///
-/// The `hop` inputs carry the per-hop request shape (method/body framing,
-/// cookies, referer, authorization), letting the orchestrator vary the method
-/// across a redirect chain without re-reading the source body.
-///
-/// # Errors
-///
-/// Any URL, resolve, connect, TLS, or transfer error from the layers below, or
-/// [`CurlError::UrlMalformat`] for a host-less URL.
-async fn perform_http_hop(
+/// Establish the connection for one HTTP hop: proxy routing, DNS resolution,
+/// the SETUP filter chain (eyeballs → socks → ssl_proxy → http_proxy → ssl),
+/// the TCP/TLS handshake, and the per-connection `data->info` / verbose-trace
+/// publication. Extracted from [`perform_http_hop`] so the reactive-auth loop
+/// can RE-establish a fresh connection when the server closes the socket after
+/// a `401` challenge (curl reconnects and retries with the credential; e.g. the
+/// `swsclose` Digest tests). `host`/`host_ace` are taken by value so the caller
+/// retains its copies for the (possibly repeated) reconnect call.
+#[allow(clippy::too_many_arguments)]
+async fn http_connect_hop(
     data: &mut Easy,
-    url: &CurlUrl,
-    hop: HopInputs,
-    body: h1::RequestBody,
-    follow_enabled: bool,
+    hop: &mut HopInputs,
+    is_https: bool,
+    host: String,
+    host_ace: String,
+    port: u16,
+    verbose: bool,
+    httpwant: u8,
+    ipver: IpVersion,
+    op_start: Instant,
     sink: &mut dyn WriteCallbacks,
-) -> Result<HopResult> {
-    // The operation start for this hop, captured before DNS resolution and
-    // connection setup so the transfer timings (`CURLINFO_*_TIME`) measure from
-    // the true beginning of work — curl's `Curl_pgrsStartNow` reference point.
-    // The name-lookup and connect milestones below are recorded relative to it,
-    // and it is threaded into `drive_one` to seed `Progress`.
-    let op_start = Instant::now();
-    let verbose = data.set.verbose;
-    let httpwant = data.set.httpwant;
-    let ipver = IpVersion::from_raw(i64::from(data.set.ipver));
-
-    // The request parts for *this* hop's URL.
-    let (_scheme, is_https, host, port) = http_url_parts(url)?;
-    // Host used for the `Host:` header and TLS SNI: ACE-encode a Unicode host to
-    // its `xn--` Punycode form (curl's `Curl_idnconvert_hostname`). `to_ascii`
-    // returns an ASCII or already-`xn--` host byte-for-byte unchanged
-    // (idempotent, case-preserving), converts a Unicode host via UTS-46
-    // ToASCII, and yields `CURLE_URL_MALFORMAT` for an un-encodable name —
-    // matching curl exactly for the wire-observable host that appears in the
-    // `Host:` header and the TLS SNI. The DNS layer applies the same conversion
-    // independently (`dns::resolve`), so the lookup and the request agree on the
-    // ACE form (this resolves F6-007: the Host header previously carried raw
-    // UTF-8 while only the resolver path was ACE-encoded).
-    let host_ace = crate::idn::to_ascii(&host)?;
-
-    // (3) Decide whether this hop routes through a proxy (F6-001). The CLI/FFI
-    //     deposits `-x`/`--proxy`/`--socks*`/`--preproxy`/`--noproxy` into
-    //     `data.set`; the engine consults that config here (curl's `create_conn`
-    //     proxy setup), where it actually changes the dial target and the filter
-    //     chain. When a proxy applies, the TCP connect targets the *proxy*; the
-    //     request still targets the origin (curl keeps `conn->host` = origin,
-    //     `conn->http_proxy.host` = proxy). `--noproxy`/`NO_PROXY` is honored by
-    //     `proxy_for_target`, which returns `None` when the host is bypassed.
-    // The per-hop inputs become mutable here: a forward HTTP proxy injects
-    // `Proxy-Authorization`/`Proxy-Connection`, and the HTTP/1.1 reactive-auth
-    // loop rewrites `authorization` across challenge-response retries. Both the
-    // proxy feature and the auth loop mutate `hop`, so the rebind is
-    // unconditional (the auth loop is always compiled).
-    let mut hop = hop;
+) -> Result<Connection> {
     #[cfg(feature = "proxy")]
     let proxy_cfg = {
         // The request URL's scheme selects the `<scheme>_proxy` environment
@@ -2109,7 +2189,7 @@ async fn perform_http_hop(
     } else {
         CURL_CF_SSL_DISABLE
     };
-    let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, addrs);
+    let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, data.set.connecttimeout, addrs);
 
     // The target TLS filter (origin TLS) is installed whenever the *target* URL
     // is https, independent of any proxy in front — it rides on top of the SOCKS
@@ -2304,6 +2384,89 @@ async fn perform_http_hop(
         }
     }
 
+    Ok(conn)
+}
+
+/// Execute a single HTTP request/response hop and report the captured outcome.
+///
+/// This is the historical single-shot engine (connect → build → drive), lifted
+/// into a helper so the redirect orchestrator in [`perform_http`] can invoke it
+/// once per hop. The response sink is wrapped in a [`HopSink`] so the hop's
+/// status line, `Location`, `Set-Cookie`, `Strict-Transport-Security`, and
+/// `Alt-Svc` headers are captured for the orchestrator while every header is
+/// still forwarded to the real sink (so `-i`/`-D` observe every hop); an
+/// intermediate 3xx body is suppressed so only the final response body reaches
+/// the caller, matching curl `-L`.
+///
+/// The `hop` inputs carry the per-hop request shape (method/body framing,
+/// cookies, referer, authorization), letting the orchestrator vary the method
+/// across a redirect chain without re-reading the source body.
+///
+/// # Errors
+///
+/// Any URL, resolve, connect, TLS, or transfer error from the layers below, or
+/// [`CurlError::UrlMalformat`] for a host-less URL.
+async fn perform_http_hop(
+    data: &mut Easy,
+    url: &CurlUrl,
+    hop: HopInputs,
+    body: h1::RequestBody,
+    follow_enabled: bool,
+    sink: &mut dyn WriteCallbacks,
+) -> Result<HopResult> {
+    // The operation start for this hop, captured before DNS resolution and
+    // connection setup so the transfer timings (`CURLINFO_*_TIME`) measure from
+    // the true beginning of work — curl's `Curl_pgrsStartNow` reference point.
+    // The name-lookup and connect milestones below are recorded relative to it,
+    // and it is threaded into `drive_one` to seed `Progress`.
+    let op_start = Instant::now();
+    let verbose = data.set.verbose;
+    let httpwant = data.set.httpwant;
+    let ipver = IpVersion::from_raw(i64::from(data.set.ipver));
+
+    // The request parts for *this* hop's URL.
+    let (_scheme, is_https, host, port) = http_url_parts(url)?;
+    // Host used for the `Host:` header and TLS SNI: ACE-encode a Unicode host to
+    // its `xn--` Punycode form (curl's `Curl_idnconvert_hostname`). `to_ascii`
+    // returns an ASCII or already-`xn--` host byte-for-byte unchanged
+    // (idempotent, case-preserving), converts a Unicode host via UTS-46
+    // ToASCII, and yields `CURLE_URL_MALFORMAT` for an un-encodable name —
+    // matching curl exactly for the wire-observable host that appears in the
+    // `Host:` header and the TLS SNI. The DNS layer applies the same conversion
+    // independently (`dns::resolve`), so the lookup and the request agree on the
+    // ACE form (this resolves F6-007: the Host header previously carried raw
+    // UTF-8 while only the resolver path was ACE-encoded).
+    let host_ace = crate::idn::to_ascii(&host)?;
+
+    // (3) Decide whether this hop routes through a proxy (F6-001). The CLI/FFI
+    //     deposits `-x`/`--proxy`/`--socks*`/`--preproxy`/`--noproxy` into
+    //     `data.set`; the engine consults that config here (curl's `create_conn`
+    //     proxy setup), where it actually changes the dial target and the filter
+    //     chain. When a proxy applies, the TCP connect targets the *proxy*; the
+    //     request still targets the origin (curl keeps `conn->host` = origin,
+    //     `conn->http_proxy.host` = proxy). `--noproxy`/`NO_PROXY` is honored by
+    //     `proxy_for_target`, which returns `None` when the host is bypassed.
+    // The per-hop inputs become mutable here: a forward HTTP proxy injects
+    // `Proxy-Authorization`/`Proxy-Connection`, and the HTTP/1.1 reactive-auth
+    // loop rewrites `authorization` across challenge-response retries. Both the
+    // proxy feature and the auth loop mutate `hop`, so the rebind is
+    // unconditional (the auth loop is always compiled).
+    let mut hop = hop;
+    let mut conn = http_connect_hop(
+        data,
+        &mut hop,
+        is_https,
+        host.clone(),
+        host_ace.clone(),
+        port,
+        verbose,
+        httpwant,
+        ipver,
+        op_start,
+        sink,
+    )
+    .await?;
+
     // (6) Select the wire version (forced option, else negotiated ALPN) and
     //     build + drive the matching exchange, capturing the hop outcome.
     let version = select_http_version(data, &conn)?;
@@ -2318,6 +2481,24 @@ async fn perform_http_hop(
         }
         _ => None,
     };
+    // Single-scheme NTLM opens its handshake preemptively: curl pre-picks the
+    // sole wanted scheme and sends the challenge-free Type-1 message on the FIRST
+    // request (`--ntlm`), rather than waiting for a `401` (which `--anyauth` does,
+    // and which Digest must, lacking a nonce). Seed this hop's `Authorization`
+    // with that Type-1 so it rides the first request; the controller's NTLM state
+    // advances in lock-step, so the `401`'s Type-2 challenge produces the Type-3
+    // authenticate message on the retry. This runs per hop, so the handshake
+    // correctly RESTARTS from Type-1 on a redirect target (the new hop's fresh
+    // controller), matching curl. Only applies when no preemptive credential is
+    // already set (a reactive NTLM transfer carries none).
+    if hop.authorization.is_none() {
+        if let Some(initial) = auth_controller
+            .as_mut()
+            .and_then(auth_engine::HttpAuthController::initial_header)
+        {
+            hop.authorization = Some(initial);
+        }
+    }
     // When auth negotiation is active, a `401`/`407` body is buffered rather than
     // streamed to the application, so an intermediate auth-probe error page is
     // not delivered when the request is about to be re-issued with credentials.
@@ -2337,10 +2518,33 @@ async fn perform_http_hop(
             // challenging server cannot loop forever.
             const MAX_AUTH_ATTEMPTS: u32 = 10;
             let mut attempt: u32 = 0;
+            // Whether the current connection is freshly (re)established versus
+            // reused for a same-connection retry. This is curl's
+            // `conn->bits.reuse` (inverted): it gates the HTTP/0.9 fallback and
+            // the reused-connection retry below.
+            let mut conn_is_fresh = true;
+            // curl's `conn->bits.authneg`: while a reactive auth handshake is
+            // negotiating, a POST/PUT request body is suppressed (sent as
+            // `Content-Length: 0`) so the upload payload is not transmitted before
+            // the credentials are accepted — the body rides only the final,
+            // authenticated request. A reactive controller opens by negotiating
+            // (an empty-bodied probe: `--anyauth`/`--digest`/`--ntlm` send no
+            // preemptive credential); without a controller this stays false and
+            // the body is always sent on the single attempt.
+            let mut authneg = auth_controller
+                .as_ref()
+                .is_some_and(|c| c.is_negotiating());
             let result = loop {
                 // The request body is re-sent on each auth attempt (curl rewinds
                 // and resends), so clone the buffered body per iteration; the
-                // GET/HEAD case clones `RequestBody::None` (free).
+                // GET/HEAD case clones `RequestBody::None` (free). During auth
+                // negotiation (`authneg`) the upload payload is replaced with an
+                // empty `Content-Length: 0` body — curl's body-less auth probe.
+                let attempt_body = if authneg {
+                    suppress_upload_body(&body)
+                } else {
+                    body.clone()
+                };
                 let plan = {
                     let inputs = make_inputs(
                         data,
@@ -2351,7 +2555,7 @@ async fn perform_http_hop(
                         port,
                         is_https,
                         false,
-                        body.clone(),
+                        attempt_body,
                         http_minor,
                         &hop,
                     );
@@ -2365,34 +2569,82 @@ async fn perform_http_hop(
                 if verbose {
                     hop_sink.debug(crate::transfer::DebugInfoType::HeaderOut, &plan.head);
                 }
-                // On a retry (`attempt > 0`) the connection is being reused, which
-                // forbids the HTTP/0.9 no-status-line fallback (curl's reused-conn
-                // rule). The first attempt on a fresh connection passes `false`.
+                // A reused connection forbids the HTTP/0.9 no-status-line fallback
+                // (curl's reused-conn rule); a freshly (re)established connection
+                // permits it. `!conn_is_fresh` is precisely curl's
+                // `conn->bits.reuse`.
                 let mut exchange = h1::H1Exchange::new(
                     h1::ConnByteStream::new(&mut conn),
                     plan,
                     data.set.http09_allowed,
-                    attempt > 0,
+                    !conn_is_fresh,
                 );
+                // `CURLOPT_TRANSFER_ENCODING` (`--tr-encoding`): opt into
+                // transfer decoding of a compressed `Transfer-Encoding` response
+                // body and the chunked-not-last rejection (curl's `is_transfer`
+                // path, gated on `data.set.http_transfer_encoding`).
+                exchange.set_transfer_decoding(data.set.http_transfer_encoding);
                 let result = drive_one(data, &mut exchange, &mut hop_sink, op_start).await;
                 let keepalive = exchange.keepalive();
                 drop(exchange);
                 h1::apply_connection_reuse(&mut conn, keepalive);
 
-                // A transport/protocol error ends the hop immediately.
+                // A transport/protocol error normally ends the hop. But a *reused*
+                // connection that died before delivering any response — the case
+                // where the server closed an apparently keep-alive socket after a
+                // prior challenge (the `swsclose` pattern), which the non-blocking
+                // liveness peek below can miss when the peer's FIN has not yet
+                // arrived — is retried once on a fresh connection. This is curl's
+                // `Curl_retry_request`, scoped to an active auth negotiation so it
+                // cannot mask a genuine transport failure on a fresh connection or
+                // in a non-auth transfer.
                 if result.is_err() {
+                    let retryable = auth_controller.is_some()
+                        && !conn_is_fresh
+                        && attempt < MAX_AUTH_ATTEMPTS
+                        && matches!(
+                            result.as_ref().err(),
+                            Some(CurlError::GotNothing)
+                                | Some(CurlError::RecvError)
+                                | Some(CurlError::SendError)
+                                | Some(CurlError::PartialFile)
+                        );
+                    if retryable {
+                        attempt += 1;
+                        hop_sink.reset_for_retry();
+                        conn = http_connect_hop(
+                            data,
+                            &mut hop,
+                            is_https,
+                            host.clone(),
+                            host_ace.clone(),
+                            port,
+                            verbose,
+                            httpwant,
+                            ipver,
+                            op_start,
+                            &mut hop_sink,
+                        )
+                        .await?;
+                        conn_is_fresh = true;
+                        continue;
+                    }
                     break result;
                 }
 
-                // Reactive auth: on a `401` over a still-reusable connection, ask
-                // the controller for the next `Authorization` value and retry on
-                // the same connection. Any other status (or no controller, or a
-                // closed connection, or the attempt budget exhausted) is terminal.
+                // Reactive auth: on a `401`, ask the controller for the next
+                // `Authorization` value and retry. When the connection is still
+                // reusable the retry rides the same socket; when the server closed
+                // it after the challenge (curl's `swsclose` Digest/anyauth tests,
+                // or any `Connection: close` 401) the retry RE-establishes a fresh
+                // connection — curl reconnects-and-retries rather than giving up.
+                // Any non-`401` status (or no controller, or the attempt budget
+                // exhausted) is terminal.
                 let Some(controller) = auth_controller.as_mut() else {
                     break result;
                 };
                 attempt += 1;
-                if !keepalive || hop_sink.status != 401 || attempt >= MAX_AUTH_ATTEMPTS {
+                if hop_sink.status != 401 || attempt >= MAX_AUTH_ATTEMPTS {
                     break result;
                 }
                 // Compute the verb and origin-form target the Digest response
@@ -2417,12 +2669,66 @@ async fn perform_http_hop(
                     &target,
                 ) {
                     Some(next) => {
-                        // Re-issue on the same connection with the new credential;
-                        // drop the buffered probe body and reset the per-attempt
-                        // observable state.
+                        // Decide whether the existing connection can carry the
+                        // retry. curl reuses a still-open keep-alive connection
+                        // but RECONNECTS when the server closed the socket after
+                        // the challenge. This covers two cases: an explicit
+                        // `Connection: close` 401 (`keepalive == false`), AND the
+                        // common HTTP/1.1 `401` with `Content-Length` and no
+                        // `Connection: close` header whose peer nonetheless closed
+                        // the socket (the harness `swsclose` directive). A
+                        // non-blocking liveness peek (`Curl_conn_is_alive`, curl's
+                        // pre-reuse `connalive` check) detects the peer's `EOF` in
+                        // the latter case so the credential is not written into a
+                        // dead socket.
+                        let conn_alive = keepalive && Curl_conn_is_alive(&mut conn).0;
+                        // A connection-bound NTLM handshake that has already
+                        // consumed the server's Type-2 challenge cannot continue
+                        // on a new socket; if the connection is gone the
+                        // negotiation is unrecoverable, so the current `401` is the
+                        // real answer (curl fails likewise).
+                        if !conn_alive && controller.requires_same_connection() {
+                            break result;
+                        }
+                        // Re-issue with the new credential; drop the buffered probe
+                        // body and reset the per-attempt observable state.
                         hop.authorization = Some(next);
+                        // Update curl's `authneg`: the body is sent only on the
+                        // final authenticated request. A single-pass scheme
+                        // (Basic/Bearer/Digest) or the NTLM Type-3 message clears
+                        // it (the next attempt carries the real upload); the NTLM
+                        // Type-1 initial message keeps it set (the Type-1 probe
+                        // is still body-less).
+                        authneg = controller.is_negotiating();
                         hop_sink.discard_auth_body();
                         hop_sink.reset_for_retry();
+                        // When the connection is no longer usable, re-establish a
+                        // fresh one for the retry. The controller (and any NTLM
+                        // Type-1 state) persists across the reconnect; only the
+                        // socket is replaced. The verbose `* Trying …`/`*
+                        // Connected to …` trace is re-emitted via the hop sink,
+                        // matching curl's per-connection logging.
+                        if conn_alive {
+                            // The kept-alive connection carries the next attempt
+                            // (curl's same-connection challenge-response retry).
+                            conn_is_fresh = false;
+                        } else {
+                            conn = http_connect_hop(
+                                data,
+                                &mut hop,
+                                is_https,
+                                host.clone(),
+                                host_ace.clone(),
+                                port,
+                                verbose,
+                                httpwant,
+                                ipver,
+                                op_start,
+                                &mut hop_sink,
+                            )
+                            .await?;
+                            conn_is_fresh = true;
+                        }
                     }
                     // No acceptable scheme / rejected credentials / scheme done:
                     // the current response is the real answer.
@@ -2989,6 +3295,18 @@ async fn drive_one<P: ProtocolExchange>(
     data.info.pretransfer_time_us = progress.pretransfer_time().as_micros();
     data.info.header_size = request.headerbytecount as i64;
 
+    // Latch the decompression-bomb diagnostic so the front-end's `curl: (61)
+    // <msg>` line and `%{errormsg}` carry curl's specific `failf` text rather
+    // than the generic `CURLE_BAD_CONTENT_ENCODING` description. curl writes
+    // `"Reject response due to more than 5 content encodings"` from
+    // `Curl_build_unencoding_stack`; the safe core records the equivalent on the
+    // handle (the C `CURLOPT_ERRORBUFFER` cannot be written from here — the
+    // documented foundation limitation). Scoped to this one cause so no other
+    // transfer error's diagnostic text changes.
+    if matches!(outcome, Err(CurlError::TooManyContentEncodings)) {
+        data.set_last_error(CurlError::TooManyContentEncodings.description());
+    }
+
     // Surface any transfer error only after the info store is recorded.
     outcome?;
     Ok(())
@@ -3363,6 +3681,21 @@ async fn doh_probe_post(req: DohProbeRequest) -> Result<Vec<u8>> {
 /// (`allowed_to_host`), proxy keep-alive, and a proxy absolute-URI request
 /// target. For an un-redirected, un-proxied transfer these reduce to the handle's
 /// own options, so the single-hop request is byte-for-byte unchanged.
+/// Replace an upload payload with an explicit zero-length body for curl's
+/// auth-negotiation probe (`conn->bits.authneg`). A POST/PUT sent during auth
+/// negotiation advertises `Content-Length: 0` and transmits no data; the real
+/// payload is sent only on the final, authenticated request. A request that has
+/// no body ([`RequestBody::None`], i.e. GET/HEAD) is returned unchanged, so the
+/// suppression is a no-op there.
+fn suppress_upload_body(body: &h1::RequestBody) -> h1::RequestBody {
+    match body {
+        h1::RequestBody::None => h1::RequestBody::None,
+        h1::RequestBody::Sized(_) | h1::RequestBody::Chunked(_) => {
+            h1::RequestBody::Sized(Vec::new())
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn make_inputs<'a>(
     data: &'a Easy,
@@ -3399,7 +3732,13 @@ fn make_inputs<'a>(
         proxy_authorization: hop.proxy_authorization.as_deref(),
         range: data.set.str(StrId::SetRange),
         accept_present: any_custom_header(custom_headers, "Accept"),
-        te_gzip: false,
+        // `CURLOPT_TRANSFER_ENCODING` (`--tr-encoding`): announce `TE: gzip`
+        // (and the matching `Connection: TE`, emitted in `h1.rs`) on HTTP/1.x
+        // requests so the server may apply a compressed transfer-encoding.
+        // Mirrors curl's `http_transfer_encoding` gate in `lib/http.c`, which
+        // also honors a user-supplied `TE:` header (`Curl_checkheaders`) and
+        // then leaves the announcement to the application.
+        te_gzip: data.set.http_transfer_encoding && !any_custom_header(custom_headers, "TE"),
         accept_encoding: data.set.str(StrId::Encoding),
         referer: hop.referer.as_deref(),
         proxy_connection_keepalive: hop.proxy_connection_keepalive,
@@ -3649,5 +3988,459 @@ mod tests {
             .await
             .expect("done ok");
         assert!(conn.take_proto_state().is_none());
+    }
+
+    // ---- pure orchestration helpers --------------------------------------
+    //
+    // The status/redirect/auth classifiers and the request-shaping helpers are
+    // the deterministic core of the hop driver; they are exercised here in
+    // isolation (the full hop flow needs a live socket).
+
+    #[test]
+    fn is_redirect_status_covers_3xx_only() {
+        assert!(!is_redirect_status(200));
+        assert!(!is_redirect_status(299));
+        assert!(is_redirect_status(300));
+        assert!(is_redirect_status(301));
+        assert!(is_redirect_status(302));
+        assert!(is_redirect_status(307));
+        assert!(is_redirect_status(399));
+        assert!(!is_redirect_status(400));
+    }
+
+    #[test]
+    fn http_should_fail_matches_curl_rules() {
+        // < 400 never fails.
+        assert!(!http_should_fail(204, false, true, false, false));
+        // 416 on a resumed GET is the "already complete" exception.
+        assert!(!http_should_fail(416, true, true, false, false));
+        // 416 without resume is a normal failure.
+        assert!(http_should_fail(416, false, true, false, false));
+        // A plain 404 is terminal.
+        assert!(http_should_fail(404, false, true, false, false));
+        // 401 with no host credential is terminal.
+        assert!(http_should_fail(401, false, true, false, false));
+        // 401 even with a credential is terminal (no negotiation loop).
+        assert!(http_should_fail(401, false, true, true, false));
+        // 407 with no proxy credential is terminal.
+        assert!(http_should_fail(407, false, true, false, false));
+        // 407 with a proxy credential is still terminal here.
+        assert!(http_should_fail(407, false, true, false, true));
+    }
+
+    #[test]
+    fn http_method_of_maps_each_request_kind() {
+        assert_eq!(http_method_of(HttpReq::Get), HttpMethod::Get);
+        assert_eq!(http_method_of(HttpReq::Post), HttpMethod::Post);
+        assert_eq!(http_method_of(HttpReq::PostForm), HttpMethod::PostForm);
+        assert_eq!(http_method_of(HttpReq::PostMime), HttpMethod::PostMime);
+        assert_eq!(http_method_of(HttpReq::Put), HttpMethod::Put);
+        assert_eq!(http_method_of(HttpReq::Head), HttpMethod::Head);
+    }
+
+    #[test]
+    fn parse_status_code_reads_second_token() {
+        assert_eq!(parse_status_code("1.1 302 Found"), Some(302));
+        assert_eq!(parse_status_code("2 200 OK"), Some(200));
+        // Missing code token.
+        assert_eq!(parse_status_code("1.1"), None);
+        // Non-numeric code.
+        assert_eq!(parse_status_code("1.1 NaN Bad"), None);
+        // Empty input.
+        assert_eq!(parse_status_code(""), None);
+    }
+
+    #[test]
+    fn strip_brackets_unwraps_ipv6_literals_only() {
+        assert_eq!(strip_brackets("[::1]"), "::1");
+        assert_eq!(strip_brackets("[2001:db8::1]"), "2001:db8::1");
+        assert_eq!(strip_brackets("example.com"), "example.com");
+        // An unbalanced bracket is left untouched.
+        assert_eq!(strip_brackets("[half"), "[half");
+    }
+
+    #[test]
+    fn take_host_field_and_plain_field_split_on_colon() {
+        // Plain token up to the colon.
+        assert_eq!(take_plain_field("443:rest"), ("443".to_string(), ":rest"));
+        assert_eq!(take_plain_field("tail"), ("tail".to_string(), ""));
+        // Bracketed IPv6 host keeps its brackets and resumes after ']'.
+        let (h, rest) = take_host_field("[::1]:443");
+        assert_eq!(h, "[::1]");
+        assert_eq!(rest, ":443");
+        // Plain host.
+        let (h2, rest2) = take_host_field("example.com:80");
+        assert_eq!(h2, "example.com");
+        assert_eq!(rest2, ":80");
+    }
+
+    #[test]
+    fn split_connect_to_parses_four_fields() {
+        assert_eq!(
+            split_connect_to("example.com:443:backend.internal:8080"),
+            Some((
+                "example.com".to_string(),
+                "443".to_string(),
+                "backend.internal".to_string(),
+                "8080".to_string()
+            ))
+        );
+        // IPv6 host fields keep their brackets.
+        assert_eq!(
+            split_connect_to("[::1]:443:[::2]:8080"),
+            Some((
+                "[::1]".to_string(),
+                "443".to_string(),
+                "[::2]".to_string(),
+                "8080".to_string()
+            ))
+        );
+        // Fewer than four fields ⇒ None.
+        assert_eq!(split_connect_to("example.com:443:backend"), None);
+    }
+
+    #[test]
+    fn connect_target_remaps_matching_entry() {
+        let mut data = Easy::new();
+        // No --connect-to ⇒ identity.
+        assert_eq!(connect_target(&data, "example.com", 443), ("example.com".to_string(), 443));
+
+        let mut list = SList::default();
+        list.append("example.com:443:backend.internal:8080").unwrap();
+        data.set.connect_to = Some(list);
+        // Matching host+port ⇒ remapped.
+        assert_eq!(
+            connect_target(&data, "example.com", 443),
+            ("backend.internal".to_string(), 8080)
+        );
+        // Non-matching port ⇒ identity (the entry's port filter fails).
+        assert_eq!(
+            connect_target(&data, "example.com", 80),
+            ("example.com".to_string(), 80)
+        );
+    }
+
+    #[test]
+    fn any_custom_header_matches_case_insensitively() {
+        let lines = vec![
+            "Host: example.com".to_string(),
+            "X-Trace: 1".to_string(),
+        ];
+        assert!(any_custom_header(&lines, "host"));
+        assert!(any_custom_header(&lines, "X-TRACE"));
+        assert!(!any_custom_header(&lines, "Authorization"));
+    }
+
+    #[test]
+    fn upload_is_chunked_detects_explicit_te_header() {
+        let mut data = Easy::new();
+        // No headers ⇒ not chunked.
+        assert!(!upload_is_chunked(&data));
+
+        let mut list = SList::default();
+        list.append("Transfer-Encoding: chunked").unwrap();
+        data.set.headers = Some(list);
+        assert!(upload_is_chunked(&data));
+
+        // A different header value is not chunked.
+        let mut other = SList::default();
+        other.append("Content-Type: text/plain").unwrap();
+        data.set.headers = Some(other);
+        assert!(!upload_is_chunked(&data));
+    }
+
+    #[test]
+    fn collect_custom_headers_returns_each_line() {
+        let mut data = Easy::new();
+        assert!(collect_custom_headers(&data).is_empty());
+
+        let mut list = SList::default();
+        list.append("X-One: 1").unwrap();
+        list.append("X-Two: 2").unwrap();
+        data.set.headers = Some(list);
+        let got = collect_custom_headers(&data);
+        assert_eq!(got, vec!["X-One: 1".to_string(), "X-Two: 2".to_string()]);
+    }
+
+    #[test]
+    fn suppress_upload_body_zeroes_sized_and_chunked() {
+        assert!(matches!(
+            suppress_upload_body(&h1::RequestBody::None),
+            h1::RequestBody::None
+        ));
+        match suppress_upload_body(&h1::RequestBody::Sized(b"abc".to_vec())) {
+            h1::RequestBody::Sized(v) => assert!(v.is_empty()),
+            _ => panic!("expected empty Sized"),
+        }
+        // A chunked body is reduced to an empty Sized body (no bytes on the wire).
+        match suppress_upload_body(&h1::RequestBody::Chunked(b"abc".to_vec())) {
+            h1::RequestBody::Sized(v) => assert!(v.is_empty()),
+            _ => panic!("expected empty Sized"),
+        }
+    }
+
+
+    // ---- HopSink response-routing core (Issue #4 redirect/body delivery) ----
+
+    /// A `WriteCallbacks` sink that records every body and header byte it is
+    /// handed, so tests can assert exactly what the `HopSink` decorator forwarded
+    /// to the application after applying its redirect/auth body-routing decision.
+    #[derive(Default)]
+    struct CapturingSink {
+        body: Vec<u8>,
+        headers: Vec<u8>,
+    }
+
+    impl WriteCallbacks for CapturingSink {
+        fn write_body(&mut self, data: &[u8]) -> usize {
+            self.body.extend_from_slice(data);
+            data.len()
+        }
+        fn write_header(&mut self, data: &[u8]) -> Option<usize> {
+            self.headers.extend_from_slice(data);
+            Some(data.len())
+        }
+    }
+
+    /// Feed a complete response head (status line + header lines + the
+    /// end-of-headers blank line) through the sink's header channel, exactly as
+    /// the transfer engine delivers it. This drives `note_header` for each line
+    /// and leaves `headers_complete` set so a following body write takes its
+    /// routing decision with the status fully known.
+    fn feed_head(sink: &mut HopSink<'_>, lines: &[&str]) {
+        for line in lines {
+            let mut raw = line.as_bytes().to_vec();
+            raw.extend_from_slice(b"\r\n");
+            sink.write_header(&raw);
+        }
+        sink.write_header(b"\r\n");
+    }
+
+    #[test]
+    fn hopsink_forwards_final_response_body() {
+        // A plain 200 with following enabled: the body is forwarded verbatim and
+        // the disposition resolves to Forward.
+        let mut inner = CapturingSink::default();
+        let mut sink = HopSink::with_auth(&mut inner, true, false);
+        feed_head(&mut sink, &["HTTP/1.1 200 OK", "Content-Type: text/plain"]);
+        assert_eq!(sink.status, 200);
+        assert!(!sink.should_suppress());
+        assert!(matches!(sink.decide_disposition(), BodyDisposition::Forward));
+        assert_eq!(sink.write_body(b"hello world"), 11);
+        // Content-Type was captured for CURLINFO_CONTENT_TYPE.
+        assert_eq!(sink.content_type.as_deref(), Some(&b"text/plain"[..]));
+        // Inner read last (after the sink is no longer used).
+        assert_eq!(inner.body, b"hello world");
+    }
+
+    #[test]
+    fn hopsink_suppresses_followed_redirect_body() {
+        // The Issue #4 core: a 3xx with Location, while following is enabled, must
+        // NOT leak its intermediate body to the application — only the final hop's
+        // body is delivered. write_body still reports the bytes as consumed so the
+        // driver does not see a short write.
+        let mut inner = CapturingSink::default();
+        let mut sink = HopSink::with_auth(&mut inner, true, false);
+        feed_head(
+            &mut sink,
+            &["HTTP/1.1 301 Moved Permanently", "Location: http://example/2"],
+        );
+        assert_eq!(sink.status, 301);
+        assert_eq!(sink.location.as_deref(), Some("http://example/2"));
+        assert!(sink.should_suppress());
+        assert!(matches!(sink.decide_disposition(), BodyDisposition::Discard));
+        assert_eq!(sink.write_body(b"<html>moved</html>"), 18);
+        // The intermediate redirect body was discarded, not forwarded.
+        assert!(inner.body.is_empty());
+        // Headers, however, are always forwarded (curl shows hop headers under -i).
+        assert!(!inner.headers.is_empty());
+    }
+
+    #[test]
+    fn hopsink_redirect_without_following_forwards_body() {
+        // With following DISABLED, a 3xx body is the real response and must be
+        // forwarded (curl without -L prints the redirect page).
+        let mut inner = CapturingSink::default();
+        let mut sink = HopSink::with_auth(&mut inner, false, false);
+        feed_head(&mut sink, &["HTTP/1.1 302 Found", "Location: http://example/2"]);
+        assert!(!sink.should_suppress());
+        assert!(matches!(sink.decide_disposition(), BodyDisposition::Forward));
+        assert_eq!(sink.write_body(b"see other"), 9);
+        assert_eq!(inner.body, b"see other");
+    }
+
+    #[test]
+    fn hopsink_pre_header_body_bytes_are_forwarded_verbatim() {
+        // Under CURLOPT_HEADER (-i) the header-merge bytes arrive on the body
+        // stream before the end-of-headers blank line. While headers_complete is
+        // false they are header content and must be forwarded verbatim — never
+        // suppressed and never allowed to memoize the redirect disposition early
+        // (the precise regression behind Issue #4).
+        let mut inner = CapturingSink::default();
+        let mut sink = HopSink::with_auth(&mut inner, true, false);
+        // Status seen, but the blank line has NOT been observed yet.
+        sink.write_header(b"HTTP/1.1 301 Moved Permanently\r\n");
+        sink.write_header(b"Location: http://example/2\r\n");
+        assert!(!sink.headers_complete);
+        // A body-stream write at this point is the -i header merge: forward it.
+        let merged = b"HTTP/1.1 301 Moved Permanently\r\n";
+        assert_eq!(sink.write_body(merged), merged.len());
+        // The disposition must NOT have been memoized by the pre-header write.
+        assert!(sink.disposition.is_none());
+        // Inner read last (after the sink is no longer used).
+        assert_eq!(inner.body, merged);
+    }
+
+    #[test]
+    fn hopsink_buffers_then_discards_answered_auth_body() {
+        // During auth negotiation a 401 body is buffered (not forwarded); once the
+        // challenge is answered and the request re-issued, the probe body is
+        // discarded so the intermediate error page never reaches the application.
+        let mut inner = CapturingSink::default();
+        let mut sink = HopSink::with_auth(&mut inner, true, true);
+        feed_head(
+            &mut sink,
+            &["HTTP/1.1 401 Unauthorized", "WWW-Authenticate: Digest realm=\"x\""],
+        );
+        assert!(matches!(sink.decide_disposition(), BodyDisposition::BufferAuth));
+        assert_eq!(sink.write_body(b"auth required"), 13);
+        // Not forwarded; held in the auth buffer instead.
+        assert_eq!(sink.auth_body_buf, b"auth required");
+        // The challenge line was captured for the auth controller.
+        assert_eq!(sink.www_authenticate, vec!["Digest realm=\"x\"".to_string()]);
+        // Answered → discard the probe body.
+        sink.discard_auth_body();
+        assert!(sink.auth_body_buf.is_empty());
+        // Inner never received the probe body (read last).
+        assert!(inner.body.is_empty());
+    }
+
+    #[test]
+    fn hopsink_flushes_terminal_auth_body() {
+        // A 401 whose challenge cannot be answered is terminal: the buffered error
+        // page is flushed to the application as the real response body.
+        let mut inner = CapturingSink::default();
+        let mut sink = HopSink::with_auth(&mut inner, true, true);
+        feed_head(&mut sink, &["HTTP/1.1 401 Unauthorized", "WWW-Authenticate: Basic"]);
+        sink.write_body(b"please log in");
+        // Buffered, not yet forwarded.
+        assert_eq!(sink.auth_body_buf, b"please log in");
+        sink.flush_auth_body();
+        // The buffer is emptied by the flush.
+        assert!(sink.auth_body_buf.is_empty());
+        // Inner now holds the flushed terminal body (read last).
+        assert_eq!(inner.body, b"please log in");
+    }
+
+    #[test]
+    fn hopsink_reset_for_retry_clears_block_state() {
+        // Re-issuing on the same connection during auth must clear all per-attempt
+        // observable state while keeping the inner sink and the negotiation flags.
+        let mut inner = CapturingSink::default();
+        let mut sink = HopSink::with_auth(&mut inner, true, true);
+        feed_head(
+            &mut sink,
+            &["HTTP/1.1 401 Unauthorized", "Location: /x", "WWW-Authenticate: NTLM"],
+        );
+        sink.write_body(b"probe");
+        sink.reset_for_retry();
+        assert_eq!(sink.status, 0);
+        assert!(sink.location.is_none());
+        assert!(sink.headers.is_empty());
+        assert!(sink.content_type.is_none());
+        assert!(sink.www_authenticate.is_empty());
+        assert!(sink.auth_body_buf.is_empty());
+        assert!(!sink.headers_complete);
+        assert!(sink.disposition.is_none());
+    }
+
+    #[test]
+    fn note_header_resets_per_block_state_on_new_status_line() {
+        // A new status line (e.g. the next hop on a kept-alive connection) clears
+        // the prior block's Location, Content-Type, and captured headers so a
+        // redirect block's values never leak into the final response.
+        let mut inner = CapturingSink::default();
+        let mut sink = HopSink::with_auth(&mut inner, true, false);
+        feed_head(
+            &mut sink,
+            &["HTTP/1.1 301 Moved", "Location: /next", "Content-Type: text/html"],
+        );
+        assert_eq!(sink.location.as_deref(), Some("/next"));
+        assert!(sink.content_type.is_some());
+        // The next response block begins; its status line resets the block state.
+        sink.write_header(b"HTTP/1.1 200 OK\r\n");
+        assert_eq!(sink.status, 200);
+        assert!(sink.location.is_none());
+        assert!(sink.content_type.is_none());
+        assert!(sink.headers.is_empty());
+        assert!(!sink.headers_complete);
+    }
+
+
+    #[test]
+    fn http_url_parts_derives_scheme_host_and_default_port() {
+        fn parts(url: &str) -> (String, bool, String, u16) {
+            let mut u = CurlUrl::new();
+            u.set(CurlUPart::Url, Some(url), CURLU_GUESS_SCHEME)
+                .expect("parse url");
+            http_url_parts(&u).expect("derive parts")
+        }
+        // Plain HTTP with no explicit port → port 80, not https.
+        assert_eq!(
+            parts("http://example.com/path"),
+            ("http".to_string(), false, "example.com".to_string(), 80)
+        );
+        // HTTPS with no explicit port → port 443, https flagged.
+        assert_eq!(
+            parts("https://example.com/"),
+            ("https".to_string(), true, "example.com".to_string(), 443)
+        );
+        // An explicit port overrides the scheme default.
+        assert_eq!(
+            parts("https://example.com:8443/"),
+            ("https".to_string(), true, "example.com".to_string(), 8443)
+        );
+        // An IPv6 literal host has its surrounding brackets stripped for identity.
+        assert_eq!(
+            parts("http://[::1]:8080/"),
+            ("http".to_string(), false, "::1".to_string(), 8080)
+        );
+    }
+
+    #[test]
+    fn hop_inputs_single_shot_seeds_from_easy_set() {
+        // `HopInputs::single_shot` seeds the first-hop overrides directly from
+        // `data.set`: the configured method/no-body and the inline `-b` cookie
+        // and `CURLOPT_REFERER`, with no auth/proxy injection (those are added
+        // only on reactive-auth re-issue). This is the seed the HTTP/3 path and
+        // the first hop of a follow chain start from.
+        let mut e = Easy::new();
+        e.setopt(CurlOption::CURLOPT_NOBODY, OptionValue::Long(1))
+            .unwrap();
+        e.setopt(
+            CurlOption::CURLOPT_COOKIE,
+            OptionValue::Str(Some("session=abc".into())),
+        )
+        .unwrap();
+        e.setopt(
+            CurlOption::CURLOPT_REFERER,
+            OptionValue::Str(Some("https://ref.example/".into())),
+        )
+        .unwrap();
+
+        let hop = HopInputs::single_shot(&e);
+        assert_eq!(hop.method, e.set.method, "method must mirror data.set");
+        assert!(hop.no_body, "CURLOPT_NOBODY must propagate to the hop");
+        assert_eq!(hop.cookie.as_deref(), Some("session=abc"));
+        assert_eq!(hop.referer.as_deref(), Some("https://ref.example/"));
+        // A first-shot hop injects no auth/proxy credentials.
+        assert!(hop.authorization.is_none());
+        assert!(hop.proxy_authorization.is_none());
+        assert!(hop.auth.is_none());
+        // It is allowed to send to the origin host and does not force proxy
+        // keep-alive.
+        assert!(hop.allowed_to_host);
+        assert!(!hop.proxy_connection_keepalive);
+        assert!(hop.request_target_override.is_none());
     }
 }

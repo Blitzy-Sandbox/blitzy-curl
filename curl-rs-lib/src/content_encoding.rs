@@ -759,9 +759,12 @@ impl UnencodingStack {
             }
 
             // Bomb guard: reject before creating the decoder, matching curl's
-            // `Curl_cwriter_count(...) + 1 >= MAX_ENCODE_STACK` check.
+            // `Curl_cwriter_count(...) + 1 >= MAX_ENCODE_STACK` check. The
+            // dedicated variant carries curl's specific `failf` diagnostic
+            // ("Reject response due to more than 5 content encodings"); it still
+            // maps to `CURLE_BAD_CONTENT_ENCODING` (61).
             if stack.writers.len() + 1 >= MAX_ENCODE_STACK {
-                return Err(CurlError::BadContentEncoding);
+                return Err(CurlError::TooManyContentEncodings);
             }
 
             let enc = ContentEncoding::from_token(trimmed);
@@ -1102,9 +1105,15 @@ mod tests {
         // `UnencodingStack` is intentionally neither `Debug` nor `PartialEq`
         // (it owns `Box<dyn Unencoder>` trait objects), so assert the error
         // variant by matching rather than comparing the whole `Result`.
+        // The bomb guard returns the dedicated `TooManyContentEncodings`
+        // variant (which maps to `CURLE_BAD_CONTENT_ENCODING` (61) but carries
+        // curl's specific "more than 5 content encodings" diagnostic).
         match UnencodingStack::from_content_encoding(five, true) {
-            Err(e) => assert_eq!(e, CurlError::BadContentEncoding),
-            Ok(_) => panic!("expected BadContentEncoding for 5 content encodings"),
+            Err(e) => {
+                assert_eq!(e, CurlError::TooManyContentEncodings);
+                assert_eq!(e.code(), CurlError::BadContentEncoding.code());
+            }
+            Ok(_) => panic!("expected TooManyContentEncodings for 5 content encodings"),
         }
     }
 

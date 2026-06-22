@@ -1397,7 +1397,7 @@ pub(crate) async fn connect_network_scheme(
     // avoid pulling a connection-pool trait into the protocols layer.)
     conn.connection_id = 0;
 
-    let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, addrs);
+    let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, data.set.connecttimeout, addrs);
     let (ssl_mode, dispatch) = if scheme.is_ssl() {
         // These line/command protocols negotiate no ALPN; offer none.
         let tls = tls_config_from_easy(data);
@@ -1541,6 +1541,51 @@ pub(crate) async fn stream_body_to_sink(
 ///   (or a network scheme whose drive is not yet wired).
 /// * The protocol handler's connect / do / transfer error otherwise.
 pub(crate) async fn perform_transfer(
+    data: &mut Easy,
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+) -> Result<()> {
+    // Enforce the overall transfer timeout (`CURLOPT_TIMEOUT(_MS)`, the CLI
+    // `--max-time`) centrally, exactly as curl bounds the *whole* operation —
+    // name resolution, connect, and transfer — with a single elapsed-deadline
+    // check that maps to `CURLE_OPERATION_TIMEDOUT` (exit code 28). curl arms
+    // this clock in `Curl_init_userdefined`/`multi_runsingle` (`data->set.timeout`)
+    // and trips it wherever the deadline is exceeded; here the asynchronous core
+    // expresses the same semantics by racing the per-protocol dispatch future
+    // against a Tokio timer. When the timer wins, dropping the in-flight future
+    // cancels any pending connect/read/write at the next await point (Tokio's
+    // cancellation), so a black-hole peer no longer hangs forever. A zero value
+    // means "no timeout" (curl's default), so the unbounded path is preserved
+    // verbatim. `data.set.timeout` is stored in milliseconds by the
+    // `CURLOPT_TIMEOUT`/`CURLOPT_TIMEOUT_MS` setters.
+    let timeout_ms = data.set.timeout;
+    if timeout_ms > 0 {
+        let deadline = std::time::Duration::from_millis(timeout_ms as u64);
+        return match tokio::time::timeout(
+            deadline,
+            perform_transfer_inner(data, sink, source),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(_elapsed) => Err(CurlError::OperationTimedout),
+        };
+    }
+    perform_transfer_inner(data, sink, source).await
+}
+
+/// Dispatch a recognized scheme to its protocol handler and drive the transfer
+/// to completion. This is the un-timed inner body of [`perform_transfer`]; the
+/// public wrapper layers the overall `CURLOPT_TIMEOUT` deadline on top of it so
+/// the timeout applies uniformly to every protocol without each handler having
+/// to re-implement it.
+///
+/// # Errors
+///
+/// * [`CurlError::UnsupportedProtocol`] for a scheme with no compiled-in handler
+///   (or a network scheme whose drive is not yet wired).
+/// * The protocol handler's connect / do / transfer error otherwise.
+async fn perform_transfer_inner(
     data: &mut Easy,
     sink: &mut dyn WriteCallbacks,
     source: &mut dyn ReadCallback,

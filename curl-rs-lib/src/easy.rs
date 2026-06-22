@@ -359,6 +359,18 @@ pub struct Easy {
     /// [`duphandle`](Easy::duphandle).
     #[cfg(feature = "hsts")]
     hsts_store: Option<std::sync::Arc<std::sync::Mutex<crate::hsts::HstsStore>>>,
+    /// The most recent failure diagnostic latched by the engine (curl's
+    /// `data->state.errorbuf` / `CURLOPT_ERRORBUFFER` value), as a Rust-native
+    /// string the safe core can write directly. The C `CURLOPT_ERRORBUFFER`
+    /// pointer cannot be populated from the `#![forbid(unsafe_code)]` core (the
+    /// documented foundation limitation), but a front-end that drives the
+    /// library through this Rust API (the `curl-rs` CLI) reads the message back
+    /// via [`last_error`](Self::last_error) for the `curl: (N) <msg>` line and
+    /// `%{errormsg}`. Reset at the start of each [`perform`](Easy::perform),
+    /// mirroring curl clearing the error buffer per transfer. Only specific
+    /// `failf` sites whose exact text differs from the static code description
+    /// populate this today (e.g. the decompression-bomb diagnostic).
+    last_error: Option<String>,
 }
 
 // `Easy` is `Debug` (formerly derived) but the retained-connection fields hold
@@ -399,7 +411,32 @@ impl Easy {
             cookie_jar: None,
             #[cfg(feature = "hsts")]
             hsts_store: None,
+            last_error: None,
         }
+    }
+
+    /// The most recent engine failure diagnostic, if one was latched during the
+    /// last [`perform`](Easy::perform) (curl's `CURLOPT_ERRORBUFFER` value). See
+    /// [`last_error`](Self::last_error) field docs for the foundation-limitation
+    /// rationale. Returns `None` when no specific message was recorded, so the
+    /// caller falls back to [`crate::error::CurlError::description`].
+    #[must_use]
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    /// Latch an engine failure diagnostic (the safe-core analogue of curl's
+    /// `Curl_failf` writing `CURLOPT_ERRORBUFFER`). Called by the protocol
+    /// drivers for the few `failf` messages whose exact text differs from the
+    /// static `CURLcode` description and must reach the `curl: (N) <msg>` line.
+    pub fn set_last_error(&mut self, msg: impl Into<String>) {
+        self.last_error = Some(msg.into());
+    }
+
+    /// Clear the latched failure diagnostic (curl resets the error buffer at the
+    /// start of each transfer). Invoked by [`pre_perform`](Self::pre_perform).
+    pub fn clear_last_error(&mut self) {
+        self.last_error = None;
     }
 }
 
@@ -577,6 +614,8 @@ impl Easy {
             // store, if any, is carried by the duplicated `CURLOPT_SHARE`.
             #[cfg(feature = "hsts")]
             hsts_store: None,
+            // A duplicated handle carries no latched failure diagnostic.
+            last_error: None,
         }
     }
 
@@ -884,6 +923,10 @@ impl Easy {
         // stale values from a previous transfer never leak (curl re-inits
         // `data->info` at transfer start).
         self.info = Info::new();
+
+        // Clear any failure diagnostic latched by a prior transfer on this
+        // handle (curl clears `CURLOPT_ERRORBUFFER` at transfer start).
+        self.last_error = None;
 
         // Resolve the URL handle: prefer an explicitly-set `CURLOPT_CURLU`
         // (`set.uh`); otherwise parse the `CURLOPT_URL` string. With neither
@@ -1830,4 +1873,1500 @@ mod tests {
             SslSetResult::UnknownBackend
         );
     }
+
+    // ---- perform_with: end-to-end HTTP/1.1 over a loopback server -----------
+    //
+    // These drive the REAL HTTP stack — connect (resolving the 127.0.0.1 literal
+    // + the TCP dial), the HTTP/1.1 request build/send, the response parse, the
+    // `HopSink` redirect/body routing, and the `CwOut` delivery — against an
+    // in-process loopback server returning canned replies. They are the network
+    // analog of the `file://` `perform_with` tests above and exercise the
+    // transfer engine over a real socket. No external network is used (loopback
+    // only), so they are hermetic.
+
+    /// Spawn a loopback HTTP server that accepts `replies.len()` connections in
+    /// turn, reads each request head (through the blank line) plus any
+    /// `Content-Length` body so the client's send fully drains, then writes the
+    /// corresponding canned reply and closes (every reply carries
+    /// `Connection: close`). Returns the bound port and a handle capturing the
+    /// raw bytes of each received request (one entry per connection).
+    async fn spawn_loopback_http(
+        replies: Vec<Vec<u8>>,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap_task = std::sync::Arc::clone(&captured);
+        tokio::spawn(async move {
+            for reply in replies {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut acc: Vec<u8> = Vec::new();
+                let mut buf = [0u8; 2048];
+                // Read up to and including the end-of-headers blank line.
+                let head_end = loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) => break acc.len(),
+                        Ok(n) => {
+                            acc.extend_from_slice(&buf[..n]);
+                            if let Some(p) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break p + 4;
+                            }
+                        }
+                        Err(_) => break acc.len(),
+                    }
+                };
+                // Drain any declared request body (a POST/PUT payload).
+                let head = String::from_utf8_lossy(&acc[..head_end]).to_ascii_lowercase();
+                let want_body = head
+                    .split("content-length:")
+                    .nth(1)
+                    .and_then(|s| s.split("\r\n").next())
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while acc.len() < head_end + want_body {
+                    match sock.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => acc.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                if let Ok(mut g) = cap_task.lock() {
+                    g.push(acc);
+                }
+                let _ = sock.write_all(&reply).await;
+                let _ = sock.flush().await;
+                // Dropping `sock` closes the connection (EOF for the client).
+            }
+        });
+        (port, captured)
+    }
+
+    /// Run `perform_with` against a sink, failing the test (rather than hanging)
+    /// if it does not complete promptly.
+    async fn perform_guarded(e: &mut Easy, sink: &mut dyn WriteCallbacks) {
+        let mut source = NoSource;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            e.perform_with(sink, &mut source),
+        )
+        .await
+        .expect("transfer must not hang")
+        .expect("transfer must succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_drives_http_get_into_sink() {
+        let (port, _cap) = spawn_loopback_http(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nhello world".to_vec()]).await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/"))),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        // The final response body reached the application sink verbatim.
+        assert_eq!(sink.body, b"hello world");
+        // The header callback observed the status line.
+        let hdrs = String::from_utf8_lossy(&sink.headers);
+        assert!(hdrs.starts_with("HTTP/1.1 200"), "status not seen: {hdrs:?}");
+        // CURLINFO_RESPONSE_CODE recorded the 200.
+        match e.getinfo(CurlInfo::ResponseCode).unwrap() {
+            InfoValue::Long(c) => assert_eq!(c, 200),
+            other => panic!("expected long response code, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_404_delivers_body_and_records_code() {
+        // Without `--fail`, a 4xx is a successful transfer whose body (the error
+        // page) is delivered and whose code is recorded (curl's default).
+        let (port, _cap) = spawn_loopback_http(vec![b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found".to_vec()]).await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/missing"))),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        assert_eq!(sink.body, b"not found");
+        match e.getinfo(CurlInfo::ResponseCode).unwrap() {
+            InfoValue::Long(c) => assert_eq!(c, 404),
+            other => panic!("expected long response code, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_post_sends_request_body() {
+        // Setting CURLOPT_COPYPOSTFIELDS selects POST and supplies the body; the
+        // request line and the payload must appear on the wire.
+        let (port, cap) = spawn_loopback_http(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+        ])
+        .await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/submit"))),
+        )
+        .unwrap();
+        e.setopt(
+            CurlOption::CURLOPT_COPYPOSTFIELDS,
+            OptionValue::Bytes(Some(b"field=value&x=1".to_vec())),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        assert_eq!(sink.body, b"ok");
+        let reqs = cap.lock().unwrap();
+        let req = String::from_utf8_lossy(&reqs[0]);
+        assert!(req.starts_with("POST /submit "), "method/path wrong: {req:?}");
+        assert!(req.contains("field=value&x=1"), "body not sent: {req:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_follows_redirect_to_final_body() {
+        // End-to-end verification of Issue #4: with following enabled, only the
+        // FINAL hop's body reaches the application — the intermediate 301 body is
+        // suppressed (not leaked). The server answers two connections: a 301 with
+        // a relative Location, then the 200 final response.
+        let (port, _cap) = spawn_loopback_http(vec![
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: /final\r\nContent-Length: 13\r\nConnection: close\r\n\r\nredirect-page".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nfinal body".to_vec(),
+        ])
+        .await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/start"))),
+        )
+        .unwrap();
+        e.setopt(CurlOption::CURLOPT_FOLLOWLOCATION, OptionValue::Long(1))
+            .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        // Only the final body is delivered; the intermediate redirect page must
+        // NOT leak into the application output.
+        assert_eq!(sink.body, b"final body");
+        assert!(
+            !sink.body.windows(8).any(|w| w == b"redirect"),
+            "intermediate 301 body leaked: {:?}",
+            String::from_utf8_lossy(&sink.body)
+        );
+        match e.getinfo(CurlInfo::ResponseCode).unwrap() {
+            InfoValue::Long(c) => assert_eq!(c, 200),
+            other => panic!("expected long response code, got {other:?}"),
+        }
+    }
+
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_head_request_sends_head_and_skips_body() {
+        // CURLOPT_NOBODY issues a HEAD; the server replies with headers only (the
+        // declared Content-Length describes the would-be GET body). The client
+        // must NOT read a body and must record the status.
+        let (port, cap) = spawn_loopback_http(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n".to_vec(),
+        ])
+        .await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/resource"))),
+        )
+        .unwrap();
+        e.setopt(CurlOption::CURLOPT_NOBODY, OptionValue::Long(1))
+            .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        assert!(sink.body.is_empty(), "HEAD must not deliver a body");
+        let reqs = cap.lock().unwrap();
+        let req = String::from_utf8_lossy(&reqs[0]);
+        assert!(req.starts_with("HEAD /resource "), "method wrong: {req:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_sends_custom_request_headers() {
+        // CURLOPT_HTTPHEADER adds/overrides request headers; they must appear on
+        // the wire (curl's Curl_add_custom_headers).
+        let (port, cap) = spawn_loopback_http(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+        ])
+        .await;
+        let mut headers = crate::slist::SList::default();
+        headers.append("X-Test: foo").unwrap();
+        headers.append("User-Agent: probe/1.0").unwrap();
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/"))),
+        )
+        .unwrap();
+        e.setopt(
+            CurlOption::CURLOPT_HTTPHEADER,
+            OptionValue::Slist(Some(headers)),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        assert_eq!(sink.body, b"ok");
+        let reqs = cap.lock().unwrap();
+        let req = String::from_utf8_lossy(&reqs[0]);
+        assert!(req.contains("X-Test: foo\r\n"), "custom header missing: {req:?}");
+        assert!(
+            req.contains("User-Agent: probe/1.0\r\n"),
+            "overridden UA missing: {req:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_reads_eof_framed_body() {
+        // A response with no Content-Length and Connection: close frames the body
+        // by the connection close (curl's "read until EOF"). The full body must
+        // still be delivered.
+        let (port, _cap) = spawn_loopback_http(vec![
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody-by-eof".to_vec(),
+        ])
+        .await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/stream"))),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        assert_eq!(sink.body, b"body-by-eof");
+    }
+
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_1_0_uses_http_1_0_request_line() {
+        // CURLOPT_HTTP_VERSION = 1.0 forces the HTTP/1.0 request line.
+        let (port, cap) = spawn_loopback_http(vec![
+            b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nv10".to_vec(),
+        ])
+        .await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/"))),
+        )
+        .unwrap();
+        e.setopt(CurlOption::CURLOPT_HTTP_VERSION, OptionValue::Long(1))
+            .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        assert_eq!(sink.body, b"v10");
+        let reqs = cap.lock().unwrap();
+        let req = String::from_utf8_lossy(&reqs[0]);
+        let first = req.lines().next().unwrap_or_default();
+        assert!(first.ends_with("HTTP/1.0"), "request line not 1.0: {first:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_failonerror_returns_error_on_404() {
+        // CURLOPT_FAILONERROR makes a 4xx a hard error (CURLE_HTTP_RETURNED_ERROR),
+        // exercising http_should_fail on the live response.
+        let (port, _cap) = spawn_loopback_http(vec![
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\nConnection: close\r\n\r\n404".to_vec(),
+        ])
+        .await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/missing"))),
+        )
+        .unwrap();
+        e.setopt(CurlOption::CURLOPT_FAILONERROR, OptionValue::Long(1))
+            .unwrap();
+        let mut sink = CollectSink::default();
+        let mut source = NoSource;
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            e.perform_with(&mut sink, &mut source),
+        )
+        .await
+        .expect("transfer must not hang");
+        assert_eq!(res.unwrap_err(), CurlError::HttpReturnedError);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_basic_auth_sends_authorization_header() {
+        // CURLOPT_USERPWD with the default Basic scheme emits the canonical
+        // `Authorization: Basic base64(user:pass)` header. base64("user:pass")
+        // is the well-known "dXNlcjpwYXNz".
+        let (port, cap) = spawn_loopback_http(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+        ])
+        .await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/"))),
+        )
+        .unwrap();
+        e.setopt(
+            CurlOption::CURLOPT_USERPWD,
+            OptionValue::Str(Some("user:pass".to_string())),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        assert_eq!(sink.body, b"ok");
+        let reqs = cap.lock().unwrap();
+        let req = String::from_utf8_lossy(&reqs[0]);
+        assert!(
+            req.contains("Authorization: Basic dXNlcjpwYXNz\r\n"),
+            "basic auth header missing/wrong: {req:?}"
+        );
+    }
+
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_dechunks_chunked_response_body() {
+        // A `Transfer-Encoding: chunked` response must be de-chunked before the
+        // decoded payload reaches the sink (the chunk sizes/CRLF framing removed).
+        let (port, _cap) = spawn_loopback_http(vec![
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+              5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+                .to_vec(),
+        ])
+        .await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/"))),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+        assert_eq!(sink.body, b"hello world", "chunked body not decoded");
+        assert_eq!(
+            e.getinfo(CurlInfo::ResponseCode).unwrap(),
+            InfoValue::Long(200)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_put_upload_sends_body_with_put_method() {
+        // CURLOPT_UPLOAD selects PUT and streams the read source as the request
+        // body, framed by CURLOPT_INFILESIZE (a fixed Content-Length).
+        const PAYLOAD: &[u8] = b"the quick brown fox";
+        let (port, cap) = spawn_loopback_http(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+        ])
+        .await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/upload"))),
+        )
+        .unwrap();
+        e.setopt(CurlOption::CURLOPT_UPLOAD, OptionValue::Long(1))
+            .unwrap();
+        e.setopt(
+            CurlOption::CURLOPT_INFILESIZE,
+            OptionValue::Long(PAYLOAD.len() as i64),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        let mut source = SliceSource {
+            data: PAYLOAD.to_vec(),
+            pos: 0,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            e.perform_with(&mut sink, &mut source),
+        )
+        .await
+        .expect("PUT upload must not hang")
+        .expect("PUT upload must succeed");
+
+        let reqs = cap.lock().unwrap();
+        let req = String::from_utf8_lossy(&reqs[0]);
+        assert!(
+            req.starts_with("PUT /upload HTTP/1.1\r\n"),
+            "expected PUT request line: {req:?}"
+        );
+        assert!(
+            req.ends_with("the quick brown fox"),
+            "uploaded body missing from request: {req:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_204_no_content_has_empty_body() {
+        // A 204 response is body-less by definition: the engine must not block
+        // waiting for a body and must report the 204 status with no payload.
+        let (port, _cap) = spawn_loopback_http(vec![
+            b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_vec(),
+        ])
+        .await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/"))),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+        assert!(sink.body.is_empty(), "204 must deliver no body");
+        assert_eq!(
+            e.getinfo(CurlInfo::ResponseCode).unwrap(),
+            InfoValue::Long(204)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_custom_request_sets_method() {
+        // CURLOPT_CUSTOMREQUEST overrides the method verb verbatim (here DELETE)
+        // while otherwise behaving like the default no-body request.
+        let (port, cap) = spawn_loopback_http(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ngone".to_vec(),
+        ])
+        .await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/item/7"))),
+        )
+        .unwrap();
+        e.setopt(
+            CurlOption::CURLOPT_CUSTOMREQUEST,
+            OptionValue::Str(Some("DELETE".to_string())),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+        assert_eq!(sink.body, b"gone");
+        let reqs = cap.lock().unwrap();
+        let req = String::from_utf8_lossy(&reqs[0]);
+        assert!(
+            req.starts_with("DELETE /item/7 HTTP/1.1\r\n"),
+            "expected DELETE request line: {req:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_large_body_reassembled_across_reads() {
+        // A body larger than a single socket read must be reassembled intact,
+        // exercising the engine's incremental body-write loop.
+        let payload = vec![b'x'; 5000];
+        let mut reply =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len())
+                .into_bytes();
+        reply.extend_from_slice(&payload);
+        let (port, _cap) = spawn_loopback_http(vec![reply]).await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/big"))),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+        assert_eq!(sink.body.len(), 5000, "large body truncated/short");
+        assert!(sink.body.iter().all(|&b| b == b'x'), "large body corrupted");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_response_headers_reach_sink() {
+        // Response header lines are delivered to the write-callback header path;
+        // a custom response header must appear among the captured header lines.
+        let (port, _cap) = spawn_loopback_http(vec![
+            b"HTTP/1.1 200 OK\r\nX-Served-By: rust-loopback\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                .to_vec(),
+        ])
+        .await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/"))),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+        assert_eq!(sink.body, b"ok");
+        let headers = String::from_utf8_lossy(&sink.headers);
+        assert!(
+            headers.contains("X-Served-By: rust-loopback"),
+            "custom response header not delivered to sink: {headers:?}"
+        );
+        assert!(
+            headers.starts_with("HTTP/1.1 200"),
+            "status line missing from header stream: {headers:?}"
+        );
+    }
+
+
+    // ---- perform_with: end-to-end FTP passive download over loopback --------
+
+    /// Spawn a minimal passive-mode FTP server on loopback that serves a single
+    /// file via `RETR`. It answers the standard control dialog leniently and, on
+    /// `EPSV`/`PASV`, opens a data listener whose port it advertises; the
+    /// subsequent `RETR` streams `body` on the accepted data connection, framed
+    /// by the data-channel close. Returns the bound control port. This drives the
+    /// real FTP handler's connect/login/PWD/TYPE/SIZE/passive-negotiation and the
+    /// data-channel download path (`run_do_phase`) end-to-end.
+    #[cfg(feature = "ftp")]
+    async fn spawn_loopback_ftp(
+        body: &'static [u8],
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Captures the bytes received on a STOR upload's data channel.
+        let uploaded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let up_task = std::sync::Arc::clone(&uploaded);
+        tokio::spawn(async move {
+            let Ok((ctrl, _)) = listener.accept().await else {
+                return;
+            };
+            let (rd, mut wr) = ctrl.into_split();
+            let mut lines = BufReader::new(rd).lines();
+            let _ = wr.write_all(b"220 loopback FTP ready\r\n").await;
+            // The data listener bound by the most recent EPSV/PASV, awaiting RETR.
+            let mut data_listener: Option<tokio::net::TcpListener> = None;
+            while let Ok(Some(line)) = lines.next_line().await {
+                let upper = line.trim_end().to_ascii_uppercase();
+                let cmd = upper.split_whitespace().next().unwrap_or("");
+                match cmd {
+                    "USER" => {
+                        let _ = wr.write_all(b"331 need password\r\n").await;
+                    }
+                    "PASS" => {
+                        let _ = wr.write_all(b"230 logged in\r\n").await;
+                    }
+                    "PWD" | "XPWD" => {
+                        let _ = wr.write_all(b"257 \"/\" is the current directory\r\n").await;
+                    }
+                    "CWD" => {
+                        let _ = wr.write_all(b"250 directory changed\r\n").await;
+                    }
+                    "TYPE" => {
+                        let _ = wr.write_all(b"200 type set\r\n").await;
+                    }
+                    "SIZE" => {
+                        let _ = wr
+                            .write_all(format!("213 {}\r\n", body.len()).as_bytes())
+                            .await;
+                    }
+                    "MDTM" => {
+                        let _ = wr.write_all(b"213 20200101000000\r\n").await;
+                    }
+                    "REST" => {
+                        let _ = wr.write_all(b"350 restart marker accepted\r\n").await;
+                    }
+                    "FEAT" => {
+                        let _ = wr.write_all(b"211-Features:\r\n EPSV\r\n PASV\r\n211 End\r\n").await;
+                    }
+                    "OPTS" => {
+                        let _ = wr.write_all(b"200 ok\r\n").await;
+                    }
+                    "SYST" => {
+                        let _ = wr.write_all(b"215 UNIX Type: L8\r\n").await;
+                    }
+                    "EPSV" => {
+                        let dl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        let dp = dl.local_addr().unwrap().port();
+                        data_listener = Some(dl);
+                        let _ = wr
+                            .write_all(
+                                format!("229 Entering Extended Passive Mode (|||{dp}|)\r\n")
+                                    .as_bytes(),
+                            )
+                            .await;
+                    }
+                    "PASV" => {
+                        let dl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        let dp = dl.local_addr().unwrap().port();
+                        data_listener = Some(dl);
+                        let (hi, lo) = (dp / 256, dp % 256);
+                        let _ = wr
+                            .write_all(
+                                format!("227 Entering Passive Mode (127,0,0,1,{hi},{lo})\r\n")
+                                    .as_bytes(),
+                            )
+                            .await;
+                    }
+                    "RETR" | "LIST" | "NLST" => {
+                        let _ = wr.write_all(b"150 opening data connection\r\n").await;
+                        if let Some(dl) = data_listener.take() {
+                            if let Ok((mut dsock, _)) = dl.accept().await {
+                                let _ = dsock.write_all(body).await;
+                                let _ = dsock.flush().await;
+                                // Dropping `dsock` closes the data channel (EOF).
+                            }
+                        }
+                        let _ = wr.write_all(b"226 transfer complete\r\n").await;
+                    }
+                    "STOR" | "APPE" => {
+                        let _ = wr.write_all(b"150 ready to receive\r\n").await;
+                        if let Some(dl) = data_listener.take() {
+                            if let Ok((mut dsock, _)) = dl.accept().await {
+                                let mut got = Vec::new();
+                                let _ = dsock.read_to_end(&mut got).await;
+                                if let Ok(mut g) = up_task.lock() {
+                                    *g = got;
+                                }
+                            }
+                        }
+                        let _ = wr.write_all(b"226 transfer complete\r\n").await;
+                    }
+                    "QUIT" => {
+                        let _ = wr.write_all(b"221 goodbye\r\n").await;
+                        break;
+                    }
+                    _ => {
+                        let _ = wr.write_all(b"200 ok\r\n").await;
+                    }
+                }
+            }
+        });
+        (port, uploaded)
+    }
+
+    #[cfg(feature = "ftp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_ftp_downloads_file_into_sink() {
+        // A passive-mode FTP GET: the control dialog logs in and negotiates EPSV,
+        // and the file body arrives on the data channel into the sink.
+        let (port, _up) = spawn_loopback_ftp(b"ftp file contents\n").await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("ftp://user:pass@127.0.0.1:{port}/file.txt"))),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        assert_eq!(sink.body, b"ftp file contents\n");
+    }
+
+    #[cfg(feature = "ftp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_ftp_lists_directory() {
+        // A directory URL (trailing slash) triggers a LIST; the listing body is
+        // delivered on the data channel.
+        let (port, _up) =
+            spawn_loopback_ftp(b"-rw-r--r-- 1 owner group 17 Jan 01 file.txt\r\n").await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("ftp://user:pass@127.0.0.1:{port}/"))),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        assert!(
+            sink.body.windows(8).any(|w| w == b"file.txt"),
+            "directory listing missing: {:?}",
+            String::from_utf8_lossy(&sink.body)
+        );
+    }
+
+    #[cfg(feature = "ftp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_ftp_uploads_file_from_source() {
+        // CURLOPT_UPLOAD drives a STOR: the read source's bytes must arrive on the
+        // server's data channel (the run_upload path).
+        let (port, uploaded) = spawn_loopback_ftp(b"").await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("ftp://user:pass@127.0.0.1:{port}/upload.txt"))),
+        )
+        .unwrap();
+        e.setopt(CurlOption::CURLOPT_UPLOAD, OptionValue::Long(1))
+            .unwrap();
+        let payload = b"uploaded payload\n";
+        e.setopt(
+            CurlOption::CURLOPT_INFILESIZE,
+            OptionValue::Long(payload.len() as i64),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        let mut source = SliceSource {
+            data: payload.to_vec(),
+            pos: 0,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            e.perform_with(&mut sink, &mut source),
+        )
+        .await
+        .expect("transfer must not hang")
+        .expect("upload must succeed");
+
+        let got = uploaded.lock().unwrap().clone();
+        assert_eq!(got, payload, "server did not receive the uploaded body");
+    }
+
+
+    // ---- perform_with: end-to-end Gopher over loopback ----------------------
+
+    #[cfg(feature = "gopher")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_gopher_sends_selector_and_reads_body() {
+        // Gopher: the client writes a single selector line (CRLF-terminated) then
+        // reads the response body, framed by the connection close.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = std::sync::Arc::clone(&captured);
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Read the selector line (up to the CRLF the client sends).
+                let mut acc = Vec::new();
+                let mut buf = [0u8; 256];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            acc.extend_from_slice(&buf[..n]);
+                            if acc.contains(&b'\n') {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if let Ok(mut g) = cap.lock() {
+                    *g = acc;
+                }
+                let _ = sock.write_all(b"gopher menu body\r\n").await;
+                let _ = sock.flush().await;
+                // Drop sock → EOF frames the body.
+            }
+        });
+
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("gopher://127.0.0.1:{port}/1/welcome"))),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        assert_eq!(sink.body, b"gopher menu body\r\n");
+        // The selector reached the server (curl strips the leading "/1").
+        let sel = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        assert!(sel.contains("welcome"), "selector not sent: {sel:?}");
+    }
+
+    // ---- perform_with: end-to-end RTSP over loopback ------------------------
+
+    /// Spawn a minimal RTSP responder on a loopback port.
+    ///
+    /// Reads one request head (terminated by the blank `\r\n\r\n`), captures the
+    /// raw request bytes, parses the request `CSeq`, and echoes a `200 OK`
+    /// response that mirrors that `CSeq` (RTSP mandates the response `CSeq` match
+    /// the request). `extra_headers` is appended verbatim after the `CSeq` line.
+    /// When `body` is `Some`, a `Content-Length` header frames it; otherwise the
+    /// response is header-only. The socket is closed after the reply.
+    #[cfg(feature = "rtsp")]
+    async fn spawn_loopback_rtsp(
+        extra_headers: &'static str,
+        body: Option<&'static [u8]>,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = std::sync::Arc::clone(&captured);
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Read the request head up to the terminating blank line.
+                let mut head = Vec::new();
+                let mut buf = [0u8; 256];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            head.extend_from_slice(&buf[..n]);
+                            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // Parse the request CSeq so the reply can mirror it.
+                let head_str = String::from_utf8_lossy(&head);
+                let cseq = head_str
+                    .lines()
+                    .find_map(|l| {
+                        let l = l.trim_end();
+                        let rest = l.strip_prefix("CSeq:").or_else(|| l.strip_prefix("cseq:"))?;
+                        Some(rest.trim().to_string())
+                    })
+                    .unwrap_or_else(|| "0".to_string());
+                if let Ok(mut g) = cap.lock() {
+                    *g = head;
+                }
+                let mut resp = format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n{extra_headers}");
+                match body {
+                    Some(b) => {
+                        resp.push_str(&format!("Content-Length: {}\r\n\r\n", b.len()));
+                        let mut bytes = resp.into_bytes();
+                        bytes.extend_from_slice(b);
+                        let _ = sock.write_all(&bytes).await;
+                    }
+                    None => {
+                        resp.push_str("\r\n");
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    }
+                }
+                let _ = sock.flush().await;
+                // Drop sock → close; harmless once the framed reply is consumed.
+            }
+        });
+        (port, captured)
+    }
+
+    #[cfg(feature = "rtsp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_rtsp_describe_delivers_sdp_body() {
+        // DESCRIBE is a body-bearing method: the engine reads the response headers
+        // (capturing the CSeq) and then the Content-Length-framed SDP body, which
+        // must reach the write sink intact.
+        const SDP: &[u8] = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=rtsp-test\r\n";
+        let (port, captured) =
+            spawn_loopback_rtsp("Content-Type: application/sdp\r\n", Some(SDP)).await;
+
+        let url = format!("rtsp://127.0.0.1:{port}/stream");
+        let mut e = Easy::new();
+        e.setopt(CurlOption::CURLOPT_URL, OptionValue::Str(Some(url.clone())))
+            .unwrap();
+        // Select DESCRIBE and target the explicit stream URI (curl's request line).
+        e.setopt(CurlOption::CURLOPT_RTSP_REQUEST, OptionValue::Long(2))
+            .unwrap();
+        e.setopt(
+            CurlOption::CURLOPT_RTSP_STREAM_URI,
+            OptionValue::Str(Some(url.clone())),
+        )
+        .unwrap();
+
+        let mut sink = CollectSink::default();
+        let mut source = NoSource;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            e.perform_with(&mut sink, &mut source),
+        )
+        .await
+        .expect("RTSP DESCRIBE must not hang")
+        .expect("RTSP DESCRIBE must succeed");
+
+        // The SDP body reached the sink intact.
+        assert_eq!(sink.body, SDP, "SDP body not delivered");
+        // The request line is a DESCRIBE for the configured stream URI.
+        let req = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        assert!(
+            req.starts_with(&format!("DESCRIBE {url} RTSP/1.0\r\n")),
+            "unexpected request line: {req:?}"
+        );
+        assert!(req.contains("CSeq: 1\r\n"), "missing/incorrect CSeq: {req:?}");
+        // The matched response CSeq is surfaced via getinfo.
+        assert_eq!(
+            e.getinfo(CurlInfo::RtspCseqRecv).unwrap(),
+            InfoValue::Long(1)
+        );
+    }
+
+    #[cfg(feature = "rtsp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_rtsp_options_reads_response_headers() {
+        // OPTIONS is the default request and carries no body in either direction;
+        // the engine sends the request and consumes the header-only response,
+        // recording the round-tripped CSeq.
+        let (port, captured) =
+            spawn_loopback_rtsp("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n", None).await;
+
+        let url = format!("rtsp://127.0.0.1:{port}/stream");
+        let mut e = Easy::new();
+        e.setopt(CurlOption::CURLOPT_URL, OptionValue::Str(Some(url.clone())))
+            .unwrap();
+        // OPTIONS (value 1) is also the default, but set it explicitly to exercise
+        // the option path.
+        e.setopt(CurlOption::CURLOPT_RTSP_REQUEST, OptionValue::Long(1))
+            .unwrap();
+        e.setopt(
+            CurlOption::CURLOPT_RTSP_STREAM_URI,
+            OptionValue::Str(Some(url.clone())),
+        )
+        .unwrap();
+
+        let mut sink = CollectSink::default();
+        let mut source = NoSource;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            e.perform_with(&mut sink, &mut source),
+        )
+        .await
+        .expect("RTSP OPTIONS must not hang")
+        .expect("RTSP OPTIONS must succeed");
+
+        // No body for OPTIONS.
+        assert!(sink.body.is_empty(), "OPTIONS must not deliver a body");
+        let req = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        assert!(
+            req.starts_with(&format!("OPTIONS {url} RTSP/1.0\r\n")),
+            "unexpected request line: {req:?}"
+        );
+        assert_eq!(
+            e.getinfo(CurlInfo::RtspCseqRecv).unwrap(),
+            InfoValue::Long(1)
+        );
+    }
+
+
+    // ---- perform_with: end-to-end POP3 over loopback ------------------------
+
+    /// Spawn a minimal single-channel POP3 server on loopback.
+    ///
+    /// It greets, answers `CAPA` with `-ERR` (so the client uses the clear-text
+    /// `USER`/`PASS` path), accepts the login, and serves a dot-terminated
+    /// multi-line body for `RETR`/`LIST`. Captures every command line received.
+    /// Returns the bound port and the captured-command handle. This drives the
+    /// real POP3 connect/greeting/CAPA/USER/PASS state machine and the
+    /// dot-terminated body reader end-to-end.
+    #[cfg(feature = "pop3")]
+    async fn spawn_loopback_pop3(
+        body: &'static str,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cmds = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let cmds_task = std::sync::Arc::clone(&cmds);
+        tokio::spawn(async move {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let (rd, mut wr) = sock.into_split();
+            let mut lines = BufReader::new(rd).lines();
+            let _ = wr.write_all(b"+OK POP3 loopback ready\r\n").await;
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(mut g) = cmds_task.lock() {
+                    g.push(line.clone());
+                }
+                let upper = line.trim_end().to_ascii_uppercase();
+                let verb = upper.split_whitespace().next().unwrap_or("");
+                match verb {
+                    // Unrecognised → clear-text USER/PASS path.
+                    "CAPA" => {
+                        let _ = wr.write_all(b"-ERR unknown command\r\n").await;
+                    }
+                    "USER" => {
+                        let _ = wr.write_all(b"+OK send PASS\r\n").await;
+                    }
+                    "PASS" => {
+                        let _ = wr.write_all(b"+OK logged in\r\n").await;
+                    }
+                    "STAT" => {
+                        let _ = wr.write_all(b"+OK 1 100\r\n").await;
+                    }
+                    "RETR" => {
+                        let _ = wr
+                            .write_all(format!("+OK {} octets\r\n", body.len()).as_bytes())
+                            .await;
+                        let _ = wr.write_all(body.as_bytes()).await;
+                        let _ = wr.write_all(b"\r\n.\r\n").await;
+                    }
+                    "LIST" => {
+                        let _ = wr.write_all(b"+OK 1 messages\r\n1 100\r\n.\r\n").await;
+                    }
+                    "QUIT" => {
+                        let _ = wr.write_all(b"+OK bye\r\n").await;
+                        break;
+                    }
+                    _ => {
+                        let _ = wr.write_all(b"+OK\r\n").await;
+                    }
+                }
+            }
+        });
+        (port, cmds)
+    }
+
+    #[cfg(feature = "pop3")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_pop3_retrieves_message_body() {
+        // `pop3://host/1` issues `RETR 1`; the dot-terminated message body must be
+        // delivered to the sink (with the trailing dot terminator removed).
+        const MSG: &str = "Subject: hi\r\n\r\nHello mail body";
+        let (port, cmds) = spawn_loopback_pop3(MSG).await;
+        let mut e = Easy::new();
+        // URL-embedded credentials drive the clear-text USER/PASS path.
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("pop3://bob:secret@127.0.0.1:{port}/1"))),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        let body = String::from_utf8_lossy(&sink.body);
+        assert!(body.contains("Hello mail body"), "POP3 body missing: {body:?}");
+        // The clear-text login and RETR ran in order over the real socket.
+        let seen = cmds.lock().unwrap().clone();
+        assert!(seen.iter().any(|c| c.starts_with("USER bob")), "no USER: {seen:?}");
+        assert!(seen.iter().any(|c| c.starts_with("PASS secret")), "no PASS: {seen:?}");
+        assert!(seen.iter().any(|c| c.starts_with("RETR 1")), "no RETR: {seen:?}");
+    }
+
+    #[cfg(feature = "pop3")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_pop3_lists_mailbox() {
+        // `pop3://host/` with no message id issues `LIST`, whose dot-terminated
+        // listing body is delivered to the sink.
+        let (port, cmds) = spawn_loopback_pop3("unused").await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("pop3://bob:secret@127.0.0.1:{port}/"))),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        let body = String::from_utf8_lossy(&sink.body);
+        assert!(body.contains("1 100"), "POP3 LIST body missing: {body:?}");
+        let seen = cmds.lock().unwrap().clone();
+        assert!(seen.iter().any(|c| c.trim_end() == "LIST"), "no LIST: {seen:?}");
+    }
+
+
+    // ---- perform_with: end-to-end IMAP over loopback ------------------------
+
+    /// Spawn a minimal IMAP4rev1 server on loopback that echoes each command's
+    /// tag in its tagged completion line.
+    ///
+    /// It greets, advertises only `IMAP4rev1` on `CAPABILITY` (no `LOGINDISABLED`
+    /// and no SASL mechanism → the client uses cleartext `LOGIN`), accepts the
+    /// login, `SELECT`s any mailbox, and answers a `UID FETCH … BODY[]` with a
+    /// sized literal carrying `body`. Captures every command line received and
+    /// returns the bound port plus the capture handle. This drives the real IMAP
+    /// connect/CAPABILITY/LOGIN/SELECT/FETCH state machine and the literal-body
+    /// reader end-to-end.
+    #[cfg(feature = "imap")]
+    async fn spawn_loopback_imap(
+        body: &'static str,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cmds = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let cmds_task = std::sync::Arc::clone(&cmds);
+        tokio::spawn(async move {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let (rd, mut wr) = sock.into_split();
+            let mut lines = BufReader::new(rd).lines();
+            let _ = wr.write_all(b"* OK IMAP4 loopback ready\r\n").await;
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(mut g) = cmds_task.lock() {
+                    g.push(line.clone());
+                }
+                let mut parts = line.split_whitespace();
+                let tag = parts.next().unwrap_or("*").to_string();
+                let mut verb = parts.next().unwrap_or("").to_ascii_uppercase();
+                // `UID FETCH`/`UID SEARCH` carry the real command in the next word.
+                if verb == "UID" {
+                    verb = parts.next().unwrap_or("").to_ascii_uppercase();
+                }
+                match verb.as_str() {
+                    "CAPABILITY" => {
+                        let _ = wr.write_all(b"* CAPABILITY IMAP4rev1\r\n").await;
+                        let _ = wr
+                            .write_all(format!("{tag} OK CAPABILITY completed\r\n").as_bytes())
+                            .await;
+                    }
+                    "LOGIN" => {
+                        let _ = wr
+                            .write_all(format!("{tag} OK LOGIN completed\r\n").as_bytes())
+                            .await;
+                    }
+                    "SELECT" => {
+                        let _ = wr.write_all(b"* 1 EXISTS\r\n").await;
+                        let _ = wr.write_all(b"* OK [UIDVALIDITY 1] ok\r\n").await;
+                        let _ = wr
+                            .write_all(
+                                format!("{tag} OK [READ-WRITE] SELECT completed\r\n").as_bytes(),
+                            )
+                            .await;
+                    }
+                    "FETCH" => {
+                        // Sized-literal body: `{N}` then exactly N bytes.
+                        let _ = wr
+                            .write_all(
+                                format!("* 1 FETCH (BODY[] {{{}}}\r\n", body.len()).as_bytes(),
+                            )
+                            .await;
+                        let _ = wr.write_all(body.as_bytes()).await;
+                        let _ = wr.write_all(b")\r\n").await;
+                        let _ = wr
+                            .write_all(format!("{tag} OK FETCH completed\r\n").as_bytes())
+                            .await;
+                    }
+                    "LOGOUT" => {
+                        let _ = wr.write_all(b"* BYE logging out\r\n").await;
+                        let _ = wr
+                            .write_all(format!("{tag} OK LOGOUT completed\r\n").as_bytes())
+                            .await;
+                        break;
+                    }
+                    _ => {
+                        let _ = wr.write_all(format!("{tag} OK\r\n").as_bytes()).await;
+                    }
+                }
+            }
+        });
+        (port, cmds)
+    }
+
+    #[cfg(feature = "imap")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_imap_fetches_message_literal_body() {
+        // `imap://user:pass@host/INBOX;UID=1` SELECTs INBOX then `UID FETCH 1
+        // BODY[]`; the sized literal body must be delivered to the sink intact.
+        const MSG: &str = "From: a@b\r\nSubject: hi\r\n\r\nimap body!";
+        let (port, cmds) = spawn_loopback_imap(MSG).await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!(
+                "imap://bob:secret@127.0.0.1:{port}/INBOX;UID=1"
+            ))),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        let got = String::from_utf8_lossy(&sink.body);
+        assert!(got.contains("imap body!"), "IMAP literal body missing: {got:?}");
+        // The cleartext login, SELECT, and UID FETCH ran in order over the socket.
+        let seen = cmds.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|c| c.contains("LOGIN bob secret")),
+            "no cleartext LOGIN: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|c| c.contains("SELECT INBOX")),
+            "no SELECT: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|c| c.contains("UID FETCH 1 BODY[]")),
+            "no UID FETCH: {seen:?}"
+        );
+    }
+
+
+    // ---- perform_with: end-to-end SMTP over loopback ------------------------
+
+    /// Spawn a minimal ESMTP server on loopback.
+    ///
+    /// It greets, answers `EHLO` with a multi-line `250` (no `AUTH`, so the
+    /// client — given no credentials — skips authentication), accepts
+    /// `MAIL FROM`/`RCPT TO`, returns `354` to `DATA`, reads the message until the
+    /// `<CRLF>.<CRLF>` terminator (capturing the body lines), and acknowledges.
+    /// Returns the bound port and the captured-message handle. This drives the
+    /// real SMTP connect/EHLO/MAIL/RCPT/DATA upload state machine end-to-end.
+    #[cfg(feature = "smtp")]
+    async fn spawn_loopback_smtp() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let message = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let msg_task = std::sync::Arc::clone(&message);
+        tokio::spawn(async move {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let (rd, mut wr) = sock.into_split();
+            let mut lines = BufReader::new(rd).lines();
+            let _ = wr.write_all(b"220 loopback SMTP ready\r\n").await;
+            let mut in_data = false;
+            while let Ok(Some(line)) = lines.next_line().await {
+                if in_data {
+                    // The lone "." line terminates the DATA payload.
+                    if line == "." {
+                        in_data = false;
+                        let _ = wr.write_all(b"250 2.0.0 OK queued\r\n").await;
+                        continue;
+                    }
+                    if let Ok(mut g) = msg_task.lock() {
+                        g.extend_from_slice(line.as_bytes());
+                        g.extend_from_slice(b"\r\n");
+                    }
+                    continue;
+                }
+                let upper = line.trim_end().to_ascii_uppercase();
+                let verb = upper.split_whitespace().next().unwrap_or("");
+                match verb {
+                    "EHLO" => {
+                        let _ = wr.write_all(b"250-loopback at your service\r\n").await;
+                        let _ = wr.write_all(b"250 SIZE 1048576\r\n").await;
+                    }
+                    "HELO" => {
+                        let _ = wr.write_all(b"250 loopback\r\n").await;
+                    }
+                    "MAIL" => {
+                        let _ = wr.write_all(b"250 2.1.0 sender OK\r\n").await;
+                    }
+                    "RCPT" => {
+                        let _ = wr.write_all(b"250 2.1.5 recipient OK\r\n").await;
+                    }
+                    "DATA" => {
+                        let _ = wr
+                            .write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n")
+                            .await;
+                        in_data = true;
+                    }
+                    "QUIT" => {
+                        let _ = wr.write_all(b"221 2.0.0 bye\r\n").await;
+                        break;
+                    }
+                    _ => {
+                        let _ = wr.write_all(b"250 OK\r\n").await;
+                    }
+                }
+            }
+        });
+        (port, message)
+    }
+
+    #[cfg(feature = "smtp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_smtp_sends_message_envelope_and_body() {
+        // A full SMTP submit: EHLO → MAIL FROM → RCPT TO → DATA → message body.
+        // The uploaded message must arrive on the server's DATA channel.
+        const MSG: &[u8] = b"From: sender@example.com\r\n\
+                             To: rcpt@example.com\r\n\
+                             Subject: loopback test\r\n\
+                             \r\n\
+                             Hello SMTP body line\r\n";
+        let (port, message) = spawn_loopback_smtp().await;
+        let mut rcpts = crate::slist::SList::default();
+        rcpts.append("<rcpt@example.com>").unwrap();
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("smtp://127.0.0.1:{port}/"))),
+        )
+        .unwrap();
+        e.setopt(
+            CurlOption::CURLOPT_MAIL_FROM,
+            OptionValue::Str(Some("<sender@example.com>".to_string())),
+        )
+        .unwrap();
+        e.setopt(CurlOption::CURLOPT_MAIL_RCPT, OptionValue::Slist(Some(rcpts)))
+            .unwrap();
+        e.setopt(CurlOption::CURLOPT_UPLOAD, OptionValue::Long(1))
+            .unwrap();
+        e.setopt(
+            CurlOption::CURLOPT_INFILESIZE,
+            OptionValue::Long(MSG.len() as i64),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        let mut source = SliceSource {
+            data: MSG.to_vec(),
+            pos: 0,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            e.perform_with(&mut sink, &mut source),
+        )
+        .await
+        .expect("SMTP submit must not hang")
+        .expect("SMTP submit must succeed");
+
+        // The server received the message body via DATA.
+        let got = String::from_utf8_lossy(&message.lock().unwrap()).to_string();
+        assert!(
+            got.contains("Hello SMTP body line"),
+            "SMTP body not received by server: {got:?}"
+        );
+        assert!(
+            got.contains("Subject: loopback test"),
+            "SMTP headers not received: {got:?}"
+        );
+    }
+
+    // ---- perform_with: HTTP redirect following + POST body ------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_follows_redirect_and_discards_intermediate_body() {
+        // CURLOPT_FOLLOWLOCATION: a 301 with a relative Location is followed to
+        // the final 200 over a fresh connection. The intermediate 3xx body must
+        // be discarded (it must never leak into the application sink); only the
+        // final body is delivered — the redirect-final-body contract (Issue #4).
+        let (port, cap) = spawn_loopback_http(vec![
+            b"HTTP/1.1 301 Moved Permanently\r\nLocation: /final\r\nContent-Length: 17\r\nConnection: close\r\n\r\nintermediate body".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nfinal body!".to_vec(),
+        ])
+        .await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/start"))),
+        )
+        .unwrap();
+        e.setopt(CurlOption::CURLOPT_FOLLOWLOCATION, OptionValue::Long(1))
+            .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        // Only the final body reaches the sink; the 301 body is suppressed.
+        assert_eq!(sink.body, b"final body!", "final redirected body wrong");
+        assert!(
+            !sink
+                .body
+                .windows("intermediate".len())
+                .any(|w| w == b"intermediate"),
+            "intermediate 3xx body leaked into sink: {:?}",
+            String::from_utf8_lossy(&sink.body)
+        );
+        // The engine reports the final 200 and a single redirect hop.
+        assert_eq!(
+            e.getinfo(CurlInfo::ResponseCode).unwrap(),
+            InfoValue::Long(200)
+        );
+        assert_eq!(
+            e.getinfo(CurlInfo::RedirectCount).unwrap(),
+            InfoValue::Long(1)
+        );
+        // The effective URL is the followed target.
+        match e.getinfo(CurlInfo::EffectiveUrl).unwrap() {
+            InfoValue::Str(Some(s)) => assert!(
+                s.to_bytes().ends_with(b"/final"),
+                "effective URL not the redirect target: {s:?}"
+            ),
+            other => panic!("unexpected effective URL info: {other:?}"),
+        }
+        // The second request went to the resolved relative target.
+        let reqs = cap.lock().unwrap();
+        assert_eq!(
+            reqs.len(),
+            2,
+            "expected exactly two requests (original + follow)"
+        );
+        let second = String::from_utf8_lossy(&reqs[1]);
+        assert!(
+            second.starts_with("GET /final HTTP/1.1\r\n"),
+            "follow-up request not GET /final: {second:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_http_post_copypostfields_sends_body() {
+        // CURLOPT_COPYPOSTFIELDS selects POST and streams an owned body with a
+        // computed Content-Length; the server must observe the POST request line
+        // and the exact body bytes.
+        const BODY: &[u8] = b"field=value&n=42";
+        let (port, cap) = spawn_loopback_http(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+        ])
+        .await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("http://127.0.0.1:{port}/submit"))),
+        )
+        .unwrap();
+        e.setopt(
+            CurlOption::CURLOPT_COPYPOSTFIELDS,
+            OptionValue::Bytes(Some(BODY.to_vec())),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        perform_guarded(&mut e, &mut sink).await;
+
+        assert_eq!(sink.body, b"ok");
+        let reqs = cap.lock().unwrap();
+        let req = String::from_utf8_lossy(&reqs[0]);
+        assert!(
+            req.starts_with("POST /submit HTTP/1.1\r\n"),
+            "expected POST request line: {req:?}"
+        );
+        assert!(
+            req.to_ascii_lowercase().contains("content-length: 16\r\n"),
+            "expected computed Content-Length for the POST body: {req:?}"
+        );
+        assert!(
+            req.ends_with("field=value&n=42"),
+            "POST body missing from request: {req:?}"
+        );
+    }
+
+    // ---- perform_with: FTP append upload (APPE) -----------------------------
+
+    #[cfg(feature = "ftp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_with_ftp_append_upload_sends_body() {
+        // CURLOPT_APPEND issues APPE instead of STOR; the uploaded payload must
+        // still reach the data channel intact.
+        const PAYLOAD: &[u8] = b"appended ftp payload\n";
+        let (port, up) = spawn_loopback_ftp(b"").await;
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some(format!("ftp://user:pass@127.0.0.1:{port}/out.txt"))),
+        )
+        .unwrap();
+        e.setopt(CurlOption::CURLOPT_UPLOAD, OptionValue::Long(1))
+            .unwrap();
+        e.setopt(CurlOption::CURLOPT_APPEND, OptionValue::Long(1))
+            .unwrap();
+        e.setopt(
+            CurlOption::CURLOPT_INFILESIZE,
+            OptionValue::Long(PAYLOAD.len() as i64),
+        )
+        .unwrap();
+        let mut sink = CollectSink::default();
+        let mut source = SliceSource {
+            data: PAYLOAD.to_vec(),
+            pos: 0,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            e.perform_with(&mut sink, &mut source),
+        )
+        .await
+        .expect("FTP append must not hang")
+        .expect("FTP append must succeed");
+
+        assert_eq!(
+            &*up.lock().unwrap(),
+            PAYLOAD,
+            "server did not receive the appended FTP body"
+        );
+    }
+
+
+
+
+
+
+
 }

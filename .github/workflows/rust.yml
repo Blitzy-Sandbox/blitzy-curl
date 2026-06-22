@@ -469,6 +469,22 @@ jobs:
             exit 1
           fi
           ln -sf "${PWD}/${rust_curl}" bin/curl
+          # Feature-detection helper (AAP 0.7.3, QA Issue #8): runtests.pl drives
+          # feature-gated test selection from TWO sources -- the `curl --version`
+          # capability line AND a separate `curlinfo` helper (globalconfig.pm
+          # `$CURLINFO`) that reports the `CURL_DISABLE_*`/build gates not shown in
+          # `curl -V` (cookies, proxy, Mime, HTTP-auth, form-api, digest, ...).
+          # `cargo build --workspace` above produces the Rust `curlinfo` companion
+          # binary; expose it next to `curl` so the harness reads true capabilities
+          # instead of leaving those `%feature` flags unset and SILENTLY SKIPPING
+          # the corresponding tests (which would make a green run untrustworthy).
+          if [ -x target/release/curlinfo ]; then
+            ln -sf "${PWD}/target/release/curlinfo" bin/curlinfo
+          else
+            echo 'ERROR: curlinfo helper not found under target/release (feature detection would mis-skip tests)' >&2
+            exit 1
+          fi
           export PATH="${PWD}/bin:${PATH}"
           curl --version
+          curlinfo
           perl ./tests/runtests.pl -a

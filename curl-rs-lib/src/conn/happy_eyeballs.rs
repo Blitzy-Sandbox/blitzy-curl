@@ -861,6 +861,31 @@ pub fn create_ip_happy_filter(
     ))
 }
 
+/// Create the Happy-Eyeballs filter for an IP transport with an explicit
+/// **overall connect deadline** (`CURLOPT_CONNECTTIMEOUT(_MS)`, the CLI
+/// `--connect-timeout`), in milliseconds. A value `<= 0` means "no connect
+/// deadline" — identical to [`create_ip_happy_filter`]. On expiry the connect
+/// race returns [`CurlError::OperationTimedout`] (exit code 28), matching curl's
+/// `Curl_timeleft`-driven connect-phase abort so a black-hole peer no longer
+/// hangs the connect forever.
+///
+/// This is the deadline-aware counterpart the SETUP builder uses so the
+/// configured connect timeout actually arms the race; the racing engine's
+/// deadline guard already exists (see [`HappyEyeballsFilter::with_connect_timeout_ms`]).
+#[must_use]
+pub fn create_ip_happy_filter_with_timeout(
+    transport: u8,
+    ip_version: IpVersion,
+    happy_eyeballs_timeout: i64,
+    connect_timeout_ms: i64,
+    addrs: ResolvedAddrs,
+) -> Box<dyn ConnectionFilter> {
+    Box::new(
+        HappyEyeballsFilter::new(transport, ip_version, happy_eyeballs_timeout, addrs)
+            .with_connect_timeout_ms(connect_timeout_ms),
+    )
+}
+
 /// Create the Happy-Eyeballs filter for the UNIX-domain transport as a boxed
 /// [`ConnectionFilter`]. C: the `TRNSPRT_UNIX` path of `cf_ip_ballers_init`.
 #[cfg(unix)]
