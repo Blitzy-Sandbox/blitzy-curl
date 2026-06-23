@@ -1044,6 +1044,74 @@ impl Mime {
         top.prepare_headers(Some(top_content_type), None, MimeStrategy::Form, false)?;
         top.to_bytes()
     }
+
+    /// Serialize this multipart into a **complete mail body** for SMTP/IMAP —
+    /// the bytes that follow the `DATA`/`APPEND` command — using curl's
+    /// [`MimeStrategy::Mail`] conventions. Unlike [`into_form_body`], the
+    /// top-level `Content-Type` line *is* emitted into the returned bytes
+    /// (mail has no separate request-header block to announce it).
+    ///
+    /// This reproduces, byte-for-byte, the sequence curl performs in
+    /// `lib/smtp.c` / `lib/imap.c` when `IS_MIME_POST(data)` is true:
+    ///
+    /// 1. The synthetic top part is built **without** the `MIME_BODY_ONLY`
+    ///    flag (curl clears it — `postp->flags &= ~MIME_BODY_ONLY`), so the
+    ///    wrapper's generated `Content-Type` is serialized into the body.
+    /// 2. The caller's external headers (`-H` / `CURLOPT_HTTPHEADER`,
+    ///    `data->set.headers`) are attached to the top part as user headers —
+    ///    curl's `curl_mime_headers(postp, data->set.headers, 0)`.
+    /// 3. Part headers are prepared with [`MimeStrategy::Mail`]
+    ///    (`Curl_mime_prepare_headers(..., MIMESTRATEGY_MAIL)`), which generates
+    ///    the top `Content-Type: multipart/mixed; boundary=…` and, recursively,
+    ///    each subpart's mail-convention headers (`8bit` CTE for leaf parts,
+    ///    `attachment` disposition for named/file parts, backslash escaping).
+    /// 4. `Mime-Version: 1.0` is appended to the top part's curl-generated
+    ///    headers unless the caller already supplied a `Mime-Version` header —
+    ///    curl's `if(!Curl_checkheaders(data, "Mime-Version"))
+    ///    Curl_mime_add_header(&postp->curlheaders, "Mime-Version: 1.0")`.
+    ///
+    /// Serialization then emits the curl-generated headers
+    /// (`Content-Type`, `Mime-Version`) followed by the user headers (with any
+    /// `Content-Type` among them skipped, since it was already issued), the
+    /// terminating blank line, and the multipart body — exactly matching curl's
+    /// `readback_part` output that the SMTP/IMAP test oracle (e.g. test 646)
+    /// verifies.
+    ///
+    /// Because the `#![forbid(unsafe_code)]` library core cannot follow the
+    /// opaque `CURLOPT_MIMEPOST` tree pointer, this assembly is performed
+    /// eagerly at the CLI boundary (which knows the URL scheme and the `-H`
+    /// list); the resulting owned bytes are then handed to the SMTP/IMAP send
+    /// path as the message body. Only the memory ownership differs from curl
+    /// (eager owned `Vec<u8>` vs. curl's lazy callback stream); the produced
+    /// bytes are identical.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CurlError::ReadError`] if a file or callback part cannot be
+    /// read while assembling the body, or any encoder error.
+    pub fn into_mail_body(self, headers: Option<SList>) -> Result<Vec<u8>> {
+        // Build the synthetic top part WITHOUT MIME_BODY_ONLY so its
+        // Content-Type is part of the serialized mail body (curl clears the
+        // flag for mail).
+        let mut top = MimePart::new();
+        top.data = PartData::Multipart(Box::new(self));
+        top.datasize = -1;
+
+        // Attach the external (-H / CURLOPT_HTTPHEADER) headers as user headers
+        // on the top part — `curl_mime_headers(postp, data->set.headers, 0)`.
+        top.set_headers(headers, false)?;
+
+        // Generate the mail-convention part headers recursively.
+        top.prepare_headers(None, None, MimeStrategy::Mail, false)?;
+
+        // Append `Mime-Version: 1.0` unless the caller already provided one via
+        // an external header — `Curl_checkheaders(data, "Mime-Version")`.
+        if search_header(top.userheaders.as_ref(), "Mime-Version").is_none() {
+            top.curlheaders.push(b"Mime-Version: 1.0".to_vec());
+        }
+
+        top.to_bytes()
+    }
 }
 
 // =============================================================================

@@ -1123,6 +1123,13 @@ impl Protocol for SmtpProtocol {
             // connection is borrowed for I/O.
             let postfields_body = data.set.copypostfields.clone();
             let has_postfields = postfields_body.is_some() || data.set.postfields.is_some();
+            // A `-F`/MIME post body, assembled eagerly by the CLI with curl's
+            // mail strategy (`MIMESTRATEGY_MAIL`) and parked here via
+            // `Easy::set_mime_body`. curl drives the same MAIL/RCPT/DATA send
+            // path whenever `IS_MIME_POST(data)` is true (`lib/smtp.c`), so a
+            // configured MIME body — like an `-T` upload or a `-d` buffer —
+            // marks this as a mail send rather than a command-only exchange.
+            let mime_body = data.set.mime_body.clone();
 
             // Acquire the connection state and detach the ping-pong engine so it
             // is disjoint from `smtpc` (the response/SASL callback target). The
@@ -1135,11 +1142,15 @@ impl Protocol for SmtpProtocol {
             // A mail transfer requires upload data and at least one recipient
             // (C: `(upload || MIME) && mail_rcpt`); otherwise this is a
             // command-only exchange (VRFY/EXPN/NOOP/RSET/HELP).
-            let has_body = upload_mode || has_postfields;
+            let has_body = upload_mode || has_postfields || mime_body.is_some();
             let do_mail = has_body && !rcpt_raw.is_empty();
             // The message body: the staged `-T` upload takes precedence over the
-            // in-memory `-d` buffer (a request uses one or the other).
-            let body = staged_upload.or(postfields_body).unwrap_or_default();
+            // in-memory `-d` buffer, which in turn takes precedence over an
+            // eagerly assembled `-F` MIME body (a request uses exactly one).
+            let body = staged_upload
+                .or(postfields_body)
+                .or(mime_body)
+                .unwrap_or_default();
 
             // Run the exchange in a sub-scope so we always restore state below.
             let outcome: Result<TransferDirection> = async {
@@ -1366,9 +1377,27 @@ pub(crate) async fn perform_smtp(
     let result = handler.do_it(data, &mut conn).await.map(|_| ());
 
     // (4) Finalize (`done` propagates the status) then best-effort `QUIT`.
+    //
+    //     The `dead` argument must reflect genuine *connection* death, NOT the
+    //     transfer's success or failure. curl drives teardown from the multi
+    //     state machine, which — for a DO-phase protocol error (e.g. a server
+    //     `5xx` rejection of `MAIL FROM:<...> SIZE=NNN` when the message
+    //     exceeds the advertised `SIZE`, surfaced as `CURLE_SEND_ERROR` = 55) —
+    //     calls `multi_done(data, result, FALSE)` (premature = FALSE), and that
+    //     `FALSE` flows to `smtp_disconnect` as `dead_connection = FALSE`, so a
+    //     graceful `QUIT` is still sent (see `tests/data/test913`: `EHLO` →
+    //     `MAIL FROM:<sender@example.com> SIZE=38` → `5xx` → `QUIT`, with exit
+    //     code 55). The connection is only genuinely dead on a control-channel
+    //     I/O failure, in which case the best-effort `QUIT` send simply fails
+    //     and is ignored. Passing `false` here and letting the
+    //     `session_established` gate in `disconnect` decide therefore matches
+    //     curl exactly; using `done.is_err()` would wrongly suppress `QUIT` on
+    //     every protocol error (the SMTP-2 defect). The basic-success path
+    //     (`tests/data/test900`/`test901`) is unaffected — `done` is `Ok`
+    //     there, so the `dead` value was already `false`.
     let premature = result.is_err();
     let done = handler.done(data, &mut conn, result, premature).await;
-    let _ = handler.disconnect(data, &mut conn, done.is_err()).await;
+    let _ = handler.disconnect(data, &mut conn, false).await;
     done
 }
 

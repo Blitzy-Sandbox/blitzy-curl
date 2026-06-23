@@ -1458,6 +1458,46 @@ fn setopt_post(
             }
             if let Some(root) = config.mimeroot.as_ref() {
                 let mime = crate::formparse::build_mime(easy, root)?;
+
+                // Select curl's MIME serialization strategy by URL scheme. curl
+                // applies `MIMESTRATEGY_MAIL` for mail transfers (`lib/smtp.c`,
+                // `lib/imap.c`) and `MIMESTRATEGY_FORM` for HTTP (`lib/http.c`).
+                // The choice must be made here because the
+                // `#![forbid(unsafe_code)]` library core cannot follow the
+                // opaque `CURLOPT_MIMEPOST` tree pointer, so the tree is
+                // serialized eagerly at this CLI boundary (which knows the
+                // scheme). `url_proto_and_rewrite` classifies the already
+                // resolved URL exactly as the SSH/FTP/HTTP setopt paths do.
+                if matches!(
+                    url_proto_and_rewrite(&per.url),
+                    "smtp" | "smtps" | "imap" | "imaps"
+                ) {
+                    // Mail body (SMTP/IMAP): reproduce `lib/smtp.c`'s
+                    // `IS_MIME_POST` sequence eagerly —
+                    //   `postp->flags &= ~MIME_BODY_ONLY;` (top `Content-Type`
+                    //      is emitted into the body),
+                    //   `curl_mime_headers(postp, data->set.headers, 0);`
+                    //      (attach the `-H` list as the top part's user headers),
+                    //   `Curl_mime_prepare_headers(..., MIMESTRATEGY_MAIL);`,
+                    //   `Curl_mime_add_header(&curlheaders, "Mime-Version: 1.0")`
+                    //      unless the user already supplied one.
+                    // `Mime::into_mail_body` performs exactly these steps. The
+                    // same `-H` list is still programmed as `CURLOPT_HTTPHEADER`
+                    // below (curl's tool sets the identical list regardless of
+                    // scheme); that is inert for the SMTP/IMAP command path. The
+                    // mail `Content-Type` lives inside the body (SMTP/IMAP `DATA`
+                    // has no separate header block), so no announced content type
+                    // is needed and the send path never reads `mime_content_type`.
+                    let headers = if config.headers.is_empty() {
+                        None
+                    } else {
+                        Some(SList::try_from_strs(config.headers.iter())?)
+                    };
+                    let body = mime.into_mail_body(headers)?;
+                    easy.set_mime_body(body, String::new());
+                    return Ok(());
+                }
+
                 // curl's C tool attaches the live MIME tree by opaque pointer via
                 // `my_setopt_mimepost(curl, CURLOPT_MIMEPOST, config->mimepost)`,
                 // and the library streams it through a read callback. The

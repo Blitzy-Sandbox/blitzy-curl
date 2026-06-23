@@ -1837,4 +1837,42 @@ mod tests {
         assert_eq!(h.scheme().name, "telnet");
         assert_eq!(h.scheme().default_port, 23);
     }
+
+    // -----------------------------------------------------------------------
+    // Pure numeric parsers (telnet.c `str_number`): leading_number / parse_naws.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn leading_number_parses_prefix_and_enforces_bounds() {
+        // A leading run of digits is parsed; trailing non-digits are ignored
+        // (curl's `str_number` leaves them unconsumed).
+        assert_eq!(leading_number("0", 1), Some(0));
+        assert_eq!(leading_number("1", 1), Some(1));
+        assert_eq!(leading_number("0abc", 1), Some(0));
+        // Out of range → None (curl rejects a value above the max).
+        assert_eq!(leading_number("2", 1), None);
+        // No leading digit → None.
+        assert_eq!(leading_number("", 1), None);
+        assert_eq!(leading_number("x9", 9), None);
+        // Larger ceilings admit multi-digit prefixes.
+        assert_eq!(leading_number("65535rest", 0xffff), Some(65535));
+        assert_eq!(leading_number("65536", 0xffff), None);
+    }
+
+    #[test]
+    fn parse_naws_accepts_wxh_and_rejects_malformed() {
+        // `WIDTHxHEIGHT`, both <= 0xffff; trailing text after the height is
+        // ignored exactly as the C parser leaves it unconsumed.
+        assert_eq!(parse_naws("80x24"), Some((80, 24)));
+        assert_eq!(parse_naws("0x0"), Some((0, 0)));
+        assert_eq!(parse_naws("65535x65535"), Some((65535, 65535)));
+        assert_eq!(parse_naws("80x24trailing"), Some((80, 24)));
+        // Missing/invalid separator, missing field, or out-of-range → None.
+        assert_eq!(parse_naws("80"), None);
+        assert_eq!(parse_naws("80y24"), None);
+        assert_eq!(parse_naws("x24"), None);
+        assert_eq!(parse_naws("80x"), None);
+        assert_eq!(parse_naws("65536x1"), None);
+        assert_eq!(parse_naws("1x65536"), None);
+    }
 }

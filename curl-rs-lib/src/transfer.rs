@@ -2132,6 +2132,21 @@ pub trait ProtocolExchange {
     /// Send a chunk of request body, returning the number of bytes accepted
     /// (which may be fewer than offered for flow-controlled protocols).
     async fn send_body(&mut self, data: &[u8]) -> Result<usize>;
+
+    /// Total request bytes written to the wire so far for this exchange — the
+    /// request head plus all body framing actually sent — surfaced as
+    /// `CURLINFO_REQUEST_SIZE` (`%{size_request}`). The default is `0` for
+    /// protocols that do not account it; the HTTP/1.x exchange overrides it.
+    fn request_size_sent(&self) -> u64 {
+        0
+    }
+
+    /// Total upload PAYLOAD bytes written so far for this exchange (excluding
+    /// any chunked framing) — surfaced as `CURLINFO_SIZE_UPLOAD`
+    /// (`%{size_upload}`). The default is `0`; the HTTP/1.x exchange overrides it.
+    fn upload_size_sent(&self) -> u64 {
+        0
+    }
 }
 
 /// The disjoint set of mutable borrows the byte-loop driver operates on, bundled

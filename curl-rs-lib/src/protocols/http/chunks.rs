@@ -1825,4 +1825,34 @@ mod tests {
         assert_eq!(res.unwrap_err(), CurlError::RecvError);
         assert_eq!(state, ChunkState::Failed);
     }
+
+    /// Regression guard for WO-1/WO-2 (`%{size_upload}` / `%{size_request}`).
+    ///
+    /// curl counts the **framed** byte stream — not the raw payload — toward
+    /// `CURLINFO_SIZE_UPLOAD`/`CURLINFO_REQUEST_SIZE` for a chunked upload
+    /// (`lib/http_chunks.c` `cr_chunked_read` frames the payload *before*
+    /// `xfer_send`, and `lib/request.c` increments `writebytecount` /
+    /// `Curl_pgrs_upload_inc` by the wire byte count). The H1 upload path in
+    /// `h1.rs` therefore advances `upload_bytes_sent`/`req_bytes_sent` by
+    /// `encode_chunked_blocks(...).len()`. This test locks that exact byte count
+    /// so the framed-vs-payload accounting can never silently regress to the
+    /// pre-fix (payload-only) behavior.
+    #[test]
+    fn chunked_framed_length_locks_size_upload_accounting() {
+        // A single 10-byte read (the QA test C: `printf '0123456789' | curl -T -`).
+        let payload = b"0123456789".to_vec();
+        let framed = encode_chunked_blocks(std::slice::from_ref(&payload), None);
+        // "a\r\n" (3) + payload (10) + "\r\n" (2) = 15 data-chunk bytes,
+        // then the terminal "0\r\n\r\n" (5) => 20 framed bytes total.
+        assert_eq!(framed.len(), 20, "framed chunked size_upload must be 20");
+        assert_eq!(framed, b"a\r\n0123456789\r\n0\r\n\r\n".to_vec());
+        // The framing overhead over the raw payload is exactly the chunk-size
+        // line (`<hex-len>\r\n`), its trailing CRLF, and the terminal chunk.
+        let overhead = framed.len() - payload.len();
+        assert_eq!(overhead, 3 + 2 + 5);
+        // The bare terminal chunk (the trailing `0\r\n\r\n` the streaming upload
+        // path adds as its own +5) is invariant.
+        assert_eq!(encode_chunked_blocks(&[], None), b"0\r\n\r\n".to_vec());
+        assert_eq!(encode_chunked_blocks(&[], None).len(), 5);
+    }
 }

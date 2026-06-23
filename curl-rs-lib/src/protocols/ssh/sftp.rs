@@ -2560,4 +2560,59 @@ mod tests {
         // A non-status error yields no SFTP status code.
         assert_eq!(sftp_status_code(&io_err()), None);
     }
+
+    // -- collect_quote_items / format_statvfs (pure) ------------------------
+
+    #[test]
+    fn collect_quote_items_from_slist_and_none() {
+        // `None` (no -Q/--quote list) yields no commands.
+        assert!(collect_quote_items(None).is_empty());
+        // A populated list is flattened, in order, to owned `String`s — the
+        // input to the C `sftp_quote` command loop.
+        let mut sl = SList::default();
+        sl.append("pwd").unwrap();
+        sl.append("chmod 644 /f").unwrap();
+        sl.append("rename a b").unwrap();
+        assert_eq!(
+            collect_quote_items(Some(&sl)),
+            vec![
+                "pwd".to_string(),
+                "chmod 644 /f".to_string(),
+                "rename a b".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn format_statvfs_matches_c_field_order_and_names() {
+        // Byte-for-byte parity with the C `ssh_state_sftp_quote_statvfs` block:
+        // the `f_*` field names and their order are observable output.
+        let st = Statvfs {
+            block_size: 4096,
+            fragment_size: 4096,
+            blocks: 1_000_000,
+            blocks_free: 500_000,
+            blocks_avail: 400_000,
+            inodes: 250_000,
+            inodes_free: 200_000,
+            inodes_avail: 199_999,
+            fs_id: 42,
+            flags: 0,
+            name_max: 255,
+        };
+        let out = format_statvfs(&st);
+        let expected = "statvfs:\n\
+             f_bsize: 4096\n\
+             f_frsize: 4096\n\
+             f_blocks: 1000000\n\
+             f_bfree: 500000\n\
+             f_bavail: 400000\n\
+             f_files: 250000\n\
+             f_ffree: 200000\n\
+             f_favail: 199999\n\
+             f_fsid: 42\n\
+             f_flag: 0\n\
+             f_namemax: 255\n";
+        assert_eq!(out, expected);
+    }
 }

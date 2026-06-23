@@ -1466,6 +1466,26 @@ pub struct H1Exchange<'u, C: ByteStream> {
     /// the server's EOF, which a deferred-close server never sends, hanging the
     /// transfer until timeout. Test oracle: tests/data/test187.
     follow_enabled: bool,
+    /// Running total of request bytes WRITTEN to the wire for this exchange:
+    /// the request head (request line + headers + terminating CRLF) plus the
+    /// full body framing actually sent (the raw bytes of a sized body, or the
+    /// chunk size lines / CRLFs and the terminal `0\r\n\r\n` of a chunked
+    /// upload). This is the memory-safe equivalent of curl accumulating every
+    /// `Curl_xfer_send` write into `data->info.request_size` (lib/transfer.c:
+    /// `data->info.request_size += *pnwritten`), surfaced as
+    /// `CURLINFO_REQUEST_SIZE` (`%{size_request}`). Read via
+    /// [`request_size_sent`](H1Exchange::request_size_sent).
+    req_bytes_sent: u64,
+    /// Running total of upload BODY bytes written to the wire for this exchange
+    /// — every byte sent after the request head. For a sized body this equals
+    /// the payload; for a chunked body it is the FRAMED stream (chunk size
+    /// lines, CRLFs and the terminal `0\r\n\r\n`), because curl accounts the
+    /// upload by the body bytes actually written (`*pnwritten - hds_len` in
+    /// lib/request.c `xfer_send`, fed to both `data->req.writebytecount` and
+    /// `Curl_pgrs_upload_inc`). Surfaced as `CURLINFO_SIZE_UPLOAD`
+    /// (`%{size_upload}`); it equals `req_bytes_sent` minus the request-header
+    /// bytes. Read via [`upload_size_sent`](H1Exchange::upload_size_sent).
+    upload_bytes_sent: u64,
 }
 
 impl<'u, C: ByteStream> H1Exchange<'u, C> {
@@ -1505,6 +1525,8 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
             max_filesize: 0,
             ignore_cl: false,
             follow_enabled: false,
+            req_bytes_sent: 0,
+            upload_bytes_sent: 0,
         }
     }
 
@@ -1629,6 +1651,11 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
     /// parse the response head — the once-per-exchange startup.
     async fn start(&mut self) -> Result<()> {
         send_all(&mut self.conn, &self.head).await?;
+        // Account the request head (request line + headers + terminating CRLF)
+        // toward CURLINFO_REQUEST_SIZE. The head is always written, even when an
+        // Expect: 100-continue probe yields a final response and the body is
+        // skipped — so it is counted here, immediately after the head send.
+        self.req_bytes_sent += self.head.len() as u64;
 
         if self.expect_100 {
             match self.await_interim_100().await? {
@@ -1667,7 +1694,16 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
         let body = core::mem::take(&mut self.body);
         match body {
             RequestBody::None => Ok(()),
-            RequestBody::Sized(bytes) => send_all(&mut self.conn, &bytes).await,
+            RequestBody::Sized(bytes) => {
+                send_all(&mut self.conn, &bytes).await?;
+                // A sized body is sent verbatim (no framing), so its length
+                // counts toward BOTH the upload payload (CURLINFO_SIZE_UPLOAD)
+                // and the total request size (CURLINFO_REQUEST_SIZE).
+                let n = bytes.len() as u64;
+                self.upload_bytes_sent += n;
+                self.req_bytes_sent += n;
+                Ok(())
+            }
             RequestBody::Chunked(blocks, trailers) => {
                 // Frame EACH read block as its own chunk (curl frames every
                 // read-callback return as a separate chunk), then the terminal
@@ -1682,7 +1718,19 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
                     Some(trailer_refs.as_slice())
                 };
                 let framed = super::chunks::encode_chunked_blocks(&blocks, trailers_opt);
-                send_all(&mut self.conn, &framed).await
+                send_all(&mut self.conn, &framed).await?;
+                // curl accounts the upload by the BODY bytes written to the wire
+                // (`*pnwritten - hds_len` in lib/request.c:xfer_send), which for a
+                // chunked body is the framed stream — chunk size lines, CRLFs, the
+                // terminal `0`-chunk and any trailers — not just the raw payload.
+                // Both CURLINFO_SIZE_UPLOAD (`writebytecount`/`Curl_pgrs_upload_inc`)
+                // and CURLINFO_REQUEST_SIZE therefore advance by the full framed
+                // length; they differ only by the request-header bytes counted in
+                // `start()`.
+                let n = framed.len() as u64;
+                self.upload_bytes_sent += n;
+                self.req_bytes_sent += n;
+                Ok(())
             }
             RequestBody::Streaming { chunked, .. } => self.stream_upload(chunked).await,
         }
@@ -1736,8 +1784,20 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
                         framed.extend_from_slice(&buf[..n]);
                         framed.extend_from_slice(b"\r\n");
                         send_all(&mut self.conn, &framed).await?;
+                        // curl counts the BODY bytes on the wire (lib/request.c
+                        // `xfer_send`: `*pnwritten - hds_len`) toward BOTH
+                        // CURLINFO_SIZE_UPLOAD and CURLINFO_REQUEST_SIZE. For a
+                        // chunked body those are the framed bytes, so the upload
+                        // count advances by the full framed chunk, not the payload.
+                        let fl = framed.len() as u64;
+                        self.req_bytes_sent += fl;
+                        self.upload_bytes_sent += fl;
                     } else {
                         send_all(&mut self.conn, &buf[..n]).await?;
+                        // Raw body: wire bytes == payload bytes, so the upload and
+                        // request counts both advance by `n`.
+                        self.req_bytes_sent += n as u64;
+                        self.upload_bytes_sent += n as u64;
                     }
                     sent_total += n as u64;
                     // Pace the upload between writes (curl's windowed rate
@@ -1754,8 +1814,12 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
             }
         }
         if chunked {
-            // Terminal zero-length chunk closes the chunked body.
+            // Terminal zero-length chunk closes the chunked body. curl counts it
+            // as body bytes on the wire, so it advances BOTH the upload size and
+            // the request size (`size_upload = request_size - request_header_len`).
             send_all(&mut self.conn, b"0\r\n\r\n").await?;
+            self.req_bytes_sent += 5;
+            self.upload_bytes_sent += 5;
         }
         Ok(())
     }
@@ -2491,6 +2555,14 @@ impl<'u, C: ByteStream> ProtocolExchange for H1Exchange<'u, C> {
 
     async fn send_body(&mut self, data: &[u8]) -> Result<usize> {
         self.conn.send(data).await
+    }
+
+    fn request_size_sent(&self) -> u64 {
+        self.req_bytes_sent
+    }
+
+    fn upload_size_sent(&self) -> u64 {
+        self.upload_bytes_sent
     }
 }
 

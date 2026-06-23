@@ -5331,7 +5331,9 @@ async fn drive_one<P: ProtocolExchange>(
 
     let outcome = drive_transfer(
         TransferParts {
-            exchange,
+            // Reborrow so `exchange` remains usable after `drive_transfer`
+            // returns, to read its written-byte counters into `data.info` below.
+            exchange: &mut *exchange,
             request: &mut request,
             progress: &mut progress,
             writer: &mut writer,
@@ -5362,7 +5364,27 @@ async fn drive_one<P: ProtocolExchange>(
     data.info.response_code = i64::from(request.httpcode);
     data.info.http_version = i64::from(request.httpversion);
     data.info.size_download = progress.download_size();
+    // Publish the upload payload (CURLINFO_SIZE_UPLOAD / `%{size_upload}`) and
+    // the total request size (CURLINFO_REQUEST_SIZE / `%{size_request}`) from
+    // the exchange's written-byte counters. curl's HTTP/1.x send path
+    // (`Curl_xfer_send`) accumulates each write into `data->progress.uploaded`
+    // and `data->req.writebytecount` / `request_size`; the safe core counts the
+    // same bytes on the `H1Exchange` (the request head is always written; a
+    // sized body counts verbatim, a chunked body counts its framed bytes toward
+    // the request size and its raw payload toward the upload size). The
+    // direct-write H1 send path never touches `request.writebytecount` (which
+    // the byte-loop samples for the progress callback), so seed the progress
+    // upload counter here so `upload_size()` reflects the real total. Per curl,
+    // `request_size` ACCUMULATES across hops within one perform — `pre_perform`
+    // resets `data.info` exactly once per `curl_easy_perform` (redirect/auth
+    // resends add to the same total). Non-HTTP/1.x exchanges report `0` (the
+    // `ProtocolExchange` trait default), leaving their accounting unchanged.
+    let uploaded = exchange.upload_size_sent() as i64;
+    if uploaded > 0 {
+        progress.set_upload_counter(uploaded);
+    }
     data.info.size_upload = progress.upload_size();
+    data.info.request_size += exchange.request_size_sent() as i64;
 
     // Finalize the elapsed-time accounting and publish the transfer-phase timings
     // and header byte count to `data->info`, mirroring curl's `Curl_pgrsDone` /

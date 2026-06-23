@@ -2951,6 +2951,29 @@ impl FtpConn {
             return self.run_info_phase(data, conn, sink).await;
         }
 
+        // A body-less request on a *directory* (`--head`/`-I` on a path that
+        // names no file, e.g. `ftp://host/1000/`) stops right after the final
+        // `CWD`: curl's `ftp_perform` sets `ftp->transfer = PPTRANSFER_INFO`
+        // for `data->req.no_body`, and `ftp_state_prepare_transfer` routes a
+        // non-`PPTRANSFER_BODY` transfer to `FTP_RETR_PREQUOTE`. With no file to
+        // stat, the prequote state falls straight through to `FTP_STOP`
+        // (lib/ftp.c L1786-1793) — so curl opens NO data connection and issues
+        // NO `EPSV`/`TYPE A`/`LIST` for a directory `NOBODY` request. Previously
+        // this case was mis-classified as a directory listing (it has
+        // `is_listing == true` because `file.is_none()`), emitting the extra
+        // `EPSV`/`TYPE A`/`LIST` — the root cause of the `tests/data/test1000`
+        // wire mismatch. Mirror curl exactly: stop after `CWD`. `dont_check`
+        // suppresses the (absent) trailing `226`/`250` completion read, and the
+        // control channel stays valid (`ctl_valid` is untouched after a
+        // successful `cwd_navigate`) so a graceful `QUIT` still follows in
+        // teardown — yielding `USER`/`PASS`/`PWD`/`CWD`/`QUIT`. `transfer_kind`
+        // is left at its default: it is inert on this path (no data transfer,
+        // `maxdownload == 0`, no `run_*_phase` body code runs).
+        if !is_upload && data.set.opt_no_body && self.file.is_none() {
+            self.dont_check = true;
+            return Ok(());
+        }
+
         let (kind, direction) = if is_upload {
             (TransferKind::Stor, TransferDirection::Upload)
         } else if is_listing {
@@ -5236,4 +5259,429 @@ mod tests {
         assert_eq!(err, CurlError::FtpCouldntUseRest);
     }
 
+    // -----------------------------------------------------------------------
+    // FTPS login-protection response handlers (ACCT / PBSZ / PROT / CCC / SYST).
+    // These mirror the C `ftp_statemachine` per-state arms; each is driven in
+    // isolation over the scripted `MockFilter` control channel. `send_cmd` is
+    // send-only (the reply is consumed on the *next* state), so no recv script
+    // is needed — only the emitted command and the resulting state are checked.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn state_acct_resp_proceeds_on_2xx_and_fails_otherwise() {
+        let mut data = Easy::new();
+        // A non-2xx ACCT reply ⇒ CURLE_FTP_WEIRD_PASS_REPLY (C "ACCT rejected").
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(Arc::new(Mutex::new(Vec::new())), sent.clone());
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        let err = ftpc
+            .state_acct_resp(&mut data, &mut conn, 530)
+            .await
+            .unwrap_err();
+        assert_eq!(err, CurlError::FtpWeirdPassReply);
+
+        // A 2xx ACCT on a clear control channel ⇒ logged in ⇒ straight to PWD.
+        let sent2 = Arc::new(Mutex::new(Vec::new()));
+        let mut conn2 = make_conn(Arc::new(Mutex::new(Vec::new())), sent2.clone());
+        let mut ftpc2 = FtpConn::new();
+        ftpc2.pp.init(timeval::curlx_now());
+        ftpc2.control_ssl = false;
+        ftpc2
+            .state_acct_resp(&mut data, &mut conn2, 230)
+            .await
+            .unwrap();
+        assert!(sent_str(&sent2).contains("PWD\r\n"));
+        assert_eq!(ftpc2.state, FtpState::Pwd);
+    }
+
+    #[tokio::test]
+    async fn state_loggedin_starts_pbsz_on_tls_else_pwd() {
+        let mut data = Easy::new();
+        // TLS control channel ⇒ begin data-protection with `PBSZ 0`.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(Arc::new(Mutex::new(Vec::new())), sent.clone());
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.control_ssl = true;
+        ftpc.state_loggedin(&mut data, &mut conn).await.unwrap();
+        assert!(sent_str(&sent).contains("PBSZ 0\r\n"));
+        assert_eq!(ftpc.state, FtpState::Pbsz);
+
+        // Clear control channel ⇒ skip straight to `PWD`.
+        let sent2 = Arc::new(Mutex::new(Vec::new()));
+        let mut conn2 = make_conn(Arc::new(Mutex::new(Vec::new())), sent2.clone());
+        let mut ftpc2 = FtpConn::new();
+        ftpc2.pp.init(timeval::curlx_now());
+        ftpc2.control_ssl = false;
+        ftpc2.state_loggedin(&mut data, &mut conn2).await.unwrap();
+        assert!(sent_str(&sent2).contains("PWD\r\n"));
+        assert_eq!(ftpc2.state, FtpState::Pwd);
+    }
+
+    #[tokio::test]
+    async fn state_pbsz_resp_selects_prot_clear_or_private() {
+        // CURLUSESSL_CONTROL ⇒ only the control channel is protected ⇒ `PROT C`.
+        let mut data = Easy::new();
+        data.set.use_ssl = CURLUSESSL_CONTROL;
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(Arc::new(Mutex::new(Vec::new())), sent.clone());
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.state_pbsz_resp(&mut data, &mut conn, 200).await.unwrap();
+        assert!(sent_str(&sent).contains("PROT C\r\n"));
+        assert_eq!(ftpc.state, FtpState::Prot);
+
+        // Full SSL (CURLUSESSL_ALL = 3) ⇒ protect the data channel too ⇒ `PROT P`.
+        let mut data2 = Easy::new();
+        data2.set.use_ssl = 3;
+        let sent2 = Arc::new(Mutex::new(Vec::new()));
+        let mut conn2 = make_conn(Arc::new(Mutex::new(Vec::new())), sent2.clone());
+        let mut ftpc2 = FtpConn::new();
+        ftpc2.pp.init(timeval::curlx_now());
+        ftpc2
+            .state_pbsz_resp(&mut data2, &mut conn2, 200)
+            .await
+            .unwrap();
+        assert!(sent_str(&sent2).contains("PROT P\r\n"));
+        assert_eq!(ftpc2.state, FtpState::Prot);
+    }
+
+    #[tokio::test]
+    async fn state_prot_resp_records_level_or_ccc_or_fails() {
+        // 2xx with no CCC requested ⇒ record the SSL level and proceed to PWD.
+        let mut data = Easy::new();
+        data.set.use_ssl = 3; // CURLUSESSL_ALL
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(Arc::new(Mutex::new(Vec::new())), sent.clone());
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.state_prot_resp(&mut data, &mut conn, 200).await.unwrap();
+        assert_eq!(ftpc.use_ssl, 3);
+        assert!(sent_str(&sent).contains("PWD\r\n"));
+        assert_eq!(ftpc.state, FtpState::Pwd);
+
+        // 2xx with CCC requested ⇒ send `CCC` and advance to the CCC state.
+        let mut data2 = Easy::new();
+        data2.set.use_ssl = 3;
+        data2.set.ftp_ccc = 1;
+        let sent2 = Arc::new(Mutex::new(Vec::new()));
+        let mut conn2 = make_conn(Arc::new(Mutex::new(Vec::new())), sent2.clone());
+        let mut ftpc2 = FtpConn::new();
+        ftpc2.pp.init(timeval::curlx_now());
+        ftpc2
+            .state_prot_resp(&mut data2, &mut conn2, 200)
+            .await
+            .unwrap();
+        assert_eq!(ftpc2.ccc, 1);
+        assert!(sent_str(&sent2).contains("CCC\r\n"));
+        assert_eq!(ftpc2.state, FtpState::Ccc);
+
+        // Server rejects `PROT P` (500) while full SSL was required ⇒ fail.
+        let mut data3 = Easy::new();
+        data3.set.use_ssl = 3; // > CURLUSESSL_CONTROL
+        let sent3 = Arc::new(Mutex::new(Vec::new()));
+        let mut conn3 = make_conn(Arc::new(Mutex::new(Vec::new())), sent3.clone());
+        let mut ftpc3 = FtpConn::new();
+        ftpc3.pp.init(timeval::curlx_now());
+        let err = ftpc3
+            .state_prot_resp(&mut data3, &mut conn3, 500)
+            .await
+            .unwrap_err();
+        assert_eq!(err, CurlError::UseSslFailed);
+    }
+
+    #[tokio::test]
+    async fn state_ccc_resp_clears_control_then_sends_pwd() {
+        let mut data = Easy::new();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(Arc::new(Mutex::new(Vec::new())), sent.clone());
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.control_ssl = true;
+        ftpc.state_ccc_resp(&mut data, &mut conn).await.unwrap();
+        assert!(!ftpc.control_ssl, "CCC returns the control channel to clear");
+        assert!(sent_str(&sent).contains("PWD\r\n"));
+        assert_eq!(ftpc.state, FtpState::Pwd);
+    }
+
+    #[tokio::test]
+    async fn state_syst_resp_records_os_and_handles_os400() {
+        // A 215 naming a generic UNIX OS ⇒ record it and finish the connect phase.
+        let mut data = Easy::new();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(Arc::new(Mutex::new(Vec::new())), sent.clone());
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.last_response = b"215 UNIX Type: L8".to_vec();
+        ftpc.state_syst_resp(&mut data, &mut conn, 215).await.unwrap();
+        assert_eq!(ftpc.server_os.as_deref(), Some("UNIX"));
+        assert_eq!(ftpc.state, FtpState::Stop);
+
+        // `OS/400` additionally triggers `SITE NAMEFMT 1` ⇒ Namefmt state.
+        let sent2 = Arc::new(Mutex::new(Vec::new()));
+        let mut conn2 = make_conn(Arc::new(Mutex::new(Vec::new())), sent2.clone());
+        let mut ftpc2 = FtpConn::new();
+        ftpc2.pp.init(timeval::curlx_now());
+        ftpc2.last_response = b"215 OS/400 is the operating system".to_vec();
+        ftpc2
+            .state_syst_resp(&mut data, &mut conn2, 215)
+            .await
+            .unwrap();
+        assert_eq!(ftpc2.server_os.as_deref(), Some("OS/400"));
+        assert!(sent_str(&sent2).contains("SITE NAMEFMT 1\r\n"));
+        assert_eq!(ftpc2.state, FtpState::Namefmt);
+
+        // A non-215 reply ⇒ no OS recorded, connect phase ends.
+        let sent3 = Arc::new(Mutex::new(Vec::new()));
+        let mut conn3 = make_conn(Arc::new(Mutex::new(Vec::new())), sent3.clone());
+        let mut ftpc3 = FtpConn::new();
+        ftpc3.pp.init(timeval::curlx_now());
+        ftpc3.last_response = b"500 Unknown command".to_vec();
+        ftpc3
+            .state_syst_resp(&mut data, &mut conn3, 500)
+            .await
+            .unwrap();
+        assert_eq!(ftpc3.server_os, None);
+        assert_eq!(ftpc3.state, FtpState::Stop);
+    }
+
+    #[tokio::test]
+    async fn state_wait220_greeting_dispatches_user_auth_or_error() {
+        // Plain 220 with no SSL ⇒ send USER and move to the User state.
+        let mut data = Easy::new();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(Arc::new(Mutex::new(Vec::new())), sent.clone());
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.state_wait220(&mut data, &mut conn, 220).await.unwrap();
+        assert!(sent_str(&sent).contains("USER "));
+        assert_eq!(ftpc.state, FtpState::User);
+
+        // A non-220/230 greeting (e.g. 421) ⇒ CURLE_WEIRD_SERVER_REPLY.
+        let mut conn_e = make_conn(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+        let mut ftpc_e = FtpConn::new();
+        ftpc_e.pp.init(timeval::curlx_now());
+        let err = ftpc_e
+            .state_wait220(&mut data, &mut conn_e, 421)
+            .await
+            .unwrap_err();
+        assert_eq!(err, CurlError::WeirdServerReply);
+
+        // FTPS requested (CURLUSESSL_TRY) on a clear control channel, default
+        // FTPSSLAUTH ⇒ begin AUTH negotiation with `AUTH SSL`.
+        let mut data_ssl = Easy::new();
+        data_ssl.set.use_ssl = CURLUSESSL_TRY;
+        data_ssl.set.ftpsslauth = CURLFTPAUTH_DEFAULT;
+        let sent_s = Arc::new(Mutex::new(Vec::new()));
+        let mut conn_s = make_conn(Arc::new(Mutex::new(Vec::new())), sent_s.clone());
+        let mut ftpc_s = FtpConn::new();
+        ftpc_s.pp.init(timeval::curlx_now());
+        ftpc_s
+            .state_wait220(&mut data_ssl, &mut conn_s, 220)
+            .await
+            .unwrap();
+        assert!(sent_str(&sent_s).contains("AUTH SSL\r\n"));
+        assert_eq!(ftpc_s.state, FtpState::Auth);
+
+        // FTPSSLAUTH=TLS starts the negotiation at `AUTH TLS` instead.
+        let mut data_tls = Easy::new();
+        data_tls.set.use_ssl = CURLUSESSL_TRY;
+        data_tls.set.ftpsslauth = CURLFTPAUTH_TLS;
+        let sent_t = Arc::new(Mutex::new(Vec::new()));
+        let mut conn_t = make_conn(Arc::new(Mutex::new(Vec::new())), sent_t.clone());
+        let mut ftpc_t = FtpConn::new();
+        ftpc_t.pp.init(timeval::curlx_now());
+        ftpc_t
+            .state_wait220(&mut data_tls, &mut conn_t, 220)
+            .await
+            .unwrap();
+        assert!(sent_str(&sent_t).contains("AUTH TLS\r\n"));
+        assert_eq!(ftpc_t.state, FtpState::Auth);
+
+        // An unsupported FTPSSLAUTH value ⇒ CURLE_UNKNOWN_OPTION.
+        let mut data_bad = Easy::new();
+        data_bad.set.use_ssl = CURLUSESSL_TRY;
+        data_bad.set.ftpsslauth = 99;
+        let mut conn_b = make_conn(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+        let mut ftpc_b = FtpConn::new();
+        ftpc_b.pp.init(timeval::curlx_now());
+        let err = ftpc_b
+            .state_wait220(&mut data_bad, &mut conn_b, 220)
+            .await
+            .unwrap_err();
+        assert_eq!(err, CurlError::UnknownOption);
+    }
+
+    #[tokio::test]
+    async fn state_auth_retries_then_fails_or_falls_back() {
+        // First rejection (count3 == 0) ⇒ try the alternative mechanism and
+        // remain in AUTH. Starting from the default `AUTH SSL` setup
+        // (count1=0, count2=+1), the retry advances to `AUTH TLS`.
+        let mut data = Easy::new();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(Arc::new(Mutex::new(Vec::new())), sent.clone());
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.count1 = 0;
+        ftpc.count2 = 1;
+        ftpc.count3 = 0;
+        ftpc.state_auth(&mut data, &mut conn, 500).await.unwrap();
+        assert_eq!(ftpc.count3, 1);
+        assert!(sent_str(&sent).contains("AUTH TLS\r\n"));
+
+        // Second rejection (count3 >= 1) with mandatory SSL ⇒ CURLE_USE_SSL_FAILED.
+        let mut data_req = Easy::new();
+        data_req.set.use_ssl = CURLUSESSL_CONTROL; // > CURLUSESSL_TRY
+        let mut conn_r = make_conn(Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+        let mut ftpc_r = FtpConn::new();
+        ftpc_r.pp.init(timeval::curlx_now());
+        ftpc_r.count3 = 1;
+        let err = ftpc_r
+            .state_auth(&mut data_req, &mut conn_r, 500)
+            .await
+            .unwrap_err();
+        assert_eq!(err, CurlError::UseSslFailed);
+
+        // Second rejection with optional SSL ⇒ continue in clear text (USER).
+        let mut data_try = Easy::new();
+        data_try.set.use_ssl = CURLUSESSL_TRY;
+        let sent_c = Arc::new(Mutex::new(Vec::new()));
+        let mut conn_c = make_conn(Arc::new(Mutex::new(Vec::new())), sent_c.clone());
+        let mut ftpc_c = FtpConn::new();
+        ftpc_c.pp.init(timeval::curlx_now());
+        ftpc_c.count3 = 1;
+        ftpc_c
+            .state_auth(&mut data_try, &mut conn_c, 500)
+            .await
+            .unwrap();
+        assert!(sent_str(&sent_c).contains("USER "));
+        assert_eq!(ftpc_c.state, FtpState::User);
+    }
+
+    #[tokio::test]
+    async fn state_user_resp_password_account_alt_and_denied() {
+        let mut data = Easy::new();
+        // 331 in the User state ⇒ send PASS, advance to Pass.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(Arc::new(Mutex::new(Vec::new())), sent.clone());
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.set_state(FtpState::User);
+        ftpc.passwd = "secret".to_string();
+        ftpc.state_user_resp(&mut data, &mut conn, 331).await.unwrap();
+        assert!(sent_str(&sent).contains("PASS secret\r\n"));
+        assert_eq!(ftpc.state, FtpState::Pass);
+
+        // 2xx ⇒ logged in; on a clear control channel that means straight to PWD.
+        let sent2 = Arc::new(Mutex::new(Vec::new()));
+        let mut conn2 = make_conn(Arc::new(Mutex::new(Vec::new())), sent2.clone());
+        let mut ftpc2 = FtpConn::new();
+        ftpc2.pp.init(timeval::curlx_now());
+        ftpc2.control_ssl = false;
+        ftpc2
+            .state_user_resp(&mut data, &mut conn2, 230)
+            .await
+            .unwrap();
+        assert!(sent_str(&sent2).contains("PWD\r\n"));
+
+        // 332 with an account configured ⇒ send ACCT, advance to Acct.
+        let sent3 = Arc::new(Mutex::new(Vec::new()));
+        let mut conn3 = make_conn(Arc::new(Mutex::new(Vec::new())), sent3.clone());
+        let mut ftpc3 = FtpConn::new();
+        ftpc3.pp.init(timeval::curlx_now());
+        ftpc3.account = Some("acct-1".to_string());
+        ftpc3
+            .state_user_resp(&mut data, &mut conn3, 332)
+            .await
+            .unwrap();
+        assert!(sent_str(&sent3).contains("ACCT acct-1\r\n"));
+        assert_eq!(ftpc3.state, FtpState::Acct);
+
+        // 332 with no account ⇒ CURLE_LOGIN_DENIED.
+        let mut conn4 = make_conn(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let mut ftpc4 = FtpConn::new();
+        ftpc4.pp.init(timeval::curlx_now());
+        ftpc4.account = None;
+        let err = ftpc4
+            .state_user_resp(&mut data, &mut conn4, 332)
+            .await
+            .unwrap_err();
+        assert_eq!(err, CurlError::LoginDenied);
+
+        // Access denial with an alternative command ⇒ try it once, back to User.
+        let sent5 = Arc::new(Mutex::new(Vec::new()));
+        let mut conn5 = make_conn(Arc::new(Mutex::new(Vec::new())), sent5.clone());
+        let mut ftpc5 = FtpConn::new();
+        ftpc5.pp.init(timeval::curlx_now());
+        ftpc5.alternative_to_user = Some("USER anonymous".to_string());
+        ftpc5
+            .state_user_resp(&mut data, &mut conn5, 530)
+            .await
+            .unwrap();
+        assert!(sent_str(&sent5).contains("USER anonymous\r\n"));
+        assert!(ftpc5.ftp_trying_alternative);
+        assert_eq!(ftpc5.state, FtpState::User);
+
+        // Access denial with no (remaining) alternative ⇒ CURLE_LOGIN_DENIED.
+        let mut conn6 = make_conn(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let mut ftpc6 = FtpConn::new();
+        ftpc6.pp.init(timeval::curlx_now());
+        let err = ftpc6
+            .state_user_resp(&mut data, &mut conn6, 530)
+            .await
+            .unwrap_err();
+        assert_eq!(err, CurlError::LoginDenied);
+    }
+
+    #[tokio::test]
+    async fn state_pwd_resp_records_entrypath_and_probes_syst() {
+        let mut data = Easy::new();
+        // 257 with a *relative* entry path and unknown OS ⇒ probe SYST.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(Arc::new(Mutex::new(Vec::new())), sent.clone());
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.last_response = b"257 \"home/user\" is current directory".to_vec();
+        ftpc.server_os = None;
+        ftpc.state_pwd_resp(&mut data, &mut conn, 257).await.unwrap();
+        assert_eq!(ftpc.entrypath.as_deref(), Some("home/user"));
+        assert!(sent_str(&sent).contains("SYST\r\n"));
+        assert_eq!(ftpc.state, FtpState::Syst);
+
+        // 257 with an *absolute* entry path ⇒ no SYST probe, connect phase ends.
+        let sent2 = Arc::new(Mutex::new(Vec::new()));
+        let mut conn2 = make_conn(Arc::new(Mutex::new(Vec::new())), sent2.clone());
+        let mut ftpc2 = FtpConn::new();
+        ftpc2.pp.init(timeval::curlx_now());
+        ftpc2.last_response = b"257 \"/pub\" is current directory".to_vec();
+        ftpc2
+            .state_pwd_resp(&mut data, &mut conn2, 257)
+            .await
+            .unwrap();
+        assert_eq!(ftpc2.entrypath.as_deref(), Some("/pub"));
+        assert!(!sent_str(&sent2).contains("SYST"));
+        assert_eq!(ftpc2.state, FtpState::Stop);
+
+        // A non-257 reply ⇒ no entry path recorded, connect phase ends.
+        let mut conn3 = make_conn(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let mut ftpc3 = FtpConn::new();
+        ftpc3.pp.init(timeval::curlx_now());
+        ftpc3.last_response = b"500 not understood".to_vec();
+        ftpc3
+            .state_pwd_resp(&mut data, &mut conn3, 500)
+            .await
+            .unwrap();
+        assert_eq!(ftpc3.entrypath, None);
+        assert_eq!(ftpc3.state, FtpState::Stop);
+    }
 }

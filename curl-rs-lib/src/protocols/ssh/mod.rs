@@ -1992,6 +1992,231 @@ mod tests {
         let data = easy_with_url("sftp://host/etc/motd");
         assert_eq!(get_working_path(&data, &conn, None).unwrap(), "/etc/motd");
     }
+
+    // ---- verify_host_key (≈ `ssh_check_fingerprint` + `ssh_knownhost`) -----
+
+    /// A stable OpenSSH ed25519 public key used as the host-key test vector.
+    const TEST_HOSTKEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDsxsTorEIw/YwmlUSEoKb9n/jJ+t1fwM3Yriwlbv7qa blitzy-test";
+
+    fn test_pubkey() -> ssh_key::PublicKey {
+        let mut key =
+            ssh_key::PublicKey::from_openssh(TEST_HOSTKEY).expect("parse test host key");
+        // A host key presented during the SSH key-exchange carries no comment:
+        // comments are an artifact of the OpenSSH *text* serialization
+        // (authorized_keys / known_hosts lines), not of the binary wire blob.
+        // russh's `known_hosts` round-trip likewise stores/reads keys as base64
+        // key-data only (empty comment), and `ssh_key::PublicKey`'s derived `Eq`
+        // compares the comment. Clearing it here mirrors the runtime key exactly
+        // so the recorded-key equality in `check_known_hosts_path` is faithful.
+        key.set_comment("");
+        key
+    }
+
+    fn hostcfg() -> HostKeyConfig {
+        HostKeyConfig {
+            host: "testhost".to_string(),
+            port: 22,
+            verbose: false,
+            known_hosts: None,
+            expected_md5: None,
+            expected_sha256: None,
+        }
+    }
+
+    #[test]
+    fn verify_host_key_accepts_without_fingerprint_or_known_hosts() {
+        // No explicit fingerprint AND no known_hosts file → C `ssh_knownhost`
+        // returns CURLE_OK (no host verification). Accept.
+        let key = test_pubkey();
+        assert!(verify_host_key(&hostcfg(), &key).is_ok());
+    }
+
+    #[test]
+    fn verify_host_key_sha256_match_and_mismatch() {
+        // The expected fingerprint is derived exactly as the verifier derives it
+        // (sha256 over the wire blob, base64), so a faithful copy must match and
+        // any other value must fail closed.
+        let key = test_pubkey();
+        let blob = key.to_bytes().unwrap();
+        let good = base64_string(&crate::util::sha256::sha256it(&blob)).unwrap();
+        let mut cfg = hostcfg();
+        cfg.expected_sha256 = Some(good);
+        cfg.verbose = true; // also drive the verbose `infof` lines.
+        assert!(verify_host_key(&cfg, &key).is_ok(), "matching SHA256 accepts");
+        cfg.expected_sha256 = Some("AAAAwrongfingerprintvalueAAAA".to_string());
+        assert!(matches!(
+            verify_host_key(&cfg, &key),
+            Err(CurlError::PeerFailedVerification)
+        ));
+    }
+
+    #[test]
+    fn verify_host_key_md5_match_and_mismatch() {
+        let key = test_pubkey();
+        let blob = key.to_bytes().unwrap();
+        let good = to_hex_lower(&crate::util::md5::md5it(&blob));
+        let mut cfg = hostcfg();
+        cfg.expected_md5 = Some(good);
+        assert!(verify_host_key(&cfg, &key).is_ok(), "matching MD5 accepts");
+        cfg.expected_md5 = Some("00112233445566778899aabbccddeeff".to_string());
+        assert!(matches!(
+            verify_host_key(&cfg, &key),
+            Err(CurlError::PeerFailedVerification)
+        ));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real-filesystem integration: writes/reads an on-disk known_hosts file (tempfile `mkdir`), which Miri's isolation mode blocks. The unsafe-free `verify_host_key` logic is otherwise covered by the non-I/O host-key tests under native `cargo test`.
+    fn verify_host_key_known_hosts_recorded_accepts_missing_rejects() {
+        // Record the key with russh's own writer so the on-disk format is exact,
+        // then exercise both the recorded-host (accept) and unrecorded-host
+        // (strict reject) branches of the known_hosts fallback.
+        let key = test_pubkey();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        russh::keys::known_hosts::learn_known_hosts_path("testhost", 22, &key, &path).unwrap();
+        let path_str = path.to_str().unwrap().to_string();
+
+        let mut cfg = hostcfg();
+        cfg.known_hosts = Some(path_str.clone());
+        assert!(
+            verify_host_key(&cfg, &key).is_ok(),
+            "recorded host key accepts"
+        );
+
+        let mut cfg2 = hostcfg();
+        cfg2.host = "otherhost".to_string();
+        cfg2.known_hosts = Some(path_str);
+        assert!(
+            matches!(
+                verify_host_key(&cfg2, &key),
+                Err(CurlError::PeerFailedVerification)
+            ),
+            "unrecorded host fails closed"
+        );
+    }
+
+    // ---- host_key_config / resolve_private_key_path (pure option readers) --
+
+    #[test]
+    fn host_key_config_reads_and_filters_options() {
+        let conn = ssh_conn(&SCHEME_SFTP);
+        let mut e = easy_with_url("sftp://host/file");
+        e.setopt(
+            CurlOption::CURLOPT_SSH_KNOWNHOSTS,
+            OptionValue::Str(Some("/tmp/kh".to_string())),
+        )
+        .unwrap();
+        e.setopt(
+            CurlOption::CURLOPT_SSH_HOST_PUBLIC_KEY_SHA256,
+            OptionValue::Str(Some("abc123".to_string())),
+        )
+        .unwrap();
+        // An empty MD5 string is treated as unset (curl's `!s.is_empty()` filter).
+        e.setopt(
+            CurlOption::CURLOPT_SSH_HOST_PUBLIC_KEY_MD5,
+            OptionValue::Str(Some(String::new())),
+        )
+        .unwrap();
+        let cfg = host_key_config(&e, &conn);
+        assert_eq!(cfg.known_hosts.as_deref(), Some("/tmp/kh"));
+        assert_eq!(cfg.expected_sha256.as_deref(), Some("abc123"));
+        assert_eq!(cfg.expected_md5, None);
+        assert_eq!(cfg.port, conn.remote_port);
+        assert_eq!(cfg.host, conn.remote_host);
+    }
+
+    #[test]
+    fn resolve_private_key_path_prefers_explicit_setopt() {
+        let mut e = easy_with_url("sftp://host/file");
+        e.setopt(
+            CurlOption::CURLOPT_SSH_PRIVATE_KEYFILE,
+            OptionValue::Str(Some("/keys/id_ed25519".to_string())),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_private_key_path(&e),
+            Some("/keys/id_ed25519".to_string())
+        );
+    }
+
+    // ---- error mappers / auth-method extraction (pure) --------------------
+
+    #[test]
+    fn map_ssh_err_collapses_transport_errors_to_ssh() {
+        // C `ssh_libssh2_error_to_CURLE` maps every transport-level libssh2
+        // failure to `CURLE_SSH`; the Rust mapper mirrors that by discarding the
+        // specific `russh::Error` and always returning `CurlError::Ssh`.
+        assert!(matches!(
+            map_ssh_err(russh::Error::Disconnect),
+            CurlError::Ssh
+        ));
+        assert!(matches!(
+            map_ssh_err(russh::Error::NotAuthenticated),
+            CurlError::Ssh
+        ));
+        assert!(matches!(
+            map_ssh_err(russh::Error::CouldNotReadKey),
+            CurlError::Ssh
+        ));
+    }
+
+    #[cfg(feature = "sftp")]
+    #[test]
+    fn map_sftp_err_matches_libssh2_status_table() {
+        use russh_sftp::client::error::Error as SftpError;
+        use russh_sftp::protocol::{Status, StatusCode};
+        fn status(code: StatusCode) -> SftpError {
+            SftpError::Status(Status {
+                id: 0,
+                status_code: code,
+                error_message: String::new(),
+                language_tag: String::new(),
+            })
+        }
+        // NO_SUCH_FILE → REMOTE_FILE_NOT_FOUND (C `libssh2.c` L158-189 table).
+        assert!(matches!(
+            map_sftp_err(status(StatusCode::NoSuchFile)),
+            CurlError::RemoteFileNotFound
+        ));
+        // PERMISSION_DENIED → REMOTE_ACCESS_DENIED.
+        assert!(matches!(
+            map_sftp_err(status(StatusCode::PermissionDenied)),
+            CurlError::RemoteAccessDenied
+        ));
+        // Every other SFTP status collapses to the C `default` arm → SSH.
+        assert!(matches!(
+            map_sftp_err(status(StatusCode::Failure)),
+            CurlError::Ssh
+        ));
+        assert!(matches!(
+            map_sftp_err(status(StatusCode::Eof)),
+            CurlError::Ssh
+        ));
+        // Transport-level (non-`Status`) errors also fall back to SSH.
+        assert!(matches!(map_sftp_err(SftpError::Timeout), CurlError::Ssh));
+        assert!(matches!(
+            map_sftp_err(SftpError::UnexpectedPacket),
+            CurlError::Ssh
+        ));
+    }
+
+    #[test]
+    fn remaining_methods_extracts_server_offered_set() {
+        // On `Success` no methods remain to try; the C auth loop stops.
+        assert_eq!(remaining_methods(AuthResult::Success), MethodSet::empty());
+        // On `Failure` the server's still-offered method set is surfaced verbatim
+        // so the fallback chain can pick the next method.
+        let offered = MethodSet::all();
+        assert_eq!(
+            remaining_methods(AuthResult::Failure {
+                remaining_methods: offered.clone(),
+                partial_success: false,
+            }),
+            offered
+        );
+    }
 }
 
 
