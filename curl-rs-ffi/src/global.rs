@@ -75,6 +75,7 @@ use std::env;
 use std::ffi::{c_char, c_int, c_long, c_uint, c_void, CStr, CString};
 use std::ptr;
 use std::slice;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use libc::{size_t, time_t};
@@ -85,6 +86,97 @@ use crate::types::{
     curl_ssl_backend, curl_sslbackend, curl_strdup_callback, curl_version_info_data, CURLversion,
     CURL,
 };
+
+// =============================================================================
+// Custom memory-allocator hooks (curl_global_init_mem)
+// =============================================================================
+
+/// Address of the caller-supplied `malloc` callback installed via
+/// [`curl_global_init_mem`], or `0` when none is registered.
+///
+/// curl's `curl_global_init_mem` lets an embedder route *all* of libcurl's heap
+/// traffic through its own allocator (e.g. for leak tracking — exactly what
+/// `tests/libtest/lib509.c` does). The Rust safe core owns its memory via Rust's
+/// global allocator and cannot be redirected, but the **C-heap contract**
+/// buffers this crate hands to C callers (the `c_strdup_bytes` family, freed by
+/// [`curl_free`]) are a self-contained allocate-here / free-here domain, so they
+/// *can* honor the custom allocator faithfully. We therefore record the caller's
+/// `malloc`/`free` here and route those two helpers through them.
+///
+/// Stored as the raw function-pointer address (`fn as usize`); `0` is the
+/// "unset" sentinel (a valid function pointer is never null).
+/// `curl_global_init_mem` is documented non-thread-safe and "must be called
+/// before any other curl call", so a `Release` store paired with `Acquire`
+/// loads is sufficient.
+static CUSTOM_MALLOC: AtomicUsize = AtomicUsize::new(0);
+
+/// Address of the caller-supplied `free` callback installed via
+/// [`curl_global_init_mem`], or `0` when none is registered. See
+/// [`CUSTOM_MALLOC`] for the rationale and the memory-ordering contract.
+static CUSTOM_FREE: AtomicUsize = AtomicUsize::new(0);
+
+/// Allocate `size` bytes for the crate-wide C-heap contract, honoring a custom
+/// allocator installed via [`curl_global_init_mem`] when present.
+///
+/// Returns a pointer to at least `size` writable bytes, or NULL on failure. When
+/// a custom `malloc` callback is registered it is used; otherwise the allocation
+/// falls back to `libc::malloc`, so the default behavior (no
+/// `curl_global_init_mem` allocators — every caller except the memory-callback
+/// libtests) is byte-for-byte identical to before.
+#[inline]
+fn c_heap_alloc(size: size_t) -> *mut c_void {
+    let cb = CUSTOM_MALLOC.load(Ordering::Acquire);
+    if cb != 0 {
+        // SAFETY: `cb` is the address of a `curl_malloc_callback` payload
+        // recorded verbatim by `curl_global_init_mem` from a valid
+        // `Some(unsafe extern "C" fn(size_t) -> *mut c_void)`; transmuting the
+        // address back to that signature and calling it with a byte count is the
+        // exact C-ABI call curl performs. The callee returns NULL or a buffer of
+        // at least `size` bytes, matching `libc::malloc`'s contract. (We use
+        // `std::mem::transmute`: this module aliases `curl_rs_lib as core`, which
+        // shadows the standard `core` crate.)
+        unsafe {
+            let f: unsafe extern "C" fn(size_t) -> *mut c_void = std::mem::transmute(cb);
+            f(size)
+        }
+    } else {
+        // SAFETY: `libc::malloc` is always sound to call; it returns NULL or a
+        // pointer to at least `size` writable bytes, handled by the caller.
+        unsafe { libc::malloc(size) }
+    }
+}
+
+/// Free a crate-wide C-heap contract buffer, honoring a custom allocator
+/// installed via [`curl_global_init_mem`] when present.
+///
+/// Mirrors [`c_heap_alloc`]: when a custom `free` callback is registered it is
+/// used, otherwise `libc::free`. Because `curl_global_init_mem` installs the
+/// allocator once before any allocation, every buffer is freed with the same
+/// allocator family that produced it.
+///
+/// # Safety
+///
+/// `ptr` must be non-NULL and previously returned by [`c_heap_alloc`] (the
+/// active allocator does not change after init) and not yet freed.
+#[inline]
+unsafe fn c_heap_free(ptr: *mut c_void) {
+    let cb = CUSTOM_FREE.load(Ordering::Acquire);
+    if cb != 0 {
+        // SAFETY: `cb` is the address of a `curl_free_callback` recorded by
+        // `curl_global_init_mem` (a valid C `void(*)(void*)`); `ptr` was produced
+        // by the matching custom `malloc` (the allocator is fixed for the process
+        // lifetime once installed). Transmute-and-call is the C-ABI free curl
+        // performs. (`std::mem::transmute` — `core` is shadowed in this module.)
+        unsafe {
+            let f: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(cb);
+            f(ptr);
+        }
+    } else {
+        // SAFETY: per the function contract `ptr` was produced by `libc::malloc`
+        // (the default allocator) and is freed exactly once here.
+        unsafe { libc::free(ptr) };
+    }
+}
 
 // =============================================================================
 // Phase 0 — the crate-wide C-heap string contract (libc::malloc / libc::free)
@@ -115,10 +207,12 @@ pub(crate) unsafe fn c_strdup_bytes(bytes: &[u8]) -> *mut c_char {
     // since at least one address is unused), so the `+ 1` is always sound.
     let total = bytes.len() + 1;
 
-    // SAFETY: `total` is a non-zero byte count (`>= 1`). `libc::malloc` either
-    // returns a pointer to at least `total` writable bytes or NULL; we handle
-    // the NULL case immediately below before any write.
-    let raw = unsafe { libc::malloc(total) } as *mut u8;
+    // The crate-wide C-heap allocator: a custom `malloc` installed via
+    // `curl_global_init_mem` when present (faithful to curl's allocator
+    // redirection — see `c_heap_alloc`), else `libc::malloc`. `total >= 1`, and
+    // the allocator returns NULL or a buffer of at least `total` writable bytes;
+    // the NULL case is handled immediately below before any write.
+    let raw = c_heap_alloc(total) as *mut u8;
     if raw.is_null() {
         return ptr::null_mut();
     }
@@ -200,10 +294,11 @@ pub unsafe extern "C" fn curl_free(p: *mut c_void) {
         return;
     }
     // SAFETY: per the `# Safety` contract `p` is non-NULL here and was allocated
-    // by this crate via `libc::malloc` (the `c_strdup_*` / `c_alloc_bytes`
-    // helpers), so freeing it with the matching `libc::free` is sound and frees
-    // the allocation exactly once.
-    unsafe { libc::free(p) };
+    // by this crate via `c_heap_alloc` (the `c_strdup_*` / `c_alloc_bytes`
+    // helpers), so freeing it with the matching `c_heap_free` — the same
+    // allocator family (custom-or-libc), fixed for the process lifetime once
+    // `curl_global_init_mem` runs — is sound and frees the allocation once.
+    unsafe { c_heap_free(p) };
 }
 
 // =============================================================================
@@ -257,31 +352,54 @@ pub extern "C" fn curl_global_init(flags: c_long) -> CURLcode {
 ///
 /// In C, this installs custom `malloc`/`free`/`realloc`/`strdup`/`calloc`
 /// functions so that all of `libcurl`'s allocations route through the caller's
-/// allocator. The Rust rewrite manages its own allocator (the safe core relies
-/// on Rust ownership and `Drop`, and `memdebug.c` is retired per AAP §0.3.2), so
-/// the custom allocators **cannot** be wired into Rust's global allocator on
-/// stable Rust. The callbacks are therefore *accepted but unused*: this function
-/// behaves exactly like `curl_global_init(flags)`, preserving the ABI and return
-/// code. Passing non-NULL callbacks is safe and never crashes.
+/// allocator. The Rust safe core manages its own memory via Rust ownership and
+/// `Drop` and *cannot* be redirected to a foreign allocator on stable Rust
+/// (`memdebug.c` is retired per AAP §0.3.2). However, the buffers this crate
+/// allocates for the **C-heap contract** — the `curl_easy_escape` /
+/// `curl_easy_unescape` / `curl_getenv` / `curl_url_get` outputs that a C caller
+/// releases with [`curl_free`] — form a self-contained allocate-here / free-here
+/// domain. Those *can* honor the custom allocator faithfully, so this function
+/// records the caller's `malloc`/`free` and routes that domain through them (see
+/// [`c_heap_alloc`] / [`c_heap_free`]); the `realloc`/`strdup`/`calloc` hooks are
+/// accepted for ABI completeness. The function otherwise behaves like
+/// `curl_global_init(flags)`, preserving the ABI and return code, and passing
+/// NULL callbacks (the common case) leaves the default `libc` allocator in place
+/// — byte-for-byte identical to before.
 ///
 /// # Safety
 ///
 /// The callback function pointers, if non-NULL, must be valid C function
-/// pointers with the documented `curl_*_callback` signatures. They are not
-/// invoked by this build, so even a dangling pointer cannot be dereferenced
-/// here; the `unsafe` marker exists only to match the C-ABI surface that
-/// historically accepts raw function pointers.
+/// pointers with the documented `curl_*_callback` signatures and must remain
+/// valid for the lifetime of the program (curl requires `curl_global_init_mem`
+/// to run before any other curl call and never reverts it). The recorded
+/// `malloc`/`free` pair is invoked for the crate's C-heap contract buffers, so a
+/// mismatched or transient pointer is undefined behavior — exactly as in C.
 #[no_mangle]
 pub unsafe extern "C" fn curl_global_init_mem(
     flags: c_long,
-    _m: curl_malloc_callback,
-    _f: curl_free_callback,
-    _r: curl_realloc_callback,
-    _s: curl_strdup_callback,
-    _c: curl_calloc_callback,
+    m: curl_malloc_callback,
+    f: curl_free_callback,
+    r: curl_realloc_callback,
+    s: curl_strdup_callback,
+    c: curl_calloc_callback,
 ) -> CURLcode {
-    // The custom allocators are intentionally ignored — memory safety is
-    // provided natively by Rust (AAP §0.3.2). Behave like the plain initializer.
+    // The Rust safe core owns its own memory and cannot be redirected to a
+    // foreign allocator (AAP §0.3.2). However, the crate-wide *C-heap contract*
+    // buffers handed to C callers — produced by `c_strdup_bytes` / `c_alloc_bytes`
+    // and reclaimed by `curl_free` — are a self-contained allocate-here /
+    // free-here domain, so we faithfully route those two helpers through the
+    // caller's `malloc`/`free` (matching curl's allocator redirection for these
+    // buffers; see `lib/easy.c:curl_global_init_mem`). The `realloc`/`strdup`/
+    // `calloc` hooks are accepted for ABI completeness; the crate's C-heap
+    // helpers only ever `malloc`-then-copy and `free`, so only those two are
+    // invoked.
+    //
+    // curl documents this entry point as non-thread-safe and "must be called
+    // before any other curl call", so recording the pointers with a `Release`
+    // store (read via `Acquire` in `c_heap_alloc` / `c_heap_free`) is sufficient.
+    CUSTOM_MALLOC.store(m.map_or(0, |p| p as usize), Ordering::Release);
+    CUSTOM_FREE.store(f.map_or(0, |p| p as usize), Ordering::Release);
+    let _ = (r, s, c);
     // (`c_long` is the same primitive as the core's `i64` on supported targets.)
     result_to_code(core::global_init(flags))
 }

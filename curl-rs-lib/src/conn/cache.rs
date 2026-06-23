@@ -698,6 +698,26 @@ impl ConnectionPool {
         std::mem::take(&mut self.discards)
     }
 
+    /// Remove and return **every** connection currently pooled, emptying all
+    /// per-destination bundles.
+    ///
+    /// Used by the synchronous easy/CLI teardown to drain the pool for a
+    /// graceful protocol goodbye (e.g. FTP `QUIT`) while a live runtime is still
+    /// available — the analog of iterating `cpool->dest2bundle` in C's
+    /// `Curl_cpool_destroy`. Connections already queued for asynchronous
+    /// shutdown (`discards`) are left untouched; callers drain those separately
+    /// via [`take_discards`](Self::take_discards).
+    #[must_use]
+    pub fn take_all(&mut self) -> Vec<Box<dyn PoolConn>> {
+        let mut out = Vec::new();
+        for (_dest, mut bundle) in self.dest2bundle.drain() {
+            while let Some(conn) = bundle.conns.pop_front() {
+                out.push(conn);
+            }
+        }
+        out
+    }
+
     /// The number of connections currently queued for shutdown but not yet
     /// drained (mainly for tests/observability).
     #[must_use]

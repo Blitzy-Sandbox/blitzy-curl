@@ -236,6 +236,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn readiness_helpers_track_socket_state() {
         use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;

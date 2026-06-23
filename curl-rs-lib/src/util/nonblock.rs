@@ -154,6 +154,7 @@ mod tests {
     /// that the toggle reached the underlying socket, not merely that the call
     /// returned `Ok`.
     #[test]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     fn enabling_nonblock_makes_accept_wouldblock() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
 
@@ -171,6 +172,7 @@ mod tests {
     /// Toggling the flag on then off then on again must succeed on every cycle,
     /// exercising both branches of the `nonblock` argument repeatedly.
     #[test]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     fn toggle_on_off_on_succeeds() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
 
@@ -182,6 +184,7 @@ mod tests {
 
     /// The helper accepts a connected `TcpStream`, not just a listener.
     #[test]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     fn works_on_connected_tcp_stream() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let addr = listener.local_addr().expect("local addr");
@@ -201,6 +204,7 @@ mod tests {
     /// any standard socket handle.
     #[cfg_attr(miri, ignore)]
     #[test]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     fn works_on_udp_socket() {
         let sock = UdpSocket::bind("127.0.0.1:0").expect("bind udp");
 

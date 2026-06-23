@@ -1514,10 +1514,32 @@ impl CookieJar {
     ///
     /// Returns [`CurlError::UrlMalformat`] when `url` cannot yield request parts.
     pub fn store_response_url(&mut self, header: &str, url: &CurlUrl, now: i64) -> Result<bool> {
+        self.store_response_url_host(header, url, None, now)
+    }
+
+    /// Stores a `Set-Cookie:` value against `url`, but scopes the cookie's
+    /// default domain to `host_override` when present — used when the request
+    /// carried a custom `Host:` header. curl stores cookies against
+    /// `data->state.aptr.cookiehost` (the `Host:` header's hostname) rather than
+    /// the connection/URL host, so a `Set-Cookie` without an explicit `domain=`
+    /// is scoped to the custom host. Path and secure context still come from
+    /// `url`. With `host_override == None` this is exactly
+    /// [`store_response_url`](Self::store_response_url).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CurlError::UrlMalformat`] when `url` cannot yield request parts.
+    pub fn store_response_url_host(
+        &mut self,
+        header: &str,
+        url: &CurlUrl,
+        host_override: Option<&str>,
+        now: i64,
+    ) -> Result<bool> {
         let parts = url
             .to_request_parts()
             .map_err(|_| CurlError::UrlMalformat)?;
-        let host = strip_host_brackets(&parts.host);
+        let host = strip_host_brackets(host_override.unwrap_or(&parts.host));
         let secure = Self::secure_context(&parts.scheme, host);
         self.add(
             header,
@@ -1681,10 +1703,31 @@ impl CookieJar {
     ///
     /// Returns [`CurlError::UrlMalformat`] when `url` cannot yield request parts.
     pub fn match_for_url(&mut self, url: &CurlUrl, now: i64) -> Result<String> {
+        self.match_for_url_host(url, None, now)
+    }
+
+    /// Builds the `Cookie:` header value for `url`, but scopes the domain match
+    /// to `host_override` when present — used when the request carries a custom
+    /// `Host:` header. curl matches (and stores) cookies against
+    /// `data->state.aptr.cookiehost` — the hostname from the user's `Host:`
+    /// header — rather than the connection/URL host (`lib/http.c`). The path and
+    /// secure context are still derived from `url`; only the host used for the
+    /// domain rule changes. With `host_override == None` this is exactly
+    /// [`match_for_url`](Self::match_for_url).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CurlError::UrlMalformat`] when `url` cannot yield request parts.
+    pub fn match_for_url_host(
+        &mut self,
+        url: &CurlUrl,
+        host_override: Option<&str>,
+        now: i64,
+    ) -> Result<String> {
         let parts = url
             .to_request_parts()
             .map_err(|_| CurlError::UrlMalformat)?;
-        let host = strip_host_brackets(&parts.host);
+        let host = strip_host_brackets(host_override.unwrap_or(&parts.host));
         let secure = Self::secure_context(&parts.scheme, host);
         Ok(self.match_for(host, &parts.path, secure, now))
     }

@@ -264,6 +264,20 @@ impl CurlProxyType {
     pub const fn is_https_proxy(self) -> bool {
         matches!(self, CurlProxyType::Https | CurlProxyType::Https2)
     }
+
+    /// Returns `true` for [`Http10`](CurlProxyType::Http10) (`CURLPROXY_HTTP_1_0`),
+    /// the proxy type set by `--proxy1.0`, which forces the `CONNECT` request to
+    /// be written as `HTTP/1.0` rather than the default `HTTP/1.1`.
+    ///
+    /// Oracle: `lib/cf-h1-proxy.c` `start_CONNECT` (L223) selects the request's
+    /// HTTP minor version with
+    /// `http_minor = (proxytype == CURLPROXY_HTTP_1_0) ? 0 : 1;`. This predicate
+    /// is the Rust analog of that comparison, letting the `CONNECT`-tunnel builder
+    /// pick the matching `http_minor` ([`H1ProxyConfig::with_http_minor`]).
+    #[must_use]
+    pub const fn is_http_1_0(self) -> bool {
+        matches!(self, CurlProxyType::Http10)
+    }
 }
 
 /// Returns `true` when `t` is an HTTPS proxy type (`CURLPROXY_HTTPS` or
@@ -598,9 +612,18 @@ mod gated {
                 return Ok(None);
             }
 
-            // Basic is requested when the mask carries the Basic bit; this also
-            // covers `CURLAUTH_ANY` / `CURLAUTH_ANYSAFE`, which include it.
-            let basic_requested = authmask & crate::auth::CURLAUTH_BASIC != 0;
+            // Preemptive Basic is emitted only when Basic is the SOLE wanted
+            // scheme (`authmask == CURLAUTH_BASIC`), mirroring curl's
+            // `output_auth_headers`, which gates the challenge-free Basic header
+            // on `authstatus->picked == CURLAUTH_BASIC` — and on the first request
+            // `picked == want`. A multi-scheme mask (`--proxy-anyauth`,
+            // `CURLAUTH_BASIC | CURLAUTH_DIGEST | CURLAUTH_NTLM`, or
+            // `CURLAUTH_ANY`) must NOT send a preemptive Basic: curl issues a
+            // credential-less probe and lets the proxy's `407` challenge select
+            // the scheme, which the reactive proxy-auth controller then drives
+            // (test 548). Testing the bit (`& CURLAUTH_BASIC != 0`) would wrongly
+            // emit Basic for every anyauth mask.
+            let basic_requested = authmask == crate::auth::CURLAUTH_BASIC;
             let have_credentials = self.user.is_some() || self.passwd.is_some();
 
             if basic_requested && have_credentials {
@@ -817,6 +840,25 @@ mod tests_abi {
             assert!(!t.is_https_proxy(), "{t:?}");
         }
     }
+
+    /// `is_http_1_0` is true only for `Http10` (`CURLPROXY_HTTP_1_0`, set by
+    /// `--proxy1.0`) — the predicate the `CONNECT` builder uses to pick
+    /// `http_minor = 0` (oracle: `cf-h1-proxy.c` L223).
+    #[test]
+    fn is_http_1_0_matches_only_http10() {
+        assert!(CurlProxyType::Http10.is_http_1_0());
+        for t in [
+            CurlProxyType::Http,
+            CurlProxyType::Https,
+            CurlProxyType::Https2,
+            CurlProxyType::Socks4,
+            CurlProxyType::Socks5,
+            CurlProxyType::Socks4a,
+            CurlProxyType::Socks5Hostname,
+        ] {
+            assert!(!t.is_http_1_0(), "{t:?}");
+        }
+    }
 }
 
 #[cfg(all(test, feature = "proxy"))]
@@ -825,7 +867,7 @@ mod tests {
         default_proxy_port, proxy_for_target, resolve_no_proxy, CurlProxyType, Proxy, ProxyConfig,
         ProxyUse, DEFAULT_HTTPS_PROXY_PORT, DEFAULT_PROXY_PORT, PROXY_TIMEOUT,
     };
-    use crate::auth::{CURLAUTH_BASIC, CURLAUTH_DIGEST};
+    use crate::auth::{CURLAUTH_BASIC, CURLAUTH_DIGEST, CURLAUTH_NTLM};
 
     #[test]
     fn proxy_timeout_is_one_hour_in_ms() {
@@ -979,6 +1021,19 @@ mod tests {
         // Only Digest requested (no Basic bit) ⇒ this hook emits nothing; the
         // challenge/response scheme is driven from the CONNECT exchange.
         assert_eq!(p.proxy_auth(CURLAUTH_DIGEST).unwrap(), None);
+    }
+
+    #[test]
+    fn proxy_auth_multibit_anyauth_mask_returns_none() {
+        // A multi-scheme mask (`--proxy-anyauth` style) must NOT emit a
+        // preemptive Basic even with credentials: curl probes credential-less and
+        // lets the `407` challenge pick the scheme (test 548). Only an exact
+        // `CURLAUTH_BASIC` mask emits the challenge-free Basic line.
+        let p = Proxy::parse("http://testuser:testpass@proxy:3128", CurlProxyType::Http).unwrap();
+        let mask = CURLAUTH_BASIC | CURLAUTH_DIGEST | CURLAUTH_NTLM;
+        assert_eq!(p.proxy_auth(mask).unwrap(), None);
+        // The exact-Basic mask still emits, for the single `--proxy-user` case.
+        assert!(p.proxy_auth(CURLAUTH_BASIC).unwrap().is_some());
     }
 
     #[test]

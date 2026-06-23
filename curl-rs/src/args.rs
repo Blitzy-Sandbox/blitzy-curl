@@ -4617,6 +4617,81 @@ mod parse_tests {
         assert!(body.contains("name=value"), "postdata was {body:?}");
     }
 
+    /// A single URL must yield `num_urls == 1`, never 2. Regression test for the
+    /// `num_urls` double-count that wrongly tripped the "etag options only work
+    /// on a single URL" guard. In curl (`tool_getparam.c`) the shared node
+    /// allocator `new_getout` does not touch `num_urls`; only the URL-add path
+    /// does `++config->num_urls` (L1118). Here `add_url` is the sole counter.
+    #[test]
+    fn single_url_counts_once() {
+        let (g, r) = run(&["http://a/"]);
+        assert_eq!(r, Ok(()));
+        assert_eq!(
+            g.operations[0].num_urls, 1,
+            "a single URL must count exactly once (not double-counted)"
+        );
+        assert_eq!(g.operations[0].url_list.len(), 1);
+    }
+
+    /// `--etag-save FILE <url>` (flag before the URL) on a single URL must be
+    /// accepted: the etag guard sees `num_urls == 0` at flag time, then the URL
+    /// brings `num_urls` to 1 — never to 2. Mirrors curl test 339.
+    #[test]
+    fn etag_save_single_url_flag_first_ok() {
+        let (g, r) = run(&["--etag-save", "/tmp/etag.txt", "http://a/"]);
+        assert_eq!(r, Ok(()), "single-URL --etag-save must be accepted");
+        assert_eq!(g.operations[0].num_urls, 1);
+        assert_eq!(
+            g.operations[0].etag_save_file.as_deref(),
+            Some("/tmp/etag.txt")
+        );
+    }
+
+    /// `<url> --etag-save FILE` (URL before the flag) on a single URL must also
+    /// be accepted: with the double-count bug this path produced `num_urls == 2`
+    /// at flag time and was wrongly rejected with "only work on a single URL".
+    #[test]
+    fn etag_save_single_url_url_first_ok() {
+        let (g, r) = run(&["http://a/", "--etag-save", "/tmp/etag.txt"]);
+        assert_eq!(
+            r,
+            Ok(()),
+            "single-URL --etag-save (URL first) must be accepted"
+        );
+        assert_eq!(g.operations[0].num_urls, 1);
+        assert_eq!(
+            g.operations[0].etag_save_file.as_deref(),
+            Some("/tmp/etag.txt")
+        );
+    }
+
+    /// `--etag-compare FILE <url>` on a single URL must be accepted. Mirrors
+    /// curl tests 341/342.
+    #[test]
+    fn etag_compare_single_url_ok() {
+        let (g, r) = run(&["--etag-compare", "/tmp/etag.txt", "http://a/"]);
+        assert_eq!(r, Ok(()));
+        assert_eq!(g.operations[0].num_urls, 1);
+        assert_eq!(
+            g.operations[0].etag_compare_file.as_deref(),
+            Some("/tmp/etag.txt")
+        );
+    }
+
+    /// The single-URL guard must still fire for genuinely multiple URLs: an etag
+    /// option alongside two URLs in the same operation is a `BadUse`. This
+    /// confirms the fix narrows the count to real URLs without disabling the
+    /// guard.
+    #[test]
+    fn etag_save_two_urls_is_bad_use() {
+        let (_g, r) = run(&["--etag-save", "/tmp/etag.txt", "http://a/", "http://b/"]);
+        assert_eq!(
+            r,
+            Err(ParameterError::BadUse),
+            "etag option with two URLs must be rejected"
+        );
+    }
+
     #[test]
     fn short_cluster_of_booleans_all_apply() {
         // `-sS`: silent + show-error (both global booleans).

@@ -106,6 +106,27 @@ use std::{ptr, slice};
 
 use libc::size_t;
 
+// libc's standard-output `FILE*` (the C stdio `stdout` global). The default
+// (no-`CURLOPT_WRITEFUNCTION`) body-write path emits through this exact stream,
+// so body bytes interleave — in program order — with output from
+// `curl_mprintf`/`curl_mfprintf`, which the C printf trampoline (`csrc/mprintf.c`)
+// routes through the same single C stdio buffer. Rust's `std::io::stdout()` keeps
+// a *separate*, independently-flushed buffer (a `LineWriter`), so mixing the two
+// reorders output across `curl_easy_perform` boundaries (oracle test536, where a
+// libtest prints the response body via libcurl and a status line via
+// `curl_mprintf` after each of two performs). Using the C stream matches C curl's
+// default write (`fwrite(ptr, 1, len, stdout)`). Apple targets name it `__stdoutp`.
+#[cfg(not(target_vendor = "apple"))]
+extern "C" {
+    #[link_name = "stdout"]
+    static C_STDOUT: *mut libc::FILE;
+}
+#[cfg(target_vendor = "apple")]
+extern "C" {
+    #[link_name = "__stdoutp"]
+    static C_STDOUT: *mut libc::FILE;
+}
+
 // Per the crate-wide FFI invariant, the safe async core is reached through the
 // `core` alias. Standard-library primitives are taken from `std::*` above
 // (never `core::*`) because this alias shadows the `core` standard crate within
@@ -281,6 +302,31 @@ pub unsafe extern "C" fn curl_easy_cleanup(handle: *mut CURL) {
     // `ChannelCloseOnDrop` re-enters `tokio::spawn` with no runtime context and
     // panics. Draining here reaps those tasks first. See
     // `crate::drop_and_drain`.
+    //
+    // Issue the deferred FTP `QUIT` for this handle's OWN parked control
+    // connection, when the lone-easy reuse mechanism was enabled (a prior
+    // `curl_easy_perform` called `enable_self_pool_drain`). This drain runs on
+    // the SAME thread-local current-thread runtime that opened the socket — the
+    // FFI easy-perform path builds and reuses one runtime per thread — so the
+    // `QUIT` exchange completes rather than deadlocking. The
+    // `should_drain_own_pool` gate confines this to *self-owned* pools, so a
+    // pool injected by the CLI (which runs its own end-of-run `ftp_drain_pool`
+    // on its runtime; see `Easy::set_conn_pool`) or by a multi handle (which
+    // drains in `curl_multi_cleanup` on the multi's own runtime) is never
+    // drained here — closing the old cross-runtime-deadlock hazard that the
+    // unconditional skip previously avoided (`tests/data/test539`).
+    //
+    // For a single-transfer handle this is wire-identical to inline `QUIT`: the
+    // same `QUIT` is merely issued at cleanup instead of at transfer end. For
+    // two performs on one handle, the first transfer parks the still-valid
+    // control connection and the second reuses it (skipping a fresh
+    // `USER`/`PASS`), with the single `QUIT` fired here. HTTP/keep-alive pools
+    // hold no FTP connection, so the drain just force-closes their sockets,
+    // equivalent to the pool's `Drop` teardown.
+    if easy.should_drain_own_pool() {
+        block_on(easy.drain_own_conn_pool());
+    }
+
     crate::drop_and_drain(easy);
 }
 
@@ -377,13 +423,26 @@ impl core::transfer::WriteCallbacks for CWriteBridge {
     fn write_body(&mut self, data: &[u8]) -> usize {
         let addr = self.write_fn;
         if addr == 0 {
-            // Default `CURLOPT_WRITEFUNCTION`: `fwrite` to stdout. A short write
-            // is reported as `0` taken, which the engine maps to
-            // `CURLE_WRITE_ERROR`.
-            use std::io::Write;
-            return match std::io::stdout().write_all(data) {
-                Ok(()) => data.len(),
-                Err(_) => 0,
+            // Default `CURLOPT_WRITEFUNCTION`: curl's `fwrite` to the C stdio
+            // `stdout` FILE* (`data->set.out` defaults to `stdout`). Emit through
+            // the SAME C stream `curl_mprintf`/`curl_mfprintf` use so the two
+            // interleave in program order, matching C curl exactly; Rust's
+            // `std::io::stdout()` has an independent buffer and would reorder them.
+            // `fwrite` with `(size = 1, nmemb = len)` returns the byte count
+            // actually written; a short write (< len) is propagated as fewer bytes
+            // taken, which the engine maps to `CURLE_WRITE_ERROR` — identical to
+            // the previous `Err(_) => 0` behavior.
+            // SAFETY: `C_STDOUT` is libc's `stdout` global, a valid `FILE*` for the
+            // whole process lifetime. `data` is a valid slice of `data.len()`
+            // bytes; `fwrite` reads exactly that many and does not retain the
+            // pointer. The returned count is a plain `size_t` (== `usize`).
+            return unsafe {
+                libc::fwrite(
+                    data.as_ptr() as *const libc::c_void,
+                    1,
+                    data.len(),
+                    C_STDOUT,
+                )
             };
         }
         // SAFETY: `addr` is a non-zero `curl_write_callback` address previously
@@ -440,14 +499,56 @@ struct CReadBridge {
     read_fn: usize,
     /// `CURLOPT_READDATA` opaque userdata, passed through to the callback.
     read_data: usize,
+    /// `CURLOPT_TRAILERFUNCTION` address, or `0` for no trailing headers.
+    trailer_fn: usize,
+    /// `CURLOPT_TRAILERDATA` opaque userdata, passed through to the trailer
+    /// callback.
+    trailer_data: usize,
+    /// `CURLOPT_IOCTLFUNCTION` (deprecated) address, or `0` if unset — the legacy
+    /// rewind hook invoked with `CURLIOCMD_RESTARTREAD` before a credentialed
+    /// body resend (see [`core::transfer::ReadCallback::rewind`]).
+    ioctl_fn: usize,
+    /// `CURLOPT_IOCTLDATA` opaque userdata, passed through to the ioctl callback.
+    ioctl_data: usize,
+    /// The owning `CURL *` handle, passed as the ioctl callback's first argument
+    /// (`curlioerr (*)(CURL *, int, void *)`). `0` when not available (the
+    /// multi-driven provider path); the `CURLIOCMD_RESTARTREAD` callback ignores
+    /// the handle, so a `0` handle is harmless there.
+    handle: usize,
 }
 
 impl core::transfer::ReadCallback for CReadBridge {
     fn read(&mut self, buf: &mut [u8]) -> usize {
         let addr = self.read_fn;
         if addr == 0 {
-            // Default `CURLOPT_READFUNCTION`: `fread` from stdin; a read error or
-            // EOF yields `0`, signaling end-of-input.
+            // Default `CURLOPT_READFUNCTION` is C's `fread`. curl initializes
+            // `set.fread_func_set = fread` and `set.in_set = stdin`
+            // (lib/easy.c), so the default reader pulls from the
+            // `CURLOPT_READDATA` `FILE*`, falling back to `stdin` when the
+            // consumer set no `READDATA`. When `read_data` names a `FILE*`
+            // (e.g. `tests/libtest/lib505` / `tests/data/test505`, which set
+            // `CURLOPT_READDATA` to an `fopen`ed handle without a custom
+            // `READFUNCTION`), read from that stream with `fread` — reading
+            // from stdin instead would deliver 0 bytes against a known
+            // `CURLOPT_INFILESIZE` and abort the upload with
+            // `CURLE_READ_ERROR`.
+            if self.read_data != 0 {
+                // SAFETY: with the default `fread` read function in effect, the
+                // consumer's `CURLOPT_READDATA` is a C `FILE*` (curl's
+                // documented contract). `fread` fills up to `buf.len()` bytes
+                // (element size 1) and returns the count, short at EOF/error —
+                // exactly the byte count this bridge must return.
+                return unsafe {
+                    libc::fread(
+                        buf.as_mut_ptr() as *mut c_void,
+                        1,
+                        buf.len(),
+                        self.read_data as *mut libc::FILE,
+                    )
+                };
+            }
+            // No `CURLOPT_READDATA`: curl's default stream is stdin. A read
+            // error or EOF yields `0`, signaling end-of-input.
             use std::io::Read;
             return std::io::stdin().read(buf).unwrap_or(0);
         }
@@ -469,6 +570,105 @@ impl core::transfer::ReadCallback for CReadBridge {
                 self.read_data as *mut c_void,
             )
         }
+    }
+
+    /// Bridge `CURLOPT_TRAILERFUNCTION` to the core's chunked-trailer seam.
+    ///
+    /// Invokes the stored C trailer callback once (curl calls it at end-of-body,
+    /// in `add_last_chunk`), collecting the `curl_slist` of `name: value` lines
+    /// it builds. Each node's NUL-terminated payload becomes one trailer line;
+    /// the engine's chunked encoder writes only the correctly-formatted ones
+    /// (those bearing `": "`), exactly as curl's `add_last_chunk` does. The
+    /// callback-owned list is freed here with `curl_slist_free_all`, matching
+    /// curl's ownership contract.
+    fn trailers(&mut self) -> Vec<Vec<u8>> {
+        let addr = self.trailer_fn;
+        if addr == 0 {
+            // No `CURLOPT_TRAILERFUNCTION`: the bare `0\r\n\r\n` last chunk.
+            return Vec::new();
+        }
+        // SAFETY: `addr` is a non-zero `curl_trailer_callback` address previously
+        // stored by `curl_easy_setopt(CURLOPT_TRAILERFUNCTION, ...)`, so its ABI
+        // matches the transmuted signature.
+        let cb: unsafe extern "C" fn(*mut *mut curl_slist, *mut c_void) -> c_int =
+            unsafe { std::mem::transmute(addr) };
+        let mut list: *mut curl_slist = ptr::null_mut();
+        // SAFETY: `&mut list` is a valid `*mut *mut curl_slist` for the callback
+        // to write the (heap, `curl_slist_append`-built) chain into; `trailer_data`
+        // is the caller's `CURLOPT_TRAILERDATA` userdata, passed through verbatim.
+        let rc = unsafe { cb(&mut list, self.trailer_data as *mut c_void) };
+        // `CURL_TRAILERFUNC_OK == 0`. Any other value is `CURL_TRAILERFUNC_ABORT`,
+        // which curl turns into `CURLE_ABORTED_BY_CALLBACK`. The core read seam
+        // has no error channel here, so on abort we free the (possibly partial)
+        // list and emit no trailers; the common OK path is fully honored.
+        if rc != 0 {
+            // SAFETY: `list` is null or a `curl_slist_append` chain; the free
+            // accepts null and releases the whole chain.
+            unsafe { slist::curl_slist_free_all(list) };
+            return Vec::new();
+        }
+        let mut lines: Vec<Vec<u8>> = Vec::new();
+        let mut node = list;
+        while !node.is_null() {
+            // SAFETY: `node` is a valid `curl_slist` node from the callback's
+            // chain; `data` is its owned NUL-terminated string (or null).
+            let data = unsafe { (*node).data };
+            if !data.is_null() {
+                // SAFETY: `data` is a valid NUL-terminated C string owned by the
+                // node; copied into an owned `Vec` before the list is freed.
+                let bytes = unsafe { CStr::from_ptr(data) }.to_bytes().to_vec();
+                lines.push(bytes);
+            }
+            // SAFETY: `node` is valid; `next` is the next node or null.
+            node = unsafe { (*node).next };
+        }
+        // SAFETY: `list` is the callback-built chain (or null) and is no longer
+        // referenced; free it exactly as curl's `add_last_chunk` does.
+        unsafe { slist::curl_slist_free_all(list) };
+        lines
+    }
+
+    /// Bridge the legacy `CURLOPT_IOCTLFUNCTION` rewind hook to the core's
+    /// upload-rewind seam (curl's `cr_in_rewind` ioctl fallback).
+    ///
+    /// Invoked once before a body-bearing request is re-sent on a reactive-auth
+    /// resend. curl's client reader (`cr_in_rewind`, `lib/sendf.c`) repositions a
+    /// `CURLOPT_READFUNCTION` source by calling the application's
+    /// `CURLOPT_IOCTLFUNCTION` with `CURLIOCMD_RESTARTREAD` (the legacy path,
+    /// superseded by `CURLOPT_SEEKFUNCTION` but still honored). The engine buffers
+    /// the read-callback body and re-sends a buffered clone, so this call exists
+    /// only to fire the application callback for its observable side effects
+    /// (matching curl's wire/stdout behavior — QA libtest 552). A `0` ioctl
+    /// address means no callback is registered, so the rewind is a no-op (the
+    /// engine's buffered clone already satisfies the resend); the `CURLIOE_*`
+    /// return is not propagated because the buffered re-send cannot fail to
+    /// rewind.
+    fn rewind(&mut self) {
+        let addr = self.ioctl_fn;
+        if addr == 0 {
+            // No `CURLOPT_IOCTLFUNCTION`: nothing to notify; the engine's
+            // buffered body clone is re-sent unchanged.
+            return;
+        }
+        // `CURLIOCMD_RESTARTREAD == 1` (include/curl/curl.h): "restart the read
+        // stream from start".
+        const CURLIOCMD_RESTARTREAD: c_int = 1;
+        // SAFETY: `addr` is a non-zero `curl_ioctl_callback` address previously
+        // stored by `curl_easy_setopt(CURLOPT_IOCTLFUNCTION, ...)`, so its ABI
+        // (`curlioerr (*)(CURL *, int, void *)`) matches the transmuted signature.
+        let cb: unsafe extern "C" fn(*mut CURL, c_int, *mut c_void) -> c_int =
+            unsafe { std::mem::transmute(addr) };
+        // SAFETY: `self.handle` is the owning `CURL *` (or `0`, which the
+        // `RESTARTREAD` command ignores); `self.ioctl_data` is the caller's
+        // `CURLOPT_IOCTLDATA` userdata, passed through verbatim. The call upholds
+        // the C contract; the `curlioerr` result is intentionally discarded.
+        let _ = unsafe {
+            cb(
+                self.handle as *mut CURL,
+                CURLIOCMD_RESTARTREAD,
+                self.ioctl_data as *mut c_void,
+            )
+        };
     }
 }
 
@@ -500,6 +700,10 @@ pub(crate) struct CBridgeProvider {
     header_data: usize,
     read_fn: usize,
     read_data: usize,
+    trailer_fn: usize,
+    trailer_data: usize,
+    ioctl_fn: usize,
+    ioctl_data: usize,
 }
 
 impl CBridgeProvider {
@@ -514,6 +718,10 @@ impl CBridgeProvider {
             header_data: easy.set.writeheader.0,
             read_fn: easy.set.fread_func_set.0,
             read_data: easy.set.in_set.0,
+            trailer_fn: easy.set.trailer_callback.0,
+            trailer_data: easy.set.trailer_data.0,
+            ioctl_fn: easy.set.ioctl_func.0,
+            ioctl_data: easy.set.ioctl_client.0,
         }
     }
 }
@@ -535,6 +743,14 @@ impl core::transfer::MultiIoProvider for CBridgeProvider {
             Box::new(CReadBridge {
                 read_fn: self.read_fn,
                 read_data: self.read_data,
+                trailer_fn: self.trailer_fn,
+                trailer_data: self.trailer_data,
+                ioctl_fn: self.ioctl_fn,
+                ioctl_data: self.ioctl_data,
+                // The multi-driven provider runs on a separate runtime and does
+                // not carry the owning `CURL *`; the `CURLIOCMD_RESTARTREAD`
+                // callback ignores its handle argument, so `0` is harmless.
+                handle: 0,
             }),
         )
     }
@@ -577,6 +793,26 @@ pub unsafe extern "C" fn curl_easy_perform(handle: *mut CURL) -> CURLcode {
     // the `CURLU` passed to `CURLOPT_CURLU` remains valid until the transfer.
     unsafe { resolve_curlu(easy) };
 
+    // Materialize a borrowed `CURLOPT_POSTFIELDS` body pointer into owned bytes
+    // the safe core can frame (curl reads `data->set.postfields` here, at
+    // transfer time, not at setopt). A NULL/unset pointer or the owned
+    // `CURLOPT_COPYPOSTFIELDS` path is a no-op.
+    // SAFETY: per `curl_easy_perform`'s `# Safety` contract the handle is valid
+    // and exclusively borrowed here, and the caller upholds curl's contract that
+    // the `CURLOPT_POSTFIELDS` buffer remains valid until the transfer.
+    unsafe { resolve_postfields(easy) };
+
+    // Serialize a stored `CURLOPT_HTTPPOST` legacy form chain into an owned
+    // `multipart/form-data` body now, at transfer time (curl reads the
+    // `curl_httppost *` here, in `Curl_getformdata`, not at setopt). A NULL/unset
+    // chain is a no-op; callback (`CURLFORM_STREAM`) parts stream from the
+    // handle's `CURLOPT_READFUNCTION`.
+    // SAFETY: per `curl_easy_perform`'s `# Safety` contract the handle is valid
+    // and exclusively borrowed here, and the caller upholds curl's contract that
+    // the `CURLOPT_HTTPPOST` chain (and the read function for callback parts)
+    // remains valid until the transfer.
+    unsafe { resolve_httppost(easy) };
+
     // Bridge the consumer's registered C callbacks to the core's sink/source so
     // the transfer routes body/header bytes to `CURLOPT_WRITEFUNCTION` /
     // `HEADERFUNCTION` and pulls upload bytes from `CURLOPT_READFUNCTION`. The
@@ -593,7 +829,25 @@ pub unsafe extern "C" fn curl_easy_perform(handle: *mut CURL) -> CURLcode {
     let mut read_source = CReadBridge {
         read_fn: easy.set.fread_func_set.0,
         read_data: easy.set.in_set.0,
+        trailer_fn: easy.set.trailer_callback.0,
+        trailer_data: easy.set.trailer_data.0,
+        ioctl_fn: easy.set.ioctl_func.0,
+        ioctl_data: easy.set.ioctl_client.0,
+        // The owning `CURL *` for the legacy ioctl rewind callback's first
+        // argument (`curlioerr (*)(CURL *, int, void *)`); available here on the
+        // easy path. `easy` reborrows `handle`, so capture the raw address.
+        handle: handle as usize,
     };
+
+    // Opt this lone easy handle into deferred-`QUIT`-via-pool-check-in for its
+    // OWN connection pool, so a second `curl_easy_perform` on the same handle
+    // reuses the still-parked control connection (`tests/data/test539`,
+    // `test541`) instead of opening a fresh one. The single deferred `QUIT` is
+    // issued by `curl_easy_cleanup` via `drain_own_conn_pool`, on this same
+    // thread-local runtime that owns the socket — so it cannot hang. This is
+    // gated to self-owned pools (`should_drain_own_pool`), so a handle whose
+    // pool was injected by the CLI or a multi handle is never drained here.
+    easy.enable_self_pool_drain();
 
     // Drive the async transfer to completion synchronously. `block_on` runs the
     // future on this thread's current-thread runtime; `result_to_code` collapses
@@ -908,6 +1162,79 @@ pub(crate) unsafe fn resolve_curlu(easy: &mut core::Easy) {
     }
 }
 
+/// Resolve a handle's borrowed `CURLOPT_POSTFIELDS` body pointer into owned
+/// bytes the safe core can frame, just before a transfer is driven — the
+/// deferred dereference that mirrors curl reading `data->set.postfields` at
+/// transfer time.
+///
+/// `curl_easy_setopt(CURLOPT_POSTFIELDS, ptr)` stores `ptr` verbatim in
+/// `easy.set.postfields` *without copying* — the caller must keep the buffer
+/// alive until the transfer (matching `lib/setopt.c`) — and clears the owned
+/// `easy.set.copypostfields`. The safe core (`#![forbid(unsafe_code)]`) cannot
+/// dereference a raw pointer, so this function deposits an owned copy into
+/// `easy.set.copypostfields` (the single in-memory POST body the transfer
+/// engine reads), applying curl's `POSTFIELDSIZE`-vs-`strlen` length rule — the
+/// very rule the owned `CURLOPT_COPYPOSTFIELDS` path uses.
+///
+/// `CURLOPT_COPYPOSTFIELDS` already populates `copypostfields` at setopt time
+/// and leaves `postfields` NULL, so this is a no-op for it. A NULL/unset
+/// `postfields` (for example a read-callback POST that set
+/// `CURLOPT_POSTFIELDS, NULL`) is likewise left untouched, preserving the
+/// read-callback upload path. Re-resolving on every perform mirrors curl's
+/// read-at-perform behaviour: a caller that mutates the pointed-to body between
+/// performs sees the change reflected.
+///
+/// # Safety
+///
+/// If `easy.set.postfields` is non-NULL it must point to a live body of at
+/// least `easy.set.postfieldsize` bytes (or a NUL-terminated C string when
+/// `postfieldsize < 0`) that stays valid for this call — curl's contract that
+/// the `CURLOPT_POSTFIELDS` buffer remains valid until the transfer is
+/// performed. `easy` must be a unique borrow (curl's single-thread-per-handle
+/// contract), so writing `easy.set.copypostfields` is sound.
+pub(crate) unsafe fn resolve_postfields(easy: &mut core::Easy) {
+    if let Some(ptr) = easy.set.postfields {
+        if ptr.0 != 0 {
+            // SAFETY: per this function's contract `ptr.0` points to a live body
+            // honoring the `POSTFIELDSIZE`-vs-`strlen` length rule; the shared
+            // `copy_postfields` applies that exact rule and copies the bytes.
+            easy.set.copypostfields = unsafe { copy_postfields(ptr.0, easy.set.postfieldsize) };
+        }
+    }
+}
+
+/// Materialize a stored `CURLOPT_HTTPPOST` legacy form chain into an owned
+/// `multipart/form-data` body the safe core can frame — the deferred-dereference
+/// analog of [`resolve_postfields`] for the legacy `curl_formadd` form API. curl
+/// reads the `curl_httppost *` here, at transfer time (its `Curl_getformdata`
+/// runs as the request is set up), not at setopt, so this is the perform-time
+/// dereference of the address `setopt` stored opaquely. The chain-walk and
+/// `multipart/form-data` serialization live in
+/// [`crate::mime::httppost_chain_to_body`] (which owns the `curl_httppost`
+/// imports and the read-callback bridge); `CURL_HTTPPOST_CALLBACK`
+/// (`CURLFORM_STREAM`) parts are streamed from the handle's
+/// `CURLOPT_READFUNCTION`. The produced body and its boundary-bearing
+/// `Content-Type` are handed to the core via `set_mime_body`, exactly as the CLI
+/// `-F` path does, so the request is byte-for-byte curl's. A NULL/unset chain
+/// (`httppost.0 == 0`) makes the helper return `None` and is a no-op.
+///
+/// # Safety
+///
+/// Per `curl_easy_perform`'s contract the handle is valid and exclusively
+/// borrowed here, and the caller upholds curl's contract that the
+/// `curl_httppost` chain passed to `CURLOPT_HTTPPOST` (and the read function and
+/// its per-part `userp` for any callback parts) remains valid until the transfer.
+pub(crate) unsafe fn resolve_httppost(easy: &mut core::Easy) {
+    // SAFETY: the stored chain and read-function addresses are valid per this
+    // function's contract; the mime helper walks the chain (a no-op for a 0
+    // address) and drives any callback parts through the read function.
+    if let Some((body, content_type)) = unsafe {
+        crate::mime::httppost_chain_to_body(easy.set.httppost.0, easy.set.fread_func_set.0)
+    } {
+        easy.set_mime_body(body, content_type);
+    }
+}
+
 /// Apply curl's `CURLOPT_COPYPOSTFIELDS` length rule and copy the body bytes
 /// (NULL → `None`). With `postfieldsize < 0` the data is a NUL-terminated string
 /// (length via the C string's length); otherwise exactly `postfieldsize` bytes
@@ -1139,8 +1466,9 @@ pub unsafe extern "C" fn curl_easy_recv(
         unsafe { slice::from_raw_parts_mut(buffer as *mut u8, buflen) }
     };
 
-    // Run the (synchronous) core recv inside the runtime bridge.
-    match block_on(async move { easy.recv(dst) }) {
+    // Drive the core's async raw recv inside the runtime bridge (mirrors
+    // `curl_ws_recv`); `block_on` honors curl's synchronous `curl_easy_recv`.
+    match block_on(async move { easy.recv(dst).await }) {
         Ok(received) => {
             if !n.is_null() {
                 // SAFETY: per the contract `n` is a valid `size_t*` when non-null.
@@ -1203,7 +1531,7 @@ pub unsafe extern "C" fn curl_easy_send(
     };
 
     // Run the (synchronous) core send inside the runtime bridge.
-    match block_on(async move { easy.send(src) }) {
+    match block_on(async move { easy.send(src).await }) {
         Ok(sent) => {
             if !n.is_null() {
                 // SAFETY: per the contract `n` is a valid `size_t*` when non-null.

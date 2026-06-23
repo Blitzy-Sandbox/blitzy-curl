@@ -201,6 +201,16 @@ pub const CF_QUERY_SSL_CTX_INFO: i32 = 13;
 pub const CF_QUERY_TRANSPORT: i32 = 14;
 /// The ALPN protocol the server selected, if any.
 pub const CF_QUERY_ALPN_NEGOTIATED: i32 = 15;
+/// The peer (server) certificate chain in DER form, leaf first.
+///
+/// Not a `CF_QUERY_*` code in the C oracle (curl's TLS backends push certinfo
+/// directly into `data->info` during the handshake via
+/// `Curl_ssl_push_certinfo_len`). The memory-safe core instead retains the DER
+/// chain on the `rustls` filter and exposes it through this internal query,
+/// which the HTTP engine pulls post-connect to populate `CURLINFO_CERTINFO`
+/// (`%{certs}` / `%{num_certs}`). Internal-only: it is not an exported
+/// `curl_*` symbol and so does not affect the libcurl ABI surface.
+pub const CF_QUERY_PEER_CERTS: i32 = 16;
 
 /// Strongly-typed connection-filter query selector (the Rust face of the
 /// `CF_QUERY_*` integers).
@@ -244,6 +254,8 @@ pub enum CfQuery {
     Transport = CF_QUERY_TRANSPORT,
     /// `CF_QUERY_ALPN_NEGOTIATED`.
     AlpnNegotiated = CF_QUERY_ALPN_NEGOTIATED,
+    /// `CF_QUERY_PEER_CERTS`.
+    PeerCerts = CF_QUERY_PEER_CERTS,
 }
 
 impl CfQuery {
@@ -273,6 +285,7 @@ impl CfQuery {
             CF_QUERY_SSL_CTX_INFO => Some(Self::SslCtxInfo),
             CF_QUERY_TRANSPORT => Some(Self::Transport),
             CF_QUERY_ALPN_NEGOTIATED => Some(Self::AlpnNegotiated),
+            CF_QUERY_PEER_CERTS => Some(Self::PeerCerts),
             _ => None,
         }
     }
@@ -365,6 +378,10 @@ pub enum CfQueryResult {
     /// The ALPN protocol the server selected, or `None`
     /// (`CF_QUERY_ALPN_NEGOTIATED`).
     AlpnNegotiated(Option<Vec<u8>>),
+    /// The peer certificate chain in DER form, leaf first; empty when the
+    /// connection is not TLS or no chain was captured (`CF_QUERY_PEER_CERTS`).
+    /// Backs `CURLINFO_CERTINFO` (`%{certs}` / `%{num_certs}`).
+    PeerCerts(Vec<Vec<u8>>),
 }
 
 // =============================================================================
@@ -660,6 +677,55 @@ pub trait ConnectionFilter: Send {
         match self.cf_state().next.as_ref() {
             Some(next) => next.query(query),
             None => Err(CurlError::UnknownOption),
+        }
+    }
+
+    /// Return the HTTP/1.x CONNECT-tunnel response header lines captured by a
+    /// CONNECT filter ([`crate::conn::h1_proxy::CfH1Proxy`]) in this chain —
+    /// the proxy's status line, each response header, and the terminating blank
+    /// line, every line retaining its original CRLF — or `None` when no CONNECT
+    /// filter is present.
+    ///
+    /// curl emits these lines to the client as it parses them, tagged
+    /// `CLIENTWRITE_HEADER | CLIENTWRITE_CONNECT` (`cf-h1-proxy.c` `single_header`
+    /// → `Curl_client_write` → `cw_download_write`). For a `--proxytunnel`
+    /// transfer to a plain-HTTP origin `cw_download_write` forwards those header
+    /// bytes onto the body writer, so they surface on the data stream ahead of
+    /// the tunneled response (oracle: tests/data/test80/83/95). This accessor
+    /// lets the transfer engine read them back out of the chain after the
+    /// tunnel is established.
+    ///
+    /// The default delegates to the next (lower) filter — the same transparent
+    /// pass-through every non-CONNECT filter exhibits once the tunnel is up; the
+    /// CONNECT filter overrides it to return its captured lines.
+    fn connect_response_headers(&self) -> Option<Vec<Vec<u8>>> {
+        match self.cf_state().next.as_ref() {
+            Some(next) => next.connect_response_headers(),
+            None => None,
+        }
+    }
+
+    /// The HTTP status code of the proxy's `CONNECT` response, if a CONNECT
+    /// filter is present in (or below) this filter (C: `data->info.httpproxycode`,
+    /// surfaced as `CURLINFO_HTTP_CONNECTCODE` / the `%{http_connect}` write-out
+    /// variable). `0` means no CONNECT status line was parsed (no tunnel, or the
+    /// status line never arrived).
+    ///
+    /// curl records `info.httpproxycode` the moment the CONNECT status line is
+    /// parsed, so this is valid whether the tunnel ultimately succeeded (2xx) or
+    /// failed (e.g. a 405/407 with no auth to satisfy it). The transfer engine
+    /// reads it after driving the connect — on both the success and the failure
+    /// path — so `%{http_connect}` reports the real code even when the tunnel
+    /// failed (oracle: tests/data/test217 — a 405 CONNECT yields `%{http_connect}`
+    /// == 405 while the transfer fails with `CURLE_RECV_ERROR`).
+    ///
+    /// The default delegates to the next (lower) filter — every non-CONNECT
+    /// filter is transparent here; the CONNECT filter overrides it to return its
+    /// parsed status code.
+    fn connect_proxy_code(&self) -> Option<i32> {
+        match self.cf_state().next.as_ref() {
+            Some(next) => next.connect_proxy_code(),
+            None => None,
         }
     }
 
@@ -1266,6 +1332,30 @@ impl FilterChain {
         }
     }
 
+    /// The HTTP/1.x CONNECT-tunnel response header lines captured by a CONNECT
+    /// filter in this chain (see
+    /// [`ConnectionFilter::connect_response_headers`]), or `None` if the chain
+    /// has no CONNECT filter. The head answers or delegates down the chain.
+    #[must_use]
+    pub fn connect_response_headers(&self) -> Option<Vec<Vec<u8>>> {
+        match self.head.as_deref() {
+            Some(head) => head.connect_response_headers(),
+            None => None,
+        }
+    }
+
+    /// The HTTP status code of the proxy's `CONNECT` response captured by a
+    /// CONNECT filter in this chain (see
+    /// [`ConnectionFilter::connect_proxy_code`]), or `None` if the chain has no
+    /// CONNECT filter. Backs `CURLINFO_HTTP_CONNECTCODE` / `%{http_connect}`.
+    #[must_use]
+    pub fn connect_proxy_code(&self) -> Option<i32> {
+        match self.head.as_deref() {
+            Some(head) => head.connect_proxy_code(),
+            None => None,
+        }
+    }
+
     /// The chain's socket descriptor (`CF_QUERY_SOCKET`); `-1` if unavailable.
     #[must_use]
     pub fn get_socket(&self) -> i64 {
@@ -1299,6 +1389,16 @@ impl FilterChain {
         match self.query(CfQuery::AlpnNegotiated) {
             Ok(CfQueryResult::AlpnNegotiated(alpn)) => alpn,
             _ => None,
+        }
+    }
+
+    /// The peer certificate chain in DER form (`CF_QUERY_PEER_CERTS`), leaf
+    /// first; empty when the connection is not TLS or no chain was captured.
+    #[must_use]
+    pub fn get_peer_certs(&self) -> Vec<Vec<u8>> {
+        match self.query(CfQuery::PeerCerts) {
+            Ok(CfQueryResult::PeerCerts(certs)) => certs,
+            _ => Vec::new(),
         }
     }
 

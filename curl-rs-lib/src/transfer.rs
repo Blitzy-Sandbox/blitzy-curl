@@ -321,6 +321,18 @@ pub trait WriteCallbacks: Send {
     /// redirection. The default *discards* the bytes (no diagnostic stream
     /// configured), matching the behavior of a sink with no error destination.
     fn write_diag(&mut self, _bytes: &[u8]) {}
+
+    /// Whether the response body is being read but ignored — curl's
+    /// `data->req.ignorebody`. The download-side limits that curl confines to
+    /// delivered bodies (notably `CURLOPT_MAXFILESIZE` in `cw_download_write`,
+    /// gated on `!data->req.ignorebody`) are skipped while this is `true`, so an
+    /// intermediate redirect or auth-probe body that the engine discards never
+    /// trips the file-size cap (oracle: tests/data/test477 — a redirect body
+    /// larger than `--max-filesize` is followed, not failed). The default sink
+    /// always delivers its body, so this is `false`.
+    fn ignorebody(&self) -> bool {
+        false
+    }
 }
 
 /// The kind of a [`WriteCallbacks::debug`] trace event — the core's mirror of
@@ -930,6 +942,42 @@ pub trait ReadCallback: Send {
     /// `buf.len()` is a fault and fails the transfer with
     /// [`CurlError::ReadError`] ("read function returned funny value").
     fn read(&mut self, buf: &mut [u8]) -> usize;
+
+    /// The chunked-transfer **trailing headers** to emit after the final `0`
+    /// chunk, each as a complete `name: value` line (no CRLF), or an empty `Vec`
+    /// for no trailers.
+    ///
+    /// Mirrors curl's `CURLOPT_TRAILERFUNCTION`: the callback is invoked once,
+    /// at end-of-body, to supply the trailer set for a chunked upload (see
+    /// `lib/http_chunks.c` / `Curl_http_compile_trailers`). The default returns
+    /// no trailers, so only an upload source that bridges a real
+    /// `CURLOPT_TRAILERFUNCTION` (the FFI read bridge) overrides it; every other
+    /// source (the CLI, tests, the default stdin reader) inherits the empty set.
+    /// The engine calls this only after the body is fully read and only for a
+    /// chunked upload — the lone framing that can carry trailers.
+    fn trailers(&mut self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
+    /// Rewind the upload source to its beginning before the body is re-sent on a
+    /// reactive-auth resend (curl's `Curl_creader_rewind` / `cr_in_rewind`).
+    ///
+    /// When a `401`/`407` challenge forces a body-bearing request to be re-issued
+    /// with credentials, curl rewinds the client reader before reading the body
+    /// again — for a `CURLOPT_READFUNCTION` source that means invoking the
+    /// application's `CURLOPT_SEEKFUNCTION` or, failing that, the legacy
+    /// `CURLOPT_IOCTLFUNCTION` with `CURLIOCMD_RESTARTREAD` (see `lib/http.c`
+    /// `http_perhapsrewind` → `Curl_creader_set_rewind`). The engine buffers the
+    /// read-callback body up front (`build_request_body`) and re-sends a buffered
+    /// clone, so the rewind is a no-op for the engine's own bytes; this hook
+    /// exists purely so the registered application rewind callback still fires
+    /// exactly once before the credentialed resend, reproducing curl's observable
+    /// behavior (the legacy ioctl/seek notification — QA libtest 552).
+    ///
+    /// The default is a no-op: only an upload source that bridges a real
+    /// `CURLOPT_IOCTLFUNCTION`/`SEEKFUNCTION` (the FFI read bridge) overrides it;
+    /// every other source (the CLI, tests, the default stdin reader) inherits it.
+    fn rewind(&mut self) {}
 }
 
 /// Builds the per-transfer write sink and read source for a transfer that the
@@ -1583,6 +1631,11 @@ pub struct TransferLimits {
     /// `CURLOPT_LOW_SPEED_TIME` in seconds — how long the rate may stay below
     /// `low_speed_limit` before the transfer is aborted.
     pub low_speed_time: u32,
+    /// `CURLOPT_MAXFILESIZE[_LARGE]` (`--max-filesize`) in bytes; `0` disables
+    /// the cap. The download body write is truncated to the remaining allowance
+    /// and the transfer fails with `CURLE_FILESIZE_EXCEEDED` once the cap would
+    /// be exceeded (curl's `cw_download_write` in `lib/sendf.c`).
+    pub max_filesize: i64,
 }
 
 /// Time remaining until `deadline` (`Curl_timeleft`). `None` ⇒ no deadline;
@@ -2258,6 +2311,28 @@ pub async fn drive_transfer<P: ProtocolExchange>(
                 }
             }
             ResponseEvent::Body(chunk) => {
+                // CURLOPT_MAXFILESIZE (`--max-filesize`): mirror curl's
+                // `cw_download_write` (lib/sendf.c). Cap the body write to the
+                // remaining allowance (`max_filesize - bytecount`); if the chunk
+                // overflows the cap, write only the permitted prefix and then
+                // fail with `CURLE_FILESIZE_EXCEEDED`. The accounting uses the
+                // de-framed body bytecount (after de-chunk, before content-decode)
+                // — curl's `CURL_CW_PROTOCOL` writer position, so an unknown-length
+                // (chunked) response is capped mid-stream exactly as curl does.
+                // (Oracle: tests/data/test457.)
+                let mut chunk = chunk;
+                let mut size_exceeded = false;
+                // Gate on `!ignorebody`, exactly as curl's `cw_download_write`:
+                // an intermediate redirect / auth-probe body the engine discards
+                // is never subject to the cap (oracle: test477).
+                if limits.max_filesize > 0 && !write_cb.ignorebody() {
+                    let wmax =
+                        (limits.max_filesize - request.bytecount as i64).max(0) as usize;
+                    if chunk.len() > wmax {
+                        chunk.truncate(wmax);
+                        size_exceeded = true;
+                    }
+                }
                 request.bytecount += chunk.len() as u64;
                 progress.set_download_counter(request.bytecount as i64);
                 // CURLINFO_DATA_IN: while verbose, report received body bytes to
@@ -2269,6 +2344,14 @@ pub async fn drive_transfer<P: ProtocolExchange>(
                     write_cb.debug(DebugInfoType::DataIn, &chunk);
                 }
                 writer.write(ClientWriteType::BODY, &chunk, write_cb)?;
+                if size_exceeded {
+                    // curl's exact `failf` text from `cw_download_write`.
+                    errbuf.failf(format_args!(
+                        "Exceeded the maximum allowed file size ({}) with {} bytes",
+                        limits.max_filesize, request.bytecount
+                    ));
+                    return Err(CurlError::FilesizeExceeded);
+                }
 
                 // Advance the progress accounting and enforce the low-speed
                 // abort (Curl_pgrsUpdate + Curl_pgrsCheck). `show` is curl's
@@ -2659,6 +2742,10 @@ mod tests {
         header_sink: bool,
         /// 1-based header-call indices that return [`CURL_WRITEFUNC_PAUSE`].
         pause_header_calls: Vec<usize>,
+        /// `true` ⇒ [`WriteCallbacks::ignorebody`] reports the body is ignored
+        /// (curl's `data->req.ignorebody`), used to assert the `--max-filesize`
+        /// cap is suppressed for discarded redirect/auth-probe bodies.
+        ignore_body: bool,
     }
 
     impl CollectCb {
@@ -2674,6 +2761,7 @@ mod tests {
                 short_on_body_call: None,
                 header_sink: true,
                 pause_header_calls: Vec::new(),
+                ignore_body: false,
             }
         }
     }
@@ -2707,6 +2795,10 @@ mod tests {
             }
             self.headers.extend_from_slice(data);
             Some(data.len())
+        }
+
+        fn ignorebody(&self) -> bool {
+            self.ignore_body
         }
     }
 
@@ -4081,6 +4173,87 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, CurlError::AbortedByCallback);
+    }
+
+    #[tokio::test]
+    async fn drive_max_filesize_truncates_body_and_fails() {
+        // `CURLOPT_MAXFILESIZE`: a body that overruns the cap is written up to
+        // the remaining allowance, then the transfer fails with
+        // CURLE_FILESIZE_EXCEEDED — curl's `cw_download_write` (oracle: test457,
+        // a chunked/unknown-length body capped mid-stream).
+        let mut exchange = MockExchange::new(vec![
+            ResponseEvent::Status(200),
+            ResponseEvent::HeadersComplete {
+                content_length: None,
+                content_encoding: None,
+            },
+            // Two 4-byte chunks; the cap is 5, so the first is delivered whole
+            // and the second is truncated to a single byte before failing.
+            ResponseEvent::Body(b"aaaa".to_vec()),
+            ResponseEvent::Body(b"bbbb".to_vec()),
+            ResponseEvent::End,
+        ]);
+        let mut request = Request::new();
+        let mut progress = Progress::new(Instant::now());
+        let mut writer = ClientWriter::new();
+        let mut cb = CollectCb::new();
+        let limits = TransferLimits {
+            max_filesize: 5,
+            ..TransferLimits::default()
+        };
+        let mut errbuf = ErrorBuffer::new();
+        let parts = TransferParts {
+            exchange: &mut exchange,
+            request: &mut request,
+            progress: &mut progress,
+            writer: &mut writer,
+            write_cb: &mut cb,
+            limits: &limits,
+            errbuf: &mut errbuf,
+        };
+        let err = drive_transfer(parts, None, None, None).await.unwrap_err();
+        assert_eq!(err, CurlError::FilesizeExceeded);
+        // Exactly `max_filesize` bytes were delivered (4 + truncated 1).
+        assert_eq!(cb.body, b"aaaab");
+        assert_eq!(request.bytecount, 5);
+    }
+
+    #[tokio::test]
+    async fn drive_max_filesize_skipped_when_ignorebody() {
+        // A body the sink reports as ignored (curl's `ignorebody`, e.g. a
+        // followed-redirect body) is never subject to the cap, so an
+        // over-cap body completes without error (oracle: test477).
+        let mut exchange = MockExchange::new(vec![
+            ResponseEvent::Status(301),
+            ResponseEvent::HeadersComplete {
+                content_length: None,
+                content_encoding: None,
+            },
+            ResponseEvent::Body(b"aaaaaaaaaaaaaaaaaaaa".to_vec()), // 20 bytes >> cap 5
+            ResponseEvent::End,
+        ]);
+        let mut request = Request::new();
+        let mut progress = Progress::new(Instant::now());
+        let mut writer = ClientWriter::new();
+        let mut cb = CollectCb::new();
+        cb.ignore_body = true;
+        let limits = TransferLimits {
+            max_filesize: 5,
+            ..TransferLimits::default()
+        };
+        let mut errbuf = ErrorBuffer::new();
+        let parts = TransferParts {
+            exchange: &mut exchange,
+            request: &mut request,
+            progress: &mut progress,
+            writer: &mut writer,
+            write_cb: &mut cb,
+            limits: &limits,
+            errbuf: &mut errbuf,
+        };
+        // No error: the ignored body bypasses the file-size cap entirely.
+        drive_transfer(parts, None, None, None).await.unwrap();
+        assert_eq!(request.bytecount, 20);
     }
 
     #[tokio::test]

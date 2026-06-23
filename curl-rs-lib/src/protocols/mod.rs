@@ -1368,11 +1368,52 @@ pub(crate) async fn connect_network_scheme(
 
     let ipver = IpVersion::from_raw(i64::from(data.set.ipver));
 
-    // (3) Resolve the endpoint's addresses (system resolver).
+    // (2b) Proxy selection (curl's `create_conn` → `detect_proxy`/`parse_proxy`).
+    //      When an HTTP(S) proxy is configured and `--proxytunnel`/`-p` is set
+    //      (or the scheme is implicitly TLS), curl routes a NON-HTTP-family
+    //      protocol to its origin through a `CONNECT` tunnel: `lib/url.c`
+    //      L2380-2391 forces `conn->bits.tunnel_proxy = TRUE` (and
+    //      `bits.httpproxy = TRUE`) for such a scheme behind an HTTP proxy, and
+    //      the protocol-independent `Curl_conn_setup` (`lib/connect.c` L384-401)
+    //      then inserts the http-proxy CONNECT filter. This shared connector is
+    //      the analog of that protocol-independent path for the line/command
+    //      protocols (SMTP, IMAP, POP3, gopher, dict, telnet, …); it must insert
+    //      the SAME `h1_proxy` CONNECT filter the HTTP hop uses so that, e.g., a
+    //      proxy that refuses the tunnel with a non-2xx reply surfaces as
+    //      `CURLE_RECV_ERROR` (56) rather than a direct-dial connect/resolve
+    //      failure (test445 "Refuse tunneling protocols through HTTP proxy",
+    //      whose last URL `smtp://send` — and thus the process exit code —
+    //      flows through here). Without a proxy (the common case) this is inert:
+    //      `hop_proxy` is `None`, the origin is dialed directly, and the wire is
+    //      byte-for-byte identical to before. A SOCKS proxy is not handled here
+    //      (it dials the origin transparently and is not a CONNECT tunnel); only
+    //      the HTTP(S)-proxy tunnel changes the dial target.
+    #[cfg(all(feature = "proxy", feature = "http"))]
+    let hop_proxy: Option<crate::proxy::Proxy> = {
+        let proxy_cfg = crate::protocols::http::proxy_engine::config(data, scheme.name)?;
+        crate::proxy::proxy_for_target(&proxy_cfg, &host).cloned()
+    };
+    #[cfg(not(all(feature = "proxy", feature = "http")))]
+    let hop_proxy: Option<crate::proxy::Proxy> = None;
+
+    let use_http_tunnel = hop_proxy
+        .as_ref()
+        .is_some_and(|px| !px.is_socks() && (scheme.is_ssl() || data.set.tunnel_thru_httpproxy));
+
+    // The dialed endpoint: the PROXY host:port when tunneling (the origin is
+    // reached via `CONNECT`), else the origin itself. The recorded remote
+    // (`conn.set_remote`, below) stays the origin in both cases, matching curl —
+    // `conn->host` is the origin even for a proxied connection.
+    let (dial_host, dial_port) = match (use_http_tunnel, hop_proxy.as_ref()) {
+        (true, Some(px)) => (px.host.clone(), px.port),
+        _ => (host.clone(), port),
+    };
+
+    // (3) Resolve the dialed endpoint's addresses (system resolver).
     let addrs = {
         let mut cache = DnsCache::new();
         let mut errbuf: Option<String> = None;
-        let mut params = ResolveParams::new(&host, port);
+        let mut params = ResolveParams::new(&dial_host, dial_port);
         params.ip_version = ipver;
         params.verbose = verbose;
         let entry = dns::resolve(&mut cache, &params, &mut errbuf).await?;
@@ -1382,6 +1423,8 @@ pub(crate) async fn connect_network_scheme(
     // (4) Build the connection + its filter chain. A `PROTOPT_SSL` scheme
     //     installs the implicit-TLS filter now; a plain scheme stays a bare TCP
     //     chain (any STARTTLS-style upgrade is the handler's job mid-session).
+    //     When tunneling, the http-proxy CONNECT filter sits beneath any target
+    //     TLS — the tunnel is opened first, then the origin TLS rides on top.
     let desc = SchemeDescriptor::new(scheme.name, scheme.default_port, scheme.flags, scheme.protocol);
     let mut conn = Connection::new(format!("{host}:{port}"), TRNSPRT_TCP, desc).with_verbose(verbose);
     conn.set_remote(host.clone(), port);
@@ -1397,25 +1440,70 @@ pub(crate) async fn connect_network_scheme(
     // avoid pulling a connection-pool trait into the protocols layer.)
     conn.connection_id = 0;
 
-    let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, data.set.connecttimeout, addrs);
-    let (ssl_mode, dispatch) = if scheme.is_ssl() {
-        // These line/command protocols negotiate no ALPN; offer none.
+    // The origin's implicit-TLS factory (a `PROTOPT_SSL` scheme: smtps / imaps /
+    // pop3s / gophers / …). Built once and applied whether the origin is dialed
+    // directly or reached over a CONNECT tunnel. These line/command protocols
+    // negotiate no ALPN; offer none.
+    let target_ssl = if scheme.is_ssl() {
         let tls = tls_config_from_easy(data);
         let pinned = data
             .set
             .str(crate::setopt::StrId::SslPinnedPublicKey)
             .map(String::from);
-        let ssl = tls_factory(tls, host.clone(), port, pinned, Vec::new());
-        (
-            CURL_CF_SSL_ENABLE,
-            ConnSetup::Default(SetupConfig::new(CURL_CF_SSL_ENABLE, true, eyeballs).with_ssl(ssl)),
-        )
+        Some(tls_factory(tls, host.clone(), port, pinned, Vec::new()))
     } else {
-        (
-            CURL_CF_SSL_DISABLE,
-            ConnSetup::Default(SetupConfig::new(CURL_CF_SSL_DISABLE, false, eyeballs)),
-        )
+        None
     };
+    let ssl_mode = if scheme.is_ssl() {
+        CURL_CF_SSL_ENABLE
+    } else {
+        CURL_CF_SSL_DISABLE
+    };
+
+    let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, data.set.connecttimeout, addrs);
+    let mut setup = SetupConfig::new(ssl_mode, scheme.is_ssl(), eyeballs);
+
+    #[cfg(all(feature = "proxy", feature = "http"))]
+    if use_http_tunnel {
+        if let Some(px) = hop_proxy.as_ref() {
+            use crate::conn::connect::h1_proxy_factory;
+            use crate::conn::h1_proxy::{H1ProxyConfig, ProxyConnectAuth, StandardProxyAuth};
+
+            conn.bits.httpproxy = true;
+            conn.bits.tunnel_proxy = true;
+
+            // The `CONNECT` request's HTTP minor version: `--proxy1.0`
+            // (`CURLPROXY_HTTP_1_0`) forces `HTTP/1.0`, every other HTTP proxy
+            // type uses `HTTP/1.1` (`cf-h1-proxy.c` `start_CONNECT`).
+            let proxy_http_minor = if px.proxytype.is_http_1_0() { 0 } else { 1 };
+            // `User-Agent` for the CONNECT comes from `CURLOPT_USERAGENT`; the
+            // builder omits it when empty, matching `Curl_http_proxy_create_CONNECT`.
+            let proxy_user_agent = data.set.str(crate::setopt::StrId::Useragent).map(str::to_string);
+            // The CONNECT authority scheme is only used to shape proxy-auth (Digest
+            // `uri=`); these protocols carry no target TLS announcement, so a plain
+            // proxy uses `http`, an HTTPS-target scheme uses `https`.
+            let scheme_name = if scheme.is_ssl() { "https" } else { "http" };
+            // test445's proxy presents no `407`, so the lightweight proactive /
+            // no-auth `StandardProxyAuth` (Basic from `--proxy-user` when present)
+            // is sufficient here; a reactive `--proxy-digest`/`-ntlm` handshake for
+            // a tunneled line protocol is not exercised by the suite.
+            let proxy_auth: Box<dyn ProxyConnectAuth> =
+                Box::new(StandardProxyAuth::new(px.clone(), data.set.proxyauth));
+            let h1cfg = H1ProxyConfig::new(host.clone(), port)
+                .with_http_minor(proxy_http_minor)
+                .with_user_agent(proxy_user_agent)
+                .with_scheme(scheme_name, true)
+                .with_auth(proxy_auth);
+            setup = setup.with_http_proxy(h1_proxy_factory(h1cfg));
+        }
+    }
+
+    // Target TLS rides on top of the (optional) tunnel for a `PROTOPT_SSL` scheme.
+    if let Some(ssl) = target_ssl {
+        setup = setup.with_ssl(ssl);
+    }
+
+    let dispatch = ConnSetup::Default(setup);
     establish_connection(&mut conn, FIRSTSOCKET, ssl_mode, dispatch, true).await?;
     Ok(conn)
 }
@@ -1574,6 +1662,80 @@ pub(crate) async fn perform_transfer(
     perform_transfer_inner(data, sink, source).await
 }
 
+/// curl's `PROTOPT_PROXY_AS_HTTP` swap decision for an `ftp://` URL (`lib/url.c`
+/// `create_conn`, L2377-L2391): returns `true` when the FTP request must be
+/// driven AS HTTP over a forward HTTP proxy (the proxy receives
+/// `GET ftp://host/path HTTP/1.1`), and `false` when it must use the native FTP
+/// engine.
+///
+/// The three C preconditions are reproduced exactly:
+/// * `!conn->bits.tunnel_proxy` — `--proxytunnel`/`-p`
+///   ([`Easy::set`]`.tunnel_thru_httpproxy`) forces `CONNECT` tunneling, never
+///   proxy-as-HTTP, so it declines the swap.
+/// * a proxy applies — resolved for the ORIGINAL `ftp` scheme exactly as curl's
+///   `detect_proxy`/`parse_proxy` (so `-x`/`CURLOPT_PROXY`, `ftp_proxy`, and
+///   `all_proxy` all apply), with the `no_proxy` list honored via
+///   [`crate::proxy::proxy_for_target`] so a bypassed host still uses native FTP.
+/// * the proxy is an HTTP proxy, not SOCKS (`!px.is_socks()`); a SOCKS proxy
+///   carries native FTP transparently and must not be swapped to HTTP.
+///
+/// A URL or proxy-config error simply declines the swap, leaving the native FTP
+/// engine to surface the same error curl would.
+#[cfg(all(feature = "ftp", feature = "http", feature = "proxy"))]
+fn ftp_driven_as_http_proxy(data: &Easy) -> bool {
+    use crate::url::{CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_GUESS_SCHEME};
+
+    // `--proxytunnel`/`-p` forces `CONNECT` tunneling — never proxy-as-HTTP.
+    if data.set.tunnel_thru_httpproxy {
+        return false;
+    }
+
+    // Resolve the proxy exactly as curl does for the `ftp` scheme: an explicit
+    // `-x`/`CURLOPT_PROXY` wins, else the `ftp_proxy`/`all_proxy` environment.
+    // This MUST agree with the resolution `perform_http` performs internally
+    // (`http_connect_hop` now derives the env scheme from the URL too), so the
+    // dispatch decision and the engine's proxy decision never diverge.
+    let cfg = match http::proxy_engine::config(data, "ftp") {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    // The target host drives the `no_proxy` match. Mirror `perform_http`'s URL
+    // resolution: prefer a pre-parsed `CURLOPT_CURLU` handle, else parse the
+    // stored URL string with the same scheme/port-guessing flags. The `.get`
+    // calls return owned `String`s, so no borrow of the local parse escapes.
+    let host = if let Some(uh) = data.set.uh.as_ref() {
+        match uh.get(CurlUPart::Host, 0) {
+            Ok(h) => h,
+            Err(_) => return false,
+        }
+    } else {
+        let url_str = match data.url() {
+            Some(s) => s.to_string(),
+            None => return false,
+        };
+        let mut parsed = CurlUrl::new();
+        if parsed
+            .set(
+                CurlUPart::Url,
+                Some(&url_str),
+                CURLU_GUESS_SCHEME | CURLU_DEFAULT_PORT,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        match parsed.get(CurlUPart::Host, 0) {
+            Ok(h) => h,
+            Err(_) => return false,
+        }
+    };
+
+    // A forward HTTP proxy applies iff one is selected for this host and it is
+    // not a SOCKS proxy.
+    matches!(crate::proxy::proxy_for_target(&cfg, &host), Some(px) if !px.is_socks())
+}
+
 /// Dispatch a recognized scheme to its protocol handler and drive the transfer
 /// to completion. This is the un-timed inner body of [`perform_transfer`]; the
 /// public wrapper layers the overall `CURLOPT_TIMEOUT` deadline on top of it so
@@ -1619,6 +1781,16 @@ async fn perform_transfer_inner(
     // network scheme returned `UnsupportedProtocol` before a socket opened).
     #[cfg(feature = "http")]
     if matches!(scheme_name.as_str(), "http" | "https") {
+        // `CURLOPT_CONNECT_ONLY` (the non-WebSocket case): establish the
+        // connection and park it on the easy handle for the application's raw
+        // `curl_easy_send`/`curl_easy_recv`, sending no request — curl's
+        // CONNECT_ONLY contract (the multi state machine goes straight to DONE
+        // after connect). `ws`/`wss` route to `perform_ws` below, which owns the
+        // WebSocket-specific CONNECT_ONLY handshake, so this only fires for the
+        // plain `http`/`https` raw-socket pattern (e.g. `tests/libtest/lib556`).
+        if data.set.connect_only {
+            return http::http_connect_only(data, scheme).await;
+        }
         return http::perform_http(data, sink, source).await;
     }
 
@@ -1630,6 +1802,25 @@ async fn perform_transfer_inner(
     // socket). This wires the FTP/FTPS seam whose absence produced QA findings
     // F4-CRIT-1/2/4 (every FTP/FTPS scheme returned `UnsupportedProtocol`
     // before a socket opened).
+    // curl's `PROTOPT_PROXY_AS_HTTP` handler swap (`lib/url.c` create_conn,
+    // L2377-L2391): a non-HTTP scheme that carries `PROTOPT_PROXY_AS_HTTP` is
+    // driven AS HTTP over a *forward* (non-tunnel) HTTP proxy — curl sends
+    // `GET ftp://host/path HTTP/1.1` to the proxy, which acts as an FTP gateway
+    // (`conn->scheme = &Curl_scheme_http`). Only the `ftp` scheme carries the
+    // flag (`lib/ftp.c` L4358); `ftps` has `PROTOPT_SSL` and instead tunnels via
+    // `CONNECT`, and `--proxytunnel` forces tunneling — so neither reaches this
+    // swap. The complete HTTP-side machinery already exists: the forward-proxy
+    // absolute-URI request target (`http::proxy::request_target` preserves the
+    // `ftp` scheme and appends `;type=a`/`;type=i` for
+    // `CURLOPT_PROXY_TRANSFER_MODE`) and the `CURLOPT_PORT` rewrite. Without this
+    // routing the FTP engine would dial the HTTP proxy and wait for an FTP `220`
+    // greeting that never comes (QA findings: tests 79/208/299/549/550/561/563
+    // timed out with `(28)`).
+    #[cfg(all(feature = "ftp", feature = "http", feature = "proxy"))]
+    if scheme_name == "ftp" && ftp_driven_as_http_proxy(data) {
+        return http::perform_http(data, sink, source).await;
+    }
+
     #[cfg(feature = "ftp")]
     if matches!(scheme_name.as_str(), "ftp" | "ftps") {
         return ftp::perform_ftp(data, sink, source).await;

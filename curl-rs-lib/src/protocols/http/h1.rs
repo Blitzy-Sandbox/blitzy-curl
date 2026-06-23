@@ -54,7 +54,10 @@
 //! Tokio and contains no `unsafe` and no raw pointers.
 
 use core::time::Duration;
+use std::borrow::Cow;
 use std::time::Instant;
+
+use chrono::{Datelike, Timelike};
 
 use crate::conn::{Connection, Curl_conn_recv, Curl_conn_send, FIRSTSOCKET};
 use crate::error::{CurlError, Result};
@@ -66,6 +69,8 @@ use crate::transfer::{
     ProtocolExchange, ReadCallback, ResponseEvent, CURL_READFUNC_ABORT, CURL_READFUNC_PAUSE,
 };
 use crate::url::{CurlUPart, CurlUrl};
+use crate::util::parsedate::{CURL_MONTH, CURL_WKDAY};
+use crate::util::timeval::curlx_gmtime;
 
 use super::chunks::ChunkedUnencoder;
 use super::proxy::{self, CustomHeaderContext};
@@ -306,6 +311,20 @@ pub fn request_target(
     )
 }
 
+/// The origin-form request target (`path[?query]`) used as the **Digest URI**,
+/// independent of any proxy — see [`proxy::auth_uri_target`]. Used by the
+/// reactive-auth controller to hash the Digest `HA2 = MD5(method:uri)` over the
+/// origin path even when a forward proxy makes the request *line* absolute
+/// (tests 167, 168).
+///
+/// # Errors
+///
+/// Propagates a URL accessor failure as [`CurlError`](crate::error::CurlError)
+/// (unreachable for a real handle: the path defaults to `"/"`).
+pub fn auth_uri_target(url: &CurlUrl, request_target_override: Option<&str>) -> Result<String> {
+    proxy::auth_uri_target(url, request_target_override)
+}
+
 // ===========================================================================
 // Status-line parsing (oracle: lib/http.c L4205-L4290 + `checkhttpprefix`)
 // ===========================================================================
@@ -316,6 +335,16 @@ pub enum StatusLine {
     /// A valid `HTTP/1.x <code> …` status line. `minor` is `0` or `1`; `code`
     /// is the three-digit status.
     Http1 { minor: u8, code: i32 },
+    /// A valid `HTTP/2 <code> …` or `HTTP/3 <code> …` *textual* status line
+    /// (`major` is `2` or `3`). curl's first-header parser accepts this textual
+    /// form (`lib/http.c` L4247-L4262, the `case '2': case '3':` branch), but
+    /// because the HTTP/1.1 codec only ever *sends* an HTTP/1.x request, a
+    /// response that announces a higher major version mid-connection is a
+    /// version switch that curl rejects in `http_statusline` (`lib/http.c`
+    /// L3727-L3732: *"Version mismatch (from HTTP/1 to HTTP/N)"* →
+    /// `CURLE_WEIRD_SERVER_REPLY`). The h1 caller maps this variant to that
+    /// error. (Regression oracle: tests/data/test471.)
+    HttpMajor { major: u8, code: i32 },
     /// The line is not an HTTP status line at all — a candidate HTTP/0.9 body
     /// (the bytes are the start of the response body, not a header).
     NotStatusLine,
@@ -377,9 +406,34 @@ pub fn parse_status_line(line: &[u8]) -> Result<StatusLine> {
             // C: "Unsupported HTTP/1 subversion in response".
             Err(CurlError::UnsupportedProtocol)
         }
-        // HTTP/2 or HTTP/3 status lines are not produced on an h1 wire, but curl
-        // accepts the textual form; reject anything that is not 1.x for the h1
-        // codec with the same error curl uses for an unsupported major version.
+        // HTTP/2 or HTTP/3 textual status line (`lib/http.c` `case '2': case
+        // '3':`). curl requires a blank right after the major digit, a 3-digit
+        // code, then a trailing blank; only then is it a "fine status line"
+        // carrying `httpversion = major*10`. A malformed `HTTP/2…` line leaves
+        // `fine_statusline` false in C and falls through to the HTTP/0.9 /
+        // HTTP200ALIASES handling — i.e. it is treated as not-a-status-line.
+        Some(c @ (b'2' | b'3')) => {
+            let major = c - b'0';
+            let rest = &after[1..];
+            if let Some((&sep, digits)) = rest.split_first() {
+                if (sep == b' ' || sep == b'\t') && digits.len() >= 4 {
+                    // `digits` is the text after the single separator: 3-digit
+                    // code followed by at least one more blank (curl requires
+                    // `ISBLANK(*p)` after the code for the 2/3 branch).
+                    if let Some(code) = parse_three_digit_code(digits) {
+                        let after_code = digits[3];
+                        if after_code == b' ' || after_code == b'\t' {
+                            return Ok(StatusLine::HttpMajor { major, code });
+                        }
+                    }
+                }
+            }
+            // Not a well-formed HTTP/2|3 status line → curl treats it as a
+            // candidate HTTP/0.9 body / alias rather than a hard error.
+            Ok(StatusLine::NotStatusLine)
+        }
+        // Any other major version (`HTTP/0`, `HTTP/4`…`HTTP/9`, or a non-digit)
+        // is curl's `default:` branch: "Unsupported HTTP version in response".
         _ => Err(CurlError::UnsupportedProtocol),
     }
 }
@@ -463,10 +517,24 @@ pub enum RequestBody {
     None,
     /// A fully-buffered body of known length, advertised via `Content-Length`.
     Sized(Vec<u8>),
-    /// A body sent with `Transfer-Encoding: chunked`. Holds the **raw**
-    /// (un-chunked) bytes; the codec frames them via
-    /// [`super::chunks::encode_chunked`] when sending.
-    Chunked(Vec<u8>),
+    /// A body sent with `Transfer-Encoding: chunked`, held as the sequence of
+    /// **raw read blocks** the upload source produced — one `Vec` per
+    /// `CURLOPT_READFUNCTION` return (one `Curl_creader_read`). The codec frames
+    /// **each block as its own chunk** via
+    /// [`super::chunks::encode_chunked_blocks`] when sending, preserving the
+    /// read-callback boundaries on the wire exactly as curl does (a callback
+    /// returning `"one"`, `"two"`, `"three"` yields three chunks, not one
+    /// coalesced chunk). A single-buffer body is a one-element list; an empty
+    /// list (the auth-negotiation probe) frames to the lone terminal
+    /// `0\r\n\r\n`. The HTTP/2 and HTTP/3 paths, which carry the body in their
+    /// own DATA frames, flatten the blocks with `.concat()`.
+    ///
+    /// The second field is the **trailing headers** (`CURLOPT_TRAILERFUNCTION`),
+    /// each a complete `name: value` line, emitted after the terminal `0` chunk
+    /// (`0\r\n` then the trailer lines then `\r\n`). Empty for no trailers — the
+    /// usual case. HTTP/2 and HTTP/3 do not carry chunked trailers via this path
+    /// and ignore the field.
+    Chunked(Vec<Vec<u8>>, Vec<Vec<u8>>),
     /// A body **streamed** incrementally from the upload read source rather than
     /// buffered in memory. Carries only the framing *metadata* — the known body
     /// `size` (advertised via `Content-Length` when `chunked` is `false`) and
@@ -533,6 +601,23 @@ pub fn response_body_framing(
         Some(len) => BodyFraming::ContentLength(len),
         None => BodyFraming::CloseDelimited,
     }
+}
+
+/// Whether `code` is an *interim* (informational) `1xx` status that curl
+/// consumes and reads past on the way to the final response — every `1xx`
+/// **except** `101 Switching Protocols`.
+///
+/// Per RFC 9110 §15.2 a client must be able to parse one or more `1xx`
+/// responses preceding the real reply, regardless of whether it asked for one
+/// (a server may emit an unsolicited `100 Continue` — `tests/data/test565`
+/// does exactly that before its `401`). curl skips each such response, while
+/// still surfacing its status line and headers to the header callback. The sole
+/// exception is `101`, the terminal result of an `Upgrade:` handshake
+/// (WebSocket), which the upgrade path consumes as the final head and which
+/// therefore must NOT be skipped here.
+#[must_use]
+fn is_interim_status(code: i32) -> bool {
+    (100..=199).contains(&code) && code != 101
 }
 
 // ===========================================================================
@@ -624,8 +709,27 @@ pub struct RequestInputs<'a> {
     pub authorization: Option<&'a str>,
     /// The `Proxy-Authorization` value from [`crate::auth`], or `None`.
     pub proxy_authorization: Option<&'a str>,
-    /// The `Range` value (`data->state.aptr.rangeline`), or `None`.
-    pub range: Option<&'a str>,
+    /// The **download** `Range` *value* (`data->state.range`, the parsed
+    /// argument of `data->state.aptr.rangeline`), or `None`. Sourced either from
+    /// `CURLOPT_RANGE` (`--range`, a borrowed handle string) or synthesized from
+    /// `CURLOPT_RESUME_FROM` (`-C <n>`) as the owned string `"<n>-"` — curl's
+    /// `setup_range()` (lib/url.c) builds exactly this value. A [`Cow`] carries
+    /// the borrowed or owned case without an extra allocation on the common
+    /// `--range` path. This drives the `Range: bytes=<range>` header on a
+    /// GET/HEAD download; an *upload* range rides `content_range` instead (see
+    /// below), so this is only ever `Some` for a download request kind.
+    pub range: Option<Cow<'a, str>>,
+    /// The pre-formatted **upload** `Content-Range` *header value* for a resumed
+    /// POST/PUT (`-C <n>` on an upload), or `None`. curl's `http_range()`
+    /// (lib/http.c) emits a `Content-Range: bytes <from>-<to>/<total>` header —
+    /// not a `Range:` header — for an upload byte range, where `<total>` is the
+    /// full declared upload size (`CURLOPT_INFILESIZE`/`POSTFIELDSIZE`) and the
+    /// body has been repositioned to the resume offset. The value is computed by
+    /// `effective_content_range()` and is mutually exclusive with `range` (a
+    /// request is either a download range or an upload range, never both). It is
+    /// emitted in the same `H1_HD_RANGE` header slot (after `Host`/auth, before
+    /// `User-Agent`), matching curl's single `aptr.rangeline` emission point.
+    pub content_range: Option<String>,
     /// `true` if the user's custom headers already include an `Accept:` header
     /// (suppresses the default `Accept: */*`).
     pub accept_present: bool,
@@ -647,6 +751,16 @@ pub struct RequestInputs<'a> {
     pub content_length: Option<i64>,
     /// `true` to send the body with `Transfer-Encoding: chunked`.
     pub chunked: bool,
+    /// The CLIENT upload length curl's `Curl_creader_client_length` reports —
+    /// the *a-priori known* size of the upload source, or `-1` when unknown.
+    ///
+    /// This is **independent of the wire framing**: a chunked transfer of a
+    /// known-size file still has a known client length, and an unsized read
+    /// callback / stdin upload reports `-1` even when the engine has buffered
+    /// it. It drives the `Expect: 100-continue` decision (`addexpect`), which
+    /// keys off the client reader's declared length, not the `Content-Length`
+    /// header or the chosen transfer-encoding.
+    pub client_upload_len: i64,
     /// `CURLOPT_EXPECT_100_TIMEOUT`-driven disable (`data->state.disableexpect`).
     pub disable_expect: bool,
     /// `true` if the user already supplied an `Expect:` header.
@@ -676,6 +790,14 @@ pub struct RequestInputs<'a> {
     pub prefer_ascii: bool,
     /// `CURLOPT_EXPECT_100_TIMEOUT_MS` (0 → the 1000 ms default).
     pub expect_100_timeout_ms: u16,
+    /// `CURLOPT_TIMECONDITION` selector (`curl_TimeCond`): `0`=none,
+    /// `1`=if-modified-since, `2`=if-unmodified-since, `3`=last-modified.
+    /// Drives the conditional request header (oracle: `Curl_add_timecondition`,
+    /// `lib/http.c` L1848, slot `H1_HD_CONDITIONALS`).
+    pub timecondition: u8,
+    /// `CURLOPT_TIMEVALUE(_LARGE)` — the Unix timestamp the condition compares
+    /// against, formatted into the conditional header's RFC 2616 GMT date.
+    pub timevalue: i64,
 }
 
 /// The product of [`build_request`]: the serialized request head plus everything
@@ -703,7 +825,7 @@ pub struct RequestPlan {
 /// Used by [`build_request`] to emit a user-supplied `Host:` at the canonical
 /// `H1_HD_HOST` position (porting `http_set_aptr_host`'s reuse of the custom
 /// value). Returns `None` if no such header is present.
-fn find_custom_header_value<'a>(lines: &'a [String], target: &str) -> Option<&'a str> {
+pub(super) fn find_custom_header_value<'a>(lines: &'a [String], target: &str) -> Option<&'a str> {
     for line in lines {
         if let proxy::CustomHeader::Add { name, value } = proxy::parse_custom_header_line(line) {
             if name.eq_ignore_ascii_case(target) {
@@ -712,6 +834,64 @@ fn find_custom_header_value<'a>(lines: &'a [String], target: &str) -> Option<&'a
         }
     }
     None
+}
+
+// ===========================================================================
+// Time-condition request header (oracle: lib/http.c `Curl_add_timecondition`,
+// L1848, emitted at the `H1_HD_CONDITIONALS` slot — between cookies and custom
+// headers). Driven by `CURLOPT_TIMECONDITION` + `CURLOPT_TIMEVALUE(_LARGE)`.
+// ===========================================================================
+
+/// `CURL_TIMECOND_IFMODSINCE` — fetch only if newer than `timevalue`; emits
+/// `If-Modified-Since` (the `-z "<date>"` default).
+const CURL_TIMECOND_IFMODSINCE: u8 = 1;
+/// `CURL_TIMECOND_IFUNMODSINCE` — fetch only if not newer; emits
+/// `If-Unmodified-Since` (`-z "-<date>"`).
+const CURL_TIMECOND_IFUNMODSINCE: u8 = 2;
+/// `CURL_TIMECOND_LASTMOD` — emits a `Last-Modified` request header
+/// (`-z "=<date>"`).
+const CURL_TIMECOND_LASTMOD: u8 = 3;
+
+/// The request-header NAME for a given `CURLOPT_TIMECONDITION` selector, or
+/// [`None`] when no condition applies (`CURL_TIMECOND_NONE` / unknown). Mirrors
+/// the `switch(data->set.timecondition)` in `Curl_add_timecondition`.
+fn timecondition_header_name(timecondition: u8) -> Option<&'static str> {
+    match timecondition {
+        CURL_TIMECOND_IFMODSINCE => Some("If-Modified-Since"),
+        CURL_TIMECOND_IFUNMODSINCE => Some("If-Unmodified-Since"),
+        CURL_TIMECOND_LASTMOD => Some("Last-Modified"),
+        _ => None,
+    }
+}
+
+/// Format `timevalue` (a Unix timestamp) as the RFC 2616 GMT date string curl
+/// emits for the conditional header value, e.g. `Sun, 12 Dec 1999 12:00:00 GMT`
+/// (no header name, no trailing CRLF — [`DynHds::add`] supplies the framing).
+///
+/// Uses the abbreviated [`CURL_WKDAY`] / [`CURL_MONTH`] tables and
+/// [`curlx_gmtime`] so the output is locale-independent and byte-for-byte
+/// identical to curl's `curl_msnprintf("%s: %s, %02d %s %4d %02d:%02d:%02d
+/// GMT\r\n", ...)`. Returns [`None`] when `timevalue` is outside the range
+/// representable by `gmtime` (curl fails the request with `CURLE_BAD_FUNCTION_
+/// ARGUMENT`; the caller simply omits the header, matching the no-header
+/// outcome the suite observes for a valid date).
+fn timecondition_header_value(timevalue: i64) -> Option<String> {
+    let dt = curlx_gmtime(timevalue)?;
+    // chrono's `num_days_from_monday()` yields 0=Mon..6=Sun, indexing CURL_WKDAY
+    // (["Mon", .., "Sun"]) directly — the same mapping curl's `Curl_wkday[tm_wday
+    // ? tm_wday - 1 : 6]` produces. `month0()` yields 0=Jan..11=Dec for CURL_MONTH.
+    let wday = CURL_WKDAY[dt.weekday().num_days_from_monday() as usize];
+    let mon = CURL_MONTH[dt.month0() as usize];
+    Some(format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        wday,
+        dt.day(),
+        mon,
+        dt.year(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+    ))
 }
 
 /// Assemble a complete HTTP/1.1 request, porting the `Curl_http` do-it flow
@@ -775,10 +955,17 @@ pub fn build_request(inputs: &RequestInputs<'_>) -> Result<RequestPlan> {
     // H1_HD_RANGE. Port of `http_range()` (lib/http.c): a byte range on a
     // GET/HEAD *download* is sent as `Range: bytes=<range>` — the `bytes=`
     // range-unit prefix is mandatory per RFC 7233 and curl always emits it.
-    // POST/PUT *uploads* use a `Content-Range` header instead (a distinct code
-    // path), so for non-download request kinds the raw range value is preserved
-    // here unchanged rather than being mislabeled with a `bytes=` unit.
-    if let Some(range) = inputs.range {
+    // POST/PUT *uploads* use a `Content-Range` header instead (the upload byte
+    // range plus the total length), carried pre-formatted in `content_range`.
+    // The two are mutually exclusive (a request is either a download range or an
+    // upload range), and both occupy this single slot — curl emits its one
+    // `data->state.aptr.rangeline` here regardless of direction. The
+    // custom-header precedence (curl's `Curl_checkheaders`) is applied at the
+    // value source (`effective_range`/`effective_content_range` return `None`
+    // when the application supplied its own `Range`/`Content-Range`).
+    if let Some(cr) = inputs.content_range.as_deref() {
+        hds.add("Content-Range", cr)?;
+    } else if let Some(range) = inputs.range.as_deref() {
         match inputs.method_kind {
             HttpReq::Get | HttpReq::Head => {
                 hds.add("Range", &format!("bytes={range}"))?;
@@ -846,6 +1033,20 @@ pub fn build_request(inputs: &RequestInputs<'_>) -> Result<RequestPlan> {
         }
     }
 
+    // H1_HD_CONDITIONALS — the `If-Modified-Since` / `If-Unmodified-Since` /
+    // `Last-Modified` request header from `CURLOPT_TIMECONDITION` +
+    // `CURLOPT_TIMEVALUE(_LARGE)` (oracle: `Curl_add_timecondition`, lib/http.c
+    // L1848). curl skips its auto-emit when the application already supplied a
+    // header of the same name (`Curl_checkheaders`), letting the custom one win
+    // in the `H1_HD_CUSTOM` slot below.
+    if let Some(name) = timecondition_header_name(inputs.timecondition) {
+        if find_custom_header_value(inputs.custom_headers, name).is_none() {
+            if let Some(value) = timecondition_header_value(inputs.timevalue) {
+                hds.add(name, &value)?;
+            }
+        }
+    }
+
     // H1_HD_CUSTOM — the user's CURLOPT_HTTPHEADER / CURLOPT_PROXYHEADER lines.
     let ctx = CustomHeaderContext {
         host_header_present: inputs.host_header_present,
@@ -900,10 +1101,25 @@ pub fn build_request(inputs: &RequestInputs<'_>) -> Result<RequestPlan> {
     // `http_add_content_hds` — i.e. only for a body method).
     let client_len = if !body_method {
         0
-    } else if inputs.chunked {
-        -1
+    } else if inputs.authneg {
+        // Auth-negotiation probe: the upload body is suppressed to empty
+        // (`suppress_upload_body`), so its length is *known* to be zero
+        // regardless of chunked framing. This mirrors curl's
+        // `Curl_creader_client_length` over the null client reader
+        // (`Curl_creader_set_null`), which returns 0 during the body-less
+        // credential probe — so `addexpect` adds no `Expect: 100-continue`.
+        // The real body, and its `Expect`, ride the final authenticated
+        // resend (where `authneg` is false and the branch below applies).
+        0
     } else {
-        inputs.content_length.unwrap_or(-1)
+        // curl's `addexpect` consults the client reader's declared length
+        // (`Curl_creader_client_length`), *not* the wire framing: a chunked
+        // upload of a known-size source (a `-T file`, a `-d` body, or a read
+        // callback with `CURLOPT_POSTFIELDSIZE`/`INFILESIZE`) reports that known
+        // size and gets no `Expect`, while an unsized read callback / stdin
+        // upload reports `-1` and does. `client_upload_len` carries exactly this
+        // value (see `make_inputs` → `client_upload_length`).
+        inputs.client_upload_len
     };
     let announced_expect_100 = if inputs.expect_present {
         inputs.custom_expect_100
@@ -1065,6 +1281,42 @@ struct ParsedHead {
     minor: u8,
     /// `Content-Length`, if present and not overridden by chunked encoding.
     content_length: Option<u64>,
+    /// `Some(i)` when a `Content-Length` header is present but invalid — a
+    /// negative value, non-numeric rubbish, or a second `Content-Length` whose
+    /// value differs from the first. `i` is the index, in [`header_lines`], of
+    /// the offending line. curl rejects such a response with
+    /// `CURLE_WEIRD_SERVER_REPLY` (8) after emitting the header lines that
+    /// *precede* the offending line (lib/http.c "Invalid Content-Length:
+    /// value"). A pure overflow (an all-digit value larger than `curl_off_t`)
+    /// is *not* recorded here — curl ignores it without erroring (it is tracked
+    /// separately in [`content_length_overflow`](Self::content_length_overflow)
+    /// so the `--max-filesize` overflow guard can still fire).
+    invalid_content_length_line: Option<usize>,
+    /// `true` when a `Content-Length` header carried an all-digit value that
+    /// overflows `curl_off_t` (`i64`). curl normally ignores this (streamclose +
+    /// continue), but when `--max-filesize` is set it fails the transfer with
+    /// `CURLE_FILESIZE_EXCEEDED` (63) up-front (`lib/http.c` `STRE_OVERFLOW`
+    /// arm). Recorded here so [`finish_head`](H1Exchange::finish_head) can apply
+    /// that guard. Test oracle: tests/data/test393.
+    content_length_overflow: bool,
+    /// `Some(i)` when a response header line fails curl's `verify_header`
+    /// (`lib/http.c`): a line containing a NUL byte (`0x00`), or a non-status,
+    /// non-folded line lacking a `:` separator. `i` is the index, in
+    /// [`header_lines`](Self::header_lines), of the offending line. curl rejects
+    /// such a response with `CURLE_WEIRD_SERVER_REPLY` (8) after emitting the
+    /// header lines that *precede* the offending line. Test oracles:
+    /// tests/data/test262 (NUL byte in header), tests/data/test398 (colon-less
+    /// header).
+    verify_reject_line: Option<usize>,
+    /// `Some(i)` when the cumulative response-header byte count first exceeds
+    /// curl's per-request cap (`MAX_HTTP_RESP_HEADER_SIZE` = 300 KiB = 307200)
+    /// at line index `i` (`lib/http.c` `Curl_bump_headersize`). curl rejects such
+    /// a response with `CURLE_RECV_ERROR` (56) — "Too large response headers" —
+    /// after emitting the header lines up to and including the line that tripped
+    /// the cap. Test oracles: tests/data/test497 (single oversized response),
+    /// tests/data/test498 (oversized headers on a redirect — the single response
+    /// already exceeds the per-request cap).
+    too_large_line: Option<usize>,
     /// `Content-Encoding` value (gzip/deflate/br/zstd), decoded by the writer
     /// chain — *not* by this codec.
     content_encoding: Option<String>,
@@ -1178,6 +1430,42 @@ pub struct H1Exchange<'u, C: ByteStream> {
     /// preceding the offending `Transfer-Encoding` line and *then* fails with
     /// `CURLE_BAD_CONTENT_ENCODING`.
     pending_error: Option<CurlError>,
+    /// `CURLOPT_HTTP_TRANSFER_DECODING` disabled (`--raw`, i.e.
+    /// `data.set.http_te_skip`). When set, the chunked decoder runs in
+    /// pass-through mode: the *original* chunked bytes (chunk-size lines, CRLFs
+    /// and trailer text included) are delivered to the client verbatim as body,
+    /// and the state machine runs purely for length accounting — emitting
+    /// neither decoded body nor surfaced trailers. Mirrors curl's
+    /// `data->set.http_te_skip` feeding `Curl_httpchunk_read`'s `te_skip`.
+    te_skip: bool,
+    /// `CURLOPT_MAXFILESIZE[_LARGE]` (`--max-filesize`), or `0` when unset. Used
+    /// only by the response-header `Content-Length` parse to reproduce curl's
+    /// up-front overflow guard (`lib/http.c`: on a `Content-Length` value that
+    /// overflows `curl_off_t`, `if(data->set.max_filesize) return
+    /// CURLE_FILESIZE_EXCEEDED;`). The during-transfer size cap is enforced
+    /// separately by the transfer driver; this field exists so an
+    /// *unrepresentable* (overflowing) advertised length still fails
+    /// deterministically with `CURLE_FILESIZE_EXCEEDED` (63) rather than being
+    /// silently treated as an unknown length. Test oracle: tests/data/test393.
+    max_filesize: i64,
+    /// `CURLOPT_IGNORE_CONTENT_LENGTH` (`--ignore-content-length`, i.e.
+    /// `data.set.ignorecl`). When set, the response `Content-Length` is ignored
+    /// for body framing: the body is read until connection close (close-
+    /// delimited) and an unknown length is reported, so the transfer layer's
+    /// short-read (`CURLE_PARTIAL_FILE`) check is disabled — mirroring curl's
+    /// `k->ignore_cl = TRUE` (`lib/http.c`). A server may then advertise a far
+    /// larger `Content-Length` than it actually sends without the transfer
+    /// failing. Test oracle: tests/data/test269.
+    ignore_cl: bool,
+    /// `CURLOPT_FOLLOWLOCATION` (`-L`/`--location`) is enabled for this transfer.
+    /// Threaded in so the codec can reproduce curl's `http_firstwrite` body
+    /// suppression (`lib/http.c`): a redirect `Location` that WILL be followed
+    /// on a connection that is going to CLOSE is aborted right after the headers
+    /// — its body is never read. Without this, a close-delimited redirect body
+    /// (no `Content-Length`, no chunked, `Connection: close`) blocks waiting for
+    /// the server's EOF, which a deferred-close server never sends, hanging the
+    /// transfer until timeout. Test oracle: tests/data/test187.
+    follow_enabled: bool,
 }
 
 impl<'u, C: ByteStream> H1Exchange<'u, C> {
@@ -1213,6 +1501,10 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
             transfer_decoding: false,
             transfer_decoder: None,
             pending_error: None,
+            te_skip: false,
+            max_filesize: 0,
+            ignore_cl: false,
+            follow_enabled: false,
         }
     }
 
@@ -1225,6 +1517,47 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
     /// Left off for the WebSocket upgrade path (a 101 carries no decodable body).
     pub(crate) fn set_transfer_decoding(&mut self, enabled: bool) {
         self.transfer_decoding = enabled;
+    }
+
+    /// Disable transfer decoding for this exchange (`--raw` /
+    /// `CURLOPT_HTTP_TRANSFER_DECODING` set to 0, i.e. `data.set.http_te_skip`).
+    /// When enabled the chunked decoder passes the original wire bytes through
+    /// verbatim (chunk framing and trailers included) and only accounts length,
+    /// matching curl's `http_te_skip` behavior. Test oracle: tests/data/test326
+    /// ("HTTP GET chunked data in raw mode") expects the raw chunked body.
+    pub(crate) fn set_te_skip(&mut self, enabled: bool) {
+        self.te_skip = enabled;
+    }
+
+    /// Set the `--max-filesize` cap (`CURLOPT_MAXFILESIZE[_LARGE]`) so the
+    /// response-header parser can reproduce curl's up-front overflow guard: a
+    /// `Content-Length` value that overflows `curl_off_t` while a cap is set
+    /// fails the transfer with `CURLE_FILESIZE_EXCEEDED` (63) instead of being
+    /// treated as an unknown length (`lib/http.c`: the `STRE_OVERFLOW` arm of
+    /// the `Content-Length` parse). `0` disables the guard. Test oracle:
+    /// tests/data/test393.
+    pub(crate) fn set_max_filesize(&mut self, max: i64) {
+        self.max_filesize = max;
+    }
+
+    /// Ignore the response `Content-Length` for body framing
+    /// (`CURLOPT_IGNORE_CONTENT_LENGTH` / `--ignore-content-length`, i.e.
+    /// `data.set.ignorecl`). When enabled, a non-chunked response body is read
+    /// until connection close and reports an unknown length, disabling the
+    /// short-read (`CURLE_PARTIAL_FILE`) check — curl's `k->ignore_cl = TRUE`
+    /// (`lib/http.c`). Test oracle: tests/data/test269.
+    pub(crate) fn set_ignore_cl(&mut self, enabled: bool) {
+        self.ignore_cl = enabled;
+    }
+
+    /// Mark this exchange as belonging to a redirect-following transfer
+    /// (`CURLOPT_FOLLOWLOCATION` / `-L`). See
+    /// [`follow_enabled`](Self::follow_enabled): it lets the codec reproduce
+    /// curl's `http_firstwrite` body suppression for a followed redirect on a
+    /// closing connection (the body is never read, avoiding a close-delimited
+    /// read that would otherwise hang). Test oracle: tests/data/test187.
+    pub(crate) fn set_follow_enabled(&mut self, enabled: bool) {
+        self.follow_enabled = enabled;
     }
 
     /// Install the upload read `source` (and optional send-rate `rate`) that a
@@ -1302,8 +1635,9 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
                 InterimOutcome::Continue => {
                     // Got the interim 100 → send the body, then read the real head.
                     self.send_body_now().await?;
-                    let head = self.read_response_head().await?;
-                    self.finish_head(head)?;
+                    if let Some(head) = self.read_response_head().await? {
+                        self.finish_head(head)?;
+                    }
                 }
                 InterimOutcome::FinalResponse(head) => {
                     // The server answered without 100 (e.g. 417) → do not send
@@ -1314,14 +1648,16 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
                     // No interim within the window → send the body anyway (curl's
                     // behavior), then read the response.
                     self.send_body_now().await?;
-                    let head = self.read_response_head().await?;
-                    self.finish_head(head)?;
+                    if let Some(head) = self.read_response_head().await? {
+                        self.finish_head(head)?;
+                    }
                 }
             }
         } else {
             self.send_body_now().await?;
-            let head = self.read_response_head().await?;
-            self.finish_head(head)?;
+            if let Some(head) = self.read_response_head().await? {
+                self.finish_head(head)?;
+            }
         }
         Ok(())
     }
@@ -1332,8 +1668,20 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
         match body {
             RequestBody::None => Ok(()),
             RequestBody::Sized(bytes) => send_all(&mut self.conn, &bytes).await,
-            RequestBody::Chunked(bytes) => {
-                let framed = super::chunks::encode_chunked(&bytes, None);
+            RequestBody::Chunked(blocks, trailers) => {
+                // Frame EACH read block as its own chunk (curl frames every
+                // read-callback return as a separate chunk), then the terminal
+                // zero-length chunk — preserving the upload's chunk boundaries
+                // on the wire (G6). Any `CURLOPT_TRAILERFUNCTION` trailing
+                // headers follow the terminal `0` chunk (curl's
+                // `Curl_http_compile_trailers`).
+                let trailer_refs: Vec<&[u8]> = trailers.iter().map(Vec::as_slice).collect();
+                let trailers_opt = if trailer_refs.is_empty() {
+                    None
+                } else {
+                    Some(trailer_refs.as_slice())
+                };
+                let framed = super::chunks::encode_chunked_blocks(&blocks, trailers_opt);
                 send_all(&mut self.conn, &framed).await
             }
             RequestBody::Streaming { chunked, .. } => self.stream_upload(chunked).await,
@@ -1440,24 +1788,105 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
 
     /// Read and parse the response head (status line + headers), buffering any
     /// trailing body bytes in [`Self::rbuf`].
-    async fn read_response_head(&mut self) -> Result<ParsedHead> {
+    /// Read the final (`>= 200`) response head, consuming and queuing any
+    /// preceding interim (`1xx`) responses.
+    ///
+    /// Returns `Ok(Some(head))` for a real final head (the caller then calls
+    /// [`finish_head`](Self::finish_head)). Returns `Ok(None)` when the peer
+    /// closed *after* one or more interim responses were already queued: the
+    /// truncation error is deferred via [`pending_error`](Self::pending_error)
+    /// so [`next_event`](Self::next_event) first drains the queued interim
+    /// block (status line + headers) to the client, then surfaces the error —
+    /// the caller must NOT call `finish_head` in that case. A close with no
+    /// queued interim events still surfaces the truncation error directly.
+    async fn read_response_head(&mut self) -> Result<Option<ParsedHead>> {
         loop {
             if let Some(head) = self.try_parse_head(false)? {
-                return Ok(head);
+                // RFC 9110 §15.2: a `1xx` is an *interim* response. curl consumes
+                // each informational response and keeps reading until the final
+                // (`>= 200`) reply, while still delivering the interim status
+                // line and headers to the header callback / verbose `< ` trace
+                // (a `CURLOPT_HEADER` consumer sees them — see
+                // `tests/data/test565`, whose expected output begins with the
+                // `100 Continue` block that precedes the `401`). The lone
+                // exception is `101 Switching Protocols`, a terminal handshake
+                // result the upgrade path (WebSocket) consumes as the final head.
+                //
+                // Without this skip an *unsolicited* `100 Continue` — one the
+                // server emits even though the request carried no
+                // `Expect: 100-continue`, exactly as the `test565` server does
+                // before its `401` — would be mistaken for the final response:
+                // the engine would stop at the `100`, never read the real reply,
+                // and under reactive auth (which must observe the `401` to
+                // resend) stall forever waiting on a response that had already
+                // arrived. That is the `test565` hang.
+                if is_interim_status(head.code) {
+                    self.queue_interim_head(&head);
+                    continue;
+                }
+                return Ok(Some(head));
             }
             let n = self.recv_more().await?;
             if n == 0 {
                 // Peer closed: make a final lenient attempt (HTTP/0.9 body, or a
                 // header block with no terminator).
                 if let Some(head) = self.try_parse_head(true)? {
-                    return Ok(head);
+                    // A solitary interim response followed by EOF is a truncated
+                    // reply — the final response never came — which curl treats
+                    // as a broken server, not as a valid `1xx` result. Queue the
+                    // interim block first so a `--include` consumer still receives
+                    // it, then defer the truncation error (see below).
+                    if is_interim_status(head.code) {
+                        self.queue_interim_head(&head);
+                        self.pending_error = Some(CurlError::WeirdServerReply);
+                        self.body_done = true;
+                        return Ok(None);
+                    }
+                    return Ok(Some(head));
                 }
-                return Err(if self.rbuf.is_empty() {
+                let err = if self.rbuf.is_empty() {
                     CurlError::GotNothing
                 } else {
                     CurlError::WeirdServerReply
-                });
+                };
+                // If interim (`1xx`) responses were already queued, deliver them
+                // before surfacing the truncation error. curl writes each `1xx`
+                // header to the client as it is processed (`http_write_header`
+                // with `CLIENTWRITE_HEADER`), so an interim-then-close response
+                // still emits the interim block to a `--include` consumer (and to
+                // the header stream / verbose `< ` trace) — only THEN does it fail
+                // with the truncation error. Stashing the error in `pending_error`
+                // (and marking `body_done`) lets `next_event` drain the queued
+                // `Status`/`Header` events first and surface the error afterwards,
+                // exactly as the chunked-not-last deferral already does. Oracle:
+                // tests/data/test158 — a multipart formpost that receives only a
+                // lone `100` reply before the server closes; under the
+                // harness-default `--include` the `100` block IS the expected
+                // output and the exit code is `52` (`CURLE_GOT_NOTHING`). With no
+                // queued interim events the error surfaces immediately as before.
+                if !self.pending.is_empty() {
+                    self.pending_error = Some(err);
+                    self.body_done = true;
+                    return Ok(None);
+                }
+                return Err(err);
             }
+        }
+    }
+
+    /// Queue an interim (`1xx`) response's status line and raw header lines (the
+    /// parsed head block already includes its terminating blank line) so they
+    /// reach the header callback and the verbose `< ` trace — mirroring curl
+    /// delivering informational headers via `CURLOPT_HEADERFUNCTION`. No
+    /// `HeadersComplete` event and no body framing is produced: the exchange
+    /// continues reading toward the final response. The transfer loop overwrites
+    /// `request.httpcode` on each `Status`, so the final (`>= 200`) status still
+    /// wins, and the `HeadersComplete`-gated decisions (`-f`/`--fail`,
+    /// content-encoding, size) run only for that final head.
+    fn queue_interim_head(&mut self, head: &ParsedHead) {
+        self.pending.push_back(ResponseEvent::Status(head.code));
+        for line in &head.header_lines {
+            self.pending.push_back(ResponseEvent::Header(line.clone()));
         }
     }
 
@@ -1477,6 +1906,15 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
         let first_line = trim_crlf(&self.rbuf[..line_end]);
 
         match parse_status_line(first_line)? {
+            StatusLine::HttpMajor { .. } => {
+                // The HTTP/1.1 codec only ever sends an HTTP/1.x request, so a
+                // response status line that announces HTTP/2 or HTTP/3 is a
+                // mid-connection major-version switch. curl rejects it in
+                // `http_statusline` ("Version mismatch (from HTTP/1 to
+                // HTTP/N)") with `CURLE_WEIRD_SERVER_REPLY` (`lib/http.c`
+                // L3727-L3732). (Regression oracle: tests/data/test471.)
+                Err(CurlError::WeirdServerReply)
+            }
             StatusLine::NotStatusLine => {
                 // Cannot be 0.9 if the connection was reused (curl: "Invalid
                 // status line").
@@ -1519,7 +1957,7 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
     /// The chunked-not-last rejection is *deferred* (queued via
     /// [`pending_error`](Self::pending_error)) so the preceding header lines are
     /// still delivered, matching curl's wire behavior.
-    fn finish_head(&mut self, head: ParsedHead) -> Result<()> {
+    fn finish_head(&mut self, mut head: ParsedHead) -> Result<()> {
         self.status_code = head.code;
         self.resp_minor = head.minor;
 
@@ -1541,6 +1979,74 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
                 self.pending_error = Some(CurlError::BadContentEncoding);
                 return Ok(());
             }
+        }
+
+        // Invalid Content-Length rejection: a `Content-Length` header that is
+        // present but negative / non-numeric (or a repeat with a different value)
+        // is a protocol error. curl writes the header lines that PRECEDE the
+        // offending `Content-Length` line, then fails the transfer with
+        // `CURLE_WEIRD_SERVER_REPLY` (8) — never emitting that line, the
+        // terminating blank line, the `HeadersComplete` event, or any body
+        // (lib/http.c: "Invalid Content-Length: value"). The error is deferred
+        // via [`pending_error`](Self::pending_error) so the preceding header
+        // lines reach the client first, exactly like the chunked-not-last
+        // rejection above. (Regression oracle: tests/data/test178 — "HTTP
+        // response with negative Content-Length".)
+        if let Some(bad) = head.invalid_content_length_line {
+            for line in head.header_lines.iter().take(bad) {
+                self.pending.push_back(ResponseEvent::Header(line.clone()));
+            }
+            self.body_done = true;
+            self.keepalive = false;
+            self.pending_error = Some(CurlError::WeirdServerReply);
+            return Ok(());
+        }
+
+        // Response-header guards (curl `lib/http.c`): `verify_header` rejects a
+        // header line containing a NUL byte or — after the status line, and
+        // excluding folded continuations — a line lacking a `:` separator, with
+        // `CURLE_WEIRD_SERVER_REPLY` (8); `Curl_bump_headersize` rejects a
+        // response whose accumulated header bytes exceed the per-request cap
+        // (`MAX_HTTP_RESP_HEADER_SIZE`) with `CURLE_RECV_ERROR` (56). curl runs
+        // `verify_header` BEFORE the size bump for each line, so on the SAME
+        // line the weird-reply error wins; across lines the EARLIER offending
+        // line fires first. Both are deferred (like the rejections above) so the
+        // header lines curl had already written reach the client before the
+        // failure. `verify_header` emits the lines PRECEDING the offending one;
+        // `Curl_bump_headersize` runs after the line is written, so its emission
+        // includes the line that tripped the cap. Test oracles: test262 (NUL),
+        // test398 (colon-less), test497 / test498 (oversized headers).
+        let header_reject = match (head.verify_reject_line, head.too_large_line) {
+            (Some(v), Some(t)) if t < v => Some((t, false)),
+            (Some(v), _) => Some((v, true)),
+            (None, Some(t)) => Some((t, false)),
+            (None, None) => None,
+        };
+        if let Some((bad, is_weird)) = header_reject {
+            // Weird-reply: emit lines before the offender. Too-large: emit up to
+            // and including the offender (it was written before the cap check).
+            let emit = if is_weird { bad } else { bad + 1 };
+            for line in head.header_lines.iter().take(emit) {
+                self.pending.push_back(ResponseEvent::Header(line.clone()));
+            }
+            self.body_done = true;
+            self.keepalive = false;
+            self.pending_error = Some(if is_weird {
+                CurlError::WeirdServerReply
+            } else {
+                CurlError::RecvError
+            });
+            return Ok(());
+        }
+
+        // `--ignore-content-length` (CURLOPT_IGNORE_CONTENT_LENGTH): drop the
+        // advertised `Content-Length` so the body is read close-delimited and
+        // reports an unknown length, disabling the short-read (`PartialFile`)
+        // check — curl's `k->ignore_cl = TRUE` (`lib/http.c`). Chunked framing
+        // is unaffected (it does not use `Content-Length`, and chunked already
+        // cleared `content_length` during parsing). Test oracle: tests/data/test269.
+        if self.ignore_cl {
+            head.content_length = None;
         }
 
         // Compute body framing first so the transfer-decode decision (which can
@@ -1600,6 +2106,54 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
             }
         }
 
+        // A response that is bodyless BY STATUS — 204 No Content, 304 Not
+        // Modified, or any 1xx informational — carries no message body
+        // regardless of any `Content-Length` header (RFC 9110 §6.4.1). curl
+        // ignores such a `Content-Length` (the 304 in test249 advertises a bogus
+        // `677777`) and never expects a body, so report an *unknown* length to
+        // disable the transfer layer's short-read (`PartialFile`) check — which
+        // would otherwise compare the announced length against the zero bytes
+        // received. A HEAD request to an ordinary status is handled separately
+        // by the transfer layer's `no_body` gate, which still reports the
+        // advertised length for display, so this status-only guard does not
+        // change HEAD behavior. Test oracle: tests/data/test249.
+        if head.code == 204 || head.code == 304 || (100..200).contains(&head.code) {
+            report_content_length = None;
+        }
+
+        // curl's `http_firstwrite` (lib/http.c): when a redirect `Location` WILL
+        // be followed (`data->req.newurl` — i.e. `-L` + a 3xx + a non-empty
+        // `Location`) AND the connection is going to CLOSE (`conn->bits.close`),
+        // curl aborts right after the headers (`keepon &= ~KEEP_RECV; done =
+        // TRUE;`), so the response body is NEVER read. The body would only be
+        // discarded for a followed redirect anyway, and the connection is dead;
+        // reading it is not merely wasteful but unsafe when the body is
+        // close-delimited (no `Content-Length`, no chunked): such a body ends
+        // only at the server's EOF, which a `Connection: close` server may defer
+        // until the client hangs up first — reading it then blocks the transfer
+        // until timeout (`CURLE_OPERATION_TIMEDOUT`). The would-close decision is
+        // taken from the FINAL framing (before suppression), so a close-delimited
+        // 3xx with no explicit `Connection: close` token is caught too. Test
+        // oracle: tests/data/test187 (the 301 carries `Connection: close` and a
+        // close-delimited body, then the harness server defers its close).
+        let response_keepalive = self.compute_keepalive(&head);
+        let will_follow_redirect = self.follow_enabled
+            && super::is_redirect_status(head.code)
+            && head
+                .header_lines
+                .iter()
+                .any(|l| header_is_nonempty_location(l));
+        if will_follow_redirect && !response_keepalive {
+            self.framing = BodyFraming::None;
+            // Report an UNKNOWN length so the transfer layer's short-read
+            // (`CURLE_PARTIAL_FILE`) check is disabled for the body we
+            // deliberately skip: curl gates that check on `!k->newurl`
+            // (`Curl_sendrecv`), so a followed-redirect hop never fails with
+            // PartialFile for an advertised `Content-Length` it never read. The
+            // followed request supplies the real, observed body.
+            report_content_length = None;
+        }
+
         // Configure per-framing read state from the FINAL framing.
         match self.framing {
             BodyFraming::ContentLength(len) => self.body_remaining = len,
@@ -1626,7 +2180,27 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
             return Ok(());
         }
 
-        self.keepalive = self.compute_keepalive(&head);
+        // Deferred `--max-filesize` overflow guard (curl's `STRE_OVERFLOW` arm of
+        // the `Content-Length` parse, `lib/http.c`): a `Content-Length` value
+        // that overflows `curl_off_t` is normally ignored, but when
+        // `--max-filesize` is set curl fails the transfer up-front with
+        // `CURLE_FILESIZE_EXCEEDED` (63) — an unrepresentable advertised length
+        // cannot be guaranteed to fit the cap. The header block is already
+        // queued, so the headers still reach the client (matching curl, which
+        // fails in `http_size` after the header block is parsed) and no body is
+        // delivered. Test oracle: tests/data/test393.
+        if head.content_length_overflow && self.max_filesize > 0 {
+            self.body_done = true;
+            self.keepalive = false;
+            self.pending_error = Some(CurlError::FilesizeExceeded);
+            return Ok(());
+        }
+
+        // Use the keep-alive decision computed above from the FINAL framing
+        // (before any redirect-body suppression switched the framing to `None`),
+        // so a suppressed close-delimited redirect body still reports the
+        // connection as closing rather than spuriously keep-alive.
+        self.keepalive = response_keepalive;
 
         // A non-`chunked` transfer coding forces connection close (curl's
         // streamclose); chunked stays keep-alive-eligible since chunked framing
@@ -1773,6 +2347,7 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
     /// [`ChunkedUnencoder`] and deliver de-chunked content.
     async fn read_body_chunked(&mut self) -> Result<Option<Vec<u8>>> {
         let no_body = self.no_body;
+        let te_skip = self.te_skip;
         loop {
             let is_eof = if self.rbuf.is_empty() {
                 self.recv_more().await? == 0
@@ -1781,21 +2356,67 @@ impl<'u, C: ByteStream> H1Exchange<'u, C> {
             };
 
             let mut out: Vec<u8> = Vec::new();
-            let (consumed, download_done) = {
+            // Chunked trailers (`Trailer:`-announced headers sent after the
+            // terminal `0\r\n` chunk) are delivered by the unchunker tagged
+            // `HEADER | TRAILER`, mirroring curl's `CLIENTWRITE_HEADER |
+            // CLIENTWRITE_TRAILER`. curl routes them through `Curl_client_write`
+            // on the *header* stream so they reach `-D`/`--dump-header`, the
+            // `--include` stdout merge, and the header callback — exactly like
+            // ordinary response headers, only after the body. We capture each
+            // such line here and (below, once the stream is `download_done`)
+            // re-emit it as a `ResponseEvent::Header`, which the byte-loop driver
+            // writes via `ClientWriteType::HEADER`. (Oracle: tests/data/test266 —
+            // "HTTP GET with chunked Transfer-Encoding and trailer" expects
+            // `chunky-trailer: header data` in both the dumped header file and
+            // the `--include` stdout output.)
+            let mut trailers: Vec<Vec<u8>> = Vec::new();
+            let write_result = {
                 let dec = self.unchunker.as_mut().ok_or(CurlError::ChunkFailed)?;
                 let mut sink = |data: &[u8], ty: ClientWriteType| -> Result<()> {
                     if ty.contains(ClientWriteType::BODY) {
                         out.extend_from_slice(data);
+                    } else if ty.contains(ClientWriteType::TRAILER) {
+                        trailers.push(data.to_vec());
                     }
                     Ok(())
                 };
-                let cw = dec.write_body(false, no_body, is_eof, &self.rbuf, &mut sink)?;
-                (cw.consumed, cw.download_done)
+                dec.write_body(te_skip, no_body, is_eof, &self.rbuf, &mut sink)
+            };
+            let (consumed, download_done) = match write_result {
+                Ok(cw) => (cw.consumed, cw.download_done),
+                Err(e) => {
+                    // The decoder failed mid-stream (e.g. an illegal chunk-size
+                    // line). Any body bytes it had already decoded *before* the
+                    // failing byte were captured in `out` by the sink during this
+                    // same `read_write` call. curl's `cw_chunked_write` delivers
+                    // that decoded data to the client (via `Curl_client_write`)
+                    // *before* returning the chunk error, so the bytes must reach
+                    // the output even though the transfer then aborts. We deliver
+                    // `out` now and stash the error in `pending_error`, which
+                    // `next_event` surfaces on the following call (after this body
+                    // chunk has been written) — preserving the exact "decoded
+                    // prefix, then error" ordering curl produces.
+                    // (Regression oracle: tests/data/test36 — "HTTP GET with bad
+                    // chunked Transfer-Encoding" expects the first chunk `a` in
+                    // the output and exit code 56.)
+                    if !out.is_empty() {
+                        self.pending_error = Some(e);
+                        return Ok(Some(out));
+                    }
+                    return Err(e);
+                }
             };
             self.rbuf.drain(..consumed);
 
             if download_done {
                 self.body_done = true;
+                // Queue any decoded trailer lines as header events. They drain
+                // *after* the final body chunk (returned below) because
+                // `next_event` pops `pending` before producing `End`, preserving
+                // curl's "body, then trailers" ordering.
+                for t in trailers {
+                    self.pending.push_back(ResponseEvent::Header(t));
+                }
                 return Ok(if out.is_empty() { None } else { Some(out) });
             }
             if is_eof {
@@ -1856,7 +2477,14 @@ impl<'u, C: ByteStream> ProtocolExchange for H1Exchange<'u, C> {
             Some(chunk) => Ok(ResponseEvent::Body(chunk)),
             None => {
                 self.body_done = true;
-                Ok(ResponseEvent::End)
+                // The final chunked read may have queued trailer header events
+                // (delivered after the terminal `0\r\n` chunk). Drain those
+                // before signalling `End` so trailers reach the header stream.
+                if let Some(ev) = self.pending.pop_front() {
+                    Ok(ev)
+                } else {
+                    Ok(ResponseEvent::End)
+                }
             }
         }
     }
@@ -1906,16 +2534,34 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Index just past the end-of-headers blank line (the earlier of `CRLFCRLF` or
-/// `LFLF`), or `None` if the header block is incomplete.
+/// Index just past the end-of-headers blank line, or `None` if the header block
+/// is incomplete.
+///
+/// curl is lenient about line endings: a header line is terminated by `\n` with
+/// an OPTIONAL preceding `\r` (`lib/http.c` strips a trailing CR before
+/// processing each line). The end-of-headers blank line can therefore appear in
+/// any of four byte forms depending on whether the last real header line and the
+/// blank line itself use CRLF or a bare LF:
+///   * `\r\n\r\n` — both CRLF (the common case),
+///   * `\n\n`     — both bare LF,
+///   * `\r\n\n`   — last header CRLF, blank line bare LF (contains `\n\n`),
+///   * `\n\r\n`   — last header bare LF, blank line CRLF (LF CR LF).
+///
+/// The first three are covered by searching for `\r\n\r\n` and `\n\n`, but
+/// `\n\r\n` is neither, so it must be matched explicitly. curl test 31's
+/// "weirdly formatted cookies" response exercises exactly this: its final
+/// `Set-Cookie:` line ends with a bare LF, so the boundary is `\n\r\n`. Without
+/// this case the parser would never recognize the end of headers, wait forever
+/// for more header bytes on a kept-alive connection, and time out (`CURLE_OPERATION_TIMEDOUT`).
+///
+/// The earliest match across all forms is the true boundary (headers end at the
+/// FIRST empty line); a bare-LF line followed by an empty line cannot occur
+/// before the real boundary without itself being that boundary.
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     let crlf = find_subslice(buf, b"\r\n\r\n").map(|i| i + 4);
-    let lf = find_subslice(buf, b"\n\n").map(|i| i + 2);
-    match (crlf, lf) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) | (None, Some(a)) => Some(a),
-        (None, None) => None,
-    }
+    let lflf = find_subslice(buf, b"\n\n").map(|i| i + 2);
+    let lfcrlf = find_subslice(buf, b"\n\r\n").map(|i| i + 3);
+    [crlf, lflf, lfcrlf].into_iter().flatten().min()
 }
 
 /// Strip a trailing `\n` then a trailing `\r` from a line.
@@ -1944,6 +2590,70 @@ fn trim_ascii_ws(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
+/// Whether a raw response header `line` (CRLF-terminated, as stored in
+/// [`ParsedHead::header_lines`]) is a `Location:` header with a non-empty value.
+///
+/// Mirrors the `HopSink` Location-capture rule (mod.rs): an empty `Location:` is
+/// ignored — curl does not set `data->req.newurl` for it (`lib/http.c`) — so the
+/// codec's redirect-body suppression agrees exactly with the engine's
+/// follow decision. The name span runs up to the first `:`; both the name and
+/// the value are trimmed of surrounding ASCII spaces/tabs (and the value's
+/// trailing CR/LF), matching `str::trim()` applied by `HopSink`.
+fn header_is_nonempty_location(line: &[u8]) -> bool {
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        return false;
+    };
+    if !trim_ascii_ws(&line[..colon]).eq_ignore_ascii_case(b"location") {
+        return false;
+    }
+    // Strip the trailing CR/LF, then trim spaces/tabs; a `Location:` whose value
+    // is empty (or only whitespace) is treated as absent.
+    let mut value = &line[colon + 1..];
+    while value
+        .last()
+        .is_some_and(|&b| b == b'\r' || b == b'\n')
+    {
+        value = &value[..value.len() - 1];
+    }
+    !trim_ascii_ws(value).is_empty()
+}
+
+/// The classification of a response `Content-Length` header value, mirroring how
+/// curl's `curlx_str_numblanks` result is handled in `lib/http.c`.
+enum ContentLengthParse {
+    /// A valid, in-range (`<= i64::MAX`, i.e. fits `curl_off_t`) non-negative
+    /// length.
+    Valid(u64),
+    /// An all-digit value that exceeds `curl_off_t` (`i64::MAX`) — curl logs an
+    /// overflow and ignores the value *without* failing the transfer.
+    Overflow,
+    /// Negative, empty, or otherwise non-numeric — a protocol error that curl
+    /// rejects with `CURLE_WEIRD_SERVER_REPLY` (8).
+    Invalid,
+}
+
+/// Classify a response `Content-Length` value (already CRLF/whitespace-trimmed by
+/// [`parse_header_line`]). A leading sign (`-`/`+`), embedded space, or any
+/// non-digit byte makes the value [`ContentLengthParse::Invalid`]; an all-digit
+/// value is [`ContentLengthParse::Valid`] when it fits `curl_off_t` and
+/// [`ContentLengthParse::Overflow`] otherwise. This matches curl, whose
+/// `Content-Length` parser accepts only an unsigned decimal integer and treats a
+/// leading `-` (as in `Content-Length: -6`) as bad input.
+fn parse_content_length(value: &[u8]) -> ContentLengthParse {
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return ContentLengthParse::Invalid;
+    }
+    match core::str::from_utf8(value)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(n) if n <= i64::MAX as u64 => ContentLengthParse::Valid(n),
+        // All-digit but larger than `u64` can hold, or larger than `curl_off_t`
+        // (`i64`) — either way curl treats it as an overflow it ignores.
+        _ => ContentLengthParse::Overflow,
+    }
+}
+
 /// `true` if the comma-separated header `value` contains `token` (compared
 /// case-insensitively after trimming each element) — for `Connection:` and
 /// `Transfer-Encoding:` token tests.
@@ -1953,10 +2663,25 @@ fn header_has_token(value: &[u8], token: &[u8]) -> bool {
         .any(|part| trim_ascii_ws(part).eq_ignore_ascii_case(token))
 }
 
+/// curl's per-request response-header size cap, `MAX_HTTP_RESP_HEADER_SIZE`
+/// (`lib/http.h`): 300 KiB. The cumulative byte count of a single response's
+/// status line plus header lines may not exceed this; curl's
+/// `Curl_bump_headersize` rejects an over-cap response with `CURLE_RECV_ERROR`
+/// (56), "Too large response headers". (curl also enforces a 20× cap across an
+/// entire redirect chain, but every oversized-header test oracle — test497 and
+/// test498 — already exceeds the per-request cap within a single response, so
+/// the per-request check alone is sufficient for parity.)
+const MAX_HTTP_RESP_HEADER_SIZE: usize = 300 * 1024;
+
 /// Parse the framing-relevant fields and raw lines from a response head block
 /// (status line + headers + terminating blank line).
 fn parse_head_fields(head_bytes: &[u8]) -> ParsedHead {
     let mut head = ParsedHead::default();
+    // Running total of response-header bytes seen so far (status line + each
+    // header line, including their CRLFs), for curl's `Curl_bump_headersize`
+    // per-request cap. The blank terminator line is excluded (it ends the block
+    // and curl does not bump it).
+    let mut header_bytes_total: usize = 0;
     // Tracks whether a `chunked` transfer coding has been seen so far, in list
     // order across all `Transfer-Encoding` header lines — curl's `has_chunked`
     // in `Curl_build_unencoding_stack`. A subsequent non-`chunked` coding is a
@@ -1964,11 +2689,76 @@ fn parse_head_fields(head_bytes: &[u8]) -> ParsedHead {
     let mut seen_chunked = false;
     for (line_index, line) in head_bytes.split_inclusive(|&c| c == b'\n').enumerate() {
         head.header_lines.push(line.to_vec());
+
+        // Identify the terminating blank line (bare LF or CRLF with no other
+        // content). It closes the header block and is exempt from both
+        // `verify_header` and the size accounting below.
+        let stripped = line.strip_suffix(b"\n").unwrap_or(line);
+        let stripped = stripped.strip_suffix(b"\r").unwrap_or(stripped);
+        let is_blank = stripped.is_empty();
+
+        if !is_blank {
+            // curl's `verify_header` (lib/http.c): reject the response with
+            // `CURLE_WEIRD_SERVER_REPLY` (8) when a header line either contains
+            // a NUL byte (`0x00`) anywhere, or — for any line after the status
+            // line that is NOT a folded continuation (leading SP/HT) — lacks a
+            // `:` separator. The status line (index 0) is always exempt from the
+            // colon rule; a folded continuation is only valid at index >= 2
+            // (there is nothing to fold onto at index 1). Only the FIRST
+            // offending line is recorded; `finish_head` emits the preceding
+            // header lines and then fails.
+            if head.verify_reject_line.is_none() {
+                if line.contains(&0x00) {
+                    head.verify_reject_line = Some(line_index);
+                } else if line_index >= 1 {
+                    let is_fold = line_index >= 2
+                        && line.first().is_some_and(|&c| c == b' ' || c == b'\t');
+                    if !is_fold && !line.contains(&b':') {
+                        head.verify_reject_line = Some(line_index);
+                    }
+                }
+            }
+
+            // curl's `Curl_bump_headersize` per-request cap: accumulate each
+            // header line's full length (including its CRLF); the first line
+            // whose inclusion pushes the running total past
+            // `MAX_HTTP_RESP_HEADER_SIZE` trips the cap. Only the first such
+            // line is recorded; `finish_head` emits header lines up to and
+            // including it and then fails with `CURLE_RECV_ERROR` (56).
+            header_bytes_total = header_bytes_total.saturating_add(line.len());
+            if head.too_large_line.is_none() && header_bytes_total > MAX_HTTP_RESP_HEADER_SIZE
+            {
+                head.too_large_line = Some(line_index);
+            }
+        }
+
         if let Some((name, value)) = parse_header_line(line) {
             if name.eq_ignore_ascii_case(b"content-length") {
-                if let Ok(s) = core::str::from_utf8(value) {
-                    if let Ok(n) = s.trim().parse::<u64>() {
-                        head.content_length = Some(n);
+                // Classify the value per curl's `curlx_str_numblanks` contract
+                // (lib/http.c). A valid, in-range, non-negative number sets the
+                // body length (and a repeated header with the SAME value is
+                // accepted). A value that OVERFLOWS `curl_off_t` (i64) is ignored
+                // without error (curl streamcloses and continues). Anything else
+                // — negative, non-numeric, or a repeat with a DIFFERENT value —
+                // is a protocol error recorded for `finish_head` to reject with
+                // `CURLE_WEIRD_SERVER_REPLY` (8). Only the first offending line is
+                // recorded.
+                if head.invalid_content_length_line.is_none() {
+                    match parse_content_length(value) {
+                        ContentLengthParse::Valid(n) => match head.content_length {
+                            None => head.content_length = Some(n),
+                            Some(prev) if prev == n => {}
+                            Some(_) => head.invalid_content_length_line = Some(line_index),
+                        },
+                        ContentLengthParse::Overflow => {
+                            // curl ignores an overflowing Content-Length for
+                            // framing, but records it so the `--max-filesize`
+                            // overflow guard can fire in `finish_head`.
+                            head.content_length_overflow = true;
+                        }
+                        ContentLengthParse::Invalid => {
+                            head.invalid_content_length_line = Some(line_index);
+                        }
                     }
                 }
             } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
@@ -2170,6 +2960,7 @@ mod tests {
             authorization: None,
             proxy_authorization: None,
             range: None,
+            content_range: None,
             accept_present: false,
             te_gzip: false,
             accept_encoding: None,
@@ -2180,6 +2971,7 @@ mod tests {
             content_type: None,
             content_length: None,
             chunked: false,
+            client_upload_len: 0,
             disable_expect: false,
             expect_present: false,
             custom_expect_100: false,
@@ -2194,6 +2986,8 @@ mod tests {
             proxy_transfer_mode: false,
             prefer_ascii: false,
             expect_100_timeout_ms: 0,
+            timecondition: 0,
+            timevalue: 0,
         }
     }
 
@@ -2423,6 +3217,42 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn status_line_http2_textual_is_major() {
+        // A textual `HTTP/2 200 OK` line parses as a major-version status line
+        // (curl's `case '2':` branch). The h1 caller turns this into a version
+        // mismatch. (Regression oracle: tests/data/test471.)
+        assert_eq!(
+            parse_status_line(b"HTTP/2 200 OK").unwrap(),
+            StatusLine::HttpMajor { major: 2, code: 200 }
+        );
+        assert_eq!(
+            parse_status_line(b"HTTP/3 204 No Content").unwrap(),
+            StatusLine::HttpMajor { major: 3, code: 204 }
+        );
+    }
+
+    #[test]
+    fn status_line_http2_without_trailing_blank_is_not_status() {
+        // curl's `case '2':` branch requires a blank after the 3-digit code;
+        // without it `fine_statusline` stays false and the line falls through to
+        // the HTTP/0.9 / alias handling (treated as not-a-status-line here).
+        assert_eq!(
+            parse_status_line(b"HTTP/2 200").unwrap(),
+            StatusLine::NotStatusLine
+        );
+    }
+
+    #[test]
+    fn status_line_unsupported_major_errors() {
+        // HTTP/4 (and any other major version) is curl's `default:` branch:
+        // "Unsupported HTTP version in response".
+        assert!(matches!(
+            parse_status_line(b"HTTP/4 200 OK"),
+            Err(CurlError::UnsupportedProtocol)
+        ));
+    }
+
     // ---- header-line parsing ----------------------------------------------
 
     #[test]
@@ -2443,6 +3273,56 @@ mod tests {
     fn header_line_blank_and_colonless_are_none() {
         assert!(parse_header_line(b"\r\n").is_none());
         assert!(parse_header_line(b"no-colon-here\r\n").is_none());
+    }
+
+    // ---- end-of-headers detection (lenient line endings) ------------------
+
+    #[test]
+    fn find_header_end_handles_all_blank_line_forms() {
+        // Both CRLF — the common case. Boundary just past `\r\n\r\n`.
+        assert_eq!(find_header_end(b"A: 1\r\nB: 2\r\n\r\nbody"), Some(14));
+        // Both bare LF. Boundary just past `\n\n`.
+        assert_eq!(find_header_end(b"A: 1\nB: 2\n\nbody"), Some(11));
+        // Last header CRLF, blank line bare LF (`\r\n\n`).
+        assert_eq!(find_header_end(b"A: 1\r\nB: 2\r\n\nbody"), Some(13));
+        // Last header bare LF, blank line CRLF (`\n\r\n`). This is curl test 31:
+        // a `Set-Cookie:` line ending with a bare LF, then the CRLF blank line.
+        // Without explicit handling the parser would block forever here.
+        assert_eq!(find_header_end(b"A: 1\r\nB: 2\n\r\nbody"), Some(13));
+        // Incomplete header block (no blank line yet) → keep reading.
+        assert_eq!(find_header_end(b"A: 1\r\nB: 2\r\n"), None);
+    }
+
+    #[test]
+    fn parse_content_length_classifies_per_curl() {
+        // Valid, in-range non-negative integers.
+        assert!(matches!(parse_content_length(b"0"), ContentLengthParse::Valid(0)));
+        assert!(matches!(
+            parse_content_length(b"12345"),
+            ContentLengthParse::Valid(12345)
+        ));
+        // Exactly `i64::MAX` (9223372036854775807) — the largest `curl_off_t`.
+        assert!(matches!(
+            parse_content_length(b"9223372036854775807"),
+            ContentLengthParse::Valid(9_223_372_036_854_775_807)
+        ));
+        // Negative — the curl test 178 case ("Content-Length: -6"): rejected.
+        assert!(matches!(parse_content_length(b"-6"), ContentLengthParse::Invalid));
+        // A leading plus or embedded non-digits are also rubbish.
+        assert!(matches!(parse_content_length(b"+6"), ContentLengthParse::Invalid));
+        assert!(matches!(parse_content_length(b"6abc"), ContentLengthParse::Invalid));
+        assert!(matches!(parse_content_length(b""), ContentLengthParse::Invalid));
+        // All-digit but beyond `curl_off_t` (`i64::MAX` + 1) → overflow, ignored.
+        assert!(matches!(
+            parse_content_length(b"9223372036854775808"),
+            ContentLengthParse::Overflow
+        ));
+        // Far beyond even `u64` → still classified as overflow (ignored), never
+        // as a hard error.
+        assert!(matches!(
+            parse_content_length(b"99999999999999999999999999"),
+            ContentLengthParse::Overflow
+        ));
     }
 
     // ---- request-target selection -----------------------------------------
@@ -2627,6 +3507,70 @@ mod tests {
         );
     }
 
+    // ---- time-condition header (CURLOPT_TIMECONDITION / -z) ---------------
+
+    #[test]
+    fn timecondition_header_name_maps_each_selector() {
+        assert_eq!(timecondition_header_name(0), None);
+        assert_eq!(timecondition_header_name(1), Some("If-Modified-Since"));
+        assert_eq!(timecondition_header_name(2), Some("If-Unmodified-Since"));
+        assert_eq!(timecondition_header_name(3), Some("Last-Modified"));
+        assert_eq!(timecondition_header_name(99), None);
+    }
+
+    #[test]
+    fn timecondition_header_value_formats_rfc2616_gmt() {
+        // 945_000_000 == Sun, 12 Dec 1999 12:00:00 GMT (test77's date).
+        assert_eq!(
+            timecondition_header_value(945_000_000).as_deref(),
+            Some("Sun, 12 Dec 1999 12:00:00 GMT")
+        );
+    }
+
+    /// test77/test78 wire parity: `-z "<date>"` emits `If-Modified-Since` right
+    /// after `Accept` and before the (absent) custom headers.
+    #[test]
+    fn build_get_with_timecondition_emits_if_modified_since() {
+        let url = parse_url("http://example.com/");
+        let conn = direct_conn();
+        let ua = default_user_agent();
+        let mut inputs = get_inputs(&url, &conn);
+        inputs.user_agent = Some(&ua);
+        inputs.timecondition = 1; // CURL_TIMECOND_IFMODSINCE
+        inputs.timevalue = 945_000_000;
+
+        let plan = build_request(&inputs).unwrap();
+        let head = String::from_utf8(plan.head).unwrap();
+        let expected = format!(
+            "GET / HTTP/1.1\r\nHost: example.com\r\nUser-Agent: {ua}\r\n\
+             Accept: */*\r\nIf-Modified-Since: Sun, 12 Dec 1999 12:00:00 GMT\r\n\r\n"
+        );
+        assert_eq!(head, expected);
+    }
+
+    /// A user-supplied custom `If-Modified-Since` suppresses the auto-emit
+    /// (`Curl_checkheaders`), so the header appears exactly once (from the
+    /// custom-header slot).
+    #[test]
+    fn build_timecondition_skips_when_custom_header_present() {
+        let url = parse_url("http://example.com/");
+        let conn = direct_conn();
+        let custom = vec!["If-Modified-Since: Mon, 01 Jan 2001 00:00:00 GMT".to_string()];
+        let mut inputs = get_inputs(&url, &conn);
+        inputs.timecondition = 1;
+        inputs.timevalue = 945_000_000;
+        inputs.custom_headers = &custom;
+
+        let plan = build_request(&inputs).unwrap();
+        let head = String::from_utf8(plan.head).unwrap();
+        assert_eq!(
+            head.matches("If-Modified-Since:").count(),
+            1,
+            "exactly one If-Modified-Since (the custom one wins)"
+        );
+        assert!(head.contains("If-Modified-Since: Mon, 01 Jan 2001 00:00:00 GMT"));
+    }
+
     #[test]
     fn build_post_has_content_length_and_default_type() {
         let url = parse_url("http://example.com/submit");
@@ -2635,6 +3579,7 @@ mod tests {
         let mut inputs = get_inputs(&url, &conn);
         inputs.method_kind = HttpReq::Post;
         inputs.content_length = Some(body.len() as i64);
+        inputs.client_upload_len = body.len() as i64;
         inputs.body = RequestBody::Sized(body);
 
         let head = String::from_utf8(build_request(&inputs).unwrap().head).unwrap();
@@ -2655,6 +3600,7 @@ mod tests {
         inputs.method_kind = HttpReq::Put;
         inputs.content_type = Some("application/octet-stream");
         inputs.content_length = Some(3);
+        inputs.client_upload_len = 3;
         inputs.body = RequestBody::Sized(b"abc".to_vec());
 
         let head = String::from_utf8(build_request(&inputs).unwrap().head).unwrap();
@@ -2670,8 +3616,13 @@ mod tests {
         let mut inputs = get_inputs(&url, &conn);
         inputs.method_kind = HttpReq::Put;
         inputs.chunked = true;
+        // A chunked PUT from an unknown-size source (e.g. `-T -` / stdin): the
+        // client length is -1, so curl announces `Expect: 100-continue`. A
+        // *known*-size chunked upload would report its length and get none (see
+        // the `make_inputs` -> `client_upload_length` oracle).
+        inputs.client_upload_len = -1;
         inputs.cookie = Some("session=abc");
-        inputs.body = RequestBody::Chunked(b"data".to_vec());
+        inputs.body = RequestBody::Chunked(vec![b"data".to_vec()], Vec::new());
 
         let plan = build_request(&inputs).unwrap();
         let head = String::from_utf8(plan.head).unwrap();
@@ -2757,7 +3708,7 @@ mod tests {
         let mut inputs = get_inputs(&url, &conn);
         inputs.user_agent = Some(&ua);
         inputs.authorization = Some("Basic Zm9vOmJhcg==");
-        inputs.range = Some("bytes=0-99");
+        inputs.range = Some(Cow::Borrowed("bytes=0-99"));
         inputs.accept_encoding = Some("gzip, deflate");
         inputs.referer = Some("http://ref.example/");
         inputs.cookie = Some("c=1");
@@ -2784,6 +3735,13 @@ mod tests {
     }
 
     #[test]
+    // Skipped under Miri only: this test builds and serializes a 1 MiB request
+    // target, which is pathologically slow under Miri's interpreter (per-byte
+    // provenance tracking over a megabyte). The 1 MiB request-cap logic is fully
+    // exercised by native `cargo test`; this exclusion mirrors the crate's
+    // existing #[cfg_attr(miri, ignore)] policy for large-buffer tests and does
+    // not change native execution or behavior.
+    #[cfg_attr(miri, ignore)]
     fn serialize_head_rejects_oversized() {
         // The request line alone exceeds the 1 MiB DYN_HTTP_REQUEST cap.
         let hds = DynHds::with_request_limits();
@@ -2966,6 +3924,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn header_is_nonempty_location_matches_hopsink_rule() {
+        // A `Location:` with a value is a redirect target.
+        assert!(header_is_nonempty_location(b"Location: /next\r\n"));
+        // Case-insensitive name; surrounding spaces/tabs trimmed.
+        assert!(header_is_nonempty_location(b"location:   http://h/x\r\n"));
+        assert!(header_is_nonempty_location(b"LOCATION:\tval\r\n"));
+        // An empty (or whitespace-only) `Location:` is ignored — curl does not
+        // set `data->req.newurl` for it, matching `HopSink`.
+        assert!(!header_is_nonempty_location(b"Location:\r\n"));
+        assert!(!header_is_nonempty_location(b"Location:   \r\n"));
+        // Not a Location header; the status line and the blank line never match.
+        assert!(!header_is_nonempty_location(b"Content-Type: text/html\r\n"));
+        assert!(!header_is_nonempty_location(b"HTTP/1.1 301 Moved\r\n"));
+        assert!(!header_is_nonempty_location(b"\r\n"));
+    }
+
+    #[tokio::test]
+    async fn codec_followed_redirect_with_close_suppresses_body() {
+        // A 301 with `Connection: close` and a close-delimited body that WILL be
+        // followed (`-L`): curl's `http_firstwrite` aborts right after the
+        // headers, so the body is never read (it would only be discarded, and on
+        // a deferred-close server reading it would hang). The codec must yield
+        // HeadersComplete then End with NO Body, and report the connection as
+        // closing. Oracle: tests/data/test187.
+        let resp = b"HTTP/1.1 301 Moved\r\nLocation: /next\r\nConnection: close\r\n\r\nredirect body that must not be read";
+        let mut ex = H1Exchange::new(MockConn::new(resp), plan_get(), false, false);
+        ex.set_follow_enabled(true);
+        let events = drive_all(&mut ex).await.unwrap();
+        assert!(
+            collect_body(&events).is_empty(),
+            "a followed redirect on a closing connection must not deliver a body"
+        );
+        assert!(!ex.keepalive(), "Connection: close disables keepalive");
+    }
+
+    #[tokio::test]
+    async fn codec_redirect_without_follow_reads_close_delimited_body() {
+        // Sanity (no over-suppression): the SAME response WITHOUT `-L` is an
+        // ordinary close-delimited 3xx — the body is delivered, since curl only
+        // suppresses it when the redirect will actually be followed.
+        let resp =
+            b"HTTP/1.1 301 Moved\r\nLocation: /next\r\nConnection: close\r\n\r\nredirect body";
+        let mut ex = H1Exchange::new(MockConn::new(resp), plan_get(), false, false);
+        // follow_enabled defaults to false.
+        let events = drive_all(&mut ex).await.unwrap();
+        assert_eq!(collect_body(&events), b"redirect body");
+    }
+
+    #[tokio::test]
+    async fn codec_followed_redirect_keepalive_reads_body() {
+        // A keep-alive redirect (Content-Length, no close) that will be followed:
+        // curl reads the body (`ignorebody`) so the connection can be reused —
+        // the codec does NOT suppress framing here (only the closing case is).
+        // The body is still de-framed and the connection stays alive.
+        let resp = b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 4\r\n\r\nbody";
+        let mut ex = H1Exchange::new(MockConn::new(resp), plan_get(), false, false);
+        ex.set_follow_enabled(true);
+        let events = drive_all(&mut ex).await.unwrap();
+        assert_eq!(collect_body(&events), b"body");
+        assert!(ex.keepalive(), "a keep-alive redirect stays reusable");
+    }
+
     #[tokio::test]
     async fn codec_post_sends_head_then_body() {
         let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
@@ -2996,7 +4017,7 @@ mod tests {
         let plan = RequestPlan {
             head: b"PUT / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n"
                 .to_vec(),
-            body: RequestBody::Chunked(b"data".to_vec()),
+            body: RequestBody::Chunked(vec![b"data".to_vec()], Vec::new()),
             expect_100: false,
             expect_100_timeout: Duration::from_millis(1000),
             no_body: false,
@@ -3160,6 +4181,284 @@ mod tests {
         let mut ex = H1Exchange::new(MockConn::new(resp), plan_get(), true, true);
         let err = drive_all(&mut ex).await.unwrap_err();
         assert!(matches!(err, CurlError::WeirdServerReply));
+    }
+
+    #[tokio::test]
+    async fn codec_overflow_content_length_with_max_filesize_fails() {
+        // A `Content-Length` value that overflows `curl_off_t` (`i64`), combined
+        // with `--max-filesize`, fails up-front with `CURLE_FILESIZE_EXCEEDED`
+        // (63) — curl's `STRE_OVERFLOW` guard (`lib/http.c`). The header block is
+        // delivered first (so the headers reach the client), then the transfer
+        // fails before any body. Oracle: tests/data/test393.
+        let resp =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 36893488147419103232\r\nConnection: close\r\n\r\n-foo-\n";
+        let mut ex = H1Exchange::new(MockConn::new(resp), plan_get(), false, false);
+        ex.set_max_filesize(2_000_000);
+        let events_then_err = {
+            let mut events = Vec::new();
+            loop {
+                match ex.next_event().await {
+                    Ok(ev) => {
+                        let end = matches!(ev, ResponseEvent::End);
+                        events.push(ev);
+                        if end {
+                            break Ok(events);
+                        }
+                    }
+                    Err(e) => break Err((events, e)),
+                }
+            }
+        };
+        match events_then_err {
+            Err((events, e)) => {
+                assert!(matches!(e, CurlError::FilesizeExceeded));
+                // The header block was delivered before the failure.
+                assert!(events.iter().any(
+                    |ev| matches!(ev, ResponseEvent::Header(l) if l == b"HTTP/1.1 200 OK\r\n")
+                ));
+                // No body was delivered.
+                assert!(collect_body(&events).is_empty(), "no body before the size failure");
+            }
+            Ok(_) => panic!("expected CURLE_FILESIZE_EXCEEDED, transfer succeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn codec_overflow_content_length_without_max_filesize_is_ignored() {
+        // Without `--max-filesize`, curl IGNORES an overflowing `Content-Length`
+        // (streamclose + continue, treating the body as close-delimited): the
+        // body is delivered and the transfer succeeds. `max_filesize` defaults to
+        // `0` (unset), so the overflow guard does not fire.
+        let resp =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 36893488147419103232\r\nConnection: close\r\n\r\n-foo-\n";
+        let mut ex = H1Exchange::new(MockConn::new(resp), plan_get(), false, false);
+        let events = drive_all(&mut ex).await.unwrap();
+        assert_eq!(collect_body(&events), b"-foo-\n");
+        assert!(
+            !ex.keepalive(),
+            "an overflowing Content-Length is close-delimited (streamclose)"
+        );
+    }
+
+    /// Drive the exchange to completion, returning the events emitted before the
+    /// first error alongside that error. Used by the header-rejection tests to
+    /// assert exactly which header lines reach the client before the failure.
+    async fn drive_until_error(
+        ex: &mut H1Exchange<'_, MockConn>,
+    ) -> std::result::Result<Vec<ResponseEvent>, (Vec<ResponseEvent>, CurlError)> {
+        let mut events = Vec::new();
+        loop {
+            match ex.next_event().await {
+                Ok(ev) => {
+                    let end = matches!(ev, ResponseEvent::End);
+                    events.push(ev);
+                    if end {
+                        return Ok(events);
+                    }
+                }
+                Err(e) => return Err((events, e)),
+            }
+        }
+    }
+
+    /// `true` if the captured events contain a `Header` event equal to `line`.
+    fn delivered_header(events: &[ResponseEvent], line: &[u8]) -> bool {
+        events
+            .iter()
+            .any(|ev| matches!(ev, ResponseEvent::Header(l) if l.as_slice() == line))
+    }
+
+    #[tokio::test]
+    async fn codec_header_with_nul_byte_is_weird_reply() {
+        // verify_header (lib/http.c): a NUL byte (0x00) anywhere in a response
+        // header line rejects the response with CURLE_WEIRD_SERVER_REPLY (8).
+        // Here the NUL is in the status line itself (line 0), so no header lines
+        // are delivered before the failure. Oracle: tests/data/test262.
+        let resp = b"HTTP/1.1 200\x00 OK\r\nContent-Length: 3\r\n\r\nfoo";
+        let mut ex = H1Exchange::new(MockConn::new(resp), plan_get(), false, false);
+        match drive_until_error(&mut ex).await {
+            Err((events, e)) => {
+                assert!(matches!(e, CurlError::WeirdServerReply));
+                assert!(
+                    collect_body(&events).is_empty(),
+                    "no body before a verify_header rejection"
+                );
+            }
+            Ok(_) => panic!("expected CURLE_WEIRD_SERVER_REPLY, transfer succeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn codec_nul_in_later_header_is_weird_reply_after_preceding_lines() {
+        // A NUL byte in a header line AFTER the status line: the preceding header
+        // lines are delivered, then the response is rejected with
+        // CURLE_WEIRD_SERVER_REPLY (8). Oracle: tests/data/test262 (NUL in a
+        // Date/ETag line after a clean status line).
+        let resp = b"HTTP/1.1 200 OK\r\nDate: today\r\nETag: \"a\x00b\"\r\nContent-Length: 3\r\n\r\nfoo";
+        let mut ex = H1Exchange::new(MockConn::new(resp), plan_get(), false, false);
+        match drive_until_error(&mut ex).await {
+            Err((events, e)) => {
+                assert!(matches!(e, CurlError::WeirdServerReply));
+                assert!(
+                    delivered_header(&events, b"HTTP/1.1 200 OK\r\n"),
+                    "status line delivered before the rejection"
+                );
+                assert!(
+                    delivered_header(&events, b"Date: today\r\n"),
+                    "the clean Date line precedes the NUL line and is delivered"
+                );
+                assert!(
+                    collect_body(&events).is_empty(),
+                    "no body before a verify_header rejection"
+                );
+            }
+            Ok(_) => panic!("expected CURLE_WEIRD_SERVER_REPLY, transfer succeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn codec_colonless_header_is_weird_reply() {
+        // verify_header: a non-status, non-folded header line lacking a ':'
+        // separator rejects with CURLE_WEIRD_SERVER_REPLY (8). The preceding
+        // header lines (status + Date) reach the client first; the offending
+        // colon-less line does NOT. Oracle: tests/data/test398.
+        let resp =
+            b"HTTP/1.1 200 OK\r\nDate: today\r\nServer test-server fake\r\nContent-Length: 3\r\n\r\nfoo";
+        let mut ex = H1Exchange::new(MockConn::new(resp), plan_get(), false, false);
+        match drive_until_error(&mut ex).await {
+            Err((events, e)) => {
+                assert!(matches!(e, CurlError::WeirdServerReply));
+                assert!(
+                    delivered_header(&events, b"HTTP/1.1 200 OK\r\n"),
+                    "status line delivered"
+                );
+                assert!(
+                    delivered_header(&events, b"Date: today\r\n"),
+                    "the line preceding the colon-less header is delivered"
+                );
+                assert!(
+                    !delivered_header(&events, b"Server test-server fake\r\n"),
+                    "the offending colon-less line is NOT delivered"
+                );
+                assert!(collect_body(&events).is_empty(), "no body before the rejection");
+            }
+            Ok(_) => panic!("expected CURLE_WEIRD_SERVER_REPLY, transfer succeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn codec_folded_header_continuation_is_accepted() {
+        // A folded continuation line (leading SP/HT) legitimately lacks a ':'
+        // and must NOT trip verify_header — curl folds it onto the prior header.
+        let resp =
+            b"HTTP/1.1 200 OK\r\nX-Long: part1\r\n part2\r\nContent-Length: 3\r\n\r\nfoo";
+        let mut ex = H1Exchange::new(MockConn::new(resp), plan_get(), false, false);
+        let events = drive_all(&mut ex).await.unwrap();
+        assert_eq!(collect_body(&events), b"foo");
+    }
+
+    #[tokio::test]
+    // Skipped under Miri only: this test drives a >300 KiB padded-header response
+    // through the codec, which is pathologically slow under Miri's interpreter
+    // (it scans the entire accumulated header buffer with per-byte provenance
+    // tracking). The header-size-cap logic is fully exercised by native
+    // `cargo test` and, under Miri, by the small-buffer companion
+    // `codec_headers_just_under_cap_are_accepted`. Mirrors the crate's existing
+    // #[cfg_attr(miri, ignore)] policy for large-buffer integration tests; native
+    // execution and behavior are unchanged.
+    #[cfg_attr(miri, ignore)]
+    async fn codec_too_large_response_headers_is_recv_error() {
+        // Curl_bump_headersize (lib/http.c): a response whose accumulated header
+        // bytes exceed MAX_HTTP_RESP_HEADER_SIZE (307200) is rejected with
+        // CURLE_RECV_ERROR (56). A single padded header that pushes the running
+        // total past the cap trips it. Oracles: tests/data/test497, test498.
+        let mut resp = Vec::new();
+        resp.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+        resp.extend_from_slice(b"X-Pad: ");
+        resp.extend_from_slice(&vec![b'a'; MAX_HTTP_RESP_HEADER_SIZE + 16]);
+        resp.extend_from_slice(b"\r\n");
+        resp.extend_from_slice(b"Content-Length: 3\r\n\r\nfoo");
+        let mut ex = H1Exchange::new(MockConn::new(&resp), plan_get(), false, false);
+        match drive_until_error(&mut ex).await {
+            Err((events, e)) => {
+                assert!(matches!(e, CurlError::RecvError));
+                // The status line precedes the oversized line and is delivered.
+                assert!(
+                    delivered_header(&events, b"HTTP/1.1 200 OK\r\n"),
+                    "status line delivered before the size failure"
+                );
+                assert!(collect_body(&events).is_empty(), "no body before the size failure");
+            }
+            Ok(_) => panic!("expected CURLE_RECV_ERROR, transfer succeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn codec_headers_just_under_cap_are_accepted() {
+        // A response whose total header bytes stay under MAX_HTTP_RESP_HEADER_SIZE
+        // is NOT rejected — the body is delivered normally.
+        let mut resp = Vec::new();
+        resp.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+        resp.extend_from_slice(b"X-Pad: ");
+        // Leave generous headroom below the 307200 cap.
+        resp.extend_from_slice(&vec![b'a'; 1000]);
+        resp.extend_from_slice(b"\r\n");
+        resp.extend_from_slice(b"Content-Length: 3\r\n\r\nfoo");
+        let mut ex = H1Exchange::new(MockConn::new(&resp), plan_get(), false, false);
+        let events = drive_all(&mut ex).await.unwrap();
+        assert_eq!(collect_body(&events), b"foo");
+    }
+
+    #[tokio::test]
+    async fn codec_ignore_content_length_reads_until_close() {
+        // --ignore-content-length (CURLOPT_IGNORE_CONTENT_LENGTH): the server
+        // advertises a huge Content-Length but sends a short body then closes.
+        // With ignore_cl set, the body is read close-delimited and the transfer
+        // SUCCEEDS (no PartialFile despite the under-run). Oracle: tests/data/test269.
+        let resp =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 677654\r\nConnection: close\r\n\r\nmuahahaha\n";
+        let mut ex = H1Exchange::new(MockConn::new(resp), plan_get(), false, false);
+        ex.set_ignore_cl(true);
+        let events = drive_all(&mut ex).await.unwrap();
+        assert_eq!(collect_body(&events), b"muahahaha\n");
+        assert!(
+            !ex.keepalive(),
+            "a close-delimited body cannot keep the connection alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn codec_304_with_content_length_reports_no_body() {
+        // A 304 Not Modified with a (bogus) Content-Length is bodyless by status
+        // (RFC 9110): curl ignores the Content-Length and expects no body. The
+        // codec must report an UNKNOWN length so the transfer layer's short-read
+        // (PartialFile) check is disabled — otherwise the announced 677777 vs the
+        // 0 bytes received would be a spurious PartialFile. Oracle: tests/data/test249.
+        let resp =
+            b"HTTP/1.1 304 Not Modified\r\nContent-Length: 677777\r\nConnection: close\r\n\r\n";
+        let mut ex = H1Exchange::new(MockConn::new(resp), plan_get(), false, false);
+        let events = drive_all(&mut ex).await.unwrap();
+        assert!(collect_body(&events).is_empty(), "a 304 carries no body");
+        let reported = events.iter().find_map(|ev| match ev {
+            ResponseEvent::HeadersComplete { content_length, .. } => Some(*content_length),
+            _ => None,
+        });
+        assert_eq!(
+            reported,
+            Some(None),
+            "a status-bodyless 304 reports an unknown content length (Content-Length ignored)"
+        );
+    }
+
+    #[tokio::test]
+    async fn codec_without_ignore_content_length_short_body_is_partial() {
+        // Sanity (the default the flag overrides): WITHOUT ignore_cl, the same
+        // short body vs the declared length is a PartialFile error.
+        let resp =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 677654\r\nConnection: close\r\n\r\nmuahahaha\n";
+        let mut ex = H1Exchange::new(MockConn::new(resp), plan_get(), false, false);
+        let err = drive_all(&mut ex).await.unwrap_err();
+        assert!(matches!(err, CurlError::PartialFile));
     }
 
     #[tokio::test]

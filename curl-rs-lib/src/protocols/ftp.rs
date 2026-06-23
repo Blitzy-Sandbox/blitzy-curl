@@ -49,6 +49,7 @@
 //! not re-declared here.
 
 use std::mem;
+use std::path::Path;
 
 // Connection layer: the DUAL-socket plumbing and the byte-level send/recv used
 // for the data channel. Control-channel I/O goes through the ping-pong engine
@@ -58,13 +59,15 @@ use crate::conn::https_connect::create_tls_filter;
 use crate::conn::socket::{is_tcp_listen, tcp_listen_set};
 use crate::conn::{
     establish_connection, BoxFuture, ConnSetup, Connection, Curl_conn_cf_add, Curl_conn_close,
-    Curl_conn_connect, Curl_conn_get_ip_info, Curl_conn_is_ssl, Curl_conn_recv, Curl_conn_send,
+    Curl_conn_connect, Curl_conn_get_ip_info, Curl_conn_is_alive, Curl_conn_is_ssl, Curl_conn_recv,
+    Curl_conn_send,
     SchemeDescriptor, CURL_CF_SSL_DISABLE, CURL_CF_SSL_ENABLE, FIRSTSOCKET, SECONDARYSOCKET,
     TRNSPRT_TCP,
 };
 use crate::dns::{self, DnsCache, IpVersion, ResolveParams, ResolvedAddrs};
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
+use crate::protocols::file::format_last_modified_header;
 use crate::protocols::ftp_list::{FileInfo, FileType, FtpParseListData, WildcardData, WildcardState};
 use crate::protocols::pingpong::{tls_config_from_easy, PingPong, PingPongProtocol, PpTransfer};
 use crate::protocols::{
@@ -79,7 +82,8 @@ use crate::transfer::{
 // only way to read the requested transfer method (upload vs download) is to
 // name it. This mirrors the established convention in `protocols::smb` and
 // `protocols::rtsp`, which import `crate::setopt` types for the same reason.
-use crate::setopt::HttpReq;
+use crate::netrc::{self, CurlNetrcOption};
+use crate::setopt::{HttpReq, StrId};
 use crate::url::{CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_GUESS_SCHEME, CURLU_URLDECODE};
 use crate::util::fnmatch::{curl_fnmatch, FnMatch};
 use crate::util::sendf;
@@ -404,9 +408,63 @@ pub struct FtpConn {
     /// A file size discovered during wildcard `LIST` parsing, or `-1`
     /// (C `known_filesize`).
     pub known_filesize: i64,
+    /// The maximum number of body bytes to download for this transfer, or `-1`
+    /// for "no cap / open-ended" (C `data->req.maxdownload`). A bounded
+    /// `CURLOPT_RANGE` (`-r X-Y` or `-r -N`) parsed by [`Curl_range`-equivalent]
+    /// [`crate::protocols::file::parse_range`] yields `maxdownload >= 0`; an
+    /// open-ended `-r X-` or a plain `-C n` resume leaves it `-1`. When a
+    /// bounded range is in force the engine reads at most `maxdownload` bytes,
+    /// then [`ftp_done`](Self::ftp_done) sends `ABOR` to stop the server early
+    /// (C `ftp_done`: `if(dont_check && req.maxdownload > 0) ABOR`). See
+    /// `tests/data/test135` (`-r 4-16`: `REST 4`/`RETR`/`ABOR`/`QUIT`).
+    pub maxdownload: i64,
+    /// The effective absolute resume/start offset for the current *download*
+    /// (the `REST` offset), folded from either a `CURLOPT_RANGE` start or a
+    /// `CURLOPT_RESUME_FROM` (`-C n`). Used by the partial-file check so that
+    /// the expected length is `known_filesize - xfer_resume_off`, not the full
+    /// announced size — a `CURLOPT_RANGE` start does **not** flow through
+    /// `set.set_resume_from`, so without this the bytes received after a `REST`
+    /// would be misread as a premature/partial transfer (see
+    /// `tests/data/test2307`, `-r 4-1000` with the end past EOF). `0` for a
+    /// non-resumed transfer.
+    pub xfer_resume_off: i64,
+    /// The source offset to skip when *resuming an upload* (C
+    /// `ftp_state_ul_setup`: the first `resume_from` bytes are already on the
+    /// server, so curl advances the source past them and `APPE`nds the rest).
+    /// `0` for a non-resumed upload. Applied in
+    /// [`run_upload_body`](Self::run_upload_body) by reading and discarding this
+    /// many bytes from the source (mirroring C's `CURL_SEEKFUNC_CANTSEEK`
+    /// fallback, since the read callback has no seek). See `tests/data/test112`
+    /// (`-T file -C 41`, whose wire uses `APPE` and uploads only the bytes past
+    /// offset 41).
+    pub upload_resume_from: i64,
+    /// Force the `APPE` verb (append) for this upload instead of `STOR`, even
+    /// when `CURLOPT_APPEND` is not set. Set by the upload-resume path (C
+    /// `ftp_state_ul_setup`: `append = TRUE;` whenever `resume_from > 0`), so a
+    /// resumed upload appends its remaining bytes to the partial file rather
+    /// than truncating it.
+    pub upload_append: bool,
     /// General-purpose state-machine counter 1 — for FTP it toggles
     /// `EPSV (0)` vs `PASV (1)` and `EPRT (0)` vs `PORT (1)` (C `count1`).
     pub count1: i32,
+    /// Connection-level "EPSV has been disabled for this connection" flag — the
+    /// Rust analog of C clearing `conn->bits.ftp_use_epsv` in
+    /// `ftp_epsv_disable` (lib/ftp.c L1858). Once an `EPSV` is refused and the
+    /// session falls back to `PASV`, every later passive negotiation on the
+    /// SAME (reused) control connection skips `EPSV` and uses `PASV` directly
+    /// (`tests/data/test211`). Connection-lifetime: preserved across reuse,
+    /// never re-enabled for the connection. Defaults `false` (EPSV permitted),
+    /// so a fresh connection and the unit tests behave exactly as before.
+    pub epsv_disabled: bool,
+    /// Connection-level "EPRT has been disabled for this connection" flag — the
+    /// active-mode analog of [`epsv_disabled`](Self::epsv_disabled), mirroring
+    /// C clearing `conn->bits.ftp_use_eprt` after an `EPRT` refusal. Once
+    /// `EPRT` is refused and the session falls back to `PORT`, every later
+    /// active negotiation on the SAME (reused) control connection uses `PORT`
+    /// directly (`tests/data/test212`). Connection-lifetime: preserved across
+    /// reuse. Defaults `false` (EPRT permitted), keeping fresh connections and
+    /// the unit tests unchanged.
+    pub eprt_disabled: bool,
     /// General-purpose state-machine counter 2 (C `count2`).
     pub count2: i32,
     /// General-purpose state-machine counter 3 (C `count3`).
@@ -475,6 +533,27 @@ pub struct FtpConn {
     /// or after a successful `AUTH TLS` upgrade (C
     /// `conn->bits.ftp_use_control_ssl`). Gates the `PBSZ`/`PROT` sequence.
     pub control_ssl: bool,
+    /// Effective per-transfer ASCII preference (C `data->state.prefer_ascii`).
+    /// Seeded from `CURLOPT_TRANSFERTEXT` (`data.set.prefer_ascii`) and then
+    /// possibly overridden by a URL `;type=A`/`;type=I` suffix
+    /// ([`type_url_check`]). Held here — rather than mutating the persistent
+    /// `data.set` — so the override is scoped to this transfer exactly as C's
+    /// per-request `state` is, and does not leak onto a reused easy handle.
+    pub prefer_ascii: bool,
+    /// Effective per-transfer directory-listing preference
+    /// (C `data->state.list_only`). Seeded from `CURLOPT_DIRLISTONLY`
+    /// (`data.set.list_only`) and possibly forced on by a URL `;type=D` suffix
+    /// ([`type_url_check`]). Selects `NLST` over `LIST` and marks the operation
+    /// as a directory listing.
+    pub list_only: bool,
+    /// Set when the URL path failed to url-decode because it contains a control
+    /// byte (`< 0x20`), e.g. a percent-encoded `%00`. curl performs this
+    /// `REJECT_CTRL` decode inside `ftp_parse_url_path` (lib/ftp.c L221-224),
+    /// which runs in the DO phase — *after* login — so the malformed path is
+    /// recorded here at setup time and surfaced as `CURLE_URL_MALFORMAT` at the
+    /// start of `run_do_phase`, with `USER`/`PASS`/`PWD` already on the wire
+    /// (`tests/data/test340`).
+    pub path_malformed: bool,
 }
 
 impl FtpConn {
@@ -486,6 +565,10 @@ impl FtpConn {
         FtpConn {
             pp: PingPong::new(),
             known_filesize: -1,
+            maxdownload: -1,
+            xfer_resume_off: 0,
+            upload_resume_from: 0,
+            upload_append: false,
             state: FtpState::Stop,
             port_cmd: PortCmd::Eprt,
             // curl's anonymous-login defaults when the URL carries no userinfo.
@@ -667,6 +750,80 @@ pub fn format_port_command(host: &str, port: u16) -> String {
     format!("PORT {target}")
 }
 
+/// Extract the advertised *address* from a `CURLOPT_FTPPORT` (`--ftp-port`/`-P`)
+/// value, the Rust analog of the address-parsing arm of C `ftp_state_use_port`
+/// (lib/ftp.c L912-L1010).
+///
+/// curl only parses an address when the option string is **longer than one
+/// character**; the single-character default `"-"` (and the empty string) mean
+/// "advertise the control connection's local IP", for which this returns
+/// `None`. The accepted grammar is `(ipv4|ipv6|domain|interface)?(:port-range)?`:
+///
+/// * `[ipv6]:port` → the bracketed IPv6 literal;
+/// * a bare IPv6 literal (parses as `Ipv6Addr`, has no port) → used whole;
+/// * otherwise the text up to the first `:` is the address and any trailing
+///   `:port(-range)` is dropped (the local listener still binds an ephemeral
+///   port — no test exercises an explicit `-P` port range).
+///
+/// An interface name is returned verbatim (curl resolves it via `Curl_if2ip`;
+/// no test relies on interface-name resolution, and a literal IP — the
+/// `IF2IP_NOT_FOUND` arm — is used as-is, exactly as here). See
+/// `tests/data/test116` (`-P 1.2.3.4`) and `tests/data/test251` (`-P %CLIENTIP`).
+/// Apply curl's `CURLOPT_CRLF` (`--crlf`) line-ending conversion to one chunk
+/// of upload data, the Rust analog of C `cr_lc_read` (lib/sendf.c L981-L1058).
+///
+/// A lone `\n` — one **not** immediately preceded by a `\r` — is expanded to
+/// `\r\n`; an `\n` that already follows a `\r` (an existing CRLF pair) is left
+/// unchanged. `prev_cr` carries the "previous byte was CR" state across chunk
+/// boundaries so a `\r` ending one read and an `\n` starting the next are
+/// correctly recognized as an already-converted pair (C `ctx->prev_cr`). The
+/// converted bytes are appended to `out`. See `tests/data/test128`.
+fn crlf_convert_chunk(chunk: &[u8], prev_cr: &mut bool, out: &mut Vec<u8>) {
+    for &b in chunk {
+        if b == b'\n' && !*prev_cr {
+            // Lone LF → CRLF (C: emit "\r\n", reset prev_cr).
+            out.push(b'\r');
+            out.push(b'\n');
+            *prev_cr = false;
+        } else {
+            out.push(b);
+            *prev_cr = b == b'\r';
+        }
+    }
+}
+
+#[must_use]
+pub fn parse_ftpport_address(spec: &str) -> Option<String> {
+    // C gate: `strlen(STRING_FTPPORT) > 1`. "-" (the default) is length 1.
+    if spec.len() <= 1 {
+        return None;
+    }
+    // `[ipv6]:port(-range)`
+    if let Some(rest) = spec.strip_prefix('[') {
+        return rest
+            .split(']')
+            .next()
+            .filter(|ip| !ip.is_empty())
+            .map(str::to_string);
+    }
+    // `:port` — only a port was given, no address.
+    if spec.starts_with(':') {
+        return None;
+    }
+    // A bare IPv6 literal (e.g. `::1`, `fe80::1`) contains ':' but parses as an
+    // address and carries no port; use it whole (C `inet_pton(AF_INET6, ...)`).
+    if spec.parse::<std::net::Ipv6Addr>().is_ok() {
+        return Some(spec.to_string());
+    }
+    // `ipv4|domain|interface` optionally followed by `:port(-range)`.
+    let addr = spec.split(':').next().unwrap_or(spec);
+    if addr.is_empty() {
+        None
+    } else {
+        Some(addr.to_string())
+    }
+}
+
 /// Decomposes a URL-decoded FTP path into the directory components to `CWD`
 /// through and the terminal file name, the Rust analog of C
 /// `ftp_parse_url_path`.
@@ -688,11 +845,7 @@ pub fn format_port_command(host: &str, port: u16) -> String {
 /// The returned `cwddone` reflects only the `NOCWD` + absolute-path rule; the
 /// connection-reuse refinement (comparing against the previous transfer's path)
 /// is applied by the caller, which has access to the reuse state.
-pub fn decompose_url_path(
-    method: CurlFtpFile,
-    rawpath: &str,
-    is_upload: bool,
-) -> Result<PathDecomp> {
+pub fn decompose_url_path(method: CurlFtpFile, rawpath: &str) -> Result<PathDecomp> {
     let bytes = rawpath.as_bytes();
     let path_len = bytes.len();
     let mut dirs: Vec<PathComp> = Vec::new();
@@ -753,10 +906,14 @@ pub fn decompose_url_path(
         }
     }
 
-    // An upload requires a target file name (C `CURLE_URL_MALFORMAT`).
-    if is_upload && file.is_none() {
-        return Err(CurlError::UrlMalformat);
-    }
+    // NOTE: an upload to a path that names no file (e.g. one ending in `/`)
+    // is malformed (`CURLE_URL_MALFORMAT`), but curl does **not** raise that
+    // here. C performs the check in `ftp_parse_url_path` during the DO phase
+    // (lib/ftp.c L310-313), which runs *after* the control connection has
+    // logged in — so the error must surface with `USER`/`PASS`/`PWD` already
+    // on the wire (see `run_do_phase` and `tests/data/test524`/`lib524`). This
+    // function only splits the path; the upload-without-filename decision is
+    // made by the caller from `file.is_none()`.
 
     // CWD can be skipped for absolute paths under NOCWD.
     let cwddone = method == CurlFtpFile::NoCwd && bytes.first() == Some(&b'/');
@@ -777,6 +934,34 @@ pub fn ftp_type_arg(prefer_ascii: bool) -> u8 {
         b'A'
     } else {
         b'I'
+    }
+}
+
+/// Detect a trailing FTP `;type=<typecode>` URL extension and return its
+/// (upper-cased) type code, or `None` when the path carries no such suffix.
+///
+/// This is the detection half of curl's `type_url_check` (C: lib/ftp.c
+/// L4226-4253). The check is performed on the *encoded* path, exactly as curl
+/// runs it on `ftp->path` before URL-decoding: a path qualifies when it is at
+/// least 7 bytes long and ends with the literal six-byte tag `;type=` followed
+/// by a single type character. The caller maps the returned code to the
+/// per-transfer preferences — `A` ⇒ ASCII (`prefer_ascii`), `D` ⇒ directory
+/// listing (`list_only`), `I` (or anything else) ⇒ binary — and strips the
+/// 7-byte suffix from the path before CWD decomposition.
+///
+/// The suffix is always literal ASCII (`;type=X`), so it is byte-identical in
+/// the encoded and decoded forms; the caller can therefore detect it here on
+/// the encoded path yet remove the final 7 characters from the decoded path.
+#[must_use]
+pub fn type_url_check(path: &str) -> Option<u8> {
+    let bytes = path.as_bytes();
+    let len = bytes.len();
+    // C: `if((len >= 7) && !memcmp(&ftp->path[len - 7], ";type=", 6))`.
+    if len >= 7 && &bytes[len - 7..len - 1] == b";type=" {
+        // C: `command = Curl_raw_toupper(type[6])` — the type character.
+        Some(bytes[len - 1].to_ascii_uppercase())
+    } else {
+        None
     }
 }
 
@@ -875,6 +1060,20 @@ impl PingPongProtocol for FtpConn {
                 return Ok(());
             }
 
+            // Store the latest **final** FTP response code so it is retrievable
+            // via `CURLINFO_RESPONSE_CODE` (`getinfo`), except during shutdown —
+            // the Rust analog of C `ftp_readresp` (lib/ftp.c L601-603):
+            //   `if(!ftpc->shutdown) data->info.httpcode = code;`
+            // Without this, a transfer that fails on a control-channel reply
+            // (e.g. `430` on `PASS` → `CURLE_LOGIN_DENIED`) leaves the recorded
+            // response code at 0, so the CLI retry machinery (`retrycheck`,
+            // which retries FTP when `response / 100 == 4`) never fires and
+            // `%{num_retries}` stays 0 (QA test 196). HTTP records this in the
+            // transfer engine (`http::mod.rs`); FTP must do so here.
+            if !self.shutdown {
+                data.info.response_code = i64::from(code);
+            }
+
             self.advance(data, conn, code).await
         })
     }
@@ -916,11 +1115,26 @@ impl FtpConn {
         let mut sent = 0usize;
         while sent < bytes.len() {
             match Curl_conn_send(conn, FIRSTSOCKET, &bytes[sent..], false).await {
-                Ok(0) => return Err(CurlError::SendError),
+                // A failed write on the *control* channel means the connection
+                // is no longer usable. Mark it dead so the teardown sends no
+                // `QUIT` and does not wait in vain on a half-closed peer — the
+                // exact role of C's `ctl_valid`, which `ftp_disconnect` clears
+                // for a dead connection before `ftp_quit` consults it
+                // (lib/ftp.c L4172-4178). A *protocol* error (a successfully
+                // read non-2xx reply such as `550`) does **not** reach here and
+                // so leaves `ctl_valid` set, exactly as curl keeps the control
+                // connection alive and still sends `QUIT` after, e.g., a `550`.
+                Ok(0) => {
+                    self.ctl_valid = false;
+                    return Err(CurlError::SendError);
+                }
                 Ok(n) => sent += n,
                 // Would-block: yield and retry (the runtime awaits writability).
                 Err(CurlError::Again) => tokio::task::yield_now().await,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.ctl_valid = false;
+                    return Err(e);
+                }
             }
         }
         Ok(())
@@ -1331,6 +1545,35 @@ pub fn parse_size_213(reply: &[u8]) -> Option<i64> {
     token.parse::<i64>().ok().filter(|&n| n >= 0)
 }
 
+/// Parse an FTP `MDTM` `213 YYYYMMDDHHMMSS[.sss]` reply into a Unix timestamp,
+/// the Rust analog of C `ftp_state_mdtm_resp` (`ftp_213_date` + the
+/// `"%04d%02d%02d %02d:%02d:%02d GMT"` reformat handed to
+/// `Curl_getdate_capped`, lib/ftp.c L2420-L2433). The reply carries the
+/// modification time as a compact `YYYYMMDDHHMMSS` token (an optional `.sss`
+/// fractional-seconds suffix is ignored, exactly as curl does). Returns `None`
+/// when the reply is not a parseable `213` timestamp — the caller then simply
+/// omits the synthetic `Last-Modified` header (C "unsupported MDTM reply
+/// format").
+#[must_use]
+pub fn parse_mdtm_213(reply: &[u8]) -> Option<i64> {
+    let text = core::str::from_utf8(reply).ok()?;
+    // Skip the 3-digit code and following whitespace, then take the first token.
+    let rest = text.get(3..)?.trim_start();
+    let token = rest.split_whitespace().next()?;
+    // Collect the leading run of ASCII digits (drops any `.sss` fraction).
+    let digits: String = token.chars().take_while(char::is_ascii_digit).collect();
+    if digits.len() < 14 {
+        return None;
+    }
+    let (y, mo, d) = (&digits[0..4], &digits[4..6], &digits[6..8]);
+    let (h, mi, s) = (&digits[8..10], &digits[10..12], &digits[12..14]);
+    // Reformat exactly as curl does, then run it through the same getdate path
+    // so the resulting `time_t` (and thus the emitted `Last-Modified` and
+    // `CURLINFO_FILETIME_T`) is byte-for-byte identical to the C tool.
+    let formatted = format!("{y}{mo}{d} {h}:{mi}:{s} GMT");
+    crate::util::parsedate::getdate_capped(&formatted)
+}
+
 // ===========================================================================
 // Data connection — passive (PASV / EPSV) and active (PORT / EPRT).
 // (C `ftp_state_use_pasv`, `ftp_state_pasv_resp`, `ftp_epsv_disable`,
@@ -1343,8 +1586,17 @@ impl FtpConn {
     /// else `PASV`, records the attempt in [`FtpConn::count1`] (`0` = EPSV,
     /// `1` = PASV), and enters [`FtpState::Pasv`].
     pub async fn send_pasv(&mut self, data: &mut Easy, conn: &mut Connection) -> Result<()> {
-        // C `mode[][5] = { "EPSV", "PASV" }`; `modeoff = ftp_use_epsv ? 0 : 1`.
-        let modeoff = if data.set.ftp_use_epsv { 0 } else { 1 };
+        // C `mode[][5] = { "EPSV", "PASV" }`; `modeoff = ftp_use_epsv ? 0 : 1`,
+        // where curl's `conn->bits.ftp_use_epsv` is the option AND-ed with the
+        // not-yet-disabled connection flag. A prior `EPSV` refusal on THIS
+        // (reused) connection latches `epsv_disabled`, so the negotiation goes
+        // straight to `PASV` (`tests/data/test211`); on a fresh connection
+        // `epsv_disabled` is `false`, leaving the choice identical to before.
+        let modeoff = if data.set.ftp_use_epsv && !self.epsv_disabled {
+            0
+        } else {
+            1
+        };
         let cmd = if modeoff == 0 { "EPSV" } else { "PASV" };
         self.send_cmd(data, conn, cmd).await?;
         self.count1 = modeoff;
@@ -1359,6 +1611,11 @@ impl FtpConn {
         if data.set.verbose {
             sendf::infof(true, "Failed EPSV attempt. Disabling EPSV");
         }
+        // Latch EPSV off for the lifetime of this (possibly-reused) connection,
+        // mirroring C `conn->bits.ftp_use_epsv = FALSE` (lib/ftp.c L1858): a
+        // subsequent transfer on the same control channel will start with
+        // `PASV` and not re-probe `EPSV` (`tests/data/test211`).
+        self.epsv_disabled = true;
         self.send_cmd(data, conn, "PASV").await?;
         self.count1 += 1;
         self.set_state(FtpState::Pasv);
@@ -1579,10 +1836,31 @@ impl FtpConn {
         );
         debug_assert!(is_tcp_listen(&conn.cfilter[SECONDARYSOCKET]));
 
-        // Advertise the local endpoint. Prefer EPRT (works for IPv4 and IPv6),
+        // Advertise the endpoint. Prefer EPRT (works for IPv4 and IPv6),
         // falling back to PORT for IPv4 (C `mode[][5] = { "EPRT", "PORT" }`).
-        let is_ipv6 = local.is_ipv6();
-        let host = local.ip().to_string();
+        //
+        // The advertised *address* honors `CURLOPT_FTPPORT` (`--ftp-port`/`-P`):
+        // when an explicit address is given (option longer than one char), curl
+        // advertises *that* address rather than the bound local IP (C
+        // `ftp_state_use_port`; lib/ftp.c L912-L1010). The local listener still
+        // binds an ephemeral local port; only the advertised IP changes. The
+        // single-char default `-` advertises the control connection's local IP.
+        // See `tests/data/test116` (`-P 1.2.3.4` → `EPRT |1|1.2.3.4|`).
+        let advertised = data
+            .set
+            .str(StrId::Ftpport)
+            .and_then(parse_ftpport_address);
+        let host = match advertised {
+            Some(ref a) => a.clone(),
+            None => local.ip().to_string(),
+        };
+        // The EPRT family selector (`|1|` IPv4, `|2|` IPv6) follows the
+        // advertised address's family when one was specified, else the bound
+        // socket's family.
+        let is_ipv6 = match advertised {
+            Some(ref a) => a.parse::<std::net::Ipv6Addr>().is_ok(),
+            None => local.is_ipv6(),
+        };
         let port = local.port();
         let cmd = match self.port_cmd {
             PortCmd::Eprt => format_eprt_command(&host, port, is_ipv6),
@@ -1616,6 +1894,11 @@ impl FtpConn {
             if data.set.verbose {
                 sendf::infof(true, "disabling EPRT usage");
             }
+            // Latch EPRT off for the lifetime of this (possibly-reused)
+            // connection (C clears `conn->bits.ftp_use_eprt`): a subsequent
+            // active transfer on the same control channel starts with `PORT`
+            // and does not re-probe `EPRT` (`tests/data/test212`).
+            self.eprt_disabled = true;
             self.port_cmd = PortCmd::Port;
             self.setup_active(data, conn).await?;
             Ok(false)
@@ -1940,6 +2223,48 @@ fn install_ftp_disconnect_hook(conn: &mut Connection) {
     }));
 }
 
+/// Graceful end-of-run drain of FTP control connections left alive in the
+/// shared connection pool for reuse (the synchronous easy/CLI analog of curl
+/// tearing down its connection cache in `Curl_cpool_destroy`).
+///
+/// A reused FTP connection is **not** QUITed inline at the end of its transfer
+/// (see [`perform_ftp`]'s tail); it is checked back into the pool so a
+/// subsequent same-host transfer can reuse it. Whatever connection remains in
+/// the pool after the final transfer must therefore receive its deferred,
+/// best-effort `QUIT` here, while the Tokio runtime is still live — producing
+/// the single trailing `QUIT` the curl oracle expects (e.g.
+/// `tests/data/test215`). For a single transfer this is wire-identical to the
+/// previous inline teardown: the transfer's commands, then `QUIT`.
+///
+/// Each pooled connection still carrying an [`FtpConn`] proto-state is handed to
+/// [`FtpHandler::disconnect`] (which only reads `data.set.verbose` from the
+/// handle, so a throwaway [`Easy`] drives it faithfully); connections without
+/// FTP state — e.g. pooled HTTP keep-alives — are simply dropped here, which
+/// force-closes their sockets exactly as the pool's own `Drop` did. `verbose`
+/// is propagated to the throwaway handle so the internal `> QUIT` trace is
+/// still emitted under `-v`/`CURLOPT_VERBOSE`.
+pub async fn ftp_drain_pool(pool: &crate::conn::SharedPool, verbose: bool) {
+    let conns = crate::conn::pool_take_all(pool);
+    if conns.is_empty() {
+        return;
+    }
+    let handler = FtpHandler::new(&SCHEME_FTP);
+    let mut throwaway = Easy::new();
+    throwaway.set.verbose = verbose;
+    for mut conn in conns {
+        if conn.proto_state_ref::<FtpConn>().is_some() {
+            // Best-effort graceful `QUIT` + socket close; failures are ignored
+            // (a dying peer must never block teardown). Only connections checked
+            // in with a still-valid control channel reach here, so `disconnect`
+            // sends the `QUIT` exactly as the prior inline path did.
+            let _ = handler.disconnect(&mut throwaway, &mut conn, false).await;
+        }
+        // `conn` drops at the end of the loop body: a non-FTP connection (or an
+        // FTP one after its `QUIT`) has its sockets force-closed here, matching
+        // the connection pool's previous `Drop`-time teardown.
+    }
+}
+
 impl Protocol for FtpHandler {
     fn scheme(&self) -> &'static Scheme {
         self.scheme
@@ -1968,43 +2293,258 @@ impl Protocol for FtpHandler {
             // *no* directory component (and so emits no `CWD`), matching
             // `tests/data/test102`; a leading double slash (`//abs/file`) keeps
             // exactly one slash, expressing an absolute path that CWDs to root.
-            let raw_path = {
-                let decoded = url
-                    .get(CurlUPart::Path, CURLU_URLDECODE)
+            // FTP URLs may carry a trailing `;type=<typecode>` extension
+            // (C `type_url_check`, lib/ftp.c L4226-4253). curl detects it on the
+            // *encoded* path before decoding, so do the same: read the encoded
+            // path (leading '/' dropped, as for `ftp->path`) and probe for the
+            // suffix.
+            let encoded_path = {
+                let p = url
+                    .get(CurlUPart::Path, 0)
                     .map_err(|_| CurlError::UrlMalformat)?;
-                decoded
-                    .strip_prefix('/')
-                    .unwrap_or(&decoded)
-                    .to_string()
+                p.strip_prefix('/').unwrap_or(&p).to_string()
+            };
+            let type_code = type_url_check(&encoded_path);
+
+            // Seed the per-transfer ASCII / directory-listing preferences from
+            // the options (C copies `data->set.*` into `data->state.*` per
+            // request), then apply any URL `;type=` override: `A` ⇒ ASCII,
+            // `D` ⇒ directory listing, `I`/other ⇒ binary. These are stored on
+            // the (per-transfer) `FtpConn` rather than mutated onto the
+            // persistent `data.set`, so the override cannot leak onto a reused
+            // easy handle.
+            let mut prefer_ascii = data.set.prefer_ascii;
+            let mut list_only = data.set.list_only;
+            match type_code {
+                Some(b'A') => prefer_ascii = true,
+                Some(b'D') => list_only = true,
+                Some(_) => prefer_ascii = false, // 'I' and any other code
+                None => {}
+            }
+
+            // C `ftp->path = &data->state.up.path[1]` — the URL path (always
+            // rooted with a leading '/') is taken WITHOUT that initial slash
+            // before CWD decomposition. Thus `ftp://host/file` decomposes to
+            // *no* directory component (and so emits no `CWD`), matching
+            // `tests/data/test102`; a leading double slash (`//abs/file`) keeps
+            // exactly one slash, expressing an absolute path that CWDs to root.
+            // The `;type=X` suffix (7 literal ASCII bytes, identical encoded and
+            // decoded) is removed here, mirroring C's `*type = 0` cut, so it
+            // never reaches the CWD/RETR path.
+            // The url-decode of the path uses `REJECT_CTRL` semantics
+            // (`CURLU_URLDECODE` → `escape::urldecode(.., UrlReject::Ctrl)`), so
+            // a control byte such as a percent-encoded `%00` makes it fail. curl
+            // performs that REJECT_CTRL decode inside `ftp_parse_url_path` — in
+            // the DO phase, *after* login (lib/ftp.c L221-224) — so a failure
+            // here must NOT abort before the control connection logs in. Record
+            // the malformed state instead and surface `CURLE_URL_MALFORMAT` at
+            // the start of `run_do_phase` (`tests/data/test340`). The success
+            // path is unchanged.
+            let mut path_malformed = false;
+            let raw_path = match url.get(CurlUPart::Path, CURLU_URLDECODE) {
+                Ok(decoded) => {
+                    let decoded = decoded.strip_prefix('/').unwrap_or(&decoded);
+                    let trimmed = if type_code.is_some() {
+                        &decoded[..decoded.len().saturating_sub(7)]
+                    } else {
+                        decoded
+                    };
+                    trimmed.to_string()
+                }
+                Err(_) => {
+                    path_malformed = true;
+                    String::new()
+                }
             };
 
+            // On a reused control connection, carry the connection-lifetime FTP
+            // state across into the fresh per-transfer state: the live
+            // ping-pong engine and its control buffers, the login `entrypath`,
+            // the `prevpath` left by the previous transfer (the basis for the
+            // same-path / delta-CWD decision below), the negotiated
+            // `transfertype` (so `ftp_need_type` can elide a redundant `TYPE`),
+            // the server OS, and the control-channel TLS flag. A fresh
+            // connection starts from `FtpConn::new()` defaults. Every
+            // *per-transfer* field is taken from the fresh `FtpConn::new()` (and
+            // overwritten below from the new URL/options), so no stale request
+            // state leaks across the reuse — only the genuinely
+            // connection-lifetime fields survive.
             let mut ftpc = FtpConn::new();
-            if let Ok(user) = url.get(CurlUPart::User, CURLU_URLDECODE) {
-                if !user.is_empty() {
-                    ftpc.user = user;
+            let mut reuse_prevpath: Option<String> = None;
+            if conn.bits.reuse {
+                if let Some(prev) = conn
+                    .take_proto_state()
+                    .and_then(|b| b.downcast::<FtpConn>().ok().map(|b| *b))
+                {
+                    ftpc.pp = prev.pp;
+                    ftpc.entrypath = prev.entrypath;
+                    ftpc.transfertype = prev.transfertype;
+                    ftpc.server_os = prev.server_os;
+                    ftpc.control_ssl = prev.control_ssl;
+                    // The control channel was validated at login and remains
+                    // usable for the deferred `QUIT`; it is set true only in
+                    // `connect()`, which reuse skips, so carry it forward (else
+                    // teardown would silently drop the connection without the
+                    // pooled, drained `QUIT` — `tests/data/test215`).
+                    ftpc.ctl_valid = prev.ctl_valid;
+                    // A prior `EPSV` refusal stays disabled for the connection
+                    // (C `conn->bits.ftp_use_epsv` is never re-enabled); the
+                    // reused transfer goes straight to `PASV` (test211). The
+                    // active-mode `EPRT` refusal latches the same way (test212).
+                    ftpc.epsv_disabled = prev.epsv_disabled;
+                    ftpc.eprt_disabled = prev.eprt_disabled;
+                    reuse_prevpath = prev.prevpath;
+                    // Carry the previous directory forward so `ftp_done`'s
+                    // NOCWD-absolute "keep existing prevpath" branch sees it.
+                    ftpc.prevpath = reuse_prevpath.clone();
                 }
             }
-            if let Ok(pass) = url.get(CurlUPart::Password, CURLU_URLDECODE) {
-                if !pass.is_empty() {
-                    ftpc.passwd = pass;
+            // Record the resolved per-transfer transfer-mode preferences.
+            ftpc.prefer_ascii = prefer_ascii;
+            ftpc.list_only = list_only;
+            ftpc.path_malformed = path_malformed;
+
+            // Resolve the login credentials with curl's exact precedence
+            // (C `override_login`, lib/url.c L2575, plus the create_conn comment
+            // at L1761-1763: "username and password set with their own options
+            // override the credentials possibly set in the URL, but netrc does
+            // not"):
+            //   1. explicit `-u user:password` (CURLOPT_USERPWD →
+            //      `StrId::Username`/`StrId::Password`) overrides the URL
+            //      userinfo on a per-field basis (CREDS_OPTION > CREDS_URL);
+            //   2. the URL userinfo seeds any field `-u` did not set;
+            //   3. `.netrc` (when `CURLOPT_NETRC` is enabled AND no `-u`
+            //      *username* was given) fills the remaining gaps.
+            // Anything still unset falls back to curl's anonymous defaults
+            // (`anonymous` / `ftp@example.com`), already seeded by
+            // `FtpConn::new()`.
+            let explicit_user = data.set.str(StrId::Username).map(str::to_string);
+            let explicit_pass = data.set.str(StrId::Password).map(str::to_string);
+
+            // URL userinfo (empty userinfo is treated as absent, matching the
+            // C `CURLUE_NO_USER`/`CURLUE_NO_PASSWORD` handling).
+            let url_user = url
+                .get(CurlUPart::User, CURLU_URLDECODE)
+                .ok()
+                .filter(|u| !u.is_empty());
+            let url_pass = url
+                .get(CurlUPart::Password, CURLU_URLDECODE)
+                .ok()
+                .filter(|p| !p.is_empty());
+
+            // `CURLOPT_NETRC` mode (0=ignored / 1=optional / 2=required).
+            let netrc_opt = CurlNetrcOption::from_long(i64::from(data.set.use_netrc))
+                .unwrap_or(CurlNetrcOption::Ignored);
+
+            // For `CURL_NETRC_REQUIRED` curl discards the URL-supplied
+            // credentials up front so `.netrc` fully overrides them
+            // (C `override_login` L2591-2593); the URL username is still kept as
+            // the `.netrc` lookup hint below. Otherwise the URL userinfo is the
+            // seed.
+            let (mut user, mut passwd) = if netrc_opt == CurlNetrcOption::Required {
+                (None, None)
+            } else {
+                (url_user.clone(), url_pass.clone())
+            };
+
+            // `-u` overrides the URL for each field independently.
+            if explicit_user.is_some() {
+                user = explicit_user.clone();
+            }
+            if explicit_pass.is_some() {
+                passwd = explicit_pass.clone();
+            }
+
+            // `.netrc`: consulted only when enabled AND `-u` supplied no
+            // username (C `use_netrc && !STRING_USERNAME`), and only while the
+            // password is still unset (C guards the lookup with `if(!*passwdp)`).
+            // The entry is matched by the URL-provided username when one exists
+            // (preserved as the hint even under `REQUIRED`); otherwise the first
+            // host match is taken and supplies the login too.
+            if netrc_opt != CurlNetrcOption::Ignored
+                && explicit_user.is_none()
+                && passwd.is_none()
+            {
+                let host = url.get(CurlUPart::Host, 0).unwrap_or_default();
+                let file = data.set.str(StrId::NetrcFile).map(Path::new);
+                let hint = url_user.as_deref();
+                if let Ok(Some(entry)) = netrc::resolve(netrc_opt, file, &host, hint) {
+                    if user.is_none() {
+                        user = entry.login;
+                    }
+                    if passwd.is_none() {
+                        passwd = entry.password;
+                    }
                 }
             }
 
+            if let Some(u) = user {
+                ftpc.user = u;
+            }
+            if let Some(p) = passwd {
+                ftpc.passwd = p;
+            }
+
+            // CURLOPT_FTP_ACCOUNT / CURLOPT_FTP_ALTERNATIVE_TO_USER
+            // (C `data->set.str[STRING_FTP_ACCOUNT]` /
+            // `STRING_FTP_ALTERNATIVE_TO_USER`): lift the configured strings
+            // onto the FTP state so `state_user_resp` can answer a `332` with
+            // `ACCT <account>` and retry a denied login with the alternative
+            // command. Both stay `None` when the option is unset, matching the
+            // C default of a NULL pointer.
+            ftpc.account = data.set.str(StrId::FtpAccount).map(str::to_string);
+            ftpc.alternative_to_user = data
+                .set
+                .str(StrId::FtpAlternativeToUser)
+                .map(str::to_string);
+
             // Decode the path into directory components + the leaf file name,
-            // per the configured CWD method (C `ftp_parse_url_path`).
+            // per the configured CWD method (C `ftp_parse_url_path`). The
+            // upload-without-filename malformat check is deliberately NOT done
+            // here — it is deferred to the DO phase (`run_do_phase`) so the
+            // login (`USER`/`PASS`/`PWD`) reaches the wire before the error, as
+            // curl does (lib/ftp.c L310-313; `tests/data/test524`).
             let method = CurlFtpFile::from_raw(data.set.ftp_filemethod);
-            let is_upload = data.set.method == HttpReq::Put;
-            let decomp = decompose_url_path(method, &raw_path, is_upload)?;
+            let decomp = decompose_url_path(method, &raw_path)?;
             ftpc.rawpath = raw_path;
             ftpc.dirs = decomp.dirs;
             ftpc.file = decomp.file;
+            // Decide whether ANY `CWD` is needed for this request. On a fresh
+            // connection only the NOCWD-absolute rule applies (`decomp.cwddone`).
+            // On a reused connection curl additionally skips ALL `CWD`s when the
+            // request's directory portion is byte-identical to the previous
+            // transfer's `prevpath` — "Request has same path as previous
+            // transfer" (lib/ftp.c L316-334): the directory length is
+            // `pathLen - strlen(file)` (or `0` for NOCWD); if that prefix equals
+            // `prevpath` exactly, `cwddone = TRUE` and the DO phase goes straight
+            // to the file command (`tests/data/test215`). A differing path
+            // leaves `cwddone = FALSE`, and the CWD state machine first resets to
+            // the login `entrypath` before descending (`test146`, `test149`).
             ftpc.cwddone = decomp.cwddone;
+            if conn.bits.reuse && !ftpc.cwddone {
+                if let Some(prev) = reuse_prevpath {
+                    let dirlen = match method {
+                        CurlFtpFile::NoCwd => 0,
+                        _ => ftpc
+                            .rawpath
+                            .len()
+                            .saturating_sub(ftpc.file.as_ref().map_or(0, String::len)),
+                    };
+                    if ftpc.rawpath.get(..dirlen).unwrap_or("") == prev {
+                        ftpc.cwddone = true;
+                    }
+                }
+            }
 
             // Lift SSL / CCC preferences (consumed by the PBSZ/PROT/CCC arms).
             ftpc.use_ssl = data.set.use_ssl;
             ftpc.ccc = data.set.ftp_ccc;
-            // The active EPRT-vs-PORT preference: EPRT first unless disabled.
-            ftpc.port_cmd = if data.set.ftp_use_eprt {
+            // The active EPRT-vs-PORT preference: EPRT first unless disabled by
+            // the option, OR latched off by a prior EPRT refusal carried across
+            // reuse (`eprt_disabled`, set above from the pooled connection).
+            // On a fresh connection `eprt_disabled` is `false`, leaving the
+            // choice identical to before (`tests/data/test212`).
+            ftpc.port_cmd = if data.set.ftp_use_eprt && !ftpc.eprt_disabled {
                 PortCmd::Eprt
             } else {
                 PortCmd::Port
@@ -2219,12 +2759,82 @@ impl FtpConn {
                 let mut pp = mem::take(&mut self.pp);
                 let res = pp.readresp(data, conn, FIRSTSOCKET, self).await;
                 self.pp = pp;
-                res?
+                match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // A failed *read* on the control channel (peer closed,
+                        // recv error, timeout) means the connection is dead.
+                        // Clear `ctl_valid` so teardown skips `QUIT`, mirroring
+                        // C's `ftp_disconnect` clearing it for a dead connection
+                        // (lib/ftp.c L4172-4178). Note a successfully read
+                        // non-2xx status code returns `Ok((code, _))` below and
+                        // therefore keeps `ctl_valid` set — curl still issues a
+                        // graceful `QUIT` after a protocol error such as `550`.
+                        self.ctl_valid = false;
+                        return Err(e);
+                    }
+                }
             };
             if code != 0 {
                 return Ok(code);
             }
         }
+    }
+
+    /// Send a list of custom FTP commands (`CURLOPT_QUOTE` / `CURLOPT_PREQUOTE`
+    /// / `CURLOPT_POSTQUOTE`) on the control channel, one at a time, reading and
+    /// validating each reply — the Rust analog of C `ftp_state_quote`
+    /// (lib/ftp.c L1721) and the blocking `ftp_sendquote` (lib/ftp.c L3442).
+    ///
+    /// Each entry is sent verbatim followed by `CRLF`; its single reply is read
+    /// and its numeric code inspected. A command prefixed with `*` (which no
+    /// legal FTP verb begins with) is *allowed to fail*: the leading `*` is
+    /// stripped before sending and any reply — including a `>= 400` failure — is
+    /// accepted. Any other command whose reply code is `>= 400` aborts the
+    /// operation with `CURLE_QUOTE_ERROR` (C: "QUOT command failed with %03d").
+    /// Empty entries are skipped (matching C's `if(item->data)` guard).
+    ///
+    /// Used for all three quote phases: `CURLOPT_QUOTE` (after login, before
+    /// `CWD`), `CURLOPT_PREQUOTE` (after `TYPE`, before the transfer command),
+    /// and `CURLOPT_POSTQUOTE` (after a successful transfer's completion
+    /// handshake). See `tests/data/test120`, `test121`, and `test227`.
+    async fn send_quote_list(
+        &mut self,
+        data: &mut Easy,
+        conn: &mut Connection,
+        list: &[std::ffi::CString],
+    ) -> Result<()> {
+        for entry in list {
+            let raw = entry.to_bytes();
+            if raw.is_empty() {
+                continue;
+            }
+            // A leading `*` marks the command as allowed-to-fail; strip it
+            // before sending (C `ftp_state_quote`: `if(cmd[0] == '*')`).
+            let (cmd_bytes, acceptfail) = if raw[0] == b'*' {
+                (&raw[1..], true)
+            } else {
+                (raw, false)
+            };
+            if cmd_bytes.is_empty() {
+                continue;
+            }
+            // FTP control commands are ASCII; a lossy decode is correct for the
+            // send path (`send_cmd` re-encodes to bytes and appends `CRLF`).
+            let cmd = String::from_utf8_lossy(cmd_bytes).into_owned();
+            self.send_cmd(data, conn, &cmd).await?;
+            let code = self.read_one(data, conn).await?;
+            if !acceptfail && code >= 400 {
+                // C: `failf(data, "QUOT command failed with %03d", ftpcode)` /
+                // `"QUOT string not accepted: %s"` → `CURLE_QUOTE_ERROR`.
+                sendf::failf(
+                    &mut conn.filter_data.error_buffer,
+                    &format!("QUOT command failed with {code:03}"),
+                );
+                return Err(CurlError::QuoteError);
+            }
+        }
+        Ok(())
     }
 
     /// Drive the entire FTP DO phase end to end — the Rust analog of the C
@@ -2260,6 +2870,55 @@ impl FtpConn {
         sink: &mut dyn WriteCallbacks,
         source: &mut dyn ReadCallback,
     ) -> Result<()> {
+        // A path that failed to url-decode under `REJECT_CTRL` (a control byte
+        // such as a percent-encoded `%00`) is malformed. C raises this at the
+        // very top of `ftp_parse_url_path` — the url-decode step (lib/ftp.c
+        // L221-224) — which runs in the DO phase, *after* login, and *before*
+        // the upload-without-filename check. Surfacing it here (first, then the
+        // upload check) reproduces that exact ordering and wire: the login
+        // (`USER`/`PASS`/`PWD`) is already sent, then the transfer aborts with
+        // `CURLE_URL_MALFORMAT` before any `QUOTE`/`CWD` (`tests/data/test340`).
+        if self.path_malformed {
+            sendf::failf(
+                &mut conn.filter_data.error_buffer,
+                "path contains control characters",
+            );
+            return Err(CurlError::UrlMalformat);
+        }
+
+        // An upload to a URL that names no file (e.g. a path ending in `/`)
+        // is malformed. C makes this check in `ftp_parse_url_path` (lib/ftp.c
+        // L310-313), which runs at the very start of the DO phase (`ftp_do`) —
+        // *after* the control connection has logged in but *before* any
+        // `QUOTE`/`CWD`. Surfacing it here reproduces that exact wire: the
+        // login (`USER`/`PASS`/`PWD`) is already sent, and the transfer aborts
+        // with `CURLE_URL_MALFORMAT` before issuing any further command (see
+        // `tests/data/test524`/`lib524`).
+        if data.set.method == HttpReq::Put && self.file.is_none() {
+            sendf::failf(
+                &mut conn.filter_data.error_buffer,
+                "Uploading to a URL without a filename",
+            );
+            return Err(CurlError::UrlMalformat);
+        }
+
+        // (0) CURLOPT_QUOTE — custom commands sent immediately after login,
+        // before any `CWD` (C `ftp_do` kicks off `ftp_state_quote(.., FTP_QUOTE)`
+        // at lib/ftp.c L3754, and on exhaustion that state falls through to
+        // `ftp_state_cwd`; lib/ftp.c L1786). See `tests/data/test227`, whose
+        // wire shows `NOOP 1`/`FAIL` immediately after `PWD`, before `EPSV`.
+        // Cloned out of `data.set` so the per-command `send_cmd`/`read_one`
+        // calls can borrow `data` mutably.
+        let quote = data
+            .set
+            .quote
+            .as_ref()
+            .map(|s| s.as_slice().to_vec())
+            .unwrap_or_default();
+        if !quote.is_empty() {
+            self.send_quote_list(data, conn, &quote).await?;
+        }
+
         // (1) CWD through each directory component (C `ftp_state_cwd`). A fresh
         // control connection starts at the server's home dir; CWD walks down to
         // the target directory before the file command runs.
@@ -2269,7 +2928,29 @@ impl FtpConn {
         // carries only RETR/STOR/LIST; APPE (vs STOR) and NLST (vs LIST) are
         // selected here from the option state.
         let is_upload = data.set.method == HttpReq::Put;
-        let is_listing = self.file.is_none() || (data.set.opt_no_body && !is_upload);
+        // C `ftp_do` treats the operation as a directory listing when
+        // `data->state.list_only || !ftpc->file` (lib/ftp.c L2245) — i.e. when
+        // `--list-only`/`;type=d` is in force or the URL named no file (a
+        // directory). NOTE: `--head`/`-I` (`opt_no_body`) on a *file* is NOT a
+        // listing — see the INFO branch below.
+        let is_listing = self.list_only || self.file.is_none();
+
+        // A body-less request on a *file* (`--head`/`-I`) is curl's "INFO"
+        // transfer (C sets `ftp->transfer = PPTRANSFER_INFO` in
+        // `ftp_state_type`). It opens no data connection and issues no
+        // `LIST`/`RETR`: it queries the file's metadata via
+        // `MDTM`/`TYPE`/`SIZE`/`REST 0` and emits HTTP-style headers
+        // (`Last-Modified`/`Content-Length`/`Accept-ranges`). Previously this
+        // case was mis-classified as a directory listing (`EPSV`/`TYPE A`/
+        // `LIST`), the root cause of the `tests/data/test104` and
+        // `tests/data/test141` wire mismatches.
+        if !is_upload && !is_listing && data.set.opt_no_body && self.file.is_some() {
+            // Record the verb as a file operation (not a listing) for any state
+            // observed by the completion path, then run the metadata sequence.
+            self.transfer_kind = TransferKind::Retr;
+            return self.run_info_phase(data, conn, sink).await;
+        }
+
         let (kind, direction) = if is_upload {
             (TransferKind::Stor, TransferDirection::Upload)
         } else if is_listing {
@@ -2278,6 +2959,61 @@ impl FtpConn {
             (TransferKind::Retr, TransferDirection::Download)
         };
         self.transfer_kind = kind;
+
+        // MDTM + time-condition (C `ftp_state_mdtm` / `ftp_state_mdtm_resp`,
+        // lib/ftp.c). For a single *file* transfer in **either direction**, when
+        // the file time was requested (`CURLOPT_FILETIME`) or a time condition
+        // is active (`-z`), query the modification time via `MDTM` *before*
+        // opening the data channel — C `ftp_state_mdtm` gates this on
+        // `(get_filetime || timecondition) && file` regardless of upload vs
+        // download. The wire order is `… / MDTM / EPSV / TYPE / SIZE / RETR` for
+        // a download (`tests/data/test139`) and `… / MDTM / EPSV / TYPE / STOR`
+        // for an upload (`tests/data/test248`). A `213` reply sets
+        // `info.filetime`; a `550`/other reply is non-fatal ("MDTM failed …
+        // continuing"). Directory listings (`LIST`/`NLST`) have no single file
+        // and are excluded.
+        if !is_listing
+            && self.file.is_some()
+            && (data.set.get_filetime || data.set.timecondition != 0)
+        {
+            let f = self.file.clone().unwrap_or_default();
+            self.send_cmd(data, conn, &format!("MDTM {f}")).await?;
+            let code = self.read_one(data, conn).await?;
+            if code == 213 {
+                if let Some(ft) = parse_mdtm_213(&self.last_response) {
+                    data.info.filetime = ft;
+                }
+            }
+
+            // Time-condition gate (C `ftp_state_mdtm_resp`): `IFMODSINCE` (the
+            // `-z "<date>"` default) skips the transfer when the file is NOT
+            // newer (`filetime <= timevalue`); `IFUNMODSINCE` (`-z "-<date>"`)
+            // skips when it IS newer (`filetime > timevalue`). Only applied when
+            // both the parsed filetime and the configured timevalue are
+            // positive, exactly as curl guards it.
+            if data.set.timecondition != 0 {
+                let filetime = data.info.filetime;
+                let timevalue = data.set.timevalue;
+                if filetime > 0 && timevalue > 0 {
+                    // `CURL_TIMECOND_IFUNMODSINCE == 2`; every other selector
+                    // (including `IFMODSINCE == 1`) takes the default skip rule.
+                    let skip = if data.set.timecondition == 2 {
+                        filetime > timevalue
+                    } else {
+                        filetime <= timevalue
+                    };
+                    if skip {
+                        // `CURLINFO_CONDITION_UNMET`: no data transfer and no
+                        // trailing `226`/`250`, so the control channel stays
+                        // valid for a graceful `QUIT` (`tests/data/test140`
+                        // expects exactly `MDTM` then `QUIT`).
+                        data.info.timecond = true;
+                        self.dont_check = true;
+                        return Ok(());
+                    }
+                }
+            }
+        }
 
         // (2) Establish the data-channel endpoint. Passive connects out now
         // (before TYPE/SIZE/RETR, as in `tests/data/test102`); active binds a
@@ -2289,25 +3025,217 @@ impl FtpConn {
             self.negotiate_passive(data, conn).await?;
         }
 
-        // (3) TYPE — ASCII (`A`) when `CURLOPT_TRANSFERTEXT` is set, else binary
-        // (`I`). Sent once per transfer (curl re-sends on type change).
-        let type_byte = ftp_type_arg(data.set.prefer_ascii);
-        self.send_type(data, conn, type_byte).await?;
+        // (3) TYPE — pick the transfer mode exactly as curl's `ftp_do` does
+        // (C: `lib/ftp.c` L2245-L2266). A *directory listing* (`LIST`/`NLST`,
+        // i.e. `TransferKind::List`) is always requested in ASCII mode: curl
+        // calls `ftp_nb_type(data, ..., TRUE /*ascii*/, FTP_LIST_TYPE)` for the
+        // `(list_only || !file)` case, regardless of `CURLOPT_TRANSFERTEXT`,
+        // because directory listings are text and servers convert line endings
+        // for them (see `tests/data/test100`, which expects `TYPE A` before
+        // `LIST`). A *file* transfer (`RETR`/`STOR`/`APPE`) instead honors
+        // `CURLOPT_TRANSFERTEXT` (and a URL `;type=A`/`;type=I`) via the
+        // per-transfer `prefer_ascii` (ASCII when set, else binary). Sent once
+        // per transfer (curl re-sends only on a type change).
+        let type_byte = if kind == TransferKind::List {
+            b'A'
+        } else {
+            ftp_type_arg(self.prefer_ascii)
+        };
+        // C `ftp_need_type`: send `TYPE` only when the connection's current
+        // transfer type differs from the wanted one (lib/ftp.c L342-347). On a
+        // fresh connection `transfertype == 0`, so this always sends and the
+        // non-reuse wire is unchanged; on a reused connection whose type already
+        // matches (e.g. a second listing, still `TYPE A`), the redundant `TYPE`
+        // is skipped (`tests/data/test215`).
+        if self.transfertype != type_byte {
+            self.send_type(data, conn, type_byte).await?;
+        }
 
-        // (4) SIZE — only for a binary download; gives the engine a content
-        // length (`known_filesize`) for progress. A non-2xx `SIZE` (some servers
-        // reject it) is non-fatal: the size simply stays unknown.
-        if kind == TransferKind::Retr && type_byte == b'I' {
+        // (3b) CURLOPT_PREQUOTE — custom commands sent after `TYPE`, just before
+        // the transfer command (C `ftp_state_{retr,stor,list}_prequote` →
+        // `ftp_state_quote(.., *_PREQUOTE)`; lib/ftp.c L1467-L1480). For every
+        // transfer kind the prequote runs after `TYPE` and before
+        // `SIZE`/`REST`/the terminal `RETR`/`STOR`/`LIST`. See
+        // `tests/data/test227`, whose wire shows `NOOP 2`/`FAIL HARD` between
+        // `TYPE I` and `SIZE`.
+        let prequote = data
+            .set
+            .prequote
+            .as_ref()
+            .map(|s| s.as_slice().to_vec())
+            .unwrap_or_default();
+        if !prequote.is_empty() {
+            self.send_quote_list(data, conn, &prequote).await?;
+        }
+
+        // (4) SIZE — for a binary download it gives the engine a content length
+        // (`known_filesize`) for progress; for an *auto-resuming upload* (`-C -`
+        // → `set_resume_from < 0`) curl issues SIZE to discover the remote
+        // resume offset (C `ftp_state_ul_setup`: `resume_from < 0` → send `SIZE`
+        // → `FTP_STOR_SIZE`; the wire `… TYPE I / SIZE / STOR` in
+        // `tests/data/test235`). A non-2xx `SIZE` (some servers reject it with
+        // `500`/`550`) is non-fatal: the size simply stays unknown and the
+        // upload starts from offset 0 (a full `STOR`).
+        let need_upload_size =
+            kind == TransferKind::Stor && data.set.set_resume_from < 0;
+        // `CURLOPT_IGNORE_CONTENT_LENGTH` (`--ignore-content-length`): support
+        // *growing files* by NOT discovering the remote size — curl skips the
+        // `SIZE` command entirely and performs an open-ended `RETR`, reading
+        // until the data connection closes rather than stopping at a (possibly
+        // stale/short) reported length. C gates the size discovery on
+        // `!(data->set.ignorecl || data->state.prefer_ascii)` (lib/ftp.c
+        // L1793-1818): with `ignorecl` set the `else` arm sends no `SIZE` and
+        // goes straight to an open-ended retrieve. ASCII downloads already skip
+        // `SIZE` here because they use `TYPE A` (`type_byte != b'I'`), so adding
+        // the `ignorecl` guard completes the `ignorecl || prefer_ascii` parity.
+        // With no `SIZE`, `known_filesize` stays -1 and the transfer is
+        // open-ended (`with_size` is not applied), reading to EOF. Uploads
+        // (`need_upload_size`, the `-C -` SIZE probe) are unaffected.
+        // (oracle tests/data/test416).
+        let need_download_size =
+            kind == TransferKind::Retr && type_byte == b'I' && !data.set.ignorecl;
+        if need_download_size || need_upload_size {
             if let Some(file) = self.file.clone() {
                 self.send_size(data, conn, &file).await?;
             }
         }
 
+        // (4a) CURLOPT_MAXFILESIZE (`--max-filesize`): when `SIZE` reported a
+        // length larger than the cap, abort the *download* before opening the
+        // data channel / sending `RETR` (C `ftp_state_size_resp`:
+        // `if(data->set.max_filesize && ftpc->known_filesize > …) return
+        // CURLE_FILESIZE_EXCEEDED`). The wire shows `… / SIZE / QUIT` with no
+        // `RETR` (`tests/data/test290`). `CURLE_FILESIZE_EXCEEDED` is in the
+        // "stays alive" set, so a graceful `QUIT` still follows in
+        // `disconnect`.
+        if kind == TransferKind::Retr
+            && data.set.max_filesize > 0
+            && self.known_filesize > data.set.max_filesize
+        {
+            sendf::failf(
+                &mut conn.filter_data.error_buffer,
+                "Maximum file size exceeded",
+            );
+            return Err(CurlError::FilesizeExceeded);
+        }
+
+        // (4b) Range / resume bookkeeping (C `Curl_range` + `ftp_state_retr` /
+        // `ftp_state_ul_setup`). A `CURLOPT_RANGE` (`-r`) carries both an
+        // explicit start offset *and* (for a bounded `X-Y` / `-N`) a
+        // `maxdownload` cap; a `CURLOPT_RESUME_FROM` (`-C n`) carries only the
+        // offset. The effective `REST` offset is computed here and the
+        // "entire file already transferred" short-circuits are applied before
+        // the terminal command is sent.
+        let mut resume_off: i64 = 0;
+        if direction == TransferDirection::Download && kind == TransferKind::Retr {
+            // C `ftp_do` (download branch): parse the range; when it is
+            // *bounded* (`maxdownload >= 0`) mark `dont_check` so the
+            // post-transfer status check is skipped and an `ABOR` is issued once
+            // the cap is reached (see [`FtpConn::ftp_done`]).
+            if let Some(range) = data.set.str(StrId::SetRange) {
+                if let Ok(outcome) = crate::protocols::file::parse_range(range) {
+                    resume_off = outcome.resume_from;
+                    self.maxdownload = outcome.maxdownload;
+                    if self.maxdownload >= 0 {
+                        self.dont_check = true;
+                    }
+                }
+            } else {
+                resume_off = data.set.set_resume_from;
+            }
+
+            // C `ftp_state_retr`: with a known file size (`SIZE` → `213`) and a
+            // resume offset, compute how many bytes remain. If none remain, the
+            // file is already fully downloaded — skip `REST`/`RETR` and proceed
+            // to a graceful `QUIT` (see `tests/data/test122`). A resume offset
+            // beyond the file size is `CURLE_BAD_DOWNLOAD_RESUME`.
+            if resume_off != 0 && self.known_filesize >= 0 {
+                let downloadsize = if resume_off < 0 {
+                    // `-N`: download the last N bytes.
+                    if self.known_filesize < -resume_off {
+                        sendf::failf(
+                            &mut conn.filter_data.error_buffer,
+                            &format!(
+                                "Offset ({resume_off}) was beyond file size ({})",
+                                self.known_filesize
+                            ),
+                        );
+                        return Err(CurlError::BadDownloadResume);
+                    }
+                    -resume_off
+                } else {
+                    if self.known_filesize < resume_off {
+                        sendf::failf(
+                            &mut conn.filter_data.error_buffer,
+                            &format!(
+                                "Offset ({resume_off}) was beyond file size ({})",
+                                self.known_filesize
+                            ),
+                        );
+                        return Err(CurlError::BadDownloadResume);
+                    }
+                    self.known_filesize - resume_off
+                };
+                if downloadsize == 0 {
+                    // Nothing to transfer (C "File already completely
+                    // downloaded"): no `REST`, no `RETR`, no `ABOR`. The control
+                    // channel stays valid for a graceful `QUIT`.
+                    self.dont_check = true;
+                    self.maxdownload = -1;
+                    return Ok(());
+                }
+                if resume_off < 0 {
+                    // Convert "last N bytes" to the absolute `REST` offset.
+                    resume_off = self.known_filesize - downloadsize;
+                }
+            }
+            // Record the effective absolute download offset for the
+            // partial-file check (a `CURLOPT_RANGE` start does not flow through
+            // `set.set_resume_from`).
+            self.xfer_resume_off = resume_off.max(0);
+        }
+
         // (5) REST — resume offset for a download (C `ftp_state_rest`). Upload
         // resume is expressed via APPE, not REST.
-        let resume = data.set.set_resume_from;
-        if resume > 0 && direction == TransferDirection::Download {
-            self.send_rest(data, conn, resume).await?;
+        if resume_off > 0 && direction == TransferDirection::Download {
+            self.send_rest(data, conn, resume_off).await?;
+        }
+
+        // (5b) Upload resume "already complete" (C `ftp_state_ul_setup`): with an
+        // explicit positive resume offset and a known input size, the source is
+        // logically advanced by `resume_from` and the remaining length is
+        // `infilesize - resume_from`. When nothing remains the file is already
+        // fully uploaded — skip `STOR`/`APPE` and `QUIT` (see
+        // `tests/data/test123`, whose wire ends `TYPE I` then `QUIT`).
+        if is_upload {
+            let mut resume = data.set.set_resume_from;
+            // `-C -` (auto-resume, `set_resume_from < 0`): the real offset was
+            // just probed via `SIZE` above. A `213` set `known_filesize`; a
+            // failed `SIZE` (`500`/`550`) leaves it unknown (`-1`), in which
+            // case curl uploads the whole file from offset 0 (C
+            // `ftp_state_size_resp` for `FTP_STOR_SIZE` → `ftp_state_ul_setup`
+            // with the discovered size, or 0 when SIZE failed). `max(0)` folds
+            // both "unknown" and "empty remote file" into a full `STOR`.
+            if resume < 0 {
+                resume = self.known_filesize.max(0);
+            }
+            if resume > 0 {
+                let infilesize = data.set.filesize;
+                if infilesize >= 0 && infilesize - resume <= 0 {
+                    // Nothing remains to send — the file is already fully
+                    // uploaded; skip `STOR`/`APPE` entirely and `QUIT`
+                    // (C "File already completely uploaded"; `tests/data/test123`).
+                    self.dont_check = true;
+                    return Ok(());
+                }
+                // Bytes remain (or the input size is unknown): curl resumes by
+                // skipping the first `resume` bytes of the source and APPENDing
+                // the rest (C `ftp_state_ul_setup`: `append = TRUE;` + source
+                // seek). Force the `APPE` verb (chosen in `transfer_command`)
+                // and record the offset for `run_upload_body` to skip.
+                self.upload_append = true;
+                self.upload_resume_from = resume;
+            }
         }
 
         // (6) The terminal transfer command. Its `1xx` reply (150/125) signals
@@ -2316,7 +3244,21 @@ impl FtpConn {
         let cmd = self.transfer_command(data, kind)?;
         self.send_cmd(data, conn, &cmd).await?;
         let code = self.read_one(data, conn).await?;
-        self.check_transfer_start(code, kind)?;
+        let transfer_open = self.check_transfer_start(code, kind)?;
+
+        // An empty directory listing (a `LIST`/`NLST` answered with `450 No
+        // files`) opens no data connection — there is nothing to accept,
+        // TLS-upgrade, or read. curl treats this as a *successful* empty
+        // listing: it sets `PPTRANSFER_NONE`, transitions to `FTP_STOP`, and
+        // proceeds to a graceful `QUIT` (C: lib/ftp.c L2783-2787). Mark the
+        // completion handshake as skipped (no trailing `226`/`250` arrives) and
+        // finish the DO phase successfully so the control connection is closed
+        // via `QUIT` rather than torn down as dead — see `tests/data/test144`,
+        // whose expected wire ends `NLST` then `QUIT`.
+        if !transfer_open {
+            self.dont_check = true;
+            return Ok(());
+        }
 
         // (7) Active mode: now that the server has the transfer command, accept
         // its inbound data connection (correct ordering — the accept must follow
@@ -2353,15 +3295,95 @@ impl FtpConn {
     /// (`CURLE_REMOTE_ACCESS_DENIED`), matching curl's default behavior when
     /// `--ftp-create-dirs` is not in force.
     async fn cwd_navigate(&mut self, data: &mut Easy, conn: &mut Connection) -> Result<()> {
+        // (reuse) The previous transfer left us in the exact directory this
+        // request needs — `cwddone` was set in `setup_connection` by the
+        // same-path comparison against `prevpath`, or by the NOCWD-absolute
+        // rule. Emit no `CWD` at all and go straight to the file command
+        // (C `ftp_state_cwd`: `if(ftpc->cwddone)`; `tests/data/test215`).
+        if self.cwddone {
+            return Ok(());
+        }
+        // (reuse) A DIFFERENT directory on a reused connection: curl first
+        // changes back to the login entry path, then descends to the new
+        // target — it does NOT issue relative `CWD`s from wherever the previous
+        // transfer ended (C `ftp_state_cwd` L838-849; `tests/data/test146`,
+        // `test149`). The reset is skipped for an absolute request path
+        // (a non-empty `dirdepth` AND a leading-slash `rawpath`), which already
+        // descends from root. A fresh connection (no reuse, or no `entrypath`
+        // yet) descends directly from the post-login working directory —
+        // byte-identical to the pre-reuse behavior.
+        if conn.bits.reuse {
+            if let Some(entry) = self.entrypath.clone() {
+                let absolute = !self.dirs.is_empty() && self.rawpath.starts_with('/');
+                if !absolute {
+                    let cwd_cmd = format!("CWD {entry}");
+                    self.send_cmd(data, conn, &cwd_cmd).await?;
+                    let code = self.read_one(data, conn).await?;
+                    if code / 100 != 2 {
+                        sendf::failf(
+                            &mut conn.filter_data.error_buffer,
+                            &format!("Server denied changing to directory: {code:03}"),
+                        );
+                        self.cwdfail = true;
+                        return Err(CurlError::RemoteAccessDenied);
+                    }
+                }
+            }
+        }
         let dirs = self.dirs.clone();
+        // C `ftp_state_cwd` MKD-on-failure: when `CURLOPT_FTP_CREATE_MISSING_DIRS`
+        // is set (`--ftp-create-dirs` → `CURLFTP_CREATE_DIR_RETRY` = 2), a `CWD`
+        // into a non-existent directory is recovered by issuing `MKD <dir>` and
+        // retrying the `CWD` (lib/ftp.c FTP_CWD / FTP_MKD response arms,
+        // L3253-L3306). Level 2 additionally tolerates a *failed* `MKD` (e.g. a
+        // racing session already created the dir, or the server rejects it) and
+        // still retries the `CWD` exactly once. See `tests/data/test147`
+        // (`CWD`→`MKD`→`CWD` ok) and `tests/data/test148`
+        // (`CWD`→`MKD`→`CWD` all fail → exit 9 `CURLE_REMOTE_ACCESS_DENIED`).
+        let create_missing = data.set.ftp_create_missing_dirs;
         for comp in &dirs {
-            let cmd = format!("CWD {}", comp.name);
-            self.send_cmd(data, conn, &cmd).await?;
+            let cwd_cmd = format!("CWD {}", comp.name);
+            self.send_cmd(data, conn, &cwd_cmd).await?;
             let code = self.read_one(data, conn).await?;
-            if code / 100 != 2 {
+            if code / 100 == 2 {
+                continue;
+            }
+            // The `CWD` was denied. Without `--ftp-create-dirs` this is fatal
+            // (curl's default: `CURLE_REMOTE_ACCESS_DENIED`).
+            if create_missing == 0 {
                 sendf::failf(
                     &mut conn.filter_data.error_buffer,
                     &format!("Server denied changing to directory: {code:03}"),
+                );
+                self.cwdfail = true;
+                return Err(CurlError::RemoteAccessDenied);
+            }
+            // Attempt to create the missing directory (C `MKD %.*s`). `count3`
+            // in C is the number of tolerated `MKD` failures: 1 for level 2
+            // (retry), 0 for level 1 (create-only).
+            let mkd_retry = create_missing == 2;
+            let mkd_cmd = format!("MKD {}", comp.name);
+            self.send_cmd(data, conn, &mkd_cmd).await?;
+            let mkd_code = self.read_one(data, conn).await?;
+            if mkd_code / 100 != 2 && !mkd_retry {
+                // `MKD` failed and no retry is permitted (C "Failed to MKD
+                // dir: %03d" → `CURLE_REMOTE_ACCESS_DENIED`).
+                sendf::failf(
+                    &mut conn.filter_data.error_buffer,
+                    &format!("Failed to MKD dir: {mkd_code:03}"),
+                );
+                self.cwdfail = true;
+                return Err(CurlError::RemoteAccessDenied);
+            }
+            // `MKD` succeeded (or failed but is tolerated once): retry the
+            // `CWD` into the directory exactly once. A second failure is fatal
+            // (C: the `count2` guard now blocks another `MKD`).
+            self.send_cmd(data, conn, &cwd_cmd).await?;
+            let retry_code = self.read_one(data, conn).await?;
+            if retry_code / 100 != 2 {
+                sendf::failf(
+                    &mut conn.filter_data.error_buffer,
+                    &format!("Server denied changing to directory: {retry_code:03}"),
                 );
                 self.cwdfail = true;
                 return Err(CurlError::RemoteAccessDenied);
@@ -2467,19 +3489,49 @@ impl FtpConn {
             }
             TransferKind::Stor => {
                 let file = self.file.clone().ok_or(CurlError::UrlMalformat)?;
-                if data.set.remote_append {
+                // `APPE` is selected either explicitly (`CURLOPT_APPEND` /
+                // `--append`) or implicitly by an upload *resume* (C
+                // `ftp_state_ul_setup` forces `append = TRUE` whenever
+                // `resume_from > 0`), so the remaining bytes are appended to the
+                // partial remote file rather than truncating it.
+                if data.set.remote_append || self.upload_append {
                     format!("APPE {file}")
                 } else {
                     format!("STOR {file}")
                 }
             }
             TransferKind::List => {
-                // A directory listing of the CWD'd-into directory: no path
-                // argument (curl issues a bare LIST/NLST after CWD).
-                if data.set.list_only {
-                    "NLST".to_string()
+                // Base verb: NLST when `--list-only` / `CURLOPT_DIRLISTONLY`
+                // or a URL `;type=D` suffix is in force, else LIST (C:
+                // `ftp_state_list`, lib/ftp.c L1442-1443 —
+                // `data->state.list_only ? "NLST" : "LIST"`). The per-transfer
+                // `self.list_only` already folds in the URL override.
+                let base = if self.list_only { "NLST" } else { "LIST" };
+
+                // For the NOCWD method curl does *not* `CWD` into the directory;
+                // instead it appends the directory path as an argument to
+                // LIST/NLST (C: `ftp_state_list`, lib/ftp.c L1424-1445). The
+                // argument is `rawpath` truncated at its last '/': for a
+                // `dir/dir/` path that drops the trailing slash (→ `dir/dir`),
+                // and the absolute root `/` is preserved via the special-case
+                // `if(n == 0) ++n;`. `self.rawpath` already matches C's
+                // `ftpc->rawpath` exactly — URL-decoded with the leading '/'
+                // stripped (C uses `ftp->path = &up.path[1]`, lib/ftp.c L4290)
+                // — so this slash arithmetic is byte-for-byte identical to the
+                // C oracle. The other methods (MULTICWD/SINGLECWD) `CWD` into
+                // the directory first and then issue a bare LIST/NLST, so no
+                // path argument is added here.
+                let method = CurlFtpFile::from_raw(data.set.ftp_filemethod);
+                if method == CurlFtpFile::NoCwd {
+                    match self.rawpath.rfind('/') {
+                        Some(slash) => {
+                            let n = if slash == 0 { 1 } else { slash };
+                            format!("{base} {}", &self.rawpath[..n])
+                        }
+                        None => base.to_string(),
+                    }
                 } else {
-                    "LIST".to_string()
+                    base.to_string()
                 }
             }
         })
@@ -2489,19 +3541,31 @@ impl FtpConn {
     /// the data transfer; any other reply maps to the curl error appropriate to
     /// the operation (download → `REMOTE_FILE_NOT_FOUND` on 550, else
     /// `FTP_COULDNT_RETR_FILE`; upload → `UPLOAD_FAILED`).
-    fn check_transfer_start(&self, code: i32, kind: TransferKind) -> Result<()> {
+    fn check_transfer_start(&self, code: i32, kind: TransferKind) -> Result<bool> {
+        // A `1xx` (`150`/`125`) opens the data transfer — proceed to move data.
         if code / 100 == 1 {
-            return Ok(());
+            return Ok(true);
         }
+        // A directory listing answered with `450` means "no matching files":
+        // curl treats it as a *successful empty listing*, not an error. It
+        // opens no data connection and goes straight to a graceful `QUIT`
+        // (C: the RETR/LIST response handler, lib/ftp.c L2783-2787 —
+        // `if((instate == FTP_LIST) && (ftpcode == 450)) { ftp->transfer =
+        // PPTRANSFER_NONE; ftp_state(data, ftpc, FTP_STOP); }`). Signal "no
+        // transfer opened" so the caller skips the data phase but still
+        // succeeds.
+        if kind == TransferKind::List && code == 450 {
+            return Ok(false);
+        }
+        // Any other non-`1xx` reply fails the operation. curl maps only a
+        // *RETR* answered with `550` to `CURLE_REMOTE_FILE_NOT_FOUND`; every
+        // other download/listing failure (including a `LIST` `550`) is
+        // `CURLE_FTP_COULDNT_RETR_FILE`, and an upload is `CURLE_UPLOAD_FAILED`
+        // (C: lib/ftp.c L2788-2791, `instate == FTP_RETR && ftpcode == 550`).
         match kind {
             TransferKind::Stor => Err(CurlError::UploadFailed),
-            _ => {
-                if code == 550 {
-                    Err(CurlError::RemoteFileNotFound)
-                } else {
-                    Err(CurlError::FtpCouldntRetrFile)
-                }
-            }
+            TransferKind::Retr if code == 550 => Err(CurlError::RemoteFileNotFound),
+            _ => Err(CurlError::FtpCouldntRetrFile),
         }
     }
 
@@ -2521,6 +3585,113 @@ impl FtpConn {
         Curl_conn_connect(conn, SECONDARYSOCKET, true).await
     }
 
+    /// Run the FTP "INFO" sequence for a body-less request on a file
+    /// (`--head`/`-I`), the fused Rust analog of C's
+    /// `ftp_state_mdtm` → `ftp_state_type` → `ftp_state_size` →
+    /// `ftp_state_rest` chain when `ftp->transfer == PPTRANSFER_INFO`
+    /// (lib/ftp.c). It opens **no** data connection and issues **no**
+    /// `LIST`/`RETR`; it queries the file's metadata and emits the
+    /// corresponding HTTP-style response headers:
+    ///
+    /// 1. `MDTM <file>` — only when `CURLOPT_FILETIME` (`--head`/`--remote-time`)
+    ///    or a time condition is in force (C `ftp_state_mdtm`). On a `213`
+    ///    timestamp reply the modification time is recorded
+    ///    (`CURLINFO_FILETIME_T`) and a `Last-Modified:` header is emitted (C
+    ///    `ftp_state_mdtm_resp`); `550`/other replies are non-fatal ("MDTM
+    ///    failed … continuing").
+    /// 2. `TYPE <I|A>` — the file's transfer mode (binary unless ASCII is
+    ///    preferred), exactly as `ftp_nb_type` selects it.
+    /// 3. `SIZE <file>` — on a `213` reply a `Content-Length:` header is emitted
+    ///    (C `ftp_state_size_resp`); a `550` is a missing file
+    ///    (`CURLE_REMOTE_FILE_NOT_FOUND`); any other non-`213` leaves the size
+    ///    unknown (no header).
+    /// 4. `REST 0` — probes resume support; a `350` reply emits
+    ///    `Accept-ranges: bytes` (C `ftp_state_rest_resp`). A non-`350` is
+    ///    non-fatal (curl simply omits the header and proceeds).
+    ///
+    /// No trailing blank header line is written — matching the C oracle, whose
+    /// FTP metadata path emits each header individually with no terminating
+    /// `\r\n` (see `tests/data/test141`'s expected `stdout`). The control
+    /// connection stays valid so the engine finishes with a graceful `QUIT`;
+    /// `dont_check` is set because no `226`/`250` completion line follows.
+    async fn run_info_phase(
+        &mut self,
+        data: &mut Easy,
+        conn: &mut Connection,
+        sink: &mut dyn WriteCallbacks,
+    ) -> Result<()> {
+        let file = self.file.clone().ok_or(CurlError::UrlMalformat)?;
+        // FTP's synthesized metadata headers (`Last-Modified`, `Content-Length`,
+        // `Accept-ranges`) are ALWAYS written to the body/stdout stream,
+        // regardless of `CURLOPT_HEADER` — exactly C's `client_write_header`
+        // (lib/ftp.c L2381), which temporarily forces `data->set.include_header
+        // = TRUE` for these writes: "For historic reasons, FTP never played this
+        // game and expects all its headers to do that always." Hence the writer
+        // is forced to include headers even when `CURLOPT_HEADER` is off (a
+        // `NOBODY` request with `HEADER 0`, `tests/data/test542`); `--head`
+        // (which already sets `include_header`) is unaffected.
+        let mut writer = ClientWriter::with_options(true, false);
+
+        // (1) MDTM — file modification time (C `ftp_state_mdtm`): only when the
+        // file time was requested (`--head` sets `CURLOPT_FILETIME`) or a time
+        // condition is active.
+        if data.set.get_filetime || data.set.timecondition != 0 {
+            self.send_cmd(data, conn, &format!("MDTM {file}")).await?;
+            let code = self.read_one(data, conn).await?;
+            if code == 213 {
+                if let Some(ft) = parse_mdtm_213(&self.last_response) {
+                    data.info.filetime = ft;
+                    // C emits `Last-Modified` only for a body-less file request
+                    // when the time was actually requested and parsed.
+                    if data.set.get_filetime {
+                        if let Some(hdr) = format_last_modified_header(ft) {
+                            writer.write(ClientWriteType::HEADER, &hdr, sink)?;
+                        }
+                    }
+                }
+            }
+            // 550/other: "MDTM failed … continuing" — non-fatal, no header.
+        }
+
+        // (2) TYPE — the file's transfer mode (binary unless ASCII preferred).
+        // C `ftp_need_type`: skip a redundant `TYPE` on a reused connection
+        // whose type already matches. Inert on the fresh path (`transfertype`
+        // starts at `0`).
+        let type_byte = ftp_type_arg(self.prefer_ascii);
+        if self.transfertype != type_byte {
+            self.send_type(data, conn, type_byte).await?;
+        }
+
+        // (3) SIZE — emit `Content-Length` on a 213 reply (C `ftp_state_size`/
+        // `ftp_state_size_resp`). A 550 is a missing file; any other non-213
+        // leaves the size unknown.
+        self.send_cmd(data, conn, &format!("SIZE {file}")).await?;
+        let size_code = self.read_one(data, conn).await?;
+        if size_code == 213 {
+            if let Some(size) = parse_size_213(&self.last_response) {
+                self.known_filesize = size;
+                let cl = format!("Content-Length: {size}\r\n");
+                writer.write(ClientWriteType::HEADER, cl.as_bytes(), sink)?;
+            }
+        } else if size_code == 550 {
+            sendf::failf(&mut conn.filter_data.error_buffer, "The file does not exist");
+            return Err(CurlError::RemoteFileNotFound);
+        }
+
+        // (4) REST 0 — probe resume support; a 350 reply emits `Accept-ranges`
+        // (C `ftp_state_rest`/`ftp_state_rest_resp`). A non-350 is non-fatal.
+        self.send_cmd(data, conn, "REST 0").await?;
+        let rest_code = self.read_one(data, conn).await?;
+        if rest_code == 350 {
+            writer.write(ClientWriteType::HEADER, b"Accept-ranges: bytes\r\n", sink)?;
+        }
+
+        // No data transfer and no trailing `226`/`250`: the control channel
+        // stays valid for a graceful `QUIT`.
+        self.dont_check = true;
+        Ok(())
+    }
+
     /// Move a download body from the data connection to the client `sink`
     /// (C: the `SECONDARYSOCKET` read loop feeding `Curl_client_write`). Reads
     /// `SECONDARYSOCKET` until EOF, routing each chunk through a [`ClientWriter`]
@@ -2535,7 +3706,38 @@ impl FtpConn {
         let mut writer = ClientWriter::with_options(data.set.include_header, false);
         let mut buf = vec![0u8; 64 * 1024];
         let mut total: i64 = 0;
+        // A bounded `CURLOPT_RANGE` (`-r X-Y` / `-r -N`) bounds the body. curl's
+        // output limit is `req.size` — the number of bytes *available after the
+        // `REST` offset* (`known_filesize - xfer_resume_off`), then further
+        // capped by `maxdownload` (C `ftp_state_retr` + the `req.size =
+        // min(downloadsize, maxdownload)` clamp at `lib/ftp.c` L2751-2755). The
+        // test servers ignore `REST` and stream the whole file from byte 0, so
+        // the limit is applied to the *received* prefix. When the announced size
+        // is unknown (`SIZE` failed → `known_filesize == -1`, e.g. test336/337)
+        // only `maxdownload` bounds the output. `capped` (a bounded range was
+        // requested) keeps the data socket open and drives the `ABOR` in
+        // [`FtpConn::ftp_done`] regardless of whether the limit or EOF arrives
+        // first (C sends `ABOR` whenever `dont_check && maxdownload > 0`).
+        let capped = self.maxdownload >= 0;
+        let range_limit: i64 = if capped {
+            let avail = if self.known_filesize >= 0 {
+                self.known_filesize - self.xfer_resume_off
+            } else {
+                i64::MAX
+            };
+            avail.min(self.maxdownload)
+        } else {
+            -1
+        };
+        let mut aborted = false;
         loop {
+            if capped && total >= range_limit {
+                // Reached the range output limit: stop early without reading the
+                // EOS and without closing the socket (ABOR is sent by
+                // `ftp_done`).
+                aborted = true;
+                break;
+            }
             let n = Curl_conn_recv(conn, SECONDARYSOCKET, &mut buf).await?;
             if n == 0 {
                 // End of the data stream: flush a zero-length end-of-stream so
@@ -2547,13 +3749,71 @@ impl FtpConn {
                 )?;
                 break;
             }
-            total += n as i64;
-            writer.write(ClientWriteType::BODY, &buf[..n], sink)?;
+            // Never write past the range output limit (C caps `req.size`): a
+            // single recv may straddle the boundary.
+            let take = if capped {
+                std::cmp::min(n as i64, range_limit - total) as usize
+            } else {
+                n
+            };
+            total += take as i64;
+            writer.write(ClientWriteType::BODY, &buf[..take], sink)?;
+            if capped && total >= range_limit {
+                aborted = true;
+                break;
+            }
         }
-        // Bound the transfer: close the data socket (the server has already
-        // closed its end after sending the body).
-        Curl_conn_close(conn, SECONDARYSOCKET);
+        if !capped {
+            // Bound the transfer: close the data socket (the server has already
+            // closed its end after sending the body). For *any* bounded range
+            // (`maxdownload >= 0`) the socket is instead left open so
+            // [`FtpConn::ftp_done`] can issue `ABOR` *before* closing it — curl
+            // sends `ABOR` whenever `dont_check && req.maxdownload > 0`, even
+            // when the body happened to end at EOF before the cap (the range end
+            // exceeded the file size; see `tests/data/test2307`).
+            Curl_conn_close(conn, SECONDARYSOCKET);
+        }
         data.info.size_download = total;
+        // Partial-file detection (oracle: `lib/transfer.c` L412-416): a download
+        // whose size was announced (`SIZE` → `known_filesize >= 0`, i.e. curl's
+        // `k->size != -1`) but whose received byte count differs from the
+        // *expected* transfer length (`k->bytecount != k->size`) ended
+        // prematurely — the data connection closed before delivering the whole
+        // file. curl reports this as `CURLE_PARTIAL_FILE`. A directory listing
+        // (`LIST`/`NLST`) never issues `SIZE`, so `known_filesize` stays `-1` and
+        // this check is skipped there.
+        //
+        // A resume (`REST <n>`, i.e. `CURLOPT_RESUME_FROM`) shifts the start of
+        // the transfer: only the `known_filesize - resume_from` bytes *after* the
+        // resume point are delivered. The expected count is therefore the
+        // remaining length, not the full announced size — curl's `k->size` is the
+        // resume-adjusted maxdownload. Without this adjustment every resumed
+        // download (`-C <n>`) would be misread as a premature/partial transfer
+        // and wrongly suppress the graceful `QUIT`. The `expected_bytes >= 0`
+        // guard skips the check when the resume point is at/beyond EOF (handled
+        // separately, like curl's "entire document already downloaded"). The
+        // non-resumed premature-end case remains exercised by
+        // `tests/data/test161`; the resumed success case by
+        // `tests/data/test110` ("FTP download resume with set limit").
+        //
+        // A *capped range* transfer (`aborted`) read exactly `maxdownload`
+        // bytes by design; curl's partial-file check explicitly excludes this
+        // case (`req.maxdownload == req.bytecount`), so it is skipped here — the
+        // early stop is expected, not premature (see `tests/data/test135`).
+        let expected_bytes = self.known_filesize - self.xfer_resume_off;
+        if !aborted && self.known_filesize >= 0 && expected_bytes >= 0 && total != expected_bytes {
+            // curl's KNOWN_BUGS 7.8 ("Premature transfer end but healthy control
+            // channel"): on a premature end curl's `ftp_done` falls through to
+            // clear `ctl_valid` (lib/ftp.c L3520-3536), so the session teardown
+            // sends **no** `QUIT` even though the control channel is still alive.
+            // Clearing `ctl_valid` here reproduces that exactly — distinct from a
+            // command-level error (e.g. `RETR`/`NLST` → `550`), which leaves
+            // `ctl_valid` set and still sends a graceful `QUIT` (test 145). See
+            // `tests/data/test161`, whose expected wire ends at `RETR` with no
+            // `QUIT` and errorcode 18.
+            self.ctl_valid = false;
+            return Err(CurlError::PartialFile);
+        }
         Ok(())
     }
 
@@ -2568,28 +3828,83 @@ impl FtpConn {
         conn: &mut Connection,
         source: &mut dyn ReadCallback,
     ) -> Result<()> {
+        // Upload resume (C `ftp_state_ul_setup`): the first `upload_resume_from`
+        // bytes are already on the server (we issued `APPE`), so advance the
+        // source past them before sending. The `ReadCallback` exposes no seek,
+        // so mirror C's `CURL_SEEKFUNC_CANTSEEK` fallback: read and discard the
+        // prefix in scratch-sized chunks. A premature `0` (or an over-long
+        // funny value) maps to `CURLE_FTP_COULDNT_USE_REST`, exactly as C's
+        // discard loop ("Failed to read data").
+        if self.upload_resume_from > 0 {
+            let mut scratch = vec![0u8; 4 * 1024];
+            let mut skipped: i64 = 0;
+            while skipped < self.upload_resume_from {
+                let want = std::cmp::min(
+                    (self.upload_resume_from - skipped) as usize,
+                    scratch.len(),
+                );
+                let got = source.read(&mut scratch[..want]);
+                if got == 0 || got > want {
+                    return Err(CurlError::FtpCouldntUseRest);
+                }
+                skipped += got as i64;
+            }
+        }
+
+        // The announced upload length after the resume offset: curl lowers
+        // `infilesize` by `resume_from` (C `ftp_state_ul_setup`: "now, decrease
+        // the size of the read"). An unknown input size stays open-ended.
         let total_len = if data.set.filesize >= 0 {
-            Some(data.set.filesize as u64)
+            let remaining = (data.set.filesize - self.upload_resume_from.max(0)).max(0);
+            Some(remaining as u64)
         } else {
             None
         };
+        // `CURLOPT_CRLF` (`--crlf`): convert lone LFs in the upload stream to
+        // CRLF before sending (C adds the `cr_lc` content reader; lib/sendf.c
+        // L1068). The conversion is byte-count-changing, so `size_upload`
+        // reflects the *converted* (sent) length, matching C's progress
+        // accounting. `prev_cr` tracks CRLF pairs across read boundaries.
+        //
+        // ASCII-mode FTP uploads (`TYPE A`, requested via the `;type=a` URL
+        // suffix or `CURLOPT_TRANSFERTEXT`) perform the *same* LF→CRLF
+        // conversion even without `--crlf`: C gates the `cr_lc` reader on
+        // `data->set.crlf || data->state.prefer_ascii` (lib/sendf.c
+        // L1111-1113), and `prefer_ascii` is what selects `TYPE A` over
+        // `TYPE I` on the control channel. An ASCII upload therefore must put
+        // CRLF line endings on the wire even though the local file has lone
+        // LFs (`tests/data/test475`, whose `<upload crlf="yes">` verify expects
+        // CRLF-terminated lines).
+        let crlf = data.set.crlf || self.prefer_ascii;
+        let mut prev_cr = false;
+        let mut conv = Vec::new();
         let mut reader = UploadReader::new(total_len, false);
         let mut buf = vec![0u8; 64 * 1024];
         let mut total: i64 = 0;
         loop {
             match reader.read(&mut buf, source)? {
                 ReadStep::Data(n) => {
+                    // Select the bytes to send: the raw chunk, or its CRLF-
+                    // converted form when `--crlf` is in force.
+                    let payload: &[u8] = if crlf {
+                        conv.clear();
+                        crlf_convert_chunk(&buf[..n], &mut prev_cr, &mut conv);
+                        &conv
+                    } else {
+                        &buf[..n]
+                    };
                     // A single filter `send` may write fewer bytes than offered;
                     // loop until the whole chunk is on the wire.
                     let mut off = 0usize;
-                    while off < n {
-                        let wrote = Curl_conn_send(conn, SECONDARYSOCKET, &buf[off..n], false).await?;
+                    while off < payload.len() {
+                        let wrote =
+                            Curl_conn_send(conn, SECONDARYSOCKET, &payload[off..], false).await?;
                         if wrote == 0 {
                             return Err(CurlError::UploadFailed);
                         }
                         off += wrote;
                     }
-                    total += n as i64;
+                    total += payload.len() as i64;
                 }
                 ReadStep::Eof => break,
                 // `can_pause = false`, so the reader never returns `Paused`.
@@ -2647,21 +3962,182 @@ impl FtpConn {
         status: Result<()>,
         premature: bool,
     ) -> Result<()> {
+        // A capped-range download (`-r X-Y`) stopped early with the data socket
+        // still open and `maxdownload > 0`. Mirror C `ftp_done`: send `ABOR` on
+        // the control channel to tell the server to abandon the rest of the
+        // transfer, close the data socket, then read the single queued trailing
+        // response (the server's `226 File transfer complete`, already sent
+        // after its `senddata`). curl deliberately does **not** verify this
+        // status ("partial download completed, closing connection"), so the
+        // normal completion check below is skipped. `ctl_valid` is left set so a
+        // graceful `QUIT` still follows in `disconnect`. See `tests/data/test135`
+        // (`-r 4-16` → `REST 4`/`RETR`/`ABOR`/`QUIT`).
+        if status.is_ok() && self.maxdownload > 0 {
+            self.send_cmd(data, conn, "ABOR").await?;
+            Curl_conn_close(conn, SECONDARYSOCKET);
+            let _ = self.read_one(data, conn).await?;
+            self.data_host = None;
+            self.data_port = 0;
+            // `transfertype` is connection-lifetime (see the note at the end of
+            // `ftp_done`); do not clear it here so a reused connection can skip
+            // a redundant `TYPE`. Inert on the fresh path.
+            return status;
+        }
+
         if premature || status.is_err() {
             // Skip the completion handshake; the connection may be closed.
             self.dont_check = true;
         }
+
+        // Control-connection survival after an error (C `ftp_done` switch,
+        // lib/ftp.c L3513-3539). A specific set of transfer errors leave the
+        // control connection usable, so a graceful `QUIT` still follows in
+        // `disconnect` (these reach `case CURLE_OK` and, being non-premature
+        // DO-phase failures, `break`). Every *other* error wedges the control
+        // connection (it is out of sync / untrustworthy), so curl falls to the
+        // `default` arm, clears `ctl_valid`, and closes the connection without
+        // `QUIT`. The canonical example is `CURLE_FTP_WEIRD_227_FORMAT` — a
+        // malformed `227` PASV reply whose bytes were read but cannot be
+        // interpreted (`tests/data/test237`) — which is deliberately *absent*
+        // from the "stays alive" list even though its sibling
+        // `CURLE_FTP_WEIRD_PASV_REPLY` is present. Genuine control-channel I/O
+        // death is handled separately by `send_cmd`/`read_one` clearing
+        // `ctl_valid`, so this only governs the error-code dimension.
+        // C `ftp_done` switch (lib/ftp.c L3513-3539): an OK transfer or one of
+        // the listed soft errors keeps the control connection usable ("the
+        // connection stays alive fine even though this happened"); every other
+        // error wedges it. This is exactly curl's `result == CURLE_OK` predicate
+        // reused by the `prevpath` block below, so it is computed once here.
+        let keeps_control_alive = match status {
+            Ok(()) => true,
+            Err(ref e) => matches!(
+                e,
+                CurlError::BadDownloadResume
+                    | CurlError::FtpWeirdPasvReply
+                    | CurlError::FtpPortFailed
+                    | CurlError::FtpAcceptFailed
+                    | CurlError::FtpAcceptTimeout
+                    | CurlError::FtpCouldntSetType
+                    | CurlError::FtpCouldntRetrFile
+                    | CurlError::PartialFile
+                    | CurlError::UploadFailed
+                    | CurlError::RemoteAccessDenied
+                    | CurlError::FilesizeExceeded
+                    | CurlError::RemoteFileNotFound
+                    | CurlError::WriteError
+            ),
+        };
+        if !keeps_control_alive {
+            self.ctl_valid = false;
+        }
+
         if !self.dont_check && self.ctl_valid {
             let code = self.read_one(data, conn).await?;
             if code / 100 != 2 {
+                // C `ftp_done` maps the trailing completion code (lib/ftp.c
+                // L3634-3647): `226`/`250` succeed; `552` ("Exceeded storage
+                // allocation") → `CURLE_REMOTE_DISK_FULL`; any other non-2xx →
+                // `CURLE_PARTIAL_FILE`. This `result` is computed *after* the
+                // `switch(status)` that governs `ctl_valid`, so an OK transfer
+                // whose completion line is an error keeps the control channel
+                // alive and still sends a graceful `QUIT` (see
+                // `tests/data/test348`, whose wire ends `STOR`/`QUIT` with
+                // errorcode 70).
+                if code == 552 {
+                    sendf::failf(
+                        &mut conn.filter_data.error_buffer,
+                        "Exceeded storage allocation",
+                    );
+                    return Err(CurlError::RemoteDiskFull);
+                }
                 return Err(CurlError::PartialFile);
             }
         }
+
+        // CURLOPT_POSTQUOTE — custom commands sent after a *successful*
+        // transfer's completion handshake, while the control connection is
+        // still up, before teardown (C `ftp_done`: `if(!status && !result &&
+        // !premature && data->set.postquote) ftp_sendquote(...)`; lib/ftp.c
+        // L3690). Only runs for a clean, non-premature transfer. See
+        // `tests/data/test120` (`DELE file` after `RETR`/`226`) and
+        // `tests/data/test121` (`DELE after_transfer`). The control channel
+        // must still be valid to issue them.
+        if status.is_ok() && !premature && self.ctl_valid {
+            let postquote = data
+                .set
+                .postquote
+                .as_ref()
+                .map(|s| s.as_slice().to_vec())
+                .unwrap_or_default();
+            if !postquote.is_empty() {
+                self.send_quote_list(data, conn, &postquote).await?;
+            }
+        }
+
+        // Remember the working directory for connection reuse (C `ftp_done`
+        // prevpath block, lib/ftp.c L3559-3585). On a clean, non-`cwdfail`
+        // transfer, store this request's directory portion — the rawpath with
+        // the leaf filename stripped — so a later same-host transfer on the
+        // reused connection can compare it (`ftp_state_pwd`/`cwddone`) and skip
+        // redundant `CWD` commands (`tests/data/test215`). A failed transfer or
+        // a `cwdfail` clears it ("no path remembering"). Under `FTPFILE_NOCWD`
+        // an absolute path means no `CWD` happened, so the existing `prevpath`
+        // is kept; a relative path leaves us in the FTP home (empty prevpath).
+        // This only ever affects the reuse path; on a fresh connection the next
+        // transfer gets a new `FtpConn` and never reads this.
+        // C `ftp_done`'s `if(result) … else …` (lib/ftp.c L3554-3586): the
+        // working directory is remembered for connection reuse whenever the
+        // control connection survived. curl's `result == CURLE_OK` predicate
+        // holds for an OK transfer AND for the soft errors handled above, when
+        // not genuinely premature — which is *exactly* the condition under which
+        // `ctl_valid` remains set here: `keeps_control_alive` already cleared it
+        // for a hard (`default`-arm) error, a control-channel I/O death cleared
+        // it in `send_cmd`/`read_one`, and a genuinely premature data-end cleared
+        // it in `run_download_body`. (Our local `premature` flag is merely
+        // `result.is_err()` and so is *true* for a clean soft error like a 550
+        // `RETR`, which is NOT premature in curl's sense — hence it must not gate
+        // this decision.) A 550 `RETR` of a missing file
+        // (`CURLE_REMOTE_FILE_NOT_FOUND` / `CURLE_FTP_COULDNT_RETR_FILE`) is a
+        // soft error: the directory was entered successfully, so `ctl_valid`
+        // stays set, curl keeps `prevpath`, and a later same-path transfer on the
+        // reused connection skips the `CWD` entirely (`tests/data/test533`,
+        // `test546`). A hard error or genuine premature end wedges the channel
+        // (`ctl_valid` cleared) and forgets the path. The inner `cwdfail` /
+        // `NOCWD`-absolute structure mirrors curl exactly: a full NOCWD path
+        // means no `CWD` happened, so the existing `prevpath` is kept regardless
+        // of `cwdfail`; otherwise a failed `CWD` clears it.
+        if self.ctl_valid {
+            let method = CurlFtpFile::from_raw(data.set.ftp_filemethod);
+            if method == CurlFtpFile::NoCwd && self.rawpath.starts_with('/') {
+                // full path => no CWDs happened => keep existing prevpath
+            } else if self.cwdfail {
+                // a failed CWD means we are not where we think — forget the path
+                self.prevpath = None;
+            } else if method == CurlFtpFile::NoCwd {
+                self.prevpath = Some(String::new());
+            } else {
+                let flen = self.file.as_ref().map_or(0, String::len);
+                let dir = self
+                    .rawpath
+                    .get(..self.rawpath.len().saturating_sub(flen))
+                    .unwrap_or("")
+                    .to_string();
+                self.prevpath = Some(dir);
+            }
+        } else {
+            self.prevpath = None;
+        }
+
         // Clear the per-transfer data-channel endpoint so the control
-        // connection can be reused for the next transfer.
+        // connection can be reused for the next transfer. `transfertype` is
+        // deliberately NOT cleared here: it is a connection-lifetime property
+        // (C `ftpc->transfertype`) that a reused connection consults via
+        // `ftp_need_type` to skip a redundant `TYPE` (`tests/data/test215`). On
+        // a fresh connection the next transfer gets a new `FtpConn`
+        // (`transfertype == 0`), so persisting it is inert for the non-reuse
+        // path.
         self.data_host = None;
         self.data_port = 0;
-        self.transfertype = 0;
         status
     }
 }
@@ -2729,54 +4205,131 @@ pub(crate) async fn perform_ftp(
         .and_then(|inner| inner.strip_suffix(']'))
         .unwrap_or(&host_bracketed)
         .to_string();
-    let port = url
+    let url_port = url
         .get(CurlUPart::Port, 0)
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(scheme_const.default_port);
+    // `CURLOPT_PORT` (`data.set.use_port`, 0 = "use the URL / scheme default")
+    // overrides the port from the URL for the *control* connection (C
+    // `parse_remote_port`, lib/url.c L2538-2549: `if(data->set.use_port &&
+    // data->state.allow_port) conn->remote_port = data->set.use_port`).
+    // `allow_port` is TRUE for a normal (non-redirected) transfer, which is the
+    // case here. The passive/active *data* port is negotiated separately
+    // (227/229 or the client listener) and is unaffected.
+    let port = if data.set.use_port != 0 {
+        data.set.use_port
+    } else {
+        url_port
+    };
 
     let ipver = IpVersion::from_raw(i64::from(data.set.ipver));
 
-    // (2) Resolve the control endpoint's addresses (system resolver; FTP has no
-    //     DoH path of its own).
-    let addrs = resolve_ftp_addrs(&host, port, ipver, verbose).await?;
-
-    // (3) Build the control connection and its filter chain. `ftps://` installs
-    //     the TLS filter now (implicit TLS, encrypted from the first byte);
-    //     `ftp://` is a plain TCP chain — the optional `AUTH TLS` upgrade is
-    //     performed mid-login by `FtpConn::upgrade_control_tls`.
-    let desc = SchemeDescriptor::new(
-        scheme_const.name,
-        scheme_const.default_port,
-        scheme_const.flags,
-        scheme_const.protocol,
-    );
-    let mut conn = Connection::new(format!("{host}:{port}"), TRNSPRT_TCP, desc).with_verbose(verbose);
-    conn.set_remote(host.clone(), port);
-
-    let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, data.set.connecttimeout, addrs);
-    let (ssl_mode, dispatch) = if is_ftps {
-        // FTP control channels do not negotiate ALPN; offer none.
-        let tls = tls_config_from_easy(data);
-        let ssl = tls_factory(tls, host.clone(), port, None, Vec::new());
-        (
-            CURL_CF_SSL_ENABLE,
-            ConnSetup::Default(SetupConfig::new(CURL_CF_SSL_ENABLE, true, eyeballs).with_ssl(ssl)),
-        )
-    } else {
-        (
-            CURL_CF_SSL_DISABLE,
-            ConnSetup::Default(SetupConfig::new(CURL_CF_SSL_DISABLE, false, eyeballs)),
-        )
-    };
-    establish_connection(&mut conn, FIRSTSOCKET, ssl_mode, dispatch, true).await?;
-
-    // (4) Per-connection setup (decode the URL path/credentials onto `FtpConn`)
-    //     then run the login state machine (greeting → optional `AUTH TLS` →
-    //     `USER`/`PASS` → `PBSZ`/`PROT` → `PWD`/`SYST`).
     let handler = FtpHandler::new(scheme_const);
+
+    // (2)/(3) Obtain the control connection. On the CLI path — the only path
+    //     with a guaranteed end-of-run pool drain (`external_pool_drain`, set
+    //     solely by `set_conn_pool`) — first try to reuse a pooled same-host
+    //     control channel. A pool hit skips BOTH the TCP/TLS dial AND the
+    //     `USER`/`PASS`/`PWD` login, so a subsequent transfer resumes the live
+    //     session exactly as curl's connection cache does, eliding the
+    //     redundant login (and, via the delta-CWD/`ftp_need_type` logic, the
+    //     redundant `CWD`/`TYPE`) — see `tests/data/test215`, `test146`,
+    //     `test149`. `CURLOPT_FRESH_CONNECT` / `CURLOPT_FORBID_REUSE` opt out,
+    //     identical to the HTTP reuse gate. On the FFI easy-perform and
+    //     multi-interface paths `external_pool_drain` is `false`, so the pool is
+    //     never populated, checkout never hits, and this is byte-identical to a
+    //     fresh dial — the connection is then QUITed inline at teardown
+    //     (reg-baseline; see the teardown note and `tests/data/test529`/`test539`).
+    let reuse_key = format!("{host}:{port}");
+    let mut conn = {
+        let mut reused: Option<Connection> = None;
+        if data.external_pool_drain && !data.set.reuse_fresh && !data.set.reuse_forbid {
+            let pool = data.conn_pool_handle();
+            if let Some(mut candidate) = crate::conn::pool_checkout(&pool, &reuse_key) {
+                // Liveness probe (curl's `Curl_conn_is_alive`): reuse only a
+                // control channel that is still open AND carries no unexpected
+                // pending bytes — a server-side close or stray data makes a
+                // supposedly-idle keep-alive socket unsafe to reuse.
+                let (alive, pending) = Curl_conn_is_alive(&mut candidate);
+                if alive && !pending {
+                    // Mark pool-reused (curl's `conn->bits.reuse`); this drives
+                    // the login skip below and the delta-CWD / TYPE-skip in the
+                    // DO phase.
+                    candidate.bits.reuse = true;
+                    if verbose {
+                        // curl's reuse trace omits the `* Trying`/`* Connected`
+                        // dial lines (lib/url.c L3540).
+                        sendf::infof(
+                            true,
+                            &format!("Re-using existing connection with host {host}"),
+                        );
+                    }
+                    reused = Some(candidate);
+                }
+                // Dead / unexpected pending data: `candidate` is dropped here
+                // (closing its socket) and we fall through to a fresh dial.
+            }
+        }
+        match reused {
+            Some(c) => c,
+            None => {
+                // Fresh dial. Resolve the control endpoint's addresses (system
+                // resolver; FTP has no DoH path of its own) and build the
+                // control connection + filter chain. `ftps://` installs the TLS
+                // filter now (implicit TLS, encrypted from the first byte);
+                // `ftp://` is a plain TCP chain — the optional `AUTH TLS` upgrade
+                // is performed mid-login by `FtpConn::upgrade_control_tls`.
+                let addrs = resolve_ftp_addrs(&host, port, ipver, verbose).await?;
+                let desc = SchemeDescriptor::new(
+                    scheme_const.name,
+                    scheme_const.default_port,
+                    scheme_const.flags,
+                    scheme_const.protocol,
+                );
+                let mut conn = Connection::new(reuse_key.clone(), TRNSPRT_TCP, desc)
+                    .with_verbose(verbose);
+                conn.set_remote(host.clone(), port);
+
+                let eyeballs = eyeballs_factory(
+                    TRNSPRT_TCP,
+                    ipver,
+                    data.set.happy_eyeballs_timeout,
+                    data.set.connecttimeout,
+                    addrs,
+                );
+                let (ssl_mode, dispatch) = if is_ftps {
+                    // FTP control channels do not negotiate ALPN; offer none.
+                    let tls = tls_config_from_easy(data);
+                    let ssl = tls_factory(tls, host.clone(), port, None, Vec::new());
+                    (
+                        CURL_CF_SSL_ENABLE,
+                        ConnSetup::Default(
+                            SetupConfig::new(CURL_CF_SSL_ENABLE, true, eyeballs).with_ssl(ssl),
+                        ),
+                    )
+                } else {
+                    (
+                        CURL_CF_SSL_DISABLE,
+                        ConnSetup::Default(SetupConfig::new(CURL_CF_SSL_DISABLE, false, eyeballs)),
+                    )
+                };
+                establish_connection(&mut conn, FIRSTSOCKET, ssl_mode, dispatch, true).await?;
+                conn
+            }
+        }
+    };
+
+    // (4) Per-connection setup: decode the URL path/credentials onto `FtpConn`,
+    //     preserving the pooled connection-lifetime state (live ping-pong
+    //     engine, `entrypath`, `prevpath`, `transfertype`, server OS) on reuse.
+    //     The login state machine (greeting → optional `AUTH TLS` →
+    //     `USER`/`PASS` → `PBSZ`/`PROT` → `PWD`/`SYST`) runs ONLY for a freshly
+    //     dialed connection; a reused channel is already logged in.
     handler.setup_connection(data, &mut conn).await?;
-    handler.connect(data, &mut conn).await?;
+    if !conn.bits.reuse {
+        handler.connect(data, &mut conn).await?;
+    }
 
     // (5) Take the per-connection state out and drive the DO phase + body
     //     movement, then the trailing completion handshake (`226`/`250`).
@@ -2787,11 +4340,54 @@ pub(crate) async fn perform_ftp(
     let result = ftpc.run_do_phase(data, &mut conn, sink, source).await;
     let premature = result.is_err();
     let done = ftpc.ftp_done(data, &mut conn, result, premature).await;
+    // Snapshot the control-channel validity before parking the state back: a
+    // still-valid channel is reuse-eligible (and would have received a graceful
+    // `QUIT`); a cleared one means a dead connection that must be torn down now
+    // without a `QUIT`.
+    let ctl_valid = ftpc.ctl_valid;
     conn.set_proto_state(Box::new(ftpc));
 
-    // (6) Best-effort graceful teardown (`QUIT` + socket close). The transfer
-    //     outcome is what we return; teardown failures do not mask it.
-    let _ = handler.disconnect(data, &mut conn, done.is_err()).await;
+    // (6) Teardown — deferred-`QUIT` connection reuse (the FTP analog of curl's
+    //     connection cache). The transfer outcome is what we return; teardown
+    //     failures never mask it.
+    //
+    //     A connection whose control channel is still valid and not marked
+    //     non-reusable is **checked back into the shared pool** instead of being
+    //     QUITed inline. This lets a subsequent same-host transfer reuse it
+    //     (skipping `USER`/`PASS`/`PWD` and redundant `CWD`/`TYPE`, per
+    //     `tests/data/test215`); the connection's single, deferred, best-effort
+    //     `QUIT` is sent later by [`ftp_drain_pool`] at end-of-run /
+    //     `curl_easy_cleanup`, while the runtime is still live. For a lone
+    //     transfer this is wire-identical to the previous inline teardown — the
+    //     transfer's commands, then `QUIT` at drain.
+    //
+    //     A connection with a cleared `ctl_valid` (a control-channel I/O
+    //     failure recorded by `send_cmd`/`read_one`) — or one explicitly marked
+    //     `no_reuse` — is torn down immediately via [`FtpHandler::disconnect`],
+    //     which sends no `QUIT` on a dead channel. This preserves the exact
+    //     no-`QUIT`-on-dead-connection behavior (and, for a *protocol* error
+    //     such as a `550` that leaves `ctl_valid` set, the connection is still
+    //     reuse-eligible and its graceful `QUIT` is issued at drain — matching
+    //     curl, which keeps the channel alive and QUITs after a `550`; see
+    //     `tests/data/test145`).
+    //     The deferred-`QUIT`-via-pool-check-in path is taken **only** when this
+    //     handle's pool is externally managed with a guaranteed end-of-run drain
+    //     (`data.external_pool_drain`, set solely by the CLI's `set_conn_pool`).
+    //     On the FFI easy-perform and multi-interface paths the flag is `false`,
+    //     so the connection is QUITed inline here — curl's reg-baseline. This is
+    //     mandatory: a connection checked into a pool that is never drained would
+    //     drop its `QUIT` (`tests/data/test529`), and a connection whose socket
+    //     lives on the multi handle's runtime cannot be driven to `QUIT` from a
+    //     `curl_easy_cleanup` `block_on` on a different runtime — it would hang
+    //     (`tests/data/test539`). Confining check-in to the CLI keeps the drain
+    //     on the same (current-thread) runtime that opened the socket.
+    if data.external_pool_drain && ctl_valid && !conn.bits.no_reuse {
+        let pool = data.conn_pool_handle();
+        let maxconnects = data.set.maxconnects;
+        crate::conn::pool_checkin(&pool, conn, maxconnects);
+    } else {
+        let _ = handler.disconnect(data, &mut conn, false).await;
+    }
     done
 }
 
@@ -2889,11 +4485,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_ftpport_address_honors_curl_grammar() {
+        // "-" (the default) and single chars → None (advertise local IP).
+        assert_eq!(parse_ftpport_address("-"), None);
+        assert_eq!(parse_ftpport_address(""), None);
+        // A literal IPv4 (tests/data/test116 `-P 1.2.3.4`).
+        assert_eq!(
+            parse_ftpport_address("1.2.3.4"),
+            Some("1.2.3.4".to_string())
+        );
+        // A loopback literal (tests/data/test251 `-P %CLIENTIP`).
+        assert_eq!(
+            parse_ftpport_address("127.0.0.1"),
+            Some("127.0.0.1".to_string())
+        );
+        // An IPv4 with a trailing :port(-range) keeps only the address.
+        assert_eq!(
+            parse_ftpport_address("1.2.3.4:8000-9000"),
+            Some("1.2.3.4".to_string())
+        );
+        // `[ipv6]:port` → the bracketed literal.
+        assert_eq!(
+            parse_ftpport_address("[::1]:2000"),
+            Some("::1".to_string())
+        );
+        // A bare IPv6 literal carries no port and is used whole.
+        assert_eq!(parse_ftpport_address("fe80::1"), Some("fe80::1".to_string()));
+        // `:port` only → no address.
+        assert_eq!(parse_ftpport_address(":8000"), None);
+    }
+
     // ---- CWD path decomposition (the three --ftp-method strategies) ------
 
     #[test]
     fn decompose_multicwd_splits_each_component() {
-        let d = decompose_url_path(CurlFtpFile::MultiCwd, "/dir1/dir2/file.txt", false).unwrap();
+        let d = decompose_url_path(CurlFtpFile::MultiCwd, "/dir1/dir2/file.txt").unwrap();
         let names: Vec<&str> = d.dirs.iter().map(|c| c.name.as_str()).collect();
         // Leading slash becomes the "/" root component, then each dir.
         assert_eq!(names, ["/", "dir1", "dir2"]);
@@ -2903,13 +4530,13 @@ mod tests {
     #[test]
     fn decompose_multicwd_relative_and_directory_url() {
         // Relative path: no leading "/" root component.
-        let d = decompose_url_path(CurlFtpFile::MultiCwd, "dir1/dir2/file.txt", false).unwrap();
+        let d = decompose_url_path(CurlFtpFile::MultiCwd, "dir1/dir2/file.txt").unwrap();
         let names: Vec<&str> = d.dirs.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["dir1", "dir2"]);
         assert_eq!(d.file.as_deref(), Some("file.txt"));
 
         // A trailing slash means a directory (listing) — no file name.
-        let dir = decompose_url_path(CurlFtpFile::MultiCwd, "/pub/", false).unwrap();
+        let dir = decompose_url_path(CurlFtpFile::MultiCwd, "/pub/").unwrap();
         let dnames: Vec<&str> = dir.dirs.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(dnames, ["/", "pub"]);
         assert!(dir.file.is_none());
@@ -2917,7 +4544,7 @@ mod tests {
 
     #[test]
     fn decompose_nocwd_keeps_whole_path_as_file() {
-        let d = decompose_url_path(CurlFtpFile::NoCwd, "/dir1/dir2/file.txt", false).unwrap();
+        let d = decompose_url_path(CurlFtpFile::NoCwd, "/dir1/dir2/file.txt").unwrap();
         assert!(d.dirs.is_empty());
         assert_eq!(d.file.as_deref(), Some("/dir1/dir2/file.txt"));
         // CWD can be skipped for an absolute path under NOCWD.
@@ -2926,30 +4553,35 @@ mod tests {
 
     #[test]
     fn decompose_singlecwd_one_dir_plus_file() {
-        let d = decompose_url_path(CurlFtpFile::SingleCwd, "/dir1/dir2/file.txt", false).unwrap();
+        let d = decompose_url_path(CurlFtpFile::SingleCwd, "/dir1/dir2/file.txt").unwrap();
         let names: Vec<&str> = d.dirs.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["/dir1/dir2"]);
         assert_eq!(d.file.as_deref(), Some("file.txt"));
 
         // A root-only leading slash keeps a single "/" directory.
-        let r = decompose_url_path(CurlFtpFile::SingleCwd, "/file.txt", false).unwrap();
+        let r = decompose_url_path(CurlFtpFile::SingleCwd, "/file.txt").unwrap();
         let rnames: Vec<&str> = r.dirs.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(rnames, ["/"]);
         assert_eq!(r.file.as_deref(), Some("file.txt"));
     }
 
     #[test]
-    fn decompose_upload_without_filename_is_malformed() {
-        // Uploading to a directory URL has no target file name.
-        let err = decompose_url_path(CurlFtpFile::MultiCwd, "/pub/", true).unwrap_err();
-        assert_eq!(err, CurlError::UrlMalformat);
+    fn decompose_upload_without_filename_yields_no_file() {
+        // A directory URL (trailing slash) has no target file name. Path
+        // decomposition itself no longer fails for an upload — the
+        // upload-without-filename malformat error (`CURLE_URL_MALFORMAT`) is
+        // raised in the DO phase (`run_do_phase`), *after* login, exactly like
+        // C's `ftp_parse_url_path` (lib/ftp.c L310-313). Here we only assert
+        // the precondition the DO phase keys off: `file` is `None`.
+        let d = decompose_url_path(CurlFtpFile::MultiCwd, "/pub/").unwrap();
+        assert!(d.file.is_none());
     }
 
     #[test]
     fn decompose_multicwd_rejects_excessive_depth() {
         let deep = "/".repeat(FTP_MAX_DIR_DEPTH + 1);
         assert_eq!(
-            decompose_url_path(CurlFtpFile::MultiCwd, &deep, false).unwrap_err(),
+            decompose_url_path(CurlFtpFile::MultiCwd, &deep).unwrap_err(),
             CurlError::UrlMalformat
         );
     }
@@ -3102,6 +4734,22 @@ mod tests {
         assert_eq!(parse_size_213(b"213 -5"), None);
         // No token after the code → None.
         assert_eq!(parse_size_213(b"213"), None);
+    }
+
+    #[test]
+    fn parse_mdtm_213_parses_timestamp() {
+        // The canonical `tests/data/test141` reply: 2003-04-09 10:26:59 GMT.
+        // Independently confirmed: unix(2003-04-09 10:26:59 GMT) = 1_049_884_019.
+        assert_eq!(parse_mdtm_213(b"213 20030409102659"), Some(1_049_884_019));
+        // A fractional-seconds suffix (`.sss`) is ignored, exactly as curl does.
+        assert_eq!(parse_mdtm_213(b"213 20030409102659.123"), Some(1_049_884_019));
+        // Fewer than 14 digits is not a usable timestamp → None (caller omits
+        // the synthetic `Last-Modified` header).
+        assert_eq!(parse_mdtm_213(b"213 200304091026"), None);
+        // A `550` (or any non-`213`) reply is not a timestamp.
+        assert_eq!(parse_mdtm_213(b"550 No such file"), None);
+        // No token after the code → None.
+        assert_eq!(parse_mdtm_213(b"213"), None);
     }
 
 
@@ -3405,25 +5053,115 @@ mod tests {
             "APPE report.bin"
         );
 
-        // NLST is selected for a name-only listing (CURLOPT_DIRLISTONLY).
-        let mut data_nlst = Easy::new();
-        data_nlst.set.list_only = true;
+        // NLST is selected for a name-only listing (the per-transfer
+        // `list_only`, seeded from `CURLOPT_DIRLISTONLY`/`;type=d`).
+        ftpc.list_only = true;
         assert_eq!(
-            ftpc.transfer_command(&data_nlst, TransferKind::List).unwrap(),
+            ftpc.transfer_command(&data, TransferKind::List).unwrap(),
             "NLST"
+        );
+    }
+
+    #[test]
+    fn type_url_check_detects_type_suffix() {
+        // `;type=A` / `;type=a` ⇒ ASCII (upper-cased to 'A').
+        assert_eq!(type_url_check("dir/file;type=A"), Some(b'A'));
+        assert_eq!(type_url_check("dir/file;type=a"), Some(b'A'));
+        // `;type=I` / `;type=i` ⇒ binary.
+        assert_eq!(type_url_check("path/123;type=I"), Some(b'I'));
+        assert_eq!(type_url_check("path/123;type=i"), Some(b'I'));
+        // `;type=D` ⇒ directory listing.
+        assert_eq!(type_url_check("pub;type=D"), Some(b'D'));
+        // The minimal qualifying string is exactly the 7-byte tag.
+        assert_eq!(type_url_check(";type=A"), Some(b'A'));
+        // No suffix ⇒ None (and short strings never match).
+        assert_eq!(type_url_check("dir/file.txt"), None);
+        assert_eq!(type_url_check("type=A"), None);
+        assert_eq!(type_url_check(""), None);
+        // A `;type=` that is not a *trailing* suffix is not matched.
+        assert_eq!(type_url_check("a;type=A/b"), None);
+    }
+
+    #[test]
+    fn transfer_command_nocwd_appends_list_path() {
+        // Under `--ftp-method nocwd` curl does not CWD into the directory; it
+        // passes the directory path as an argument to LIST/NLST, truncated at
+        // the last '/' (C `ftp_state_list`, lib/ftp.c L1424-1445).
+        let mut data = Easy::new();
+        data.set.ftp_filemethod = CurlFtpFile::NoCwd as u8;
+
+        // Absolute root `/` (URL `ftp://host//`): the `if(n == 0) ++n;`
+        // special-case keeps the single slash ⇒ `LIST /` (tests/data/test351).
+        let mut root = FtpConn::new();
+        root.rawpath = "/".to_string();
+        assert_eq!(
+            root.transfer_command(&data, TransferKind::List).unwrap(),
+            "LIST /"
+        );
+
+        // A nested directory drops the trailing slash ⇒ `LIST fir#t/third/244`
+        // (tests/data/test244; rawpath is URL-decoded, leading '/' stripped).
+        let mut nested = FtpConn::new();
+        nested.rawpath = "fir#t/third/244/".to_string();
+        assert_eq!(
+            nested.transfer_command(&data, TransferKind::List).unwrap(),
+            "LIST fir#t/third/244"
+        );
+
+        // `--list-only` (per-transfer `list_only`) selects the NLST verb but
+        // the same path argument.
+        nested.list_only = true;
+        assert_eq!(
+            nested.transfer_command(&data, TransferKind::List).unwrap(),
+            "NLST fir#t/third/244"
+        );
+
+        // A rawpath with no slash (e.g. the server home) yields a bare verb.
+        let mut bare = FtpConn::new();
+        bare.rawpath = String::new();
+        assert_eq!(
+            bare.transfer_command(&data, TransferKind::List).unwrap(),
+            "LIST"
+        );
+
+        // The other CWD methods CWD into the directory first, so they emit a
+        // bare LIST/NLST with no path argument even when a rawpath is present.
+        let mut multicwd = FtpConn::new();
+        multicwd.rawpath = "pub/".to_string();
+        let data_default = Easy::new(); // default method = MULTICWD
+        assert_eq!(
+            multicwd.transfer_command(&data_default, TransferKind::List).unwrap(),
+            "LIST"
         );
     }
 
     #[test]
     fn check_transfer_start_classifies_reply_codes() {
         let ftpc = FtpConn::new();
-        // 1xx preliminary replies open the data transfer.
-        assert!(ftpc.check_transfer_start(150, TransferKind::Retr).is_ok());
-        assert!(ftpc.check_transfer_start(125, TransferKind::List).is_ok());
-        // 550 on a download ⇒ file not found.
+        // 1xx preliminary replies open the data transfer (⇒ Ok(true)).
+        assert!(ftpc.check_transfer_start(150, TransferKind::Retr).unwrap());
+        assert!(ftpc.check_transfer_start(125, TransferKind::List).unwrap());
+        // 450 on a LIST/NLST ⇒ empty listing: a *successful* transfer that
+        // opens no data connection (C lib/ftp.c L2783-2787). Signaled as
+        // Ok(false), NOT an error, so the control connection is QUIT-ed
+        // gracefully (tests/data/test144).
+        assert!(!ftpc.check_transfer_start(450, TransferKind::List).unwrap());
+        // 450 on a RETR is *not* the empty-listing special case ⇒ generic
+        // RETR failure.
+        assert_eq!(
+            ftpc.check_transfer_start(450, TransferKind::Retr).unwrap_err(),
+            CurlError::FtpCouldntRetrFile
+        );
+        // 550 on a RETR ⇒ file not found (C: only `instate == FTP_RETR`).
         assert_eq!(
             ftpc.check_transfer_start(550, TransferKind::Retr).unwrap_err(),
             CurlError::RemoteFileNotFound
+        );
+        // 550 on a LIST ⇒ generic RETR failure, NOT file-not-found (C maps
+        // only RETR+550 to REMOTE_FILE_NOT_FOUND).
+        assert_eq!(
+            ftpc.check_transfer_start(550, TransferKind::List).unwrap_err(),
+            CurlError::FtpCouldntRetrFile
         );
         // Any other non-1xx download failure ⇒ generic RETR failure.
         assert_eq!(

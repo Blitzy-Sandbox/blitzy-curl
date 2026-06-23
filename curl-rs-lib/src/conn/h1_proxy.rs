@@ -1650,6 +1650,27 @@ impl ConnectionFilter for CfH1Proxy {
         }
     }
 
+    /// Hand back the CONNECT response lines this filter captured while parsing
+    /// the proxy's reply (C: the lines `single_header` surfaced with
+    /// `CLIENTWRITE_HEADER | CLIENTWRITE_CONNECT`). Each retains its original
+    /// CRLF, ready to be written verbatim to the data stream by the transfer
+    /// engine for a plain-HTTP `--proxytunnel` transfer (oracle: test80/83/95).
+    /// They persist across the tunnel teardown of working buffers (see the
+    /// `is_established()` branch in `connect`), so this is valid for the life of
+    /// the connection.
+    fn connect_response_headers(&self) -> Option<Vec<Vec<u8>>> {
+        Some(self.tunnel.response_headers.clone())
+    }
+
+    /// The proxy's parsed `CONNECT` status code (C: `data->info.httpproxycode`),
+    /// surfaced for `CURLINFO_HTTP_CONNECTCODE` / `%{http_connect}`. `0` until
+    /// the CONNECT status line is parsed; valid for the life of the connection
+    /// thereafter, including after a non-2xx (failed) tunnel — the transfer
+    /// engine records it on both the success and failure paths (oracle: test217).
+    fn connect_proxy_code(&self) -> Option<i32> {
+        Some(self.tunnel.httpproxycode)
+    }
+
     // NOTE: `shutdown`, `data_pending`, `send`, `recv`, `cntrl`, `is_alive`,
     // `keep_alive`, and `query` are intentionally left as the trait defaults:
     // once the tunnel is ESTABLISHED this filter is fully transparent and every
@@ -2087,6 +2108,37 @@ mod tests {
             .response_headers()
             .iter()
             .any(|h| h.starts_with(b"HTTP/1.1 200")));
+    }
+
+    #[test]
+    fn connect_response_headers_surfaces_captured_lines() {
+        // The CONNECT-tunnel filter must hand its captured response lines back
+        // through the `ConnectionFilter::connect_response_headers` trait method
+        // — the path the transfer engine uses to write the proxy's CONNECT
+        // reply onto the data stream for a plain-HTTP `--proxytunnel` transfer
+        // (oracle: tests/data/test80, test83, test95). Each line must retain its
+        // original CRLF, and the terminating blank line must be included so the
+        // data-stream prefix is `...indeed\r\n\r\n`.
+        let mock = MockProxy::new(vec![b"HTTP/1.1 200 Mighty fine indeed\r\n\r\n".to_vec()]);
+        let mut cf = filter_with(Box::new(mock), H1ProxyConfig::new("example.com", 80));
+        let (res, _err) = drive_connect(&mut cf);
+        assert!(res.is_ok(), "connect should succeed: {res:?}");
+
+        // Call through the trait, exactly as the engine does via the chain
+        // (`FilterChain::connect_response_headers`).
+        let lines = cf
+            .connect_response_headers()
+            .expect("CONNECT filter returns Some(lines)");
+        // The status line is first and keeps its CRLF intact.
+        assert_eq!(
+            lines.first().map(Vec::as_slice),
+            Some(&b"HTTP/1.1 200 Mighty fine indeed\r\n"[..]),
+        );
+        // The terminating blank line (CRLF) is captured too.
+        assert!(
+            lines.iter().any(|l| l.as_slice() == b"\r\n"),
+            "blank end-of-headers line must be captured, got {lines:?}",
+        );
     }
 
     #[test]

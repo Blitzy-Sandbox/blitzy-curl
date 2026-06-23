@@ -1414,16 +1414,27 @@ pub unsafe extern "C" fn curl_formfree(form: *mut curl_httppost) {
 /// bytes are copied; the borrowed `contentheader` slist is deep-copied; `more`
 /// and `next` are translated recursively.
 ///
-/// Callback (`CURL_HTTPPOST_CALLBACK`) parts have no readable bytes outside a
-/// live transfer (the data comes from the easy handle's read function, absent
-/// here), so their body is left empty — `curl_formget` is a standalone
-/// serializer, matching what curl can produce without an attached handle.
+/// Callback (`CURL_HTTPPOST_CALLBACK`) parts have no standalone bytes — the data
+/// is produced by the easy handle's `CURLOPT_READFUNCTION` at transfer time. When
+/// `fread_func` is `Some` (the live-transfer path, [`httppost_chain_to_body`]),
+/// such a part is given a [`CCallbackReader`] that streams its body from that
+/// callback using the node's `userp` as the opaque arg — exactly curl's
+/// `Curl_getformdata` wiring
+/// (`curl_mime_data_cb(part, clen, fread_func, NULL, NULL, post->userp)`,
+/// lib/formdata.c). When `fread_func` is `None` (the standalone `curl_formget`
+/// serializer, which has no attached handle / read function) the callback body is
+/// left empty, matching what curl can produce without a handle.
 ///
 /// # Safety
 ///
 /// `c` must be NULL or a valid `curl_httppost` chain (each owned string a valid
-/// C string / buffer of the stated length).
-unsafe fn c_post_to_core(c: *const curl_httppost) -> Option<Box<core::mime::HttpPost>> {
+/// C string / buffer of the stated length). When `fread_func` is `Some`, it must
+/// be safe to call with each callback node's `userp` for the duration of the
+/// serialization driven by the caller.
+unsafe fn c_post_to_core(
+    c: *const curl_httppost,
+    fread_func: curl_read_callback,
+) -> Option<Box<core::mime::HttpPost>> {
     if c.is_null() {
         return None;
     }
@@ -1481,7 +1492,24 @@ unsafe fn c_post_to_core(c: *const curl_httppost) -> Option<Box<core::mime::Http
             hp.buffer = Some(unsafe { slice::from_raw_parts(cn.buffer as *const u8, n) }.to_vec());
         }
     } else if is_callback {
-        // No standalone bytes; core uses an empty reader for the callback body.
+        // A `CURL_HTTPPOST_CALLBACK` part (a `CURLFORM_STREAM` field) carries no
+        // standalone bytes. On the live-transfer path `fread_func` is the easy
+        // handle's `CURLOPT_READFUNCTION`, so attach a reader that streams the
+        // body from that callback with this node's `userp` as the opaque arg —
+        // exactly curl's `Curl_getformdata`, which converts such a part via
+        // `curl_mime_data_cb(part, clen, fread_func, NULL, NULL, post->userp)`
+        // (lib/formdata.c L811-817; the seek/free callbacks are NULL there too).
+        // The declared size (`contentslength`/`contentlen`) is applied to the
+        // part later by `apply_fill`. With `fread_func == None` (standalone
+        // `curl_formget`) the body is left empty, as before.
+        if fread_func.is_some() {
+            hp.reader = Some(Box::new(CCallbackReader {
+                readfunc: fread_func,
+                seekfunc: None,
+                freefunc: None,
+                arg: cn.userp,
+            }));
+        }
     } else if !cn.contents.is_null() {
         // Plain data: length from `contentlen` when LARGE, else `contentslength`,
         // else strlen.
@@ -1524,13 +1552,82 @@ unsafe fn c_post_to_core(c: *const curl_httppost) -> Option<Box<core::mime::Http
         hp.contentheader = Some(unsafe { crate::slist::raw_to_core(cn.contentheader) });
     }
 
-    // recurse into the additional files and the next sibling
+    // recurse into the additional files and the next sibling (threading the
+    // same read function so every callback part in the chain is wired alike).
     // SAFETY: `more`/`next` are NULL or live sub-chains.
-    hp.more = unsafe { c_post_to_core(cn.more) };
+    hp.more = unsafe { c_post_to_core(cn.more, fread_func) };
     // SAFETY: `cn.next` is NULL or a live `curl_httppost` sub-chain owned by this crate (read only).
-    hp.next = unsafe { c_post_to_core(cn.next) };
+    hp.next = unsafe { c_post_to_core(cn.next, fread_func) };
 
     Some(Box::new(hp))
+}
+
+/// Serialize a stored `CURLOPT_HTTPPOST` legacy form chain into an owned
+/// `multipart/form-data` request body and its boundary-bearing `Content-Type`,
+/// the memory-safe FFI equivalent of curl's `Curl_getformdata` + mime readback
+/// performed at transfer time (`lib/formdata.c`; `lib/http.c` `HTTPREQ_POST_FORM`).
+///
+/// The `#![forbid(unsafe_code)]` core stores `CURLOPT_HTTPPOST` only as an opaque
+/// address it cannot dereference, so — exactly as the CLI's `-F` handler eagerly
+/// serializes its MIME tree and hands the core an owned body via
+/// `Easy::set_mime_body` — the FFI walks the C `curl_httppost` chain here, at
+/// perform time, into a [`core::mime::Mime`], reads it back into the finished
+/// multipart body, and announces the matching `multipart/form-data; boundary=…`
+/// `Content-Type`. `CURL_HTTPPOST_CALLBACK` (`CURLFORM_STREAM`) parts are streamed
+/// from the easy handle's `CURLOPT_READFUNCTION` (`read_fn_addr`) with each node's
+/// `userp` as the opaque arg (see [`c_post_to_core`]); the produced bytes — and
+/// thus the wire — are byte-for-byte identical to curl's, differing only in the
+/// body's memory ownership (the AAP G1 mandate). The boundary is read with
+/// [`boundary_str`](core::mime::Mime::boundary_str) *before*
+/// [`into_form_body`](core::mime::Mime::into_form_body) consumes the tree, so the
+/// announced `boundary=` parameter matches the delimiter framing the body.
+///
+/// Returns the `(body, content_type)` pair, or `None` when `chain` is `0`
+/// (unset) or serialization fails (a callback abort / read error / boundary RNG
+/// failure), in which case the caller leaves the body unmaterialized.
+///
+/// # Safety
+///
+/// `chain`, when non-zero, must be a live `curl_httppost` chain (each owned
+/// string a valid C string / buffer of the stated length). `read_fn_addr`, when
+/// non-zero, must be a `curl_read_callback` address (stored by
+/// `curl_easy_setopt(CURLOPT_READFUNCTION, …)`) safe to call with each callback
+/// part's `userp` for the duration of this serialization.
+pub(crate) unsafe fn httppost_chain_to_body(
+    chain: usize,
+    read_fn_addr: usize,
+) -> Option<(Vec<u8>, String)> {
+    if chain == 0 {
+        return None;
+    }
+    // The easy handle's `CURLOPT_READFUNCTION` drives `CURL_HTTPPOST_CALLBACK`
+    // parts (curl's `data->set.fread_func`). A `0` address (never set) → `None`,
+    // so callback parts serialize empty (curl behaves the same with no reader).
+    let fread_func: curl_read_callback = if read_fn_addr == 0 {
+        None
+    } else {
+        // SAFETY: `read_fn_addr` is a `curl_read_callback` previously stored by
+        // `curl_easy_setopt(CURLOPT_READFUNCTION, …)`, so its ABI matches the
+        // transmuted signature (the same transmute the upload `CReadBridge`
+        // performs on this very field in `easy.rs`).
+        Some(unsafe {
+            std::mem::transmute::<
+                usize,
+                unsafe extern "C" fn(*mut c_char, size_t, size_t, *mut c_void) -> size_t,
+            >(read_fn_addr)
+        })
+    };
+    // SAFETY: per this function's contract `chain` is a live `curl_httppost`
+    // chain and `fread_func` is safe to call with each callback node's `userp`.
+    let mut hp = unsafe { c_post_to_core(chain as *const curl_httppost, fread_func) }?;
+    // Build the MIME tree from the chain, then read it back into the finished
+    // body — the same `httppost_to_mime` + `into_form_body` path `curl_formget`
+    // uses, so the encoded parts match curl byte-for-byte.
+    let mime = core::mime::httppost_to_mime(&mut hp).ok()?;
+    let boundary = String::from_utf8_lossy(mime.boundary_str()).into_owned();
+    let content_type = format!("multipart/form-data; boundary={boundary}");
+    let body = mime.into_form_body().ok()?;
+    Some((body, content_type))
 }
 
 /// `int curl_formget(struct curl_httppost *form, void *arg, curl_formget_callback
@@ -1559,8 +1656,11 @@ pub unsafe extern "C" fn curl_formget(
         return 0;
     }
 
-    // SAFETY: `form` is a valid chain per the contract.
-    let mut head = match unsafe { c_post_to_core(form) } {
+    // SAFETY: `form` is a valid chain per the contract. `None` read function:
+    // `curl_formget` is a standalone serializer with no attached easy handle, so
+    // any `CURL_HTTPPOST_CALLBACK` part serializes with an empty body (curl
+    // likewise cannot read callback data without a transfer).
+    let mut head = match unsafe { c_post_to_core(form, None) } {
         Some(h) => h,
         None => return 0,
     };

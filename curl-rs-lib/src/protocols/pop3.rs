@@ -44,6 +44,7 @@ use crate::conn::{
 };
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
+use crate::netrc::{self, CurlNetrcOption};
 use crate::protocols::pingpong::{tls_config_from_easy, PingPong, PingPongProtocol};
 use crate::protocols::{
     connect_network_scheme, Protocol, ProtocolTransfer, Scheme, TransferDirection, SCHEME_POP3,
@@ -54,6 +55,7 @@ use crate::transfer::{ClientWriteType, ClientWriter, ReadCallback, WriteCallback
 use crate::url::{CurlUPart, CurlUrl, CURLU_GUESS_SCHEME, CURLU_NON_SUPPORT_SCHEME};
 use crate::util::md5;
 use crate::util::sendf;
+use std::path::Path;
 
 // ===========================================================================
 // Constants (C `lib/pop3.c` / `lib/pop3.h`)
@@ -669,17 +671,24 @@ fn percent_decode(input: &[u8]) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Parse the transfer URL into `(user, password, options, message_id)` using the
-/// crate URL engine ([`CurlUrl`]).
+/// C `str_has_ctrl` (lib/url.c L2557): return `true` when the string contains
+/// any control byte (`< 0x20`). Used to reject `.netrc` credentials carrying
+/// control codes for protocols without `PROTOPT_USERPWDCTRL` (POP3/IMAP/SMTP).
+fn str_has_ctrl(input: Option<&str>) -> bool {
+    input.is_some_and(|s| s.bytes().any(|b| b < 0x20))
+}
+
+/// Parse the transfer URL into `(user, password, options, message_id, host)`
+/// using the crate URL engine ([`CurlUrl`]).
 ///
 /// Mirrors C `pop3_connect` (credentials and `;options` from the URL) and
 /// `pop3_parse_url_path` (the message id is the path with its leading `/`
 /// stripped, URL-decoded). Credentials are URL-decoded to match curl's
 /// `conn->user` / `conn->passwd`. Any parse failure yields all-empty values,
 /// leaving the connect phase to stop gracefully when no username is present.
-fn parse_url_info(data: &Easy) -> (String, String, Option<String>, String) {
+fn parse_url_info(data: &Easy) -> (String, String, Option<String>, String, String) {
     let Some(url) = data.url() else {
-        return (String::new(), String::new(), None, String::new());
+        return (String::new(), String::new(), None, String::new(), String::new());
     };
     let mut handle = CurlUrl::new();
     if handle
@@ -690,7 +699,7 @@ fn parse_url_info(data: &Easy) -> (String, String, Option<String>, String) {
         )
         .is_err()
     {
-        return (String::new(), String::new(), None, String::new());
+        return (String::new(), String::new(), None, String::new(), String::new());
     }
     match handle.to_request_parts() {
         Ok(parts) => {
@@ -708,9 +717,12 @@ fn parse_url_info(data: &Easy) -> (String, String, Option<String>, String) {
                 .password
                 .map(|p| percent_decode(p.as_bytes()))
                 .unwrap_or_default();
-            (user, passwd, parts.options, id)
+            // The wire-ready host is carried out for the `.netrc` lookup
+            // (C `override_login` matches `.netrc` entries against
+            // `conn->host.name`).
+            (user, passwd, parts.options, id, parts.host)
         }
-        Err(_) => (String::new(), String::new(), None, String::new()),
+        Err(_) => (String::new(), String::new(), None, String::new(), String::new()),
     }
 }
 
@@ -1506,11 +1518,95 @@ impl Protocol for Pop3Protocol {
             // Initialise the ping-pong engine (C `Curl_pp_init`).
             pop3c.pp.init(conn.created);
 
-            // Credentials and options come from the URL (C `pop3_connect` uses
-            // `conn->user`/`conn->passwd`/`conn->options`).
-            let (user, passwd, options, _id) = parse_url_info(data);
-            pop3c.user = user;
-            pop3c.passwd = passwd;
+            // Resolve the login credentials with curl's exact precedence
+            // (C `override_login`, lib/url.c L2575, plus the create_conn comment
+            // at L1761-1763: "username and password set with their own options
+            // override the credentials possibly set in the URL, but netrc does
+            // not"):
+            //   1. explicit `-u user:password` (CURLOPT_USERPWD →
+            //      `StrId::Username`/`StrId::Password`) overrides the URL
+            //      userinfo on a per-field basis (CREDS_OPTION > CREDS_URL);
+            //   2. the URL userinfo seeds any field `-u` did not set;
+            //   3. `.netrc` (when `CURLOPT_NETRC` is enabled AND no `-u`
+            //      *username* was given) fills the remaining gaps.
+            // Anything still unset stays empty — POP3 has no anonymous default,
+            // and an empty username makes `perform_user` stop gracefully (C
+            // `pop3_perform_user`: "Check we have a username and password to
+            // authenticate with").
+            let (url_user, url_passwd, options, _id, host) = parse_url_info(data);
+            // Empty URL userinfo is treated as absent (C `CURLUE_NO_USER` /
+            // `CURLUE_NO_PASSWORD`).
+            let url_user = Some(url_user).filter(|u| !u.is_empty());
+            let url_passwd = Some(url_passwd).filter(|p| !p.is_empty());
+
+            let explicit_user = data.set.str(StrId::Username).map(str::to_string);
+            let explicit_pass = data.set.str(StrId::Password).map(str::to_string);
+
+            // `CURLOPT_NETRC` mode (0=ignored / 1=optional / 2=required).
+            let netrc_opt = CurlNetrcOption::from_long(i64::from(data.set.use_netrc))
+                .unwrap_or(CurlNetrcOption::Ignored);
+
+            // For `CURL_NETRC_REQUIRED` curl discards the URL-supplied
+            // credentials up front so `.netrc` fully overrides them
+            // (C `override_login` L2591-2593); the URL username is still kept as
+            // the `.netrc` lookup hint below. Otherwise the URL userinfo seeds.
+            let (mut user, mut passwd) = if netrc_opt == CurlNetrcOption::Required {
+                (None, None)
+            } else {
+                (url_user.clone(), url_passwd.clone())
+            };
+
+            // `-u` overrides the URL for each field independently.
+            if explicit_user.is_some() {
+                user = explicit_user.clone();
+            }
+            if explicit_pass.is_some() {
+                passwd = explicit_pass.clone();
+            }
+
+            // `.netrc`: consulted only when enabled AND `-u` supplied no
+            // username (C `use_netrc && !STRING_USERNAME`), and only while the
+            // password is still unset (C guards the lookup with `if(!*passwdp)`).
+            // The entry is matched by the URL-provided username when one exists
+            // (kept as the hint even under `REQUIRED`); otherwise the first host
+            // match supplies the login too. A `.netrc` parse failure or a
+            // missing file under `REQUIRED` surfaces as `CURLE_READ_ERROR`
+            // (propagated by `netrc::resolve`).
+            if netrc_opt != CurlNetrcOption::Ignored
+                && explicit_user.is_none()
+                && passwd.is_none()
+            {
+                let file = data.set.str(StrId::NetrcFile).map(Path::new);
+                let hint = url_user.as_deref();
+                if let Some(entry) = netrc::resolve(netrc_opt, file, &host, hint)? {
+                    if user.is_none() {
+                        user = entry.login;
+                    }
+                    if passwd.is_none() {
+                        passwd = entry.password;
+                    }
+                    // POP3 lacks `PROTOPT_USERPWDCTRL`, so credentials taken
+                    // from `.netrc` must not contain control bytes (< 0x20):
+                    // C `override_login` rejects them with `CURLE_READ_ERROR`
+                    // ("control code detected in .netrc credentials"). The check
+                    // runs only in the netrc-match-success branch and examines
+                    // the final resolved username/password.
+                    if str_has_ctrl(user.as_deref()) || str_has_ctrl(passwd.as_deref()) {
+                        sendf::failf(
+                            &mut conn.filter_data.error_buffer,
+                            "control code detected in .netrc credentials",
+                        );
+                        return Err(CurlError::ReadError);
+                    }
+                }
+            }
+
+            if let Some(u) = user {
+                pop3c.user = u;
+            }
+            if let Some(p) = passwd {
+                pop3c.passwd = p;
+            }
 
             // Default preferred auth, then SASL init (C order).
             pop3c.preftype = POP3_TYPE_ANY;
@@ -1542,11 +1638,16 @@ impl Protocol for Pop3Protocol {
         conn: &'a mut Connection,
     ) -> BoxFuture<'a, Result<ProtocolTransfer>> {
         Box::pin(async move {
-            // The message id is the URL path (C `pop3_parse_url_path`). A custom
-            // request (`CURLOPT_CUSTOMREQUEST`) is not reachable through the
-            // dependency whitelist, so it is left unset (standard RETR/LIST and
-            // `--list-only` still work).
-            let (_user, _passwd, _options, id) = parse_url_info(data);
+            // The message id is the URL path (C `pop3_parse_url_path`).
+            let (_user, _passwd, _options, id, _host) = parse_url_info(data);
+
+            // A custom request (`CURLOPT_CUSTOMREQUEST`, set via the CLI `-X`)
+            // overrides the default `RETR`/`LIST` command, exactly as C
+            // `pop3_perform_command` consults `data->set.str[STRING_CUSTOMREQUEST]`
+            // (curl supports `STAT`, `DELE`, `UIDL`, `NOOP`, etc. this way). The
+            // option is `None` when `-X` was not given, leaving the standard
+            // RETR/LIST/`--list-only` behaviour intact.
+            let custom = data.set.str(StrId::Customrequest).map(str::to_string);
 
             // Borrow the per-connection state out so its methods can take `conn`.
             let mut pop3c = match conn.take_proto_state() {
@@ -1557,7 +1658,7 @@ impl Protocol for Pop3Protocol {
             };
 
             pop3c.req.id = id;
-            pop3c.req.custom = None;
+            pop3c.req.custom = custom;
             pop3c.req.transfer = Pop3Transfer::Body;
 
             // Send the command (borrow the engine out, as the drive loop does).
@@ -1781,9 +1882,23 @@ pub(crate) async fn perform_pop3(
     .await;
 
     // (4) Finalize then best-effort `QUIT` teardown.
+    //
+    //     The `dead` argument must reflect genuine *connection* death, NOT the
+    //     transfer's success or failure. curl drives teardown from the multi
+    //     state machine, which — for a DO-phase protocol error (a successfully
+    //     read `-ERR` reply to `RETR`/`LIST`, surfaced as `CURLE_WEIRD_SERVER_REPLY`
+    //     = 8) — calls `multi_done(data, result, FALSE)` (premature = FALSE),
+    //     and that `FALSE` flows to `pop3_disconnect` as `dead_connection =
+    //     FALSE`, so a graceful `QUIT` is still sent (see `tests/data/test855`:
+    //     `RETR` → `-ERR` → `QUIT`, with exit code 8). A connection is only
+    //     genuinely dead on a control-channel I/O failure, in which case the
+    //     best-effort `QUIT` send simply fails and is ignored. Passing `false`
+    //     here and letting the `!pp.needs_flush()` gate in `disconnect` decide
+    //     therefore matches curl exactly; using `done.is_err()` would wrongly
+    //     suppress `QUIT` on every protocol error.
     let premature = result.is_err();
     let done = handler.done(data, &mut conn, result, premature).await;
-    let _ = handler.disconnect(data, &mut conn, done.is_err()).await;
+    let _ = handler.disconnect(data, &mut conn, false).await;
     done
 }
 

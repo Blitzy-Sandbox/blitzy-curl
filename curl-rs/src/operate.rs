@@ -62,6 +62,11 @@ use curl_rs_lib::share::{LockData, ShareSetting};
 use curl_rs_lib::{
     CurlCode, CurlError, CurlInfo, CurlOption, Easy, InfoValue, Multi, OptionValue, Share,
 };
+// `InfoPtr` is the pointer-valued arm of `InfoValue`; `CURLINFO_CERTINFO`
+// (`%{certs}`/`%{num_certs}`) returns `InfoValue::Ptr(InfoPtr::CertInfo(..))`,
+// which `post_per_transfer` reads into `PerTransfer::certinfo`. It is not in the
+// crate prelude, so it is imported from the public `getinfo` module directly.
+use curl_rs_lib::getinfo::InfoPtr;
 
 use crate::callbacks::debug::CurlInfoType;
 use crate::callbacks::write::{
@@ -171,6 +176,19 @@ pub struct HdrCbData {
     /// (the C `hdrcbdata.headlist` of `struct curl_slist`). Owned here so the
     /// `--write-out` `%{header_json}` renderer can walk them.
     pub headlist: Vec<Vec<u8>>,
+    /// The most recent HTTP status code parsed from the response header stream
+    /// (the status line `HTTP/x.y NNN ...`). This is the CLI's stand-in for
+    /// `CURLINFO_RESPONSE_CODE` *during* the transfer: the real easy handle is
+    /// moved out for the duration of `perform_with_cli_io` (a default placeholder
+    /// is left in `per.easy`), so a mid-transfer `getinfo` on it cannot return the
+    /// live code. curl reads it via
+    /// `curl_easy_getinfo(per->curl, CURLINFO_RESPONSE_CODE, ...)` in
+    /// `tool_header_cb`; the header callback here tracks it from the status line
+    /// instead. `0` until the first status line of the transfer is seen, and
+    /// updated on every status line so the latest response block's code gates the
+    /// etag / content-disposition header handling — exactly as curl's getinfo
+    /// returns the most recent code across redirect/auth hops.
+    pub last_response_code: i64,
 }
 
 // ===========================================================================
@@ -748,13 +766,17 @@ fn add_file_name_to_url(inurl: &str, filename: &str) -> Result<String, CurlCode>
 
     // Percent-encode the base name conservatively (RFC 3986 unreserved set is
     // left as-is; everything else is %-escaped), matching curl_easy_escape.
+    // curl emits LOWERCASE hex digits (`Curl_ldigits = "0123456789abcdef"` via
+    // `Curl_hexbyte`, lib/escape.c), so the escape must use `{:02x}` — the
+    // percent-encoding casing is wire-significant for protocol-verify tests
+    // (e.g. tests/data/test58 expects `%5b%5d`, not `%5B%5D`).
     let mut enc = String::with_capacity(base.len());
     for &b in base.as_bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
             enc.push(b as char);
         } else {
             enc.push('%');
-            enc.push_str(&format!("{b:02X}"));
+            enc.push_str(&format!("{b:02x}"));
         }
     }
 
@@ -2516,6 +2538,22 @@ impl Driver {
 
         global.noprogress = orig_noprogress;
         global.isatty = orig_isatty;
+
+        // Graceful end-of-run teardown of the shared connection pool. Any FTP
+        // control connection kept alive for reuse (checked in rather than
+        // QUITed inline at its transfer's end) receives its deferred,
+        // best-effort `QUIT` here, while the runtime is still live — yielding
+        // the single trailing `QUIT` the curl oracle expects for multi-URL
+        // same-host FTP (e.g. `tests/data/test215`) and remaining wire-identical
+        // for a single transfer. Pooled non-FTP (e.g. HTTP keep-alive)
+        // connections are force-closed by the same drain, equivalent to the
+        // pool's prior `Drop`-time teardown. The deferred `QUIT`'s verbose trace
+        // is not reproduced (it originates from the per-handle debug callback,
+        // absent on the drain's throwaway handle); no curl test asserts a
+        // client-side `QUIT` trace, and the on-wire `QUIT` — the parity oracle —
+        // is sent regardless.
+        curl_rs_lib::protocols::ftp::ftp_drain_pool(&self.conn_pool, false).await;
+
         result
     }
 }
@@ -3235,6 +3273,34 @@ fn post_per_transfer(
         }
 
         result = post_close_output(global, per, result);
+    }
+
+    // Capture the certificate chain for `%{certs}`/`%{num_certs}` before the
+    // write-out consumes it. curl's `tool_writeout.c` fetches `CURLINFO_CERTINFO`
+    // lazily via `certinfo(per)`, only when `--write-out` is in effect (the same
+    // condition under which `config2setopts.c` set `CURLOPT_CERTINFO`).
+    // `CURLINFO_CERTINFO` borrows the easy handle's stored chain — one
+    // `"Cert:<pem>"` node per certificate — which `WriteOutId::Cert` strips and
+    // newline-terminates. Storing `Some` whenever the info is present (even with
+    // zero certs) makes `%{num_certs}` report `0` rather than emitting nothing,
+    // matching curl's always-non-NULL `curl_certinfo` pointer.
+    if global.operations[per.config_idx].writeout.is_some() {
+        let captured: Option<Vec<Vec<String>>> = match per.easy.getinfo(CurlInfo::Certinfo) {
+            Ok(InfoValue::Ptr(InfoPtr::CertInfo(ci))) => Some(
+                ci.certs()
+                    .iter()
+                    .map(|sl| {
+                        sl.iter()
+                            .map(|e| e.to_string_lossy().into_owned())
+                            .collect()
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        };
+        if captured.is_some() {
+            per.certinfo = captured;
+        }
     }
 
     // Write the --write-out data after the result is final but before cleanup.
@@ -4325,6 +4391,26 @@ mod tests {
     fn add_file_name_leaves_query_urls_unchanged() {
         let url = "http://host/path?a=b";
         assert_eq!(add_file_name_to_url(url, "local.bin").unwrap(), url);
+    }
+
+    /// When the URL path ends in a slash, `add_file_name_to_url` appends the
+    /// local basename percent-encoded with curl_easy_escape semantics: the
+    /// RFC 3986 unreserved set is preserved and every other byte is escaped
+    /// with **lowercase** hex digits (`Curl_ldigits`, lib/escape.c). This is
+    /// wire-significant — tests/data/test58 (`PUT .../58te%5b%5dst.txt`) fails
+    /// the protocol-verify diff if the casing is uppercase.
+    #[test]
+    fn add_file_name_appends_lowercase_percent_escaped_basename() {
+        assert_eq!(
+            add_file_name_to_url("http://host/we/want/", "/dir/58te[]st.txt").unwrap(),
+            "http://host/we/want/58te%5b%5dst.txt"
+        );
+        // No path at all: a separator is inserted before the basename, and the
+        // unreserved characters (`-`, `.`, `_`, `~`, alphanumerics) survive.
+        assert_eq!(
+            add_file_name_to_url("http://host", "a b~c.txt").unwrap(),
+            "http://host/a%20b~c.txt"
+        );
     }
 
     /// SSL-session export is not a capability of this build, so the gate is

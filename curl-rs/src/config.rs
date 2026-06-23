@@ -317,8 +317,13 @@ pub struct OperationConfig {
     pub url_out: Option<usize>,
     /// Index of the node awaiting an upload file (C `url_ul`).
     pub url_ul: Option<usize>,
-    /// Number of URLs added to [`url_list`](OperationConfig::url_list)
-    /// (C `num_urls`; kept in sync with the list length).
+    /// Number of URL arguments added (C `num_urls`). Incremented exactly once
+    /// per URL by [`add_url`](crate::args), mirroring curl's
+    /// `++config->num_urls` (`tool_getparam.c` L1118). This counts URL
+    /// arguments only — not output (`-o`/`-O`) or upload (`-T`) nodes, and not
+    /// glob expansion — so the "etag options only work on a single URL" guard
+    /// fires correctly. It is therefore not necessarily equal to
+    /// `url_list.len()`.
     pub num_urls: usize,
 
     /// `--ipfs-gateway` (C field guarded by `CURL_DISABLE_IPFS`; always present
@@ -582,8 +587,16 @@ impl OperationConfig {
     /// The new node inherits `useremote` from
     /// [`remote_name_all`](OperationConfig::remote_name_all) (curl's `-O` /
     /// `--remote-name-all` behavior) and receives a process-global sequence
-    /// number (C's `static int outnum`). [`num_urls`](OperationConfig::num_urls)
-    /// is updated to track the list length.
+    /// number (C's `static int outnum`).
+    ///
+    /// This does **not** touch [`num_urls`](OperationConfig::num_urls): in curl
+    /// `new_getout` (`tool_getparam.c`) is the shared node allocator for URL,
+    /// output (`-o`/`-O`), and upload (`-T`) nodes alike, and only the URL-add
+    /// path (`add_url`) increments `num_urls` (`++config->num_urls`,
+    /// `tool_getparam.c` L1118). Syncing `num_urls` to the list length here
+    /// would double-count a single URL (the allocator bumps it, then `add_url`
+    /// bumps it again) and also miscount when `-o`/`-T` allocate body-less
+    /// nodes, breaking the "etag options only work on a single URL" guard.
     pub fn new_getout(&mut self) -> usize {
         let node = GetOut {
             num: GETOUT_OUTNUM.fetch_add(1, Ordering::Relaxed) as i64,
@@ -594,7 +607,6 @@ impl OperationConfig {
             ..GetOut::default()
         };
         self.url_list.push(node);
-        self.num_urls = self.url_list.len();
         self.url_list.len() - 1
     }
 

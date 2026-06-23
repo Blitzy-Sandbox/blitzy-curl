@@ -681,6 +681,36 @@ fn apply_output_dir(global: &GlobalConfig, config_idx: usize, filename: String) 
     }
 }
 
+/// Parse the HTTP status code from a status line as it streams through the
+/// header callback. Returns `None` for any non-status line. The status line is
+/// `HTTP/<version> <code> <reason>`; the second whitespace-separated token is
+/// the integer code (`HTTP/1.1 200 OK` → `200`, `HTTP/2 301 ...` → `301`). This
+/// is the CLI's stand-in for `CURLINFO_RESPONSE_CODE` during the transfer — the
+/// live handle is moved out (see [`tool_header_cb`]) — and mirrors the core's
+/// own status-line parser (`parse_status_code`).
+fn parse_status_line_code(line: &[u8]) -> Option<i64> {
+    let s = std::str::from_utf8(line).ok()?;
+    let rest = s.strip_prefix("HTTP/")?;
+    let mut tokens = rest.split_whitespace();
+    let _version = tokens.next()?; // "1.1", "1.0", "2", "3"
+    tokens.next()?.parse::<i64>().ok()
+}
+
+/// Whether `url`'s scheme is `http` or `https` (case-insensitive). Gates the
+/// etag / content-disposition header handling to HTTP(S) transfers — the CLI's
+/// stand-in for `getinfo(SCHEME) ∈ {http, https}`, taken from the transfer URL
+/// because the live handle is unavailable in the header callback.
+fn url_is_http_or_https(url: &str) -> bool {
+    let u = url.trim_start();
+    match u.find("://") {
+        Some(pos) => {
+            let scheme = &u[..pos];
+            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+        }
+        None => false,
+    }
+}
+
 // ===========================================================================
 // The CURLOPT_HEADERFUNCTION callback — port of `tool_header_cb`
 // (`src/tool_cb_hdr.c:426-543`).
@@ -751,18 +781,40 @@ pub fn tool_header_cb(buffer: &[u8], per: &mut PerTransfer, global: &mut GlobalC
         }
     }
 
-    // ---- Scheme / response gating ------------------------------------------
-    // curl: getinfo SCHEME → proto_token; only http/https carry a response code,
-    // and only 2xx/3xx responses care about etag / content-disposition.
+    // ---- Scheme retained only for the `-i`/`--include` header echo ---------
+    // curl's `tool_header_cb` reads getinfo(SCHEME) from the live handle. Here
+    // the real easy handle is moved out for the duration of the CLI transfer
+    // (`perform_with_cli_io`), so getinfo returns the default (empty) — and the
+    // `-i` header echo further below is in any case driven independently by the
+    // core's `CURLOPT_HEADER` merge (set from `show_headers` in `setopt`). This
+    // value is therefore retained purely to preserve that block's original gate.
     let scheme = match per.easy.getinfo(CurlInfo::Scheme) {
         Ok(InfoValue::Str(Some(c))) => c.to_string_lossy().to_ascii_lowercase(),
         _ => String::new(),
     };
-    if matches!(scheme.as_str(), "http" | "https") {
-        let response = match per.easy.getinfo(CurlInfo::ResponseCode) {
-            Ok(InfoValue::Long(c)) => c,
-            _ => 0,
-        };
+
+    // ---- Track the response code from the status line ----------------------
+    // The CLI cannot read `CURLINFO_RESPONSE_CODE` / `CURLINFO_SCHEME` from the
+    // in-flight handle (moved out, as above), so `--etag-save` / `-J` would never
+    // fire if gated on getinfo. curl reads the live code via
+    // `curl_easy_getinfo(per->curl, CURLINFO_RESPONSE_CODE)` in `tool_header_cb`;
+    // we instead parse it from the status line as it streams through this
+    // callback. The status line always precedes the `ETag:`/`Content-Disposition:`
+    // lines of its block, and the latest status line wins — mirroring getinfo
+    // returning the most recent response code across redirect/auth hops.
+    if let Some(code) = parse_status_line_code(buffer) {
+        per.hdrcbdata.last_response_code = code;
+    }
+
+    // ---- Scheme / response gating for --etag-save and -J -------------------
+    // curl: only http/https carry a response code, and only 2xx/3xx responses
+    // care about etag / content-disposition (`tool_cb_hdr.c`). The scheme is
+    // taken from the transfer URL (`per.url`) — equivalent to getinfo(SCHEME) for
+    // this http/https gate — and the response code from the status line tracked
+    // above, because the live handle is unavailable mid-transfer.
+    let http_like = per.url.as_deref().is_some_and(url_is_http_or_https);
+    if http_like {
+        let response = per.hdrcbdata.last_response_code;
         let class = response / 100;
         if class == 2 || class == 3 {
             if has_etag_file
@@ -1039,6 +1091,125 @@ mod tests {
         assert!(fs::read(&path).unwrap().is_empty());
     }
 
+    // ---- response-code / scheme gate helpers --------------------------------
+
+    #[test]
+    fn parse_status_line_code_reads_second_token() {
+        assert_eq!(parse_status_line_code(b"HTTP/1.1 200 OK\r\n"), Some(200));
+        assert_eq!(parse_status_line_code(b"HTTP/1.0 301 Moved\r\n"), Some(301));
+        assert_eq!(parse_status_line_code(b"HTTP/2 204\r\n"), Some(204));
+        assert_eq!(parse_status_line_code(b"HTTP/3 200\r\n"), Some(200));
+        // Non-status lines and malformed status lines yield None.
+        assert_eq!(parse_status_line_code(b"ETag: W/\"x\"\r\n"), None);
+        assert_eq!(parse_status_line_code(b"\r\n"), None);
+        assert_eq!(parse_status_line_code(b"HTTP/1.1\r\n"), None); // no code token
+        assert_eq!(parse_status_line_code(b"HTTP/1.1 NaN Bad\r\n"), None);
+    }
+
+    #[test]
+    fn url_is_http_or_https_matches_scheme_case_insensitively() {
+        assert!(url_is_http_or_https("http://h/x"));
+        assert!(url_is_http_or_https("https://h/x"));
+        assert!(url_is_http_or_https("HTTP://h/x"));
+        assert!(url_is_http_or_https("HtTpS://h/x"));
+        assert!(!url_is_http_or_https("ftp://h/x"));
+        assert!(!url_is_http_or_https("file:///x"));
+        assert!(!url_is_http_or_https("no-scheme-here"));
+        assert!(!url_is_http_or_https(""));
+    }
+
+    /// A read+write temp `OutStruct` bound to `path`, used as the `--etag-save`
+    /// sink for the `tool_header_cb` integration tests.
+    fn etag_sink(path: &std::path::Path) -> OutStruct {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        OutStruct {
+            stream: Some(file),
+            ..OutStruct::default()
+        }
+    }
+
+    /// End-to-end: a 2xx response with an `ETag:` header on an http URL must
+    /// write the trimmed etag to the `--etag-save` file. Regression test for the
+    /// CLI etag-save gate: the live easy handle is moved out during the transfer,
+    /// so the gate must derive the scheme from `per.url` and the response code
+    /// from the status line (parsed by the callback) rather than from `getinfo`,
+    /// which would return the placeholder defaults and skip the save. Mirrors
+    /// curl test 339.
+    #[test]
+    fn tool_header_cb_saves_etag_on_2xx_http() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("etag339");
+        let mut global = GlobalConfig::new();
+        global.operations[0].etag_save_file = Some(path.to_string_lossy().into_owned());
+        let mut per = PerTransfer::new(0);
+        per.url = Some("http://127.0.0.1/339".to_string());
+        per.etag_save = etag_sink(&path);
+        // The status line arrives first, then the ETag header — exactly as the
+        // engine streams them to the callback.
+        tool_header_cb(b"HTTP/1.1 200 funky chunky!\r\n", &mut per, &mut global);
+        tool_header_cb(b"ETag: W/\"asdf\"\r\n", &mut per, &mut global);
+        // Close the sink so the bytes are flushed before reading back.
+        per.etag_save.stream = None;
+        assert_eq!(fs::read(&path).unwrap(), b"W/\"asdf\"\n");
+    }
+
+    /// A 3xx (redirect) response that is not followed must still save its etag —
+    /// curl saves in 2xx and 3xx alike. Mirrors curl test 473 (etag on a 301).
+    #[test]
+    fn tool_header_cb_saves_etag_on_3xx_http() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("etag473");
+        let mut global = GlobalConfig::new();
+        global.operations[0].etag_save_file = Some(path.to_string_lossy().into_owned());
+        let mut per = PerTransfer::new(0);
+        per.url = Some("http://127.0.0.1/473".to_string());
+        per.etag_save = etag_sink(&path);
+        tool_header_cb(b"HTTP/1.1 301 funky chunky!\r\n", &mut per, &mut global);
+        tool_header_cb(b"ETag: W/\"asdf\"\r\n", &mut per, &mut global);
+        per.etag_save.stream = None;
+        assert_eq!(fs::read(&path).unwrap(), b"W/\"asdf\"\n");
+    }
+
+    /// A 4xx response must NOT save the etag (the gate restricts to 2xx/3xx),
+    /// matching curl's `(response/100 != 2) && (response/100 != 3)` skip.
+    #[test]
+    fn tool_header_cb_skips_etag_on_4xx() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("etag4xx");
+        let mut global = GlobalConfig::new();
+        global.operations[0].etag_save_file = Some(path.to_string_lossy().into_owned());
+        let mut per = PerTransfer::new(0);
+        per.url = Some("http://127.0.0.1/x".to_string());
+        per.etag_save = etag_sink(&path);
+        tool_header_cb(b"HTTP/1.1 404 Not Found\r\n", &mut per, &mut global);
+        tool_header_cb(b"ETag: W/\"asdf\"\r\n", &mut per, &mut global);
+        per.etag_save.stream = None;
+        assert!(fs::read(&path).unwrap().is_empty());
+    }
+
+    /// A non-HTTP scheme must NOT save the etag even on a 2xx — the gate is
+    /// http/https only (curl's `scheme == proto_http || proto_https`).
+    #[test]
+    fn tool_header_cb_skips_etag_on_non_http_scheme() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("etagftp");
+        let mut global = GlobalConfig::new();
+        global.operations[0].etag_save_file = Some(path.to_string_lossy().into_owned());
+        let mut per = PerTransfer::new(0);
+        per.url = Some("ftp://127.0.0.1/x".to_string());
+        per.etag_save = etag_sink(&path);
+        tool_header_cb(b"HTTP/1.1 200 OK\r\n", &mut per, &mut global);
+        tool_header_cb(b"ETag: W/\"asdf\"\r\n", &mut per, &mut global);
+        per.etag_save.stream = None;
+        assert!(fs::read(&path).unwrap().is_empty());
+    }
+
     // ---- tool_write_headers -------------------------------------------------
 
     #[test]
@@ -1049,6 +1220,7 @@ mod tests {
             config_idx: 0,
             honor_cd_filename: false,
             headlist: vec![b"H1: a\r\n".to_vec(), b"H2: b\r\n".to_vec()],
+            last_response_code: 0,
         };
         let failed = tool_write_headers(&mut hdr, &mut outs);
         assert!(!failed);
@@ -1086,6 +1258,7 @@ mod tests {
             config_idx: 0,
             honor_cd_filename: true,
             headlist: Vec::new(),
+            last_response_code: 0,
         };
         let line = b"Content-Disposition: attachment; filename=\"report.pdf\"\r\n";
         let rc = content_disposition(line, line.len(), &mut outs, &mut hdr, 0, &global, 200);
@@ -1109,6 +1282,7 @@ mod tests {
             config_idx: 0,
             honor_cd_filename: true,
             headlist: Vec::new(),
+            last_response_code: 0,
         };
         let line = b"Location: /downloads/file.zip\r\n";
         let rc = content_disposition(line, line.len(), &mut outs, &mut hdr, 0, &global, 302);
@@ -1131,6 +1305,7 @@ mod tests {
             config_idx: 0,
             honor_cd_filename: true,
             headlist: Vec::new(),
+            last_response_code: 0,
         };
         let line = b"Location: /downloads/file.zip\r\n";
         let rc = content_disposition(line, line.len(), &mut outs, &mut hdr, 0, &global, 200);
@@ -1149,6 +1324,7 @@ mod tests {
             config_idx: 0,
             honor_cd_filename: true,
             headlist: Vec::new(),
+            last_response_code: 0,
         };
         let line = b"Server: nginx\r\n";
         let rc = content_disposition(line, line.len(), &mut outs, &mut hdr, 0, &global, 200);
@@ -1167,6 +1343,7 @@ mod tests {
             config_idx: 0,
             honor_cd_filename: true,
             headlist: Vec::new(),
+            last_response_code: 0,
         };
         // Unquoted filename, stopping at the trailing CRLF.
         let line = b"Content-Disposition: inline; filename=data.json\r\n";

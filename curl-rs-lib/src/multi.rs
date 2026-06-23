@@ -887,6 +887,32 @@ pub struct Multi {
     /// Set when a callback returned an abort code; the multi is "dead" and the
     /// timer callback is no longer invoked (mirrors curl's `multi->dead`).
     dead: bool,
+    /// Shared connection-reuse pool for handles driven by this multi, mirroring
+    /// curl's per-`Curl_multi` connection cache: easy handles added to one multi
+    /// share its connections, so a transfer can reuse a keep-alive (HTTP) or
+    /// control (FTP) connection opened by an earlier transfer on the same multi
+    /// — even after the earlier handle was removed and cleaned up, because the
+    /// multi (not the handle) owns the pool. Injected into each fresh, un-opted
+    /// handle by [`spawn_pending`](Multi::spawn_pending) only when
+    /// [`share_conn_pool`](Multi::share_conn_pool) is enabled. `Arc<Mutex<…>>`
+    /// makes it safe to consult from per-transfer tasks on the multi's runtime
+    /// threads, and lets it outlive any single handle (`tests/data/test526`,
+    /// `test540`).
+    conn_pool: crate::conn::SharedPool,
+    /// Whether to inject [`conn_pool`](Multi::conn_pool) into added handles
+    /// (default `false`).
+    ///
+    /// Enabled only via
+    /// [`enable_conn_pool_sharing`](Multi::enable_conn_pool_sharing), which the
+    /// FFI `curl_multi_init` calls — that path also drains the pool in
+    /// `curl_multi_cleanup` via
+    /// [`drain_conn_pool_blocking`](Multi::drain_conn_pool_blocking) on the
+    /// multi's own runtime, so any deferred FTP `QUIT` is issued safely. The
+    /// CLI's parallel driver constructs a `Multi` via [`new`](Multi::new) and
+    /// does NOT enable sharing — it drops the multi inside its own runtime, where
+    /// a blocking drain would panic — so its FTP handles keep curl's
+    /// inline-`QUIT` baseline.
+    share_conn_pool: bool,
 }
 
 impl Default for Multi {
@@ -940,6 +966,13 @@ impl Multi {
             last_timeout_ms: -1,
             in_callback: false,
             dead: false,
+            // A fresh shared pool; harmless until a handle is injected with it
+            // (only when sharing is enabled, which `new` leaves off).
+            conn_pool: crate::conn::cache::new_shared_pool(4),
+            // The CLI parallel driver uses `new` and must NOT share/drain (it
+            // drops the multi inside its own runtime); the FFI opts in via
+            // `enable_conn_pool_sharing`.
+            share_conn_pool: false,
         }
     }
 
@@ -1083,6 +1116,12 @@ impl Multi {
             let mid = self.transfers[idx].mid;
             let tx = self.tx.clone();
             let socket_tx = self.socket_tx.clone();
+            // When pool sharing is enabled (the FFI multi path), hand each fresh
+            // transfer the multi's shared connection pool so it reuses a
+            // connection an earlier transfer on this multi opened, and leaves its
+            // own for a later one (curl's per-`Curl_multi` connection cache).
+            // `None` (CLI parallel path) leaves handles on their private pools.
+            let share_pool = self.share_conn_pool.then(|| self.conn_pool.clone());
             let join = handle.spawn(async move {
                 // The transfer engine (shared with curl_easy_perform via
                 // Easy::perform → crate::transfer) runs here. The async Mutex is
@@ -1090,6 +1129,20 @@ impl Multi {
                 // exclusive access to its handle for the duration of the run.
                 let result = {
                     let mut guard = easy.lock().await;
+                    // Adopt the multi's shared connection pool before connecting,
+                    // so checkout/checkin hit the shared cache on the multi's
+                    // runtime. Only a fresh, un-opted handle adopts it
+                    // (`pool_is_self_owned_inert`); a CLI handle that already owns
+                    // an externally-drained pool (serial path) is left untouched,
+                    // and a handle re-driven on the multi keeps the pool it was
+                    // first given. `set_conn_pool` also marks the pool externally
+                    // owned, so the handle's own cleanup never drains it — the
+                    // multi drains it once at `curl_multi_cleanup`.
+                    if let Some(pool) = share_pool {
+                        if guard.pool_is_self_owned_inert() {
+                            guard.set_conn_pool(pool);
+                        }
+                    }
                     // Install the socket observer so the connection layer reports
                     // this transfer's real fd + interest back to the Multi,
                     // driving CURLMOPT_SOCKETFUNCTION for event-loop consumers
@@ -1918,6 +1971,38 @@ impl Multi {
         CurlMError::Ok
     }
 
+    /// Enable connection-pool sharing across handles added to this multi (see
+    /// [`conn_pool`](Multi::conn_pool)). The FFI `curl_multi_init` calls this;
+    /// the CLI parallel driver does not. MUST be paired with a
+    /// [`drain_conn_pool_blocking`](Multi::drain_conn_pool_blocking) call at
+    /// cleanup, on this multi's own runtime, to issue any deferred FTP `QUIT`.
+    pub fn enable_conn_pool_sharing(&mut self) {
+        self.share_conn_pool = true;
+    }
+
+    /// Drain the shared connection pool on the multi's OWN runtime, issuing the
+    /// single deferred FTP `QUIT` for any parked control connection and
+    /// force-closing pooled HTTP keep-alive sockets.
+    ///
+    /// Called by the FFI `curl_multi_cleanup` from a non-runtime C thread; the
+    /// `block_on` drives the drain on the multi-thread runtime that owns the
+    /// connections' sockets, so it cannot deadlock (the cross-runtime hazard the
+    /// FTP engine's inline-`QUIT` baseline otherwise avoids). A no-op unless
+    /// sharing was enabled ([`enable_conn_pool_sharing`](Multi::enable_conn_pool_sharing))
+    /// and the runtime was created.
+    ///
+    /// MUST NOT be called from [`Drop`] (the CLI drops a `Multi` inside its own
+    /// runtime, where `block_on` would panic); `Drop` uses the non-blocking
+    /// `shutdown_background` instead, which force-closes the pooled sockets.
+    pub fn drain_conn_pool_blocking(&mut self) {
+        if !self.share_conn_pool {
+            return;
+        }
+        if let Some(rt) = &self.runtime {
+            rt.block_on(crate::protocols::ftp::ftp_drain_pool(&self.conn_pool, false));
+        }
+    }
+
     /// Abort in-flight transfers and shut the runtime down — the equivalent of
     /// `curl_multi_cleanup`.
     ///
@@ -2687,6 +2772,7 @@ mod tests {
     /// core (no `libc::socketpair`).
     #[test]
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     fn wait_polls_external_fd_and_reports_revents() {
         use std::io::Write;
         use std::net::{TcpListener, TcpStream};
@@ -2740,6 +2826,7 @@ mod tests {
     /// every one of them (both `revents` and the aggregate `numfds`).
     #[test]
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     fn wait_reports_every_ready_external_fd() {
         use std::net::{TcpListener, TcpStream};
         use std::os::fd::AsRawFd;

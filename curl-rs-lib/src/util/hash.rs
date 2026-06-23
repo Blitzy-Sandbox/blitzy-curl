@@ -752,10 +752,18 @@ mod tests {
         assert!(h.is_empty());
     }
 
-    // A module-local counter used exclusively by the destructor-hook tests
-    // below. Those tests funnel all hook invocations through this counter; no
-    // other test touches it, so parallel test execution cannot interfere.
+    // A module-local counter used by the destructor-hook tests below. Because
+    // `counting_dtor` is a plain `fn` pointer stored inside the hash, it cannot
+    // capture a per-test local; all hook-counting tests must therefore share
+    // this single global counter. Several tests each reset it to zero and then
+    // assert exact invocation counts, so they MUST NOT run concurrently with one
+    // another — otherwise one test's `store(0)`/`fetch_add` races another's
+    // assertions. `DTOR_TEST_LOCK` serializes exactly those tests. The lock is
+    // poison-tolerant (`unwrap_or_else(PoisonError::into_inner)`) so that a
+    // genuine assertion failure in one test is reported as that test's own
+    // failure instead of cascading into the others as spurious poison panics.
     static DTOR_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DTOR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn counting_dtor(_v: &mut i32) {
         DTOR_CALLS.fetch_add(1, Ordering::SeqCst);
@@ -763,6 +771,10 @@ mod tests {
 
     #[test]
     fn dtor_hook_invoked_on_removal_paths() {
+        // Serialize with the other DTOR_CALLS-sharing tests; held for the body.
+        let _guard = DTOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         DTOR_CALLS.store(0, Ordering::SeqCst);
 
         let mut h: CurlHash<i32> = CurlHash::with_dtor(counting_dtor);
@@ -795,6 +807,10 @@ mod tests {
 
     #[test]
     fn destroy_runs_hook_on_remaining_entries() {
+        // Serialize with the other DTOR_CALLS-sharing tests; held for the body.
+        let _guard = DTOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         DTOR_CALLS.store(0, Ordering::SeqCst);
 
         let mut h: CurlHash<i32> = CurlHash::curl_hash_init(Some(counting_dtor));
@@ -806,6 +822,10 @@ mod tests {
 
     #[test]
     fn add2_installs_and_uses_dtor() {
+        // Serialize with the other DTOR_CALLS-sharing tests; held for the body.
+        let _guard = DTOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         DTOR_CALLS.store(0, Ordering::SeqCst);
 
         // Start with no hook; add2 installs one.

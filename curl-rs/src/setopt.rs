@@ -1368,6 +1368,34 @@ fn tls_srp_setopts(config: &OperationConfig, easy: &mut Easy) -> Result<(), Curl
 // setopt_post — POST body / MIME post (config2setopts.c)
 // ===========================================================================
 
+/// Extract the value of the custom `-H`/`CURLOPT_HTTPHEADER` line whose field
+/// name equals `name` (ASCII case-insensitive), mirroring curl's
+/// `Curl_checkheaders` lookup plus the `HTTPREQ_POST_MIME` value extraction in
+/// `lib/http.c` (skip the `Content-Type:` field name and its leading spaces).
+///
+/// curl matches a header line that *begins* with `name` immediately followed by
+/// a colon, so the field name is compared without trimming (`"Content-Type :"`
+/// — note the space before the colon — does not match in curl either, and
+/// `split_once(':')` yields `"Content-Type "` here, which fails the equality
+/// check, matching curl). The returned value has its leading spaces trimmed,
+/// exactly curl's `for(cthdr += 13; *cthdr == ' '; cthdr++)`.
+///
+/// An empty value (the `-H "Content-Type:"` suppression form) yields `None` so
+/// the caller keeps its default: the multipart body always requires a
+/// boundary-bearing `Content-Type` on the wire, and curl-rs has no separate
+/// header-suppression path at this site.
+fn custom_header_value<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let (field, value) = line.split_once(':')?;
+    if !field.eq_ignore_ascii_case(name) {
+        return None;
+    }
+    let value = value.trim_start();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value)
+}
+
 /// Programs the POST body for simple (`-d`) and MIME (`-F`) requests.
 ///
 /// Port of `setopt_post()`:
@@ -1454,11 +1482,32 @@ fn setopt_post(
                 // retained (`per.mimepost` stays `None`): it has been fully
                 // serialized into the owned body above, so it need not outlive
                 // this call.
-                let content_type = format!(
-                    "multipart/form-data; boundary={}",
-                    String::from_utf8_lossy(mime.boundary_str())
-                );
-                let body = mime.into_form_body()?;
+                //
+                // A user-supplied `-H "Content-Type: <type>"` overrides the
+                // default `multipart/form-data` top type, exactly as curl's
+                // `lib/http.c` `HTTPREQ_POST_MIME` path does: it reads the
+                // custom `Content-Type` value (`Curl_checkheaders`, stripping
+                // the field name + leading spaces) and passes it as the mime
+                // top type (`cthdr`). That value drives the part disposition —
+                // a `multipart/form-data` container yields `form-data` parts,
+                // any other top type (e.g. `text/info`) yields `attachment`
+                // parts — and curl appends the `; boundary=…` parameter to the
+                // announced type. The custom-header emitter then *skips* the
+                // user `Content-Type` for a mime post (it is "sent later"), so
+                // the boundary-bearing type is announced exactly once. The
+                // memory-safe path reproduces this by serializing the body with
+                // `into_form_body_with_type(<custom or default>)` and announcing
+                // `<custom or default>; boundary=…` via `set_mime_body`.
+                let boundary = String::from_utf8_lossy(mime.boundary_str()).into_owned();
+                let custom_ct: Option<&str> = config
+                    .headers
+                    .iter()
+                    .find_map(|h| custom_header_value(h, "Content-Type"));
+                let base_type: &[u8] =
+                    custom_ct.map_or(b"multipart/form-data".as_slice(), str::as_bytes);
+                let announced_type = custom_ct.unwrap_or("multipart/form-data");
+                let content_type = format!("{announced_type}; boundary={boundary}");
+                let body = mime.into_form_body_with_type(base_type)?;
                 easy.set_mime_body(body, content_type);
             }
         }

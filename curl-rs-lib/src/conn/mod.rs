@@ -1023,6 +1023,26 @@ pub fn Curl_conn_cf_get_alpn_negotiated(cf: Option<&dyn ConnectionFilter>) -> Op
     }
 }
 
+/// The peer (server) certificate chain in DER form for the chain at `cf`
+/// (the [`CfQuery::PeerCerts`] query the non-proxy SSL filter answers from the
+/// `rustls` `TlsConnection::peer_certificates` it retained at connect), leaf
+/// first. Empty when the query is unanswered, `cf` is absent, or the
+/// connection is not TLS.
+///
+/// There is no direct C analog — curl's TLS backends push the chain into
+/// `data->info` during the handshake (`Curl_ssl_push_certinfo_len`). The
+/// memory-safe core defers that to a post-connect pull through this query so
+/// the TLS layer stays free of a back-reference to the easy handle. Backs
+/// `CURLINFO_CERTINFO` / `%{certs}`.
+#[allow(non_snake_case)]
+#[must_use]
+pub fn Curl_conn_cf_get_peer_certs(cf: Option<&dyn ConnectionFilter>) -> Vec<Vec<u8>> {
+    match cf.map(|c| c.query(CfQuery::PeerCerts)) {
+        Some(Ok(CfQueryResult::PeerCerts(certs))) => certs,
+        _ => Vec::new(),
+    }
+}
+
 // ===========================================================================
 // Connection-level API — the `Curl_conn_*` per-sockindex surface
 // (oracle `lib/cfilters.h` L362-616, `lib/cfilters.c` L144-1130).
@@ -1205,6 +1225,21 @@ pub fn Curl_conn_get_transport(conn: &Connection) -> u8 {
 #[must_use]
 pub fn Curl_conn_get_alpn_negotiated(conn: &Connection) -> Option<String> {
     Curl_conn_cf_get_alpn_negotiated(conn.cfilter[FIRSTSOCKET].head_ref())
+}
+
+/// The peer (server) certificate chain in DER form for the `sockindex` chain,
+/// leaf first (the connection-level wrapper over
+/// [`Curl_conn_cf_get_peer_certs`]). Empty when `sockindex` is invalid or no
+/// TLS chain was captured. The HTTP engine pulls this post-connect to populate
+/// `CURLINFO_CERTINFO` (`%{certs}` / `%{num_certs}`) when `CURLOPT_CERTINFO`
+/// is set.
+#[allow(non_snake_case)]
+#[must_use]
+pub fn Curl_conn_get_peer_certs(conn: &Connection, sockindex: usize) -> Vec<Vec<u8>> {
+    if !sock_idx_valid(sockindex) {
+        return Vec::new();
+    }
+    Curl_conn_cf_get_peer_certs(conn.cfilter[sockindex].head_ref())
 }
 
 /// The host and port the `sockindex` chain currently talks to
@@ -1796,4 +1831,23 @@ pub fn pool_checkin(pool: &cache::SharedPool, conn: Connection, maxconnects: u32
         // Drop evicted connections (close their sockets) — see doc above.
         let _evicted = p.take_discards();
     });
+}
+
+/// Drain **all** connections from the shared pool, returning them **by value**
+/// for a graceful synchronous teardown (the easy/CLI end-of-run path where a
+/// protocol goodbye such as FTP `QUIT` must be sent before the sockets close).
+///
+/// Each connection is recovered as a concrete [`Connection`] (downcast via
+/// [`cache::PoolConn::into_any`], the same mechanism [`pool_checkout`] uses) and
+/// the pool is left empty. The caller is responsible for running each
+/// connection's protocol goodbye and/or dropping it to force-close its sockets
+/// (the analog of curl tearing down its connection cache in
+/// `Curl_cpool_destroy`). A connection whose type is not [`Connection`] (none
+/// exist in production; only test doubles) is silently discarded.
+#[must_use]
+pub fn pool_take_all(pool: &cache::SharedPool) -> Vec<Connection> {
+    cache::do_locked(pool, cache::ConnectionPool::take_all)
+        .into_iter()
+        .filter_map(|b| b.into_any().downcast::<Connection>().ok().map(|x| *x))
+        .collect()
 }

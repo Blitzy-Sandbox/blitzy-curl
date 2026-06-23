@@ -147,8 +147,18 @@ struct MultiHandle {
 impl MultiHandle {
     /// Create an empty multi handle wrapping a fresh [`core::Multi`].
     fn new() -> Self {
+        let mut inner = core::Multi::new();
+        // Share one connection pool across all easy handles added to this multi,
+        // so a transfer reuses a connection an earlier transfer opened on the
+        // same multi — curl's per-`Curl_multi` connection cache (`tests/data/
+        // test526`, `test540`). Paired with the drain in `curl_multi_cleanup`,
+        // which issues any deferred FTP `QUIT` on the multi's own runtime. Only
+        // the FFI multi enables this; the CLI parallel driver does not (it drops
+        // its `Multi` inside its own runtime, where a blocking drain would
+        // panic).
+        inner.enable_conn_pool_sharing();
         MultiHandle {
-            inner: core::Multi::new(),
+            inner,
             registry: Arc::new(Mutex::new(Vec::new())),
             restored: HashSet::new(),
             msg_storage: None,
@@ -499,9 +509,21 @@ pub unsafe extern "C" fn curl_multi_cleanup(multi: *mut CURLM) -> CURLMcode {
     }
     // SAFETY: per the `# Safety` contract `multi` is a live handle from
     // `curl_multi_init` (`Box::into_raw` of a `MultiHandle`) not yet freed, so
-    // reconstructing the owning `Box` and dropping it frees the allocation
-    // exactly once.
-    drop(unsafe { Box::from_raw(multi as *mut MultiHandle) });
+    // reconstructing the owning `Box` is sound and frees the allocation exactly
+    // once when it drops at the end of this scope.
+    let mut handle = unsafe { Box::from_raw(multi as *mut MultiHandle) };
+    // Drain the shared connection pool while the multi's runtime is still alive,
+    // issuing the single deferred FTP `QUIT` for any parked control connection
+    // (`tests/data/test526`) and force-closing pooled HTTP keep-alive sockets
+    // (`tests/data/test540`'s final `[DISCONNECT]`). This runs the drain via
+    // `block_on` on the multi's OWN multi-thread runtime, which owns the
+    // connections' sockets — safe here because `curl_multi_cleanup` is called
+    // from a plain C thread with no ambient runtime. It MUST be done here rather
+    // than in `core::Multi::Drop` (the CLI drops a `Multi` inside its own
+    // runtime, where this `block_on` would panic). The subsequent drop runs the
+    // core's `Drop` (aborting tasks, `shutdown_background`) and frees the box.
+    handle.inner.drain_conn_pool_blocking();
+    drop(handle);
     CURLMcode::CURLM_OK
 }
 
@@ -566,6 +588,28 @@ pub unsafe extern "C" fn curl_multi_add_handle(multi: *mut CURLM, easy: *mut CUR
     // is uniquely owned here; the caller upholds curl's contract that the `CURLU`
     // passed to `CURLOPT_CURLU` stays valid until the transfer is performed.
     unsafe { crate::easy::resolve_curlu(&mut real) };
+
+    // Materialize a borrowed `CURLOPT_POSTFIELDS` body pointer into owned bytes
+    // the safe core can frame (curl reads `data->set.postfields` at transfer
+    // time). Mirrors [`crate::easy::curl_easy_perform`] so multi-interface
+    // `CURLOPT_POSTFIELDS` consumers behave identically; a NULL/unset pointer or
+    // the owned `CURLOPT_COPYPOSTFIELDS` path is a no-op.
+    // SAFETY: `real` is the live `Easy` just moved out of the caller's handle and
+    // is uniquely owned here; the caller upholds curl's contract that the
+    // `CURLOPT_POSTFIELDS` buffer stays valid until the transfer is performed.
+    unsafe { crate::easy::resolve_postfields(&mut real) };
+
+    // Serialize a stored `CURLOPT_HTTPPOST` legacy form chain into an owned
+    // `multipart/form-data` body (curl reads the `curl_httppost *` in
+    // `Curl_getformdata` at transfer time). Mirrors
+    // [`crate::easy::curl_easy_perform`] so multi-interface `CURLOPT_HTTPPOST`
+    // consumers behave identically; a NULL/unset chain is a no-op and callback
+    // (`CURLFORM_STREAM`) parts stream from this handle's `CURLOPT_READFUNCTION`.
+    // SAFETY: `real` is the live `Easy` just moved out of the caller's handle and
+    // is uniquely owned here; the caller upholds curl's contract that the
+    // `CURLOPT_HTTPPOST` chain (and the read function for callback parts) stays
+    // valid until the transfer is performed.
+    unsafe { crate::easy::resolve_httppost(&mut real) };
 
     // Register a Send + Sync bridge factory so the multi-driven transfer routes
     // body/header bytes to this handle's `CURLOPT_WRITEFUNCTION`/`HEADERFUNCTION`

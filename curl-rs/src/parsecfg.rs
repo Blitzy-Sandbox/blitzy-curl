@@ -394,44 +394,27 @@ fn split_line(line: &str) -> Result<SplitLine, ParameterError> {
 /// `$HOME` is set in every practical and test environment, so the search above
 /// is faithful wherever the fallback would matter.
 fn find_default_curlrc() -> Option<String> {
-    /// Returns the environment variable's value only when it is set and not
-    /// empty (curl: `if(home) { if(!home[0]) continue; ... }`).
-    fn env_nonempty(key: &str) -> Option<String> {
-        match std::env::var(key) {
-            Ok(value) if !value.is_empty() => Some(value),
-            _ => None,
-        }
-    }
+    // Delegate to the canonical `findfile` finder table (`src/tool_findfile.c`
+    // `conf_list`), which is the exact port C uses for the default `.curlrc`
+    // (`parseconfig(NULL, …)` → `findfile(".curlrc", CURLRC_DOTSCORE)`).
+    //
+    // This deliberately replaces an earlier, narrower home-only search that
+    // only probed `$CURL_HOME/.curlrc`, `$XDG_CONFIG_HOME/curlrc`, and
+    // `$HOME/.curlrc`. That search was missing the `.config`-suffixed finder
+    // entries — `$CURL_HOME/.config/curlrc` and `$HOME/.config/curlrc` — so a
+    // user who keeps their config under the XDG `.config` directory pointed to
+    // by `CURL_HOME` (but with `XDG_CONFIG_HOME` unset) would never have their
+    // `.curlrc` located. (Regression oracle: tests/data/test436 — "Find
+    // .curlrc in .config/curlrc via CURL_HOME".)
+    //
+    // `CURLRC_DOTSCORE` is `2` on Windows (also probe the `_curlrc` variant)
+    // and `1` elsewhere (`src/tool_findfile.h`).
+    #[cfg(windows)]
+    const CURLRC_DOTSCORE: i32 = 2;
+    #[cfg(not(windows))]
+    const CURLRC_DOTSCORE: i32 = 1;
 
-    /// Joins `home` and `name` with the platform directory separator without
-    /// normalizing, matching curl's `curl_maprintf("%s" DIR_CHAR "%s", ...)`,
-    /// and returns the path if it can be opened for reading.
-    fn readable_join(home: &str, name: &str) -> Option<String> {
-        let path = format!("{home}{}{name}", std::path::MAIN_SEPARATOR);
-        // curl probes with `open(..., O_RDONLY)`; an openable file is a match.
-        if File::open(&path).is_ok() {
-            Some(path)
-        } else {
-            None
-        }
-    }
-
-    if let Some(home) = env_nonempty("CURL_HOME") {
-        if let Some(path) = readable_join(&home, ".curlrc") {
-            return Some(path);
-        }
-    }
-    if let Some(home) = env_nonempty("XDG_CONFIG_HOME") {
-        if let Some(path) = readable_join(&home, "curlrc") {
-            return Some(path);
-        }
-    }
-    if let Some(home) = env_nonempty("HOME") {
-        if let Some(path) = readable_join(&home, ".curlrc") {
-            return Some(path);
-        }
-    }
-    None
+    crate::operate::findfile(".curlrc", CURLRC_DOTSCORE)
 }
 
 /// Parse a curl configuration file, dispatching each directive through the same

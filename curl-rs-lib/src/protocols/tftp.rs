@@ -1649,8 +1649,26 @@ pub(crate) async fn perform_tftp(
     //     C logic exactly: the user timeout when set (`data.set.timeout` is in
     //     ms), else 15 000 ms — which yields the same `retry_max` 3 / `retry_time`
     //     5 s and a sane upper bound.
+    //     The WRQ/RRQ option negotiation is transmitted while the transfer is
+    //     still in its connect phase, where C's `Curl_timeleft_now_ms`
+    //     (lib/connect.c) bounds the deadline by BOTH the connect timeout and
+    //     the overall transfer timeout and returns their minimum
+    //     (`CURLMIN(ctimeleft_ms, timeleft_ms)`). A set `CURLOPT_CONNECTTIMEOUT`
+    //     bounds the connect phase; with none set C falls back to
+    //     `DEFAULT_CONNECT_TIMEOUT` (300 s, lib/connect.h). Mirror that minimum
+    //     so the advertised `timeout` option matches curl byte-for-byte on the
+    //     wire — e.g. test285 (`--connect-timeout 549 --max-time 599`) yields
+    //     `min(549, 599) = 549` -> `retry_time` 10, whereas using the transfer
+    //     timeout alone would advertise 11. The no-transfer-timeout fallback is
+    //     left at the hard-coded 15 s budget (`retry_time` 5 s) that the other
+    //     TFTP tests' `^timeout = [5-6]$` strip tolerates.
     let timeleft_ms = if data.set.timeout > 0 {
-        data.set.timeout
+        let connect_timeout_ms = if data.set.connecttimeout > 0 {
+            data.set.connecttimeout
+        } else {
+            300_000 // DEFAULT_CONNECT_TIMEOUT (lib/connect.h)
+        };
+        data.set.timeout.min(connect_timeout_ms)
     } else {
         15_000
     };
@@ -2305,6 +2323,7 @@ mod tests {
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn udp_io_roundtrip_and_tid_pin() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();

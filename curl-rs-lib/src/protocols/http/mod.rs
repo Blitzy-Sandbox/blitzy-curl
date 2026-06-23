@@ -110,7 +110,8 @@ pub mod h3;
 
 use crate::conn::{
     BoxFuture, Connection, Curl_conn_cf_adjust_pollset, Curl_conn_get_alpn_negotiated,
-    Curl_conn_get_first_socket, Curl_conn_get_ip_info, Curl_conn_get_remote_addr, Curl_conn_is_alive,
+    Curl_conn_get_first_socket, Curl_conn_get_ip_info, Curl_conn_get_peer_certs,
+    Curl_conn_get_remote_addr, Curl_conn_is_alive,
 };
 use crate::easy::Easy;
 use crate::error::Result;
@@ -168,8 +169,12 @@ use crate::transfer::{
     RedirectState, TransferLimits, TransferParts, WriteCallbacks, CURL_READFUNC_ABORT,
     CURL_READFUNC_PAUSE,
 };
-use crate::url::{CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_GUESS_SCHEME, CURLU_URLDECODE};
+use crate::url::{
+    CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_GUESS_SCHEME, CURLU_PATH_AS_IS, CURLU_URLDECODE,
+    CURLU_URLENCODE,
+};
 use crate::util::timeval::curlx_now;
+use std::borrow::Cow;
 // DoH transport seam: this module is the runtime collaborator that carries a
 // DoH probe as an HTTP(S) `POST` (see `crate::dns::doh`). The transport is
 // installed lazily at [`perform_http`] entry so `--doh-url` resolution can
@@ -254,6 +259,28 @@ fn version_from_alpn(alpn: Option<&[u8]>) -> HttpVersion {
         Some(a) if a == ALPN_HTTP_1_0 => HttpVersion::Http10,
         _ => HttpVersion::Http11,
     }
+}
+
+/// Encode one DER-encoded certificate as a PEM block — the textual form curl's
+/// TLS backends store in `CURLINFO_CERTINFO`'s `Cert` field (their
+/// `PEM_write_bio_X509` output): a `-----BEGIN CERTIFICATE-----` header, the
+/// base64 of the DER wrapped at 64 columns (the width OpenSSL's PEM writer
+/// uses), and a `-----END CERTIFICATE-----` trailer. No trailing newline — the
+/// caller stores it as one `"Cert:<pem>"` certinfo node and the writeout
+/// `%{certs}` consumer (`tool_writeout.c` `VAR_CERT`) handles line termination.
+fn der_to_pem(der: &[u8]) -> String {
+    // `base64_encode` is the workspace's standard-alphabet encoder and emits an
+    // unwrapped ASCII string; PEM requires 64-column lines, so re-wrap here.
+    let b64 = crate::util::base64::base64_encode(der).unwrap_or_default();
+    let mut pem = String::with_capacity(b64.len() + b64.len() / 64 + 64);
+    pem.push_str("-----BEGIN CERTIFICATE-----\n");
+    for chunk in b64.chunks(64) {
+        // `b64` is pure base64 alphabet (ASCII), so the decode is lossless.
+        pem.push_str(&String::from_utf8_lossy(chunk));
+        pem.push('\n');
+    }
+    pem.push_str("-----END CERTIFICATE-----");
+    pem
 }
 
 /// Select the HTTP version for a transfer, reproducing curl's precedence:
@@ -494,6 +521,16 @@ struct HopInputs {
     allowed_to_host: bool,
     /// `true` to send `Proxy-Connection: Keep-Alive` (forward HTTP proxy).
     proxy_connection_keepalive: bool,
+    /// The resolved proxy username/password for this hop (the `-x` proxy URL's
+    /// embedded userinfo, overlaid by `CURLOPT_PROXYUSERNAME`/`PROXYPASSWORD` —
+    /// curl's unified `data->state.aptr.proxyuser`/`proxypasswd`). Deposited by
+    /// [`http_connect_hop`]'s forward-proxy branch (where the parsed [`Proxy`] is
+    /// in hand) so the reactive **proxy**-auth controller can attempt the proxy's
+    /// `407` even when the credentials were supplied only in the proxy URL rather
+    /// than via `--proxy-user` (test 335). `None` when no forward HTTP proxy
+    /// applies to this hop.
+    proxy_user: Option<String>,
+    proxy_pass: Option<String>,
     /// `CURLOPT_REQUEST_TARGET`-style request-target override (forward proxy), if any.
     request_target_override: Option<String>,
     /// The reactive-auth seed (Digest/NTLM/`--anyauth` credentials + wanted scheme
@@ -502,6 +539,17 @@ struct HopInputs {
     /// the kept-alive connection (curl's `data->state.authhost` negotiation).
     /// Deposited cross-host-gated exactly like [`authorization`](Self::authorization).
     auth: Option<auth_engine::AuthInputs>,
+    /// Suppress the application's custom `Host:` header for this hop, emitting the
+    /// auto-generated `Host:` for the *current* host instead.
+    ///
+    /// curl sends the application's custom `Host:` (`CURLOPT_HTTPHEADER`) only on
+    /// the original request and on same-host redirects: lib/http.c uses the custom
+    /// value IFF `(!data->state.this_is_a_follow || curl_strequal(first_host,
+    /// conn->host.name))`, and otherwise emits the auto `Host:` for the redirect
+    /// target's host. When this is `true` (a cross-host redirect), the orchestrator
+    /// strips the custom `Host:` line from `custom_headers` so the builder emits
+    /// the current host (tests 184/185).
+    suppress_custom_host: bool,
 }
 
 impl HopInputs {
@@ -518,8 +566,13 @@ impl HopInputs {
             referer: data.set.str(StrId::SetReferer).map(str::to_string),
             allowed_to_host: true,
             proxy_connection_keepalive: false,
+            proxy_user: None,
+            proxy_pass: None,
             request_target_override: None,
             auth: None,
+            // A single-shot transfer is never a follow, so the custom `Host:`
+            // (if any) is always sent (curl's `!this_is_a_follow`).
+            suppress_custom_host: false,
         }
     }
 }
@@ -554,6 +607,27 @@ struct HopResult {
 /// and so never follow).
 fn is_redirect_status(status: i32) -> bool {
     (300..400).contains(&status)
+}
+
+/// Whether a *followed-redirect* target `scheme` is permitted, the port of C
+/// `findprotocol` (`lib/url.c`) evaluated with `data->state.this_is_a_follow`
+/// set.
+///
+/// curl gates every connection on `CURLOPT_PROTOCOLS` (`allowed`) and, when the
+/// connection is the result of a redirect, additionally on
+/// `CURLOPT_REDIR_PROTOCOLS` (`redir`). The scheme's single `CURLPROTO_*` bit
+/// (from its [`scheme_descriptor`](crate::protocols::scheme_descriptor)) must be
+/// present in *both* masks. A scheme with no compiled-in handler has bit `0` and
+/// is therefore never allowed — matching curl's "not supported" rejection.
+///
+/// Returns `true` when the redirect may proceed; a `false` result maps to
+/// [`CurlError::UnsupportedProtocol`] (`CURLE_UNSUPPORTED_PROTOCOL`, the curl
+/// `--proto-redir`/`--proto` denial). The defaults — `allowed = CURLPROTO_ALL`
+/// and `redir = CURLPROTO_REDIR` (HTTP|HTTPS|FTP|FTPS) — leave ordinary HTTP(S)
+/// redirects untouched.
+fn redirect_protocol_allowed(scheme: &str, allowed: u32, redir: u32) -> bool {
+    let bit = crate::protocols::scheme_descriptor(scheme).map_or(0, |s| s.protocol);
+    bit != 0 && (allowed & bit) != 0 && (redir & bit) != 0
 }
 
 /// Whether an HTTP response code is a terminal `CURLOPT_FAILONERROR` failure,
@@ -605,6 +679,37 @@ fn http_should_fail(
     true
 }
 
+/// The per-response `CURLOPT_FAILONERROR` (`-f`/`--fail`) verdict, honoring the
+/// reactive-auth deferral.
+///
+/// This wraps [`http_should_fail`] with one extra rule: when `defer_auth_fail`
+/// is set (the HTTP/1.x hop loop passes `auth_controller.is_some()`), an
+/// intermediate `401`/`407` is the server's auth *challenge* during a live
+/// challenge-response negotiation, NOT a terminal error — so the failonerror
+/// verdict is deferred (returns `false`) and the negotiation is allowed to run
+/// to completion. This mirrors curl's `http_should_fail`, which returns
+/// `data->state.authproblem` for an answered-able challenge (FALSE while the
+/// negotiation can still proceed). The hop loop re-applies the real
+/// [`http_should_fail`] verdict to the TERMINAL response once negotiation ends,
+/// so a genuinely rejected/again-`401` final response still fails with exit 22.
+///
+/// Every non-auth call site (h2/h3/websocket, and any transfer without a
+/// reactive controller) passes `defer_auth_fail = false`, so a `401`/`407`
+/// fails immediately exactly as before (test 152). (test 150)
+fn failonerror_verdict(
+    defer_auth_fail: bool,
+    code: i32,
+    resume: bool,
+    is_get: bool,
+    has_user: bool,
+    has_proxy_user: bool,
+) -> bool {
+    if defer_auth_fail && (code == 401 || code == 407) {
+        return false;
+    }
+    http_should_fail(code, resume, is_get, has_user, has_proxy_user)
+}
+
 /// Map a `HttpReq` request kind to the redirect-logic [`HttpMethod`]. `HEAD`
 /// (`CURLOPT_NOBODY`) is represented as `GET` in `data.set.method`, so the
 /// rewrite rules see it as a non-POST method, exactly as curl does.
@@ -628,6 +733,21 @@ fn parse_status_code(after_http: &str) -> Option<i32> {
     let mut parts = after_http.split_whitespace();
     let _version = parts.next()?;
     parts.next()?.parse::<i32>().ok()
+}
+
+/// Parse the wire HTTP version from the portion of an HTTP status line that
+/// follows `HTTP/`, returning curl's `k->httpversion` integer encoding
+/// (`<major> * 10 + <minor>`): `"1.0 401 …"` → `Some(10)`, `"1.1 200 OK"` →
+/// `Some(11)`, `"2 200"` → `Some(20)`. The version token is the first
+/// whitespace-delimited field; a missing minor defaults to `0` (so `"2"` →
+/// `20`). Returns `None` for a malformed token, in which case the caller leaves
+/// the running version unchanged.
+fn parse_status_version(after_http: &str) -> Option<u8> {
+    let token = after_http.split_whitespace().next()?;
+    let mut nums = token.split('.');
+    let major: u32 = nums.next()?.parse().ok()?;
+    let minor: u32 = nums.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+    u8::try_from(major.checked_mul(10)?.checked_add(minor)?).ok()
 }
 
 /// How a hop's response body is routed to the application sink, decided once
@@ -670,6 +790,16 @@ struct HopSink<'s> {
     follow_enabled: bool,
     /// The most recent status code parsed from a `HTTP/...` status line.
     status: i32,
+    /// The wire HTTP version parsed from the most recent `HTTP/...` status line,
+    /// encoded as curl's `k->httpversion` integer (`10` = HTTP/1.0, `11` =
+    /// HTTP/1.1, `20` = HTTP/2, `30` = HTTP/3); `0` until a status line is seen.
+    /// Read by the auth/redirect loop immediately after each exchange to fold
+    /// into the transfer's `rcvd_min` (curl's `data->state.http_neg.rcvd_min`),
+    /// which downgrades a later HTTP/1.1 request to HTTP/1.0 once a `1.0` reply
+    /// has been observed (`http_may_use_1_1`). `data.info.http_version` is *not*
+    /// usable for this because it is published only at transfer finalize, after
+    /// this loop has already chosen the resend's version.
+    version: u8,
     /// The `Location` header value seen in the current response block.
     location: Option<String>,
     /// Captured `Set-Cookie` header values (for the cookie engine).
@@ -691,6 +821,13 @@ struct HopSink<'s> {
     /// `CURLINFO_CONTENT_TYPE`. Reset on each status line so a redirect block's
     /// value does not leak into the final one.
     content_type: Option<Vec<u8>>,
+    /// The parsed `Retry-After` value in seconds-from-now for
+    /// `CURLINFO_RETRY_AFTER` (curl's `data->info.retry_after`), or `None` when
+    /// the response carried no `Retry-After` header. Flushed to `data.info` at
+    /// the end of the hop; consulted by the CLI `--retry-max-time` budget check
+    /// (`retrycheck`) so a too-distant server back-off skips the retry (oracle
+    /// test366).
+    retry_after: Option<i64>,
     /// The `WWW-Authenticate` (host) / `Proxy-Authenticate` (proxy) challenge
     /// values from the current response block, in order, for the auth controller
     /// to parse on a `401`/`407`. Reset on each status line so only the current
@@ -701,6 +838,16 @@ struct HopSink<'s> {
     /// active). When set, a `401`/`407` body is buffered rather than forwarded
     /// (see [`BodyDisposition::BufferAuth`]).
     auth_negotiating: bool,
+    /// Whether THIS attempt is a body-bearing auth-negotiation probe (the loop's
+    /// `authneg` is set AND the method is a body-bearing `POST`/`PUT`). When set
+    /// and the probe receives a non-`401` *success* (`status < 300`), curl
+    /// re-issues the request with the real body (`Curl_http_auth_act`
+    /// else-branch, lib/http.c L597-611) and sets `newurl`, so `http_firstwrite`
+    /// ignores THIS response's body (`k->ignorebody`). The body is therefore
+    /// DISCARDED (only its headers flow, verbatim under `-i`), matching curl's
+    /// suppression of the intermediate auth-probe response body. Oracle: test175
+    /// (Digest) and test176 (NTLM) `POST` to a server requiring no auth.
+    authneg_probe: bool,
     /// The buffered body of a `401`/`407` captured under
     /// [`BodyDisposition::BufferAuth`], pending the retry/terminal decision.
     auth_body_buf: Vec<u8>,
@@ -717,6 +864,57 @@ struct HopSink<'s> {
     /// arrives — i.e. after [`headers_complete`](Self::headers_complete), by
     /// which point the status line and all headers have been seen).
     disposition: Option<BodyDisposition>,
+    /// The download resume offset (`CURLOPT_RESUME_FROM`, `-C <n>`) for a `GET`
+    /// download, or `0` when not resuming. Set by the orchestrator after
+    /// construction. Drives the server-ignored-range check (curl's
+    /// `http_firstwrite`): a resumed `GET` whose response carries no
+    /// `Content-Range` means the server did not honor the requested byte range.
+    resume_from: i64,
+    /// Whether the current response block carried a `Content-Range:` header
+    /// (curl's `k->content_range`). Set in [`note_header`](Self::note_header);
+    /// reset on each new status line. When a resume was requested and this is
+    /// `false`, the server ignored the range.
+    content_range_seen: bool,
+    /// The current response block's `Content-Length` value (curl's `k->size`),
+    /// or `None` when absent/unpar0seable. Used only by the resume check to
+    /// detect the "entire document already downloaded" case (`size ==
+    /// resume_from`), which is a success rather than a range error.
+    body_size: Option<i64>,
+    /// Set by the first-body-write resume check when a resumed `GET` response
+    /// did not honor the range and the document is not already complete. The
+    /// orchestrator surfaces this as [`CurlError::RangeError`] (`CURLE_RANGE_ERROR`,
+    /// 33) after the exchange, and the body is discarded (the local file is left
+    /// untouched), matching curl's `http_firstwrite` `CURLE_RANGE_ERROR` return.
+    range_error: bool,
+    /// The time-condition selector (`CURLOPT_TIMECONDITION`, `-z`): `0` = none,
+    /// `1` = if-modified-since, `2` = if-unmodified-since. Set by the orchestrator
+    /// after construction. Drives the client-side response time-condition check
+    /// (curl's `http_firstwrite` / `Curl_meets_timecondition`): when set and no
+    /// byte range was requested, a response whose `Last-Modified` does not satisfy
+    /// the condition is delivered as a simulated `304` with the body discarded.
+    timecondition: u8,
+    /// The time-condition reference instant (`CURLOPT_TIMEVALUE[_LARGE]`) as a Unix
+    /// timestamp, compared against the response's `Last-Modified`. Set by the
+    /// orchestrator after construction.
+    timevalue: i64,
+    /// Whether a byte range was requested for this transfer (curl's
+    /// `data->state.range`). The time-condition check is gated off when a range is
+    /// present (RFC 2616 §13.3.4 — a partial request is not a plain conditional
+    /// GET). Set by the orchestrator after construction.
+    range_present: bool,
+    /// The response document's modification instant (curl's `k->timeofdoc`), parsed
+    /// from the current response block's `Last-Modified` header when a time
+    /// condition is active. `0` when absent/unparseable (the condition is then
+    /// treated as met, matching `Curl_meets_timecondition`). Reset on each new
+    /// status line. Consulted by the first-body-write time-condition check.
+    timeofdoc: i64,
+    /// Set by the first-body-write time-condition check when the response did not
+    /// satisfy the configured `If-Modified-Since`/`If-Unmodified-Since` condition.
+    /// The orchestrator surfaces this as a simulated `304` (`data.info.timecond =
+    /// true`, `response_code = 304`) with the body discarded, matching curl's
+    /// `http_firstwrite` "Simulate an HTTP 304 response" path (a success, not an
+    /// error).
+    condition_unmet: bool,
 }
 
 impl<'s> HopSink<'s> {
@@ -733,6 +931,7 @@ impl<'s> HopSink<'s> {
             inner,
             follow_enabled,
             status: 0,
+            version: 0,
             location: None,
             #[cfg(feature = "cookies")]
             set_cookies: Vec::new(),
@@ -742,11 +941,22 @@ impl<'s> HopSink<'s> {
             alt_svc: None,
             headers: Vec::new(),
             content_type: None,
+            retry_after: None,
             www_authenticate: Vec::new(),
             auth_negotiating,
+            authneg_probe: false,
             auth_body_buf: Vec::new(),
             headers_complete: false,
             disposition: None,
+            resume_from: 0,
+            content_range_seen: false,
+            body_size: None,
+            range_error: false,
+            timecondition: 0,
+            timevalue: 0,
+            range_present: false,
+            timeofdoc: 0,
+            condition_unmet: false,
         }
     }
 
@@ -758,14 +968,25 @@ impl<'s> HopSink<'s> {
         };
         let line = s.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
-            // The end-of-headers blank line: once a status line has been seen,
-            // the body follows. Marking the block's headers complete lets the
-            // first *real* body write take the redirect/auth disposition with the
-            // status fully known — and lets the `CURLOPT_HEADER` header-merge
-            // writes that arrive on the body stream *before* this point be
-            // forwarded verbatim (curl shows intermediate redirect headers under
-            // `-i`). A blank line before any status line (defensive) is ignored.
-            if self.status != 0 {
+            // The end-of-headers blank line: a FINAL (`>= 200`) status's blank
+            // line begins the message body. Marking the block's headers complete
+            // lets the first *real* body write take the redirect/auth disposition
+            // with the status fully known — and lets the `CURLOPT_HEADER`
+            // header-merge writes that arrive on the body stream *before* this
+            // point be forwarded verbatim (curl shows intermediate redirect
+            // headers under `-i`).
+            //
+            // A `1xx` interim response (curl's `k->httpcode < 200`) does NOT begin
+            // the body — another response always follows — so its blank line must
+            // NOT mark headers complete. Otherwise the interim block's blank line
+            // would latch `headers_complete` while `status` is still `1xx`, and
+            // the FINAL response's status-line bytes (arriving on the body stream
+            // under `-i`, before `note_header` parses them) would be taken as the
+            // first "body" write with a stale `1xx` status — wrongly driving the
+            // disposition (e.g. discarding the final status line during an
+            // auth-negotiation probe with `Expect: 100-continue`; oracle test565).
+            // A blank line before any status line (defensive) is likewise ignored.
+            if self.status >= 200 {
                 self.headers_complete = true;
             }
             return;
@@ -778,10 +999,28 @@ impl<'s> HopSink<'s> {
         if let Some(rest) = line.strip_prefix("HTTP/") {
             if let Some(code) = parse_status_code(rest) {
                 self.status = code;
+                // Capture the response's wire version (curl's `k->httpversion`)
+                // for the transfer's `rcvd_min` downgrade. A malformed version
+                // leaves the prior value untouched.
+                if let Some(v) = parse_status_version(rest) {
+                    self.version = v;
+                }
                 self.location = None;
                 self.headers.clear();
                 self.content_type = None;
+                self.retry_after = None;
                 self.www_authenticate.clear();
+                // A fresh response block resets the range-resume observations
+                // (curl re-evaluates `k->content_range`/`k->size` per response):
+                // a redirect or 1xx block's headers must not leak into the final
+                // block's server-ignored-range decision.
+                self.content_range_seen = false;
+                self.body_size = None;
+                // A fresh response block re-evaluates the document modification
+                // time (curl re-parses `Last-Modified` into `k->timeofdoc` per
+                // response): a redirect or 1xx block's `Last-Modified` must not
+                // leak into the final block's time-condition decision.
+                self.timeofdoc = 0;
                 // A fresh response block: its body boundary has not been reached
                 // yet. Reset so a prior block's blank line (a 1xx interim
                 // response, or the status line of the next hop arriving on a
@@ -801,8 +1040,71 @@ impl<'s> HopSink<'s> {
             if name.eq_ignore_ascii_case("content-type") {
                 self.content_type = Some(value.as_bytes().to_vec());
             }
+            // Server-ignored-range observations (curl's `k->content_range` /
+            // `k->size`), consulted by the first-body-write resume check. A
+            // `Content-Range:` response header means the server honored the
+            // requested byte range; its presence alone is what matters here, so
+            // the value is not parsed. `Content-Length:` gives the response body
+            // size used to detect the "already fully downloaded" case.
+            if name.eq_ignore_ascii_case("content-range") {
+                self.content_range_seen = true;
+            } else if name.eq_ignore_ascii_case("content-length") {
+                self.body_size = value.trim().parse::<i64>().ok();
+            } else if name.eq_ignore_ascii_case("retry-after") {
+                // Parse `Retry-After` (HTTP-date OR delay-seconds) into a
+                // seconds-from-now value for `CURLINFO_RETRY_AFTER`, mirroring C
+                // `http_header_r` (lib/http.c L3501-3523). curl tries a date
+                // first — because a date can start with digits and otherwise be
+                // mis-read as a number — then falls back to a decimal count, and
+                // caps the result at 21600 (6 hours). The CLI `retrycheck`
+                // reads this back via `getinfo` to honor `--retry-max-time`
+                // against a server-specified back-off (oracle test366: a 503
+                // with `Retry-After: 200` and `--retry-max-time 10` must NOT
+                // retry, since 200s exceeds the 10s budget).
+                let v = value.trim_start();
+                let mut secs: i64 = 0; // zero for unknown or "now"
+                let date = crate::util::parsedate::curl_getdate(v);
+                if date != -1 {
+                    // Parsed as a date; convert a future date to a delta.
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    if date >= now {
+                        secs = date - now;
+                    }
+                } else if let Ok(n) = v.parse::<i64>() {
+                    // Decimal delay-seconds (errors ignored, leaving `secs = 0`).
+                    secs = n;
+                }
+                if secs > 21600 {
+                    secs = 21600;
+                }
+                self.retry_after = Some(secs);
+            }
+            // The response document's modification time (curl's `http_header_l`):
+            // parse `Last-Modified` into `timeofdoc` only when a time condition is
+            // active, exactly as curl gates on `data->set.timecondition ||
+            // data->set.get_filetime`. The first-body-write check compares it
+            // against `timevalue`. An unparseable date caps to `0` (the condition
+            // is then treated as met — `Curl_getdate_capped` setting `timeofdoc =
+            // 0` on failure).
+            if self.timecondition != 0 && name.eq_ignore_ascii_case("last-modified") {
+                self.timeofdoc = crate::util::parsedate::getdate_capped(value).unwrap_or(0);
+            }
             if name.eq_ignore_ascii_case("location") {
-                self.location = Some(value.to_string());
+                // An empty `Location:` header is ignored — curl does not follow
+                // it. The C oracle (lib/http.c, `Curl_copy_header_value` path):
+                // `if(!*location || ...) { /* ignore empty header ... */ return
+                // CURLE_OK; }` returns without setting `data->req.newurl`, so the
+                // 3xx response is delivered as the final result instead of being
+                // chased into a redirect loop. `value` is already trimmed above,
+                // so a `Location:` with only whitespace is treated as empty.
+                // (Regression oracle: tests/data/test54 — "HTTP with blank
+                // Location:" expects exactly one request and rc=0.)
+                if !value.is_empty() {
+                    self.location = Some(value.to_string());
+                }
             } else if name.eq_ignore_ascii_case("www-authenticate")
                 || name.eq_ignore_ascii_case("proxy-authenticate")
             {
@@ -847,6 +1149,16 @@ impl<'s> HopSink<'s> {
         if self.auth_negotiating && (self.status == 401 || self.status == 407) {
             return BodyDisposition::BufferAuth;
         }
+        // An auth-negotiation probe (body suppressed, `Content-Length: 0`) that
+        // received a non-`401` *success* (`status < 300`) is re-issued with the
+        // real body by `Curl_http_auth_act` (lib/http.c L597-611), which sets
+        // `newurl`; `http_firstwrite` then ignores THIS response's body. Discard
+        // it so only the second (authenticated/body-bearing) response's body
+        // reaches the application — its headers already flowed under `-i`.
+        // Oracle: test175 (Digest), test176 (NTLM).
+        if self.authneg_probe && self.status < 300 {
+            return BodyDisposition::Discard;
+        }
         BodyDisposition::Forward
     }
 
@@ -856,13 +1168,27 @@ impl<'s> HopSink<'s> {
     /// headers/challenges, and the memoized body disposition + buffer.
     fn reset_for_retry(&mut self) {
         self.status = 0;
+        self.version = 0;
         self.location = None;
         self.headers.clear();
         self.content_type = None;
+        self.retry_after = None;
         self.www_authenticate.clear();
         self.auth_body_buf.clear();
         self.headers_complete = false;
         self.disposition = None;
+        // The configured resume offset (`resume_from`) persists across an auth
+        // resend — the resumed range is re-sent on the retry — but the per-block
+        // response observations and the error latch are re-evaluated.
+        self.content_range_seen = false;
+        self.body_size = None;
+        self.range_error = false;
+        // The configured time condition (`timecondition`/`timevalue`/
+        // `range_present`) likewise persists across an auth resend, while the
+        // per-response `Last-Modified` observation and the unmet latch are
+        // re-evaluated on the retry's response.
+        self.timeofdoc = 0;
+        self.condition_unmet = false;
         #[cfg(feature = "cookies")]
         self.set_cookies.clear();
         #[cfg(feature = "hsts")]
@@ -873,6 +1199,13 @@ impl<'s> HopSink<'s> {
         {
             self.alt_svc = None;
         }
+    }
+
+    /// Set whether THIS attempt is a body-bearing auth-negotiation probe — see
+    /// [`authneg_probe`](Self::authneg_probe). Called per attempt before driving
+    /// the exchange, from the loop's `authneg` state and the request method.
+    fn set_authneg_probe(&mut self, v: bool) {
+        self.authneg_probe = v;
     }
 
     /// Discard any buffered auth-probe body (the request is being re-issued with
@@ -918,15 +1251,107 @@ impl WriteCallbacks for HopSink<'_> {
         let disposition = match self.disposition {
             Some(d) => d,
             None => {
-                let d = self.decide_disposition();
+                // Server-ignored-range check — the port of curl's
+                // `http_firstwrite` (lib/http.c), taken at the first real body
+                // byte (the only point where the response head — status,
+                // `Content-Range`, `Content-Length` — is fully known but no body
+                // has yet been written to the client). It applies only to a
+                // response that would otherwise be *forwarded* to the client: a
+                // followed-redirect body (Discard) or a buffered `401`/`407`
+                // auth-probe body (BufferAuth) is not the resumed transfer's real
+                // payload, and curl evaluates the resume failure only on the
+                // final delivered response (`!k->ignorebody`). A resumed `GET`
+                // (`resume_from > 0`, only ever set for `GET` by the orchestrator)
+                // whose forwarded response carries no `Content-Range` means the
+                // server did not honor the requested byte range. If the response
+                // body size equals the resume point the document is already fully
+                // downloaded (a success — discard the redundant re-sent body and
+                // keep the local file); otherwise the range was not delivered and
+                // the transfer must fail with `CURLE_RANGE_ERROR` (33). In both
+                // cases the body is discarded so the local output file is left
+                // untouched, exactly as curl aborts before `Curl_client_write`.
+                let base = self.decide_disposition();
+                let d = if matches!(base, BodyDisposition::Forward)
+                    && self.resume_from > 0
+                    && self.status == 416
+                {
+                    // A `416 Range Not Satisfiable` answer to a resumed `GET`
+                    // (`resume_from > 0`, only ever set for `GET`) is curl's
+                    // "the file is presumably already completely downloaded"
+                    // case (`lib/http.c` `http_firstwrite`:
+                    // `if(state.resume_from && httpreq == GET && httpcode == 416)
+                    //   k->ignorebody = TRUE;`). The body is DISCARDED to avoid
+                    // appending the server's error page to the already-complete
+                    // local file, and this is a SUCCESS (`CURLE_OK`) — NOT a
+                    // range error — so `range_error` is left unset. This check
+                    // must precede the no-`Content-Range` branch below because a
+                    // `416` typically *does* carry a `Content-Range: bytes */N`
+                    // header (so `content_range_seen` is true), which would
+                    // otherwise skip the discard and forward the error body.
+                    // (Regression oracle: tests/data/test92, test194.)
+                    BodyDisposition::Discard
+                } else if matches!(base, BodyDisposition::Forward)
+                    && self.resume_from > 0
+                    && !self.content_range_seen
+                {
+                    if self.body_size != Some(self.resume_from) {
+                        self.range_error = true;
+                    }
+                    BodyDisposition::Discard
+                } else if matches!(base, BodyDisposition::Forward)
+                    && self.timecondition != 0
+                    && !self.range_present
+                    && !crate::protocols::file::meets_timecondition(
+                        self.timeofdoc,
+                        self.timecondition,
+                        self.timevalue,
+                    )
+                {
+                    // Client-side time-condition check — the port of curl's
+                    // `http_firstwrite` time-condition arm (lib/http.c), taken at
+                    // the first real body byte (the response head is fully known).
+                    // It runs AFTER the resume/range check, matching curl's order,
+                    // and only when no byte range was requested (`!range_present`,
+                    // curl's `!data->state.range`, RFC 2616 §13.3.4). A
+                    // `-z`/`CURLOPT_TIMECONDITION` response whose `Last-Modified`
+                    // does not satisfy the condition (e.g. an `If-Modified-Since`
+                    // GET whose document is not newer than `timevalue`) is
+                    // delivered as a simulated `304`: the headers already flowed
+                    // (verbatim under `-i`, before `headers_complete`) but the body
+                    // is discarded and the local output file is left untouched. The
+                    // orchestrator surfaces `condition_unmet` as `info.timecond =
+                    // true` + `response_code = 304`. Unlike the range error this is
+                    // a SUCCESS (`CURLE_OK`), so `range_error` stays unset and the
+                    // `Discard` arm pretends the bytes were consumed.
+                    self.condition_unmet = true;
+                    BodyDisposition::Discard
+                } else {
+                    base
+                };
                 self.disposition = Some(d);
                 d
             }
         };
         match disposition {
             // Pretend the bytes were consumed so the transfer driver does not
-            // treat the discard/buffer as a short write.
-            BodyDisposition::Discard => data.len(),
+            // treat the discard/buffer as a short write — EXCEPT on a resumed
+            // range failure, where curl's `http_firstwrite` returns the error at
+            // the first body byte rather than draining the rest of the response.
+            // Signal a short write (return 0) so `drive_transfer` aborts the read
+            // loop AT ONCE instead of waiting for a close-delimited HTTP/1.0 body
+            // to end (which the server need not do promptly — that wait was the
+            // observed timeout). The orchestrator translates the latched
+            // `range_error` into `CURLE_RANGE_ERROR` (33). The
+            // already-fully-downloaded case (`range_error` unset) still returns
+            // `data.len()`; its response is `Content-Length`-delimited, so the
+            // drain terminates on its own.
+            BodyDisposition::Discard => {
+                if self.range_error {
+                    0
+                } else {
+                    data.len()
+                }
+            }
             BodyDisposition::BufferAuth => {
                 self.auth_body_buf.extend_from_slice(data);
                 data.len()
@@ -955,6 +1380,20 @@ impl WriteCallbacks for HopSink<'_> {
     fn write_diag(&mut self, bytes: &[u8]) {
         self.inner.write_diag(bytes);
     }
+
+    fn ignorebody(&self) -> bool {
+        // curl's `data->req.ignorebody`: an intermediate response whose body the
+        // engine does not deliver to the application — a followed redirect
+        // (`Discard`) or a buffered `401`/`407` auth-probe (`BufferAuth`). The
+        // download-side file-size cap is suppressed for such bodies (see the
+        // trait doc / `cw_download_write`'s `!ignorebody` gate). A response that
+        // would be forwarded reports `false`. This is a pure read of the
+        // already-parsed status; it does not memoize the disposition (which is
+        // settled at the first real body byte, possibly downgrading a `Forward`
+        // base to `Discard` for the resume/time-condition cases — orthogonal to
+        // the redirect/auth ignore-body classification curl uses here).
+        !matches!(self.decide_disposition(), BodyDisposition::Forward)
+    }
 }
 
 /// Derive the `(scheme, is_https, host, port)` request parts from a parsed URL,
@@ -982,8 +1421,18 @@ fn http_url_parts(url: &CurlUrl) -> Result<(String, bool, String, u16)> {
     } else {
         SCHEME_HTTP.default_port
     };
+    // Query the port with `CURLU_DEFAULT_PORT` so a scheme-less URL resolves to
+    // the SCHEME's own default (`get_scheme().defport`): 80/`http`, 443/`https`,
+    // and — for an `ftp://` URL driven AS HTTP over a forward proxy (the
+    // PROTOPT_PROXY_AS_HTTP swap) — 21/`ftp`. curl keys the `Host:` default-port
+    // suppression off the GIVEN scheme (`lib/http.c` L2051-2068: only
+    // `(HTTPS && 443)` and `(HTTP && 80)` are omitted), so an `ftp` origin must
+    // report 21 here to emit `Host: host:21` (tests 208/299/549/550/561). The
+    // `is_https`-based fallback only triggers for a scheme `get_scheme` does not
+    // recognize. For `http`/`https` this is identical to the previous query (the
+    // default already equalled 80/443), so direct HTTP(S) behavior is unchanged.
     let port = url
-        .get(CurlUPart::Port, 0)
+        .get(CurlUPart::Port, CURLU_DEFAULT_PORT)
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(default_port);
@@ -1029,19 +1478,33 @@ mod cookie_engine {
                 // continues); there is no way to report it per cookie file.
                 let _ = guard.load_file(file, newsession, now);
             }
+            // Mark the jar live before any `Set-Cookie` is captured. curl's
+            // `Curl_cookie_init` leaves `ci->running = TRUE` whether or not a
+            // cookie file was loaded; `load_file` already does this, but a
+            // `-c`-only invocation (cookie jar set via `CURLOPT_COOKIEJAR` with
+            // no `-b` file) never calls `load_file`, leaving the jar not-running.
+            // A not-running jar treats live responses as file reads and so wrongly
+            // ACCEPTS `secure`/`__Secure-` cookies received over plain HTTP and
+            // mishandles `newsession` — e.g. curl test 61 stores a `secure`
+            // cookie delivered over `http://`. Setting it here matches curl.
+            guard.set_running(true);
         }
         Some(jar)
     }
 
-    /// Build the `Cookie:` request-header value for `url`: the inline
-    /// `CURLOPT_COOKIE` value (if any) merged with the jar's matching cookies —
-    /// inline first, then jar matches, `"; "`-separated — matching curl's
-    /// `addcookies` followed by the jar emission. With no active jar the inline
-    /// value is used verbatim (the historical inline-only behavior).
+    /// Build the `Cookie:` request-header value for `url`: the jar's matching
+    /// cookies (sorted by path length, longest first) emitted **first**, then the
+    /// inline `CURLOPT_COOKIE` value (if any) appended, `"; "`-separated. This
+    /// mirrors curl exactly (lib/http.c L2534-2581): `Curl_cookie_getlist`
+    /// emits the jar cookies, then `addcookies` (the inline `-b "name=value"`
+    /// string) is appended after them with a `count ? "; " : ""` separator. With
+    /// no active jar the inline value is used verbatim (the historical
+    /// inline-only behavior).
     pub(super) fn request_header(
         jar: &Option<JarHandle>,
         inline: Option<&str>,
         url: &CurlUrl,
+        host_override: Option<&str>,
     ) -> Option<String> {
         let Some(jar) = jar else {
             return inline.map(str::to_string);
@@ -1050,10 +1513,11 @@ mod cookie_engine {
         let matched = jar
             .lock()
             .ok()
-            .and_then(|mut j| j.match_for_url(url, now).ok())
+            .and_then(|mut j| j.match_for_url_host(url, host_override, now).ok())
             .unwrap_or_default();
         match (inline, matched.is_empty()) {
-            (Some(i), false) => Some(format!("{i}; {matched}")),
+            // Jar matches first, then the inline `-b` cookies (curl's order).
+            (Some(i), false) => Some(format!("{matched}; {i}")),
             (Some(i), true) => Some(i.to_string()),
             (None, false) => Some(matched),
             (None, true) => None,
@@ -1063,7 +1527,12 @@ mod cookie_engine {
     /// Store this hop's `Set-Cookie` response headers into the jar, scoped to the
     /// request `url` (curl's `Curl_cookie_add` per `Set-Cookie`). Public-suffix
     /// rejection and domain/path/secure scoping are enforced inside the jar.
-    pub(super) fn capture(jar: &Option<JarHandle>, set_cookies: &[String], url: &CurlUrl) {
+    pub(super) fn capture(
+        jar: &Option<JarHandle>,
+        set_cookies: &[String],
+        url: &CurlUrl,
+        host_override: Option<&str>,
+    ) {
         let Some(jar) = jar else {
             return;
         };
@@ -1072,10 +1541,30 @@ mod cookie_engine {
         }
         let now = now_unix();
         if let Ok(mut guard) = jar.lock() {
+            // Per-response cap: curl accepts at most `MAX_SET_COOKIE_AMOUNT` (50)
+            // `Set-Cookie` headers per request (`data->req.setcookies`,
+            // lib/cookie.c L955 rejects once the counter reaches the cap; the
+            // counter is incremented only on a successful add, L1039). The
+            // counter is request-scoped — reset per hop in curl's `req` — so a
+            // fresh local counter per `capture` call (one per hop) matches.
+            // test444: a response with 80 `Set-Cookie` headers stores only the
+            // first 50 (cookie-1..cookie-50); the remainder are dropped.
+            let mut setcookies: u8 = 0;
             for sc in set_cookies {
+                if setcookies >= crate::cookie::MAX_SET_COOKIE_AMOUNT {
+                    break;
+                }
                 // A malformed/blocked cookie is dropped, not fatal (curl ignores
-                // a failed `Curl_cookie_add`).
-                let _ = guard.store_response_url(sc, url, now);
+                // a failed `Curl_cookie_add`) and does not count toward the cap
+                // (curl increments `setcookies` only after a cookie is actually
+                // stored — `Ok(true)`; `Ok(false)` is a no-op/rejection and
+                // `Err` a parse failure, neither of which counts).
+                if matches!(
+                    guard.store_response_url_host(sc, url, host_override, now),
+                    Ok(true)
+                ) {
+                    setcookies += 1;
+                }
             }
         }
     }
@@ -1299,7 +1788,7 @@ mod altsvc_engine {
 /// (F8) — so only the preemptive Basic path is wired here. The leaf scheme
 /// implementations already live in [`crate::auth`].
 mod auth_engine {
-    use super::{Easy, StrId};
+    use super::{CurlUPart, CurlUrl, Easy, StrId};
     use crate::auth::basic::http_basic_header;
     use crate::auth::bearer::http_bearer_header;
     use crate::auth::digest::{input_digest, output_digest, DigestData};
@@ -1308,13 +1797,24 @@ mod auth_engine {
         build_auth_mask, parse_auth_header, pick_one_auth, AuthState, CURLAUTH_BASIC,
         CURLAUTH_BEARER, CURLAUTH_DIGEST, CURLAUTH_NEGOTIATE, CURLAUTH_NTLM,
     };
+    use crate::conn::h1_proxy::ProxyConnectAuth;
+    use crate::error::Result;
     use crate::netrc::{self, CurlNetrcOption};
+    use crate::url::CURLU_URLDECODE;
     use std::path::Path;
 
     /// Resolved host credentials (curl's `data->state.aptr.user`/`passwd`).
     struct HostCreds {
         user: String,
         password: String,
+        /// Whether the credentials were resolved from `.netrc` (curl's
+        /// `conn->bits.netrc`). curl re-runs `override_login` for every
+        /// connection, so `.netrc` is re-resolved against each hop's host; such
+        /// credentials are flagged safe to send even across a redirect to a
+        /// different host (the `|| conn->bits.netrc` clause of the auth-send gate
+        /// at lib/http.c L821-823), whereas `-u`/URL credentials are confined to
+        /// the origin host.
+        from_netrc: bool,
     }
 
     /// Reduce a full `"[Proxy-]Authorization: <scheme> …\r\n"` header line to the
@@ -1351,8 +1851,11 @@ mod auth_engine {
     ///
     /// `host` is the *origin* host the transfer starts against — the `.netrc`
     /// machine the lookup keys on (curl resolves credentials once against the
-    /// initial host, then governs cross-host forwarding separately).
-    pub(super) fn preemptive_value(data: &Easy, host: &str) -> Option<String> {
+    /// initial host, then governs cross-host forwarding separately). `url` is the
+    /// origin URL, consulted for its embedded userinfo (curl's
+    /// `data->state.aptr.user`/`passwd`, parsed from the URL authority) which
+    /// seeds the credentials and, crucially, supplies the `.netrc` login hint.
+    pub(super) fn preemptive_value(data: &Easy, host: &str, url: &CurlUrl) -> Option<String> {
         let auth = data.set.httpauth;
 
         // Bearer: a single-scheme `--oauth2-bearer` request. The token is sent
@@ -1367,7 +1870,7 @@ mod auth_engine {
         // credentials. A multi-scheme mask (anyauth) is intentionally excluded by
         // the exact-equality test so it does not pre-send Basic.
         if auth == CURLAUTH_BASIC {
-            let creds = resolve(data, host)?;
+            let creds = resolve(data, host, url)?;
             let line = http_basic_header(&creds.user, &creds.password, false).ok()?;
             return Some(reduce_to_value(&line));
         }
@@ -1396,8 +1899,8 @@ mod auth_engine {
     /// challenge-response loop on the kept-alive connection.
     #[derive(Clone)]
     pub(super) struct AuthInputs {
-        user: String,
-        password: String,
+        pub(super) user: String,
+        pub(super) password: String,
         bearer: Option<String>,
         want: u32,
     }
@@ -1407,13 +1910,13 @@ mod auth_engine {
     /// all to attempt with). A `--negotiate -u :` request with no usable
     /// credential returns `None`, leaving curl's existing graceful
     /// `CURLE_NOT_BUILT_IN` (already produced at `setopt` time) untouched.
-    pub(super) fn resolve_auth_inputs(data: &Easy, host: &str) -> Option<AuthInputs> {
+    pub(super) fn resolve_auth_inputs(data: &Easy, host: &str, url: &CurlUrl) -> Option<AuthInputs> {
         let want = data.set.httpauth;
         if !needs_reactive(want) {
             return None;
         }
         let bearer = data.set.str(StrId::Bearer).map(str::to_string);
-        let (user, password) = match resolve(data, host) {
+        let (user, password) = match resolve(data, host, url) {
             Some(c) => (c.user, c.password),
             None => (String::new(), String::new()),
         };
@@ -1425,6 +1928,67 @@ mod auth_engine {
             user,
             password,
             bearer,
+            want,
+        })
+    }
+
+    /// Build the reactive **proxy**-auth seed (curl's `data->state.authproxy`),
+    /// or `None` when reactive proxy auth does not apply.
+    ///
+    /// The proxy analog of [`resolve_auth_inputs`]: it keys on
+    /// `CURLOPT_PROXYAUTH` (`--proxy-ntlm`/`--proxy-digest`/`--proxy-anyauth`)
+    /// and the proxy credentials (`CURLOPT_PROXYUSERNAME`/`CURLOPT_PROXYPASSWORD`,
+    /// curl's `data->state.aptr.proxyuser`/`proxypasswd`). Unlike host auth there
+    /// is **no host gating** — a forward proxy is constant across redirect hops,
+    /// so the same proxy credentials apply to every hop — and **no bearer**
+    /// scheme (proxies do not use `--oauth2-bearer`).
+    ///
+    /// Returns `None` for the challenge-free single-scheme cases (the default
+    /// `CURLAUTH_BASIC`, handled preemptively by
+    /// [`proxy_engine::forward_proxy_auth_value`]) and when no proxy credentials
+    /// are present to attempt with. A reactive scheme drives the
+    /// challenge-response loop against the proxy's `407` exactly as the host
+    /// controller drives it against a `401` (tests 81, 162).
+    ///
+    /// `proxy_url_creds` carries the credentials embedded in the `-x` proxy URL's
+    /// userinfo (curl's `proxy_info.user`/`passwd`), resolved by the caller from
+    /// the parsed [`Proxy`]. The explicit `CURLOPT_PROXYUSERNAME`/`PROXYPASSWORD`
+    /// (`--proxy-user`) take precedence, falling back to the URL userinfo — curl
+    /// unifies both into `data->state.aptr.proxyuser`/`proxypasswd` (test 335
+    /// supplies the proxy credentials only in the proxy URL). `None` when no
+    /// forward proxy applies to the hop.
+    #[cfg(feature = "proxy")]
+    pub(super) fn resolve_proxy_auth_inputs(
+        data: &Easy,
+        proxy_url_creds: Option<(Option<String>, Option<String>)>,
+    ) -> Option<AuthInputs> {
+        let want = data.set.proxyauth;
+        if !needs_reactive(want) {
+            return None;
+        }
+        let (url_user, url_pass) = proxy_url_creds.unwrap_or((None, None));
+        // `--proxy-user` (CURLOPT_PROXYUSERNAME/PROXYPASSWORD) overrides the proxy
+        // URL userinfo, mirroring curl's `parse_proxy` + explicit-override order.
+        let user = data
+            .set
+            .str(StrId::Proxyusername)
+            .map(str::to_string)
+            .or(url_user)
+            .unwrap_or_default();
+        let password = data
+            .set
+            .str(StrId::Proxypassword)
+            .map(str::to_string)
+            .or(url_pass)
+            .unwrap_or_default();
+        // Need at least one proxy credential to attempt anything.
+        if user.is_empty() && password.is_empty() {
+            return None;
+        }
+        Some(AuthInputs {
+            user,
+            password,
+            bearer: None,
             want,
         })
     }
@@ -1461,16 +2025,41 @@ mod auth_engine {
     impl HttpAuthController {
         /// Create a controller seeded with the wanted scheme mask and credentials.
         pub(super) fn new(inputs: AuthInputs) -> Self {
+            // Seed `last_authneg` to exactly what curl computes for the FIRST
+            // request via `Curl_http_output_auth` + the multipass rule
+            // (lib/http.c L791-836):
+            //   * `picked` is seeded to `want` (`AuthState::new`). A credential
+            //     is emitted by `output_auth_headers` only when `picked` equals a
+            //     SINGLE scheme bit (the C `picked == CURLAUTH_<scheme>`
+            //     comparisons). A multi-bit `--anyauth` mask (`CURLAUTH_ANY`)
+            //     matches no `==` branch and emits nothing.
+            //   * `multipass = (a credential was emitted) && !done`; for a
+            //     PUT/POST `authneg = multipass`. Per scheme on this first
+            //     request:
+            //       - Basic / Bearer  : emitted, `done == TRUE`  => authneg FALSE
+            //         (preemptive credential => the REAL body rides request #1)
+            //       - Digest          : "emitted" but no nonce yet, `done == FALSE`
+            //         => authneg TRUE  (body-less probe to fetch the nonce; test 565)
+            //       - NTLM            : Type-1 emitted, `done == FALSE`
+            //         => authneg TRUE  (body-less probe; the Type-1 rides via
+            //         `initial_header`, which re-derives `last_authneg` identically)
+            //       - `--anyauth` / multi-bit / none : no credential picked yet
+            //         => authneg FALSE (the REAL body rides request #1; the scheme
+            //         is chosen only after observing the `401` — tests 154/1072)
+            // So the opening probe is body-less ONLY for a single forced Digest or
+            // NTLM scheme. For `--anyauth` and for preemptive Basic/Bearer, curl
+            // sends the real body on the first request (and, for `--anyauth`,
+            // resends it authenticated after the `401`).
+            let want = inputs.want;
+            let last_authneg = want == CURLAUTH_DIGEST || want == CURLAUTH_NTLM;
             HttpAuthController {
-                state: AuthState::new(inputs.want),
+                state: AuthState::new(want),
                 digest: DigestData::new(),
                 ntlm: NtlmHandshake::new(),
                 user: inputs.user,
                 password: inputs.password,
                 bearer: inputs.bearer,
-                // A reactive controller always opens by negotiating: the first
-                // request is an empty-bodied probe with no preemptive credential.
-                last_authneg: true,
+                last_authneg,
             }
         }
 
@@ -1526,6 +2115,20 @@ mod auth_engine {
         pub(super) fn requires_same_connection(&self) -> bool {
             self.state.picked == CURLAUTH_NTLM
                 && matches!(self.ntlm.state(), NtlmState::Type2 | NtlmState::Type3)
+        }
+
+        /// Whether the picked scheme is a connection-bound handshake that has now
+        /// COMPLETED, leaving the peer authenticated for the lifetime of the
+        /// current connection. Only NTLM qualifies, and only once the Type-3
+        /// authenticate message has been produced (state [`NtlmState::Type3`]):
+        /// curl's `Curl_output_ntlm` returns WITHOUT emitting a header once
+        /// `ntlm->state == NTLMSTATE_TYPE3`, because the connection itself is
+        /// authenticated and repeating the Type-3 on every subsequent request
+        /// over the same socket is both unnecessary and wire-incorrect (tests
+        /// 169, 170). The stateless schemes (Basic/Digest/Bearer) are re-sent on
+        /// every request and therefore never report as connection-authenticated.
+        pub(super) fn connection_authenticated(&self) -> bool {
+            self.state.picked == CURLAUTH_NTLM && matches!(self.ntlm.state(), NtlmState::Type3)
         }
 
         /// Whether the auth handshake is still negotiating (curl's
@@ -1661,30 +2264,198 @@ mod auth_engine {
         }
     }
 
-    /// Resolve the host credentials: explicit `-u` first, then `.netrc` (when
-    /// enabled) to fill any missing field. Returns `None` when neither source
-    /// supplies a credential.
-    fn resolve(data: &Easy, host: &str) -> Option<HostCreds> {
-        let explicit_user = data.set.str(StrId::Username);
-        let explicit_pass = data.set.str(StrId::Password);
+    /// A [`ProxyConnectAuth`] provider that drives the reactive challenge-response
+    /// proxy-auth schemes — Digest, NTLM, and the multi-scheme `--anyauth` — on
+    /// the HTTP `CONNECT` request, by reusing the engine's [`HttpAuthController`].
+    ///
+    /// `http_connect_hop` selects this adapter (instead of the lighter
+    /// [`StandardProxyAuth`](crate::conn::h1_proxy::StandardProxyAuth), which only
+    /// produces proactive Basic) whenever `CURLOPT_PROXYAUTH` requests a reactive
+    /// scheme — i.e. when [`resolve_proxy_auth_inputs`] yields credentials.
+    ///
+    /// It is the `CONNECT`-tunnel analog of `Curl_http_output_auth` driving the
+    /// proxy half of the auth state inside the `cf-h1-proxy.c` CONNECT loop
+    /// (`Curl_http_proxy_create_CONNECT` calls `Curl_http_output_auth(..,
+    /// req->method, HTTPREQ_GET, req->authority, /*proxy*/TRUE)`):
+    ///
+    /// * NTLM is **proactive** — the challenge-free Type-1 message rides the
+    ///   first `CONNECT` ([`HttpAuthController::initial_header`]); the `407`
+    ///   Type-2 challenge is folded and the Type-3 authenticate message is sent
+    ///   on the second `CONNECT` over the kept-alive connection (test 209).
+    /// * Digest is **reactive** — the first `CONNECT` carries no credential; the
+    ///   `407` advertises the realm/nonce, and the Digest response (computed over
+    ///   the `CONNECT` method and the tunnel authority `host:port`, which is the
+    ///   Digest `uri=`) rides the second `CONNECT` (test 206).
+    ///
+    /// The Digest `uri=` and the `HA2 = MD5("CONNECT:host:port")` target are the
+    /// CONNECT authority — exactly the request-line authority produced by
+    /// [`H1ProxyConfig`](crate::conn::h1_proxy::H1ProxyConfig) — so [`authority`]
+    /// is seeded with the identical `host:port` string.
+    pub(super) struct ConnectTunnelAuth {
+        /// The reused per-connection reactive controller (Digest/NTLM/anyauth
+        /// scheme selection + credential generation).
+        controller: HttpAuthController,
+        /// The `CONNECT` authority (`host:port`) — the Digest `uri=` value and
+        /// the request target for `HA2`. Matches the request-line authority.
+        authority: String,
+        /// `Proxy-Authenticate` challenge values accumulated from the current
+        /// `407` (fed one per [`input_challenge`](ProxyConnectAuth::input_challenge)).
+        challenges: Vec<String>,
+        /// The full `"Proxy-Authorization: <value>\r\n"` line to emit on the next
+        /// `CONNECT`, or [`None`] to send none.
+        current: Option<String>,
+        /// Set once a `407` could not be answered (rejected credentials or no
+        /// acceptable scheme) — curl's `authproblem`.
+        authproblem: bool,
+    }
+
+    impl ConnectTunnelAuth {
+        /// Build the adapter from a freshly-seeded [`HttpAuthController`] and the
+        /// `CONNECT` authority. Produces the proactive opening message (NTLM
+        /// Type-1) so it rides the first `CONNECT`; Digest / `--anyauth` open
+        /// credential-less (`initial_header` → `None`).
+        pub(super) fn new(controller: HttpAuthController, authority: String) -> Self {
+            let mut me = Self {
+                controller,
+                authority,
+                challenges: Vec::new(),
+                current: None,
+                authproblem: false,
+            };
+            if let Some(value) = me.controller.initial_header() {
+                me.current = Some(format!("Proxy-Authorization: {value}\r\n"));
+            }
+            me
+        }
+    }
+
+    impl ProxyConnectAuth for ConnectTunnelAuth {
+        fn authorization(&mut self) -> Result<Option<String>> {
+            Ok(self.current.clone())
+        }
+
+        fn input_challenge(&mut self, header_value: &str) -> Result<()> {
+            // Accumulate the `Proxy-Authenticate` value; `act` folds the whole set
+            // once the 407 response completes (matching `HttpAuthController`'s
+            // challenge-list `on_challenge` contract).
+            self.challenges.push(header_value.to_string());
+            Ok(())
+        }
+
+        fn act(&mut self, _http_proxy_code: i32) -> Result<bool> {
+            // Fold the accumulated 407 challenges and produce the next CONNECT's
+            // `Proxy-Authorization` value, computed over the CONNECT method and
+            // the tunnel authority (the Digest `uri=`).
+            let produced =
+                self.controller
+                    .on_challenge(&self.challenges, "CONNECT", &self.authority);
+            self.challenges.clear();
+            match produced {
+                Some(value) => {
+                    self.current = Some(format!("Proxy-Authorization: {value}\r\n"));
+                    Ok(true)
+                }
+                None => {
+                    // No acceptable scheme / rejected credentials: stop, and mark
+                    // the auth problem so the tunnel fails rather than retrying.
+                    self.current = None;
+                    self.authproblem = true;
+                    Ok(false)
+                }
+            }
+        }
+
+        fn authproblem(&self) -> bool {
+            self.authproblem
+        }
+
+        fn close_means_retry(&self) -> bool {
+            // A reactive scheme with credentials can recover from a proxy-initiated
+            // close during the 407 by reconnecting and restarting the handshake;
+            // once we have given up (authproblem) a close is fatal.
+            !self.authproblem
+        }
+    }
+
+    /// Resolve the host credentials with curl's exact precedence (the HTTP
+    /// analog of FTP's port of C `override_login`, lib/url.c L2575, plus the
+    /// create_conn note at L1761-1763: "username and password set with their own
+    /// options override the credentials possibly set in the URL, but netrc does
+    /// not"):
+    ///   1. the URL userinfo (`http://user:pass@host/`, curl's
+    ///      `data->state.aptr.user`/`passwd`) seeds the credentials;
+    ///   2. explicit `-u user:password` (CURLOPT_USERPWD →
+    ///      `StrId::Username`/`StrId::Password`) overrides the URL userinfo on a
+    ///      per-field basis (CREDS_OPTION > CREDS_URL);
+    ///   3. `.netrc` (when `CURLOPT_NETRC` is enabled AND no `-u` *username* was
+    ///      given AND the password is still unset) fills the remaining gaps,
+    ///      keyed by the URL-provided username when one exists.
+    ///
+    /// Returns `None` when no source supplies a credential.
+    ///
+    /// The critical fix for multi-account `.netrc` files (test 478/479): the URL
+    /// username must be the `.netrc` lookup hint so a host with several `machine`
+    /// blocks resolves to the block whose `login` matches (curl's `override_login`
+    /// sets `userp = &data->state.aptr.user` and `url_provided = TRUE` when the
+    /// URL carried a username, so `Curl_parsenetrc` searches "specific" and keeps
+    /// that login). Consulting only `-u` (the prior behavior) ran a "general"
+    /// search and wrongly took the first block.
+    fn resolve(data: &Easy, host: &str, url: &CurlUrl) -> Option<HostCreds> {
+        // explicit `-u` (CURLOPT_USERNAME/PASSWORD).
+        let explicit_user = data.set.str(StrId::Username).map(str::to_string);
+        let explicit_pass = data.set.str(StrId::Password).map(str::to_string);
+
+        // URL userinfo (empty userinfo is treated as absent, matching the C
+        // `CURLUE_NO_USER`/`CURLUE_NO_PASSWORD` handling).
+        let url_user = url
+            .get(CurlUPart::User, CURLU_URLDECODE)
+            .ok()
+            .filter(|u| !u.is_empty());
+        let url_pass = url
+            .get(CurlUPart::Password, CURLU_URLDECODE)
+            .ok()
+            .filter(|p| !p.is_empty());
 
         // `CURLOPT_NETRC` mode (0=ignored / 1=optional / 2=required).
         let netrc_opt = CurlNetrcOption::from_long(i64::from(data.set.use_netrc))
             .unwrap_or(CurlNetrcOption::Ignored);
 
-        // netrc is consulted only when enabled AND `-u` did not already supply a
-        // complete user:password pair (curl lets netrc fill a missing field, but
-        // a full `-u user:pass` wins outright).
-        let consult_netrc = netrc_opt != CurlNetrcOption::Ignored
-            && !(explicit_user.is_some() && explicit_pass.is_some());
+        // For `CURL_NETRC_REQUIRED` curl discards the URL-supplied credentials up
+        // front so `.netrc` fully overrides them (C `override_login` L2591-2593);
+        // the URL username is still kept as the `.netrc` lookup hint below.
+        // Otherwise the URL userinfo is the seed.
+        let (mut user, mut password) = if netrc_opt == CurlNetrcOption::Required {
+            (None, None)
+        } else {
+            (url_user.clone(), url_pass.clone())
+        };
 
-        let mut user = explicit_user.map(str::to_string);
-        let mut password = explicit_pass.map(str::to_string);
+        // `-u` overrides the URL for each field independently.
+        if explicit_user.is_some() {
+            user = explicit_user.clone();
+        }
+        if explicit_pass.is_some() {
+            password = explicit_pass.clone();
+        }
 
-        if consult_netrc {
+        // `.netrc`: consulted only when enabled AND `-u` supplied no username
+        // (C `use_netrc && !STRING_USERNAME`), and only while the password is
+        // still unset (C guards the lookup with `if(!*passwdp)`). The entry is
+        // matched by the URL-provided username when one exists (preserved as the
+        // hint even under `REQUIRED`); otherwise the first host match is taken
+        // and supplies the login too.
+        let mut from_netrc = false;
+        if netrc_opt != CurlNetrcOption::Ignored
+            && explicit_user.is_none()
+            && password.is_none()
+        {
             // `--netrc-file` overrides the default `~/.netrc` location.
             let file = data.set.str(StrId::NetrcFile).map(Path::new);
-            if let Ok(Some(entry)) = netrc::resolve(netrc_opt, file, host, explicit_user) {
+            let hint = url_user.as_deref();
+            if let Ok(Some(entry)) = netrc::resolve(netrc_opt, file, host, hint) {
+                // The host matched a `.netrc` block that yielded usable
+                // credentials (curl's `NETRC_OK` → `conn->bits.netrc = TRUE`).
+                from_netrc = true;
                 if user.is_none() {
                     user = entry.login;
                 }
@@ -1699,8 +2470,49 @@ mod auth_engine {
             (u, p) => Some(HostCreds {
                 user: u.unwrap_or_default(),
                 password: p.unwrap_or_default(),
+                from_netrc,
             }),
         }
+    }
+
+    /// The resolved host login (`user`, `password`) — URL userinfo overridden by
+    /// `-u`, then `.netrc` — exposed so the caller can write it back onto the URL
+    /// handle for an `ftp://` request driven AS HTTP over a forward proxy. This
+    /// mirrors curl's `override_login` writing `data->state.aptr.user`/`passwd`
+    /// onto `data->state.uh` (`curl_url_set(.., CURLUPART_USER/PASSWORD, ..)`,
+    /// `lib/url.c` L2666-L2686), which is what makes the absolute proxy request-
+    /// target carry `user:pass@host` (the request-target keeps userinfo for the
+    /// `ftp` scheme — test 299). Returns `None` when no credentials resolve.
+    pub(super) fn resolved_host_login(
+        data: &Easy,
+        host: &str,
+        url: &CurlUrl,
+    ) -> Option<(String, String)> {
+        resolve(data, host, url).map(|c| (c.user, c.password))
+    }
+
+    /// The per-hop preemptive Basic header for a redirect target, restricted to
+    /// `.netrc`-sourced credentials. curl re-runs `override_login` for each
+    /// connection, so a redirect to a new host re-resolves `.netrc` against that
+    /// host; credentials so obtained carry `conn->bits.netrc` and are therefore
+    /// sent even across a host change (lib/http.c L821-823: the auth-send gate is
+    /// `Curl_auth_allowed_to_host(data) || conn->bits.netrc`), unlike `-u`/URL
+    /// credentials which are confined to the origin. Returns the `Authorization`
+    /// value only when (a) the wanted scheme is the preemptive Basic case
+    /// (matching the exact-equality test in [`preemptive_value`]) AND (b) the
+    /// resolved credentials actually came from `.netrc`; `None` otherwise. This
+    /// supplements (never replaces) the origin's preemptive value, which already
+    /// governs the origin hop and same-host forwarding.
+    pub(super) fn preemptive_netrc_value(data: &Easy, host: &str, url: &CurlUrl) -> Option<String> {
+        if data.set.httpauth != CURLAUTH_BASIC {
+            return None;
+        }
+        let creds = resolve(data, host, url)?;
+        if !creds.from_netrc {
+            return None;
+        }
+        let line = http_basic_header(&creds.user, &creds.password, false).ok()?;
+        Some(reduce_to_value(&line))
     }
 }
 
@@ -1714,7 +2526,7 @@ mod auth_engine {
 /// mirroring the split in curl between `create_conn`'s proxy parsing
 /// (`parse_proxy`/`parse_proxy_auth`) and the connection filters that act on it.
 #[cfg(feature = "proxy")]
-mod proxy_engine {
+pub(crate) mod proxy_engine {
     use super::{Easy, StrId};
     use crate::error::Result;
     use crate::proxy::{CurlProxyType, Proxy, ProxyConfig};
@@ -1731,7 +2543,7 @@ mod proxy_engine {
     ///
     /// `scheme` is the request URL's scheme (`"http"`/`"https"`), used only to
     /// pick the scheme-specific proxy environment variable.
-    pub(super) fn config(data: &Easy, scheme: &str) -> Result<ProxyConfig> {
+    pub(crate) fn config(data: &Easy, scheme: &str) -> Result<ProxyConfig> {
         // `CURLOPT_PROXYTYPE` is the default scheme for a scheme-less `-x` host
         // (e.g. `--socks5 host:port` sets the host in `CURLOPT_PROXY` and the
         // type here). An out-of-range value falls back to curl's default (HTTP).
@@ -1832,6 +2644,46 @@ mod proxy_engine {
     }
 }
 
+/// `CURLOPT_CONNECT_ONLY` for `http`/`https`: establish the connection (TCP, or
+/// TLS for `https`) but send **no** request, then park the live connection on
+/// the easy handle for the application's own `curl_easy_send` /
+/// `curl_easy_recv`.
+///
+/// This is curl's CONNECT_ONLY contract for the network protocols: `Curl_connect`
+/// runs the full connect (resolve → TCP → optional TLS), after which the multi
+/// state machine transitions straight to `DONE` without entering the DO/PERFORM
+/// phase, leaving `data->conn` live (`lib/multi.c`; `CURLOPT_CONNECT_ONLY` in
+/// `lib/setopt.c`). The connection produced here carries only the transport
+/// filter stack (socket, plus the rustls filter for `https`) — there is no HTTP
+/// filter — so the subsequent raw `curl_easy_send`/`curl_easy_recv` operate on
+/// the bare byte stream, exactly as curl's do.
+///
+/// The WebSocket CONNECT_ONLY path is handled separately by [`perform_ws`] (it
+/// must complete the HTTP/1.1 Upgrade and install the RFC 6455 framing engine);
+/// this function is the plain-socket case used by `tests/libtest/lib556` and the
+/// generic "connect, then talk raw" embedding pattern.
+///
+/// # Errors
+///
+/// Any resolve, connect, or TLS error from [`connect_network_scheme`]; the URL
+/// itself is validated there.
+pub(crate) async fn http_connect_only(data: &mut Easy, scheme: &'static Scheme) -> Result<()> {
+    // The DoH transport must be installed before any name resolution, exactly as
+    // `perform_http` does, in case `--doh-url` drives the CONNECT_ONLY resolve.
+    install_doh_transport_once();
+
+    // Full connect (resolve → TCP → optional TLS), no request — the shared
+    // network-scheme connector used by `perform_ws`. For `http` this is a plain
+    // TCP connect; for `https` it rides implicit TLS (ALPN selects the default,
+    // which a raw CONNECT_ONLY caller drives manually afterwards).
+    let conn = crate::protocols::connect_network_scheme(data, scheme).await?;
+
+    // Park the live connection on the handle; `curl_easy_send`/`curl_easy_recv`
+    // now read/write its raw byte stream.
+    data.attach_connect_only(conn);
+    Ok(())
+}
+
 /// Drive an `http`/`https` transfer to completion.
 ///
 /// Dispatches on the requested HTTP version: `--http3`/`--http3-only` connect
@@ -1854,6 +2706,13 @@ pub(crate) async fn perform_http(
 ) -> Result<()> {
     let verbose = data.set.verbose;
 
+    // Start the transfer with no observed response version (curl initializes
+    // `data->state.http_neg` per transfer). The HTTP/1.0 downgrade
+    // (`http_may_use_1_1` / `rcvd_min`) accumulates within THIS transfer only;
+    // a downgrade learned on a previous transfer of a reused handle must not
+    // leak into this one.
+    data.reset_http_rcvd_min();
+
     // (0) Ensure the DoH transport is available before any name resolution.
     //     `--doh-url` resolution (reached below via `resolve_addrs` →
     //     `dns::resolve` → `doh::resolve`) needs a process-wide
@@ -1870,15 +2729,46 @@ pub(crate) async fn perform_http(
     } else {
         let url_str = data.url().ok_or(CurlError::UrlMalformat)?.to_string();
         let mut parsed = CurlUrl::new();
+        // `CURLOPT_PATH_AS_IS` must preserve the literal `..`/`.` segments of the
+        // *given* URL path, so the initial parse forwards `CURLU_PATH_AS_IS` when
+        // it is set — exactly as C does in `lib/url.c` (the `!use_set_uh` branch
+        // passes `data->set.path_as_is ? CURLU_PATH_AS_IS : 0`). Without this the
+        // parser would dedotdotify the request path (e.g. `/../../NNN` → `/NNN`),
+        // diverging from curl on the first request line. The relative-redirect
+        // resolution still strips dot segments per RFC 3986 (the merge re-parses
+        // with `CURLU_PATH_AS_IS` masked off), so a followed `Location` is
+        // normalized regardless.
+        let path_as_is = if data.set.path_as_is {
+            CURLU_PATH_AS_IS
+        } else {
+            0
+        };
         parsed
             .set(
                 CurlUPart::Url,
                 Some(&url_str),
-                CURLU_GUESS_SCHEME | CURLU_DEFAULT_PORT,
+                CURLU_GUESS_SCHEME | CURLU_DEFAULT_PORT | path_as_is,
             )
             .map_err(|_| CurlError::UrlMalformat)?;
         parsed
     };
+
+    // `CURLOPT_PORT` (`data.set.use_port`, 0 = "use the URL/scheme default"):
+    // override the target port on the ORIGINAL request URL, mirroring curl's
+    // `create_conn` (lib/url.c L2542-2546: `if(data->set.use_port &&
+    // data->state.allow_port) conn->remote_port = data->set.use_port`) and the
+    // matching `Host:`-header override (lib/http.c L1213). It is applied exactly
+    // once, to the original URL, which preserves curl's `state.allow_port`
+    // semantics without a separate flag: the redirect loop below re-parses every
+    // absolute `Location` from scratch, so a relative redirect inherits this
+    // overridden base port (curl keeps `allow_port` TRUE for the same host) while
+    // an absolute redirect carries its own port (curl clears `allow_port`). The
+    // single rewrite flows to all three consumers — the connect port, the default
+    // `Host:` header value, and the forward-proxy absolute request-URI — because
+    // each derives from `http_url_parts(&url)` / the `CurlUrl` port component.
+    if data.set.use_port != 0 {
+        let _ = url.set(CurlUPart::Port, Some(&data.set.use_port.to_string()), 0);
+    }
 
     let ipver = IpVersion::from_raw(i64::from(data.set.ipver));
     let httpwant = data.set.httpwant;
@@ -1926,6 +2816,17 @@ pub(crate) async fn perform_http(
         path_as_is: data.set.path_as_is,
         allow_auth_to_other_hosts: data.set.allow_auth_to_other_hosts,
     };
+    // Protocol allow-lists enforced on a *followed* redirect, the port of C
+    // `findprotocol` (`lib/url.c`) under `data->state.this_is_a_follow`: the
+    // target scheme must be permitted by BOTH `CURLOPT_PROTOCOLS`
+    // (`allowed_protocols`) and `CURLOPT_REDIR_PROTOCOLS` (`redir_protocols`).
+    // `--proto-redir -http` clears the HTTP bit from `redir_protocols`, so an
+    // `https://` → `http://` redirect must be rejected with
+    // `CURLE_UNSUPPORTED_PROTOCOL`. Defaults (`CURLPROTO_ALL` /
+    // `CURLPROTO_REDIR` = HTTP|HTTPS|FTP|FTPS) leave ordinary same-/cross-scheme
+    // HTTP(S) redirects untouched.
+    let allowed_protocols = data.set.allowed_protocols;
+    let redir_protocols = data.set.redir_protocols;
     let mut redirect_state = RedirectState::default();
 
     // Per-hop request shape, advanced on each follow. A 301/302→GET or 303→GET
@@ -1941,6 +2842,17 @@ pub(crate) async fn perform_http(
     // `cookies` feature is compiled out, the orchestrator sends only inline `-b`.
     #[cfg(feature = "cookies")]
     let cookie_jar = cookie_engine::begin(data);
+
+    // Cookie-scoping host override: when the application supplied a custom
+    // `Host:` header, curl matches and stores cookies against that hostname
+    // (`data->state.aptr.cookiehost`) rather than the connection/URL host. Held
+    // across the redirect chain like the jar itself; `None` when no custom
+    // `Host:` was set (cookies then scope to each hop's URL host, the default).
+    #[cfg(feature = "cookies")]
+    let cookie_host_override: Option<String> = {
+        let custom = collect_custom_headers(data);
+        h1::find_custom_header_value(&custom, "Host").and_then(cookie_host_from_header_value)
+    };
 
     // Activate the HSTS engine: resolve the store (shared or per-handle) and load
     // the `--hsts` policy file. Held across the loop so every hop's
@@ -1961,10 +2873,33 @@ pub(crate) async fn perform_http(
     // against the *origin* host below; the origin host is also the gate for
     // cross-host credential forwarding on redirects (`--location-trusted`).
     let (oh_scheme, _oh_https, origin_host, oh_port) = http_url_parts(&url)?;
-    let preemptive_auth = auth_engine::preemptive_value(data, &origin_host);
+    let preemptive_auth = auth_engine::preemptive_value(data, &origin_host, &url);
     // Reactive-auth seed (Digest/NTLM/`--anyauth`): `None` for the challenge-free
     // single-scheme cases handled by `preemptive_auth` above.
-    let reactive_auth = auth_engine::resolve_auth_inputs(data, &origin_host);
+    let reactive_auth = auth_engine::resolve_auth_inputs(data, &origin_host, &url);
+
+    // curl's `override_login` writes the resolved login back onto the URL handle
+    // (`curl_url_set(data->state.uh, CURLUPART_USER/PASSWORD, …, CURLU_URLENCODE)`,
+    // `lib/url.c` L2666-L2686). For an `ftp://` URL driven AS HTTP over a forward
+    // proxy this is what makes the absolute request-target carry
+    // `user:pass@host` — `-u`/`.netrc` credentials that are not already embedded
+    // in the URL are reflected in the proxied FTP `GET` (test 299). It runs
+    // AFTER the Basic/reactive auth above is resolved (those read `-u` directly,
+    // so they are unaffected), and is scoped to the `ftp` scheme so the
+    // `http`/`https` request line — which never shows userinfo (the proxy
+    // request-target clears it for `http`, and the direct request line is
+    // origin-form) — is byte-for-byte unchanged. When the URL already carried the
+    // login this is an idempotent rewrite.
+    if oh_scheme.eq_ignore_ascii_case("ftp") {
+        if let Some((u, p)) = auth_engine::resolved_host_login(data, &origin_host, &url) {
+            if !u.is_empty() {
+                let _ = url.set(CurlUPart::User, Some(&u), CURLU_URLENCODE);
+            }
+            if !p.is_empty() {
+                let _ = url.set(CurlUPart::Password, Some(&p), CURLU_URLENCODE);
+            }
+        }
+    }
 
     let final_result: Result<()> = loop {
         // Before connecting, upgrade `http`→`https` for an HSTS-known host (curl
@@ -2002,15 +2937,39 @@ pub(crate) async fn perform_http(
             && cur_scheme.eq_ignore_ascii_case(&oh_scheme))
             || redirect_cfg.allow_auth_to_other_hosts;
 
+        // Whether to suppress the application's custom `Host:` header on this hop.
+        // curl keeps the custom `Host:` only for the original request and for a
+        // redirect whose target host matches the *first* request's host
+        // (lib/http.c: custom value used IFF `!this_is_a_follow ||
+        // curl_strequal(first_host, conn->host.name)`); a cross-host redirect emits
+        // the auto `Host:` for the new host instead. `followlocation > 0` marks a
+        // follow hop (incremented in `follow` after each redirect), and the host
+        // comparison is case-insensitive like curl's `curl_strequal` (tests
+        // 184/185). The `Host:` line is stripped from `custom_headers` in
+        // `perform_http_hop` when this is set.
+        let suppress_custom_host =
+            redirect_state.followlocation > 0 && !cur_host.eq_ignore_ascii_case(&origin_host);
+
         let hop_inputs = HopInputs {
             method,
             no_body,
             // Emit the preemptive Basic/Bearer header (the h1 builder emits
             // `Authorization` unconditionally on this value, so the cross-host
             // decision is made here).
+            //
+            // The origin's preemptive value governs the origin hop and same-host
+            // (or `--location-trusted`) forwarding. When it is NOT allowed on this
+            // hop (a cross-host redirect strips `-u`/URL credentials), curl still
+            // re-runs `override_login` for the new connection and re-resolves
+            // `.netrc` against the new host: such credentials carry
+            // `conn->bits.netrc` and are sent even across the host change
+            // (lib/http.c L821-823). So a `.netrc`-driven transfer following a
+            // redirect to a different host picks up that host's `.netrc` entry
+            // (tests 257/479), while a `-u`/URL credential remains confined to the
+            // origin (tests 317 and the F8 auth-across-redirects behavior).
             authorization: match preemptive_auth.as_deref() {
                 Some(v) if auth_allowed_this_host => Some(v.to_string()),
-                _ => None,
+                _ => auth_engine::preemptive_netrc_value(data, &cur_host, &url),
             },
             // Reactive challenge-response auth (Digest/NTLM/`--anyauth`) seed,
             // gated identically. Rebuilt per hop from the resolved credentials so
@@ -2024,8 +2983,12 @@ pub(crate) async fn perform_http(
                 // Merge inline `CURLOPT_COOKIE` with the jar's cookies that match
                 // *this hop's* URL (curl re-derives the `Cookie:` header per hop).
                 #[cfg(feature = "cookies")]
-                let cookie_hdr =
-                    cookie_engine::request_header(&cookie_jar, data.set.str(StrId::Cookie), &url);
+                let cookie_hdr = cookie_engine::request_header(
+                    &cookie_jar,
+                    data.set.str(StrId::Cookie),
+                    &url,
+                    cookie_host_override.as_deref(),
+                );
                 #[cfg(not(feature = "cookies"))]
                 let cookie_hdr = data.set.str(StrId::Cookie).map(str::to_string);
                 cookie_hdr
@@ -2033,9 +2996,25 @@ pub(crate) async fn perform_http(
             referer: referer_override
                 .clone()
                 .or_else(|| data.set.str(StrId::SetReferer).map(str::to_string)),
-            allowed_to_host: true,
+            // Whether sensitive custom headers (`Authorization`, `Cookie` supplied
+            // via `-H`/`CURLOPT_HTTPHEADER`) may be carried to this hop's host.
+            // curl drops them on a cross-host redirect unless `--location-trusted`
+            // (`Curl_auth_allowed_to_host`, lib/http.c L1827-1832 — the
+            // `Authorization`/`Cookie` custom-header walk is skipped when
+            // `!Curl_auth_allowed_to_host(data)`). `auth_allowed_this_host` is the
+            // exact equivalent (same host+port+scheme as the first request, or
+            // `allow_auth_to_other_hosts`); the `add_custom_headers` machinery
+            // already strips those two headers when this is `false` (tests
+            // 317/330 — custom `Authorization:`/`Cookie:` not leaked to the new
+            // host, while `Proxy-Authorization` is retained for the same proxy).
+            allowed_to_host: auth_allowed_this_host,
             proxy_connection_keepalive: false,
+            // Populated by `http_connect_hop`'s forward-proxy branch from the
+            // resolved `Proxy` (URL userinfo unified with the explicit overlay).
+            proxy_user: None,
+            proxy_pass: None,
             request_target_override: None,
+            suppress_custom_host,
         };
 
         // Thread the upload source through so a streamed body is pulled
@@ -2061,7 +3040,12 @@ pub(crate) async fn perform_http(
         // before a redirect reassigns `url` (curl captures per hop so a cookie set
         // on a 3xx is sent on the followed request).
         #[cfg(feature = "cookies")]
-        cookie_engine::capture(&cookie_jar, &hop.set_cookies, &url);
+        cookie_engine::capture(
+            &cookie_jar,
+            &hop.set_cookies,
+            &url,
+            cookie_host_override.as_deref(),
+        );
 
         // Record this hop's HSTS policy and Alt-Svc advert against the origin the
         // request was sent to (`cur_host`/`cur_port`), before a redirect advances
@@ -2103,6 +3087,22 @@ pub(crate) async fn perform_http(
                         }
                         referer_override = fr.referer;
                         data.info.redirect_count = redirect_state.followlocation;
+                        // Enforce `--proto-redir` / `--proto` on the followed
+                        // target (C `findprotocol` under `this_is_a_follow`).
+                        // Abort with `CURLE_UNSUPPORTED_PROTOCOL` before the next
+                        // request is sent, so no connection to a denied scheme is
+                        // ever made.
+                        let new_scheme = url
+                            .get(CurlUPart::Scheme, 0)
+                            .map(|s| s.to_ascii_lowercase())
+                            .unwrap_or_default();
+                        if !redirect_protocol_allowed(
+                            &new_scheme,
+                            allowed_protocols,
+                            redir_protocols,
+                        ) {
+                            break Err(CurlError::UnsupportedProtocol);
+                        }
                         continue;
                     }
                     Ok(FollowOutcome::TooManyRedirects { would_redirect }) => {
@@ -2167,13 +3167,73 @@ async fn http_connect_hop(
     #[cfg(feature = "proxy")]
     let proxy_cfg = {
         // The request URL's scheme selects the `<scheme>_proxy` environment
-        // variable (HTTP/3 is https-only and handled separately; this TCP path is
-        // always `http`/`https`).
-        let scheme = if is_https { "https" } else { "http" };
-        proxy_engine::config(data, scheme)?
+        // variable. curl's `detect_proxy` (`lib/url.c`) builds the variable name
+        // `"%s_proxy"` from `conn->scheme->name` — the ORIGINAL URL scheme,
+        // resolved BEFORE the `PROTOPT_PROXY_AS_HTTP` handler swap. For a normal
+        // `http`/`https` request this equals the `is_https` split, so behavior is
+        // preserved; for an `ftp://` URL driven AS HTTP over a forward proxy (the
+        // PROTOPT_PROXY_AS_HTTP swap performed by the dispatcher) the scheme is
+        // `ftp`, so the `ftp_proxy` environment variable is honored (test 563).
+        // `data.info.scheme` is the preflight-recorded scheme (upper-cased);
+        // lower-case it for the env lookup and fall back to the `is_https` split
+        // if it is somehow unset (HTTP/3 is https-only and handled separately).
+        let scheme = data
+            .info
+            .scheme
+            .as_ref()
+            .and_then(|s| s.to_str().ok())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| if is_https { "https" } else { "http" }.to_string());
+        proxy_engine::config(data, &scheme)?
     };
     #[cfg(feature = "proxy")]
     let hop_proxy = crate::proxy::proxy_for_target(&proxy_cfg, &host);
+
+    // Forward HTTP-proxy per-REQUEST headers — the Basic `Proxy-Authorization`
+    // value and the `Proxy-Connection: Keep-Alive` hint — are a property of the
+    // request (and the proxy configuration), NOT of the underlying connection, so
+    // curl emits them on every forwarded request whether the proxy connection is
+    // freshly opened or reused from the pool. They are set on `hop` HERE, before
+    // the connection-reuse check below can `return` early for a kept-alive
+    // connection (which would otherwise skip them on a followed same-host redirect
+    // — curl tests 184/185, request 2). The connection-LEVEL proxy setup (the
+    // filter chain, `conn.bits.httpproxy`/`tunnel_proxy`) stays in the
+    // new-connection path further down, since a reused connection already carries
+    // it. A CONNECT tunnel (an https target, or `--proxytunnel`) instead carries
+    // `Proxy-Authorization` on the CONNECT request, and a SOCKS proxy negotiates
+    // auth inside its handshake, so neither sets a forward-request header here.
+    #[cfg(feature = "proxy")]
+    if let Some(px) = hop_proxy {
+        let tunnel = is_https || data.set.tunnel_thru_httpproxy;
+        if !px.is_socks() && !tunnel {
+            // Seed the PREEMPTIVE forward-proxy `Proxy-Authorization` (Basic) only
+            // when none is already set. This block re-runs on every
+            // `http_connect_hop` call — including a reactive-auth RECONNECT — so
+            // an unconditional assignment would WIPE a value the proxy-auth
+            // controller already negotiated (a `Proxy-Authorization: Digest`/`NTLM`
+            // computed from a `407` challenge), since `forward_proxy_auth_value`
+            // returns `None` for a non-Basic mask. The `is_none()` guard makes the
+            // seeding idempotent: the initial connect sets Basic (or leaves `None`
+            // for a reactive mask, which the controller then fills), and a later
+            // reconnect preserves whatever the controller has produced (tests 168,
+            // 169). A `--proxy-user` Basic value is identical on every request, so
+            // never re-deriving it is also correct.
+            if hop.proxy_authorization.is_none() {
+                hop.proxy_authorization =
+                    proxy_engine::forward_proxy_auth_value(px, data.set.proxyauth);
+            }
+            hop.proxy_connection_keepalive = true;
+            // Record the resolved proxy credentials so the reactive proxy-auth
+            // controller in `perform_http_hop` can attempt the proxy's `407`
+            // (`--proxy-digest`/`--proxy-ntlm`/`--proxy-anyauth`) even when the
+            // credentials live only in the proxy URL's userinfo (test 335), not in
+            // `--proxy-user`. These are the unified values (`Proxy::user`/`passwd`
+            // = URL userinfo overlaid by `CURLOPT_PROXYUSERNAME`/`PROXYPASSWORD`),
+            // matching curl's `data->state.aptr.proxyuser`/`proxypasswd`.
+            hop.proxy_user = px.user.clone();
+            hop.proxy_pass = px.passwd.clone();
+        }
+    }
 
     // The dial target (where the TCP connection is opened): the proxy host:port
     // when a proxy applies, else the (possibly `--connect-to`-overridden) origin.
@@ -2223,6 +3283,16 @@ async fn http_connect_hop(
             // supposedly-idle keep-alive socket unsafe to reuse.
             let (alive, pending) = Curl_conn_is_alive(&mut reused);
             if alive && !pending {
+                // Mark the connection as pool-reused (curl's `conn->bits.reuse`).
+                // This drives two reuse-specific behaviors downstream: the h1
+                // codec forbids the HTTP/0.9 no-status-line fallback on a reused
+                // connection, and — critically — a reused connection that the
+                // peer has silently closed (the `swsclose` keep-alive race the
+                // non-blocking liveness peek above can miss) is retried once on a
+                // fresh connection by `Curl_retry_request` in `perform_http_hop`
+                // (oracle test160). A freshly dialed connection leaves `reuse`
+                // at its `false` default.
+                reused.bits.reuse = true;
                 // Reuse milestones: this hop performed no DNS lookup or TCP/TLS
                 // connect, so name-lookup and connect times collapse to "now".
                 let reuse_us =
@@ -2244,6 +3314,34 @@ async fn http_connect_hop(
                     let line =
                         format!("Reusing existing {scheme_name}: connection with host {host}\n");
                     sink.debug(crate::transfer::DebugInfoType::Text, line.as_bytes());
+                }
+                // `CURLINFO_USED_PROXY` (`data->info.used_proxy`): mirror curl's
+                // `create_conn` (lib/url.c:3630) which sets it from `conn->bits.proxy`
+                // for EVERY transfer — including a pooled keep-alive connection that
+                // was originally dialed through a proxy. curl-rs has no single
+                // `bits.proxy`; the union of the HTTP- and SOCKS-proxy bits is the
+                // exact equivalent (NOPROXY bypass already left both `false`).
+                data.info.used_proxy =
+                    i64::from(reused.bits.httpproxy || reused.bits.socksproxy);
+                // Re-publish the connection-derived `data->info` IP quadruple for
+                // THIS transfer over the reused connection. curl recomputes the
+                // primary/local IP+port for every transfer from the (still-live)
+                // connection's sockets (`Curl_conn_get_ip_quadruple` runs on each
+                // do-phase, not only on a fresh connect), so `%{local_port}`,
+                // `%{local_ip}`, `%{remote_ip}`, `%{remote_port}` report the
+                // reused socket's endpoints rather than the unset defaults
+                // (`local_port`/`primary_port` would otherwise surface as -1 and
+                // the IPs empty). The fresh-connect path below sets the same
+                // fields; this is the reuse-branch counterpart it skips by
+                // returning early (oracle tests/data/test435). `num_connects` is
+                // intentionally NOT incremented here — reuse opens no new
+                // connection.
+                if let Some((_is_ipv6, quad)) = Curl_conn_get_ip_info(&reused, FIRSTSOCKET) {
+                    data.info.primary_ip = CString::new(quad.remote_ip).ok();
+                    data.info.local_ip = CString::new(quad.local_ip).ok();
+                    data.info.primary_port = i64::from(quad.remote_port);
+                    data.info.local_port = i64::from(quad.local_port);
+                    data.info.primary_has_ports = true;
                 }
                 return Ok(reused);
             }
@@ -2303,7 +3401,7 @@ async fn http_connect_hop(
     {
         if let Some(px) = hop_proxy {
             use crate::conn::connect::{h1_proxy_factory, socks_factory, tls_proxy_factory};
-            use crate::conn::h1_proxy::{H1ProxyConfig, StandardProxyAuth};
+            use crate::conn::h1_proxy::{H1ProxyConfig, ProxyConnectAuth, StandardProxyAuth};
             use crate::conn::socket::SocksProxyConfig;
 
             if px.is_socks() {
@@ -2373,28 +3471,65 @@ async fn http_connect_hop(
                     // (primed by `StandardProxyAuth`), and the target TLS rides on
                     // top once the tunnel is open. The request is origin-form.
                     let scheme = if is_https { "https" } else { "http" };
+                    // The `CONNECT` request's HTTP minor version: `--proxy1.0`
+                    // (`CURLPROXY_HTTP_1_0`) forces `HTTP/1.0`, every other HTTP
+                    // proxy type uses `HTTP/1.1`. Oracle: `cf-h1-proxy.c`
+                    // `start_CONNECT` L223 —
+                    // `http_minor = (proxytype == CURLPROXY_HTTP_1_0) ? 0 : 1;`.
+                    let proxy_http_minor = if px.proxytype.is_http_1_0() { 0 } else { 1 };
+                    // The `User-Agent` for the `CONNECT` request comes from the
+                    // same source as the main request (`STRING_USERAGENT`). The
+                    // builder omits the header when the value is empty (`-A ""`)
+                    // or overridden by a custom proxy header — matching curl's
+                    // `Curl_http_proxy_create_CONNECT` gate
+                    // (`http_proxy.c`): it adds `User-Agent` only when
+                    // `data->set.str[STRING_USERAGENT]` is set *and non-empty*.
+                    let proxy_user_agent = data.set.str(StrId::Useragent).map(str::to_string);
+                    // Select the proxy-auth provider for the CONNECT request. A
+                    // reactive scheme (`--proxy-digest`/`--proxy-ntlm`/multi-scheme
+                    // `--proxy-anyauth`) drives the challenge-response handshake
+                    // via the engine's `HttpAuthController` over the CONNECT
+                    // method + authority; the proactive-Basic / no-auth case stays
+                    // on the lighter `StandardProxyAuth`. Mirrors curl calling
+                    // `Curl_http_output_auth(.., req->method, .., req->authority,
+                    // TRUE)` inside `Curl_http_proxy_create_CONNECT`.
+                    let proxy_auth: Box<dyn ProxyConnectAuth> =
+                        match auth_engine::resolve_proxy_auth_inputs(
+                            data,
+                            Some((px.user.clone(), px.passwd.clone())),
+                        ) {
+                            Some(inputs) => {
+                                let controller = auth_engine::HttpAuthController::new(inputs);
+                                // The CONNECT authority — identical to the request
+                                // line authority produced by `H1ProxyConfig`
+                                // (Digest `uri=` / `HA2` target).
+                                let authority = format!("{host_ace}:{port}");
+                                Box::new(auth_engine::ConnectTunnelAuth::new(controller, authority))
+                            }
+                            None => Box::new(StandardProxyAuth::new(px.clone(), data.set.proxyauth)),
+                        };
+                    // Custom `CURLOPT_PROXYHEADER` (`--proxy-header`) lines for the
+                    // CONNECT request (curl's `HEADER_CONNECT` selection). These
+                    // can override the auto `Host`/`User-Agent`/`Proxy-Connection`
+                    // (e.g. `--proxy-header "User-Agent: …"`, test287).
+                    let proxy_custom_headers = collect_connect_custom_headers(data);
                     let h1cfg = H1ProxyConfig::new(host_ace.clone(), port)
-                        .with_http_minor(1)
+                        .with_http_minor(proxy_http_minor)
+                        .with_user_agent(proxy_user_agent)
+                        .with_custom_headers(proxy_custom_headers)
                         .with_scheme(scheme, true)
-                        .with_auth(Box::new(StandardProxyAuth::new(
-                            px.clone(),
-                            data.set.proxyauth,
-                        )));
+                        .with_auth(proxy_auth);
                     setup = setup.with_http_proxy(h1_proxy_factory(h1cfg));
                     if let Some(ssl) = target_ssl {
                         setup = setup.with_ssl(ssl);
                     }
-                } else {
-                    // Forward HTTP proxy: `request_target` auto-selects the
-                    // absolute-URI form from `conn.bits.httpproxy && !tunnel_proxy`;
-                    // here we add the Basic `Proxy-Authorization` value and the
-                    // `Proxy-Connection: Keep-Alive` hint (curl's forward-proxy
-                    // request shape). `target_ssl` is `None` for a plain-http
-                    // target, so there is nothing further to layer.
-                    hop.proxy_authorization =
-                        proxy_engine::forward_proxy_auth_value(px, data.set.proxyauth);
-                    hop.proxy_connection_keepalive = true;
                 }
+                // Forward HTTP proxy (no tunnel): `request_target` auto-selects the
+                // absolute-URI form from `conn.bits.httpproxy && !tunnel_proxy` (set
+                // above). The forward-request headers (`Proxy-Authorization`,
+                // `Proxy-Connection: Keep-Alive`) are set on `hop` up-front so they
+                // survive a reused proxy connection (curl tests 184/185); `target_ssl`
+                // is `None` for a plain-http target, so there is nothing to layer here.
             }
         } else if let Some(ssl) = target_ssl {
             setup = setup.with_ssl(ssl);
@@ -2406,7 +3541,62 @@ async fn http_connect_hop(
     }
 
     let dispatch = ConnSetup::Default(setup);
-    establish_connection(&mut conn, FIRSTSOCKET, ssl_mode, dispatch, true).await?;
+    // Drive the assembled chain to the connected state. A CONNECT-tunnel failure
+    // (a non-2xx final CONNECT response, e.g. a 405/407 with no auth left to try)
+    // surfaces as an `Err` here, but curl still records the CONNECT status code
+    // and writes the proxy's CONNECT response to the data stream before failing
+    // the transfer — so the result is captured rather than propagated with `?`.
+    let connect_result =
+        establish_connection(&mut conn, FIRSTSOCKET, ssl_mode, dispatch, true).await;
+
+    // CURLINFO_HTTP_CONNECTCODE / `%{http_connect}`: curl sets `info.httpproxycode`
+    // the moment the CONNECT status line is parsed, so it is recorded on both the
+    // success and the failure path. The CONNECT filter (if any) holds the parsed
+    // code; a value of `0` means no CONNECT status line was seen (no tunnel) and
+    // is left as the reset default (oracle: tests/data/test217 — a 405 CONNECT
+    // makes `%{http_connect}` report 405 while the transfer fails with
+    // `CURLE_RECV_ERROR`).
+    #[cfg(feature = "proxy")]
+    if conn.bits.tunnel_proxy {
+        if let Some(code) = conn.cfilter[FIRSTSOCKET].connect_proxy_code() {
+            if code > 0 {
+                data.info.http_connect_code = i64::from(code);
+            }
+        }
+    }
+
+    // On a *failed* CONNECT tunnel, curl still writes the proxy's CONNECT
+    // response (status line + headers + terminating blank line) to the client
+    // before failing — the `CLIENTWRITE_CONNECT` path fires for a non-2xx CONNECT
+    // exactly as it does for a 2xx one (lib/cf-h1-proxy.c L364-366 emits every
+    // CONNECT header line via `CLIENTWRITE_CONNECT`, gated in lib/sendf.c L191-192
+    // *only* by `suppress_connect_headers`). Unlike the success path below, this
+    // is NOT gated on `!is_https`: a failed CONNECT means no tunnel was
+    // established, so the proxy's response IS the response and is surfaced for an
+    // https origin too — e.g. an HSTS http→https upgrade routed through a proxy
+    // that denies the CONNECT (oracle: tests/data/test440, test441, test493 — a
+    // 403 CONNECT to :443 appears on stdout ahead of the error exit), as well as
+    // a plain-HTTP proxytunnel (test217/test287 — a 405 CONNECT). The captured
+    // lines retain their original CRLF and are written verbatim. The error is
+    // then propagated so the transfer fails with the correct code.
+    if let Err(e) = connect_result {
+        #[cfg(feature = "proxy")]
+        if conn.bits.tunnel_proxy && !data.set.suppress_connect_headers {
+            if let Some(lines) = conn.cfilter[FIRSTSOCKET].connect_response_headers() {
+                for line in &lines {
+                    let mut off = 0;
+                    while off < line.len() {
+                        let n = sink.write_body(&line[off..]);
+                        if n == 0 {
+                            break;
+                        }
+                        off += n;
+                    }
+                }
+            }
+        }
+        return Err(e);
+    }
     // CURLINFO_CONNECT_TIME milestone: the TCP (and, for https, the TLS) handshake
     // is complete. curl's `CONNECT_TIME`/`APPCONNECT_TIME` are measured from the
     // operation start (they include the name-lookup phase), so both deltas are
@@ -2443,6 +3633,30 @@ async fn http_connect_hop(
         data.info.appconnect_time_us = connect_us;
     }
 
+    // Populate `CURLINFO_CERTINFO` (`%{certs}` / `%{num_certs}`) from the
+    // verified peer certificate chain when the application requested it
+    // (`CURLOPT_CERTINFO`; the CLI sets this whenever `--write-out` is used,
+    // mirroring curl's `config2setopts.c` `if(config->writeout)` gate). curl's
+    // TLS backends call `Curl_ssl_push_certinfo_len(data, i, "Cert", pem, len)`
+    // once per chain certificate during the handshake; the memory-safe core
+    // pulls the DER chain the `rustls` filter retained at connect
+    // (`Curl_conn_get_peer_certs` → `CF_QUERY_PEER_CERTS`), converts each to
+    // PEM, and pushes one `"Cert:<pem>"` entry per certificate — the exact
+    // `name:content` node shape the writeout `%{certs}` consumer strips
+    // (`tool_writeout.c` `VAR_CERT`). Recorded once at connect, before the
+    // transfer drive, so the info is present even if the body later fails.
+    if is_https && data.set.ssl.certinfo {
+        let der_chain = Curl_conn_get_peer_certs(&conn, FIRSTSOCKET);
+        data.info.certinfo.clear();
+        for der in &der_chain {
+            let mut entry = crate::slist::SList::new();
+            // `append` only fails on an interior NUL byte; a PEM block is ASCII
+            // text (base64 + armor), so the push is infallible here.
+            let _ = entry.append(&format!("Cert:{}", der_to_pem(der)));
+            data.info.certinfo.push(entry);
+        }
+    }
+
     // CURLINFO_TEXT connection trace (`-v`): emit the `* Trying …` /
     // `* Connected to …` lines curl prints once the socket is connected. The
     // connected peer address is queried from the chain (`Curl_conn_get_remote_addr`,
@@ -2466,6 +3680,58 @@ async fn http_connect_hop(
             sink.debug(crate::transfer::DebugInfoType::Text, connected.as_bytes());
         }
     }
+
+    // ---- Surface the CONNECT-tunnel response to the data stream -------------
+    // When a fresh CONNECT tunnel is negotiated for a *plain-HTTP* origin
+    // (`--proxytunnel`/`-p` to an `http://` URL), curl writes the proxy's
+    // CONNECT response — its status line, each header, and the terminating
+    // blank line — to the client as it parses them, tagged
+    // `CLIENTWRITE_HEADER | CLIENTWRITE_CONNECT` (`cf-h1-proxy.c` `single_header`
+    // → `Curl_client_write`). For a non-TLS origin `cw_download_write`
+    // (`lib/sendf.c`) forwards those header bytes onto the body writer, so they
+    // appear on the data stream ahead of the tunneled response (oracle:
+    // tests/data/test80, test83, test95). The captured lines keep their original
+    // CRLF, so they are written verbatim.
+    //
+    // Three gates mirror curl exactly:
+    //  * `conn.bits.tunnel_proxy` — a CONNECT tunnel was actually used (an https
+    //    origin, or `--proxytunnel` forcing it for plain http).
+    //  * `!is_https` — an https origin keeps the plaintext CONNECT response off
+    //    the (now-encrypted) application data stream, and `cw_download_write`
+    //    would not forward it onto the body there; only plain-HTTP tunnels
+    //    surface it (also avoids regressing https-via-proxy tests, e.g. test446).
+    //  * `!suppress_connect_headers` — `CURLOPT_SUPPRESS_CONNECT_HEADERS`
+    //    (`--suppress-connect-headers`) opts out of this behavior entirely.
+    //
+    // This runs only on the fresh-connection path: the reuse branch returned
+    // above before any tunnel negotiation, matching curl — a reused tunnel
+    // performs no new CONNECT and so writes no CONNECT response.
+    #[cfg(feature = "proxy")]
+    if conn.bits.tunnel_proxy && !is_https && !data.set.suppress_connect_headers {
+        if let Some(lines) = conn.cfilter[FIRSTSOCKET].connect_response_headers() {
+            for line in &lines {
+                // Drive a possibly-partial body sink to completion for each line
+                // (the same write loop `flush_auth_body` uses); a sink returning
+                // 0 has stopped accepting, so stop forwarding.
+                let mut off = 0;
+                while off < line.len() {
+                    let n = sink.write_body(&line[off..]);
+                    if n == 0 {
+                        break;
+                    }
+                    off += n;
+                }
+            }
+        }
+    }
+
+    // `CURLINFO_USED_PROXY` (`data->info.used_proxy`): set on the freshly dialed
+    // connection, mirroring curl's `create_conn` (lib/url.c:3630
+    // `data->info.used_proxy = conn->bits.proxy`). The proxy decision above set
+    // `conn.bits.httpproxy`/`socksproxy` only when a proxy actually applies to this
+    // target (`proxy_for_target` returns `None` for a NOPROXY/NO_PROXY host, leaving
+    // both `false`), so their union is exactly C's unified `conn->bits.proxy`.
+    data.info.used_proxy = i64::from(conn.bits.httpproxy || conn.bits.socksproxy);
 
     Ok(conn)
 }
@@ -2626,14 +3892,92 @@ async fn perform_http_hop(
             hop.authorization = Some(initial);
         }
     }
+    // A reactive **proxy**-auth controller drives the forward HTTP proxy's
+    // challenge-response (`--proxy-ntlm`/`--proxy-digest`/`--proxy-anyauth`)
+    // against the proxy's `407`, symmetrically to how `auth_controller` drives
+    // the host's `401`. It applies only when a forward HTTP proxy is in effect
+    // for this hop — `hop.proxy_connection_keepalive` is set exactly in that case
+    // by the forward-proxy block in `http_connect_hop` (which has already run for
+    // the initial connect above), and is `false` for a SOCKS proxy, a CONNECT
+    // tunnel (https / `--proxytunnel`, whose proxy auth rides the CONNECT request
+    // instead), or no proxy at all. Like the host controller it is h1-only (NTLM
+    // is a connection-oriented scheme curl forces onto HTTP/1.1).
+    #[cfg(feature = "proxy")]
+    let mut proxy_auth_controller = match version {
+        HttpVersion::Http10 | HttpVersion::Http11 if hop.proxy_connection_keepalive => {
+            // The resolved proxy credentials (URL userinfo unified with the
+            // `--proxy-user` overlay) were deposited on `hop` by the forward-proxy
+            // branch of `http_connect_hop`, so a reactive proxy scheme can attempt
+            // the `407` with credentials supplied only in the proxy URL (test 335).
+            auth_engine::resolve_proxy_auth_inputs(
+                data,
+                Some((hop.proxy_user.clone(), hop.proxy_pass.clone())),
+            )
+            .map(auth_engine::HttpAuthController::new)
+        }
+        _ => None,
+    };
+    #[cfg(not(feature = "proxy"))]
+    let mut proxy_auth_controller: Option<auth_engine::HttpAuthController> = None;
+    // Seed the preemptive proxy NTLM Type-1 into `Proxy-Authorization` so it rides
+    // the first forwarded request (mirrors the host NTLM seeding above). Only when
+    // no preemptive proxy credential is already set — a forward Basic proxy auth
+    // (`forward_proxy_auth_value`) would have populated `hop.proxy_authorization`
+    // in `http_connect_hop`, but a reactive NTLM/Digest mask leaves it `None`
+    // (`proxy_auth` emits only Basic), so the Type-1 fills it here.
+    if hop.proxy_authorization.is_none() {
+        if let Some(initial) = proxy_auth_controller
+            .as_mut()
+            .and_then(auth_engine::HttpAuthController::initial_header)
+        {
+            hop.proxy_authorization = Some(initial);
+        }
+    }
     // When auth negotiation is active, a `401`/`407` body is buffered rather than
     // streamed to the application, so an intermediate auth-probe error page is
     // not delivered when the request is about to be re-issued with credentials.
-    let mut hop_sink = HopSink::with_auth(sink, follow_enabled, auth_controller.is_some());
+    // Either a host (`401`) or a proxy (`407`) reactive controller arms this.
+    let mut hop_sink = HopSink::with_auth(
+        sink,
+        follow_enabled,
+        auth_controller.is_some() || proxy_auth_controller.is_some(),
+    );
+    // Arm the server-ignored-range check (curl's `http_firstwrite`) for a
+    // resumed download. curl gates the check on `data->state.httpreq ==
+    // HTTPREQ_GET`, so only a `GET` resume offset is propagated; a `HEAD` has no
+    // body to deliver and an upload resume uses `Content-Range` semantics
+    // instead. `set_resume_from` is clamped to non-negative — a negative value
+    // is the "upload the whole file again" sentinel, not a download resume point.
+    hop_sink.resume_from = if data.set.method == HttpReq::Get {
+        data.set.set_resume_from.max(0)
+    } else {
+        0
+    };
+    // Arm the client-side time-condition check (curl's `http_firstwrite`) for a
+    // `-z`/`CURLOPT_TIMECONDITION` request. curl gates it on no byte range being
+    // requested (`!data->state.range`, RFC 2616 §13.3.4), so the effective range
+    // presence is propagated alongside the condition selector and reference value.
+    // `effective_range` is `Some` for an explicit `--range` or a `GET`/`HEAD`
+    // resume offset — exactly the cases where curl populates `data->state.range`.
+    hop_sink.timecondition = data.set.timecondition;
+    hop_sink.timevalue = data.set.timevalue;
+    hop_sink.range_present = effective_range(data).is_some();
     let drive_result = match version {
         HttpVersion::Http10 | HttpVersion::Http11 => {
-            let http_minor = if version == HttpVersion::Http10 { 0 } else { 1 };
-            let custom_headers = collect_custom_headers(data);
+            // The version negotiated for this hop before any in-transfer
+            // HTTP/1.0 downgrade. `http_minor` is (re)derived per attempt from
+            // this base and the transfer's observed `rcvd_min` (see the loop
+            // body), so an auth resend or redirect after a `1.0` response drops
+            // to HTTP/1.0 exactly as curl's `http_may_use_1_1` does.
+            let base_version = version;
+            let mut custom_headers = collect_custom_headers(data);
+            // On a cross-host redirect, drop the application's custom `Host:` so
+            // the auto `Host:` for the *current* host is sent instead (curl's
+            // per-hop rule; tests 184/185). No-op on the original request and on
+            // same-host redirects (`suppress_custom_host == false`).
+            if hop.suppress_custom_host {
+                strip_custom_host_header(&mut custom_headers);
+            }
 
             // Challenge-response retry loop on the kept-alive connection (curl's
             // `data->state.authhost` negotiation). Without a controller this runs
@@ -2645,11 +3989,27 @@ async fn perform_http_hop(
             // challenging server cannot loop forever.
             const MAX_AUTH_ATTEMPTS: u32 = 10;
             let mut attempt: u32 = 0;
+            // curl's `Curl_creader_set_rewind` one-shot: latches once the upload
+            // read source has been rewound for the credentialed body resend, so
+            // the application rewind callback (`CURLOPT_IOCTLFUNCTION`
+            // `CURLIOCMD_RESTARTREAD` / `CURLOPT_SEEKFUNCTION`) fires exactly once
+            // per hop before the body is re-sent (QA libtest 552).
+            let mut rewound = false;
             // Whether the current connection is freshly (re)established versus
-            // reused for a same-connection retry. This is curl's
-            // `conn->bits.reuse` (inverted): it gates the HTTP/0.9 fallback and
-            // the reused-connection retry below.
-            let mut conn_is_fresh = true;
+            // reused (from the pool, or for a same-connection retry). This is
+            // curl's `conn->bits.reuse` (inverted): it gates the HTTP/0.9
+            // fallback and the reused-connection retry below. It is seeded from
+            // the connection's pool-reuse state — a connection checked out of the
+            // keep-alive pool starts NON-fresh so that, if the peer has silently
+            // closed it (the `swsclose` race), `Curl_retry_request` below retries
+            // on a fresh connection (oracle test160). A freshly dialed connection
+            // starts fresh.
+            let mut conn_is_fresh = !conn.bits.reuse;
+            // curl's `data->state.retrycount`: bounds the number of times a
+            // reused-but-dead connection is retried on a fresh connect (C
+            // `CONN_MAX_RETRIES`), independent of the auth-attempt budget.
+            const CONN_MAX_RETRIES: u32 = 5;
+            let mut conn_retry_count: u32 = 0;
             // curl's `conn->bits.authneg`: while a reactive auth handshake is
             // negotiating, a POST/PUT request body is suppressed (sent as
             // `Content-Length: 0`) so the upload payload is not transmitted before
@@ -2660,8 +4020,65 @@ async fn perform_http_hop(
             // the body is always sent on the single attempt.
             let mut authneg = auth_controller
                 .as_ref()
-                .is_some_and(|c| c.is_negotiating());
+                .is_some_and(|c| c.is_negotiating())
+                || proxy_auth_controller
+                    .as_ref()
+                    .is_some_and(|c| c.is_negotiating());
+            // curl's `data->state.authhost.done`: latched once the body-less
+            // auth-negotiation probe has been re-issued with its real upload
+            // body (the `authneg && httpcode < 300` resend below). It prevents
+            // that unauthenticated resend from firing more than once on a server
+            // that never challenges (tests 175/176).
+            let mut authhost_done = false;
+            // curl's `data->state.disableexpect` + `data->req.newurl` (lib/http.c
+            // exp100 / `Curl_http_auth_act`): a body-bearing request that announced
+            // `Expect: 100-continue` and received `417 Expectation Failed` (the
+            // server rejected the expectation rather than answering with the
+            // interim `100`) is RE-SENT once to the SAME URL with the expectation
+            // disabled and the full body. `disable_expect_resend` suppresses the
+            // `Expect:` header on the next iteration's head (threaded into
+            // `inputs.disable_expect`); `expect_resend_done` latches the one-shot so
+            // a server that persistently answers `417` cannot loop. Independent of
+            // auth and of `-L` (test357).
+            let mut disable_expect_resend = false;
+            let mut expect_resend_done = false;
             let result = loop {
+                // (curl's `http_request_version` → `http_may_use_1_1`): once a
+                // `1.0` response has been seen on this transfer (`rcvd_min == 10`,
+                // recorded after each exchange below and persisted across redirect
+                // hops on `data`), an HTTP/1.1 request is downgraded to HTTP/1.0.
+                // The first request always rides the base version (no response
+                // seen yet); an auth resend or a redirect after a `1.0` reply
+                // drops to `1.0`. A forced `1.0`, or an `h2`/`h3` hop, is left
+                // unchanged (this arm only handles the h1 codec anyway).
+                let effective_version =
+                    if base_version == HttpVersion::Http11 && data.http_rcvd_min() == 10 {
+                        HttpVersion::Http10
+                    } else {
+                        base_version
+                    };
+                let http_minor = if effective_version == HttpVersion::Http10 { 0 } else { 1 };
+                // (curl's `http_req_set_TE`): a body-bearing request with an
+                // indeterminate upload length (`Curl_creader_total_length < 0`)
+                // and no explicit `Transfer-Encoding: chunked` header cannot be
+                // satisfied over HTTP/1.0 — chunked framing is unavailable there —
+                // so curl fails with `CURLE_UPLOAD_FAILED` ("Chunky upload is not
+                // supported by HTTP 1.0") BEFORE writing the request. This fires
+                // on an auth resend (test 1072) or a followed redirect (test 1073)
+                // after a `1.0` reply downgrades the version; a known-length
+                // upload (a `-T file`, test 1071) frames with `Content-Length` and
+                // is unaffected. A user-forced `Transfer-Encoding: chunked` is the
+                // application's choice and is left to the server (curl keeps it).
+                if http_minor == 0
+                    && matches!(
+                        hop.method,
+                        HttpReq::Put | HttpReq::Post | HttpReq::PostForm | HttpReq::PostMime
+                    )
+                    && known_upload_length(data).is_none()
+                    && !upload_is_chunked(data)
+                {
+                    break Err(CurlError::UploadFailed);
+                }
                 // The request body is re-sent on each auth attempt (curl rewinds
                 // and resends), so clone the buffered body per iteration; the
                 // GET/HEAD case clones `RequestBody::None` (free). During auth
@@ -2679,7 +4096,7 @@ async fn perform_http_hop(
                 let attempt_is_streaming =
                     matches!(attempt_body, h1::RequestBody::Streaming { .. });
                 let plan = {
-                    let inputs = make_inputs(
+                    let mut inputs = make_inputs(
                         data,
                         url,
                         &conn,
@@ -2692,8 +4109,45 @@ async fn perform_http_hop(
                         http_minor,
                         &hop,
                     );
+                    // Thread the live auth-negotiation state into request
+                    // shaping. During an authneg probe the upload body is
+                    // suppressed (`suppress_upload_body`), so curl's client
+                    // reader reports a known length of zero
+                    // (`Curl_creader_client_length` over `Curl_creader_set_null`).
+                    // That zero length both drops a custom `Content-Length` and
+                    // — on this body-less probe — suppresses `Expect:
+                    // 100-continue` (curl's `addexpect` only adds it for an
+                    // unknown or large body). The real payload, and its
+                    // `Expect`, ride the authenticated resend, where `authneg`
+                    // is false and the chunked body's length is unknown (-1).
+                    inputs.authneg = authneg;
+                    // Suppress `Expect: 100-continue` on a 417 resend (curl's
+                    // `data->state.disableexpect`): once the server has rejected the
+                    // expectation with a `417`, the resent request omits the header
+                    // and sends the body unconditionally (test357). `false` on every
+                    // other attempt, so the normal large-/unknown-body `Expect`
+                    // decision in `should_add_expect_100` is unaffected.
+                    inputs.disable_expect = disable_expect_resend;
+                    // The `multipart/form-data; boundary=…` (or any mime) Content-Type
+                    // is a property of the request BODY. During a body-less authneg
+                    // probe the payload is replaced with a null reader (the empty
+                    // `Content-Length: 0` body above), so curl emits no body framing
+                    // headers either — `Curl_mime_prepare_headers` runs only when the
+                    // mime part is actually the request body, not on the suppressed
+                    // probe. Drop the form Content-Type so the NTLM/Digest Type-1
+                    // probe carries only `Content-Length: 0` (test 170); the real
+                    // payload, with its Content-Type, rides the authenticated resend.
+                    if authneg {
+                        inputs.content_type = None;
+                    }
                     h1::build_request(&inputs)?
                 };
+                // Whether THIS attempt announced `Expect: 100-continue` (captured
+                // before `plan` is moved into the exchange). A `417` answer to such
+                // a request triggers the one-shot resend below (curl's exp100 417
+                // handling); a request that never sent the expectation is left
+                // untouched.
+                let attempt_announced_expect = plan.expect_100;
                 // CURLINFO_HEADER_OUT: when verbose, emit the fully serialized
                 // request head (request line + header block + terminating CRLF)
                 // as a single event before the exchange begins. curl's
@@ -2717,22 +4171,102 @@ async fn perform_http_hop(
                 // body and the chunked-not-last rejection (curl's `is_transfer`
                 // path, gated on `data.set.http_transfer_encoding`).
                 exchange.set_transfer_decoding(data.set.http_transfer_encoding);
+                // `--raw` / `CURLOPT_HTTP_TRANSFER_DECODING` set to 0
+                // (`data.set.http_te_skip`): run the chunked decoder in
+                // pass-through mode so the original chunked wire bytes reach the
+                // client verbatim (curl's `http_te_skip`). Oracle: test326.
+                exchange.set_te_skip(data.set.http_te_skip);
+                // `--max-filesize` (`CURLOPT_MAXFILESIZE[_LARGE]`): hand the cap
+                // to the codec so an *overflowing* advertised `Content-Length`
+                // fails up-front with `CURLE_FILESIZE_EXCEEDED` (63), matching
+                // curl's `STRE_OVERFLOW` guard. The during-transfer size cap is
+                // enforced separately by the transfer driver. Oracle: test393.
+                exchange.set_max_filesize(data.set.max_filesize);
+                // `--ignore-content-length` (`CURLOPT_IGNORE_CONTENT_LENGTH`):
+                // ignore the response `Content-Length` for framing — read the
+                // body close-delimited and disable the short-read check (curl's
+                // `k->ignore_cl`). Oracle: test269.
+                exchange.set_ignore_cl(data.set.ignorecl);
+                // `CURLOPT_FOLLOWLOCATION` (`-L`): let the codec reproduce curl's
+                // `http_firstwrite` redirect-body suppression — a followed
+                // redirect on a closing connection is aborted right after the
+                // headers, so a close-delimited redirect body is never read (and
+                // cannot hang on a deferred server close). Oracle: test187.
+                exchange.set_follow_enabled(follow_enabled);
                 // Install the upload source for a streamed body so the codec
                 // pulls it incrementally (bounded-memory upload, QA Issue #5),
                 // paced by the send-direction rate limiter
                 // (`CURLOPT_MAX_SEND_SPEED_LARGE` / `--limit-rate`, QA Issue #4
-                // send half). Streaming is gated to provably single-pass uploads,
-                // so the loop runs exactly once and the source is taken once.
+                // send half). Streaming is gated to provably single-pass uploads
+                // (known size, no `-L`, no resume, no reactive auth), so the
+                // body is *read* at most once.
+                //
+                // The source is REBORROWED (`as_deref_mut`), not taken: a
+                // streamed upload that announces `Expect: 100-continue` (any size
+                // over the 1 KiB threshold does) can receive `417 Expectation
+                // Failed` instead of the interim `100`. On `417` the Expect probe
+                // sends NO body (the `InterimOutcome::FinalResponse` arm in
+                // `H1Exchange::start` skips `stream_upload`), so the source is
+                // still at offset 0 and the 417-resend branch below loops once
+                // more to send the full body with the expectation disabled
+                // (curl's `data->state.disableexpect` rewind-and-resend; test357).
+                // Were the borrow `take`n on the probe, the resend would find an
+                // empty `upload_source` and fail with `CURLE_READ_ERROR`. The
+                // reborrow keeps the source available across the at-most-two
+                // iterations while preserving the read-once invariant — the probe
+                // reads nothing, the resend performs the single read. When the
+                // server answers the normal `100`, the body streams on the first
+                // iteration and the loop ends, so the reborrow behaves exactly
+                // like the prior single-take.
                 if attempt_is_streaming {
-                    if let Some(src) = source.take() {
+                    if let Some(src) = source.as_deref_mut() {
                         let rate = build_rate_limit(0, data.set.max_send_speed);
                         exchange.set_upload_source(src, rate);
                     }
                 }
-                let result = drive_one(data, &mut exchange, &mut hop_sink, op_start).await;
+                // Mark a body-bearing auth-negotiation probe so the hop sink
+                // suppresses (discards) THIS response's body if it is a non-`401`
+                // success — curl re-issues with the real body and `ignorebody`s
+                // the probe response (`Curl_http_auth_act` / `http_firstwrite`).
+                // GET/HEAD never resend on a success, so the flag is gated to
+                // body-bearing methods (tests 175/176).
+                hop_sink.set_authneg_probe(
+                    authneg
+                        && matches!(
+                            hop.method,
+                            HttpReq::Put | HttpReq::Post | HttpReq::PostForm | HttpReq::PostMime
+                        ),
+                );
+                // `defer_auth_fail = auth_controller.is_some()`: while a reactive
+                // controller drives Digest/NTLM/Negotiate/anyauth, an
+                // intermediate `401`/`407` is a challenge, not a terminal error,
+                // so the `-f` verdict is deferred until the negotiation ends
+                // (re-applied to the terminal response after this loop). A plain
+                // single-scheme `Basic`/`Bearer` request has no controller, so it
+                // fails a `401` immediately exactly as before (test 152).
+                let result = drive_one(
+                    data,
+                    &mut exchange,
+                    &mut hop_sink,
+                    op_start,
+                    auth_controller.is_some() || proxy_auth_controller.is_some(),
+                )
+                .await;
                 let keepalive = exchange.keepalive();
                 drop(exchange);
                 h1::apply_connection_reuse(&mut conn, keepalive);
+
+                // Fold this exchange's response version into the transfer's
+                // running minimum (curl's `data->state.http_neg.rcvd_min`
+                // update). The version is read from the hop sink's status-line
+                // parser (`HopSink::version`), which is populated *now*, before
+                // the next loop iteration — unlike `data.info.http_version`,
+                // which is published only at transfer finalize and would still
+                // read `0` here. Recording it lets the NEXT attempt — an auth
+                // resend, or (via the value persisting on `data`) a followed
+                // redirect's first request — downgrade to HTTP/1.0 once a `1.0`
+                // reply has been seen.
+                data.note_http_response_version(i64::from(hop_sink.version));
 
                 // A transport/protocol error normally ends the hop. But a *reused*
                 // connection that died before delivering any response — the case
@@ -2744,18 +4278,50 @@ async fn perform_http_hop(
                 // cannot mask a genuine transport failure on a fresh connection or
                 // in a non-auth transfer.
                 if result.is_err() {
-                    let retryable = auth_controller.is_some()
+                    let err_kind = result.as_ref().err();
+                    // Existing auth-negotiation reused-connection retry: a server
+                    // may close an apparently keep-alive socket after a challenge,
+                    // so the credentialed resend reconnects. Preserved verbatim.
+                    let auth_retryable = (auth_controller.is_some()
+                        || proxy_auth_controller.is_some())
                         && !conn_is_fresh
                         && attempt < MAX_AUTH_ATTEMPTS
                         && matches!(
-                            result.as_ref().err(),
+                            err_kind,
                             Some(CurlError::GotNothing)
                                 | Some(CurlError::RecvError)
                                 | Some(CurlError::SendError)
                                 | Some(CurlError::PartialFile)
                         );
-                    if retryable {
-                        attempt += 1;
+                    // curl's `Curl_retry_request` (lib/transfer.c L614), NOT
+                    // scoped to auth: a *reused* connection (`conn->bits.reuse`,
+                    // here `!conn_is_fresh`) that died before delivering ANY
+                    // response bytes is retried on a fresh connection — for HTTP
+                    // regardless of whether a body was expected. The zero-bytes
+                    // guard (no status line parsed and no headers captured, curl's
+                    // `bytecount + headerbytecount == 0`) ensures a genuine
+                    // mid-response failure is never masked. This handles a plain
+                    // keep-alive reuse where the peer closed the socket after the
+                    // previous response (the `swsclose` pattern; oracle test160's
+                    // second URL). Bounded by `CONN_MAX_RETRIES`.
+                    let conn_died_retryable = !conn_is_fresh
+                        && conn_retry_count < CONN_MAX_RETRIES
+                        && hop_sink.status == 0
+                        && hop_sink.headers.is_empty()
+                        && matches!(
+                            err_kind,
+                            Some(CurlError::GotNothing)
+                                | Some(CurlError::RecvError)
+                                | Some(CurlError::SendError)
+                        );
+                    if auth_retryable || conn_died_retryable {
+                        // Charge the auth-attempt budget when this is an auth
+                        // resend; otherwise charge the connection-retry budget.
+                        if auth_retryable {
+                            attempt += 1;
+                        } else {
+                            conn_retry_count += 1;
+                        }
                         hop_sink.reset_for_retry();
                         conn = http_connect_hop(
                             data,
@@ -2781,23 +4347,149 @@ async fn perform_http_hop(
                     break result;
                 }
 
-                // Reactive auth: on a `401`, ask the controller for the next
-                // `Authorization` value and retry. When the connection is still
-                // reusable the retry rides the same socket; when the server closed
-                // it after the challenge (curl's `swsclose` Digest/anyauth tests,
-                // or any `Connection: close` 401) the retry RE-establishes a fresh
-                // connection — curl reconnects-and-retries rather than giving up.
-                // Any non-`401` status (or no controller, or the attempt budget
-                // exhausted) is terminal.
-                let Some(controller) = auth_controller.as_mut() else {
-                    break result;
-                };
-                attempt += 1;
-                if hop_sink.status != 401 || attempt >= MAX_AUTH_ATTEMPTS {
+                // curl's lib/http.c `Expect: 100-continue` / `417` handling: a
+                // body-bearing request that announced the expectation and received
+                // `417 Expectation Failed` (the server refused the `Expect`, e.g.
+                // the harness `no-expect` server replies `417` instead of the
+                // interim `100`) is RE-SENT once to the SAME URL with the
+                // expectation disabled and the full body. curl sets
+                // `data->state.disableexpect = TRUE` and `data->req.newurl =`
+                // the current URL, routing the resend through the redirect/newurl
+                // path — which is why the `417` response itself is delivered to the
+                // application (with `--include`, BOTH the `417` and the final
+                // response appear in the output; test357's `<datacheck>`). The
+                // `417` has already been written to the sink above (no auth
+                // buffering applies on a non-auth transfer), so only the
+                // per-response parser state is reset before the resend, which
+                // reuses a still-alive keep-alive connection or reconnects when the
+                // server closed it (the `swsbounce` pattern — sws closes after the
+                // `417` and serves the `200` on a fresh accept). Gated to
+                // body-bearing methods, independent of auth and of `-L`, and
+                // latched (`expect_resend_done`) so a persistently-`417` server
+                // cannot loop. The attempt budget is a redundant safety bound.
+                if hop_sink.status == 417
+                    && attempt_announced_expect
+                    && !expect_resend_done
+                    && attempt < MAX_AUTH_ATTEMPTS
+                    && matches!(
+                        hop.method,
+                        HttpReq::Put | HttpReq::Post | HttpReq::PostForm | HttpReq::PostMime
+                    )
+                {
+                    expect_resend_done = true;
+                    disable_expect_resend = true;
+                    attempt += 1;
+                    hop_sink.reset_for_retry();
+                    // curl's pre-reuse `connalive` peek: reuse the connection only
+                    // when it is still open, else reconnect (the `swsbounce` 417
+                    // closes the socket), mirroring the auth-neg resend below.
+                    let conn_alive = keepalive && Curl_conn_is_alive(&mut conn).0;
+                    if conn_alive {
+                        conn_is_fresh = false;
+                    } else {
+                        conn = http_connect_hop(
+                            data,
+                            &mut hop,
+                            is_https,
+                            host.clone(),
+                            host_ace.clone(),
+                            port,
+                            verbose,
+                            httpwant,
+                            ipver,
+                            op_start,
+                            &mut hop_sink,
+                        )
+                        .await?;
+                        // Re-established connection (417 resend) — report the new
+                        // socket to the multi's observer.
+                        report_socket_to_observer(data, &conn);
+                        conn_is_fresh = true;
+                    }
+                    continue;
+                }
+
+                // Reactive auth: a `401` asks the HOST controller, a `407` the
+                // PROXY controller, for the next credential and retries. When the
+                // connection is still reusable the retry rides the same socket;
+                // when the server closed it after the challenge (curl's `swsclose`
+                // Digest/anyauth tests, or any `Connection: close` 401/407) the
+                // retry RE-establishes a fresh connection — curl reconnects-and-
+                // retries rather than giving up. With neither controller present,
+                // or for any status that is not the matching challenge code, or
+                // when the attempt budget is exhausted, the response is terminal.
+                if auth_controller.is_none() && proxy_auth_controller.is_none() {
                     break result;
                 }
-                // Compute the verb and origin-form target the Digest response
-                // hashes over — identical to the bytes the h1 builder writes.
+                attempt += 1;
+                // curl's `Curl_http_auth_act` else-branch (lib/http.c
+                // L597-611): a body-bearing request whose upload was SUPPRESSED
+                // during auth negotiation (`authneg`, sent as `Content-Length:
+                // 0`) but that received a non-`401` *success* (`httpcode < 300`)
+                // without ever being challenged must be RE-ISSUED once with the
+                // real body and NO `Authorization` header. This is the
+                // "`--ntlm`/`--digest` POST to a server that requires no auth"
+                // case (tests 175, 176): the body-less probe gets a `200`, so
+                // curl resends the upload unauthenticated. Gated to body-bearing
+                // methods (`httpreq != GET/HEAD`) and latched (`authhost.done`)
+                // so it fires at most once. GET/HEAD have no suppressed body, so
+                // they never reach here with `authneg` set on a success.
+                if authneg
+                    && hop_sink.status < 300
+                    && !authhost_done
+                    && attempt < MAX_AUTH_ATTEMPTS
+                    && matches!(
+                        hop.method,
+                        HttpReq::Put | HttpReq::Post | HttpReq::PostForm | HttpReq::PostMime
+                    )
+                {
+                    // Latch the resend (curl's `authhost.done = TRUE`) and send
+                    // the real body unauthenticated on the next iteration.
+                    authhost_done = true;
+                    authneg = false;
+                    hop.authorization = None;
+                    hop_sink.discard_auth_body();
+                    hop_sink.reset_for_retry();
+                    // The probe's `200` typically arrives on a `swsclose`
+                    // (server-closes) connection, so the resend rides a fresh
+                    // socket; reuse the connection only when it is still alive
+                    // (curl's pre-reuse `connalive` peek), exactly as the `401`
+                    // retry below.
+                    let conn_alive = keepalive && Curl_conn_is_alive(&mut conn).0;
+                    if conn_alive {
+                        conn_is_fresh = false;
+                    } else {
+                        conn = http_connect_hop(
+                            data,
+                            &mut hop,
+                            is_https,
+                            host.clone(),
+                            host_ace.clone(),
+                            port,
+                            verbose,
+                            httpwant,
+                            ipver,
+                            op_start,
+                            &mut hop_sink,
+                        )
+                        .await?;
+                        // Re-established connection (auth-neg resend) — report
+                        // the new socket to the multi's observer.
+                        report_socket_to_observer(data, &conn);
+                        conn_is_fresh = true;
+                    }
+                    continue;
+                }
+                if attempt >= MAX_AUTH_ATTEMPTS {
+                    break result;
+                }
+                // Compute the verb and the origin-form URI the Digest response
+                // hashes over (`HA2 = MD5(method:uri)`). curl hashes the ORIGIN
+                // path (`data->state.up.path`), NOT the absolute request-line
+                // target a forward proxy uses — so a Digest auth through a forward
+                // proxy still hashes over `/path`, matching both the host (`401`)
+                // and proxy (`407`) Digest `uri=` fields (tests 167, 168). NTLM
+                // ignores the target entirely (tests 81, 162).
                 let method = h1::resolve_http_method(
                     hop.method,
                     hop.no_body,
@@ -2805,88 +4497,181 @@ async fn perform_http_hop(
                     false,
                     hop.method == HttpReq::Put,
                 )?;
-                let target = h1::request_target(
-                    url,
-                    &conn,
-                    hop.request_target_override.as_deref(),
-                    false,
-                    data.set.prefer_ascii,
-                )?;
-                match controller.on_challenge(
-                    &hop_sink.www_authenticate,
-                    method.method.as_str(),
-                    &target,
-                ) {
-                    Some(next) => {
-                        // Decide whether the existing connection can carry the
-                        // retry. curl reuses a still-open keep-alive connection
-                        // but RECONNECTS when the server closed the socket after
-                        // the challenge. This covers two cases: an explicit
-                        // `Connection: close` 401 (`keepalive == false`), AND the
-                        // common HTTP/1.1 `401` with `Content-Length` and no
-                        // `Connection: close` header whose peer nonetheless closed
-                        // the socket (the harness `swsclose` directive). A
-                        // non-blocking liveness peek (`Curl_conn_is_alive`, curl's
-                        // pre-reuse `connalive` check) detects the peer's `EOF` in
-                        // the latter case so the credential is not written into a
-                        // dead socket.
-                        let conn_alive = keepalive && Curl_conn_is_alive(&mut conn).0;
-                        // A connection-bound NTLM handshake that has already
-                        // consumed the server's Type-2 challenge cannot continue
-                        // on a new socket; if the connection is gone the
-                        // negotiation is unrecoverable, so the current `401` is the
-                        // real answer (curl fails likewise).
-                        if !conn_alive && controller.requires_same_connection() {
-                            break result;
-                        }
-                        // Re-issue with the new credential; drop the buffered probe
-                        // body and reset the per-attempt observable state.
-                        hop.authorization = Some(next);
-                        // Update curl's `authneg`: the body is sent only on the
-                        // final authenticated request. A single-pass scheme
-                        // (Basic/Bearer/Digest) or the NTLM Type-3 message clears
-                        // it (the next attempt carries the real upload); the NTLM
-                        // Type-1 initial message keeps it set (the Type-1 probe
-                        // is still body-less).
-                        authneg = controller.is_negotiating();
-                        hop_sink.discard_auth_body();
-                        hop_sink.reset_for_retry();
-                        // When the connection is no longer usable, re-establish a
-                        // fresh one for the retry. The controller (and any NTLM
-                        // Type-1 state) persists across the reconnect; only the
-                        // socket is replaced. The verbose `* Trying …`/`*
-                        // Connected to …` trace is re-emitted via the hop sink,
-                        // matching curl's per-connection logging.
-                        if conn_alive {
-                            // The kept-alive connection carries the next attempt
-                            // (curl's same-connection challenge-response retry).
-                            conn_is_fresh = false;
-                        } else {
-                            conn = http_connect_hop(
-                                data,
-                                &mut hop,
-                                is_https,
-                                host.clone(),
-                                host_ace.clone(),
-                                port,
-                                verbose,
-                                httpwant,
-                                ipver,
-                                op_start,
-                                &mut hop_sink,
-                            )
-                            .await?;
-                            // Re-established connection (auth resend) — report
-                            // the new socket to the multi's observer.
-                            report_socket_to_observer(data, &conn);
-                            conn_is_fresh = true;
-                        }
+                let target = h1::auth_uri_target(url, hop.request_target_override.as_deref())?;
+                // Route the challenge to the matching controller: a `407`
+                // (`Proxy-Authenticate`) drives the proxy controller, a `401`
+                // (`WWW-Authenticate`) the host controller. The hop sink folds
+                // both header families into `www_authenticate` (cleared per
+                // response), and a single response carries only the family that
+                // matches its status, so there is no cross-contamination.
+                // `on_challenge` returns the next credential *value* (e.g.
+                // `"NTLM <base64>"`); the tuple also records which header it
+                // targets and whether the picked scheme is connection-bound (NTLM
+                // past its Type-1). The controller is borrowed only for the call,
+                // so `authneg` can be recomputed from both controllers afterward.
+                let challenge: Option<(String, bool, bool)> = match hop_sink.status {
+                    407 => proxy_auth_controller.as_mut().and_then(|c| {
+                        c.on_challenge(&hop_sink.www_authenticate, method.method.as_str(), &target)
+                            .map(|next| (next, true, c.requires_same_connection()))
+                    }),
+                    401 => auth_controller.as_mut().and_then(|c| {
+                        c.on_challenge(&hop_sink.www_authenticate, method.method.as_str(), &target)
+                            .map(|next| (next, false, c.requires_same_connection()))
+                    }),
+                    _ => None,
+                };
+                // No answerable challenge (a non-`401`/`407` status, no matching
+                // controller, no acceptable scheme, or rejected credentials): the
+                // current response is the real answer. The deferred `failonerror`
+                // verdict below turns a terminal `401`/`407` into exit 22 (tests
+                // 152, 162).
+                let Some((next, is_proxy, same_conn_required)) = challenge else {
+                    break result;
+                };
+                // Decide whether the existing connection can carry the retry. curl
+                // reuses a still-open keep-alive connection but RECONNECTS when the
+                // server closed the socket after the challenge — an explicit
+                // `Connection: close` (`keepalive == false`) or the harness
+                // `swsclose` directive (a non-blocking liveness peek,
+                // `Curl_conn_is_alive` / curl's pre-reuse `connalive` check,
+                // detects the peer's `EOF` so the credential is not written into a
+                // dead socket).
+                let conn_alive = keepalive && Curl_conn_is_alive(&mut conn).0;
+                // A connection-bound NTLM handshake that has already consumed the
+                // server's Type-2 challenge cannot continue on a new socket; if the
+                // connection is gone the negotiation is unrecoverable, so the
+                // current `401`/`407` is the real answer (curl fails likewise).
+                if !conn_alive && same_conn_required {
+                    break result;
+                }
+                // Re-issue with the new credential on the matching header. The host
+                // credential rewrites `Authorization`; the proxy credential
+                // rewrites `Proxy-Authorization` (overwriting any preemptive
+                // forward-proxy Basic value with the negotiated scheme). An
+                // already-set value on the OTHER header is preserved, so a combined
+                // proxy+host transfer carries both.
+                if is_proxy {
+                    hop.proxy_authorization = Some(next);
+                } else {
+                    hop.authorization = Some(next);
+                    // A host `401` implies the proxy already accepted our
+                    // credentials and forwarded the request. If the proxy used a
+                    // connection-bound scheme (NTLM) whose handshake has completed,
+                    // the proxy is authenticated for the lifetime of THIS
+                    // connection, so curl stops repeating `Proxy-Authorization` on
+                    // subsequent requests over the same socket (curl's
+                    // `Curl_output_ntlm` is a no-op once `ntlm->state ==
+                    // NTLMSTATE_TYPE3`). Clear the stale proxy Type-3 so the
+                    // host-auth retry (req3) carries only the site `Authorization`
+                    // (tests 169, 170). Stateless proxy schemes (Basic/Digest) are
+                    // re-sent every request and report `false` here, so a combined
+                    // proxy-Digest + host-Digest transfer keeps both (test 168).
+                    #[cfg(feature = "proxy")]
+                    if proxy_auth_controller
+                        .as_ref()
+                        .is_some_and(|c| c.connection_authenticated())
+                    {
+                        hop.proxy_authorization = None;
                     }
-                    // No acceptable scheme / rejected credentials / scheme done:
-                    // the current response is the real answer.
-                    None => break result,
+                }
+                // Update curl's `authneg` from BOTH controllers: the upload body is
+                // sent only once neither side is still negotiating. A single-pass
+                // scheme (Basic/Bearer/Digest) or the NTLM Type-3 message clears
+                // the active side; the NTLM Type-1 initial message keeps it set
+                // (the Type-1 probe is still body-less).
+                authneg = auth_controller.as_ref().is_some_and(|c| c.is_negotiating())
+                    || proxy_auth_controller
+                        .as_ref()
+                        .is_some_and(|c| c.is_negotiating());
+                // curl's `http_perhapsrewind` → `Curl_creader_set_rewind`: once a
+                // `401`/`407` challenge has been answered and the body is about to
+                // be re-sent with credentials (`!authneg`), curl rewinds the client
+                // reader. For a `CURLOPT_READFUNCTION` upload source that fires the
+                // application's legacy `CURLOPT_IOCTLFUNCTION`
+                // (`CURLIOCMD_RESTARTREAD`) / `CURLOPT_SEEKFUNCTION` rewind hook.
+                // The engine buffers the read-callback body up front and re-sends a
+                // buffered clone, so this is observable-only — it fires the app
+                // callback exactly once per hop (the `rewound` latch) so the wire/
+                // stdout output matches curl (QA libtest 552). Gated to a body-
+                // bearing upload sourced from a read callback; a `CURLOPT_POSTFIELDS`
+                // / form / file body (`!is_fread_set`) or a GET/HEAD never rewinds,
+                // and a source with no rewind callback registered no-ops.
+                if !authneg
+                    && data.set.is_fread_set
+                    && matches!(
+                        hop.method,
+                        HttpReq::Post | HttpReq::Put | HttpReq::PostForm | HttpReq::PostMime
+                    )
+                    && !rewound
+                {
+                    if let Some(src) = source.as_deref_mut() {
+                        src.rewind();
+                    }
+                    rewound = true;
+                }
+                // Drop the buffered probe body and reset the per-attempt observable
+                // state for the retry.
+                hop_sink.discard_auth_body();
+                hop_sink.reset_for_retry();
+                // When the connection is no longer usable, re-establish a fresh one
+                // for the retry. Both controllers (and any NTLM Type-1 state)
+                // persist across the reconnect; only the socket is replaced. The
+                // verbose `* Trying …`/`* Connected to …` trace is re-emitted via
+                // the hop sink, matching curl's per-connection logging.
+                if conn_alive {
+                    // The kept-alive connection carries the next attempt (curl's
+                    // same-connection challenge-response retry).
+                    conn_is_fresh = false;
+                } else {
+                    conn = http_connect_hop(
+                        data,
+                        &mut hop,
+                        is_https,
+                        host.clone(),
+                        host_ace.clone(),
+                        port,
+                        verbose,
+                        httpwant,
+                        ipver,
+                        op_start,
+                        &mut hop_sink,
+                    )
+                    .await?;
+                    // Re-established connection (auth resend) — report the new
+                    // socket to the multi's observer.
+                    report_socket_to_observer(data, &conn);
+                    conn_is_fresh = true;
                 }
             };
+            // Re-apply the deferred `CURLOPT_FAILONERROR` (`-f`/`--fail`) verdict
+            // to the TERMINAL auth response. While a reactive-auth controller was
+            // active, `drive_one`'s `defer_auth_fail` suppressed the failonerror
+            // decision for the intermediate `401`/`407` challenges so the
+            // negotiation could run to completion (an answerable challenge is not
+            // a terminal error — curl's `http_should_fail` returns the
+            // `data->state.authproblem` flag, FALSE during a live negotiation).
+            // Now that negotiation has ended, make the real verdict against the
+            // final status code: a transfer that authenticated successfully ends
+            // `< 400` (no failure), while one that is still `401`/`407` (rejected
+            // credentials, no acceptable scheme) fails with
+            // `CURLE_HTTP_RETURNED_ERROR` (exit 22) exactly as curl does. Gated to
+            // `auth_controller.is_some()` so a non-auth or single-scheme transfer
+            // — whose `401`/`407` was already decided inline by `drive_one` — is
+            // untouched (test 152 still fails `22`). (tests 150, 152, 162)
+            let mut result = result;
+            if (auth_controller.is_some() || proxy_auth_controller.is_some())
+                && data.set.http_fail_on_error
+                && result.is_ok()
+                && http_should_fail(
+                    hop_sink.status,
+                    data.set.set_resume_from != 0,
+                    data.set.method == HttpReq::Get,
+                    data.set.str(StrId::Username).is_some(),
+                    data.set.str(StrId::Proxyusername).is_some(),
+                )
+            {
+                result = Err(CurlError::HttpReturnedError);
+            }
             // Deliver the body of a terminal `401`/`407` (an unanswerable
             // challenge's error page) that was buffered during negotiation.
             hop_sink.flush_auth_body();
@@ -2895,7 +4680,13 @@ async fn perform_http_hop(
         HttpVersion::H2 => {
             #[cfg(feature = "http2")]
             {
-                let custom_headers = collect_custom_headers(data);
+                let mut custom_headers = collect_custom_headers(data);
+                // On a cross-host redirect, drop the application's custom `Host:`
+                // so the auto authority for the *current* host is used (curl's
+                // per-hop rule; tests 184/185).
+                if hop.suppress_custom_host {
+                    strip_custom_host_header(&mut custom_headers);
+                }
                 // HTTP/2 sends a buffered body; if this upload was selected for
                 // streaming on the (version-agnostic) build path but the hop
                 // negotiated h2, materialize it from the source here so the h2
@@ -2926,7 +4717,8 @@ async fn perform_http_hop(
                 let mut h2conn =
                     self::h2::h2_client_handshake(io, self::h2::H2Settings::default()).await?;
                 let mut exchange = h2conn.start_exchange(req, h2_body, h2_no_body).await?;
-                let result = drive_one(data, &mut exchange, &mut hop_sink, op_start).await;
+                let result =
+                    drive_one(data, &mut exchange, &mut hop_sink, op_start, false).await;
                 h2conn.close();
                 result
             }
@@ -2941,6 +4733,29 @@ async fn perform_http_hop(
             Err(CurlError::UnsupportedProtocol)
         }
     };
+
+    // Surface a resumed-download range failure detected at first-body-write
+    // (curl's `http_firstwrite` returning `CURLE_RANGE_ERROR`). `HopSink`
+    // discarded the body (the local output file is left untouched) and signaled a
+    // short write to abort the read loop promptly, so `drive_result` may carry a
+    // `WriteError` from that abort — the range error takes precedence and is
+    // checked FIRST, mirroring curl propagating `CURLE_RANGE_ERROR` (33) directly
+    // from the write path.
+    if hop_sink.range_error {
+        return Err(CurlError::RangeError);
+    }
+    // Surface a client-side time-condition miss detected at first-body-write
+    // (curl's `http_firstwrite` "Simulate an HTTP 304 response"): `HopSink`
+    // discarded the body, and curl reports a synthetic `304` with
+    // `CURLINFO_CONDITION_UNMET` set. This is NOT an error — curl returns
+    // `CURLE_OK` — so the transfer completes successfully with an empty body and
+    // the response code published here overrides the real `200` that `drive_one`
+    // recorded from the status line, exactly as curl overwrites `data->info.httpcode
+    // = 304`.
+    if hop_sink.condition_unmet {
+        data.info.timecond = true;
+        data.info.response_code = 304;
+    }
     drive_result?;
 
     // CURLINFO_HTTP_VERSION (`%{http_version}`): set from the authoritative wire
@@ -2962,6 +4777,7 @@ async fn perform_http_hop(
         location,
         headers,
         content_type,
+        retry_after,
         #[cfg(feature = "cookies")]
         set_cookies,
         #[cfg(feature = "hsts")]
@@ -2970,6 +4786,16 @@ async fn perform_http_hop(
         alt_svc,
         ..
     } = hop_sink;
+
+    // CURLINFO_RETRY_AFTER (`%{retry_after}`): the final response block's
+    // parsed `Retry-After` (seconds-from-now), captured by `HopSink`. Only a
+    // present header overwrites the value reset to 0 by `pre_perform`, matching
+    // curl's `http_header_r`, which assigns `data->info.retry_after` solely when
+    // the header appears. The CLI retry machinery consults this to weigh a
+    // server back-off against `--retry-max-time` (oracle test366).
+    if let Some(ra) = retry_after {
+        data.info.retry_after = ra;
+    }
 
     // CURLINFO_CONTENT_TYPE (`%{content_type}`, `%header{Content-Type}` via the
     // store below): the final response block's `Content-Type`, captured by
@@ -3105,7 +4931,14 @@ async fn perform_http3(
     // `build_h2_request`. `build_h3_request` drops the hop-by-hop fields itself
     // (incl. `Host`, which becomes `:authority`), so the complete list is passed
     // through unchanged.
-    let custom_headers = collect_custom_headers(data);
+    let mut custom_headers = collect_custom_headers(data);
+    // On a cross-host redirect, drop the application's custom `Host:` so the auto
+    // `:authority` for the *current* host is used (curl's per-hop rule). The
+    // forced-HTTP/3 path is single-shot today, so this is a no-op in practice, but
+    // it keeps the rule consistent across all HTTP versions (tests 184/185).
+    if hop.suppress_custom_host {
+        strip_custom_host_header(&mut custom_headers);
+    }
     let (request_headers, h3_body) = {
         let conn = Connection::new("h3", crate::conn::TRNSPRT_QUIC, http_scheme_descriptor(true));
         let inputs = make_inputs(
@@ -3160,7 +4993,11 @@ async fn perform_http3(
     // Push the request body (POST or PUT) on the QUIC send stream. Decoupled
     // from `is_upload` so a `-d` POST body (no longer an "upload") is still sent.
     let bytes = match h3_body {
-        h1::RequestBody::Sized(b) | h1::RequestBody::Chunked(b) => b,
+        h1::RequestBody::Sized(b) => b,
+        // HTTP/3 carries the body in QUIC stream DATA, not chunked framing, so
+        // the per-read blocks are flattened to the raw payload (chunked trailers
+        // do not apply to the HTTP/3 framing and are ignored here).
+        h1::RequestBody::Chunked(blocks, _) => blocks.concat(),
         h1::RequestBody::None => Vec::new(),
         // The HTTP/3 body is built with `allow_stream = false`, so a streamed
         // body never reaches this path; handled for exhaustiveness only.
@@ -3175,7 +5012,7 @@ async fn perform_http3(
         offset += sent;
     }
 
-    let result = drive_one(data, &mut exchange, sink, op_start).await;
+    let result = drive_one(data, &mut exchange, sink, op_start, false).await;
     session.close();
     result
 }
@@ -3237,11 +5074,25 @@ pub(crate) async fn perform_ws(
     } else {
         let url_str = data.url().ok_or(CurlError::UrlMalformat)?.to_string();
         let mut parsed = CurlUrl::new();
+        // `CURLOPT_PATH_AS_IS` must preserve the literal `..`/`.` segments of the
+        // *given* URL path, so the initial parse forwards `CURLU_PATH_AS_IS` when
+        // it is set — exactly as C does in `lib/url.c` (the `!use_set_uh` branch
+        // passes `data->set.path_as_is ? CURLU_PATH_AS_IS : 0`). Without this the
+        // parser would dedotdotify the request path (e.g. `/../../NNN` → `/NNN`),
+        // diverging from curl on the first request line. The relative-redirect
+        // resolution still strips dot segments per RFC 3986 (the merge re-parses
+        // with `CURLU_PATH_AS_IS` masked off), so a followed `Location` is
+        // normalized regardless.
+        let path_as_is = if data.set.path_as_is {
+            CURLU_PATH_AS_IS
+        } else {
+            0
+        };
         parsed
             .set(
                 CurlUPart::Url,
                 Some(&url_str),
-                CURLU_GUESS_SCHEME | CURLU_DEFAULT_PORT,
+                CURLU_GUESS_SCHEME | CURLU_DEFAULT_PORT | path_as_is,
             )
             .map_err(|_| CurlError::UrlMalformat)?;
         parsed
@@ -3299,7 +5150,7 @@ pub(crate) async fn perform_ws(
             data.set.http09_allowed,
             false,
         );
-        drive_one(data, &mut exchange, sink, op_start).await?;
+        drive_one(data, &mut exchange, sink, op_start, false).await?;
         exchange.take_rbuf()
     };
 
@@ -3398,6 +5249,17 @@ async fn drive_one<P: ProtocolExchange>(
     // the true start of the operation — matching curl's `Curl_pgrsStartNow`,
     // which is called at transfer start, not after connect.
     op_start: Instant,
+    // Whether `CURLOPT_FAILONERROR` (`-f`/`--fail`) must be DEFERRED for an
+    // intermediate `401`/`407`. Set `true` only by the HTTP/1.x reactive-auth
+    // hop loop while a challenge-response controller is active: an answerable
+    // `401`/`407` is the server's auth *challenge*, not a terminal error, so
+    // failonerror must not abort the negotiation mid-handshake (curl's
+    // `http_should_fail` returns `data->state.authproblem`, FALSE while the
+    // negotiation can still answer). The caller re-applies the real
+    // `http_should_fail` verdict to the TERMINAL response after the loop ends.
+    // All other call sites (h2/h3/websocket, and any non-auth transfer) pass
+    // `false`, so a `401`/`407` fails immediately exactly as before. (test 150)
+    defer_auth_fail: bool,
 ) -> Result<()> {
     let mut request = Request::new();
     // Seed `no_body` from the easy handle, mirroring curl's `Curl_req_hard_reset`
@@ -3434,6 +5296,7 @@ async fn drive_one<P: ProtocolExchange>(
         deadline,
         low_speed_limit: data.set.low_speed_limit,
         low_speed_time: u32::from(data.set.low_speed_time),
+        max_filesize: data.set.max_filesize,
     };
     // Build the `CURLOPT_FAILONERROR` (`-f`/`--fail`) predicate once, before the
     // byte loop. It is `Some` only when failonerror is set; the closure captures
@@ -3447,7 +5310,9 @@ async fn drive_one<P: ProtocolExchange>(
         let is_get = data.set.method == HttpReq::Get;
         let has_user = data.set.str(StrId::Username).is_some();
         let has_proxy_user = data.set.str(StrId::Proxyusername).is_some();
-        move |code: i32| http_should_fail(code, resume, is_get, has_user, has_proxy_user)
+        move |code: i32| {
+            failonerror_verdict(defer_auth_fail, code, resume, is_get, has_user, has_proxy_user)
+        }
     });
     let fail_ref: Option<&(dyn Fn(i32) -> bool + Send + Sync)> = fail_closure
         .as_ref()
@@ -3567,16 +5432,123 @@ fn collect_custom_headers(data: &Easy) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Whether a custom header named `target` is present (case-insensitive),
-/// matching [`build_request`]'s own `find_custom_header_value` detection exactly
-/// (the untrimmed `curlx_str_cspn` name span via [`proxy::parse_custom_header_line`]).
+/// The custom headers to apply to a proxy `CONNECT` request, mirroring curl's
+/// `HEADER_CONNECT` selection in `dynhds_add_custom` (`lib/http_proxy.c`):
+///
+/// * with separate headers in effect (`CURLOPT_HEADEROPT == CURLHEADER_SEPARATE`,
+///   set by `--proxy-header`), the CONNECT uses the dedicated `CURLOPT_PROXYHEADER`
+///   list (`data->set.proxyheaders`) — the regular `-H` list applies only to the
+///   origin request;
+/// * otherwise (unified headers) the CONNECT reuses the regular `-H` list
+///   (`data->set.headers`).
+///
+/// curl-rs defaults `sep_headers` to `true` and the CLI sets `CURLHEADER_SEPARATE`
+/// whenever a proxy or `--proxy-header` is in play, so in practice the CONNECT
+/// draws from `proxyheaders` (empty unless `--proxy-header` was given, in which
+/// case it carries those lines). The builder (`build_connect_request`) then
+/// suppresses the auto-generated `Host`/`User-Agent`/`Proxy-Connection` whenever
+/// the custom list overrides them and applies the `name:`/`name;` quirks — so a
+/// `--proxy-header "User-Agent: X"` replaces the default CONNECT user agent
+/// (oracle: tests/data/test287).
+#[cfg(feature = "proxy")]
+fn collect_connect_custom_headers(data: &Easy) -> Vec<String> {
+    let list = if data.set.sep_headers {
+        data.set.proxyheaders.as_ref()
+    } else {
+        data.set.headers.as_ref()
+    };
+    list.map(|l| {
+        l.iter()
+            .filter_map(|c| c.to_str().ok().map(String::from))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Whether the user's custom header list contains a header named `target`,
+/// mirroring curl's `Curl_checkheaders` (lib/http.c). This is curl's "did the
+/// application provide header X" test, used to SUPPRESS the auto-generated
+/// header of that name (`Host:`, `Accept:`, `Content-Range:`, `Expect:`, `TE:`).
+///
+/// curl matches the header NAME — the byte span up to the first `:` or `;`
+/// delimiter — case-insensitively, and crucially does so REGARDLESS of the
+/// header's value. That includes the two value-less directive forms: the
+/// *disable* directive `-H "X:"` (empty value after the colon) and the
+/// *blank-header* directive `-H "X;"`. Both suppress the auto-generated header
+/// X; the custom-header emission then either sends the user's value or — for a
+/// disable/blank directive — sends nothing, so the net result is that header X
+/// is absent from the request. (Test oracle: tests/data/test461 — `-H "host:"`
+/// disables the `Host:` header.)
+///
+/// Matching `Curl_checkheaders` exactly, the name span must be non-empty and
+/// equal `target` with no trailing blanks before the delimiter (`"Host :"`
+/// does NOT match, exactly as curl's `head->data[thislen] == ':'` test fails
+/// when byte `thislen` is a space).
 fn any_custom_header(lines: &[String], target: &str) -> bool {
     lines.iter().any(|line| {
-        matches!(
-            proxy::parse_custom_header_line(line),
-            proxy::CustomHeader::Add { name, .. } if name.eq_ignore_ascii_case(target)
-        )
+        let bytes = line.as_bytes();
+        match bytes.iter().position(|&b| b == b':' || b == b';') {
+            Some(sep) if sep > 0 => line[..sep].eq_ignore_ascii_case(target),
+            _ => false,
+        }
     })
+}
+
+/// Remove the application's custom `Host:` header line(s) from `lines`.
+///
+/// Used on a cross-host redirect, where curl does NOT carry the original
+/// request's custom `Host:` value to the new host and instead emits the auto
+/// `Host:` for the redirect target (lib/http.c — the custom value is used only
+/// when `!this_is_a_follow || curl_strequal(first_host, conn->host.name)`). The
+/// header NAME is matched exactly as [`any_custom_header`] (the span up to the
+/// first `:`/`;`, case-insensitive, non-empty), so the disable/blank directive
+/// forms (`-H "Host:"`, `-H "Host;"`) are dropped too. After stripping,
+/// `any_custom_header(lines, "Host")` is `false`, so the request builder emits
+/// the auto `Host:` and the proxy header walk no longer re-emits the custom one
+/// (avoiding a duplicate `Host:`).
+fn strip_custom_host_header(lines: &mut Vec<String>) {
+    lines.retain(|line| {
+        let bytes = line.as_bytes();
+        match bytes.iter().position(|&b| b == b':' || b == b';') {
+            Some(sep) if sep > 0 => !line[..sep].eq_ignore_ascii_case("Host"),
+            _ => true,
+        }
+    });
+}
+
+/// Derive the cookie-scoping host from a user-supplied `Host:` header value,
+/// stripping any `:port` suffix and IPv6 brackets.
+///
+/// curl scopes cookie matching and storage to `data->state.aptr.cookiehost` —
+/// the hostname from the application's custom `Host:` header — instead of the
+/// connection/URL host, so that a request to `http://127.0.0.1:PORT/` carrying
+/// `-H "Host: www.example.com"` matches and stores cookies for `www.example.com`
+/// (curl tests 61/62/73). Returns `None` for an empty value (no override → the
+/// URL host is used).
+#[cfg(feature = "cookies")]
+fn cookie_host_from_header_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    // IPv6 literal: `[addr]` or `[addr]:port` → `addr` (brackets removed).
+    let host = if let Some(rest) = value.strip_prefix('[') {
+        match rest.find(']') {
+            Some(end) => &rest[..end],
+            None => rest, // malformed (no closing bracket); best-effort
+        }
+    } else {
+        // `host` or `host:port` → the part before the (single) port colon.
+        match value.find(':') {
+            Some(i) => &value[..i],
+            None => value,
+        }
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
 }
 
 /// Whether the application requested a chunked upload via an explicit
@@ -3594,6 +5566,51 @@ fn upload_is_chunked(data: &Easy) -> bool {
             })
         })
     })
+}
+
+/// Whether the application supplied a `Transfer-Encoding` request header at all,
+/// and if so whether it selects chunked framing — the port of curl's
+/// `http_req_set_TE` (lib/http.c) `if(ptr) … else …` split.
+///
+/// curl's `Curl_checkheaders(data, "Transfer-Encoding")` finds any user-provided
+/// `Transfer-Encoding` header matched by NAME, *regardless of value* — including
+/// the empty `-H "Transfer-Encoding:"` removal form (which
+/// [`proxy::parse_custom_header_line`] classifies as `Skip`, so [`upload_is_chunked`]
+/// alone cannot see it). When such a header is present, curl sets
+/// `upload_chunky = Curl_compareheader(ptr, "Transfer-Encoding:", "chunked")` and
+/// emits NO automatic `Transfer-Encoding`; only when it is absent does curl
+/// auto-select chunked for an indeterminate-length upload.
+///
+/// Returns:
+/// * `Some(true)`  — a `Transfer-Encoding` header whose value mentions `chunked`
+///   (the application explicitly enabled chunked framing).
+/// * `Some(false)` — a `Transfer-Encoding` header present but NOT chunked,
+///   including the empty `-H "Transfer-Encoding:"` form that disables curl's
+///   automatic chunking even for an unknown upload length (test98).
+/// * `None`        — no `Transfer-Encoding` header at all; the caller falls back
+///   to the automatic decision (chunked iff the a-priori upload size is unknown).
+fn user_transfer_encoding(data: &Easy) -> Option<bool> {
+    let list = data.set.headers.as_ref()?;
+    for c in list.iter() {
+        let Ok(line) = c.to_str() else { continue };
+        // Match by header NAME (the span up to the first ':' or ';'), exactly as
+        // `Curl_checkheaders` matches — the value (or its absence) does not affect
+        // detection, only the chunked/not-chunked outcome below.
+        let sep = line.find([':', ';']).unwrap_or(line.len());
+        let name = line[..sep].trim();
+        if name.eq_ignore_ascii_case("Transfer-Encoding") {
+            // The value after a ':' delimiter; empty for the `-H "Transfer-Encoding:"`
+            // removal form and for the `-H "Transfer-Encoding;"` blank-header form.
+            let value = match line.as_bytes().get(sep) {
+                Some(b':') => &line[sep + 1..],
+                _ => "",
+            };
+            // curl's `Curl_compareheader(ptr, "Transfer-Encoding:", "chunked")`:
+            // chunked iff the value mentions the token `chunked` (case-insensitive).
+            return Some(value.to_ascii_lowercase().contains("chunked"));
+        }
+    }
+    None
 }
 
 /// Build the request body for the transfer:
@@ -3630,11 +5647,53 @@ fn build_request_body(
         return Ok(h1::RequestBody::Sized(body.clone()));
     }
     if let Some(fields) = data.set.copypostfields.as_ref() {
-        return Ok(h1::RequestBody::Sized(fields.clone()));
+        // A user-forced `Transfer-Encoding: chunked` (`-H`) chunk-frames the
+        // in-memory POST data rather than sending it under `Content-Length` —
+        // curl honors the application's chosen transfer-encoding (the wire shows
+        // a single chunk for the whole buffer, then the `0` terminator, with no
+        // `Content-Length`). The length stays a-priori known (copypostfields),
+        // so `client_upload_length` still reports it and no `Expect` is added.
+        return Ok(if upload_is_chunked(data) {
+            // The in-memory POST data is a single read block (one wire chunk).
+            // A `CURLOPT_TRAILERFUNCTION` is still honored for the chunked
+            // framing: curl invokes the trailer callback once at end-of-body in
+            // `add_last_chunk` regardless of the body's source, so an in-memory
+            // POST body (`CURLOPT_POSTFIELDS`/`COPYPOSTFIELDS` or `-d`) forced
+            // chunked via `Transfer-Encoding: chunked` emits the trailers too.
+            // The CLI `-d` path sets no trailer callback, so `trailers()` is
+            // empty there (a bare `0\r\n\r\n`), unchanged.
+            h1::RequestBody::Chunked(vec![fields.clone()], source.trailers())
+        } else {
+            h1::RequestBody::Sized(fields.clone())
+        });
     }
     let reads_source = data.set.method == HttpReq::Put || data.set.method == HttpReq::Post;
     if reads_source {
-        let chunked = upload_is_chunked(data);
+        // Transfer-encoding selection (oracle: `lib/http.c` `http_req_set_TE`):
+        //   * an explicit `Transfer-Encoding: chunked` header always chunks; else
+        //   * an *indeterminate* upload length auto-selects chunked — curl does
+        //     this on HTTP/1.1 (`req_clen < 0`), e.g. a `-T -` stdin PUT or a
+        //     `CURLOPT_POST` read callback with no `POSTFIELDSIZE`. A known
+        //     length (file size / `POSTFIELDSIZE` / in-memory data) uses
+        //     `Content-Length` instead.
+        // The body is built before the per-hop wire version is known; the h2/h3
+        // engines flatten chunked blocks (never emitting chunked framing), and
+        // the HTTP/1.0 "chunky upload unsupported" error path is unreachable here
+        // (curl-rs issues HTTP/1.1 requests).
+        // A user-supplied `Transfer-Encoding` header (curl's `Curl_checkheaders`,
+        // matched by NAME) takes precedence over the automatic decision — exactly
+        // curl's `http_req_set_TE` `if(ptr) … else …` split. When the application
+        // provides ANY `Transfer-Encoding` header, chunked framing is used iff that
+        // header selects `chunked`; the empty `-H "Transfer-Encoding:"` removal
+        // form is present-but-not-chunked, so it DISABLES curl's automatic chunking
+        // even for an indeterminate-length upload (test98: a `-T -` stdin PUT with
+        // an explicit `Content-Length` sends a sized body, not chunked). Only when
+        // no `Transfer-Encoding` header is supplied does curl auto-select chunked
+        // for an unknown a-priori upload length.
+        let chunked = match user_transfer_encoding(data) {
+            Some(selects_chunked) => selects_chunked,
+            None => known_upload_length(data).is_none(),
+        };
         // Stream the upload (bounded memory) only when it is provably
         // single-pass, so the source is never re-read:
         //   * `known_size` — `CURLOPT_INFILESIZE[_LARGE]` is set (a regular `-T`
@@ -3650,20 +5709,80 @@ fn build_request_body(
         // their proven resend/rewind semantics.
         let known_size = data.set.filesize >= 0;
         let follow_enabled = data.set.http_follow_mode != 0;
-        let streaming_ok =
-            allow_stream && known_size && !follow_enabled && !auth_engine::needs_reactive(data.set.httpauth);
+        // A resumed upload (`-C <n>`) repositions the source to the resume offset
+        // and uploads only the remainder; the buffered path performs that
+        // reposition (read-and-discard the leading bytes, curl's `cr_in_resume_from`
+        // CANTSEEK fallback) and computes the post-seek `Content-Length`. The
+        // streaming reader has no reposition step, so a resume always takes the
+        // buffered path.
+        let resume_upload = data.set.set_resume_from > 0;
+        let streaming_ok = allow_stream
+            && known_size
+            && !follow_enabled
+            && !resume_upload
+            && !auth_engine::needs_reactive(data.set.httpauth);
         if streaming_ok {
             return Ok(h1::RequestBody::Streaming {
                 size: Some(data.set.filesize as u64),
                 chunked,
             });
         }
-        let bytes = read_full_upload(source)?;
-        return Ok(if chunked {
-            h1::RequestBody::Chunked(bytes)
-        } else {
-            h1::RequestBody::Sized(bytes)
-        });
+        if chunked {
+            // A chunked upload preserves the read-callback boundaries: each
+            // source read becomes one wire chunk (curl frames every
+            // `Curl_creader_read` separately), so the body is buffered as a list
+            // of blocks rather than one flat buffer. The `CURLOPT_TRAILERFUNCTION`
+            // trailing headers are then collected from the source — curl invokes
+            // the trailer callback once, at end-of-body, for a chunked upload
+            // (the only framing that can carry trailers).
+            let blocks = read_upload_blocks(source)?;
+            let trailers = source.trailers();
+            return Ok(h1::RequestBody::Chunked(blocks, trailers));
+        }
+        // A *declared* zero-length upload sends an empty body and reads nothing
+        // from the source. curl's sized creader (`Curl_creader_set_fread` bounded
+        // by `Curl_creader_total_length == 0`) returns EOF immediately and never
+        // falls back to the default read callback / stdin, so a
+        // `CURLOPT_POSTFIELDS, NULL` + `CURLOPT_POSTFIELDSIZE, 0` POST (or a
+        // `0`-size `-T` PUT) must emit `Content-Length: 0` with no body — and
+        // must NOT block reading a never-closing stdin. (A copypostfields/MIME
+        // in-memory body is already returned above; an *unsized* upload, where
+        // `known_upload_length` is `None`, still reads the source — that is the
+        // intentional `-T -`/`-d @-` stdin path.)
+        if known_upload_length(data) == Some(0) {
+            return Ok(h1::RequestBody::Sized(Vec::new()));
+        }
+        let full = read_full_upload(source)?;
+        // A resumed upload (`-C <n>` on a PUT/POST) "fast forwards" the source to
+        // the resume offset and uploads only the remainder, with the resume
+        // expressed via a `Content-Range` header (computed by
+        // `effective_content_range`) rather than a whole-file `Content-Length`.
+        // This mirrors curl's `http_resume` → `Curl_creader_resume_from`: it
+        // seeks the client reader forward by `resume_from` (here, the buffered
+        // CANTSEEK fallback — drop the leading bytes) and the advertised length
+        // becomes the post-seek remainder. A resume offset at or past the end is
+        // curl's "File already completely uploaded" → `CURLE_PARTIAL_FILE`.
+        let resume_from = data.set.set_resume_from;
+        if resume_from > 0 {
+            let skip = resume_from as usize;
+            if skip >= full.len() {
+                return Err(CurlError::PartialFile);
+            }
+            return Ok(h1::RequestBody::Sized(full[skip..].to_vec()));
+        }
+        return Ok(h1::RequestBody::Sized(full));
+    }
+    // A POST_FORM/POST_MIME request whose form/MIME tree serialized to nothing
+    // — e.g. `CURLOPT_HTTPPOST, NULL` (test516/lib516 "make an HTTPPOST set to
+    // NULL") or an empty form/mime — still sends a body-framed request: curl's
+    // `http_add_content_hds` frames `HTTPREQ_POST_FORM`/`HTTPREQ_POST_MIME`
+    // with a `Content-Length`, so an empty body must advertise
+    // `Content-Length: 0` (an empty `Sized` body) rather than omit it the way a
+    // bodyless GET/HEAD (`None`) does. The non-empty case already returned its
+    // serialized `mime_body` (`Sized`) at the top of this function, so reaching
+    // here with one of these methods means there was no body to serialize.
+    if matches!(data.set.method, HttpReq::PostForm | HttpReq::PostMime) {
+        return Ok(h1::RequestBody::Sized(Vec::new()));
     }
     Ok(h1::RequestBody::None)
 }
@@ -3684,17 +5803,24 @@ fn materialize_streaming_body(
     source: Option<&mut dyn ReadCallback>,
 ) -> Result<h1::RequestBody> {
     match body {
-        h1::RequestBody::Streaming { chunked, .. } => {
+        h1::RequestBody::Streaming { chunked, .. } => Ok(if chunked {
+            // Chunked: materialize as per-read blocks so each read frames as one
+            // wire chunk (matching curl), consistent with the buffered path.
+            // This path feeds the h2/h3 engines, which carry the body in their
+            // own DATA frames and do not emit HTTP/1 chunked trailers, so the
+            // trailer set is left empty here.
+            let blocks = match source {
+                Some(s) => read_upload_blocks(s)?,
+                None => Vec::new(),
+            };
+            h1::RequestBody::Chunked(blocks, Vec::new())
+        } else {
             let bytes = match source {
                 Some(s) => read_full_upload(s)?,
                 None => Vec::new(),
             };
-            Ok(if chunked {
-                h1::RequestBody::Chunked(bytes)
-            } else {
-                h1::RequestBody::Sized(bytes)
-            })
-        }
+            h1::RequestBody::Sized(bytes)
+        }),
         other => Ok(other),
     }
 }
@@ -3715,6 +5841,34 @@ fn read_full_upload(source: &mut dyn ReadCallback) -> Result<Vec<u8>> {
         }
     }
     Ok(body)
+}
+
+/// Read the upload `source` to end-of-input as a list of **blocks**, one entry
+/// per read-callback return (`CURLOPT_READFUNCTION` / one `Curl_creader_read`).
+///
+/// Unlike [`read_full_upload`], which concatenates everything into a single
+/// buffer, this preserves the read-callback boundaries so a chunked upload can
+/// frame each read as its own wire chunk (curl's behavior — see
+/// [`chunks::encode_chunked_blocks`]). A zero-length return signals EOF and is
+/// not retained as a block (a zero-size chunk is the body terminator, never a
+/// data chunk). The per-read buffer is [`chunks::CURL_CHUNKED_MAXLEN`] (64 KiB),
+/// curl's upload buffer granularity, so a large file or pipe is split into the
+/// same chunk sizing curl emits. The [`CURL_READFUNC_ABORT`] /
+/// [`CURL_READFUNC_PAUSE`] sentinels and an over-long return are handled exactly
+/// as in [`read_full_upload`].
+fn read_upload_blocks(source: &mut dyn ReadCallback) -> Result<Vec<Vec<u8>>> {
+    let mut blocks: Vec<Vec<u8>> = Vec::new();
+    let mut buf = vec![0u8; chunks::CURL_CHUNKED_MAXLEN];
+    loop {
+        match source.read(&mut buf) {
+            0 => break,
+            CURL_READFUNC_ABORT => return Err(CurlError::AbortedByCallback),
+            CURL_READFUNC_PAUSE => return Err(CurlError::ReadError),
+            n if n <= buf.len() => blocks.push(buf[..n].to_vec()),
+            _ => return Err(CurlError::ReadError),
+        }
+    }
+    Ok(blocks)
 }
 
 /// Apply `--connect-to` (`CURLOPT_CONNECT_TO`): if an entry matches the request
@@ -3981,14 +6135,215 @@ async fn doh_probe_post(req: DohProbeRequest) -> Result<Vec<u8>> {
 fn suppress_upload_body(body: &h1::RequestBody) -> h1::RequestBody {
     match body {
         h1::RequestBody::None => h1::RequestBody::None,
-        // A streamed body is never paired with reactive auth (the engine gates
-        // streaming off whenever `needs_reactive`), so this arm is not reached on
-        // the auth-negotiation probe; it is handled for exhaustiveness and yields
-        // the same empty `Content-Length: 0` probe body as the buffered cases.
-        h1::RequestBody::Sized(_)
-        | h1::RequestBody::Chunked(_)
-        | h1::RequestBody::Streaming { .. } => h1::RequestBody::Sized(Vec::new()),
+        // A *chunked* upload keeps chunked framing on the auth-negotiation probe:
+        // curl sends only the terminating `0\r\n\r\n` (an empty chunked body) and
+        // does NOT switch to `Content-Length: 0`. The `Transfer-Encoding: chunked`
+        // header — whether user-set (a `-H 'Transfer-Encoding: chunked'`, as in
+        // `tests/data/test565`) or engine-added — stays, and emitting
+        // `Content-Length: 0` alongside it would be a self-contradictory framing
+        // that leaves a server waiting forever for the chunk terminator (the
+        // `test565` probe hang / `GOT_NOTHING`). An empty `Chunked` body builds
+        // `Transfer-Encoding: chunked` with no `Content-Length` and sends a lone
+        // `0` chunk — byte-for-byte the `test565` probe.
+        h1::RequestBody::Chunked(..) => h1::RequestBody::Chunked(Vec::new(), Vec::new()),
+        // A streamed body is normally never paired with reactive auth (the engine
+        // gates streaming off whenever `needs_reactive`), but suppress per its
+        // framing for exhaustiveness: a chunked stream collapses to an empty
+        // chunked probe, a sized stream to an empty `Content-Length: 0` probe.
+        h1::RequestBody::Streaming { chunked: true, .. } => {
+            h1::RequestBody::Chunked(Vec::new(), Vec::new())
+        }
+        // A sized upload suppresses to an empty `Content-Length: 0` probe body.
+        h1::RequestBody::Sized(_) | h1::RequestBody::Streaming { .. } => {
+            h1::RequestBody::Sized(Vec::new())
+        }
     }
+}
+
+/// The a-priori known upload length declared by the application's options, or
+/// `None` when the upload size is indeterminate (an unsized read callback, or a
+/// `-T -` / `-T .` stdin upload).
+///
+/// This is curl's `Curl_creader_total_length` / `Curl_creader_client_length`
+/// for the configured client reader, computed from the source the application
+/// selected — *independent of the wire framing chosen later*:
+///
+/// * `CURLOPT_POSTFIELDS`/`COPYPOSTFIELDS` (`-d`) and `CURLOPT_MIMEPOST` (`-F`)
+///   are in-memory sources — their length is always known.
+/// * `CURLOPT_INFILESIZE[_LARGE]` (a `-T file` PUT — the CLI seeds it from the
+///   file size) and `CURLOPT_POSTFIELDSIZE[_LARGE]` (a sized POST read callback)
+///   declare the size up front.
+/// * Everything else (an unsized read callback, `-T -`/`-T .` stdin) is
+///   indeterminate.
+///
+/// Two distinct decisions consult this value (`lib/http.c`):
+/// * `http_req_set_TE` auto-selects chunked transfer-encoding on HTTP/1.1 when
+///   the length is indeterminate (`req_clen < 0`).
+/// * `addexpect` adds `Expect: 100-continue` when the length is unknown
+///   (`< 0`) or large (`> EXPECT_100_THRESHOLD`).
+fn known_upload_length(data: &Easy) -> Option<i64> {
+    if let Some(fields) = data.set.copypostfields.as_ref() {
+        Some(fields.len() as i64)
+    } else if let Some(body) = data.set.mime_body.as_ref() {
+        Some(body.len() as i64)
+    } else if data.set.method == HttpReq::Put && data.set.filesize >= 0 {
+        Some(data.set.filesize)
+    } else if data.set.method == HttpReq::Post && data.set.postfieldsize >= 0 {
+        Some(data.set.postfieldsize)
+    } else {
+        None
+    }
+}
+
+/// The CLIENT upload length curl's `Curl_creader_client_length` reports for the
+/// `Expect: 100-continue` decision (`addexpect`): the *a-priori known* size of
+/// the upload data source, or `-1` when unknown.
+///
+/// This is **independent of the wire framing**. curl's `addexpect`
+/// (`lib/http.c`) consults the client reader's total via
+/// `Curl_creader_client_length`, which is set when the application declares the
+/// upload size up front and is `-1` for an unsized read callback / stdin upload:
+///
+/// * `CURLOPT_POSTFIELDS`/`COPYPOSTFIELDS` (`-d`) and `CURLOPT_MIMEPOST` (`-F`)
+///   are in-memory sources — their length is always known.
+/// * `CURLOPT_INFILESIZE[_LARGE]` (a `-T file` PUT) and
+///   `CURLOPT_POSTFIELDSIZE[_LARGE]` (a sized POST read callback) declare the
+///   size up front.
+/// * An unsized read callback / stdin upload (`-T -`, a `CURLOPT_POST` read
+///   callback with no `POSTFIELDSIZE`) reports `-1`.
+///
+/// Crucially, a chunked transfer of a *known* source still reports the known
+/// length (so it gets no `Expect`), while a chunked transfer of an *unknown*
+/// source reports `-1` **even though the engine has buffered the blocks** — the
+/// buffered total must not be mistaken for an a-priori known length, or unsized
+/// stdin/callback uploads would wrongly drop their `Expect`.
+fn client_upload_length(data: &Easy, body: &h1::RequestBody) -> i64 {
+    match body {
+        // No body: a known zero-length client reader.
+        h1::RequestBody::None => 0,
+        // A fully-buffered sized body: report the a-priori SOURCE length, not
+        // merely the buffered byte count. For an in-memory source (copypostfields/
+        // MIME) or a declared-size upload (`CURLOPT_INFILESIZE`/`POSTFIELDSIZE`)
+        // the two are equal, so this is unchanged for every previously-reachable
+        // Sized body. But a sized-on-the-wire upload whose SOURCE size is unknown —
+        // a `-T -` stdin PUT with chunking disabled and a user `Content-Length`
+        // (test98) — has `known_upload_length == None`: curl's `addexpect` keys off
+        // `Curl_creader_client_length` (the source size, `-1` here), so it still
+        // adds `Expect: 100-continue` even though the wire is sized. Reporting the
+        // declared source length (falling back to `-1` when never declared) mirrors
+        // that, consistent with the `Chunked` arm below.
+        h1::RequestBody::Sized(b) => {
+            if matches!(data.set.method, HttpReq::PostForm | HttpReq::PostMime)
+                && data.set.mime_body.is_none()
+            {
+                // An empty/NULL form or MIME post (e.g. `CURLOPT_HTTPPOST, NULL`,
+                // test516/lib516): no `mime_body` was serialized, so the request body
+                // is an empty `Sized` (`build_request_body`'s POST_FORM/POST_MIME
+                // fall-through emits `Content-Length: 0`). The mime reader's a-priori
+                // client length here is exactly that (zero) serialized byte count, so
+                // curl's `addexpect` keys off a *known* length and adds no
+                // `Expect: 100-continue`. A populated form/mime instead carries its
+                // bytes in `mime_body` and reports its size via `known_upload_length`'s
+                // `mime_body` arm (the `else` branch), unchanged.
+                b.len() as i64
+            } else {
+                known_upload_length(data).unwrap_or(-1)
+            }
+        }
+        // A streamed body carries its source-size knowledge directly.
+        h1::RequestBody::Streaming { size, .. } => size.map_or(-1, |s| s as i64),
+        // A chunked body's client length is the *declared source* size, not the
+        // buffered block total: known only when the application declared it up
+        // front. A known-size chunked upload reports its length (so it gets no
+        // `Expect`), while an unsized read callback / stdin upload reports -1
+        // (so curl adds `Expect`) even though the engine has buffered the blocks.
+        h1::RequestBody::Chunked(..) => known_upload_length(data).unwrap_or(-1),
+    }
+}
+
+/// Compute the effective `Range` *value* for the request, the port of curl's
+/// `setup_range()` (lib/url.c) feeding `http_range()` (lib/http.c).
+///
+/// curl folds two distinct user inputs into a single `data->state.range`
+/// string and then sends it as a `Range:` (download) or `Content-Range:`
+/// (upload) header:
+///
+/// * An explicit `CURLOPT_RANGE` (`--range`/`-r`) value is used verbatim, for
+///   any request method. This is a borrowed handle string.
+/// * A `CURLOPT_RESUME_FROM[_LARGE]` (`-C <n>`) resume offset becomes the
+///   open-ended range string `"<n>-"`. curl synthesizes this for both
+///   downloads and uploads, but only the **download** (`GET`/`HEAD`) path is
+///   produced here: an *upload* resume is expressed via a `Content-Range:`
+///   header whose value also encodes the total length (and repositions the
+///   upload body to the resume point), which is the separate
+///   `effective_content_range()` path. Synthesizing a bare `Range:`/`"<n>-"`
+///   for an upload would be wrong, so it is deliberately withheld here.
+///
+/// The two inputs are mutually exclusive at the CLI (`--continue-at` rejects a
+/// combination with `--range`), matching curl, so the precedence here (explicit
+/// range first) only ever resolves one of them.
+fn effective_range(data: &Easy) -> Option<Cow<'_, str>> {
+    if let Some(r) = data.set.str(StrId::SetRange) {
+        return Some(Cow::Borrowed(r));
+    }
+    if data.set.set_resume_from != 0
+        && matches!(data.set.method, HttpReq::Get | HttpReq::Head)
+    {
+        return Some(Cow::Owned(format!("{}-", data.set.set_resume_from)));
+    }
+    None
+}
+
+/// The effective upload `Content-Range` header value for a resumed POST/PUT
+/// (`-C <n>` on an upload), or `None`.
+///
+/// This is the upload arm of curl's `http_range()` (lib/http.c): when a byte
+/// range applies to a POST/PUT, curl emits a `Content-Range:` header (not a
+/// `Range:` header) of the form `bytes <from>-<to>/<total>`, where:
+///
+/// * `<from>` is the resume offset (`data->state.resume_from`, i.e. `-C <n>`),
+/// * `<total>` is the **full** declared upload size, and
+/// * `<to>` is `<total> - 1`.
+///
+/// curl computes `<total>` as `authneg ? infilesize : (resume_from + req_clen)`.
+/// For a known-size source those two are identical — the post-seek client-reader
+/// length `req_clen` equals `infilesize - resume_from`, so `resume_from +
+/// req_clen == infilesize` — so this uses the full declared size directly
+/// (`known_upload_length`, i.e. `CURLOPT_INFILESIZE`/`POSTFIELDSIZE`), which is
+/// both authneg-independent and matches curl's wire output exactly (e.g.
+/// `tests/data/test33`: `-C 50` on a 100-byte PUT emits `Content-Range: bytes
+/// 50-99/100`). The body itself is repositioned to the resume offset in
+/// `build_request_body` (curl's `http_resume` → `Curl_creader_resume_from`), so
+/// the advertised `Content-Length` is the post-seek remainder.
+///
+/// Returns `None` (no engine `Content-Range`) when:
+/// * no resume offset is set (`resume_from <= 0`), or
+/// * the request is not an upload (only PUT/POST carry an upload body), or
+/// * the declared upload size is unknown (an unsized read-callback/stdin upload
+///   — curl would have nothing meaningful to put in `<total>`), or
+/// * the application already supplied its own `Content-Range:` header (curl's
+///   `Curl_checkheaders(data, "Content-Range")` precedence).
+fn effective_content_range(data: &Easy, custom_headers: &[String]) -> Option<String> {
+    let resume_from = data.set.set_resume_from;
+    if resume_from <= 0 {
+        return None;
+    }
+    if !matches!(data.set.method, HttpReq::Put | HttpReq::Post) {
+        return None;
+    }
+    if any_custom_header(custom_headers, "Content-Range") {
+        return None;
+    }
+    // The full declared upload size (`CURLOPT_INFILESIZE`/`POSTFIELDSIZE`); an
+    // indeterminate upload yields `None`, so no `Content-Range` is emitted.
+    let total = known_upload_length(data)?;
+    if total <= 0 || resume_from >= total {
+        // A non-positive total has no range to express; a resume offset at or
+        // past the end means there is nothing to upload (handled as
+        // `CURLE_PARTIAL_FILE` in `build_request_body`), so emit no header.
+        return None;
+    }
+    Some(format!("bytes {}-{}/{}", resume_from, total - 1, total))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4007,7 +6362,7 @@ fn make_inputs<'a>(
 ) -> h1::RequestInputs<'a> {
     let (content_length, chunked) = match &body {
         h1::RequestBody::Sized(b) => (Some(b.len() as i64), false),
-        h1::RequestBody::Chunked(_) => (None, true),
+        h1::RequestBody::Chunked(..) => (None, true),
         h1::RequestBody::None => (None, false),
         // A streamed body carries its framing metadata directly: a known size
         // advertises `Content-Length` (the head builder uses `content_length`,
@@ -4022,6 +6377,9 @@ fn make_inputs<'a>(
             }
         }
     };
+    // The client reader's a-priori known length (or -1), for the
+    // `Expect: 100-continue` decision — computed before `body` is moved.
+    let client_upload_len = client_upload_length(data, &body);
     h1::RequestInputs {
         url,
         conn,
@@ -4037,7 +6395,8 @@ fn make_inputs<'a>(
         user_agent: data.set.str(StrId::Useragent),
         authorization: hop.authorization.as_deref(),
         proxy_authorization: hop.proxy_authorization.as_deref(),
-        range: data.set.str(StrId::SetRange),
+        range: effective_range(data),
+        content_range: effective_content_range(data, custom_headers),
         accept_present: any_custom_header(custom_headers, "Accept"),
         // `CURLOPT_TRANSFER_ENCODING` (`--tr-encoding`): announce `TE: gzip`
         // (and the matching `Connection: TE`, emitted in `h1.rs`) on HTTP/1.x
@@ -4059,6 +6418,7 @@ fn make_inputs<'a>(
         content_type: data.set.mime_content_type.as_deref(),
         content_length,
         chunked,
+        client_upload_len,
         disable_expect: false,
         expect_present: any_custom_header(custom_headers, "Expect"),
         custom_expect_100: false,
@@ -4070,9 +6430,18 @@ fn make_inputs<'a>(
         allowed_to_host: hop.allowed_to_host,
         http_minor,
         request_target_override: hop.request_target_override.as_deref(),
-        proxy_transfer_mode: false,
+        // `CURLOPT_PROXY_TRANSFER_MODE` (`data.set.proxy_transfer_mode`): for an
+        // `ftp://` URL driven AS HTTP over a forward proxy, append `;type=a`/
+        // `;type=i` to the absolute request-target (`http::proxy::request_target`,
+        // gated on the `ftp` scheme). Wired from the option so tests 549/550/561
+        // emit the correct mode; `prefer_ascii` (below) selects `a` vs `i`.
+        proxy_transfer_mode: data.set.proxy_transfer_mode,
         prefer_ascii: data.set.prefer_ascii,
         expect_100_timeout_ms: data.set.expect_100_timeout,
+        // `CURLOPT_TIMECONDITION` + `CURLOPT_TIMEVALUE(_LARGE)` (`-z`): the h1
+        // builder emits the conditional request header at `H1_HD_CONDITIONALS`.
+        timecondition: data.set.timecondition,
+        timevalue: data.set.timevalue,
     }
 }
 
@@ -4188,6 +6557,50 @@ mod tests {
         assert_eq!(got, HttpVersion::H2);
         #[cfg(not(feature = "http2"))]
         assert_eq!(got, HttpVersion::Http11);
+    }
+
+    // ---- `der_to_pem`: DER → PEM armoring for `CURLINFO_CERTINFO` (test417) ----
+
+    #[test]
+    fn der_to_pem_wraps_armor_and_64_col_base64() {
+        // 48 bytes of DER → base64 is exactly 64 chars (48 / 3 * 4), one line.
+        let der: Vec<u8> = (0u8..48).collect();
+        let pem = der_to_pem(&der);
+        let lines: Vec<&str> = pem.lines().collect();
+        assert_eq!(lines[0], "-----BEGIN CERTIFICATE-----");
+        assert_eq!(lines[lines.len() - 1], "-----END CERTIFICATE-----");
+        // Exactly one base64 body line of 64 columns between the armor lines.
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1].len(), 64);
+        // No trailing newline — the caller / writeout owns line termination.
+        assert!(!pem.ends_with('\n'));
+        assert!(pem.ends_with("-----END CERTIFICATE-----"));
+    }
+
+    #[test]
+    fn der_to_pem_wraps_long_body_at_64_columns() {
+        // 150 DER bytes → 200 base64 chars → 64 + 64 + 64 + 8 = 4 body lines,
+        // the first three exactly 64 columns wide (OpenSSL PEM-writer width).
+        let der: Vec<u8> = (0..150).map(|i| (i % 256) as u8).collect();
+        let pem = der_to_pem(&der);
+        let body: Vec<&str> = pem
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        assert_eq!(body.len(), 4);
+        assert_eq!(body[0].len(), 64);
+        assert_eq!(body[1].len(), 64);
+        assert_eq!(body[2].len(), 64);
+        assert_eq!(body[3].len(), 8);
+        // The base64 body is colon-free (so the test417 per-line `stripfile`
+        // `s/^(.*):(.*)//` keeps every PEM line). The armor lines are too.
+        assert!(pem.lines().all(|l| !l.contains(':')));
+    }
+
+    #[test]
+    fn der_to_pem_empty_der_is_empty_armor() {
+        let pem = der_to_pem(&[]);
+        assert_eq!(pem, "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----");
     }
 
     // ---- `select_http_version` precedence: explicit option > ALPN > default ----
@@ -4316,6 +6729,50 @@ mod tests {
     }
 
     #[test]
+    fn redirect_protocol_allowed_enforces_both_masks() {
+        use crate::protocols::{
+            CURLPROTO_ALL, CURLPROTO_FTP, CURLPROTO_FTPS, CURLPROTO_HTTP, CURLPROTO_HTTPS,
+        };
+        // curl's default `CURLOPT_REDIR_PROTOCOLS` = HTTP|HTTPS|FTP|FTPS.
+        const REDIR: u32 = CURLPROTO_HTTP | CURLPROTO_HTTPS | CURLPROTO_FTP | CURLPROTO_FTPS;
+
+        // Defaults (all allowed, default redir set): ordinary HTTP(S) redirects
+        // proceed.
+        assert!(redirect_protocol_allowed("http", CURLPROTO_ALL, REDIR));
+        assert!(redirect_protocol_allowed("https", CURLPROTO_ALL, REDIR));
+        assert!(redirect_protocol_allowed("ftp", CURLPROTO_ALL, REDIR));
+
+        // `--proto-redir -http` clears the HTTP bit from the redir mask: an
+        // `http://` redirect is denied, but `https://` still proceeds (test325).
+        let no_http_redir = REDIR & !CURLPROTO_HTTP;
+        assert!(!redirect_protocol_allowed("http", CURLPROTO_ALL, no_http_redir));
+        assert!(redirect_protocol_allowed(
+            "https",
+            CURLPROTO_ALL,
+            no_http_redir
+        ));
+
+        // A scheme outside the default redir set (e.g. `gopher`) is denied even
+        // when generally allowed — matching curl's restrictive redirect default.
+        assert!(!redirect_protocol_allowed("gopher", CURLPROTO_ALL, REDIR));
+
+        // `--proto -http` (the general allow-list) also denies an HTTP redirect
+        // regardless of the redir mask.
+        assert!(!redirect_protocol_allowed(
+            "http",
+            CURLPROTO_ALL & !CURLPROTO_HTTP,
+            REDIR
+        ));
+
+        // An unknown scheme has no protocol bit and is never allowed.
+        assert!(!redirect_protocol_allowed(
+            "bogus",
+            CURLPROTO_ALL,
+            CURLPROTO_ALL
+        ));
+    }
+
+    #[test]
     fn http_should_fail_matches_curl_rules() {
         // < 400 never fails.
         assert!(!http_should_fail(204, false, true, false, false));
@@ -4333,6 +6790,28 @@ mod tests {
         assert!(http_should_fail(407, false, true, false, false));
         // 407 with a proxy credential is still terminal here.
         assert!(http_should_fail(407, false, true, false, true));
+    }
+
+    #[test]
+    fn failonerror_verdict_defers_intermediate_auth_challenges() {
+        // With deferral OFF, the verdict is exactly `http_should_fail` (the
+        // single-scheme / non-auth path, e.g. test 152): a `401`/`407` fails.
+        assert!(failonerror_verdict(false, 401, false, true, true, false));
+        assert!(failonerror_verdict(false, 407, false, true, false, true));
+        // With deferral ON (a reactive controller is negotiating), an
+        // intermediate `401`/`407` is the server's challenge, not a terminal
+        // error, so the failonerror verdict is suppressed — the negotiation runs
+        // to completion (test 150: the Type-2 `401` must not abort `--fail`).
+        assert!(!failonerror_verdict(true, 401, false, true, true, false));
+        assert!(!failonerror_verdict(true, 407, false, true, false, true));
+        // Deferral only ever masks `401`/`407`. Any other status is decided by
+        // `http_should_fail` unchanged, so a non-auth error still fails even
+        // while a controller is active.
+        assert!(failonerror_verdict(true, 404, false, true, true, false));
+        assert!(failonerror_verdict(true, 500, false, true, true, false));
+        // And a success is never a failure, deferral or not.
+        assert!(!failonerror_verdict(true, 200, false, true, true, false));
+        assert!(!failonerror_verdict(false, 200, false, true, true, false));
     }
 
     #[test]
@@ -4355,6 +6834,19 @@ mod tests {
         assert_eq!(parse_status_code("1.1 NaN Bad"), None);
         // Empty input.
         assert_eq!(parse_status_code(""), None);
+    }
+
+    #[test]
+    fn parse_status_version_encodes_major_minor() {
+        // `<major>*10 + <minor>` (curl's `k->httpversion`).
+        assert_eq!(parse_status_version("1.0 401 Authorization Required"), Some(10));
+        assert_eq!(parse_status_version("1.1 200 OK"), Some(11));
+        // A missing minor defaults to 0 (HTTP/2 status lines carry no minor).
+        assert_eq!(parse_status_version("2 200"), Some(20));
+        assert_eq!(parse_status_version("3 200"), Some(30));
+        // Malformed/empty version token yields None (caller keeps prior value).
+        assert_eq!(parse_status_version(""), None);
+        assert_eq!(parse_status_version("x.y 200"), None);
     }
 
     #[test]
@@ -4439,6 +6931,86 @@ mod tests {
     }
 
     #[test]
+    fn any_custom_header_matches_disable_and_blank_directives() {
+        // The disable directive `-H "host:"` (empty value, lowercase name) must
+        // count as "Host present" so the auto-generated `Host:` is suppressed —
+        // curl's `Curl_checkheaders` matches the name regardless of value.
+        // Oracle: tests/data/test461.
+        assert!(any_custom_header(&["host:".to_string()], "Host"));
+        // The blank-header directive `-H "Accept;"` likewise counts.
+        assert!(any_custom_header(&["Accept;".to_string()], "accept"));
+        // A name with a trailing blank before the colon does NOT match (curl's
+        // `head->data[thislen] == ':'` test fails on the space).
+        assert!(!any_custom_header(&["Host :".to_string()], "Host"));
+        // A leading-colon line (empty name) never matches.
+        assert!(!any_custom_header(&[":bogus".to_string()], "Host"));
+    }
+
+    #[test]
+    fn strip_custom_host_header_removes_only_host_lines() {
+        // A cross-host redirect must drop the application's custom `Host:` so the
+        // auto `Host:` for the new host is emitted (tests 184/185). Only `Host`
+        // lines are removed; all other custom headers are preserved in order.
+        let mut lines = vec![
+            "Host: another.visitor.stay.a.while".to_string(),
+            "X-Trace: 1".to_string(),
+            "Accept: */*".to_string(),
+        ];
+        strip_custom_host_header(&mut lines);
+        assert_eq!(
+            lines,
+            vec!["X-Trace: 1".to_string(), "Accept: */*".to_string()]
+        );
+        // After stripping, the auto `Host:` is no longer suppressed.
+        assert!(!any_custom_header(&lines, "Host"));
+
+        // Case-insensitive name match, and the disable/blank directive forms
+        // (`host:`, `Host;`) are dropped too — matching `any_custom_header`.
+        let mut lc = vec!["host: lower.example".to_string(), "X-Keep: y".to_string()];
+        strip_custom_host_header(&mut lc);
+        assert_eq!(lc, vec!["X-Keep: y".to_string()]);
+        let mut disable = vec!["Host:".to_string(), "Host;".to_string(), "Keep: 1".to_string()];
+        strip_custom_host_header(&mut disable);
+        assert_eq!(disable, vec!["Keep: 1".to_string()]);
+
+        // A header whose NAME merely starts with "Host" (e.g. a hypothetical
+        // `Host-Override:`) is NOT a `Host:` header and must be preserved.
+        let mut similar = vec!["Host-Override: x".to_string()];
+        strip_custom_host_header(&mut similar);
+        assert_eq!(similar, vec!["Host-Override: x".to_string()]);
+    }
+
+    #[cfg(feature = "cookies")]
+    #[test]
+    fn cookie_host_from_header_value_strips_port_and_brackets() {
+        // Plain hostname (curl test 62's `Host: www.host.foo.com`).
+        assert_eq!(
+            cookie_host_from_header_value("www.host.foo.com").as_deref(),
+            Some("www.host.foo.com")
+        );
+        // Hostname with a port ⇒ port stripped.
+        assert_eq!(
+            cookie_host_from_header_value("example.com:8080").as_deref(),
+            Some("example.com")
+        );
+        // IPv6 literal with a port ⇒ brackets and port stripped.
+        assert_eq!(
+            cookie_host_from_header_value("[::1]:8080").as_deref(),
+            Some("::1")
+        );
+        // IPv6 literal without a port ⇒ brackets stripped.
+        assert_eq!(cookie_host_from_header_value("[fe80::1]").as_deref(), Some("fe80::1"));
+        // Surrounding whitespace is trimmed (the value after `Host:`).
+        assert_eq!(
+            cookie_host_from_header_value("  host.example  ").as_deref(),
+            Some("host.example")
+        );
+        // Empty / blank ⇒ no override (fall back to the URL host).
+        assert_eq!(cookie_host_from_header_value(""), None);
+        assert_eq!(cookie_host_from_header_value("   "), None);
+    }
+
+    #[test]
     fn upload_is_chunked_detects_explicit_te_header() {
         let mut data = Easy::new();
         // No headers ⇒ not chunked.
@@ -4454,6 +7026,40 @@ mod tests {
         other.append("Content-Type: text/plain").unwrap();
         data.set.headers = Some(other);
         assert!(!upload_is_chunked(&data));
+    }
+
+    #[test]
+    fn user_transfer_encoding_detects_presence_and_chunked() {
+        // No `Transfer-Encoding` header at all ⇒ None (caller auto-decides).
+        let mut data = Easy::new();
+        assert_eq!(user_transfer_encoding(&data), None);
+
+        let mut other = SList::default();
+        other.append("Content-Type: text/plain").unwrap();
+        data.set.headers = Some(other);
+        assert_eq!(user_transfer_encoding(&data), None);
+
+        // An explicit `Transfer-Encoding: chunked` ⇒ Some(true).
+        let mut chunked = SList::default();
+        chunked.append("Transfer-Encoding: chunked").unwrap();
+        data.set.headers = Some(chunked);
+        assert_eq!(user_transfer_encoding(&data), Some(true));
+
+        // The empty `-H "Transfer-Encoding:"` removal form: present but NOT
+        // chunked ⇒ Some(false). This is the test98 case — it must DISABLE curl's
+        // automatic chunking even for an unknown-length stdin upload, where
+        // `upload_is_chunked` alone (which only sees `Add`) returns false.
+        let mut empty = SList::default();
+        empty.append("Transfer-Encoding:").unwrap();
+        data.set.headers = Some(empty);
+        assert_eq!(user_transfer_encoding(&data), Some(false));
+        assert!(!upload_is_chunked(&data), "the Skip-classified empty form is invisible to upload_is_chunked");
+
+        // Case-insensitive name match and chunked-token detection.
+        let mut mixed = SList::default();
+        mixed.append("transfer-encoding: CHUNKED").unwrap();
+        data.set.headers = Some(mixed);
+        assert_eq!(user_transfer_encoding(&data), Some(true));
     }
 
     #[test]
@@ -4479,10 +7085,16 @@ mod tests {
             h1::RequestBody::Sized(v) => assert!(v.is_empty()),
             _ => panic!("expected empty Sized"),
         }
-        // A chunked body is reduced to an empty Sized body (no bytes on the wire).
-        match suppress_upload_body(&h1::RequestBody::Chunked(b"abc".to_vec())) {
-            h1::RequestBody::Sized(v) => assert!(v.is_empty()),
-            _ => panic!("expected empty Sized"),
+        // A chunked body keeps chunked framing but with NO blocks: the probe
+        // sends only the terminal `0\r\n\r\n` (an empty chunked body), never a
+        // contradictory `Content-Length: 0` alongside `Transfer-Encoding:
+        // chunked` (the `test565` probe — see `suppress_upload_body`).
+        match suppress_upload_body(&h1::RequestBody::Chunked(vec![b"abc".to_vec()], Vec::new())) {
+            h1::RequestBody::Chunked(blocks, trailers) => {
+                assert!(blocks.is_empty());
+                assert!(trailers.is_empty());
+            }
+            _ => panic!("expected empty Chunked"),
         }
         // A streamed body suppresses to an empty Sized probe as well (the
         // exhaustive arm; not reached at runtime since streaming is gated off
@@ -4582,7 +7194,14 @@ mod tests {
         data.set.filesize = -1; // unknown (e.g. `-T -` from stdin)
         let mut src = CountingReader::new(b"hello");
         let body = build_request_body(&data, &mut src, true).unwrap();
-        assert!(matches!(body, h1::RequestBody::Sized(ref v) if v == b"hello"));
+        // An indeterminate upload length auto-selects chunked transfer-encoding
+        // (oracle: `http_req_set_TE`: `req_clen < 0` -> chunked on HTTP/1.1),
+        // buffered as per-read blocks. It is not streamed (no known size) and is
+        // not sent under `Content-Length`.
+        assert!(
+            matches!(&body, h1::RequestBody::Chunked(blocks, _) if blocks.concat() == b"hello"),
+            "unknown-size upload must auto-chunk (buffered)"
+        );
         assert!(src.reads > 0, "buffered path must read the source");
     }
 
@@ -4612,6 +7231,204 @@ mod tests {
         let body = build_request_body(&data, &mut src, true).unwrap();
         assert!(matches!(body, h1::RequestBody::Sized(_)));
         assert!(src.reads > 0);
+    }
+
+    /// `resolve_proxy_auth_inputs` is the proxy analog of
+    /// `resolve_auth_inputs`: it builds a reactive controller seed from
+    /// `CURLOPT_PROXYAUTH` + the proxy credentials, with NO host gating and NO
+    /// bearer scheme. It returns `None` for the challenge-free default
+    /// (`CURLAUTH_BASIC`, handled preemptively) and when no proxy credentials are
+    /// present (tests 81, 162).
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn resolve_proxy_auth_inputs_gates_on_reactive_scheme_and_creds() {
+        use crate::setopt::{apply, CurlOption, OptionValue};
+        let set_str = |data: &mut Easy, opt: CurlOption, v: &str| {
+            apply(&mut data.set, opt, OptionValue::Str(Some(v.to_string()))).unwrap();
+        };
+
+        // Default proxy auth (Basic) with credentials → None (preemptive path).
+        let mut data = Easy::new();
+        data.set.proxyauth = crate::auth::CURLAUTH_BASIC;
+        set_str(&mut data, CurlOption::CURLOPT_PROXYUSERNAME, "puser");
+        set_str(&mut data, CurlOption::CURLOPT_PROXYPASSWORD, "ppass");
+        assert!(
+            auth_engine::resolve_proxy_auth_inputs(&data, None).is_none(),
+            "Basic proxy auth must use the preemptive path, not a controller"
+        );
+
+        // Reactive proxy NTLM with credentials → Some (drives the 407 loop).
+        let mut data = Easy::new();
+        data.set.proxyauth = crate::auth::CURLAUTH_NTLM;
+        set_str(&mut data, CurlOption::CURLOPT_PROXYUSERNAME, "puser");
+        set_str(&mut data, CurlOption::CURLOPT_PROXYPASSWORD, "ppass");
+        assert!(
+            auth_engine::resolve_proxy_auth_inputs(&data, None).is_some(),
+            "NTLM proxy auth with creds must build a reactive controller seed"
+        );
+
+        // Reactive proxy NTLM but NO proxy credentials → None (nothing to try).
+        let mut data = Easy::new();
+        data.set.proxyauth = crate::auth::CURLAUTH_NTLM;
+        assert!(
+            auth_engine::resolve_proxy_auth_inputs(&data, None).is_none(),
+            "no proxy credentials means no reactive proxy auth to attempt"
+        );
+
+        // Reactive proxy Digest with credentials embedded ONLY in the proxy URL
+        // (no `--proxy-user`) → Some, sourced from the fallback (test 335).
+        let mut data = Easy::new();
+        data.set.proxyauth = crate::auth::CURLAUTH_DIGEST;
+        let seed = auth_engine::resolve_proxy_auth_inputs(
+            &data,
+            Some((Some("foo".to_string()), Some("bar".to_string()))),
+        )
+        .expect("proxy-URL userinfo must seed a reactive proxy controller");
+        assert_eq!(seed.user, "foo");
+        assert_eq!(seed.password, "bar");
+
+        // `--proxy-user` (StrId) overrides the proxy-URL userinfo fallback.
+        let mut data = Easy::new();
+        data.set.proxyauth = crate::auth::CURLAUTH_DIGEST;
+        set_str(&mut data, CurlOption::CURLOPT_PROXYUSERNAME, "explicit");
+        set_str(&mut data, CurlOption::CURLOPT_PROXYPASSWORD, "secret");
+        let seed = auth_engine::resolve_proxy_auth_inputs(
+            &data,
+            Some((Some("foo".to_string()), Some("bar".to_string()))),
+        )
+        .expect("explicit proxy creds must seed a reactive proxy controller");
+        assert_eq!(seed.user, "explicit", "--proxy-user overrides URL userinfo");
+        assert_eq!(seed.password, "secret");
+    }
+
+    /// `effective_range` ports curl's `setup_range()`: a `GET`/`HEAD` resume
+    /// offset (`CURLOPT_RESUME_FROM`) becomes the open-ended range string
+    /// `"<n>-"`, while an upload (PUT) resume yields nothing here (it uses
+    /// `Content-Range` instead). The explicit `--range` passthrough is unchanged
+    /// and exercised by the harness `--range` tests.
+    #[test]
+    fn effective_range_synthesizes_resume_range() {
+        // A GET resume offset becomes the open-ended range string "<n>-".
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Get;
+        data.set.set_resume_from = 78;
+        assert_eq!(effective_range(&data).as_deref(), Some("78-"));
+
+        // A HEAD resume likewise synthesizes the range.
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Head;
+        data.set.set_resume_from = 5;
+        assert_eq!(effective_range(&data).as_deref(), Some("5-"));
+
+        // An UPLOAD (PUT) resume does NOT synthesize a bare range here — upload
+        // resume is expressed via Content-Range (a separate path).
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Put;
+        data.set.set_resume_from = 50;
+        assert_eq!(effective_range(&data), None);
+
+        // No range and no resume: nothing.
+        let data = Easy::new();
+        assert_eq!(effective_range(&data), None);
+    }
+
+    /// `effective_content_range` ports the upload arm of curl's `http_range()`:
+    /// a resumed PUT/POST emits `Content-Range: bytes <from>-<total-1>/<total>`,
+    /// where `<total>` is the full declared upload size. This is the
+    /// `tests/data/test33` contract (`-C 50` on a 100-byte PUT ⇒
+    /// `Content-Range: bytes 50-99/100`).
+    #[test]
+    fn effective_content_range_for_resumed_upload() {
+        // The headline test33 case: PUT, 100-byte file, resume from 50.
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Put;
+        data.set.filesize = 100; // CURLOPT_INFILESIZE[_LARGE]
+        data.set.set_resume_from = 50;
+        assert_eq!(
+            effective_content_range(&data, &[]).as_deref(),
+            Some("bytes 50-99/100")
+        );
+
+        // A resumed POST uses the declared POSTFIELDSIZE as the total.
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Post;
+        data.set.postfieldsize = 200;
+        data.set.set_resume_from = 20;
+        assert_eq!(
+            effective_content_range(&data, &[]).as_deref(),
+            Some("bytes 20-199/200")
+        );
+
+        // No resume offset ⇒ no Content-Range.
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Put;
+        data.set.filesize = 100;
+        assert_eq!(effective_content_range(&data, &[]), None);
+
+        // A download (GET) never gets an engine Content-Range (it uses `Range`).
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Get;
+        data.set.set_resume_from = 50;
+        assert_eq!(effective_content_range(&data, &[]), None);
+
+        // Unknown upload size (e.g. `-T -`) ⇒ no Content-Range (nothing to put
+        // in `<total>`).
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Put;
+        data.set.filesize = -1;
+        data.set.set_resume_from = 50;
+        assert_eq!(effective_content_range(&data, &[]), None);
+
+        // A user-supplied custom `Content-Range:` header takes precedence
+        // (curl's `Curl_checkheaders`), so the engine emits none of its own.
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Put;
+        data.set.filesize = 100;
+        data.set.set_resume_from = 50;
+        let custom = vec!["Content-Range: bytes 0-9/10".to_string()];
+        assert_eq!(effective_content_range(&data, &custom), None);
+
+        // A resume offset at/past the end ⇒ no header (the body build reports
+        // `CURLE_PARTIAL_FILE`).
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Put;
+        data.set.filesize = 50;
+        data.set.set_resume_from = 50;
+        assert_eq!(effective_content_range(&data, &[]), None);
+    }
+
+    /// A resumed upload repositions the buffered source to the resume offset
+    /// (curl's `http_resume` → `Curl_creader_resume_from` CANTSEEK fallback:
+    /// read-and-discard the leading bytes) and uploads only the remainder as a
+    /// sized body, so the advertised `Content-Length` is the post-seek size.
+    #[test]
+    fn build_request_body_resume_repositions_and_buffers() {
+        // PUT a 10-byte source, resume from 4 ⇒ the body is the trailing 6 bytes
+        // and the source is fully read (buffered, not streamed).
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Put;
+        data.set.filesize = 10;
+        data.set.set_resume_from = 4;
+        let mut src = CountingReader::new(b"0123456789");
+        let body = build_request_body(&data, &mut src, true).unwrap();
+        match body {
+            h1::RequestBody::Sized(b) => assert_eq!(b, b"456789"),
+            other => panic!("expected Sized(trailing bytes), got {other:?}"),
+        }
+        assert!(src.reads > 0, "resume must take the buffered (read) path");
+
+        // A resume offset at/past the end ⇒ CURLE_PARTIAL_FILE ("File already
+        // completely uploaded").
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Put;
+        data.set.filesize = 5;
+        data.set.set_resume_from = 5;
+        let mut src = CountingReader::new(b"hello");
+        let err = build_request_body(&data, &mut src, true).unwrap_err();
+        assert!(
+            matches!(err, CurlError::PartialFile),
+            "expected PartialFile, got {err:?}"
+        );
     }
 
     /// The HTTP/3 and WebSocket callers pass `allow_stream = false`, so they
@@ -4654,7 +7471,7 @@ mod tests {
             Some(&mut src2),
         )
         .unwrap();
-        assert!(matches!(out2, h1::RequestBody::Chunked(ref v) if v == b"abc"));
+        assert!(matches!(out2, h1::RequestBody::Chunked(ref blocks, _) if blocks.concat() == b"abc"));
 
         // A non-streaming body passes through untouched.
         let passthrough =
@@ -4716,6 +7533,189 @@ mod tests {
     }
 
     #[test]
+    fn hopsink_resume_without_content_range_is_range_error() {
+        // Port of curl's `http_firstwrite`: a resumed GET (`resume_from > 0`)
+        // whose response carries NO `Content-Range` means the server ignored the
+        // requested byte range. The re-sent body must be DISCARDED (the local
+        // file is left untouched) and the transfer flagged with a range error so
+        // the orchestrator returns CURLE_RANGE_ERROR (33). (Regression oracle:
+        // tests/data/test38 — "HTTP resume request without server supporting it".)
+        let mut inner = CapturingSink::default();
+        let mut sink = HopSink::with_auth(&mut inner, true, false);
+        sink.resume_from = 78; // -C - resolved against a 78-byte local file
+        // HTTP/1.0 200 with no Content-Range and no Content-Length (close-delimited).
+        feed_head(&mut sink, &["HTTP/1.0 200 Mooo", "Server: myown/1.0"]);
+        assert_eq!(sink.status, 200);
+        assert!(!sink.content_range_seen);
+        // The first body byte triggers the check: latch the error and signal a
+        // SHORT write (return 0) so the transfer driver aborts the read loop at
+        // once (curl's http_firstwrite returns the error instead of draining the
+        // close-delimited body).
+        assert_eq!(sink.write_body(b"todelooooo lalalala"), 0);
+        assert!(sink.range_error, "missing Content-Range on a resume must error");
+        // The body was discarded — the application sink received nothing.
+        assert!(inner.body.is_empty(), "resumed body must not reach the file");
+    }
+
+    #[test]
+    fn hopsink_resume_with_content_range_forwards_body() {
+        // A resumed GET whose response DOES carry `Content-Range` (a 206 partial)
+        // honored the range: the body is forwarded and no range error is set.
+        let mut inner = CapturingSink::default();
+        let mut sink = HopSink::with_auth(&mut inner, true, false);
+        sink.resume_from = 78;
+        feed_head(
+            &mut sink,
+            &[
+                "HTTP/1.1 206 Partial Content",
+                "Content-Range: bytes 78-99/100",
+                "Content-Length: 22",
+            ],
+        );
+        assert!(sink.content_range_seen);
+        assert_eq!(sink.write_body(b"the-resumed-remainder!"), 22);
+        assert!(!sink.range_error, "an honored range must not error");
+        assert_eq!(inner.body, b"the-resumed-remainder!");
+    }
+
+    #[test]
+    fn hopsink_resume_416_discards_body_is_success() {
+        // Port of curl's `http_firstwrite`: a `416 Range Not Satisfiable` answer
+        // to a resumed GET (`resume_from > 0`) means the file is presumably
+        // already fully downloaded. The error body must be DISCARDED (the local
+        // file is left untouched) and this is a SUCCESS — NOT a range error —
+        // even though the `416` carries a `Content-Range` header (so
+        // `content_range_seen` is true, which would otherwise skip the discard).
+        // curl: `if(resume_from && httpreq == GET && httpcode == 416)
+        //   k->ignorebody = TRUE;`. (Regression oracle: tests/data/test92, test194.)
+        let mut inner = CapturingSink::default();
+        let mut sink = HopSink::with_auth(&mut inner, true, false);
+        sink.resume_from = 87; // -C 87 against an 87-byte local file
+        feed_head(
+            &mut sink,
+            &[
+                "HTTP/1.1 416 Requested Range Not Satisfiable",
+                "Content-Range: bytes */87",
+                "Content-Length: 4",
+            ],
+        );
+        assert_eq!(sink.status, 416);
+        assert!(sink.content_range_seen, "a 416 typically carries Content-Range");
+        // The body is discarded but the write reports success (the response is
+        // Content-Length-delimited and drains on its own — no short-write abort),
+        // and no range error is latched.
+        assert_eq!(sink.write_body(b"bad\n"), 4);
+        assert!(
+            !sink.range_error,
+            "a 416 to a resumed GET is a success, not a range error"
+        );
+        assert!(inner.body.is_empty(), "the 416 error body must not reach the file");
+    }
+
+    #[test]
+    fn hopsink_resume_already_fully_downloaded_is_success() {
+        // The "entire document already downloaded" case: the server ignored the
+        // range (no Content-Range) but the full response size equals the resume
+        // point, so the local file is already complete. curl treats this as a
+        // SUCCESS (no error) while still discarding the redundant body.
+        let mut inner = CapturingSink::default();
+        let mut sink = HopSink::with_auth(&mut inner, true, false);
+        sink.resume_from = 100;
+        feed_head(
+            &mut sink,
+            &["HTTP/1.1 200 OK", "Content-Length: 100"],
+        );
+        assert!(!sink.content_range_seen);
+        assert_eq!(sink.body_size, Some(100));
+        assert_eq!(sink.write_body(b"x"), 1);
+        assert!(
+            !sink.range_error,
+            "size == resume_from means already complete, not an error"
+        );
+        assert!(inner.body.is_empty(), "redundant body must be discarded");
+    }
+
+    #[test]
+    fn hopsink_timecondition_unmet_discards_body_simulates_304() {
+        // Port of curl's `http_firstwrite` time-condition arm: an
+        // `If-Modified-Since` GET (`timecondition == 1`) whose response carries a
+        // `Last-Modified` that is NOT newer than `timevalue` does not satisfy the
+        // condition, so curl simulates a `304` — the headers flow (under `-i`) but
+        // the BODY is discarded and the local file is left untouched. Unlike the
+        // range error this is a SUCCESS, so the discard pretends the bytes were
+        // consumed (returns the length, not 0) and no error latch is set.
+        // (Regression oracle: tests/data/test78 — "HTTP with -z newer date".)
+        let mut inner = CapturingSink::default();
+        let mut sink = HopSink::with_auth(&mut inner, true, false);
+        sink.timecondition = 1; // CURL_TIMECOND_IFMODSINCE
+        sink.timevalue = 944_996_400; // 1999-12-12 11:00:00 GMT (test78 -z value)
+        feed_head(
+            &mut sink,
+            &[
+                "HTTP/1.1 200 OK",
+                // 1990-06-13 — older than the 1999 timevalue => not new enough.
+                "Last-Modified: Tue, 13 Jun 1990 12:10:00 GMT",
+                "Content-Length: 6",
+            ],
+        );
+        assert_eq!(sink.status, 200);
+        assert_eq!(sink.timeofdoc, 645_279_000, "Last-Modified parsed to k->timeofdoc");
+        // The first body byte triggers the check: the body is discarded but the
+        // write reports success (the response is Content-Length-delimited and
+        // drains on its own — no short-write abort).
+        assert_eq!(sink.write_body(b"-foo-\n"), 6);
+        assert!(sink.condition_unmet, "stale doc must flag a simulated 304");
+        assert!(!sink.range_error, "a time-condition miss is a success, not a range error");
+        assert!(inner.body.is_empty(), "the stale body must not reach the file");
+    }
+
+    #[test]
+    fn hopsink_timecondition_met_forwards_body() {
+        // The complement: an `If-Modified-Since` GET whose `Last-Modified` IS
+        // newer than `timevalue` satisfies the condition, so the body is forwarded
+        // normally and no simulated 304 is raised.
+        let mut inner = CapturingSink::default();
+        let mut sink = HopSink::with_auth(&mut inner, true, false);
+        sink.timecondition = 1; // CURL_TIMECOND_IFMODSINCE
+        sink.timevalue = 100_000_000; // 1973 — older than the 1990 document.
+        feed_head(
+            &mut sink,
+            &[
+                "HTTP/1.1 200 OK",
+                "Last-Modified: Tue, 13 Jun 1990 12:10:00 GMT",
+                "Content-Length: 6",
+            ],
+        );
+        assert_eq!(sink.write_body(b"-foo-\n"), 6);
+        assert!(!sink.condition_unmet, "a fresh-enough document must be delivered");
+        assert_eq!(inner.body, b"-foo-\n");
+    }
+
+    #[test]
+    fn hopsink_timecondition_skipped_when_range_present() {
+        // curl gates the client-side time-condition check on `!data->state.range`
+        // (RFC 2616 §13.3.4): when a byte range was also requested the conditional
+        // shortcut is skipped and the body is delivered regardless of the
+        // `Last-Modified` comparison. `range_present` propagates that gate.
+        let mut inner = CapturingSink::default();
+        let mut sink = HopSink::with_auth(&mut inner, true, false);
+        sink.timecondition = 1;
+        sink.timevalue = 944_996_400; // would otherwise be "not new enough"
+        sink.range_present = true; // a range was requested => check is skipped
+        feed_head(
+            &mut sink,
+            &[
+                "HTTP/1.1 200 OK",
+                "Last-Modified: Tue, 13 Jun 1990 12:10:00 GMT",
+                "Content-Length: 6",
+            ],
+        );
+        assert_eq!(sink.write_body(b"-foo-\n"), 6);
+        assert!(!sink.condition_unmet, "a range request disables the time-condition shortcut");
+        assert_eq!(inner.body, b"-foo-\n");
+    }
+
+    #[test]
     fn hopsink_suppresses_followed_redirect_body() {
         // The Issue #4 core: a 3xx with Location, while following is enabled, must
         // NOT leak its intermediate body to the application — only the final hop's
@@ -4736,6 +7736,30 @@ mod tests {
         assert!(inner.body.is_empty());
         // Headers, however, are always forwarded (curl shows hop headers under -i).
         assert!(!inner.headers.is_empty());
+    }
+
+    #[test]
+    fn hopsink_empty_location_is_not_followed() {
+        // A 3xx carrying a blank `Location:` (only whitespace) must NOT be
+        // treated as a redirect target — curl ignores an empty Location and
+        // delivers the 3xx response as the final result rather than chasing it
+        // (which, with the same URL, would loop until max-redirs). The body is
+        // therefore forwarded, not suppressed. (Regression oracle:
+        // tests/data/test54 — "HTTP with blank Location:".)
+        let mut inner = CapturingSink::default();
+        let mut sink = HopSink::with_auth(&mut inner, true, false);
+        // `Location:` with a single trailing space — trimmed to empty.
+        feed_head(
+            &mut sink,
+            &["HTTP/1.1 302 This is a weirdo text message", "Location: "],
+        );
+        assert_eq!(sink.status, 302);
+        // The empty Location was ignored: no follow target recorded.
+        assert!(sink.location.is_none());
+        assert!(!sink.should_suppress());
+        assert!(matches!(sink.decide_disposition(), BodyDisposition::Forward));
+        assert_eq!(sink.write_body(b"This server reply is for testing"), 32);
+        assert_eq!(inner.body, b"This server reply is for testing");
     }
 
     #[test]

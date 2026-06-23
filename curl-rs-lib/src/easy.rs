@@ -67,7 +67,7 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Once;
 
-use crate::conn::Connection;
+use crate::conn::{Connection, Curl_conn_recv, Curl_conn_send, FIRSTSOCKET};
 use crate::error::{CurlError, Result};
 use crate::getinfo::{self, CurlInfo, Info, InfoValue};
 use crate::headers::HeaderCollector;
@@ -75,7 +75,7 @@ use crate::options::CurlOption;
 use crate::protocols::ws::{WsConnState, WsFrameMeta};
 use crate::setopt::{self, CDataPtr, OptionValue, StrId, UserDefined};
 use crate::transfer::{uc_to_curlcode, MultiIoProvider, ReadCallback, WriteCallbacks};
-use crate::url::{CurlUPart, CurlUrl, CURLU_GUESS_SCHEME};
+use crate::url::{CurlUPart, CurlUrl, CURLU_GUESS_SCHEME, CURLU_NON_SUPPORT_SCHEME};
 
 // ===========================================================================
 // ABI constants
@@ -285,6 +285,15 @@ struct EasyState {
     /// once a connection exists. The connection layer sets this on
     /// attach/detach.
     has_connection: bool,
+    /// Minimum HTTP response version seen so far on the CURRENT transfer
+    /// (curl's `data->state.http_neg.rcvd_min`), encoded as `10`/`11`/`20`/`30`
+    /// with `0` meaning "no response seen yet". Once an HTTP/1.0 response is
+    /// observed (`rcvd_min == 10`), every subsequent request in the same
+    /// transfer — an auth-challenge resend or a followed redirect — is sent as
+    /// HTTP/1.0, mirroring curl's `http_may_use_1_1` downgrade. It persists
+    /// across redirect hops (it lives on the transfer, not the connection) and
+    /// is reset to `0` at the start of each HTTP transfer.
+    http_rcvd_min: u8,
 }
 
 /// The easy handle — the Rust backing of the opaque C `CURL` pointer.
@@ -413,6 +422,54 @@ pub struct Easy {
     /// curl shares the multi handle's cache. `Arc<Mutex<…>>` makes it safe to
     /// consult from the per-transfer task on any runtime thread.
     conn_pool: crate::conn::SharedPool,
+
+    /// Whether this handle's `conn_pool` is externally managed *with a
+    /// guaranteed end-of-run drain* (default `false`).
+    ///
+    /// Set to `true` only by [`set_conn_pool`](Easy::set_conn_pool), which the
+    /// CLI calls to inject one shared pool across all transfers of an operation
+    /// **together with** a guaranteed end-of-run `ftp_drain_pool`
+    /// (`operate.rs::run_all_transfers`). When set, the FTP engine defers its
+    /// `QUIT` by checking the still-valid control connection back into that
+    /// shared pool, so a later same-host transfer can reuse it and the single,
+    /// deferred `QUIT` is issued by the drain while that runtime is still live
+    /// (the connection-reuse parity case, `tests/data/test215`).
+    ///
+    /// When unset — the FFI easy-perform path and the multi-interface path,
+    /// neither of which performs such a drain — the FTP engine keeps curl's
+    /// reg-baseline behaviour of sending an **inline `QUIT`** at the end of each
+    /// transfer. This is essential: a connection parked into a pool that is
+    /// never drained would lose its `QUIT` (e.g. `tests/data/test529`), and a
+    /// connection whose socket lives on the multi handle's runtime cannot be
+    /// driven to `QUIT` from a `curl_easy_cleanup` `block_on` on a *different*
+    /// runtime (it would hang, e.g. `tests/data/test539`). Gating on this flag
+    /// confines the deferred-`QUIT`-via-drain mechanism to the one path (the
+    /// CLI) that guarantees a same-runtime drain.
+    pub(crate) external_pool_drain: bool,
+
+    /// Whether the `conn_pool` `Arc` is *owned by this handle itself* (default
+    /// `true` for `new`/`duphandle`) as opposed to being an externally-provided
+    /// shared pool installed via [`set_conn_pool`](Easy::set_conn_pool).
+    ///
+    /// This distinguishes the two "shared pool" owners that may inject a pool
+    /// into a handle, which require different drain semantics:
+    ///
+    /// * The **CLI** (`operate.rs`) installs its own pool via `set_conn_pool`
+    ///   (clearing this flag) *and* owns a guaranteed end-of-run
+    ///   `ftp_drain_pool` on the same runtime. Such a handle must **not** drain
+    ///   its pool itself at `curl_easy_cleanup`.
+    /// * The **multi handle** injects its shared pool only into handles that are
+    ///   still self-owned-and-inert (`pool_is_self_owned_inert`), and drains it
+    ///   itself in `curl_multi_cleanup` on the multi's own runtime.
+    ///
+    /// A self-owned handle driven through the FFI easy-perform path
+    /// ([`should_drain_own_pool`](Easy::should_drain_own_pool)) drains its *own*
+    /// pool at `curl_easy_cleanup`, on the same thread-local runtime that opened
+    /// the sockets — enabling lone-easy cross-`perform` FTP connection reuse
+    /// (`tests/data/test539`, `test541`) while still issuing the deferred `QUIT`
+    /// safely. Preserved across [`reset`](Easy::reset) (which leaves the pool
+    /// fields untouched); reset to the owning default on `duphandle`.
+    pub(crate) owns_conn_pool: bool,
 }
 
 // `Easy` is `Debug` (formerly derived) but the retained-connection fields hold
@@ -459,6 +516,13 @@ impl Easy {
             // A fresh per-handle connection-reuse pool: repeated performs on
             // this handle reuse connections; the CLI may inject a shared one.
             conn_pool: crate::conn::cache::new_shared_pool(4),
+            // Inline-`QUIT` (curl reg-baseline) until the CLI opts this handle
+            // into deferred-`QUIT`-via-drain through `set_conn_pool`.
+            external_pool_drain: false,
+            // A fresh handle owns its private pool, so the FFI easy-perform path
+            // may drain it itself at `curl_easy_cleanup` (lone-easy FTP reuse),
+            // and the multi handle may adopt it via `pool_is_self_owned_inert`.
+            owns_conn_pool: true,
         }
     }
 
@@ -593,6 +657,41 @@ impl Easy {
     pub fn is_paused(&self) -> bool {
         self.state.recv_paused || self.state.send_paused
     }
+
+    /// The minimum HTTP response version observed so far on the current
+    /// transfer (curl's `data->state.http_neg.rcvd_min`): `10`/`11`/`20`/`30`,
+    /// or `0` if no response has been seen yet. The HTTP/1.x engine consults
+    /// this to downgrade a follow-up request (auth resend or redirect) to
+    /// HTTP/1.0 once a `1.0` response has been seen (curl's `http_may_use_1_1`).
+    #[must_use]
+    pub fn http_rcvd_min(&self) -> u8 {
+        self.state.http_rcvd_min
+    }
+
+    /// Record an HTTP response's version (`10`/`11`/`20`/`30`) into the
+    /// transfer's running minimum (curl's `data->state.http_neg.rcvd_min`
+    /// update in `lib/http.c`: `if(!rcvd_min || rcvd_min > k->httpversion)
+    /// rcvd_min = k->httpversion`). Only the HTTP/1.x band (`10`/`11`) affects
+    /// the downgrade decision, but any positive version lowers the running
+    /// minimum exactly as curl does. A non-positive value (no version parsed)
+    /// is ignored.
+    pub fn note_http_response_version(&mut self, version: i64) {
+        if version <= 0 {
+            return;
+        }
+        let v = u8::try_from(version).unwrap_or(u8::MAX);
+        if self.state.http_rcvd_min == 0 || self.state.http_rcvd_min > v {
+            self.state.http_rcvd_min = v;
+        }
+    }
+
+    /// Reset the transfer's running minimum HTTP response version to "unseen"
+    /// (curl initializes `data->state.http_neg` per transfer). Called by the
+    /// HTTP engine at the start of each transfer so a downgrade learned on a
+    /// previous transfer of a reused handle does not leak into the next.
+    pub fn reset_http_rcvd_min(&mut self) {
+        self.state.http_rcvd_min = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +727,7 @@ impl Easy {
             recv_paused: false,
             send_paused: false,
             has_connection: had_connection,
+            http_rcvd_min: 0,
         };
     }
 
@@ -672,6 +772,12 @@ impl Easy {
             // A duplicated handle gets its OWN fresh reuse pool — curl's
             // `curl_easy_duphandle` does not share the source's connection cache.
             conn_pool: crate::conn::cache::new_shared_pool(4),
+            // The duplicate owns a private, un-drained pool, so it must inline-
+            // `QUIT` (the CLI re-opts each fresh per-transfer handle in via
+            // `set_conn_pool`); never inherit the source's drain management.
+            external_pool_drain: false,
+            // Like a fresh handle, a duplicate owns its private pool.
+            owns_conn_pool: true,
         }
     }
 
@@ -992,9 +1098,21 @@ impl Easy {
         } else if let Some(url_str) = self.set.str(StrId::SetUrl) {
             let mut u = CurlUrl::new();
             // curl guesses the scheme for schemeless inputs (e.g. "example.com"
-            // -> "http"); `CURLU_GUESS_SCHEME` reproduces that.
-            u.set(CurlUPart::Url, Some(url_str), CURLU_GUESS_SCHEME)
-                .map_err(uc_to_curlcode)?;
+            // -> "http"); `CURLU_GUESS_SCHEME` reproduces that. `CURLU_NON_SUPPORT_SCHEME`
+            // makes the parser accept an unknown scheme (e.g. `h55p://`) rather
+            // than rejecting it here, matching curl's main URL parse in `parseurl`
+            // (`CURLU_GUESS_SCHEME | CURLU_NON_SUPPORT_SCHEME | …`): the effective
+            // URL and scheme are recorded for `CURLINFO_EFFECTIVE_URL`/`SCHEME`
+            // (and the `%{urle.*}` write-out, test 424), and the unsupported scheme
+            // surfaces as `CURLE_UNSUPPORTED_PROTOCOL` later at handler dispatch
+            // (`perform_transfer_inner`'s `scheme_descriptor` lookup) — the same
+            // exit code (1) the old early rejection produced, just at curl's point.
+            u.set(
+                CurlUPart::Url,
+                Some(url_str),
+                CURLU_GUESS_SCHEME | CURLU_NON_SUPPORT_SCHEME,
+            )
+            .map_err(uc_to_curlcode)?;
             u
         } else {
             return Err(CurlError::UrlMalformat);
@@ -1010,6 +1128,20 @@ impl Easy {
         let scheme = url.get(CurlUPart::Scheme, 0).map_err(uc_to_curlcode)?;
         self.info.scheme =
             Some(CString::new(scheme.to_ascii_uppercase()).map_err(|_| CurlError::UrlMalformat)?);
+
+        // Reject an over-long hostname exactly as curl's `Curl_setup_conn`
+        // (lib/url.c L1699): `strlen(hostname) > MAX_URL_LEN` → `CURLE_URL_MALFORMAT`,
+        // with `MAX_URL_LEN = 0xffff` (65535). A host longer than 65535 bytes
+        // (test 399's 65536-'a' host) is malformed and must fail with exit 3 here,
+        // not surface later as a resolve failure (exit 6). curl performs the check
+        // after the URL parse and skips it when the URL has no host (e.g. `file://`);
+        // a `get(Host)` error (no host) is therefore treated as exempt, and an
+        // empty host (`""`) trivially passes the length bound.
+        if let Ok(host) = url.get(CurlUPart::Host, 0) {
+            if host.len() > 0xffff {
+                return Err(CurlError::UrlMalformat);
+            }
+        }
 
         Ok(())
     }
@@ -1117,6 +1249,59 @@ impl Easy {
     /// shares the multi handle's connection cache across its transfers.
     pub fn set_conn_pool(&mut self, pool: crate::conn::SharedPool) {
         self.conn_pool = pool;
+        // The CLI injects a shared pool *and* guarantees an end-of-run
+        // `ftp_drain_pool` (operate.rs::run_all_transfers). Opt this handle into
+        // deferred-`QUIT`-via-pool-check-in so same-host transfers reuse the
+        // control connection (test215) and its single `QUIT` fires at drain. The
+        // FFI easy-perform/multi paths never call this, so they keep inline
+        // `QUIT` (no parked, never-drained, or cross-runtime connection).
+        self.external_pool_drain = true;
+        // The pool is now externally owned (by the CLI), which performs its own
+        // end-of-run drain; this handle must NOT drain it at `curl_easy_cleanup`.
+        self.owns_conn_pool = false;
+    }
+
+    /// Opt this handle into deferred-`QUIT`-via-pool-check-in for its **own**
+    /// (self-owned) connection pool, used by the FFI easy-perform path.
+    ///
+    /// Unlike [`set_conn_pool`](Easy::set_conn_pool) — which installs an
+    /// *externally* owned shared pool — this leaves `owns_conn_pool` set, so the
+    /// matching `curl_easy_cleanup` drains the handle's own pool on the same
+    /// thread-local runtime that opened its sockets. This enables a lone easy
+    /// handle to reuse one control connection across successive
+    /// `curl_easy_perform` calls (`tests/data/test539`, `test541`), with the
+    /// single deferred `QUIT` issued by [`drain_own_conn_pool`] at cleanup.
+    pub fn enable_self_pool_drain(&mut self) {
+        self.external_pool_drain = true;
+    }
+
+    /// Whether `curl_easy_cleanup` should drain this handle's own connection
+    /// pool: true only when the deferred-`QUIT`-via-drain mechanism is enabled
+    /// ([`enable_self_pool_drain`]) **and** the pool is self-owned (so we never
+    /// drain a pool owned by the CLI or by a multi handle, which run their own
+    /// drains on their own runtimes).
+    #[must_use]
+    pub fn should_drain_own_pool(&self) -> bool {
+        self.external_pool_drain && self.owns_conn_pool
+    }
+
+    /// Whether this handle is eligible to *adopt* a multi handle's shared
+    /// connection pool: true when its pool is still self-owned and no
+    /// deferred-drain has been enabled yet. This excludes CLI handles (which
+    /// already have an externally-owned, CLI-drained pool) so the multi only
+    /// injects its pool into fresh, un-opted handles.
+    #[must_use]
+    pub fn pool_is_self_owned_inert(&self) -> bool {
+        self.owns_conn_pool && !self.external_pool_drain
+    }
+
+    /// Drain this handle's own connection pool, issuing the deferred FTP `QUIT`
+    /// for any parked control connection and force-closing pooled non-FTP
+    /// sockets. MUST be awaited on the same runtime that opened the sockets
+    /// (the FFI easy-perform path's thread-local runtime); the FFI
+    /// `curl_easy_cleanup` does exactly this before dropping the handle.
+    pub async fn drain_own_conn_pool(&self) {
+        crate::protocols::ftp::ftp_drain_pool(&self.conn_pool, self.set.verbose).await;
     }
 
     /// Drive a single transfer to completion, delivering response body/header
@@ -1261,19 +1446,29 @@ impl Easy {
     /// # Errors
     ///
     /// [`CurlError::UnsupportedProtocol`] if no `CONNECT_ONLY` connection is
-    /// attached (the raw byte transport, owned by the connection layer, is wired
-    /// in as it comes online).
-    pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
+    /// attached; [`CurlError::Again`] (→ `CURLE_AGAIN`) when the socket has no
+    /// data ready; plus any transport/`RecvError` from the connection layer. A
+    /// clean close returns `Ok(0)` (curl signals EOF as a zero-length read with
+    /// `CURLE_OK`, which a raw-I/O caller treats as connection-closed).
+    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
         // curl: raw recv requires a CONNECT_ONLY connection (`easy_connection()`);
         // otherwise CURLE_UNSUPPORTED_PROTOCOL.
         if !self.set.connect_only || !self.state.has_connection {
             return Err(CurlError::UnsupportedProtocol);
         }
-        // A CONNECT_ONLY connection is attached, but the raw byte transport lives
-        // in the connection layer and is wired in as it comes online; the read
-        // buffer is intentionally left untouched until then.
-        let _ = buf;
-        Err(CurlError::UnsupportedProtocol)
+        // Read raw bytes straight off the parked connection's filter chain
+        // (socket, plus TLS for an `https`/`wss` CONNECT_ONLY). There is no HTTP
+        // filter on a CONNECT_ONLY connection — `connect_network_scheme` builds
+        // only the transport stack — so this is byte-for-byte the raw transport
+        // curl's `curl_easy_recv` exposes via `Curl_conn_recv`. `get_mut` on the
+        // wrapping mutex never blocks given `&mut self`.
+        let conn = self
+            .connect_only_conn
+            .as_mut()
+            .ok_or(CurlError::UnsupportedProtocol)?
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Curl_conn_recv(conn, FIRSTSOCKET, buf).await
     }
 
     /// `curl_easy_send` — send raw bytes on a `CONNECT_ONLY` connection.
@@ -1287,19 +1482,26 @@ impl Easy {
     /// # Errors
     ///
     /// [`CurlError::UnsupportedProtocol`] if no `CONNECT_ONLY` connection is
-    /// attached (the raw byte transport, owned by the connection layer, is wired
-    /// in as it comes online).
-    pub fn send(&mut self, buf: &[u8]) -> Result<usize> {
+    /// attached; [`CurlError::Again`] (→ `CURLE_AGAIN`) when the socket is not
+    /// writable yet; plus any transport/`SendError` from the connection layer.
+    pub async fn send(&mut self, buf: &[u8]) -> Result<usize> {
         // curl: raw send requires a CONNECT_ONLY connection (`easy_connection()`);
         // otherwise CURLE_UNSUPPORTED_PROTOCOL.
         if !self.set.connect_only || !self.state.has_connection {
             return Err(CurlError::UnsupportedProtocol);
         }
-        // A CONNECT_ONLY connection is attached, but the raw byte transport lives
-        // in the connection layer and is wired in as it comes online; the payload
-        // is intentionally left unsent until then.
-        let _ = buf;
-        Err(CurlError::UnsupportedProtocol)
+        // Write raw bytes straight onto the parked connection's filter chain
+        // (socket, plus TLS for an `https`/`wss` CONNECT_ONLY). With no HTTP
+        // filter present this is the raw transport curl's `curl_easy_send`
+        // exposes via `Curl_conn_send` (`eos = false`). `get_mut` never blocks
+        // under `&mut self`.
+        let conn = self
+            .connect_only_conn
+            .as_mut()
+            .ok_or(CurlError::UnsupportedProtocol)?
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Curl_conn_send(conn, FIRSTSOCKET, buf, false).await
     }
 
     // ----- WebSocket CONNECT_ONLY surface (backs the `curl_ws_*` FFI) ------
@@ -1317,6 +1519,23 @@ impl Easy {
         self.state.has_connection = true;
         self.connect_only_conn = Some(std::sync::Mutex::new(conn));
         self.ws_state = Some(ws);
+    }
+
+    /// Attach a retained plain (non-WebSocket) `CURLOPT_CONNECT_ONLY` connection
+    /// to the handle (the Rust analog of curl's CONNECT_ONLY transfer: after
+    /// `Curl_connect` establishes the connection the multi state machine goes
+    /// straight to `DONE`, leaving `data->conn` live for the application's own
+    /// `curl_easy_send` / `curl_easy_recv`).
+    ///
+    /// Called by [`crate::protocols::http::http_connect_only`] once the transport
+    /// (TCP, or TLS for `https`) is up: the live [`Connection`] is moved onto the
+    /// handle and `has_connection` is set so [`recv`](Self::recv) /
+    /// [`send`](Self::send) observe the attached socket. Unlike
+    /// [`attach_ws_connection`](Self::attach_ws_connection) no RFC 6455 framing
+    /// engine is installed — raw bytes flow directly through the filter chain.
+    pub(crate) fn attach_connect_only(&mut self, conn: Connection) {
+        self.state.has_connection = true;
+        self.connect_only_conn = Some(std::sync::Mutex::new(conn));
     }
 
     /// Whether a live WebSocket context is attached (an active `ws`/`wss`
@@ -1929,35 +2148,47 @@ mod tests {
         assert!(!e.state.recv_paused && !e.state.send_paused);
     }
 
-    #[test]
-    fn recv_send_require_connect_only_connection() {
+    #[tokio::test]
+    async fn recv_send_require_connect_only_connection() {
         let mut e = Easy::new();
         let mut rbuf = [0u8; 8];
         let wbuf = [0u8; 8];
 
         // No CONNECT_ONLY, no connection.
         assert_eq!(
-            e.recv(&mut rbuf).unwrap_err(),
+            e.recv(&mut rbuf).await.unwrap_err(),
             CurlError::UnsupportedProtocol
         );
-        assert_eq!(e.send(&wbuf).unwrap_err(), CurlError::UnsupportedProtocol);
+        assert_eq!(
+            e.send(&wbuf).await.unwrap_err(),
+            CurlError::UnsupportedProtocol
+        );
 
         // CONNECT_ONLY set but still no connection.
         e.set.connect_only = true;
         assert_eq!(
-            e.recv(&mut rbuf).unwrap_err(),
+            e.recv(&mut rbuf).await.unwrap_err(),
             CurlError::UnsupportedProtocol
         );
-        assert_eq!(e.send(&wbuf).unwrap_err(), CurlError::UnsupportedProtocol);
+        assert_eq!(
+            e.send(&wbuf).await.unwrap_err(),
+            CurlError::UnsupportedProtocol
+        );
 
-        // Even with both preconditions, the raw byte transport is not wired in
-        // this layer, so the seam still reports UNSUPPORTED_PROTOCOL.
+        // `connect_only` + `has_connection` both set but no connection actually
+        // parked on the handle (`connect_only_conn` is `None`): the guard passes
+        // but the seam still reports UNSUPPORTED_PROTOCOL — only a real
+        // `attach_connect_only` (driven by `http_connect_only`) wires the raw
+        // transport in.
         e.state.has_connection = true;
         assert_eq!(
-            e.recv(&mut rbuf).unwrap_err(),
+            e.recv(&mut rbuf).await.unwrap_err(),
             CurlError::UnsupportedProtocol
         );
-        assert_eq!(e.send(&wbuf).unwrap_err(), CurlError::UnsupportedProtocol);
+        assert_eq!(
+            e.send(&wbuf).await.unwrap_err(),
+            CurlError::UnsupportedProtocol
+        );
     }
 
     #[test]
@@ -2086,6 +2317,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_drives_http_get_into_sink() {
         let (port, _cap) = spawn_loopback_http(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nhello world".to_vec()]).await;
         let mut e = Easy::new();
@@ -2110,6 +2342,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_404_delivers_body_and_records_code() {
         // Without `--fail`, a 4xx is a successful transfer whose body (the error
         // page) is delivered and whose code is recorded (curl's default).
@@ -2131,6 +2364,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_post_sends_request_body() {
         // Setting CURLOPT_COPYPOSTFIELDS selects POST and supplies the body; the
         // request line and the payload must appear on the wire.
@@ -2160,6 +2394,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_follows_redirect_to_final_body() {
         // End-to-end verification of Issue #4: with following enabled, only the
         // FINAL hop's body reaches the application — the intermediate 301 body is
@@ -2197,6 +2432,7 @@ mod tests {
 
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_head_request_sends_head_and_skips_body() {
         // CURLOPT_NOBODY issues a HEAD; the server replies with headers only (the
         // declared Content-Length describes the would-be GET body). The client
@@ -2223,6 +2459,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_sends_custom_request_headers() {
         // CURLOPT_HTTPHEADER adds/overrides request headers; they must appear on
         // the wire (curl's Curl_add_custom_headers).
@@ -2258,6 +2495,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_reads_eof_framed_body() {
         // A response with no Content-Length and Connection: close frames the body
         // by the connection close (curl's "read until EOF"). The full body must
@@ -2280,6 +2518,7 @@ mod tests {
 
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_1_0_uses_http_1_0_request_line() {
         // CURLOPT_HTTP_VERSION = 1.0 forces the HTTP/1.0 request line.
         let (port, cap) = spawn_loopback_http(vec![
@@ -2305,6 +2544,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_failonerror_returns_error_on_404() {
         // CURLOPT_FAILONERROR makes a 4xx a hard error (CURLE_HTTP_RETURNED_ERROR),
         // exercising http_should_fail on the live response.
@@ -2332,6 +2572,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_basic_auth_sends_authorization_header() {
         // CURLOPT_USERPWD with the default Basic scheme emits the canonical
         // `Authorization: Basic base64(user:pass)` header. base64("user:pass")
@@ -2365,6 +2606,7 @@ mod tests {
 
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_dechunks_chunked_response_body() {
         // A `Transfer-Encoding: chunked` response must be de-chunked before the
         // decoded payload reaches the sink (the chunk sizes/CRLF framing removed).
@@ -2390,6 +2632,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_put_upload_sends_body_with_put_method() {
         // CURLOPT_UPLOAD selects PUT and streams the read source as the request
         // body, framed by CURLOPT_INFILESIZE (a fixed Content-Length).
@@ -2437,6 +2680,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_204_no_content_has_empty_body() {
         // A 204 response is body-less by definition: the engine must not block
         // waiting for a body and must report the 204 status with no payload.
@@ -2460,6 +2704,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_custom_request_sets_method() {
         // CURLOPT_CUSTOMREQUEST overrides the method verb verbatim (here DELETE)
         // while otherwise behaving like the default no-body request.
@@ -2490,6 +2735,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_large_body_reassembled_across_reads() {
         // A body larger than a single socket read must be reassembled intact,
         // exercising the engine's incremental body-write loop.
@@ -2512,6 +2758,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_response_headers_reach_sink() {
         // Response header lines are delivered to the write-callback header path;
         // a custom response header must appear among the captured header lines.
@@ -2670,6 +2917,7 @@ mod tests {
 
     #[cfg(feature = "ftp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_ftp_downloads_file_into_sink() {
         // A passive-mode FTP GET: the control dialog logs in and negotiates EPSV,
         // and the file body arrives on the data channel into the sink.
@@ -2688,6 +2936,7 @@ mod tests {
 
     #[cfg(feature = "ftp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_ftp_lists_directory() {
         // A directory URL (trailing slash) triggers a LIST; the listing body is
         // delivered on the data channel.
@@ -2711,6 +2960,7 @@ mod tests {
 
     #[cfg(feature = "ftp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_ftp_uploads_file_from_source() {
         // CURLOPT_UPLOAD drives a STOR: the read source's bytes must arrive on the
         // server's data channel (the run_upload path).
@@ -2751,6 +3001,7 @@ mod tests {
 
     #[cfg(feature = "gopher")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_gopher_sends_selector_and_reads_body() {
         // Gopher: the client writes a single selector line (CRLF-terminated) then
         // reads the response body, framed by the connection close.
@@ -2872,6 +3123,7 @@ mod tests {
 
     #[cfg(feature = "rtsp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_rtsp_describe_delivers_sdp_body() {
         // DESCRIBE is a body-bearing method: the engine reads the response headers
         // (capturing the CSeq) and then the Content-Length-framed SDP body, which
@@ -2921,6 +3173,7 @@ mod tests {
 
     #[cfg(feature = "rtsp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_rtsp_options_reads_response_headers() {
         // OPTIONS is the default request and carries no body in either direction;
         // the engine sends the request and consumes the header-only response,
@@ -3037,6 +3290,7 @@ mod tests {
 
     #[cfg(feature = "pop3")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_pop3_retrieves_message_body() {
         // `pop3://host/1` issues `RETR 1`; the dot-terminated message body must be
         // delivered to the sink (with the trailing dot terminator removed).
@@ -3063,6 +3317,7 @@ mod tests {
 
     #[cfg(feature = "pop3")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_pop3_lists_mailbox() {
         // `pop3://host/` with no message id issues `LIST`, whose dot-terminated
         // listing body is delivered to the sink.
@@ -3174,6 +3429,7 @@ mod tests {
 
     #[cfg(feature = "imap")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_imap_fetches_message_literal_body() {
         // `imap://user:pass@host/INBOX;UID=1` SELECTs INBOX then `UID FETCH 1
         // BODY[]`; the sized literal body must be delivered to the sink intact.
@@ -3285,6 +3541,7 @@ mod tests {
 
     #[cfg(feature = "smtp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_smtp_sends_message_envelope_and_body() {
         // A full SMTP submit: EHLO → MAIL FROM → RCPT TO → DATA → message body.
         // The uploaded message must arrive on the server's DATA channel.
@@ -3344,6 +3601,7 @@ mod tests {
     // ---- perform_with: HTTP redirect following + POST body ------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_follows_redirect_and_discards_intermediate_body() {
         // CURLOPT_FOLLOWLOCATION: a 301 with a relative Location is followed to
         // the final 200 over a fresh connection. The intermediate 3xx body must
@@ -3407,6 +3665,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_http_post_copypostfields_sends_body() {
         // CURLOPT_COPYPOSTFIELDS selects POST and streams an owned body with a
         // computed Content-Length; the server must observe the POST request line
@@ -3451,6 +3710,7 @@ mod tests {
 
     #[cfg(feature = "ftp")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore)] // real-socket/fd integration test: flaky under Miri net emulation; logic covered by native `cargo test`
     async fn perform_with_ftp_append_upload_sends_body() {
         // CURLOPT_APPEND issues APPE instead of STOR; the uploaded payload must
         // still reach the data channel intact.

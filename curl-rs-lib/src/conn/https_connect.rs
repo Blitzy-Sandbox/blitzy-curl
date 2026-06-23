@@ -557,6 +557,24 @@ impl ConnectionFilter for TlsFilter {
                 host: self.hostname.clone(),
                 port: self.port,
             }),
+            // The verified peer (server) certificate chain in DER form, leaf
+            // first, taken from the `rustls` session this filter retained at
+            // connect. Gated `!is_proxy` so a CONNECT tunnel's proxy-TLS filter
+            // does not shadow the server certificate the application asked
+            // about (the same guard `SslInfo`/`SslCtxInfo` use); the proxy
+            // filter falls through to `delegate_query` and the inner server SSL
+            // filter answers. Backs `CURLINFO_CERTINFO` / `%{certs}`.
+            CfQuery::PeerCerts if !self.is_proxy => Ok(CfQueryResult::PeerCerts(
+                self.tls
+                    .as_ref()
+                    .map(|conn| {
+                        conn.peer_certificates()
+                            .iter()
+                            .map(|cert| cert.as_ref().to_vec())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )),
             CfQuery::SslInfo if !self.is_proxy => {
                 if self.tls.is_some() {
                     Ok(CfQueryResult::SslInfo)

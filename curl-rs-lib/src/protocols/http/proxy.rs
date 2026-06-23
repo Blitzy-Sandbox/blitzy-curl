@@ -211,6 +211,40 @@ pub fn request_target(
     }
 }
 
+/// The origin-form request target (`path[?query]`) used as the **Digest URI**,
+/// independent of any proxy.
+///
+/// curl computes the Digest `uri=` field (and the `HA2 = MD5(method:uri)` hash)
+/// from `data->state.up.path` plus the query — the ORIGIN form — even when a
+/// forward HTTP proxy makes the request *line* carry the absolute URL
+/// (`GET http://host/path HTTP/1.1`). So a Digest auth through a forward proxy
+/// still hashes over `/path`, not `http://host/path`. Both the host (`401`,
+/// `WWW-Authenticate`) and the proxy (`407`, `Proxy-Authenticate`) Digest
+/// challenges use this same origin-form URI (tests 167, 168).
+///
+/// An explicit `--request-target` (`CURLOPT_REQUEST_TARGET` / `STRING_TARGET`)
+/// wins verbatim, exactly as in [`request_target`] (curl sets `path =
+/// STRING_TARGET; query = NULL`). This mirrors the non-proxy (`#else`) arm of
+/// `http_target`, which is what curl's auth code effectively reads.
+pub fn auth_uri_target(url: &CurlUrl, request_target_override: Option<&str>) -> Result<String> {
+    // An explicit request-target is the verbatim URI (curl: `path =
+    // STRING_TARGET; query = NULL`).
+    if let Some(target) = request_target_override {
+        return Ok(target.to_string());
+    }
+    // C: `path = data->state.up.path` (defaults to "/") and the optional query.
+    let path = url
+        .get(CurlUPart::Path, 0)
+        .unwrap_or_else(|_| "/".to_string());
+    let query = url.get(CurlUPart::Query, 0).ok();
+    let mut result = path;
+    if let Some(q) = query {
+        result.push('?');
+        result.push_str(&q);
+    }
+    Ok(result)
+}
+
 /// Returns `true` when `path` already ends with a `;type=<X>` FTP type suffix
 /// whose letter `X` (case-insensitively) is `A`, `D`, or `I`.
 ///

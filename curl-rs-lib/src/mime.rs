@@ -1013,8 +1013,35 @@ impl Mime {
     /// Returns [`CurlError::ReadError`] if a file or callback part cannot be
     /// read while assembling the body, or any encoder error.
     pub fn into_form_body(self) -> Result<Vec<u8>> {
+        self.into_form_body_with_type(b"multipart/form-data")
+    }
+
+    /// Serialize this multipart into the HTTP request **body only** (as
+    /// [`into_form_body`](Mime::into_form_body)) but with a caller-chosen
+    /// top-level content type, mirroring curl's `HTTPREQ_POST_MIME` handling
+    /// in `lib/http.c` where a user-supplied `-H "Content-Type: <type>"`
+    /// overrides the default `multipart/form-data`.
+    ///
+    /// curl strips the `Content-Type:` field name (and its leading spaces) from
+    /// the user header and passes the bare value as `cthdr` to
+    /// `Curl_mime_prepare_headers`. That value drives the *part disposition*:
+    /// the subparts of a `multipart/form-data` container take `form-data`, but
+    /// the subparts of any other top type (here `text/info`) fall through to
+    /// the `attachment` default — see [`prepare_headers`](MimePart::prepare_headers).
+    /// The top type also has the `; boundary=…` parameter appended by curl when
+    /// announced on the request; that announced header is built separately by
+    /// the caller from [`boundary_str`](Mime::boundary_str) (read it *before*
+    /// this call, which consumes the tree). As with `into_form_body`, the
+    /// returned bytes are body-only — no top-level `Content-Type` line is
+    /// emitted into them (`MIME_BODY_ONLY`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CurlError::ReadError`] if a file or callback part cannot be
+    /// read while assembling the body, or any encoder error.
+    pub fn into_form_body_with_type(self, top_content_type: &[u8]) -> Result<Vec<u8>> {
         let mut top = self.into_top_part();
-        top.prepare_headers(Some(b"multipart/form-data"), None, MimeStrategy::Form, false)?;
+        top.prepare_headers(Some(top_content_type), None, MimeStrategy::Form, false)?;
         top.to_bytes()
     }
 }

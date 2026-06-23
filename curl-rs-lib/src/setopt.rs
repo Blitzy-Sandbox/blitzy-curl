@@ -477,7 +477,14 @@ const CURL_HTTP_VERSION_3: i64 = 30;
 const CURL_HTTP_VERSION_3ONLY: i64 = 31;
 
 // Miscellaneous range bounds used by the `LONG` handlers.
-const CURLHEADER_SEPARATE: i64 = 1 << 1;
+// `CURLHEADER_SEPARATE` is the `CURLOPT_HEADEROPT` bit that keeps proxy and
+// server headers separate. The canonical ABI value is `(1L << 0)`
+// (include/curl/curl.h: `#define CURLHEADER_SEPARATE (1L << 0)`); every consumer
+// (the CLI, libtests, C apps) passes `1`, so this MUST be `1 << 0` — using
+// `1 << 1` made `(arg & CURLHEADER_SEPARATE)` evaluate to 0 for the real `1`
+// value and silently cleared `sep_headers` (oracle: tests/data/test287, where
+// `--proxy-header` must take effect on the CONNECT request).
+const CURLHEADER_SEPARATE: i64 = 1 << 0;
 const CURL_REDIR_GET_ALL: i64 = 0;
 const CURL_REDIR_POST_301: i64 = 1;
 const CURL_REDIR_POST_302: i64 = 2;

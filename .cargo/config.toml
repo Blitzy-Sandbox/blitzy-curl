@@ -10,13 +10,21 @@
 # Minimal-change mandate (AAP §0.8.1): nothing beyond what a drop-in libcurl
 # strictly requires. Deliberately NOT configured here:
 #   * target provisioning  -> owned by rust-toolchain.toml / CI (rustup target add)
-#   * cross-compilation linkers -> aarch64-linux is built "via cross"; no linker
-#                                  selection is required here
 #   * [source]/[patch]/vendoring -> none (AAP §0.8.3; matches workspace Cargo.toml)
 #   * any C-TLS/OpenSSL flags -> rustls is the exclusive TLS backend (deny.toml)
 #   * [env] / build-time env vars -> none (AAP §0.8.3). SSL_CERT_FILE and HOME are
 #                                    honored at RUNTIME by curl-rs-lib via std::env,
 #                                    not as build-time configuration.
+#
+# Cross-compilation linker (REQUIRED for the aarch64-linux target): a host
+# (x86_64) toolchain cannot LINK an aarch64 ELF — Rust's default bundled
+# `rust-lld`/host `cc` emit x86-64 objects, so the link fails with
+# "rust-lld: ... incompatible with elf64-x86-64". The aarch64 GNU cross-linker
+# (`aarch64-linux-gnu-gcc`) must therefore be selected explicitly for the
+# `aarch64-unknown-linux-gnu` triple below. This satisfies the AAP §0.8.1
+# four-target build matrix (Linux x86_64 + aarch64, macOS x86_64 + arm64); the
+# two macOS triples are linked on macOS CI runners (a Mach-O `install_name`
+# dylib cannot be produced on Linux — see the macOS note at the end of file).
 
 # --- libcurl SONAME (drop-in shared-library identity) ---
 # curl's libcurl uses SONAME version 4 (lib/Makefile.soname: -version-info 12:0:8,
@@ -37,6 +45,13 @@
 rustflags = ["-C", "link-arg=-Wl,-soname,libcurl.so.4"]
 
 [target.aarch64-unknown-linux-gnu]
+# Select the aarch64 GNU cross-linker so the link step emits aarch64 ELF objects
+# (without this, cargo falls back to the host linker and the link fails with
+# "rust-lld: ... incompatible with elf64-x86-64"). The driver `gcc` is used
+# (rather than `ld` directly) so it pulls in the correct aarch64 crt/libgcc and
+# default library search paths. Provided by the `gcc-aarch64-linux-gnu` package
+# (binary at /usr/bin/aarch64-linux-gnu-gcc).
+linker = "aarch64-linux-gnu-gcc"
 rustflags = ["-C", "link-arg=-Wl,-soname,libcurl.so.4"]
 
 # --- macOS install_name ---

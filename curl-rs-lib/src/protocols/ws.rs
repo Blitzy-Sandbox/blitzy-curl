@@ -2436,8 +2436,10 @@ mod tests {
             CurlError::SendError
         );
         // A new frame while the previous payload is unsent.
-        let mut enc = WsEncoder::default();
-        enc.payload_remain = 3;
+        let mut enc = WsEncoder {
+            payload_remain: 3,
+            ..Default::default()
+        };
         assert_eq!(
             enc.add_frame_head(WSBIT_FIN | WSBIT_OPCODE_TEXT, 1, mask, &mut Vec::new()).unwrap_err().0,
             CurlError::SendError

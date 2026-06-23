@@ -895,15 +895,50 @@ impl ChunkedEncoder {
 #[must_use]
 pub fn encode_chunked(data: &[u8], trailers: Option<&[&[u8]]>) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
-
     // Data chunks (respect the MAXLEN sizing; empty input emits none).
+    append_data_chunks(&mut out, data);
+    // Terminal chunk (with optional trailers).
+    append_terminal_chunk(&mut out, trailers);
+    out
+}
+
+/// Frame a sequence of upload **blocks** as chunked transfer-encoding, emitting
+/// **one chunk per block** (each block split only when it exceeds
+/// [`CURL_CHUNKED_MAXLEN`]) followed by a single terminal chunk.
+///
+/// This preserves the read-callback boundaries on the wire: curl frames each
+/// `CURLOPT_READFUNCTION` return (one `Curl_creader_read`) as its own chunk, so
+/// a callback that returns `"one"`, `"two"`, `"three"`, `"four"` produces four
+/// distinct chunks — not one coalesced chunk. The buffered chunked upload path
+/// (a chunked body that must be resent across an auth challenge or a redirect,
+/// or whose size is unknown) collects those per-read blocks and frames them here
+/// so the emitted wire matches curl byte-for-byte (G6). An empty block list
+/// emits only the terminal `0\r\n\r\n`; empty blocks are never framed as data
+/// chunks (a zero-length chunk *is* the terminator).
+#[must_use]
+pub fn encode_chunked_blocks(blocks: &[Vec<u8>], trailers: Option<&[&[u8]]>) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    for block in blocks {
+        append_data_chunks(&mut out, block);
+    }
+    append_terminal_chunk(&mut out, trailers);
+    out
+}
+
+/// Append the data-chunk framing for `data` (`<hex-size>\r\n<data>\r\n` per
+/// piece, split at [`CURL_CHUNKED_MAXLEN`]); empty input appends nothing, so a
+/// zero-length read is never framed as a (body-terminating) zero-size chunk.
+fn append_data_chunks(out: &mut Vec<u8>, data: &[u8]) {
     for piece in data.chunks(CURL_CHUNKED_MAXLEN) {
         out.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
         out.extend_from_slice(piece);
         out.extend_from_slice(b"\r\n");
     }
+}
 
-    // Terminal chunk.
+/// Append the terminal chunk: the bare `0\r\n\r\n` for `trailers = None`, or
+/// `0\r\n` + each valid trailer line + the closing `\r\n` otherwise.
+fn append_terminal_chunk(out: &mut Vec<u8>, trailers: Option<&[&[u8]]>) {
     match trailers {
         None => out.extend_from_slice(b"0\r\n\r\n"),
         Some(lines) => {
@@ -917,8 +952,6 @@ pub fn encode_chunked(data: &[u8], trailers: Option<&[&[u8]]>) -> Vec<u8> {
             out.extend_from_slice(b"\r\n");
         }
     }
-
-    out
 }
 
 // ===========================================================================
@@ -1396,6 +1429,52 @@ mod tests {
     #[test]
     fn encoder_empty_body_is_bare_last_chunk() {
         assert_eq!(encode_chunked(b"", None), b"0\r\n\r\n");
+    }
+
+    #[test]
+    fn encode_blocks_frames_each_read_as_its_own_chunk() {
+        // The exact `tests/data/test565` upload: a read callback returning
+        // "one", "two", "three", "and a final longer crap: four" must produce
+        // FOUR distinct chunks (not one coalesced chunk), then the terminal.
+        let blocks: Vec<Vec<u8>> = vec![
+            b"one".to_vec(),
+            b"two".to_vec(),
+            b"three".to_vec(),
+            b"and a final longer crap: four".to_vec(),
+        ];
+        assert_eq!(
+            encode_chunked_blocks(&blocks, None),
+            b"3\r\none\r\n3\r\ntwo\r\n5\r\nthree\r\n1d\r\nand a final longer crap: four\r\n0\r\n\r\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn encode_blocks_empty_list_is_bare_terminal() {
+        // The auth-negotiation probe (suppressed body) frames to the lone
+        // terminal chunk — byte-for-byte the `test565` probe body.
+        assert_eq!(encode_chunked_blocks(&[], None), b"0\r\n\r\n".to_vec());
+    }
+
+    #[test]
+    fn encode_blocks_skips_empty_blocks() {
+        // A zero-length block is never framed as a (body-terminating) zero-size
+        // data chunk; only the final terminal carries size 0.
+        let blocks: Vec<Vec<u8>> = vec![b"ab".to_vec(), Vec::new(), b"cd".to_vec()];
+        assert_eq!(
+            encode_chunked_blocks(&blocks, None),
+            b"2\r\nab\r\n2\r\ncd\r\n0\r\n\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn encode_blocks_single_block_matches_flat_encode() {
+        // A one-element block list is identical to encoding the flat buffer.
+        let one = vec![b"data".to_vec()];
+        assert_eq!(
+            encode_chunked_blocks(&one, None),
+            encode_chunked(b"data", None)
+        );
     }
 
     #[test]

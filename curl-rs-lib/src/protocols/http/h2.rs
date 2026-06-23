@@ -745,7 +745,10 @@ impl Drop for H2Connection {
 fn body_has_bytes(body: &RequestBody) -> bool {
     match body {
         RequestBody::None => false,
-        RequestBody::Sized(b) | RequestBody::Chunked(b) => !b.is_empty(),
+        RequestBody::Sized(b) => !b.is_empty(),
+        // A chunked body is held as per-read blocks; it carries bytes when any
+        // block is non-empty.
+        RequestBody::Chunked(blocks, _) => blocks.iter().any(|b| !b.is_empty()),
         // The h2 path materializes a streamed body to a buffered one before it
         // reaches the codec (see `materialize_streaming_body`), so this is not
         // observed at runtime; a known-zero size carries no bytes.
@@ -856,7 +859,11 @@ impl H2Exchange {
         // `DATA` (curl disables `upload_chunky` on the h2 path).
         let bytes = match core::mem::take(&mut self.body) {
             RequestBody::None => Vec::new(),
-            RequestBody::Sized(b) | RequestBody::Chunked(b) => b,
+            RequestBody::Sized(b) => b,
+            // A chunked body's per-read blocks are flattened to the raw payload
+            // (curl disables `upload_chunky` on the h2 path; the bytes ride DATA
+            // frames, not chunk framing).
+            RequestBody::Chunked(blocks, _) => blocks.concat(),
             // A streamed body is materialized to a buffered body before the h2
             // codec runs (`materialize_streaming_body`); unreachable here.
             RequestBody::Streaming { .. } => Vec::new(),
@@ -1407,9 +1414,11 @@ mod tests {
     fn body_has_bytes_drives_end_stream_flag() {
         assert!(!body_has_bytes(&RequestBody::None));
         assert!(!body_has_bytes(&RequestBody::Sized(Vec::new())));
-        assert!(!body_has_bytes(&RequestBody::Chunked(Vec::new())));
+        assert!(!body_has_bytes(&RequestBody::Chunked(Vec::new(), Vec::new())));
+        // An all-empty block list also carries no bytes.
+        assert!(!body_has_bytes(&RequestBody::Chunked(vec![Vec::new()], Vec::new())));
         assert!(body_has_bytes(&RequestBody::Sized(vec![1])));
-        assert!(body_has_bytes(&RequestBody::Chunked(vec![1, 2, 3])));
+        assert!(body_has_bytes(&RequestBody::Chunked(vec![vec![1, 2, 3]], Vec::new())));
     }
 
     #[test]
