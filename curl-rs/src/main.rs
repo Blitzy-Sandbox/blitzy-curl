@@ -111,6 +111,7 @@ mod callbacks;
 mod config;
 mod formparse;
 mod help;
+mod libcurl_src;
 mod messages;
 #[allow(dead_code)]
 mod operate;

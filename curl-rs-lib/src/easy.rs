@@ -75,7 +75,9 @@ use crate::options::CurlOption;
 use crate::protocols::ws::{WsConnState, WsFrameMeta};
 use crate::setopt::{self, CDataPtr, OptionValue, StrId, UserDefined};
 use crate::transfer::{uc_to_curlcode, MultiIoProvider, ReadCallback, WriteCallbacks};
-use crate::url::{CurlUPart, CurlUrl, CURLU_GUESS_SCHEME, CURLU_NON_SUPPORT_SCHEME};
+use crate::url::{
+    CurlUPart, CurlUrl, CURLU_DISALLOW_USER, CURLU_GUESS_SCHEME, CURLU_NON_SUPPORT_SCHEME,
+};
 
 // ===========================================================================
 // ABI constants
@@ -294,6 +296,22 @@ struct EasyState {
     /// across redirect hops (it lives on the transfer, not the connection) and
     /// is reset to `0` at the start of each HTTP transfer.
     http_rcvd_min: u8,
+    /// A pending cross-protocol redirect hand-off (curl's behaviour when a
+    /// followed `Location:` names a scheme handled by a *different* protocol
+    /// engine than the one currently running — e.g. an HTTP response that
+    /// redirects to an `imap://`/`ftp://`/`pop3://` URL under
+    /// `--proto-redir`). curl's `Curl_follow` simply rewrites `data->state.url`
+    /// and lets the top-level transfer loop re-select the handler by the new
+    /// scheme; our protocol engines are dispatched once per `perform` by
+    /// [`perform_transfer_inner`](crate::protocols::perform_transfer_inner),
+    /// so the running engine cannot itself switch protocols. Instead the
+    /// engine deposits the fully-resolved redirect target URL here and returns;
+    /// the dispatcher observes the hand-off, rewrites the handle's URL/scheme
+    /// info, and re-dispatches to the engine for the new scheme. `None`
+    /// whenever no cross-protocol hand-off is pending (the common case). It is
+    /// taken (cleared) by the dispatcher before re-dispatch so a subsequent
+    /// same-protocol redirect within the new engine is unaffected.
+    protocol_handoff: Option<String>,
 }
 
 /// The easy handle — the Rust backing of the opaque C `CURL` pointer.
@@ -607,6 +625,33 @@ impl Easy {
         self.set.str(StrId::SetUrl)
     }
 
+    /// Whether this handle's `ftp://` request will be driven AS HTTP over a
+    /// forward HTTP proxy — curl's `PROTOPT_PROXY_AS_HTTP` handler swap
+    /// (`lib/url.c` create_conn L2377-L2391), after which `CURLINFO_SCHEME`
+    /// reports `http` rather than `ftp`.
+    ///
+    /// This is a *pre-transfer* predicate: it inspects only the configured URL
+    /// and proxy options (no socket is opened), so a caller can learn the
+    /// transfer's effective scheme before `perform`. The CLI needs exactly this
+    /// for `--include` header-echo parity: curl's `tool_header_cb` gates the echo
+    /// on `curl_easy_getinfo(CURLINFO_SCHEME)` being one of {http,https,rtsp,file}
+    /// (`src/tool_cb_hdr.c` L509), but the CLI cannot read `CURLINFO_SCHEME`
+    /// mid-transfer because the easy handle is moved into the async I/O bridge for
+    /// the duration of `perform`. It precomputes this instead. Returns `false`
+    /// (no swap) whenever the `ftp`, `http`, or `proxy` features are not all
+    /// compiled in. Oracle: tests/data/test79, test208, test299.
+    #[must_use]
+    pub fn ftp_driven_as_http_proxy(&self) -> bool {
+        #[cfg(all(feature = "ftp", feature = "http", feature = "proxy"))]
+        {
+            crate::protocols::ftp_driven_as_http_proxy(self)
+        }
+        #[cfg(not(all(feature = "ftp", feature = "http", feature = "proxy")))]
+        {
+            false
+        }
+    }
+
     /// Shared, immutable access to the received-header store.
     #[must_use]
     pub fn headers(&self) -> &HeaderCollector {
@@ -637,6 +682,20 @@ impl Easy {
         self.set.mime_content_type = Some(content_type);
         self.set.method = crate::setopt::HttpReq::PostMime;
         self.set.opt_no_body = false;
+    }
+
+    /// Park a *deferred* content-transfer-encoder error for a mail MIME body.
+    ///
+    /// curl streams a mail message body lazily, so a content-transfer-encoder
+    /// failure (the `7bit` encoder rejecting a high-bit byte, `CURLE_READ_ERROR`)
+    /// is reported by the body reader only after the `MAIL`/`RCPT`/`DATA`
+    /// exchange. Because this core assembles the MIME body eagerly via
+    /// [`Mime::into_mail_body`](crate::mime::Mime::into_mail_body), the CLI/FFI
+    /// seam parks such an error here (alongside an empty body installed with
+    /// [`set_mime_body`](Easy::set_mime_body)); the SMTP/IMAP send path then
+    /// reproduces curl's post-`DATA` `CURLE_READ_ERROR` (`tests/data/test649`).
+    pub fn set_mime_body_read_error(&mut self) {
+        self.set.mime_body_read_error = true;
     }
 
     /// The `Content-Type` programmed alongside a multipart body by
@@ -692,6 +751,30 @@ impl Easy {
     pub fn reset_http_rcvd_min(&mut self) {
         self.state.http_rcvd_min = 0;
     }
+
+    /// Deposit a pending cross-protocol redirect hand-off (see
+    /// [`EasyState::protocol_handoff`]). Called by a protocol engine (e.g. the
+    /// HTTP engine in [`crate::protocols::http`]) when a followed `Location:`
+    /// names a scheme served by a different engine: the engine stores the
+    /// fully-resolved absolute redirect URL here and returns `Ok`, leaving the
+    /// actual transfer of the new scheme to the dispatcher's re-dispatch. The
+    /// `--proto-redir` allow-list is enforced by the depositing engine *before*
+    /// calling this, so a URL present here is already authorized.
+    pub fn set_protocol_handoff(&mut self, url: String) {
+        self.state.protocol_handoff = Some(url);
+    }
+
+    /// Take (and clear) any pending cross-protocol redirect hand-off URL. The
+    /// dispatcher ([`crate::protocols::perform_transfer_inner`]) calls this
+    /// after each engine returns: a `Some` result means the engine handed the
+    /// transfer off to a new scheme, and the dispatcher must rewrite the
+    /// handle's URL/scheme info and re-dispatch. Clearing on take ensures a
+    /// later same-protocol redirect handled internally by the new engine does
+    /// not spuriously re-trigger a hand-off.
+    #[must_use]
+    pub fn take_protocol_handoff(&mut self) -> Option<String> {
+        self.state.protocol_handoff.take()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -728,6 +811,7 @@ impl Easy {
             send_paused: false,
             has_connection: had_connection,
             http_rcvd_min: 0,
+            protocol_handoff: None,
         };
     }
 
@@ -1050,6 +1134,10 @@ impl Easy {
             mimepost: CDataPtr::NULL,
             mime_body: None,
             mime_content_type: None,
+            // The derived serialized body is not inherited (see above), so a
+            // deferred encoder-error marker tied to that body must not carry
+            // over to the dup either.
+            mime_body_read_error: false,
             // dup does not inherit the share handle (curl keeps `data->share`
             // separate from `data->set`, so the clone starts share-less).
             share: None,
@@ -1095,7 +1183,44 @@ impl Easy {
         // there is nothing to transfer.
         let url = if let Some(uh) = self.set.uh.as_ref() {
             uh.clone()
-        } else if let Some(url_str) = self.set.str(StrId::SetUrl) {
+        } else if self.set.str(StrId::SetUrl).is_some() {
+            // `CURLOPT_DEFAULT_PROTOCOL` (`--proto-default`): when set and the
+            // input is not already an absolute URL (no `scheme://`), curl
+            // prepends `"<proto>://"` before parsing (lib/url.c L1660-1669,
+            // guarded by `Curl_is_absolute_url(..., TRUE)`). This makes a
+            // schemeless input such as `--proto-default file /path` resolve to
+            // `file:///path` instead of being mis-guessed as `http` or rejected.
+            //
+            // The prefix must become the *working* URL that the whole transfer
+            // sees, not just `CURLINFO_EFFECTIVE_URL`: the scheme is dispatched
+            // from `info.scheme` (set below), but each protocol handler then
+            // re-parses `data.url()` (the `StrId::SetUrl` slot) for the host /
+            // path. So when a prefix is applied it is written back into that
+            // slot — curl's `data->state.url` working copy — keeping the engine,
+            // the handler, and the effective URL in agreement. The rewrite is
+            // idempotent: a re-`perform` sees an already-absolute URL and the
+            // guard below leaves it untouched. Oracle: tests/data/test1146.
+            //
+            // Owned copies are taken first so the immutable borrows of `self.set`
+            // are released before the (conditional) mutable write-back.
+            let url_str = self
+                .set
+                .str(StrId::SetUrl)
+                .expect("URL present (checked above)")
+                .to_string();
+            let default_proto = self.set.str(StrId::DefaultProtocol).map(str::to_string);
+            let parse_src = match default_proto {
+                Some(proto)
+                    if !proto.is_empty()
+                        && crate::url::is_absolute_url(&url_str, true).0 == 0 =>
+                {
+                    let prefixed = format!("{proto}://{url_str}");
+                    // Adopt the prefixed URL as the working URL for this transfer.
+                    self.set.set_str(StrId::SetUrl, Some(prefixed.clone()));
+                    prefixed
+                }
+                _ => url_str,
+            };
             let mut u = CurlUrl::new();
             // curl guesses the scheme for schemeless inputs (e.g. "example.com"
             // -> "http"); `CURLU_GUESS_SCHEME` reproduces that. `CURLU_NON_SUPPORT_SCHEME`
@@ -1107,12 +1232,23 @@ impl Easy {
             // surfaces as `CURLE_UNSUPPORTED_PROTOCOL` later at handler dispatch
             // (`perform_transfer_inner`'s `scheme_descriptor` lookup) — the same
             // exit code (1) the old early rejection produced, just at curl's point.
-            u.set(
-                CurlUPart::Url,
-                Some(url_str),
-                CURLU_GUESS_SCHEME | CURLU_NON_SUPPORT_SCHEME,
-            )
-            .map_err(uc_to_curlcode)?;
+            // `CURLOPT_DISALLOW_USERNAME_IN_URL` (`--disallow-username-in-url`):
+            // when set, curl passes `CURLU_DISALLOW_USER` to the main URL parse
+            // so a URL carrying userinfo (`user[:pass]@host`) is rejected up
+            // front — the parser returns `CURLUE_USER_NOT_ALLOWED`, which
+            // `uc_to_curlcode` maps to `CURLE_LOGIN_DENIED` (67). Mirrors C
+            // `create_conn` (lib/url.c L1674-1676 building the flag, and the
+            // `CURLUE_USER_NOT_ALLOWED → CURLE_LOGIN_DENIED` arm at L1585-1586).
+            // Oracle: tests/data/test2075.
+            let url_flags = CURLU_GUESS_SCHEME
+                | CURLU_NON_SUPPORT_SCHEME
+                | if self.set.disallow_username_in_url {
+                    CURLU_DISALLOW_USER
+                } else {
+                    0
+                };
+            u.set(CurlUPart::Url, Some(&parse_src), url_flags)
+                .map_err(uc_to_curlcode)?;
             u
         } else {
             return Err(CurlError::UrlMalformat);
@@ -1123,11 +1259,17 @@ impl Easy {
         self.info.effective_url =
             Some(CString::new(effective).map_err(|_| CurlError::UrlMalformat)?);
 
-        // Record the scheme, upper-cased to match curl's `CURLINFO_SCHEME` (the
-        // URL API stores schemes lower-cased; curl reports them upper-cased).
+        // Record the scheme as-is (lower-case) to match curl's `CURLINFO_SCHEME`.
+        // In curl 8.x the info is `data->info.conn_scheme = conn->scheme->name`
+        // (lib/url.c L3627), and `struct Curl_scheme.name` is documented as the
+        // "URL scheme name in lowercase" (lib/urldata.h L516) — e.g. the HTTP
+        // handler is `Curl_scheme_http = { "http", ... }` (lib/http.c L5011-5012).
+        // The URL API already stores the scheme lower-cased, so it is emitted
+        // verbatim here. Oracle: tests/data/test1438 (`--write-out '%{scheme}'`
+        // expects `http`, not `HTTP`).
         let scheme = url.get(CurlUPart::Scheme, 0).map_err(uc_to_curlcode)?;
         self.info.scheme =
-            Some(CString::new(scheme.to_ascii_uppercase()).map_err(|_| CurlError::UrlMalformat)?);
+            Some(CString::new(scheme).map_err(|_| CurlError::UrlMalformat)?);
 
         // Reject an over-long hostname exactly as curl's `Curl_setup_conn`
         // (lib/url.c L1699): `strlen(hostname) > MAX_URL_LEN` → `CURLE_URL_MALFORMAT`,
@@ -1697,6 +1839,19 @@ mod tests {
         assert_eq!(a.url(), b.url());
     }
 
+    #[test]
+    fn set_mime_body_read_error_marks_handle() {
+        // The deferred mail-MIME content-encoder error marker defaults off and is
+        // raised only via `set_mime_body_read_error` (the CLI/FFI `-F` seam parks
+        // a `7bit`-encoder failure here, to be replayed post-`DATA`; test649).
+        let mut e = Easy::new();
+        assert!(!e.set.mime_body_read_error);
+        e.set_mime_body(Vec::new(), String::new());
+        assert!(!e.set.mime_body_read_error);
+        e.set_mime_body_read_error();
+        assert!(e.set.mime_body_read_error);
+    }
+
     // ---- setopt / getinfo -----------------------------------------------
 
     #[test]
@@ -1747,13 +1902,82 @@ mod tests {
             "effective URL = {eff}"
         );
         let scheme = e.info.scheme.as_ref().unwrap().to_str().unwrap();
-        assert_eq!(scheme, "HTTP"); // curl reports the scheme upper-cased
+        assert_eq!(scheme, "http"); // curl reports the scheme lower-cased (test1438)
     }
 
     #[test]
     fn pre_perform_without_url_is_url_malformat() {
         let mut e = Easy::new();
         assert_eq!(e.pre_perform().unwrap_err(), CurlError::UrlMalformat);
+    }
+
+    #[test]
+    fn pre_perform_applies_default_protocol_to_schemeless_url() {
+        // `CURLOPT_DEFAULT_PROTOCOL` ("file") + a schemeless absolute path must
+        // resolve to `file:///path` (curl's `--proto-default file /path`,
+        // oracle tests/data/test1146), not be rejected or mis-guessed.
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_DEFAULT_PROTOCOL,
+            OptionValue::Str(Some("file".to_string())),
+        )
+        .unwrap();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some("/tmp/x.txt".to_string())),
+        )
+        .unwrap();
+        e.pre_perform()
+            .expect("preflight succeeds for a schemeless URL with a default protocol");
+
+        let eff = e.info.effective_url.as_ref().unwrap().to_str().unwrap();
+        assert_eq!(eff, "file:///tmp/x.txt", "effective URL = {eff}");
+        let scheme = e.info.scheme.as_ref().unwrap().to_str().unwrap();
+        assert_eq!(scheme, "file");
+
+        // The prefix must also be written back into the working URL slot
+        // (`StrId::SetUrl`, surfaced by `url()`), because each protocol handler
+        // re-parses that slot for host/path. Without the write-back the file
+        // handler would receive the bare `/tmp/x.txt` and fail. Oracle: test1146.
+        assert_eq!(
+            e.url(),
+            Some("file:///tmp/x.txt"),
+            "working URL must carry the prepended scheme"
+        );
+
+        // Idempotent: a second preflight sees an already-absolute URL and leaves
+        // it untouched (no double-prefixing such as `file://file:///…`).
+        e.pre_perform()
+            .expect("second preflight succeeds and is idempotent");
+        assert_eq!(
+            e.url(),
+            Some("file:///tmp/x.txt"),
+            "re-perform must not re-prefix the working URL"
+        );
+    }
+
+    #[test]
+    fn pre_perform_without_default_protocol_does_not_rewrite_url() {
+        // Guard: with no `CURLOPT_DEFAULT_PROTOCOL`, a schemeless URL is scheme-
+        // guessed for the effective URL but the working `StrId::SetUrl` slot is
+        // left exactly as the caller set it (no spurious write-back).
+        let mut e = Easy::new();
+        e.setopt(
+            CurlOption::CURLOPT_URL,
+            OptionValue::Str(Some("example.com/path".to_string())),
+        )
+        .unwrap();
+        e.pre_perform()
+            .expect("preflight succeeds for a schemeless URL (scheme guessed)");
+
+        let eff = e.info.effective_url.as_ref().unwrap().to_str().unwrap();
+        assert_eq!(eff, "http://example.com/path", "effective URL = {eff}");
+        // Working URL slot is unchanged — no default protocol was set.
+        assert_eq!(
+            e.url(),
+            Some("example.com/path"),
+            "working URL must be untouched without a default protocol"
+        );
     }
 
     #[test]
@@ -1813,7 +2037,11 @@ mod tests {
             other => panic!("expected effective-url string, got {other:?}"),
         }
         match e.getinfo(CurlInfo::Scheme).unwrap() {
-            InfoValue::Str(Some(s)) => assert_eq!(s.to_str().unwrap(), "XYZ"),
+            // C `CURLINFO_SCHEME` returns the scheme lower-cased
+            // (`info.conn_scheme = conn->scheme->name`, lib/url.c L3627; the
+            // handler names are lowercase). The URL API stores `scheme_lower`, so
+            // even an upper-cased input URL reports lowercase here. (test1438.)
+            InfoValue::Str(Some(s)) => assert_eq!(s.to_str().unwrap(), "xyz"),
             other => panic!("expected scheme string, got {other:?}"),
         }
         assert_eq!(
@@ -1901,9 +2129,11 @@ mod tests {
         assert_eq!(sink.body, b"hello from file");
         // Post-transfer info recorded by the handler (`file_do`).
         assert!(e.info.filetime > 0, "filetime recorded for --remote-time");
-        // Preflight still populated the effective URL / scheme.
+        // Preflight still populated the effective URL / scheme. C
+        // `CURLINFO_SCHEME` reports the lower-cased handler name
+        // (`conn->scheme->name`), so `file`, not `FILE`. (test1438.)
         match e.getinfo(CurlInfo::Scheme).unwrap() {
-            InfoValue::Str(Some(s)) => assert_eq!(s.to_str().unwrap(), "FILE"),
+            InfoValue::Str(Some(s)) => assert_eq!(s.to_str().unwrap(), "file"),
             other => panic!("expected scheme string, got {other:?}"),
         }
     }

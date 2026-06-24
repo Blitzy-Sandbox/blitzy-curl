@@ -21,13 +21,13 @@
 //!
 //! # Algorithms
 //!
-//! `MD5`, `MD5-sess`, `SHA-256` and `SHA-256-sess` are fully supported via the
-//! pure-Rust [`crate::util::md5`] / [`crate::util::sha256`] primitives.
-//! `SHA-512-256` (RFC 7616) is gated behind [`HAVE_SHA512_256`]: this revision's
-//! `crate::util::sha256` does not provide the SHA-512/256 truncation, so — just
-//! like a curl build compiled **without** `CURL_HAVE_SHA512_256` — requesting it
-//! returns [`CurlError::NotBuiltIn`]. This is kept in lockstep with
-//! `version.rs`, which reports no SHA-512/256 capability.
+//! `MD5`, `MD5-sess`, `SHA-256`, `SHA-256-sess`, `SHA-512-256` and
+//! `SHA-512-256-sess` (RFC 7616) are all fully supported via the pure-Rust
+//! [`crate::util::md5`] / [`crate::util::sha256`] primitives (the last two use
+//! [`crate::util::sha256::sha512_256it`]). SHA-512/256 is gated behind
+//! [`HAVE_SHA512_256`], which is `true` in this build — exactly like a stock curl
+//! build that defines `CURL_HAVE_SHA512_256` — and is kept in lockstep with
+//! `version.rs`, which reports the `sha512-256` capability.
 //!
 //! # The cnonce and deterministic tests
 //!
@@ -53,7 +53,7 @@ use crate::util::base64::base64_encode;
 use crate::util::dynbuf::DynBuf;
 use crate::util::md5::md5it;
 use crate::util::rand::{rand_bytes, rand_hex};
-use crate::util::sha256::sha256it;
+use crate::util::sha256::{sha256it, sha512_256it};
 use crate::util::strparse::{curlx_str_casecompare, curlx_str_cmp, strcasecompare, Str, StrError};
 
 // ===========================================================================
@@ -100,15 +100,16 @@ const SASL_DIGEST_NONCE_COUNT: &[u8] = b"00000001";
 
 /// Whether this build provides SHA-512/256 (curl's `CURL_HAVE_SHA512_256`).
 ///
-/// `crate::util::sha256` does **not** implement the SHA-512/256 truncation in
-/// this revision, and `version.rs` reports no SHA-512/256 capability, so this is
-/// `false` — exactly matching a curl build compiled without
-/// `CURL_HAVE_SHA512_256`. While it is `false`, requesting the `SHA-512-256` or
-/// `SHA-512-256-SESS` algorithm yields [`CurlError::NotBuiltIn`] (in the
-/// decoder) just as curl returns `CURLE_NOT_BUILT_IN`. When SHA-512/256 is added
-/// to `crate::util::sha256` and surfaced by `version.rs`, flip this to `true` in
-/// lockstep and wire the hashing branch.
-pub const HAVE_SHA512_256: bool = false;
+/// `true` in this build: `crate::util::sha256::sha512_256it` implements the
+/// SHA-512/256 truncation via the pure-Rust RustCrypto `sha2` crate, and
+/// `version.rs` reports the `sha512-256` capability. This exactly matches a stock
+/// curl build that defines `CURL_HAVE_SHA512_256` — the default for the
+/// OpenSSL/rustls/wolfSSL/mbedTLS crypto backends. With it `true`, the
+/// `SHA-512-256` and `SHA-512-256-SESS` algorithms (RFC 7616) are accepted by the
+/// decoder ([`decode_digest_http_message`]) and hashed by [`digest_hash`], just as
+/// curl computes them with `Curl_sha512_256it` paired with
+/// `auth_digest_sha256_to_ascii` in `lib/vauth/digest.c`.
+pub const HAVE_SHA512_256: bool = true;
 
 /// The Digest algorithm, with the curl numeric values preserved exactly.
 ///
@@ -373,9 +374,10 @@ pub fn digest_get_pair(input: &[u8]) -> Option<DigestPair> {
 /// * `nonce`, `realm`, `opaque` — stored de-escaped.
 /// * `stale=true` — sets [`DigestData::stale`] and `nc = 1` (a fresh nonce).
 /// * `qop` — tokenized on `,`; `auth` is preferred, else `auth-int`.
-/// * `algorithm` — mapped to [`Algorithm`]; `SHA-512-256[-SESS]` returns
-///   [`CurlError::NotBuiltIn`] while [`HAVE_SHA512_256`] is `false`; an
-///   unrecognized value returns [`CurlError::BadContentEncoding`].
+/// * `algorithm` — mapped to [`Algorithm`]; `SHA-512-256[-SESS]` is accepted
+///   while [`HAVE_SHA512_256`] is `true` (this build), else returns
+///   [`CurlError::NotBuiltIn`]; an unrecognized value returns
+///   [`CurlError::BadContentEncoding`].
 /// * `userhash=true` — sets [`DigestData::userhash`].
 ///
 /// # Errors
@@ -590,10 +592,12 @@ fn sha256_to_ascii(source: &[u8; 32]) -> Vec<u8> {
 ///
 /// # Errors
 ///
-/// Returns [`CurlError::NotBuiltIn`] for the SHA-512/256 algorithms while
-/// [`HAVE_SHA512_256`] is `false` (matching a curl build without
-/// `CURL_HAVE_SHA512_256`). The decoder rejects those algorithms up front, so
-/// in practice this branch is defensive.
+/// Infallible in this build: `MD5`/`SHA-256`/`SHA-512-256` are all wired, so the
+/// `Result` is always `Ok`. It would only return [`CurlError::NotBuiltIn`] for
+/// the SHA-512/256 algorithms if [`HAVE_SHA512_256`] were `false` (matching a
+/// curl build without `CURL_HAVE_SHA512_256`), but the decoder rejects those
+/// up front in that case, so this signature stays fallible only to mirror curl's
+/// `#ifdef`-gated dispatch.
 fn digest_hash(algo: Algorithm, input: &[u8]) -> Result<Vec<u8>> {
     let raw = algo.raw();
     if raw <= Algorithm::Md5Sess.raw() {
@@ -601,12 +605,14 @@ fn digest_hash(algo: Algorithm, input: &[u8]) -> Result<Vec<u8>> {
     } else if raw <= Algorithm::Sha256Sess.raw() {
         Ok(sha256_to_ascii(&sha256it(input)))
     } else {
-        // ALGO_SHA512_256 / ALGO_SHA512_256SESS. `crate::util::sha256` provides
-        // no SHA-512/256 truncation in this revision (HAVE_SHA512_256 == false),
-        // so — exactly like a curl build without CURL_HAVE_SHA512_256 — it is
-        // not built in. When support is added, flip HAVE_SHA512_256 and hash
-        // here with the SHA-512/256 primitive.
-        Err(CurlError::NotBuiltIn)
+        // ALGO_SHA512_256 / ALGO_SHA512_256SESS. SHA-512/256 produces a 256-bit
+        // (32-byte) digest, so it reuses the SHA-256 hex serialization
+        // (`auth_digest_sha256_to_ascii` in curl). This mirrors curl's
+        // `Curl_auth_create_digest_http_message`, which dispatches the
+        // `algo <= ALGO_SHA512_256SESS` range to `auth_digest_sha256_to_ascii`
+        // paired with `Curl_sha512_256it` (lib/vauth/digest.c). Gated on
+        // [`HAVE_SHA512_256`], which is `true` in this build.
+        Ok(sha256_to_ascii(&sha512_256it(input)))
     }
 }
 
@@ -686,7 +692,8 @@ fn push_raw_field(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
 /// # Errors
 ///
 /// * [`CurlError::NotBuiltIn`] — the SHA-512/256 algorithm is requested while
-///   unsupported (see [`HAVE_SHA512_256`]).
+///   unsupported; never returned in this build, where [`HAVE_SHA512_256`] is
+///   `true` (see [`HAVE_SHA512_256`]).
 /// * [`CurlError::TooLarge`] — the assembled header exceeds curl's 4096-byte cap.
 /// * [`CurlError::BadFunctionArgument`] — no `nonce` is present (the challenge
 ///   must be decoded first via [`decode_digest_http_message`]).
@@ -1490,24 +1497,25 @@ response=d388dad90d4bbd760a152321f2143af7,qop=auth"
     }
 
     #[test]
-    fn sha512_256_returns_not_built_in() {
-        // While HAVE_SHA512_256 is false, decoding a SHA-512-256 challenge fails
-        // exactly like a curl build without CURL_HAVE_SHA512_256.
+    fn sha512_256_is_accepted_and_selected() {
+        // HAVE_SHA512_256 is true (crate::util::sha256::sha512_256it is wired), so
+        // decoding a SHA-512-256 challenge succeeds and selects the algorithm,
+        // exactly like a curl build with CURL_HAVE_SHA512_256.
         let mut d = DigestData::new();
-        let err = decode_digest_http_message(
+        decode_digest_http_message(
             b"realm=\"r\", nonce=\"n\", qop=\"auth\", algorithm=SHA-512-256",
             &mut d,
         )
-        .unwrap_err();
-        assert_eq!(err, CurlError::NotBuiltIn);
+        .unwrap();
+        assert_eq!(d.algo, Algorithm::Sha512_256);
 
         let mut d2 = DigestData::new();
-        let err2 = decode_digest_http_message(
+        decode_digest_http_message(
             b"realm=\"r\", nonce=\"n\", qop=\"auth\", algorithm=SHA-512-256-SESS",
             &mut d2,
         )
-        .unwrap_err();
-        assert_eq!(err2, CurlError::NotBuiltIn);
+        .unwrap();
+        assert_eq!(d2.algo, Algorithm::Sha512_256Sess);
     }
 
     #[test]
@@ -1679,10 +1687,17 @@ opaque=\"op\", algorithm=MD5-sess, userhash=true",
         assert_eq!(digest_hash(Algorithm::Md5Sess, b"").unwrap().len(), 32);
         assert_eq!(digest_hash(Algorithm::Sha256, b"").unwrap().len(), 64);
         assert_eq!(digest_hash(Algorithm::Sha256Sess, b"").unwrap().len(), 64);
-        // SHA-512/256 is not built in.
+        // SHA-512/256 → 64 hex chars (a 32-byte digest, like SHA-256).
+        assert_eq!(digest_hash(Algorithm::Sha512_256, b"").unwrap().len(), 64);
         assert_eq!(
-            digest_hash(Algorithm::Sha512_256, b"").unwrap_err(),
-            CurlError::NotBuiltIn
+            digest_hash(Algorithm::Sha512_256Sess, b"").unwrap().len(),
+            64
+        );
+        // Known FIPS 180-4 vector for SHA-512/256("abc"), hex-encoded, confirms the
+        // hashing branch routes to the SHA-512/256 primitive (not SHA-256).
+        assert_eq!(
+            digest_hash(Algorithm::Sha512_256, b"abc").unwrap(),
+            b"53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23".to_vec()
         );
     }
 }

@@ -1008,12 +1008,16 @@ impl Mime {
     /// `Content-Type: multipart/form-data; boundary=…`) *before* calling this,
     /// since it consumes the tree.
     ///
+    /// `formescape` selects backslash escaping of disposition parameters
+    /// (`CURLMIMEOPT_FORMESCAPE` / `--form-escape`); pass `false` for the
+    /// default WHATWG percent-escaping.
+    ///
     /// # Errors
     ///
     /// Returns [`CurlError::ReadError`] if a file or callback part cannot be
     /// read while assembling the body, or any encoder error.
-    pub fn into_form_body(self) -> Result<Vec<u8>> {
-        self.into_form_body_with_type(b"multipart/form-data")
+    pub fn into_form_body(self, formescape: bool) -> Result<Vec<u8>> {
+        self.into_form_body_with_type(b"multipart/form-data", formescape)
     }
 
     /// Serialize this multipart into the HTTP request **body only** (as
@@ -1039,9 +1043,18 @@ impl Mime {
     ///
     /// Returns [`CurlError::ReadError`] if a file or callback part cannot be
     /// read while assembling the body, or any encoder error.
-    pub fn into_form_body_with_type(self, top_content_type: &[u8]) -> Result<Vec<u8>> {
+    pub fn into_form_body_with_type(
+        self,
+        top_content_type: &[u8],
+        formescape: bool,
+    ) -> Result<Vec<u8>> {
         let mut top = self.into_top_part();
-        top.prepare_headers(Some(top_content_type), None, MimeStrategy::Form, false)?;
+        // `formescape` mirrors `CURLOPT_MIME_OPTIONS` / `CURLMIMEOPT_FORMESCAPE`
+        // (the CLI `--form-escape`): when set, disposition parameter values
+        // (`name=`, `filename=`) are backslash-escaped (`"` -> `\"`, `\` ->
+        // `\\`) instead of the default WHATWG percent-escaping (`"` -> `%22`).
+        // Oracle: tests/data/test1186 / test1189.
+        top.prepare_headers(Some(top_content_type), None, MimeStrategy::Form, formescape)?;
         top.to_bytes()
     }
 
@@ -2570,7 +2583,7 @@ mod tests {
         ]
         .concat();
         // Byte-exact against the canonical expectation.
-        let got = build().into_form_body().expect("serialization succeeds");
+        let got = build().into_form_body(false).expect("serialization succeeds");
         assert_eq!(got, expected);
         // And identical to the established body-only helper.
         assert_eq!(got, form_body(build()));
@@ -2717,6 +2730,34 @@ mod tests {
         let hdrs = part.curl_headers().to_vec();
         assert!(hdrs.contains(&b"Content-Type: application/json".to_vec()));
         assert!(hdrs.contains(&b"Content-Transfer-Encoding: 8bit".to_vec()));
+    }
+
+    #[test]
+    fn into_mail_body_7bit_high_bit_is_read_error() {
+        // The `7bit` content-transfer-encoder rejects any byte with the high bit
+        // set, surfacing `CURLE_READ_ERROR`. `into_mail_body` — the eager
+        // mail-body assembler used by the CLI/FFI `-F` seam — must propagate that
+        // error so the SMTP/IMAP send path can replay it after the `DATA`
+        // go-ahead (`tests/data/test649`).
+        let mut mime = Mime::with_boundary(b"X-BOUNDARY-X");
+        mime.addpart()
+            .set_encoder(Some("7bit"))
+            .unwrap()
+            .set_data(b"contains a high-bit byte: \x80 here")
+            .unwrap();
+        assert!(matches!(
+            mime.into_mail_body(None),
+            Err(CurlError::ReadError)
+        ));
+
+        // A pure-ASCII `7bit` part assembles cleanly (no deferral).
+        let mut ok = Mime::with_boundary(b"X-BOUNDARY-X");
+        ok.addpart()
+            .set_encoder(Some("7bit"))
+            .unwrap()
+            .set_data(b"plain ascii body")
+            .unwrap();
+        assert!(ok.into_mail_body(None).is_ok());
     }
 
     // --- size computation invariant -----------------------------------------

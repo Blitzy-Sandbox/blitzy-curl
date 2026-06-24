@@ -83,7 +83,7 @@ use CurlOption as O;
 /// library module) so this parity-critical translation is self-contained and
 /// auditable against the public headers it cites. Every value is taken from
 /// `include/curl/curl.h` (or `config2setopts.c` where noted).
-mod abi {
+pub(crate) mod abi {
     // -- CURLOPT_SSLVERSION min/max bits [include/curl/curl.h:CURL_SSLVERSION_*]
     /// `CURL_SSLVERSION_TLSv1_0`.
     pub const CURL_SSLVERSION_TLSV1_0: i64 = 4;
@@ -398,7 +398,7 @@ fn proto_token(scheme: &str) -> &'static str {
 /// `CURL_DISABLE_IPFS` build, in which the IPFS branch is compiled out and the
 /// scheme falls straight through `proto_token`. On any URL-parse failure the
 /// scheme resolves to `"?"`, mirroring curl leaving `proto` as `NULL`.
-fn url_proto_and_rewrite(url: &str) -> &'static str {
+pub(crate) fn url_proto_and_rewrite(url: &str) -> &'static str {
     let mut uh = CurlUrl::new();
     if uh
         .set(
@@ -510,7 +510,7 @@ fn ssh_setopts(
 /// When the minimum is unset but the maximum is below 1.2, the minimum is
 /// pulled down to equal the maximum (so an explicit `--tls-max 1.1` is
 /// honored), exactly as curl does.
-fn tlsversion(mintls: u8, maxtls: u8) -> i64 {
+pub(crate) fn tlsversion(mintls: u8, maxtls: u8) -> i64 {
     let mut mintls = mintls;
     if mintls == 0 && maxtls != 0 && maxtls < 3 {
         // Minimum is default but maximum is below 1.2: lower the minimum to
@@ -1493,8 +1493,26 @@ fn setopt_post(
                     } else {
                         Some(SList::try_from_strs(config.headers.iter())?)
                     };
-                    let body = mime.into_mail_body(headers)?;
-                    easy.set_mime_body(body, String::new());
+                    // curl streams the mail MIME body lazily during the `DATA`
+                    // phase, so a content-transfer-encoder error — notably the
+                    // `7bit` encoder rejecting a byte with the high bit set,
+                    // surfaced as `CURLE_READ_ERROR` — is reported only *after*
+                    // `EHLO`/`MAIL`/`RCPT`/`DATA` have been exchanged. This core
+                    // assembles the body eagerly, where that same error would
+                    // otherwise abort *before* any command is sent. Preserve
+                    // curl's observable behavior by parking the error as a
+                    // deferred marker (with an empty body); the SMTP/IMAP send
+                    // path replays it post-`DATA` (`tests/data/test649`). Any
+                    // other (structural) error has no streaming analog and is
+                    // still raised here, as before.
+                    match mime.into_mail_body(headers) {
+                        Ok(body) => easy.set_mime_body(body, String::new()),
+                        Err(CurlError::ReadError) => {
+                            easy.set_mime_body(Vec::new(), String::new());
+                            easy.set_mime_body_read_error();
+                        }
+                        Err(e) => return Err(e),
+                    }
                     return Ok(());
                 }
 
@@ -1547,7 +1565,14 @@ fn setopt_post(
                     custom_ct.map_or(b"multipart/form-data".as_slice(), str::as_bytes);
                 let announced_type = custom_ct.unwrap_or("multipart/form-data");
                 let content_type = format!("{announced_type}; boundary={boundary}");
-                let body = mime.into_form_body_with_type(base_type)?;
+                // `--form-escape` (`CURLOPT_MIME_OPTIONS` / `CURLMIMEOPT_FORMESCAPE`,
+                // stored in `config.mime_options`): backslash-escape disposition
+                // parameter values instead of percent-escaping them, mirroring
+                // curl's `data->set.mime_options` flowing into
+                // `Curl_mime_prepare_headers`. Oracle: tests/data/test1186 /
+                // test1189.
+                let formescape = config.mime_options & crate::args::CURLMIMEOPT_FORMESCAPE != 0;
+                let body = mime.into_form_body_with_type(base_type, formescape)?;
                 easy.set_mime_body(body, content_type);
             }
         }
@@ -1686,13 +1711,18 @@ pub fn config2setopts(
     set_long(easy, O::CURLOPT_NOBODY, i64::from(config.no_body))?;
     // `-i`/`--include` and `-I`/`--head` both set `config.show_headers`. curl's C
     // tool surfaces the response headers via its own `CURLOPT_HEADERFUNCTION`
-    // callback (`tool_cb_hdr.c`), writing them to stdout when `show_headers` is
-    // set. The curl-rs library instead delivers headers on the body stream when
-    // `CURLOPT_HEADER` is enabled (`include_header`), which is byte-identical to
-    // curl's `-i`/`-I` output (status line + header lines + blank line, then the
-    // body for `-i`). Wire the existing flag to that mechanism so `-I`/`-i`
-    // produce the expected header output. (No new flag or behavior is added.)
-    set_long(easy, O::CURLOPT_HEADER, i64::from(config.show_headers))?;
+    // callback (`tool_cb_hdr.c`'s `tool_header_cb`), writing them to the output
+    // stream when `show_headers` is set; it deliberately NEVER sets
+    // `CURLOPT_HEADER`. The header echo is therefore entirely tool-side (Path B in
+    // our `tool_header_cb`), which is what lets it coordinate with `-J`/
+    // Content-Disposition buffering: the buffered-headers path and the live echo
+    // are mutually exclusive in the C tool, so the headers are written exactly
+    // once. Mirroring that, we do NOT enable the core's `CURLOPT_HEADER`
+    // (`include_header`) merge here — doing so would double-write every header
+    // line under `-J` (core merge + tool buffer-flush). The status line, every
+    // header, and the terminating blank line are delivered to `tool_header_cb`
+    // regardless, so `-i`/`-I` output is byte-identical via Path B alone. (No new
+    // flag or behavior is added; this matches curl 8.x exactly.)
     set_str(
         easy,
         O::CURLOPT_XOAUTH2_BEARER,

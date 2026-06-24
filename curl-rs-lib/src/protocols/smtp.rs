@@ -54,7 +54,9 @@ use crate::protocols::{
     SCHEME_SMTPS,
 };
 use crate::setopt::{HttpReq, StrId};
-use crate::transfer::{ReadCallback, ReadStep, UploadReader, WriteCallbacks};
+use crate::transfer::{
+    ClientWriteType, ClientWriter, ReadCallback, ReadStep, UploadReader, WriteCallbacks,
+};
 use crate::url::{CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_URLDECODE};
 
 // ===========================================================================
@@ -185,6 +187,20 @@ pub struct SmtpConn {
     /// (the ping-pong engine exposes no public accessor for its receive
     /// buffer).
     last_final_line: Vec<u8>,
+    /// Accumulated bytes of a non-transfer service-command response
+    /// (`VRFY`/`EXPN`/`NOOP`/`RSET`/`HELP`), captured line-by-line by
+    /// [`classify_response`](SmtpConn::classify_response) while in
+    /// [`SmtpState::Command`].
+    ///
+    /// C writes every response line to the client (`Curl_client_write` with
+    /// `CLIENTWRITE_INFO` in `Curl_pp_readresp`, then the final line with
+    /// `CLIENTWRITE_BODY` in `smtp_state_command_resp`), and for the CLI all of
+    /// those lines surface on stdout. The ping-pong engine trims continuation
+    /// lines from its receive buffer as it scans, so the full multi-line
+    /// response cannot be recovered afterwards; we therefore harvest each line
+    /// here (mirroring IMAP's `data_resp`) and let [`perform_smtp`] deliver the
+    /// accumulated bytes to the client `sink` once the command completes.
+    data_resp: Vec<u8>,
     /// A wire-ready SASL command line queued by the synchronous
     /// [`SaslProto`] hooks, to be flushed by the async driver via
     /// [`PingPong::sendf`].
@@ -197,6 +213,17 @@ pub struct SmtpConn {
     /// this flag is unset; the flag makes that idempotent, so a future engine
     /// that *does* call `connect` first will not trigger a second handshake.
     session_established: bool,
+    /// Set when the transfer was aborted *after* the `DATA` go-ahead (`354`) but
+    /// before the message terminator (`<CRLF>.<CRLF>`) was written — i.e. the
+    /// control channel is stranded mid-`DATA` and can no longer be used cleanly.
+    ///
+    /// In curl such a connection is dropped rather than closed with a graceful
+    /// `QUIT`: `smtp_disconnect` only sends `QUIT` on a connection that is not
+    /// stale/mid-stream. The flag is raised when a deferred MIME body
+    /// content-encoder error (`mime_body_read_error`) fires post-`DATA`
+    /// (`tests/data/test649`, which expects `EHLO`/`MAIL`/`RCPT`/`DATA` and exit
+    /// 26 with **no** `QUIT`), and gates the `QUIT` in [`SmtpProtocol::disconnect`].
+    aborted_in_data: bool,
     /// The mail message body buffered by the transfer driver from the upload
     /// read-callback (`-T`/`CURLOPT_UPLOAD`), staged here for `do_it` to send in
     /// the `DATA` phase.
@@ -339,6 +366,36 @@ pub fn dot_stuff(body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Convert bare line-feeds to CRLF for `--crlf` (`CURLOPT_CRLF`) uploads,
+/// reproducing curl's client reader `cr_lc_read` (`lib/sendf.c` L981-L1056).
+///
+/// Each `\n` is rewritten to `\r\n` **unless** it is immediately preceded by a
+/// `\r` (i.e. it is already part of a CRLF pair), so existing CRLFs are left
+/// intact and only Unix line-ends are upgraded. This conversion is layered
+/// *below* the EOB dot-stuffing reader in curl (`Curl_creader_set_fread` adds
+/// `cr_lc` before `cr_eob_add`), so for the whole-buffer model here it must be
+/// applied to the message body *before* [`dot_stuff`]. Doing so also fixes the
+/// otherwise-spurious blank line that a trailing lone `\n` would create when the
+/// `\r\n.\r\n` terminator is appended (tests/data/test941).
+fn lf_to_crlf(body: &[u8]) -> Vec<u8> {
+    // Reserve a little headroom for the inserted CRs (one per converted LF).
+    let mut out = Vec::with_capacity(body.len() + body.len() / 8 + 2);
+    let mut prev_cr = false;
+    for &b in body {
+        if b == b'\n' && !prev_cr {
+            // A lone LF: insert the missing CR ahead of it (curl's
+            // `Curl_bufq_cwrite(..., "\r\n", ...)`).
+            out.push(b'\r');
+            out.push(b'\n');
+            prev_cr = false;
+        } else {
+            out.push(b);
+            prev_cr = b == b'\r';
+        }
+    }
+    out
+}
+
 /// Split a fully-qualified mailbox into `(local_address, host, suffix)`,
 /// reproducing curl's `smtp_parse_address` (`smtp.c`).
 ///
@@ -403,22 +460,89 @@ fn has_non_ascii(s: &str) -> bool {
     !s.is_ascii()
 }
 
-/// Determine the domain to present in `EHLO`/`HELO` from the URL path,
-/// reproducing `smtp_parse_url_path` (`smtp.c`).
+/// Convert the host part of an already-parsed mailbox to its IDN A-label
+/// (ACE / punycode) form, mirroring `Curl_idnconvert_hostname` as invoked from
+/// `smtp_parse_address` (`lib/smtp.c` L288).
 ///
-/// The path (minus its leading `/`) is URL-decoded and used as the domain. When
-/// the path is empty, curl falls back to the local host name and, failing that,
-/// to `"localhost"`; [`local_domain`] provides the same fallback without
-/// `unsafe`.
-fn domain_from_url(url: &CurlUrl) -> String {
-    let path = url.get(CurlUPart::Path, CURLU_URLDECODE).unwrap_or_default();
-    // The URL path includes the leading '/'; skip it (curl uses `&path[1]`).
-    let trimmed = path.strip_prefix('/').unwrap_or(&path);
-    if trimmed.is_empty() {
-        local_domain()
-    } else {
-        trimmed.to_string()
+/// Returns the wire-ready host together with a `non_ascii` flag reporting
+/// whether *this host* makes the mailbox internationalised for the `SMTPUTF8`
+/// decision — i.e. C's `host.encalloc || !Curl_is_ASCII_name(host.name)`.
+///
+/// curl only runs a *non-ASCII* host through `libidn2`; an ASCII host passes
+/// through verbatim (`encalloc` stays NULL → `non_ascii == false`). The
+/// conversion is best-effort: when the IDN backend rejects the name (or is not
+/// compiled in) curl ignores the failure — `(void)Curl_idnconvert_hostname()`
+/// at `smtp.c` L288 — and continues with the original UTF-8 host. We do the
+/// same: on `Err` we keep the verbatim host, which is then still reported as
+/// `non_ascii` exactly like C's unconverted (still-non-ASCII) `host.name`.
+fn idn_convert_host(host: &str) -> (String, bool) {
+    if host.is_ascii() {
+        // Pure ASCII host: no conversion, `encalloc` stays NULL.
+        return (host.to_string(), false);
     }
+    match crate::idn::to_ascii(host) {
+        // Successfully encoded to ACE: C sets `host.encalloc`, so the mailbox
+        // is flagged internationalised.
+        Ok(ace) => (ace, true),
+        // IDN conversion failed: keep the UTF-8 host verbatim (C's `(void)`
+        // ignore path). The host is still non-ASCII, so the mailbox is flagged.
+        Err(_) => (host.to_string(), true),
+    }
+}
+
+/// `smtp_parse_address`: parse a fully-qualified mailbox into
+/// `(local_address, Option<host_ace>, suffix, non_ascii)`, converting the host
+/// to its IDN A-label form ready for the wire.
+///
+/// The returned `non_ascii` flag is the per-mailbox `SMTPUTF8` predicate from
+/// `smtp_perform_mail` / `smtp_perform_command`:
+/// `host.encalloc || !Curl_is_ASCII_name(address) || !Curl_is_ASCII_name(host.name)`.
+/// The local part is never IDN-encoded (it is carried verbatim, as raw UTF-8
+/// bytes on the wire), matching curl.
+fn parse_address_idn(fqma: &str) -> (String, Option<String>, String, bool) {
+    let (address, host, suffix) = parse_address(fqma);
+    match host {
+        Some(h) => {
+            let (ace, host_non_ascii) = idn_convert_host(&h);
+            // C: encalloc(=host_non_ascii) || non-ASCII local || non-ASCII host.
+            let non_ascii = host_non_ascii || has_non_ascii(&address);
+            (address, Some(ace), suffix, non_ascii)
+        }
+        None => {
+            let non_ascii = has_non_ascii(&address);
+            (address, None, suffix, non_ascii)
+        }
+    }
+}
+
+/// Determine the domain to present in `EHLO`/`HELO` from the URL path,
+/// reproducing `smtp_parse_url_path` (`smtp.c` L182-L199).
+///
+/// C takes the URL path *after* the leading `/` (`&data->state.up.path[1]`)
+/// **without** decoding, and then runs `Curl_urldecode(path, 0, &domain, NULL,
+/// REJECT_CTRL)`. The `REJECT_CTRL` policy makes a percent-encoded control
+/// character — most importantly the CR/LF of an SMTP command-injection attempt
+/// such as `smtp://host/%0d%0a/...` — fail with `CURLE_URL_MALFORMAT`
+/// (tests/data/test931). We mirror that exactly: fetch the raw (undecoded)
+/// path, drop the leading `/`, then [`crate::escape::urldecode`] with
+/// [`UrlReject::Ctrl`](crate::escape::UrlReject::Ctrl).
+///
+/// When the path is empty, curl falls back to the local host name and, failing
+/// that, to `"localhost"`; [`local_domain`] provides the same fallback without
+/// `unsafe`.
+fn domain_from_url(url: &CurlUrl) -> Result<String> {
+    // Raw, undecoded path (flags = 0), matching C reading `up.path` directly.
+    let raw = url.get(CurlUPart::Path, 0).unwrap_or_default();
+    // The URL path includes the leading '/'; skip it (curl uses `&path[1]`).
+    let trimmed = raw.strip_prefix('/').unwrap_or(&raw);
+    if trimmed.is_empty() {
+        return Ok(local_domain());
+    }
+    // URL-decode with control-character rejection (curl's REJECT_CTRL). An
+    // embedded CR/LF (or any byte < 0x20) yields CURLE_URL_MALFORMAT.
+    let decoded = crate::escape::urldecode(trimmed.as_bytes(), crate::escape::UrlReject::Ctrl)?;
+    // REJECT_CTRL guarantees no control bytes remain; the domain is host text.
+    Ok(String::from_utf8_lossy(&decoded).into_owned())
 }
 
 /// Best-effort local host name for the `EHLO`/`HELO` domain, with curl's
@@ -530,8 +654,15 @@ fn parse_url(data: &Easy) -> Result<CurlUrl> {
 
 /// Resolve the `EHLO`/`HELO` domain from the easy handle's URL, falling back to
 /// the local host name (`local_domain`) when the URL cannot be parsed.
-fn ehlo_domain(data: &Easy) -> String {
-    parse_url(data).map_or_else(|_| local_domain(), |url| domain_from_url(&url))
+///
+/// A successfully-parsed URL whose path carries a percent-encoded control
+/// character is rejected with `CURLE_URL_MALFORMAT` by [`domain_from_url`]
+/// (test931); only an unparseable URL takes the local-host fallback.
+fn ehlo_domain(data: &Easy) -> Result<String> {
+    match parse_url(data) {
+        Ok(url) => domain_from_url(&url),
+        Err(_) => Ok(local_domain()),
+    }
 }
 
 /// Resolve the effective username/password, applying curl's precedence: the
@@ -546,6 +677,63 @@ fn resolve_credentials(data: &Easy, url: &CurlUrl) -> (String, String) {
         None => url.get(CurlUPart::Password, CURLU_URLDECODE).unwrap_or_default(),
     };
     (user, passwd)
+}
+
+/// Resolve the effective login `;options` string, mirroring how curl populates
+/// `conn->options`: `CURLOPT_LOGIN_OPTIONS` (`--login-options`, stored in
+/// [`StrId::Options`]) takes precedence over the URL's `;options` component
+/// (for `smtp`/`smtps` this is the `user;AUTH=…` userinfo suffix). Returns
+/// `None` when neither source supplies a non-empty option string.
+fn resolve_login_options(data: &Easy) -> Option<String> {
+    // `--login-options` takes precedence over the URL options when present.
+    if let Some(opts) = data.set.str(StrId::Options) {
+        return Some(opts.to_string());
+    }
+    // Otherwise fall back to the URL's `;options` component.
+    let url_str = data.url()?.to_string();
+    let mut url = CurlUrl::new();
+    url.set(CurlUPart::Url, Some(&url_str), CURLU_DEFAULT_PORT)
+        .ok()?;
+    url.get(CurlUPart::Options, CURLU_URLDECODE)
+        .ok()
+        .filter(|o| !o.is_empty())
+}
+
+/// Parse the URL/login `;options` string, mirroring C `smtp_parse_url_options`
+/// (lib/smtp.c). Iterates `key=value` pairs separated by `;`. The only
+/// recognized key is `AUTH`: `AUTH=<mech>` (or `AUTH=*`) sets the SASL
+/// `prefmech` via [`Sasl::parse_url_auth_option`]. Unlike IMAP/POP3 there is no
+/// `AUTH=+LOGIN` cleartext-preference form for SMTP. An unrecognized key is a
+/// [`CurlError::UrlMalformat`].
+fn parse_url_options(sasl: &mut Sasl, options: &[u8]) -> Result<()> {
+    let n = options.len();
+    let mut ptr = 0usize;
+
+    while ptr < n {
+        let key_start = ptr;
+        while ptr < n && options[ptr] != b'=' {
+            ptr += 1;
+        }
+        // Value begins just after '=' (or at end if there is no '=').
+        let value_start = (ptr + 1).min(n);
+        while ptr < n && options[ptr] != b';' {
+            ptr += 1;
+        }
+        let value = &options[value_start..ptr];
+        let key = &options[key_start..];
+
+        if key.len() >= 5 && key[..5].eq_ignore_ascii_case(b"AUTH=") {
+            sasl.parse_url_auth_option(value)?;
+        } else {
+            return Err(CurlError::UrlMalformat);
+        }
+
+        if ptr < n && options[ptr] == b';' {
+            ptr += 1;
+        }
+    }
+
+    Ok(())
 }
 
 // ===========================================================================
@@ -699,7 +887,17 @@ async fn connect_session(
     {
         let mut sasl = std::mem::take(&mut smtpc.sasl);
         sasl.init(&*smtpc, data.set.httpauth);
+        // C `smtp_connect` calls `smtp_parse_url_options` immediately after
+        // `Curl_sasl_init` (lib/smtp.c L1684): the URL/login `;AUTH=<mech>`
+        // option overrides the default SASL `prefmech`. Without this, a URL
+        // such as `smtp://user;AUTH=EXTERNAL@host` never reaches `prefmech`,
+        // so `SASL_AUTH_DEFAULT` (which excludes EXTERNAL) leaves the
+        // requested mechanism unselectable even when the server offers it.
+        let options = resolve_login_options(data);
+        let opt_bytes = options.as_deref().unwrap_or("");
+        let parse_result = parse_url_options(&mut sasl, opt_bytes.as_bytes());
         smtpc.sasl = sasl;
+        parse_result?;
     }
 
     // --- Server greeting (smtp_state_servergreet_resp). ---
@@ -735,6 +933,19 @@ async fn connect_session(
             smtpc.state = SmtpState::StartTls;
             send_line(data, conn, "STARTTLS").await?;
             let code = read_response(pp, smtpc, data, conn).await?;
+            // Pipelining in the STARTTLS response is forbidden: a server must
+            // not send any bytes after the response and before the TLS
+            // handshake, or those plaintext bytes could be an injection by a
+            // network attacker. Mirrors `smtp_state_starttls_resp`
+            // (`smtp.c` L1169-1171): `if(smtpc->pp.overflow) return
+            // CURLE_WEIRD_SERVER_REPLY;` (tests/data/test980).
+            if pp.has_overflow() {
+                crate::failf!(
+                    &mut conn.filter_data.error_buffer,
+                    "Reply to STARTTLS contained pipelined data"
+                );
+                return Err(CurlError::WeirdServerReply);
+            }
             if code != SMTP_RESP_SERVICE_READY {
                 if use_ssl != CURLUSESSL_TRY {
                     crate::failf!(
@@ -825,7 +1036,9 @@ async fn ensure_session(
         return Ok(());
     }
     if smtpc.domain.is_empty() {
-        smtpc.domain = ehlo_domain(data);
+        // C `smtp_parse_url_path` runs during connect; a percent-encoded
+        // control character in the path aborts here with CURLE_URL_MALFORMAT.
+        smtpc.domain = ehlo_domain(data)?;
     }
     // Make sure the transport (and, for `smtps`, the implicit TLS filter) is
     // connected before any SMTP chatter (`Curl_conn_connect`, idempotent).
@@ -896,7 +1109,10 @@ async fn run_mail_transaction(
     let mut rcpt_had_ok = false;
     let mut rcpt_last_error: i32 = 0;
     for rcpt in &smtp.rcpt {
-        let (address, host, suffix) = parse_address(rcpt);
+        // `smtp_perform_rcpt_to` parses the mailbox and IDN-converts the host
+        // to an A-label; `RCPT TO` never carries the ` SMTPUTF8` parameter
+        // (that lives only on `MAIL FROM`), so the non-ASCII flag is unused.
+        let (address, host, suffix, _) = parse_address_idn(rcpt);
         let cmd = match host {
             Some(ref h) => format!("RCPT TO:<{address}@{h}>{suffix}"),
             None => format!("RCPT TO:<{address}>{suffix}"),
@@ -933,7 +1149,35 @@ async fn run_mail_transaction(
         return Err(CurlError::SendError);
     }
 
+    // A deferred MIME body content-transfer-encoder error (the `7bit` encoder
+    // rejecting a high-bit byte) is replayed here: curl streams the body lazily
+    // and so reports `CURLE_READ_ERROR` only now, with `EHLO`/`MAIL`/`RCPT`/
+    // `DATA` already on the wire (`tests/data/test649`). The control channel is
+    // stranded mid-`DATA` (no `<CRLF>.<CRLF>` was written), so flag the session
+    // to suppress the graceful `QUIT` in `disconnect` — curl drops such a
+    // connection rather than closing it cleanly.
+    if data.set.mime_body_read_error {
+        smtpc.aborted_in_data = true;
+        crate::failf!(
+            &mut conn.filter_data.error_buffer,
+            "Failed to read data from the application"
+        );
+        return Err(CurlError::ReadError);
+    }
+
     // --- Stream the body with EOB escaping, then the terminator. ---
+    // With `--crlf` (`CURLOPT_CRLF`) the upload's bare LFs are first upgraded to
+    // CRLF (curl's `cr_lc` reader, layered below `cr_eob`); this must precede
+    // dot-stuffing so the trailing CRLF merges cleanly with the `.\r\n`
+    // terminator instead of leaving a spurious blank line (test941).
+    let converted;
+    let body: &[u8] = if data.set.crlf {
+        converted = lf_to_crlf(body);
+        &converted
+    } else {
+        body
+    };
+
     // `dot_stuff` produces the on-the-wire bytes including the trailing
     // `<CRLF>.<CRLF>` (cr_eob_read). The body is sent outside the ping-pong
     // command framing.
@@ -959,9 +1203,11 @@ async fn run_mail_transaction(
 /// no-custom branch). `VRFY` takes a bare address (no angle brackets), with the
 /// host appended after `@` and an optional ` SMTPUTF8` for non-ASCII mailboxes.
 fn build_vrfy(smtpc: &SmtpConn, rcpt: &str) -> String {
-    let (address, host, _suffix) = parse_address(rcpt);
-    let utf8 = smtpc.utf8_supported
-        && (has_non_ascii(&address) || host.as_deref().is_some_and(has_non_ascii));
+    // `smtp_perform_command` (no-custom branch) IDN-converts the host and adds
+    // ` SMTPUTF8` per RFC 6531 §3.1 pt 6 when the server supports it and the
+    // mailbox is internationalised (`host.encalloc || non-ASCII local/host`).
+    let (address, host, _suffix, non_ascii) = parse_address_idn(rcpt);
+    let utf8 = smtpc.utf8_supported && non_ascii;
     let utf8_suffix = if utf8 { " SMTPUTF8" } else { "" };
     match host {
         Some(h) => format!("VRFY {address}@{h}{utf8_suffix}"),
@@ -1065,7 +1311,10 @@ impl Protocol for SmtpProtocol {
             // (C `smtp_setup_connection` / the meta allocation in `smtp_connect`).
             let mut smtpc = take_smtp_conn(conn);
             if smtpc.domain.is_empty() {
-                smtpc.domain = ehlo_domain(data);
+                // A percent-encoded control char in the URL path is rejected
+                // here as CURLE_URL_MALFORMAT (test931), matching C's
+                // `smtp_parse_url_path` running during connection setup.
+                smtpc.domain = ehlo_domain(data)?;
             }
             conn.set_proto_state(smtpc);
             Ok(())
@@ -1161,10 +1410,12 @@ impl Protocol for SmtpProtocol {
                     // (SMTPUTF8 / SIZE availability live on `smtpc`).
                     let mut utf8 = false;
                     let from = if let Some(mf) = &mail_from_raw {
-                        let (address, host, suffix) = parse_address(mf);
-                        utf8 = smtpc.utf8_supported
-                            && (has_non_ascii(&address)
-                                || host.as_deref().is_some_and(has_non_ascii));
+                        // `smtp_perform_mail`: parse + IDN-convert the FROM host
+                        // (always, regardless of SMTPUTF8 support) and set the
+                        // envelope `utf8` flag when the server advertised
+                        // SMTPUTF8 and the mailbox is internationalised.
+                        let (address, host, suffix, non_ascii) = parse_address_idn(mf);
+                        utf8 = smtpc.utf8_supported && non_ascii;
                         format_mailbox(&address, host.as_deref(), &suffix)
                     } else {
                         // Null reverse-path, RFC 5321 §3.6.3.
@@ -1179,12 +1430,10 @@ impl Protocol for SmtpProtocol {
                             // Empty AUTH, RFC 2554 §5.
                             Some("<>".to_string())
                         } else {
-                            let (address, host, suffix) = parse_address(raw);
-                            if !utf8
-                                && smtpc.utf8_supported
-                                && (has_non_ascii(&address)
-                                    || host.as_deref().is_some_and(has_non_ascii))
-                            {
+                            // Same IDN conversion + SMTPUTF8 contribution for
+                            // the optional AUTH mailbox (`smtp_perform_mail`).
+                            let (address, host, suffix, non_ascii) = parse_address_idn(raw);
+                            if !utf8 && smtpc.utf8_supported && non_ascii {
                                 utf8 = true;
                             }
                             Some(format_mailbox(&address, host.as_deref(), &suffix))
@@ -1261,9 +1510,11 @@ impl Protocol for SmtpProtocol {
             let mut smtpc = take_smtp_conn(conn);
             // Only attempt a graceful QUIT on a live connection that actually
             // negotiated a session (C `smtp_disconnect`: skip on a dead or
-            // never-started connection). Errors are swallowed — the connection
-            // is going away regardless.
-            if !dead && smtpc.session_established {
+            // never-started connection). A connection stranded mid-`DATA`
+            // (`aborted_in_data`) is likewise skipped — it cannot be closed
+            // cleanly and curl drops it without a `QUIT` (`tests/data/test649`).
+            // Errors are swallowed — the connection is going away regardless.
+            if !dead && smtpc.session_established && !smtpc.aborted_in_data {
                 let mut pp = std::mem::take(&mut smtpc.pp);
                 let _ = perform_quit(&mut pp, &mut smtpc, data, conn).await;
                 smtpc.pp = pp;
@@ -1330,7 +1581,7 @@ fn read_upload_to_end(source: &mut dyn ReadCallback) -> Result<Vec<u8>> {
 /// surfaced by the SMTP handler.
 pub(crate) async fn perform_smtp(
     data: &mut Easy,
-    _sink: &mut dyn WriteCallbacks,
+    sink: &mut dyn WriteCallbacks,
     source: &mut dyn ReadCallback,
 ) -> Result<()> {
     // Resolve the concrete scheme descriptor (`smtps` adds `PROTOPT_SSL`).
@@ -1375,6 +1626,31 @@ pub(crate) async fn perform_smtp(
 
     // (3) The DO phase runs the whole mail transaction / command exchange.
     let result = handler.do_it(data, &mut conn).await.map(|_| ());
+
+    // Deliver any captured service-command response (`VRFY`/`EXPN`/`HELP`/…) to
+    // the client `sink` as body bytes. C writes each response line during
+    // `smtp_state_command_resp` (`CLIENTWRITE_BODY`) plus the per-line
+    // `CLIENTWRITE_INFO` writes in `Curl_pp_readresp`, and for the CLI those
+    // surface on stdout; here the lines were harvested into the connection
+    // state's `data_resp`, so emit them now (honoring `CURLOPT_NOBODY`). A
+    // mail-send transaction captures nothing, so this is a no-op for it.
+    if result.is_ok() && !data.set.opt_no_body {
+        let body = {
+            let mut smtpc = take_smtp_conn(&mut conn);
+            let captured = std::mem::take(&mut smtpc.data_resp);
+            conn.set_proto_state(smtpc);
+            captured
+        };
+        if !body.is_empty() {
+            let mut writer = ClientWriter::with_options(data.set.include_header, false);
+            writer.write(
+                ClientWriteType::BODY.union(ClientWriteType::EOS),
+                &body,
+                sink,
+            )?;
+            data.info.size_download = body.len() as i64;
+        }
+    }
 
     // (4) Finalize (`done` propagates the status) then best-effort `QUIT`.
     //
@@ -1543,6 +1819,13 @@ impl SmtpConn {
             if self.state == SmtpState::Ehlo {
                 parse_ehlo_line(self, line);
             }
+            // Capture the (final) line of a service-command response so the
+            // full reply can be delivered to the client (C `CLIENTWRITE_BODY`
+            // in `smtp_state_command_resp`, plus the per-line `CLIENTWRITE_INFO`
+            // writes). Only the COMMAND state echoes its reply to stdout.
+            if self.state == SmtpState::Command {
+                self.data_resp.extend_from_slice(line);
+            }
             // Stash the final line for the SASL challenge accessor.
             self.last_final_line.clear();
             self.last_final_line.extend_from_slice(line);
@@ -1553,6 +1836,12 @@ impl SmtpConn {
         if line[3] == b'-' && (self.state == SmtpState::Ehlo || self.state == SmtpState::Command) {
             if self.state == SmtpState::Ehlo {
                 parse_ehlo_line(self, line);
+            }
+            // Accumulate continuation lines of a service-command reply too, so
+            // the entire multi-line response (e.g. an ambiguous `VRFY` 553-list
+            // or the `HELP` 214-listing) reaches the client, matching curl.
+            if self.state == SmtpState::Command {
+                self.data_resp.extend_from_slice(line);
             }
             return None;
         }
@@ -1673,6 +1962,57 @@ mod tests {
         }
     }
 
+    // ----- URL ;AUTH= option parsing (smtp_parse_url_options) --------------
+
+    #[test]
+    fn parse_url_options_empty_is_ok() {
+        let mut sasl = Sasl::new();
+        parse_url_options(&mut sasl, b"").expect("empty options string");
+    }
+
+    #[test]
+    fn parse_url_options_auth_mechanism_sets_prefmech() {
+        let mut sasl = Sasl::new();
+        parse_url_options(&mut sasl, b"AUTH=PLAIN").expect("AUTH=PLAIN");
+        assert_ne!(sasl.prefmech, SASL_AUTH_NONE);
+        assert_ne!(sasl.prefmech, SASL_AUTH_DEFAULT);
+    }
+
+    #[test]
+    fn parse_url_options_auth_star_is_default() {
+        let mut sasl = Sasl::new();
+        parse_url_options(&mut sasl, b"AUTH=*").expect("AUTH=*");
+        assert_eq!(sasl.prefmech, SASL_AUTH_DEFAULT);
+    }
+
+    #[test]
+    fn parse_url_options_multiple_auth_options_accumulate() {
+        let mut sasl = Sasl::new();
+        parse_url_options(&mut sasl, b"AUTH=PLAIN;AUTH=LOGIN")
+            .expect("two AUTH options");
+        // Both recognised mechanisms are present in the preference mask.
+        assert_eq!(sasl.prefmech & SASL_MECH_PLAIN, SASL_MECH_PLAIN);
+        assert_eq!(sasl.prefmech & SASL_MECH_LOGIN, SASL_MECH_LOGIN);
+    }
+
+    #[test]
+    fn parse_url_options_unknown_key_is_malformat() {
+        let mut sasl = Sasl::new();
+        assert!(matches!(
+            parse_url_options(&mut sasl, b"FOO=bar"),
+            Err(CurlError::UrlMalformat)
+        ));
+    }
+
+    #[test]
+    fn parse_url_options_unknown_mechanism_is_malformat() {
+        let mut sasl = Sasl::new();
+        assert!(matches!(
+            parse_url_options(&mut sasl, b"AUTH=BOGUSMECH"),
+            Err(CurlError::UrlMalformat)
+        ));
+    }
+
     // ----- dot-stuffing (cr_eob_read parity) -------------------------------
 
     #[test]
@@ -1760,6 +2100,102 @@ mod tests {
     fn has_non_ascii_detects_utf8() {
         assert!(!has_non_ascii("plain.ascii@host"));
         assert!(has_non_ascii("nø[email protected]"));
+    }
+
+    // ----- IDN host conversion (smtp_parse_address / SMTPUTF8 predicate) ----
+
+    #[test]
+    fn idn_convert_host_passes_ascii_through_unchanged() {
+        // ASCII host: no conversion, `encalloc` (non_ascii flag) stays false.
+        assert_eq!(idn_convert_host("example.com"), ("example.com".into(), false));
+        // Case and trailing dot are preserved exactly (curl never runs ASCII
+        // names through libidn2).
+        assert_eq!(idn_convert_host("EXAMPLE.com."), ("EXAMPLE.com.".into(), false));
+    }
+
+    #[cfg(feature = "idn")]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn idn_convert_host_encodes_non_ascii_to_ace() {
+        // tests/data/test962-967: åäö.se -> xn--4cab6c.se, flagged non-ASCII.
+        let aao = format!("{}{}{}.se", '\u{e5}', '\u{e4}', '\u{f6}');
+        assert_eq!(idn_convert_host(&aao), ("xn--4cab6c.se".into(), true));
+    }
+
+    #[test]
+    fn parse_address_idn_ascii_local_and_host_is_not_flagged() {
+        // Fully ASCII mailbox: host unchanged, SMTPUTF8 predicate false.
+        let (addr, host, suffix, non_ascii) = parse_address_idn("sender@example.com");
+        assert_eq!(addr, "sender");
+        assert_eq!(host.as_deref(), Some("example.com"));
+        assert_eq!(suffix, "");
+        assert!(!non_ascii);
+    }
+
+    #[test]
+    fn parse_address_idn_non_ascii_local_flags_utf8() {
+        // A non-ASCII *local* part flags the mailbox even with an ASCII host
+        // (C `!Curl_is_ASCII_name(address)`). The local part is never encoded.
+        let local = format!("Avs{}ndaren", '\u{e4}');
+        let (addr, host, _suffix, non_ascii) =
+            parse_address_idn(&format!("{local}@example.com"));
+        assert_eq!(addr, local);
+        assert_eq!(host.as_deref(), Some("example.com"));
+        assert!(non_ascii);
+    }
+
+    #[cfg(feature = "idn")]
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn parse_address_idn_converts_host_and_flags_utf8() {
+        // tests/data/test963/966: ASCII local, non-ASCII host -> ACE host,
+        // mailbox flagged (host.encalloc set).
+        let aao = format!("{}{}{}.se", '\u{e5}', '\u{e4}', '\u{f6}');
+        let (addr, host, _suffix, non_ascii) =
+            parse_address_idn(&format!("recipient@{aao}"));
+        assert_eq!(addr, "recipient");
+        assert_eq!(host.as_deref(), Some("xn--4cab6c.se"));
+        assert!(non_ascii);
+    }
+
+    #[test]
+    fn parse_address_idn_no_host_uses_local_only() {
+        let (addr, host, _suffix, non_ascii) = parse_address_idn("Postmaster");
+        assert_eq!(addr, "Postmaster");
+        assert!(host.is_none());
+        assert!(!non_ascii);
+    }
+
+    // ----- --crlf line-ending conversion (cr_lc_read) ----------------------
+
+    #[test]
+    fn lf_to_crlf_upgrades_lone_lf() {
+        assert_eq!(lf_to_crlf(b"a\nb\n"), b"a\r\nb\r\n");
+    }
+
+    #[test]
+    fn lf_to_crlf_preserves_existing_crlf() {
+        // An LF already preceded by CR is left intact (no doubled CR).
+        assert_eq!(lf_to_crlf(b"a\r\nb\r\n"), b"a\r\nb\r\n");
+    }
+
+    #[test]
+    fn lf_to_crlf_mixed_endings() {
+        // Mix of CRLF and lone LF: only the bare LFs are upgraded.
+        assert_eq!(lf_to_crlf(b"x\r\ny\nz"), b"x\r\ny\r\nz");
+        // A lone trailing CR is untouched.
+        assert_eq!(lf_to_crlf(b"end\r"), b"end\r");
+        // Empty input stays empty.
+        assert_eq!(lf_to_crlf(b""), b"");
+    }
+
+    #[test]
+    fn lf_to_crlf_then_dot_stuff_has_no_spurious_blank_line() {
+        // Regression for test941: a body ending in a lone LF must merge with the
+        // `.\r\n` terminator, not leave an empty line before the dot.
+        let converted = lf_to_crlf(b"line1\nline2\n");
+        assert_eq!(converted, b"line1\r\nline2\r\n");
+        assert_eq!(dot_stuff(&converted), b"line1\r\nline2\r\n.\r\n");
     }
 
     // ----- response code parsing -------------------------------------------

@@ -705,6 +705,23 @@ pub trait ConnectionFilter: Send {
         }
     }
 
+    /// The user-visible informational trace lines a CONNECT filter captured while
+    /// parsing the proxy's CONNECT response (the connection-filter counterpart of
+    /// curl's `infof` calls in `cf-h1-proxy.c`, e.g. "Ignoring Content-Length in
+    /// CONNECT 200 response"). The transfer engine surfaces them as
+    /// `CURLINFO_TEXT` (`* ` lines on stderr) after the tunnel is established,
+    /// since the filter layer has no debug-callback handle of its own.
+    ///
+    /// The default delegates to the next (lower) filter — the same transparent
+    /// pass-through every non-CONNECT filter exhibits; the CONNECT filter
+    /// overrides it to return its captured lines.
+    fn connect_info_text(&self) -> Option<Vec<String>> {
+        match self.cf_state().next.as_ref() {
+            Some(next) => next.connect_info_text(),
+            None => None,
+        }
+    }
+
     /// The HTTP status code of the proxy's `CONNECT` response, if a CONNECT
     /// filter is present in (or below) this filter (C: `data->info.httpproxycode`,
     /// surfaced as `CURLINFO_HTTP_CONNECTCODE` / the `%{http_connect}` write-out
@@ -1340,6 +1357,18 @@ impl FilterChain {
     pub fn connect_response_headers(&self) -> Option<Vec<Vec<u8>>> {
         match self.head.as_deref() {
             Some(head) => head.connect_response_headers(),
+            None => None,
+        }
+    }
+
+    /// The user-visible CONNECT-response informational trace lines captured by a
+    /// CONNECT filter in this chain (see
+    /// [`ConnectionFilter::connect_info_text`]), or `None` if the chain has no
+    /// CONNECT filter. The head answers or delegates down the chain.
+    #[must_use]
+    pub fn connect_info_text(&self) -> Option<Vec<String>> {
+        match self.head.as_deref() {
+            Some(head) => head.connect_info_text(),
             None => None,
         }
     }

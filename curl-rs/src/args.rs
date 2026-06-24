@@ -1920,7 +1920,7 @@ const CURLFOLLOW_ALL: i64 = 1;
 const CURLFOLLOW_OBEYCODE: i64 = 2;
 
 /// `CURLMIMEOPT_FORMESCAPE` (stored in the `u64` `mime_options`).
-const CURLMIMEOPT_FORMESCAPE: u64 = 1 << 0;
+pub(crate) const CURLMIMEOPT_FORMESCAPE: u64 = 1 << 0;
 
 // CURLULFLAG_* — IMAP upload flags (stored in the `u8` `upload_flags`).
 const CURLULFLAG_ANSWERED: u8 = 1 << 0;

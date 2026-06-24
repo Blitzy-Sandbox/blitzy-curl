@@ -364,6 +364,13 @@ mod gated {
         Connect,
     }
 
+    /// Host literal that marks a SOCKS proxy reachable over a UNIX-domain
+    /// socket. Mirrors curl's `#define UNIX_SOCKET_PREFIX "localhost"`
+    /// (`lib/url.c` L137, guarded by `USE_UNIX_SOCKETS && !CURL_DISABLE_PROXY`):
+    /// when a SOCKS proxy string's host is exactly this literal, the URL path is
+    /// the socket path. See [`Proxy::unix_socket_path`].
+    pub const UNIX_SOCKET_PREFIX: &str = "localhost";
+
     // -----------------------------------------------------------------------
     // `Proxy` — the parsed proxy configuration the engine/filters consult.
     // -----------------------------------------------------------------------
@@ -422,6 +429,20 @@ mod gated {
         /// type as the rest of the crate; HTTPS-proxy support is reported as
         /// `CURL_VERSION_HTTPS_PROXY` by [`crate::version`].
         pub tls: Option<crate::tls::TlsConfig>,
+
+        /// UNIX-domain socket path for a SOCKS proxy reachable over a UNIX
+        /// socket (curl's `--socks5 localhost/path` / `--proxy
+        /// socks5h://localhost/path`). curl's `parse_proxy` (`lib/url.c`
+        /// L2188-2208, guarded by `USE_UNIX_SOCKETS`) detects this when the
+        /// proxy is a SOCKS type AND the host is exactly `localhost`
+        /// (`UNIX_SOCKET_PREFIX`) AND the URL carries a path other than `"/"`;
+        /// it then records the socket path and rewrites the host to
+        /// `"localhost" + path`. When [`Some`], the connection layer dials this
+        /// UNIX socket as the bottom transport and runs the SOCKS handshake over
+        /// it to reach the origin (the HTTP-proxy unix path is *not* a curl
+        /// feature — the detection is `sockstype`-gated). [`None`] for every TCP
+        /// proxy. Oracle: tests/data/test1467 (SOCKS5) and test1468 (SOCKS5h).
+        pub unix_socket_path: Option<String>,
     }
 
     impl Proxy {
@@ -547,6 +568,31 @@ mod gated {
                 host = host[1..host.len() - 1].to_string();
             }
 
+            // SOCKS-proxy-over-UNIX-socket detection, mirroring curl's
+            // `parse_proxy` (`lib/url.c` L2188-2208, `#ifdef USE_UNIX_SOCKETS`):
+            // `if (sockstype && curl_strequal(UNIX_SOCKET_PREFIX, host))`, where
+            // `UNIX_SOCKET_PREFIX == "localhost"`. When the proxy is a SOCKS type
+            // and the host is exactly `localhost`, the URL path (if not the bare
+            // default `"/"`) is the UNIX-domain socket path. curl then rewrites
+            // the proxy host to `"localhost" + path` and flags `is_unix_proxy`.
+            // The detection is deliberately SOCKS-only (HTTP-proxy-over-unix is
+            // not a curl feature). Oracle: tests/data/test1467, test1468.
+            let mut unix_socket_path = None;
+            if proxytype.is_socks() && host.eq_ignore_ascii_case(UNIX_SOCKET_PREFIX) {
+                // The path always resolves (defaulting to `"/"`); a path of
+                // exactly `"/"` means "no socket path was given" and leaves the
+                // proxy as an ordinary TCP `localhost` SOCKS proxy.
+                if let Ok(path) = uhp.get(CurlUPart::Path, CURLU_URLDECODE) {
+                    if path != "/" {
+                        // Rewrite the host to curl's `"localhost" + path` form so
+                        // the reuse key uniquely identifies this socket route, and
+                        // record the bare socket path for the dial.
+                        host = format!("{UNIX_SOCKET_PREFIX}{path}");
+                        unix_socket_path = Some(path);
+                    }
+                }
+            }
+
             Ok(Proxy {
                 proxytype,
                 host,
@@ -554,6 +600,7 @@ mod gated {
                 user,
                 passwd,
                 proxy_url: Some(uhp),
+                unix_socket_path,
                 // An HTTPS proxy starts with a default TLS configuration the
                 // caller can populate (proxy CA/cert/key, `--proxy-insecure`);
                 // plain HTTP / SOCKS proxies carry no TLS leg.
@@ -903,6 +950,63 @@ mod tests {
         assert_eq!(p.passwd.as_deref(), Some("pass"));
         assert!(p.is_socks());
         assert!(p.tls.is_none());
+    }
+
+    #[test]
+    fn parse_socks5_unix_socket_path() {
+        // `--socks5 localhost/path` → SOCKS5 over a UNIX-domain socket. curl's
+        // parse_proxy records the socket path and rewrites the host to
+        // `"localhost" + path`. The default type (Socks5 here) is kept because
+        // the scheme is guessed/absent. Oracle: tests/data/test1467.
+        let p = Proxy::parse(
+            "localhost/tmp/curl-c-build/tests/log/server/socks-uds",
+            CurlProxyType::Socks5,
+        )
+        .unwrap();
+        assert_eq!(p.proxytype, CurlProxyType::Socks5);
+        assert!(p.is_socks());
+        assert_eq!(
+            p.unix_socket_path.as_deref(),
+            Some("/tmp/curl-c-build/tests/log/server/socks-uds")
+        );
+        // Host rewritten to the `localhost`+path form (curl's `host.name`).
+        assert_eq!(p.host, "localhost/tmp/curl-c-build/tests/log/server/socks-uds");
+    }
+
+    #[test]
+    fn parse_socks5h_unix_socket_scheme_url() {
+        // `--proxy socks5h://localhost/path` → SOCKS5h over a UNIX socket.
+        // Oracle: tests/data/test1468.
+        let p = Proxy::parse("socks5h://localhost/run/socks.sock", CurlProxyType::Http).unwrap();
+        assert_eq!(p.proxytype, CurlProxyType::Socks5Hostname);
+        assert_eq!(p.unix_socket_path.as_deref(), Some("/run/socks.sock"));
+        assert_eq!(p.host, "localhost/run/socks.sock");
+    }
+
+    #[test]
+    fn parse_socks5_localhost_without_path_is_tcp() {
+        // A bare `localhost` SOCKS proxy (no path, or just `/`) stays an ordinary
+        // TCP proxy — `unix_socket_path` must be `None` and the host unchanged.
+        let p = Proxy::parse("socks5://localhost:1080", CurlProxyType::Http).unwrap();
+        assert_eq!(p.proxytype, CurlProxyType::Socks5);
+        assert!(p.unix_socket_path.is_none());
+        assert_eq!(p.host, "localhost");
+        assert_eq!(p.port, 1080);
+
+        // An explicit trailing `/` is curl's "no path" sentinel → still TCP.
+        let p2 = Proxy::parse("socks5://localhost/", CurlProxyType::Http).unwrap();
+        assert!(p2.unix_socket_path.is_none());
+        assert_eq!(p2.host, "localhost");
+    }
+
+    #[test]
+    fn parse_http_localhost_with_path_is_not_unix() {
+        // The UNIX-socket detection is SOCKS-only (curl's `sockstype` guard): an
+        // HTTP proxy with `localhost/path` is NOT a unix proxy.
+        let p = Proxy::parse("http://localhost/whatever", CurlProxyType::Http).unwrap();
+        assert!(!p.is_socks());
+        assert!(p.unix_socket_path.is_none());
+        assert_eq!(p.host, "localhost");
     }
 
     #[test]

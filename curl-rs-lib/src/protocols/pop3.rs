@@ -193,12 +193,17 @@ impl SaslProto for Pop3SaslIo {
     }
 
     fn cont_code(&self) -> i32 {
-        // C `saslpop3`: continuation expected on '+'.
-        i32::from(b'+')
+        // C `saslpop3` (lib/pop3.c): the code received when a continuation is
+        // expected is `'*'` — `pop3_endofresp` classifies a bare `+` (a `+`
+        // line that is not `+OK`) as the untagged continuation `'*'`, while
+        // `+OK` is the success `'+'`. Returning `'+'` here would make the SASL
+        // engine reject every continuation challenge (e.g. AUTH PLAIN's `+`
+        // prompt) as a non-continuation and fail with `CURLE_LOGIN_DENIED`.
+        i32::from(b'*')
     }
 
     fn final_code(&self) -> i32 {
-        // C `saslpop3`: success indicated by '+'.
+        // C `saslpop3`: success indicated by `+OK`, classified as `'+'`.
         i32::from(b'+')
     }
 
@@ -686,9 +691,9 @@ fn str_has_ctrl(input: Option<&str>) -> bool {
 /// stripped, URL-decoded). Credentials are URL-decoded to match curl's
 /// `conn->user` / `conn->passwd`. Any parse failure yields all-empty values,
 /// leaving the connect phase to stop gracefully when no username is present.
-fn parse_url_info(data: &Easy) -> (String, String, Option<String>, String, String) {
+fn parse_url_info(data: &Easy) -> Result<(String, String, Option<String>, String, String)> {
     let Some(url) = data.url() else {
-        return (String::new(), String::new(), None, String::new(), String::new());
+        return Ok((String::new(), String::new(), None, String::new(), String::new()));
     };
     let mut handle = CurlUrl::new();
     if handle
@@ -699,13 +704,23 @@ fn parse_url_info(data: &Easy) -> (String, String, Option<String>, String, Strin
         )
         .is_err()
     {
-        return (String::new(), String::new(), None, String::new(), String::new());
+        return Ok((String::new(), String::new(), None, String::new(), String::new()));
     }
     match handle.to_request_parts() {
         Ok(parts) => {
-            // C `pop3_parse_url_path`: path with the leading '/' removed, decoded.
+            // C `pop3_parse_url_path` URL-decodes the message id from the path
+            // with `REJECT_CTRL`: a decoded control byte (CR/LF, `< 0x20`) is a
+            // `CURLE_URL_MALFORMAT`. This is essential — without it a percent
+            // -encoded `%0d%0a` would inject a bare CRLF into the message id and,
+            // through it, into the POP3 command stream, desynchronising the
+            // command/response exchange (the request would hang waiting for a
+            // reply to a malformed multi-line command). Oracle: tests/data/test875.
             let id = if parts.path.len() > 1 {
-                percent_decode(&parts.path.as_bytes()[1..])
+                let decoded = crate::escape::urldecode(
+                    &parts.path.as_bytes()[1..],
+                    crate::escape::UrlReject::Ctrl,
+                )?;
+                String::from_utf8_lossy(&decoded).into_owned()
             } else {
                 String::new()
             };
@@ -717,12 +732,20 @@ fn parse_url_info(data: &Easy) -> (String, String, Option<String>, String, Strin
                 .password
                 .map(|p| percent_decode(p.as_bytes()))
                 .unwrap_or_default();
+            // POP3 lacks `PROTOPT_USERPWDCTRL`, so URL-supplied credentials must
+            // not carry control bytes (`< 0x20`). curl rejects such a URL while
+            // parsing the login details, surfacing `CURLE_URL_MALFORMAT` (a
+            // "malformed URL"), distinct from the `.netrc` path which yields
+            // `CURLE_READ_ERROR`. Oracle: tests/data/test894 (CR in username).
+            if str_has_ctrl(Some(user.as_str())) || str_has_ctrl(Some(passwd.as_str())) {
+                return Err(CurlError::UrlMalformat);
+            }
             // The wire-ready host is carried out for the `.netrc` lookup
             // (C `override_login` matches `.netrc` entries against
             // `conn->host.name`).
-            (user, passwd, parts.options, id, parts.host)
+            Ok((user, passwd, parts.options, id, parts.host))
         }
-        Err(_) => (String::new(), String::new(), None, String::new(), String::new()),
+        Err(_) => Ok((String::new(), String::new(), None, String::new(), String::new())),
     }
 }
 
@@ -987,14 +1010,25 @@ impl Pop3Conn {
         let mut progress = SaslProgress::Idle;
         if self.authtypes & self.preftype & POP3_TYPE_SASL != 0 {
             let (user, passwd, host, port, sasl_ir, allow) = self.sasl_inputs(data, conn);
+            // `--sasl-authzid`, `--service-name`, and `--oauth2-bearer` feed the
+            // SASL engine just as in C (read from `data->set`). Omitting the
+            // bearer breaks XOAUTH2/OAUTHBEARER; omitting the authzid breaks
+            // PLAIN's alternative-authorization-identity form.
+            let authzid = data
+                .set
+                .str(StrId::SaslAuthzid)
+                .unwrap_or_default()
+                .to_string();
+            let service_name = data.set.str(StrId::ServiceName).map(String::from);
+            let bearer = data.set.str(StrId::Bearer).map(String::from);
             let params = SaslParams {
                 user: &user,
                 passwd: &passwd,
-                authzid: "",
+                authzid: &authzid,
                 host: &host,
                 port,
-                service_name: None,
-                bearer: None,
+                service_name: service_name.as_deref(),
+                bearer: bearer.as_deref(),
                 sasl_ir,
                 allow_auth_to_other_hosts: allow,
                 this_is_a_follow: false,
@@ -1165,14 +1199,24 @@ impl Pop3Conn {
         self.sasl_io.msg = extract_sasl_message(&self.last_line);
 
         let (user, passwd, host, port, sasl_ir, allow) = self.sasl_inputs(data, conn);
+        // Same SASL inputs as the initial `AUTH` round (C reads `data->set`
+        // again on each continuation): the authzid/bearer/service-name must
+        // stay consistent across rounds (e.g. XOAUTH2 carries the bearer here).
+        let authzid = data
+            .set
+            .str(StrId::SaslAuthzid)
+            .unwrap_or_default()
+            .to_string();
+        let service_name = data.set.str(StrId::ServiceName).map(String::from);
+        let bearer = data.set.str(StrId::Bearer).map(String::from);
         let params = SaslParams {
             user: &user,
             passwd: &passwd,
-            authzid: "",
+            authzid: &authzid,
             host: &host,
             port,
-            service_name: None,
-            bearer: None,
+            service_name: service_name.as_deref(),
+            bearer: bearer.as_deref(),
             sasl_ir,
             allow_auth_to_other_hosts: allow,
             this_is_a_follow: false,
@@ -1533,7 +1577,7 @@ impl Protocol for Pop3Protocol {
             // and an empty username makes `perform_user` stop gracefully (C
             // `pop3_perform_user`: "Check we have a username and password to
             // authenticate with").
-            let (url_user, url_passwd, options, _id, host) = parse_url_info(data);
+            let (url_user, url_passwd, options, _id, host) = parse_url_info(data)?;
             // Empty URL userinfo is treated as absent (C `CURLUE_NO_USER` /
             // `CURLUE_NO_PASSWORD`).
             let url_user = Some(url_user).filter(|u| !u.is_empty());
@@ -1639,7 +1683,7 @@ impl Protocol for Pop3Protocol {
     ) -> BoxFuture<'a, Result<ProtocolTransfer>> {
         Box::pin(async move {
             // The message id is the URL path (C `pop3_parse_url_path`).
-            let (_user, _passwd, _options, id, _host) = parse_url_info(data);
+            let (_user, _passwd, _options, id, _host) = parse_url_info(data)?;
 
             // A custom request (`CURLOPT_CUSTOMREQUEST`, set via the CLI `-X`)
             // overrides the default `RETR`/`LIST` command, exactly as C
@@ -1924,10 +1968,18 @@ mod tests {
     #[test]
     fn saslproto_constants_match_c_oracle() {
         let io = Pop3SaslIo::default();
-        // C-oracle parity: service "pop" (not "pop3"), maxirlen 255 - 8.
+        // C-oracle parity with the `saslpop3` SASLproto vtable (lib/pop3.c
+        // L1401-1411): service "pop" (not "pop3"), maxirlen 255 - 8, the
+        // continuation code is `'*'` ("Code received when continuation is
+        // expected") and the success code is `'+'` ("Code to receive upon
+        // authentication success"). `pop3_endofresp` classifies a bare `+`
+        // continuation line as the untagged `'*'` and `+OK` as `'+'`, so the
+        // SASL engine matches challenges on `'*'` — asserting `'+'` here is the
+        // stale pre-`'*'`-fix expectation that made every continuation challenge
+        // be rejected.
         assert_eq!(io.service(), "pop");
         assert_eq!(io.maxirlen(), 247);
-        assert_eq!(io.cont_code(), i32::from(b'+'));
+        assert_eq!(io.cont_code(), i32::from(b'*'));
         assert_eq!(io.final_code(), i32::from(b'+'));
         assert_eq!(io.def_mechs(), SASL_AUTH_DEFAULT);
         assert_eq!(io.flags(), SASL_FLAG_BASE64);
@@ -2242,6 +2294,70 @@ mod tests {
             c.parse_url_options(b"FOO=bar"),
             Err(CurlError::UrlMalformat)
         ));
+    }
+
+    #[test]
+    fn parse_url_options_auth_mechanism_selects_sasl() {
+        // A concrete, recognised mechanism sets a specific SASL preference, so
+        // the post-loop switch resolves the auth type to SASL (not ANY).
+        let mut c = Pop3Conn::new();
+        c.parse_url_options(b"AUTH=PLAIN").expect("AUTH=PLAIN");
+        assert_eq!(c.preftype, POP3_TYPE_SASL);
+        assert_ne!(c.sasl.prefmech, SASL_AUTH_NONE);
+        assert_ne!(c.sasl.prefmech, SASL_AUTH_DEFAULT);
+    }
+
+    #[test]
+    fn parse_url_options_auth_star_selects_any() {
+        // `AUTH=*` requests the default mechanism set, which maps to ANY.
+        let mut c = Pop3Conn::new();
+        c.parse_url_options(b"AUTH=*").expect("AUTH=*");
+        assert_eq!(c.preftype, POP3_TYPE_ANY);
+        assert_eq!(c.sasl.prefmech, SASL_AUTH_DEFAULT);
+    }
+
+    #[test]
+    fn parse_url_options_multiple_auth_mechs_accumulate() {
+        // Two `AUTH=` options accumulate into the preference mask; the second
+        // `;`-separated option exercises the loop's separator-advance branch.
+        let mut c = Pop3Conn::new();
+        c.parse_url_options(b"AUTH=PLAIN;AUTH=LOGIN")
+            .expect("two AUTH options");
+        assert_eq!(c.preftype, POP3_TYPE_SASL);
+    }
+
+    #[test]
+    fn parse_url_options_auth_unknown_mechanism_is_malformat() {
+        // An AUTH value that is neither a known mechanism nor a `+APOP` prefix
+        // is rejected (the non-APOP error arm).
+        let mut c = Pop3Conn::new();
+        assert!(matches!(
+            c.parse_url_options(b"AUTH=BOGUSMECH"),
+            Err(CurlError::UrlMalformat)
+        ));
+    }
+
+    #[test]
+    fn parse_capa_line_skips_unknown_mechs_and_extra_spaces() {
+        // The SASL mechanism list tolerates leading/interior whitespace and
+        // silently drops mechanisms it does not recognise.
+        let mut c = Pop3Conn::new();
+        c.last_line = b"SASL   PLAIN   BOGUSMECH  CRAM-MD5\r\n".to_vec();
+        c.parse_capa_line();
+        assert_eq!(c.authtypes & POP3_TYPE_SASL, POP3_TYPE_SASL);
+        assert_ne!(c.sasl.authmechs, 0, "recognised mechanisms are recorded");
+    }
+
+    #[test]
+    fn parse_capa_line_unknown_capability_is_noop() {
+        // A capability line that is none of STLS/USER/SASL leaves all state
+        // untouched (the fall-through arm).
+        let mut c = Pop3Conn::new();
+        c.last_line = b"PIPELINING\r\n".to_vec();
+        c.parse_capa_line();
+        assert!(!c.tls_supported);
+        assert_eq!(c.authtypes, 0);
+        assert_eq!(c.sasl.authmechs, 0);
     }
 
     // ---- handler/scheme wiring -------------------------------------------

@@ -1020,7 +1020,14 @@ async fn conn_send_all(conn: &mut Connection, buf: &[u8]) -> Result<()> {
 /// On completion the transfer is reported as [`TransferDirection::None`],
 /// mirroring telnet.c's terminal `Curl_xfer_setup_nop` — the bridge above *is*
 /// the whole transfer, so the engine performs no further body transfer.
-async fn telnet_do(data: &mut Easy, conn: &mut Connection) -> Result<ProtocolTransfer> {
+async fn telnet_do(
+    data: &mut Easy,
+    conn: &mut Connection,
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+) -> Result<ProtocolTransfer> {
+    use crate::transfer::{CURL_READFUNC_ABORT, CURL_READFUNC_PAUSE};
+
     let verbose = data.set.verbose;
     // Local error-message sink. The bridge to the C `CURLOPT_ERRORBUFFER` slot
     // (`data.set.errorbuffer`, a raw C pointer) belongs to the FFI layer and is
@@ -1055,85 +1062,96 @@ async fn telnet_do(data: &mut Easy, conn: &mut Connection) -> Result<ProtocolTra
 
     sendf::infof(verbose, "TELNET: interactive session started");
 
-    // Stdin reader → bounded channel, on a blocking thread.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-    let _stdin_task = tokio::task::spawn_blocking(move || {
-        use std::io::Read;
-        let mut stdin = std::io::stdin();
-        let mut buf = [0u8; 4096];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) => break, // local EOF
-                Ok(n) => {
-                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
-                        break; // driver finished; receiver dropped
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
+    // Upload source → socket and socket → client-sink relay.
+    //
+    // curl's `telnet_do` reads the *upload* body from `data->state.in` — the
+    // `--upload-file`/`-T` target, defaulting to `stdin` — and writes the
+    // decoded server output through the normal client write path (so
+    // `-o`/`--output` is honored). We mirror that exactly via the engine's
+    // `source` (the CLI's `tool_read_cb`, which pulls from the `-T` file or
+    // stdin) and `sink` (the CLI's `CliWriteSink`, which routes to `-o` or
+    // stdout), replacing the previous raw-`stdin`/raw-`stdout` shortcut that
+    // ignored both redirections (tests/data/test1326, tests/data/test1327).
+    //
+    // C's POSIX driver (`telnet.c`, the `is_fread_set` branch — which is always
+    // our case since `source` is a read callback) polls the control socket with
+    // a 100 ms cap and reads the upload callback once per pass; we reproduce
+    // that cadence here. `Curl_conn_recv` is cancel-safe (it appends nothing
+    // until its await resolves), so bounding it with a Tokio timer cannot drop
+    // bytes, and the *outer* `--max-time` timer ([`perform_transfer`]) still
+    // cancels the whole future at one of these frequent await points —
+    // preserving the exit-28 timeout of tests/data/test1548.
     let mut netbuf = [0u8; 4096];
-    // Once stdin reaches EOF the channel closes; disable that select branch so
-    // we keep servicing the socket without spinning on a closed receiver.
-    let mut stdin_open = true;
+    let mut readbuf = [0u8; 4096];
+    let mut upload_done = false;
 
     let outcome: Result<()> = loop {
-        tokio::select! {
-            recv = Curl_conn_recv(conn, FIRSTSOCKET, &mut netbuf) => {
-                match recv {
-                    // Server closed the connection: clean end of session.
-                    Ok(0) => break Ok(()),
-                    Ok(n) => {
-                        // Decode the chunk, collecting application bytes for
-                        // local output.
-                        let mut app: Vec<u8> = Vec::new();
-                        let telrcv_res = {
-                            let mut sink = |bytes: &[u8]| app.extend_from_slice(bytes);
-                            tn.telrcv(&netbuf[..n], &mut sink)
-                        };
-                        if let Err(e) = telrcv_res {
-                            sendf::failf(&mut errbuf, "telnet: suboption error");
-                            break Err(e);
-                        }
-                        if !app.is_empty() {
-                            use std::io::Write;
-                            let mut out = std::io::stdout();
-                            if out.write_all(&app).is_err() {
-                                break Err(CurlError::WriteError);
-                            }
-                            let _ = out.flush();
-                        }
-                        // Begin negotiation only after the peer does, so we do
-                        // not "speak telnet" to non-telnet servers.
-                        if tn.please_negotiate && !tn.already_negotiated {
-                            tn.negotiate();
-                            tn.already_negotiated = true;
-                        }
-                        // Flush queued negotiation / sub-option responses.
-                        if !tn.out.is_empty() {
-                            let pending = std::mem::take(&mut tn.out);
-                            if let Err(e) = conn_send_all(conn, &pending).await {
-                                break Err(e);
-                            }
-                        }
+        // (1) Service the control socket, bounded so the upload still pumps.
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            Curl_conn_recv(conn, FIRSTSOCKET, &mut netbuf),
+        )
+        .await
+        {
+            // Server closed the connection: clean end of session.
+            Ok(Ok(0)) => break Ok(()),
+            Ok(Ok(n)) => {
+                // Decode the chunk, collecting application bytes for output.
+                let mut app: Vec<u8> = Vec::new();
+                let telrcv_res = {
+                    let mut collect = |bytes: &[u8]| app.extend_from_slice(bytes);
+                    tn.telrcv(&netbuf[..n], &mut collect)
+                };
+                if let Err(e) = telrcv_res {
+                    sendf::failf(&mut errbuf, "telnet: suboption error");
+                    break Err(e);
+                }
+                if !app.is_empty() {
+                    // Route decoded output through the client sink (honors
+                    // `-o`/`--output`). A short write fails the transfer with
+                    // `CURLE_WRITE_ERROR`, matching curl's writer contract.
+                    let wrote = sink.write_body(&app);
+                    if wrote < app.len() {
+                        break Err(CurlError::WriteError);
                     }
-                    // Not ready yet: poll again.
-                    Err(CurlError::Again) => {}
-                    Err(e) => break Err(e),
+                }
+                // Begin negotiation only after the peer does, so we do not
+                // "speak telnet" to non-telnet servers.
+                if tn.please_negotiate && !tn.already_negotiated {
+                    tn.negotiate();
+                    tn.already_negotiated = true;
+                }
+                // Flush queued negotiation / sub-option responses.
+                if !tn.out.is_empty() {
+                    let pending = std::mem::take(&mut tn.out);
+                    if let Err(e) = conn_send_all(conn, &pending).await {
+                        break Err(e);
+                    }
                 }
             }
-            chunk = rx.recv(), if stdin_open => {
-                match chunk {
-                    Some(bytes) => {
-                        let escaped = escape_iac(&bytes);
-                        if let Err(e) = conn_send_all(conn, &escaped).await {
-                            break Err(e);
-                        }
-                    }
-                    // Local input drained: stop selecting on stdin.
-                    None => stdin_open = false,
+            // Not ready yet: poll again.
+            Ok(Err(CurlError::Again)) => {}
+            Ok(Err(e)) => break Err(e),
+            // 100 ms elapsed with no socket data: fall through to the upload.
+            Err(_elapsed) => {}
+        }
+
+        // (2) Pump one upload chunk from the client source and relay it,
+        //     IAC-escaped. EOF (`0`) disables further upload but keeps the
+        //     socket serviced until the server closes (or `--max-time` fires).
+        if !upload_done {
+            let n = source.read(&mut readbuf);
+            if n == CURL_READFUNC_ABORT {
+                sendf::failf(&mut errbuf, "read aborted by callback");
+                break Err(CurlError::AbortedByCallback);
+            } else if n == CURL_READFUNC_PAUSE {
+                // Source paused: nothing available this pass.
+            } else if n == 0 {
+                upload_done = true;
+            } else {
+                let escaped = escape_iac(&readbuf[..n]);
+                if let Err(e) = conn_send_all(conn, &escaped).await {
+                    break Err(e);
                 }
             }
         }
@@ -1148,6 +1166,42 @@ async fn telnet_do(data: &mut Easy, conn: &mut Connection) -> Result<ProtocolTra
     }
 
     outcome.map(|()| ProtocolTransfer::new(TransferDirection::None))
+}
+
+/// Default stdout sink for the vestigial generic [`Telnet::do_it`] seam.
+///
+/// TELNET is never driven through the shared engine loop — it short-circuits to
+/// [`perform_telnet`], which supplies the real CLI `sink`/`source`. The trait
+/// method must still compile and stay faithful if ever invoked, so it drives
+/// the session with terminal defaults (curl's default `CURLOPT_WRITEDATA` is
+/// `stdout`). A short write reports `CURLE_WRITE_ERROR`, matching curl's writer.
+struct TerminalSink;
+
+impl WriteCallbacks for TerminalSink {
+    fn write_body(&mut self, data: &[u8]) -> usize {
+        use std::io::Write;
+        match std::io::stdout().write_all(data) {
+            Ok(()) => data.len(),
+            Err(_) => 0,
+        }
+    }
+
+    fn write_header(&mut self, _data: &[u8]) -> Option<usize> {
+        // TELNET emits no protocol headers; the default path configures no
+        // separate header destination, so model that NULL callback.
+        None
+    }
+}
+
+/// Default stdin source for the vestigial generic [`Telnet::do_it`] seam
+/// (curl's default `CURLOPT_READDATA` is `stdin`).
+struct TerminalSource;
+
+impl ReadCallback for TerminalSource {
+    fn read(&mut self, buf: &mut [u8]) -> usize {
+        use std::io::Read;
+        std::io::stdin().read(buf).unwrap_or(0)
+    }
 }
 
 /// The TELNET protocol handler (telnet.c `Curl_protocol_telnet`).
@@ -1180,7 +1234,16 @@ impl Protocol for Telnet {
         data: &'a mut Easy,
         conn: &'a mut Connection,
     ) -> BoxFuture<'a, Result<ProtocolTransfer>> {
-        Box::pin(async move { telnet_do(data, conn).await })
+        // The generic `do_it` seam carries no client sink/source (TELNET never
+        // runs through the shared engine loop — it short-circuits to
+        // [`perform_telnet`], which supplies the real CLI sink/source). Drive
+        // the session with terminal defaults so the trait method stays faithful
+        // if ever invoked through the generic path.
+        Box::pin(async move {
+            let mut sink = TerminalSink;
+            let mut source = TerminalSource;
+            telnet_do(data, conn, &mut sink, &mut source).await
+        })
     }
 
     fn done<'a>(
@@ -1203,12 +1266,14 @@ impl Protocol for Telnet {
 /// through to `CURLE_UNSUPPORTED_PROTOCOL` in
 /// [`perform_transfer`](super::perform_transfer), so no socket was ever opened.
 ///
-/// TELNET has no request/response body in the curl sense: [`do_it`](Telnet::do_it)
-/// (`telnet_do`) relays the local stdin to the socket and the decoded socket
-/// output to stdout, negotiating options only *after* the peer initiates (so it
-/// never "speaks telnet" to a non-telnet server), and returns when the server
-/// closes the connection. The client `sink`/`source` are therefore unused — the
-/// session performs its own terminal I/O exactly as the C handler does.
+/// TELNET has no request/response body in the curl sense: [`telnet_do`] relays
+/// the upload `source` (the `-T` file or stdin) to the socket and the decoded
+/// socket output to the `sink` (`-o`/`--output` or stdout), negotiating options
+/// only *after* the peer initiates (so it never "speaks telnet" to a non-telnet
+/// server), and returns when the server closes the connection. The client
+/// `sink`/`source` are driven directly here (not via the generic `do_it`),
+/// because TELNET's local terminal I/O must honor the CLI's stream
+/// redirections (tests/data/test1326, tests/data/test1327).
 ///
 /// # Errors
 ///
@@ -1218,8 +1283,8 @@ impl Protocol for Telnet {
 pub(crate) async fn perform_telnet(
     data: &mut Easy,
     scheme: &'static Scheme,
-    _sink: &mut dyn WriteCallbacks,
-    _source: &mut dyn ReadCallback,
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
 ) -> Result<()> {
     // (1) Establish the plain-TCP connection over the filter chain.
     let mut conn = connect_network_scheme(data, scheme).await?;
@@ -1229,8 +1294,11 @@ pub(crate) async fn perform_telnet(
     //     call it for parity with the other protocol drivers.
     handler.connect(data, &mut conn).await?;
 
-    // (3) DO phase: run the interactive relay to completion.
-    let result = handler.do_it(data, &mut conn).await.map(|_xfer| ());
+    // (3) DO phase: run the interactive relay to completion, driving the real
+    //     CLI sink/source so `-o`/`-T` redirections are honored.
+    let result = telnet_do(data, &mut conn, sink, source)
+        .await
+        .map(|_xfer| ());
 
     // (4) Finalize then best-effort tear-down.
     let premature = result.is_err();
@@ -1874,5 +1942,499 @@ mod tests {
         assert_eq!(parse_naws("80x"), None);
         assert_eq!(parse_naws("65536x1"), None);
         assert_eq!(parse_naws("1x65536"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // check_telnet_options error / edge arms (telnet.c `check_telnet_options`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn option_bad_ws_value_is_syntax_error() {
+        let mut tn = TelnetState::new();
+        assert!(matches!(
+            tn.check_telnet_options(["WS=notvalid"], None),
+            Err(CurlError::SetoptOptionSyntax)
+        ));
+    }
+
+    #[test]
+    fn option_binary_zero_disables_binary_preference() {
+        let mut tn = TelnetState::new();
+        // BINARY is preferred on both sides by default (init_telnet).
+        assert!(tn.us_preferred[CURL_TELOPT_BINARY as usize]);
+        assert!(tn.him_preferred[CURL_TELOPT_BINARY as usize]);
+        tn.check_telnet_options(["BINARY=0"], None).unwrap();
+        assert!(!tn.us_preferred[CURL_TELOPT_BINARY as usize]);
+        assert!(!tn.him_preferred[CURL_TELOPT_BINARY as usize]);
+    }
+
+    #[test]
+    fn option_binary_nonzero_leaves_default_preference() {
+        let mut tn = TelnetState::new();
+        // Any non-`0` value leaves the on-by-default binary preference intact.
+        tn.check_telnet_options(["BINARY=1"], None).unwrap();
+        assert!(tn.us_preferred[CURL_TELOPT_BINARY as usize]);
+    }
+
+    #[test]
+    fn option_non_ascii_value_is_silently_skipped() {
+        let mut tn = TelnetState::new();
+        // A value carrying a high-bit byte is skipped without error or effect.
+        tn.check_telnet_options(["TTYPE=caf\u{e9}"], None).unwrap();
+        assert!(tn.subopt_ttype.is_none());
+        assert!(!tn.us_preferred[CURL_TELOPT_TTYPE as usize]);
+    }
+
+    #[test]
+    fn username_becomes_new_environ_user_var() {
+        let mut tn = TelnetState::new();
+        tn.check_telnet_options(std::iter::empty::<&str>(), Some("alice"))
+            .unwrap();
+        assert_eq!(tn.telnet_vars, vec!["USER,alice".to_string()]);
+        assert!(tn.us_preferred[CURL_TELOPT_NEW_ENVIRON as usize]);
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC1143 WONT/DONT transitions (telnet.c `rec_wont` / `rec_dont`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wont_after_will_disables_him_and_replies_dont() {
+        let mut tn = TelnetState::new();
+        // Accept the peer's `WILL ECHO` (preferred on his side) ⇒ him = Yes.
+        feed(&mut tn, &[CURL_IAC, CURL_WILL, CURL_TELOPT_ECHO]);
+        assert_eq!(tn.him[CURL_TELOPT_ECHO as usize], NegState::Yes);
+        tn.out.clear();
+        // The peer then withdraws with `WONT ECHO` ⇒ him = No, we reply `DONT`.
+        feed(&mut tn, &[CURL_IAC, CURL_WONT, CURL_TELOPT_ECHO]);
+        assert_eq!(tn.him[CURL_TELOPT_ECHO as usize], NegState::No);
+        assert_eq!(tn.out, vec![CURL_IAC, CURL_DONT, CURL_TELOPT_ECHO]);
+    }
+
+    #[test]
+    fn dont_after_do_disables_us_and_replies_wont() {
+        let mut tn = TelnetState::new();
+        // The peer asks us to enable SGA (preferred locally) ⇒ us = Yes, `WILL`.
+        feed(&mut tn, &[CURL_IAC, CURL_DO, CURL_TELOPT_SGA]);
+        assert_eq!(tn.us[CURL_TELOPT_SGA as usize], NegState::Yes);
+        tn.out.clear();
+        // The peer then revokes with `DONT SGA` ⇒ us = No, we reply `WONT`.
+        feed(&mut tn, &[CURL_IAC, CURL_DONT, CURL_TELOPT_SGA]);
+        assert_eq!(tn.us[CURL_TELOPT_SGA as usize], NegState::No);
+        assert_eq!(tn.out, vec![CURL_IAC, CURL_WONT, CURL_TELOPT_SGA]);
+    }
+
+    #[test]
+    fn wont_and_dont_in_no_state_are_noops() {
+        let mut tn = TelnetState::new();
+        // From the fresh `No` state, an unsolicited `WONT`/`DONT` needs no reply
+        // (the option is already disabled on that side).
+        feed(&mut tn, &[CURL_IAC, CURL_WONT, CURL_TELOPT_ECHO]);
+        feed(&mut tn, &[CURL_IAC, CURL_DONT, CURL_TELOPT_SGA]);
+        assert!(tn.out.is_empty(), "No-state WONT/DONT must produce no reply");
+        assert_eq!(tn.him[CURL_TELOPT_ECHO as usize], NegState::No);
+        assert_eq!(tn.us[CURL_TELOPT_SGA as usize], NegState::No);
+    }
+
+    // -----------------------------------------------------------------------
+    // RFC 1143 Q-method queue branches. The basic handshake tests above cover
+    // the `No`/`Yes` arms; these drive the `WantNo`/`WantYes` states and the
+    // Empty/Opposite pending-opposite queue, which only arise when a request is
+    // in flight and the peer's reply (or a second local request) crosses it.
+    // A neutral, non-preferred, non-sub-negotiated option keeps the
+    // `NegState::No` preference arms out of the way.
+    // -----------------------------------------------------------------------
+    const OPT: u8 = CURL_TELOPT_TTYPE;
+
+    // ---- set_local_option(enable = true) ----
+    #[test]
+    fn set_local_enable_when_yes_is_noop() {
+        let mut tn = TelnetState::new();
+        tn.us[OPT as usize] = NegState::Yes;
+        tn.set_local_option(OPT, true);
+        assert!(tn.out.is_empty());
+        assert_eq!(tn.us[OPT as usize], NegState::Yes);
+    }
+
+    #[test]
+    fn set_local_enable_when_wantno_empty_queues_opposite() {
+        let mut tn = TelnetState::new();
+        tn.us[OPT as usize] = NegState::WantNo;
+        tn.usq[OPT as usize] = NegQueue::Empty;
+        tn.set_local_option(OPT, true);
+        assert!(tn.out.is_empty());
+        assert_eq!(tn.usq[OPT as usize], NegQueue::Opposite);
+    }
+
+    #[test]
+    fn set_local_enable_when_wantno_opposite_is_noop() {
+        let mut tn = TelnetState::new();
+        tn.us[OPT as usize] = NegState::WantNo;
+        tn.usq[OPT as usize] = NegQueue::Opposite;
+        tn.set_local_option(OPT, true);
+        assert_eq!(tn.usq[OPT as usize], NegQueue::Opposite);
+    }
+
+    #[test]
+    fn set_local_enable_when_wantyes_opposite_clears_queue() {
+        let mut tn = TelnetState::new();
+        tn.us[OPT as usize] = NegState::WantYes;
+        tn.usq[OPT as usize] = NegQueue::Opposite;
+        tn.set_local_option(OPT, true);
+        assert_eq!(tn.usq[OPT as usize], NegQueue::Empty);
+    }
+
+    // ---- set_local_option(enable = false) ----
+    #[test]
+    fn set_local_disable_when_yes_sends_wont() {
+        let mut tn = TelnetState::new();
+        tn.us[OPT as usize] = NegState::Yes;
+        tn.set_local_option(OPT, false);
+        assert_eq!(tn.out, vec![CURL_IAC, CURL_WONT, OPT]);
+        assert_eq!(tn.us[OPT as usize], NegState::WantNo);
+    }
+
+    #[test]
+    fn set_local_disable_when_wantyes_empty_queues_opposite() {
+        let mut tn = TelnetState::new();
+        tn.us[OPT as usize] = NegState::WantYes;
+        tn.usq[OPT as usize] = NegQueue::Empty;
+        tn.set_local_option(OPT, false);
+        assert!(tn.out.is_empty());
+        assert_eq!(tn.usq[OPT as usize], NegQueue::Opposite);
+    }
+
+    #[test]
+    fn set_local_disable_when_wantno_opposite_clears_queue() {
+        let mut tn = TelnetState::new();
+        tn.us[OPT as usize] = NegState::WantNo;
+        tn.usq[OPT as usize] = NegQueue::Opposite;
+        tn.set_local_option(OPT, false);
+        assert_eq!(tn.usq[OPT as usize], NegQueue::Empty);
+    }
+
+    // ---- set_remote_option (mirror of the local side) ----
+    #[test]
+    fn set_remote_enable_when_wantno_empty_queues_opposite() {
+        let mut tn = TelnetState::new();
+        tn.him[OPT as usize] = NegState::WantNo;
+        tn.himq[OPT as usize] = NegQueue::Empty;
+        tn.set_remote_option(OPT, true);
+        assert!(tn.out.is_empty());
+        assert_eq!(tn.himq[OPT as usize], NegQueue::Opposite);
+    }
+
+    #[test]
+    fn set_remote_enable_when_wantyes_opposite_clears_queue() {
+        let mut tn = TelnetState::new();
+        tn.him[OPT as usize] = NegState::WantYes;
+        tn.himq[OPT as usize] = NegQueue::Opposite;
+        tn.set_remote_option(OPT, true);
+        assert_eq!(tn.himq[OPT as usize], NegQueue::Empty);
+    }
+
+    #[test]
+    fn set_remote_disable_when_yes_sends_dont() {
+        let mut tn = TelnetState::new();
+        tn.him[OPT as usize] = NegState::Yes;
+        tn.set_remote_option(OPT, false);
+        assert_eq!(tn.out, vec![CURL_IAC, CURL_DONT, OPT]);
+        assert_eq!(tn.him[OPT as usize], NegState::WantNo);
+    }
+
+    #[test]
+    fn set_remote_disable_when_wantyes_empty_queues_opposite() {
+        let mut tn = TelnetState::new();
+        tn.him[OPT as usize] = NegState::WantYes;
+        tn.himq[OPT as usize] = NegQueue::Empty;
+        tn.set_remote_option(OPT, false);
+        assert_eq!(tn.himq[OPT as usize], NegQueue::Opposite);
+    }
+
+    // ---- rec_will ----
+    #[test]
+    fn rec_will_when_yes_is_noop() {
+        let mut tn = TelnetState::new();
+        tn.him[OPT as usize] = NegState::Yes;
+        tn.rec_will(OPT);
+        assert!(tn.out.is_empty());
+        assert_eq!(tn.him[OPT as usize], NegState::Yes);
+    }
+
+    #[test]
+    fn rec_will_when_wantno_empty_abandons() {
+        let mut tn = TelnetState::new();
+        tn.him[OPT as usize] = NegState::WantNo;
+        tn.himq[OPT as usize] = NegQueue::Empty;
+        tn.rec_will(OPT);
+        assert_eq!(tn.him[OPT as usize], NegState::No);
+        assert!(tn.out.is_empty());
+    }
+
+    #[test]
+    fn rec_will_when_wantno_opposite_enables() {
+        let mut tn = TelnetState::new();
+        tn.him[OPT as usize] = NegState::WantNo;
+        tn.himq[OPT as usize] = NegQueue::Opposite;
+        tn.rec_will(OPT);
+        assert_eq!(tn.him[OPT as usize], NegState::Yes);
+        assert_eq!(tn.himq[OPT as usize], NegQueue::Empty);
+    }
+
+    #[test]
+    fn rec_will_when_wantyes_empty_finalizes() {
+        let mut tn = TelnetState::new();
+        tn.him[OPT as usize] = NegState::WantYes;
+        tn.himq[OPT as usize] = NegQueue::Empty;
+        tn.rec_will(OPT);
+        assert_eq!(tn.him[OPT as usize], NegState::Yes);
+        assert!(tn.out.is_empty());
+    }
+
+    #[test]
+    fn rec_will_when_wantyes_opposite_sends_dont() {
+        let mut tn = TelnetState::new();
+        tn.him[OPT as usize] = NegState::WantYes;
+        tn.himq[OPT as usize] = NegQueue::Opposite;
+        tn.rec_will(OPT);
+        assert_eq!(tn.him[OPT as usize], NegState::WantNo);
+        assert_eq!(tn.himq[OPT as usize], NegQueue::Empty);
+        assert_eq!(tn.out, vec![CURL_IAC, CURL_DONT, OPT]);
+    }
+
+    // ---- rec_wont ----
+    #[test]
+    fn rec_wont_when_yes_sends_dont() {
+        let mut tn = TelnetState::new();
+        tn.him[OPT as usize] = NegState::Yes;
+        tn.rec_wont(OPT);
+        assert_eq!(tn.him[OPT as usize], NegState::No);
+        assert_eq!(tn.out, vec![CURL_IAC, CURL_DONT, OPT]);
+    }
+
+    #[test]
+    fn rec_wont_when_wantno_empty_finalizes_off() {
+        let mut tn = TelnetState::new();
+        tn.him[OPT as usize] = NegState::WantNo;
+        tn.himq[OPT as usize] = NegQueue::Empty;
+        tn.rec_wont(OPT);
+        assert_eq!(tn.him[OPT as usize], NegState::No);
+        assert!(tn.out.is_empty());
+    }
+
+    #[test]
+    fn rec_wont_when_wantno_opposite_sends_do() {
+        let mut tn = TelnetState::new();
+        tn.him[OPT as usize] = NegState::WantNo;
+        tn.himq[OPT as usize] = NegQueue::Opposite;
+        tn.rec_wont(OPT);
+        assert_eq!(tn.him[OPT as usize], NegState::WantYes);
+        assert_eq!(tn.himq[OPT as usize], NegQueue::Empty);
+        assert_eq!(tn.out, vec![CURL_IAC, CURL_DO, OPT]);
+    }
+
+    #[test]
+    fn rec_wont_when_wantyes_opposite_clears() {
+        let mut tn = TelnetState::new();
+        tn.him[OPT as usize] = NegState::WantYes;
+        tn.himq[OPT as usize] = NegQueue::Opposite;
+        tn.rec_wont(OPT);
+        assert_eq!(tn.him[OPT as usize], NegState::No);
+        assert_eq!(tn.himq[OPT as usize], NegQueue::Empty);
+    }
+
+    // ---- rec_do ----
+    #[test]
+    fn rec_do_when_yes_is_noop() {
+        let mut tn = TelnetState::new();
+        tn.us[OPT as usize] = NegState::Yes;
+        tn.rec_do(OPT);
+        assert!(tn.out.is_empty());
+    }
+
+    #[test]
+    fn rec_do_when_wantno_empty_abandons() {
+        let mut tn = TelnetState::new();
+        tn.us[OPT as usize] = NegState::WantNo;
+        tn.usq[OPT as usize] = NegQueue::Empty;
+        tn.rec_do(OPT);
+        assert_eq!(tn.us[OPT as usize], NegState::No);
+    }
+
+    #[test]
+    fn rec_do_when_wantno_opposite_enables() {
+        let mut tn = TelnetState::new();
+        tn.us[OPT as usize] = NegState::WantNo;
+        tn.usq[OPT as usize] = NegQueue::Opposite;
+        tn.rec_do(OPT);
+        assert_eq!(tn.us[OPT as usize], NegState::Yes);
+        assert_eq!(tn.usq[OPT as usize], NegQueue::Empty);
+    }
+
+    #[test]
+    fn rec_do_when_wantyes_empty_finalizes() {
+        let mut tn = TelnetState::new();
+        tn.us[OPT as usize] = NegState::WantYes;
+        tn.usq[OPT as usize] = NegQueue::Empty;
+        tn.rec_do(OPT);
+        assert_eq!(tn.us[OPT as usize], NegState::Yes);
+        assert!(tn.out.is_empty());
+    }
+
+    #[test]
+    fn rec_do_when_wantyes_opposite_sends_wont() {
+        let mut tn = TelnetState::new();
+        tn.us[OPT as usize] = NegState::WantYes;
+        tn.usq[OPT as usize] = NegQueue::Opposite;
+        tn.rec_do(OPT);
+        assert_eq!(tn.us[OPT as usize], NegState::WantNo);
+        assert_eq!(tn.out, vec![CURL_IAC, CURL_WONT, OPT]);
+    }
+
+    #[test]
+    fn rec_do_wantyes_empty_with_subnegotiation_emits_suboption() {
+        // NAWS is flagged for sub-negotiation; finalizing our side from WantYes
+        // must also emit the window-size sub-option payload.
+        let mut tn = TelnetState::new();
+        tn.us[CURL_TELOPT_NAWS as usize] = NegState::WantYes;
+        tn.usq[CURL_TELOPT_NAWS as usize] = NegQueue::Empty;
+        tn.rec_do(CURL_TELOPT_NAWS);
+        assert_eq!(tn.us[CURL_TELOPT_NAWS as usize], NegState::Yes);
+        // The sub-option block (IAC SB NAWS w w h h IAC SE) is queued.
+        assert!(tn.out.windows(3).any(|w| w == [CURL_IAC, CURL_SB, CURL_TELOPT_NAWS]));
+    }
+
+    // ---- rec_dont ----
+    #[test]
+    fn rec_dont_when_yes_sends_wont() {
+        let mut tn = TelnetState::new();
+        tn.us[OPT as usize] = NegState::Yes;
+        tn.rec_dont(OPT);
+        assert_eq!(tn.us[OPT as usize], NegState::No);
+        assert_eq!(tn.out, vec![CURL_IAC, CURL_WONT, OPT]);
+    }
+
+    #[test]
+    fn rec_dont_when_wantno_empty_finalizes_off() {
+        let mut tn = TelnetState::new();
+        tn.us[OPT as usize] = NegState::WantNo;
+        tn.usq[OPT as usize] = NegQueue::Empty;
+        tn.rec_dont(OPT);
+        assert_eq!(tn.us[OPT as usize], NegState::No);
+        assert!(tn.out.is_empty());
+    }
+
+    #[test]
+    fn rec_dont_when_wantno_opposite_sends_will() {
+        let mut tn = TelnetState::new();
+        tn.us[OPT as usize] = NegState::WantNo;
+        tn.usq[OPT as usize] = NegQueue::Opposite;
+        tn.rec_dont(OPT);
+        assert_eq!(tn.us[OPT as usize], NegState::WantYes);
+        assert_eq!(tn.usq[OPT as usize], NegQueue::Empty);
+        assert_eq!(tn.out, vec![CURL_IAC, CURL_WILL, OPT]);
+    }
+
+    #[test]
+    fn rec_dont_when_wantyes_opposite_clears() {
+        let mut tn = TelnetState::new();
+        tn.us[OPT as usize] = NegState::WantYes;
+        tn.usq[OPT as usize] = NegQueue::Opposite;
+        tn.rec_dont(OPT);
+        assert_eq!(tn.us[OPT as usize], NegState::No);
+        assert_eq!(tn.usq[OPT as usize], NegQueue::Empty);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-option replies (telnet.c `suboption`). Driven directly by seeding the
+    // accumulator with `[option, request…]` and the relevant `--telnet-option`
+    // value, then inspecting the queued `IAC SB … IAC SE` reply.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bad_option_rejects_none_accepts_clean() {
+        assert!(TelnetState::bad_option(None));
+        assert!(!TelnetState::bad_option(Some("xterm-256color")));
+    }
+
+    #[test]
+    fn suboption_empty_buffer_is_noop() {
+        let mut tn = TelnetState::new();
+        tn.subbuffer.clear();
+        tn.suboption().expect("empty sub-option is ignored");
+        assert!(tn.out.is_empty());
+    }
+
+    #[test]
+    fn suboption_ttype_without_config_errors() {
+        let mut tn = TelnetState::new();
+        tn.subopt_ttype = None;
+        tn.subbuffer = vec![CURL_TELOPT_TTYPE, CURL_TELQUAL_SEND];
+        assert!(matches!(
+            tn.suboption(),
+            Err(CurlError::BadFunctionArgument)
+        ));
+    }
+
+    #[test]
+    fn suboption_ttype_sends_configured_value() {
+        let mut tn = TelnetState::new();
+        tn.subopt_ttype = Some("xterm".to_string());
+        tn.subbuffer = vec![CURL_TELOPT_TTYPE, CURL_TELQUAL_SEND];
+        tn.suboption().unwrap();
+        let mut expected = vec![CURL_IAC, CURL_SB, CURL_TELOPT_TTYPE, CURL_TELQUAL_IS];
+        expected.extend_from_slice(b"xterm");
+        expected.push(CURL_IAC);
+        expected.push(CURL_SE);
+        assert_eq!(tn.out, expected);
+    }
+
+    #[test]
+    fn suboption_xdisploc_without_config_errors() {
+        let mut tn = TelnetState::new();
+        tn.subopt_xdisploc = None;
+        tn.subbuffer = vec![CURL_TELOPT_XDISPLOC, CURL_TELQUAL_SEND];
+        assert!(matches!(
+            tn.suboption(),
+            Err(CurlError::BadFunctionArgument)
+        ));
+    }
+
+    #[test]
+    fn suboption_xdisploc_sends_configured_value() {
+        let mut tn = TelnetState::new();
+        tn.subopt_xdisploc = Some("host:0.0".to_string());
+        tn.subbuffer = vec![CURL_TELOPT_XDISPLOC, CURL_TELQUAL_SEND];
+        tn.suboption().unwrap();
+        assert!(tn
+            .out
+            .starts_with(&[CURL_IAC, CURL_SB, CURL_TELOPT_XDISPLOC, CURL_TELQUAL_IS]));
+        assert!(tn.out.windows(8).any(|w| w == b"host:0.0"));
+        assert!(tn.out.ends_with(&[CURL_IAC, CURL_SE]));
+    }
+
+    #[test]
+    fn suboption_new_environ_emits_vars_with_and_without_value() {
+        let mut tn = TelnetState::new();
+        tn.telnet_vars = vec!["USER,bob".to_string(), "TERM".to_string()];
+        tn.subbuffer = vec![CURL_TELOPT_NEW_ENVIRON, CURL_TELQUAL_SEND];
+        tn.suboption().unwrap();
+        assert!(tn
+            .out
+            .starts_with(&[CURL_IAC, CURL_SB, CURL_TELOPT_NEW_ENVIRON, CURL_TELQUAL_IS]));
+        // "USER,bob" => VAR USER VALUE bob ; "TERM" => VAR TERM (no value byte).
+        assert!(tn.out.windows(4).any(|w| w == b"USER"));
+        assert!(tn.out.windows(3).any(|w| w == b"bob"));
+        assert!(tn.out.windows(4).any(|w| w == b"TERM"));
+        assert!(tn.out.ends_with(&[CURL_IAC, CURL_SE]));
+    }
+
+    #[test]
+    fn suboption_unknown_option_is_noop() {
+        let mut tn = TelnetState::new();
+        // SGA has no `suboption` arm, so a sub-negotiation for it emits nothing.
+        tn.subbuffer = vec![CURL_TELOPT_SGA, 0x01];
+        tn.suboption().unwrap();
+        assert!(tn.out.is_empty());
     }
 }

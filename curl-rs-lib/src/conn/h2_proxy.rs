@@ -1296,6 +1296,7 @@ mod tests {
             passwd: passwd.map(str::to_string),
             proxy_url: None,
             tls: None,
+            unix_socket_path: None,
         }
     }
 

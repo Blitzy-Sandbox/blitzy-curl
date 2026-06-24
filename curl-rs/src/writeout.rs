@@ -1130,8 +1130,41 @@ pub fn our_write_out<P: PerTransfer>(
         per,
         per_result,
         io::stdout().lock(),
-        io::stderr().lock(),
+        ToolStderr,
     )
+}
+
+/// A [`Write`] adapter that routes bytes to the process-global diagnostic sink
+/// (curl's `FILE *tool_stderr`), so that `%{stderr}` — and the unknown-variable
+/// diagnostic — honor a `--stderr <file>` / `--stderr -` redirection exactly as
+/// curl does.
+///
+/// curl's `ourWriteOut` switches the active stream to `tool_stderr` for
+/// `%{stderr}` (`src/tool_writeout.c`: `case VAR_STDERR: stream = tool_stderr;`)
+/// and writes the unknown-variable message with
+/// `curl_mfprintf(tool_stderr, …)` — *not* to the raw process stderr. Because
+/// `--stderr` retargets `tool_stderr` (and our [`crate::messages`] sink is its
+/// analog), the write-out stderr sink must go through that same redirectable
+/// sink rather than [`io::stderr`]. Routing every byte through
+/// [`crate::messages::emit_raw`] (which writes to the active `--stderr`
+/// destination and flushes) achieves that. (Oracle: tests/data/test978,
+/// tests/data/test1188.)
+struct ToolStderr;
+
+impl Write for ToolStderr {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // `emit_raw` writes the bytes verbatim to the active diagnostic
+        // destination (process stderr by default, the `--stderr` file/stdout
+        // when redirected) and flushes; it swallows I/O errors exactly as curl's
+        // unchecked `tool_stderr` writes do, so report the full length as written.
+        crate::messages::emit_raw(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // `emit_raw` flushes on every write, so there is nothing buffered here.
+        Ok(())
+    }
 }
 
 /// The format-string interpreter, generic over the standard-output and

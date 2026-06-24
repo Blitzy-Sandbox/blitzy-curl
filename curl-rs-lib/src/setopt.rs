@@ -752,6 +752,20 @@ pub struct UserDefined {
     /// `multipart/form-data; boundary=…`, applied unless the application supplied
     /// its own `Content-Type` (curl's `Curl_mime_contenttype` behavior).
     pub mime_content_type: Option<String>,
+    /// A *deferred* content-transfer-encoder error for a mail (`-F`) MIME body.
+    ///
+    /// curl streams a mail message body lazily, so a content-transfer-encoder
+    /// failure — notably the `7bit` encoder rejecting a byte with the high bit
+    /// set (`CURLE_READ_ERROR`) — is reported by the body reader only *after*
+    /// the `EHLO`/`MAIL`/`RCPT`/`DATA` exchange has taken place. This safe core
+    /// instead assembles the MIME body eagerly on the CLI/FFI seam
+    /// ([`Mime::into_mail_body`](crate::mime::Mime::into_mail_body)), where such
+    /// an encoder error would otherwise surface *before* any command is sent.
+    /// To preserve curl's observable behavior the assembler parks the error as
+    /// this marker (with an empty [`mime_body`](Self::mime_body)); the SMTP/IMAP
+    /// send path then reproduces the post-`DATA` `CURLE_READ_ERROR`
+    /// (`tests/data/test649`). Default `false`.
+    pub mime_body_read_error: bool,
 
     // ---- callback function pointers ----------------------------------------
     /// `CURLOPT_WRITEFUNCTION` body writer.
@@ -1185,6 +1199,7 @@ impl Default for UserDefined {
             mimepost: CDataPtr::NULL,
             mime_body: None,
             mime_content_type: None,
+            mime_body_read_error: false,
 
             // Callback pointers — all NULL; curl substitutes built-in
             // fwrite/fread shims at transfer time when these stay unset.
@@ -1417,7 +1432,7 @@ impl UserDefined {
     }
 
     /// Stores (or clears, when `value` is `None`) a string option.
-    fn set_str(&mut self, id: StrId, value: Option<String>) {
+    pub(crate) fn set_str(&mut self, id: StrId, value: Option<String>) {
         self.strings[id.idx()] = value;
     }
 
@@ -1598,6 +1613,16 @@ fn scheme_to_proto(token: &str) -> Option<u32> {
         "mqtt" => 1 << 28,
         "gophers" => 1 << 29,
         "ws" => 1 << 30,
+        // CURLPROTO_MQTTS is the public name for bit 30 (include/curl/curl.h
+        // L1106), deliberately sharing the slot with the internal CURLPROTO_WS
+        // (lib/urldata.h L70): the comment there notes bit 29 (GOPHERS) is the
+        // highest *publicly* used bit, and WS/WSS reuse 30/31 internally. Both
+        // schemes therefore map to bit 30. Without this arm, the alphabetically
+        // sorted "all" list produced by `--proto +all` (which includes "mqtts")
+        // hit the `_ => None` fall-through and made the whole CURLOPT_PROTOCOLS_STR
+        // parse fail with CURLE_UNSUPPORTED_PROTOCOL — denying even http on the
+        // initial request. Oracle: tests/data/test1245.
+        "mqtts" => 1 << 30,
         "wss" => 1u32 << 31,
         _ => return None,
     };

@@ -59,7 +59,10 @@ use std::time::Duration;
 use crate::conn::filters::{
     BoxFuture, CfState, ConnectionFilter, FilterChain, FilterData, CF_TYPE_SSL,
 };
-use crate::conn::happy_eyeballs::create_ip_happy_filter_with_timeout;
+use crate::conn::happy_eyeballs::{
+    create_ip_happy_filter_bound, create_ip_happy_filter_with_timeout,
+};
+use crate::conn::socket::BindConfig;
 use crate::conn::haproxy::create_haproxy_filter;
 use crate::conn::https_connect::{
     create_tls_filter, create_tls_proxy_filter, Curl_cf_https_setup, H3ConnectorFn,
@@ -760,6 +763,33 @@ pub fn eyeballs_factory(
             happy_eyeballs_timeout_ms,
             connect_timeout_ms,
             addrs,
+        )
+    })
+}
+
+/// Like [`eyeballs_factory`] but threads a local **interface / port binding**
+/// (`CURLOPT_INTERFACE`, `CURLOPT_LOCALPORT`/`CURLOPT_LOCALPORTRANGE`) into every
+/// connect attempt of the Happy-Eyeballs race. C: `bindlocal` inside
+/// `cf_socket_open`. An inactive [`BindConfig`] (the default — no interface and
+/// no local port) makes this behave identically to [`eyeballs_factory`], so it
+/// is safe to use unconditionally.
+#[must_use]
+pub fn eyeballs_factory_bound(
+    transport: u8,
+    ip_version: IpVersion,
+    happy_eyeballs_timeout_ms: i64,
+    connect_timeout_ms: i64,
+    addrs: ResolvedAddrs,
+    bind: BindConfig,
+) -> FilterFactory {
+    Box::new(move || {
+        create_ip_happy_filter_bound(
+            transport,
+            ip_version,
+            happy_eyeballs_timeout_ms,
+            connect_timeout_ms,
+            addrs,
+            bind,
         )
     })
 }

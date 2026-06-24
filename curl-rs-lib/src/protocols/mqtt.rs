@@ -831,7 +831,14 @@ impl Protocol for MqttProtocol {
             let mut url = CurlUrl::new();
             url.set(CurlUPart::Url, Some(&url_str), CURLU_DEFAULT_PORT)
                 .map_err(|_| CurlError::UrlMalformat)?;
-            let topic = extract_topic(&url, &mut conn.filter_data.error_buffer)?;
+            // NB: topic extraction is deliberately deferred until AFTER the
+            // CONNECT → CONNACK handshake below. In C the topic is read inside
+            // `mqtt_publish`/`mqtt_subscribe` (`mqtt.c` `mqtt_get_topic`), which
+            // run only once the control plane is up — so a bare `mqtt://host`
+            // with no topic still completes CONNECT/CONNACK on the wire before
+            // failing with `CURLE_URL_MALFORMAT`. Extracting it here (pre-connect)
+            // would skip the handshake and mismatch the protocol dump.
+            // Oracle: tests/data/test1199.
             let username = url.get(CurlUPart::User, CURLU_URLDECODE).unwrap_or_default();
             let password = url.get(CurlUPart::Password, CURLU_URLDECODE).unwrap_or_default();
             let client_id = generate_client_id();
@@ -864,6 +871,12 @@ impl Protocol for MqttProtocol {
                 &mut conn.filter_data.error_buffer,
             )?;
             crate::infof!(verbose, "mqtt: CONNACK accepted");
+
+            // Topic comes from the URL path; an empty topic (bare `mqtt://host`)
+            // is `CURLE_URL_MALFORMAT`. Deferred to here so CONNECT/CONNACK have
+            // already happened on the wire, matching C's `mqtt_get_topic` call
+            // site inside `mqtt_publish`/`mqtt_subscribe`. Oracle: test1199.
+            let topic = extract_topic(&url, &mut conn.filter_data.error_buffer)?;
 
             // --- Upload: PUBLISH then DISCONNECT (mqtt.c HTTPREQ_POST path) ---
             if upload {

@@ -64,6 +64,17 @@ use sha2::Digest;
 /// `Curl_HMAC_SHA256` parameter table (see the module-level documentation).
 pub use sha2::Sha256;
 
+/// The SHA-512/256 hash type, re-exported from the RustCrypto [`sha2`] crate.
+///
+/// SHA-512/256 (FIPS 180-4 §5.3.6) runs the SHA-512 compression function with a
+/// distinct initial hash value and truncates the result to its leading 256 bits.
+/// It is the pure-Rust replacement for the SHA-512/256 primitive curl declares in
+/// `lib/curl_sha512_256.h` (`Curl_sha512_256it` / `Curl_HMAC_SHA512_256`), used
+/// by HTTP Digest authentication for the `SHA-512-256` and `SHA-512-256-SESS`
+/// algorithms (RFC 7616). Re-exported (like [`Sha256`]) so other modules can name
+/// the type without taking their own direct dependency on `sha2`.
+pub use sha2::Sha512_256;
+
 /// Length, in bytes, of a SHA-256 digest.
 ///
 /// Direct parity with the C macro `CURL_SHA256_DIGEST_LENGTH` defined in
@@ -107,6 +118,59 @@ pub fn sha256it(input: &[u8]) -> [u8; CURL_SHA256_DIGEST_LENGTH] {
     // requires no `unsafe`. The lengths are guaranteed equal: SHA-256 always
     // emits `CURL_SHA256_DIGEST_LENGTH` bytes.
     let mut output = [0u8; CURL_SHA256_DIGEST_LENGTH];
+    output.copy_from_slice(digest.as_slice());
+    output
+}
+
+/// Length, in bytes, of a SHA-512/256 digest.
+///
+/// Direct parity with the C macro `CURL_SHA512_256_DIGEST_LENGTH` defined in
+/// `lib/curl_sha512_256.h`. SHA-512/256 truncates SHA-512 to a 256-bit (32-byte)
+/// digest, so this equals [`CURL_SHA256_DIGEST_LENGTH`].
+pub const CURL_SHA512_256_DIGEST_LENGTH: usize = 32;
+
+/// Compute the SHA-512/256 digest of `input` in a single call.
+///
+/// This is the parity replacement for curl's
+/// `Curl_sha512_256it(unsigned char *output, const unsigned char *input, size_t len)`
+/// declared in `lib/curl_sha512_256.h`. SHA-512/256 (FIPS 180-4 §5.3.6) runs the
+/// SHA-512 compression function with a distinct initial hash value and truncates
+/// the output to its leading 256 bits; the RustCrypto [`Sha512_256`] type
+/// implements exactly that. As with [`sha256it`], the C function returns a
+/// `CURLcode` (always `CURLE_OK` here, since the `sha2` backend has no fallible
+/// initialization) and writes into a caller-supplied buffer, whereas this
+/// infallible Rust API returns the digest by value.
+///
+/// Used by HTTP Digest authentication for the `SHA-512-256` and
+/// `SHA-512-256-SESS` algorithms (RFC 7616); see `crate::auth::digest`.
+///
+/// # Examples
+///
+/// ```
+/// # use curl_rs_lib::util::sha256::{sha512_256it, CURL_SHA512_256_DIGEST_LENGTH};
+/// // FIPS 180-4 test vector for SHA-512/256("abc").
+/// let digest = sha512_256it(b"abc");
+/// assert_eq!(digest.len(), CURL_SHA512_256_DIGEST_LENGTH);
+/// assert_eq!(
+///     digest,
+///     [
+///         0x53, 0x04, 0x8e, 0x26, 0x81, 0x94, 0x1e, 0xf9,
+///         0x9b, 0x2e, 0x29, 0xb7, 0x6b, 0x4c, 0x7d, 0xab,
+///         0xe4, 0xc2, 0xd0, 0xc6, 0x34, 0xfc, 0x6d, 0x46,
+///         0xe0, 0xe2, 0xf1, 0x31, 0x07, 0xe7, 0xaf, 0x23,
+///     ]
+/// );
+/// ```
+#[must_use]
+pub fn sha512_256it(input: &[u8]) -> [u8; CURL_SHA512_256_DIGEST_LENGTH] {
+    // `Sha512_256::digest` performs init + update(input) + finalize in one shot,
+    // exactly mirroring the body of `Curl_sha512_256it`.
+    let digest = Sha512_256::digest(input);
+
+    // Copy the fixed-size `GenericArray` result into a plain `[u8; 32]`. SHA-512/256
+    // always emits `CURL_SHA512_256_DIGEST_LENGTH` bytes, so the lengths match and
+    // this needs no `unsafe` (AAP §0.7.1).
+    let mut output = [0u8; CURL_SHA512_256_DIGEST_LENGTH];
     output.copy_from_slice(digest.as_slice());
     output
 }

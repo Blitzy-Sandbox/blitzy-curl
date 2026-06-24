@@ -1327,7 +1327,7 @@ pub(crate) async fn connect_network_scheme(
         establish_connection, ConnSetup, SchemeDescriptor, CURL_CF_SSL_DISABLE,
         CURL_CF_SSL_ENABLE, FIRSTSOCKET, TRNSPRT_TCP,
     };
-    use crate::dns::{self, DnsCache, IpVersion, ResolveParams};
+    use crate::dns::{self, load_host_pairs, DnsCache, IpVersion, ResolveParams};
     use crate::protocols::pingpong::tls_config_from_easy;
     use crate::url::{CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_GUESS_SCHEME, CURLU_URLDECODE};
 
@@ -1409,13 +1409,45 @@ pub(crate) async fn connect_network_scheme(
         _ => (host.clone(), port),
     };
 
-    // (3) Resolve the dialed endpoint's addresses (system resolver).
+    // (3) Resolve the dialed endpoint's addresses. A single cache backs both the
+    //     `--resolve` pre-load and the resolve below, so the permanent
+    //     pre-loaded entries are visible to `dns::resolve`'s cache lookup — the
+    //     SAME pattern the HTTP path uses (`http::resolve_addrs`). Without this
+    //     pre-load the line/command protocols (IMAP/POP3/SMTP/FTP/…) ignored
+    //     `CURLOPT_RESOLVE`/`--resolve` entirely, so a request to a host that
+    //     only resolves via a `--resolve host:port:addr` override failed with
+    //     `CURLE_COULDNT_RESOLVE_HOST` — notably an HTTP→IMAP cross-protocol
+    //     redirect whose target `imap://v@host:PORT/` relies on
+    //     `--resolve host:PORT:127.0.0.1`. Oracle: tests/data/test779, test795.
     let addrs = {
         let mut cache = DnsCache::new();
         let mut errbuf: Option<String> = None;
+
+        // Pre-load `--resolve` host:port:addr overrides (curl's
+        // `Curl_loadhostpairs`), keyed by host:port so the lookup below hits.
+        if let Some(list) = data.set.resolve.as_ref() {
+            let entries: Vec<String> = list
+                .iter()
+                .filter_map(|c| c.to_str().ok().map(String::from))
+                .collect();
+            if !entries.is_empty() {
+                load_host_pairs(
+                    &mut cache,
+                    &entries,
+                    crate::util::timeval::curlx_now(),
+                    verbose,
+                    &mut errbuf,
+                )?;
+            }
+        }
+
         let mut params = ResolveParams::new(&dial_host, dial_port);
         params.ip_version = ipver;
         params.verbose = verbose;
+        // Honor `CURLOPT_DOH_URL` (`--doh-url`) for the line protocols too, so
+        // name resolution routes through DNS-over-HTTPS when configured —
+        // matching the HTTP path's `resolve_addrs`.
+        params.doh_url = data.set.str(crate::setopt::StrId::Doh);
         let entry = dns::resolve(&mut cache, &params, &mut errbuf).await?;
         entry.addrs.clone()
     };
@@ -1435,10 +1467,20 @@ pub(crate) async fn connect_network_scheme(
     // wire-visible state from it — IMAP's command-tag letter is
     // `'A' + (connection_id % 26)`, so an unassigned `-1` would yield `'Z'`
     // instead of the `'A001'` curl emits (and the test-suite oracles expect).
-    // Assign id 0 to match curl's first-connection identity. (The field is set
-    // directly rather than via the `PoolConn::set_connection_id` trait method to
-    // avoid pulling a connection-pool trait into the protocols layer.)
-    conn.connection_id = 0;
+    // Match curl's monotonic id assignment: the *n*-th connection curl opens in
+    // a transfer gets id *n* (0-based). A single direct transfer therefore opens
+    // id 0 (⇒ tag letter `'A'`). After a cross-protocol redirect (e.g. an HTTP
+    // response that redirects to an `imap://` URL under `--proto-redir`), curl
+    // closes the HTTP connection (id 0) and opens a *fresh* connection to the
+    // new origin, which receives the next id — so the IMAP control connection
+    // is id 1 (⇒ tag letter `'B'`, the `B001 CAPABILITY` the oracle expects).
+    // `data.info.redirect_count` is exactly that hop count (0 for a direct
+    // transfer, 1 after one followed redirect), set by the HTTP engine before it
+    // hands the transfer off. Oracle: tests/data/test779, test795 (HTTP→IMAP
+    // redirect ⇒ `B001…` tags). (The field is set directly rather than via the
+    // `PoolConn::set_connection_id` trait method to avoid pulling a
+    // connection-pool trait into the protocols layer.)
+    conn.connection_id = data.info.redirect_count;
 
     // The origin's implicit-TLS factory (a `PROTOPT_SSL` scheme: smtps / imaps /
     // pop3s / gophers / …). Built once and applied whether the origin is dialed
@@ -1489,7 +1531,11 @@ pub(crate) async fn connect_network_scheme(
             // a tunneled line protocol is not exercised by the suite.
             let proxy_auth: Box<dyn ProxyConnectAuth> =
                 Box::new(StandardProxyAuth::new(px.clone(), data.set.proxyauth));
+            // Bracket an IPv6 literal target in the CONNECT authority/`Host`
+            // (C: `conn->bits.ipv6_ip`). `host` is already bracket-stripped, so
+            // a remaining colon marks an IPv6 address. Matches the HTTP path.
             let h1cfg = H1ProxyConfig::new(host.clone(), port)
+                .with_ipv6(host.contains(':'))
                 .with_http_minor(proxy_http_minor)
                 .with_user_agent(proxy_user_agent)
                 .with_scheme(scheme_name, true)
@@ -1682,7 +1728,7 @@ pub(crate) async fn perform_transfer(
 /// A URL or proxy-config error simply declines the swap, leaving the native FTP
 /// engine to surface the same error curl would.
 #[cfg(all(feature = "ftp", feature = "http", feature = "proxy"))]
-fn ftp_driven_as_http_proxy(data: &Easy) -> bool {
+pub(crate) fn ftp_driven_as_http_proxy(data: &Easy) -> bool {
     use crate::url::{CurlUPart, CurlUrl, CURLU_DEFAULT_PORT, CURLU_GUESS_SCHEME};
 
     // `--proxytunnel`/`-p` forces `CONNECT` tunneling — never proxy-as-HTTP.
@@ -1737,17 +1783,175 @@ fn ftp_driven_as_http_proxy(data: &Easy) -> bool {
 }
 
 /// Dispatch a recognized scheme to its protocol handler and drive the transfer
-/// to completion. This is the un-timed inner body of [`perform_transfer`]; the
-/// public wrapper layers the overall `CURLOPT_TIMEOUT` deadline on top of it so
-/// the timeout applies uniformly to every protocol without each handler having
-/// to re-implement it.
+/// to completion, re-dispatching across a cross-protocol redirect hand-off.
+///
+/// This is the un-timed inner body of [`perform_transfer`]; the public wrapper
+/// layers the overall `CURLOPT_TIMEOUT` deadline on top of it so the timeout
+/// applies uniformly to every protocol.
+///
+/// Most transfers dispatch exactly once: [`dispatch_scheme_once`] routes the
+/// handle's [`CURLINFO_SCHEME`](crate::getinfo) to its engine and runs it to
+/// completion. A protocol engine may, however, follow a `Location:` redirect to
+/// a URL served by a *different* engine (an HTTP response redirecting to
+/// `imap://` under `--proto-redir`). curl handles this by rewriting
+/// `data->state.url` and letting the top-level loop re-select the handler; our
+/// engines run once per dispatch, so the HTTP engine instead deposits the
+/// resolved target via [`Easy::set_protocol_handoff`] and returns. This loop
+/// observes the hand-off, rewrites the handle's URL/scheme info to the new
+/// target ([`apply_protocol_handoff`]), and re-dispatches — repeating for the
+/// (vanishingly rare) case of a chain of cross-protocol redirects, bounded by
+/// the same `--max-redirs` count the HTTP engine already enforces per hop.
+///
+/// # Errors
+///
+/// * [`CurlError::UnsupportedProtocol`] for a scheme with no compiled-in handler
+///   (or a network scheme whose drive is not yet wired).
+/// * [`CurlError::UrlMalformat`] if a hand-off target URL fails to re-parse.
+/// * The protocol handler's connect / do / transfer error otherwise.
+async fn perform_transfer_inner(
+    data: &mut Easy,
+    sink: &mut dyn WriteCallbacks,
+    source: &mut dyn ReadCallback,
+) -> Result<()> {
+    loop {
+        let result = dispatch_scheme_once(data, sink, source).await;
+        // A cross-protocol redirect hand-off is only deposited on the success
+        // path (the HTTP engine `break Ok(())`s after recording it). If the
+        // dispatch errored, propagate that error and discard any stale hand-off.
+        match data.take_protocol_handoff() {
+            Some(target) if result.is_ok() => {
+                // Rewrite the handle's working URL + scheme info to the redirect
+                // target, then loop to re-dispatch to the new scheme's engine.
+                apply_protocol_handoff(data, &target)?;
+                // Notify the front-end that the *effective* scheme changed:
+                // `apply_protocol_handoff` just rewrote `CURLINFO_SCHEME` to the
+                // new target's scheme. A front-end whose header callback gates on
+                // the scheme (the CLI's `tool_header_cb` echoes headers to the
+                // body for `-i`/`--include` only for `http`/`https`/`rtsp`/`file`)
+                // reads it via `getinfo(CURLINFO_SCHEME)`; the CLI moves its handle
+                // out for the transfer, so getinfo is unavailable and the engine
+                // must push the scheme through the sink. This makes the FTP
+                // control responses drained as `INFO` on an HTTP→FTP redirect gate
+                // on the effective `ftp` scheme (not the original `http`), so they
+                // are NOT wrongly echoed onto stdout under `-i`. Oracle:
+                // tests/data/test1055.
+                if let Some(scheme) =
+                    data.info.scheme.as_deref().and_then(|s| s.to_str().ok())
+                {
+                    sink.set_effective_scheme(scheme);
+                }
+                // The completed leg consumed the upload source (e.g. an HTTP
+                // `PUT` read its `-T` body to EOF); a body-preserving redirect
+                // (`307`/`308`) re-issues the same body on the new leg — here a
+                // cross-protocol HTTP `PUT` → FTP `STOR` hand-off. Rewind the
+                // source to its start so the re-dispatched engine re-reads the
+                // body from byte 0, mirroring how curl re-arms the upload via
+                // `CURLOPT_SEEKFUNCTION` (`src/tool_cb_see.c` `tool_seek_cb`)
+                // before resending. Without this the FTP `STOR` reads 0 bytes
+                // from the already-EOF source and fails with `CURLE_READ_ERROR`
+                // (exit 26). A non-upload hand-off (a GET-style redirect, e.g.
+                // HTTP → IMAP) has no `-T` source, so this no-ops there. Oracle:
+                // tests/data/test1055.
+                source.rewind();
+            }
+            _ => return result,
+        }
+    }
+}
+
+/// Rewrite an easy handle's working URL and `CURLINFO` scheme/effective-URL to a
+/// cross-protocol redirect target, so the next [`dispatch_scheme_once`] selects
+/// and drives the engine for the new scheme.
+///
+/// This reproduces, for the post-preflight re-dispatch, the same URL bookkeeping
+/// [`Easy::pre_perform`] does up front: the absolute target is parsed, the
+/// normalized form is stored back as the working URL (`CURLOPT_URL`), and
+/// `CURLINFO_EFFECTIVE_URL` / `CURLINFO_SCHEME` are updated to it (scheme stored
+/// lower-case, matching curl). Any pre-parsed `CURLOPT_CURLU` handle from the
+/// original transfer is cleared so the engines re-parse the new URL string
+/// rather than reusing the stale HTTP handle. `data.info.redirect_count` is left
+/// as the HTTP engine set it, so the new engine sees the correct hop count (it
+/// drives, e.g., IMAP's `'B'` command-tag letter for a first redirect).
+///
+/// # Errors
+///
+/// [`CurlError::UrlMalformat`] if the target URL cannot be parsed or its
+/// components cannot be read.
+fn apply_protocol_handoff(data: &mut Easy, target: &str) -> Result<()> {
+    use crate::url::{CurlUPart, CurlUrl, CURLU_GUESS_SCHEME, CURLU_NON_SUPPORT_SCHEME};
+
+    let mut u = CurlUrl::new();
+    u.set(
+        CurlUPart::Url,
+        Some(target),
+        CURLU_GUESS_SCHEME | CURLU_NON_SUPPORT_SCHEME,
+    )
+    .map_err(|_| CurlError::UrlMalformat)?;
+
+    // Normalized absolute URL → working URL (`CURLOPT_URL`) and
+    // `CURLINFO_EFFECTIVE_URL`.
+    let effective = u.get(CurlUPart::Url, 0).map_err(|_| CurlError::UrlMalformat)?;
+    data.set
+        .set_str(crate::setopt::StrId::SetUrl, Some(effective.clone()));
+    data.info.effective_url =
+        Some(std::ffi::CString::new(effective).map_err(|_| CurlError::UrlMalformat)?);
+
+    // Drop any pre-parsed `CURLOPT_CURLU` handle from the original transfer so
+    // the engines re-parse the (new-scheme) URL string. The CLI never sets
+    // `CURLOPT_CURLU`, so this is a no-op there; it matters only for an FFI
+    // consumer that handed in a `CURLU` for the original HTTP URL.
+    data.set.uh = None;
+
+    // Scheme → `CURLINFO_SCHEME` (lower-case, as the URL parser stores it and as
+    // the dispatcher's handler lookup expects).
+    let scheme = u
+        .get(CurlUPart::Scheme, 0)
+        .map_err(|_| CurlError::UrlMalformat)?;
+    data.info.scheme =
+        Some(std::ffi::CString::new(scheme).map_err(|_| CurlError::UrlMalformat)?);
+
+    // A cross-protocol hand-off always crosses scheme (and almost always port),
+    // so curl's "clear auth on redirect to a different port/protocol" rule fires
+    // (lib/http.c `Curl_follow`, L1209-L1255) unless `CURLOPT_UNRESTRICTED_AUTH`
+    // (`--location-trusted`, `allow_auth_to_other_hosts`) permits carrying the
+    // credentials to the new origin. Clearing the stored `-u`
+    // username/password reproduces the `Curl_safefree(aptr.user/passwd)` there:
+    // the new engine then resolves credentials from the redirect URL's own
+    // userinfo (an absent password defaults to empty, curl's `set_login`), not
+    // from `-u`. Oracle: tests/data/test795 (`-u user:secret` → redirect to
+    // `imap://v@host` ⇒ `AUTHENTICATE PLAIN AHYA`, i.e. user `v` + empty
+    // password = base64 of `\0v\0`, with `secret` dropped).
+    //
+    // The XOAUTH2 bearer (`--oauth2-bearer`, `StrId::Bearer`) is cleared on the
+    // SAME condition. Empirically (system curl 8.14.1 against test779) the IMAP
+    // SASL engine reports *"no auth mechanism offered could be selected"* and
+    // fails with `CURLE_LOGIN_DENIED` (67): XOAUTH2 IS in the offered∩preferred
+    // set, but `data->set.str[STRING_BEARER]` is NULL at IMAP auth time, so
+    // `sasl_choose_oauth2` (lib/curl_sasl.c, gated on a non-NULL bearer) does
+    // not select it — i.e. the bearer does not survive the cross-protocol
+    // redirect. Reproduce that by clearing it here; the server in test779 offers
+    // only `AUTH=XOAUTH2`, so with no bearer no mechanism is selectable and the
+    // login is denied with exactly `B001 CAPABILITY` sent and no `AUTHENTICATE`.
+    // Oracle: tests/data/test779 (exit 67, only `B001 CAPABILITY`).
+    if !data.set.allow_auth_to_other_hosts {
+        data.set.set_str(crate::setopt::StrId::Username, None);
+        data.set.set_str(crate::setopt::StrId::Password, None);
+        data.set.set_str(crate::setopt::StrId::Bearer, None);
+    }
+
+    Ok(())
+}
+
+/// Dispatch a recognized scheme to its protocol handler and drive the transfer
+/// to completion. This is the single-dispatch core invoked by
+/// [`perform_transfer_inner`]'s cross-protocol re-dispatch loop.
 ///
 /// # Errors
 ///
 /// * [`CurlError::UnsupportedProtocol`] for a scheme with no compiled-in handler
 ///   (or a network scheme whose drive is not yet wired).
 /// * The protocol handler's connect / do / transfer error otherwise.
-async fn perform_transfer_inner(
+async fn dispatch_scheme_once(
     data: &mut Easy,
     sink: &mut dyn WriteCallbacks,
     source: &mut dyn ReadCallback,
@@ -1818,6 +2022,25 @@ async fn perform_transfer_inner(
     // timed out with `(28)`).
     #[cfg(all(feature = "ftp", feature = "http", feature = "proxy"))]
     if scheme_name == "ftp" && ftp_driven_as_http_proxy(data) {
+        // curl's `PROTOPT_PROXY_AS_HTTP` handler swap replaces the connection's
+        // handler with the HTTP one (`lib/url.c` create_conn L2381,
+        // `conn->scheme = &Curl_scheme_http`). Because curl persists
+        // `data->info.conn_scheme = data->conn->scheme->name` only AFTER that
+        // swap (`lib/url.c` L3627), `CURLINFO_SCHEME` reports `http` — not `ftp`
+        // — for an FTP request driven as HTTP over a forward proxy. Reproduce
+        // that here so `CURLINFO_SCHEME` matches curl: the CLI tool gates its
+        // `--include`/`-i` response-header echo on the scheme being one of
+        // {http,https,rtsp,file} (`src/tool_cb_hdr.c` L509), so without this the
+        // response headers would be silently dropped (oracle: tests/data/test79,
+        // test208, test299). Only `info.scheme` changes — `info.effective_url`
+        // keeps the original `ftp://` URL (curl does not rewrite it either), the
+        // forward-proxy request target is still `GET ftp://… HTTP/1.1` because
+        // `request_target` reads the URL (not `info.scheme`), and the
+        // `<scheme>_proxy` environment lookup inside `perform_http` derives the
+        // scheme from `info.effective_url` (still `ftp`) — matching curl's
+        // `detect_proxy`, which runs on the original scheme before the swap, so
+        // `ftp_proxy` is still honored (test563/lib562).
+        data.info.scheme = Some(std::ffi::CString::new("http").expect("no NUL in literal"));
         return http::perform_http(data, sink, source).await;
     }
 

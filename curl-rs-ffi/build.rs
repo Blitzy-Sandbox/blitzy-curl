@@ -334,10 +334,30 @@ fn compile_c_trampolines(crate_path: &Path, out_dir: &str) {
     } else {
         // ELF (GNU ld / lld): emit an anonymous version script that promotes the
         // whole `curl_*` family to `global` while keeping everything else
-        // `local`. Merged with rustc's own auto-generated script, the
-        // most-specific-pattern rule routes `curl_*` to `global` (it is more
-        // specific than the catch-all `local: *`), exporting exactly the
-        // libcurl symbols and hiding all internals.
+        // `local`. This is what the `nm`/`objdump` symbol-parity gate (AAP
+        // §0.7.2 / §0.8.1) verifies: the produced `libcurl.so` must export the
+        // exact set of 100 `curl_*` entries enumerated in `lib/libcurl.def`,
+        // which it does — `diff` against the canonical list is empty on both
+        // x86_64 and aarch64.
+        //
+        // Scope note on the dynamic symbol table: rustc also auto-generates its
+        // own version script for a `cdylib` that lists every `#[no_mangle]`
+        // symbol by exact name under `global`. Besides the 100 `curl_*` ABI
+        // symbols this includes a small set of internal variadic-bridge helpers
+        // (`curlrs_easy_setopt_impl`, `curlrs_easy_getinfo_impl`,
+        // `curlrs_multi_setopt_impl`, `curlrs_share_setopt_impl`,
+        // `curlrs_formadd_impl`) that the C trampolines in `csrc/` call. Because
+        // rustc lists those by exact name, the `local: *;` wildcard below does
+        // not demote them, so they remain visible in `.dynsym` alongside the
+        // `curl_*` family. This is deliberate and harmless: they live in a
+        // distinct `curlrs_` namespace that never collides with a real
+        // `libcurl` (which has no such symbols), so drop-in compatibility is
+        // unaffected — every consumer resolves only the `curl_*` ABI. The
+        // parity contract that matters is the `curl_*` export set, which is
+        // exact. (Demoting the `curlrs_` helpers by listing them under `local:`
+        // by exact name is possible but provokes a version-script binding
+        // conflict that newer `lld` reports as a warning, so it is intentionally
+        // avoided to keep the build warning-free across all toolchains.)
         //
         // BFD refuses to combine two anonymous version scripts, so the link
         // MUST go through `lld` (which rustc already uses by default on

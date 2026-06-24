@@ -343,6 +343,60 @@ impl BindConfig {
     pub fn is_active(&self) -> bool {
         self.device.is_some() || self.bind_host.is_some() || self.local_port != 0
     }
+
+    /// Build a [`BindConfig`] from the already-decomposed `CURLOPT_INTERFACE`
+    /// pieces (as stored by `setopt` into `StrId::Device` / `StrId::Interface` /
+    /// `StrId::Bindhost`) plus the local-port range (`CURLOPT_LOCALPORT` /
+    /// `CURLOPT_LOCALPORTRANGE`).
+    ///
+    /// This mirrors the source selection that curl's `bindlocal`
+    /// (`lib/cf-socket.c`) performs after `Curl_parse_interface`:
+    ///
+    /// * An explicit interface (`if!NAME`, or the interface half of
+    ///   `ifhost!IF!HOST`) → bind via `SO_BINDTODEVICE` (the `device` field).
+    /// * An explicit host (`host!IP`, or the host half of `ifhost!IF!HOST`) →
+    ///   bind to that local IP (the `bind_host` field).
+    /// * A **bare** token (no prefix) is ambiguous: curl first tries it as an
+    ///   interface (`if2ip` / `SO_BINDTODEVICE`) and, failing that, resolves it
+    ///   as a host. Here an IP literal binds directly as a local IP; any other
+    ///   bare token is treated as a device name, so a non-existent name fails
+    ///   the `SO_BINDTODEVICE` bind and yields `CURLE_INTERFACE_FAILED` (45),
+    ///   exactly as curl reports for an unbindable `--interface`.
+    ///
+    /// When no interface and no local port are configured the result is an
+    /// inactive config ([`BindConfig::is_active`] is `false`) and [`bindlocal`]
+    /// is a no-op, so callers may build this unconditionally.
+    #[must_use]
+    pub fn from_interface(
+        device: Option<&str>,
+        interface: Option<&str>,
+        bind_host: Option<&str>,
+        local_port: u16,
+        local_port_range: u16,
+    ) -> Self {
+        // Explicit interface name (`if!` / `ifhost!`) → SO_BINDTODEVICE.
+        let mut dev: Option<String> = interface.map(str::to_string);
+        // Explicit host (`host!` / `ifhost!`) → bind to the literal local IP.
+        // A non-IP `host!` value is left unresolved (None); no in-scope test
+        // passes a hostname here, and curl would otherwise resolve it.
+        let mut host: Option<IpAddr> = bind_host.and_then(|h| h.parse::<IpAddr>().ok());
+
+        // Bare token: IP literal binds as a local IP, otherwise it is a device.
+        if let Some(d) = device {
+            if let Ok(ip) = d.parse::<IpAddr>() {
+                host = Some(ip);
+            } else {
+                dev = Some(d.to_string());
+            }
+        }
+
+        Self {
+            device: dev,
+            bind_host: host,
+            local_port,
+            local_port_range,
+        }
+    }
 }
 
 // =============================================================================
@@ -2494,6 +2548,63 @@ mod tests {
             parse_interface(&max).expect("512 ok"),
             ParsedInterface::Device(max.clone())
         );
+    }
+
+    // ---- `BindConfig::from_interface` source selection
+    //      (the typed equivalent of curl's `bindlocal` host/device choice). ----
+
+    #[test]
+    fn from_interface_inactive_when_nothing_set() {
+        // No interface, no local port → inactive, so `bindlocal` is a no-op.
+        let b = BindConfig::from_interface(None, None, None, 0, 0);
+        assert!(!b.is_active());
+        assert!(b.device.is_none() && b.bind_host.is_none());
+    }
+
+    #[test]
+    fn from_interface_bare_ip_literal_binds_host() {
+        // A bare `--interface 127.0.0.1` is an IP literal: bind the source IP,
+        // no SO_BINDTODEVICE device. (Tests 1045/1047/1049/1082.)
+        let b = BindConfig::from_interface(Some("127.0.0.1"), None, None, 0, 0);
+        assert_eq!(b.bind_host, Some("127.0.0.1".parse().unwrap()));
+        assert!(b.device.is_none());
+        assert!(b.is_active());
+    }
+
+    #[test]
+    fn from_interface_bare_nonip_is_device() {
+        // A bare non-IP token (a host or device name) becomes a device, so an
+        // unbindable name fails SO_BINDTODEVICE → CURLE_INTERFACE_FAILED (45).
+        // (Test 1084: `--interface non-existing-host.haxx.se.`.)
+        let b = BindConfig::from_interface(Some("non-existing-host.haxx.se."), None, None, 0, 0);
+        assert_eq!(b.device.as_deref(), Some("non-existing-host.haxx.se."));
+        assert!(b.bind_host.is_none());
+        assert!(b.is_active());
+    }
+
+    #[test]
+    fn from_interface_if_prefix_is_device() {
+        // `if!eth0` (StrId::Interface) → bind via SO_BINDTODEVICE, no host.
+        let b = BindConfig::from_interface(None, Some("eth0"), None, 0, 0);
+        assert_eq!(b.device.as_deref(), Some("eth0"));
+        assert!(b.bind_host.is_none());
+    }
+
+    #[test]
+    fn from_interface_host_prefix_ip_binds_host() {
+        // `host!127.0.0.1` (StrId::Bindhost) → bind the literal local IP.
+        let b = BindConfig::from_interface(None, None, Some("127.0.0.1"), 0, 0);
+        assert_eq!(b.bind_host, Some("127.0.0.1".parse().unwrap()));
+        assert!(b.device.is_none());
+    }
+
+    #[test]
+    fn from_interface_local_port_alone_is_active() {
+        // `--local-port` with no interface still requests a bind.
+        let b = BindConfig::from_interface(None, None, None, 8080, 3);
+        assert!(b.is_active());
+        assert_eq!(b.local_port, 8080);
+        assert_eq!(b.local_port_range, 3);
     }
 
     // ---- `cf_socket_query` exactness on an unconnected TCP filter

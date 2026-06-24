@@ -231,6 +231,20 @@ fn load(content: &[u8]) -> Vec<u8> {
             continue;
         }
 
+        // Truncate the line at the first embedded NUL byte, reproducing C
+        // `file2memory` (lib/netrc.c L91): it appends each read line to the file
+        // buffer with `curlx_dyn_add(filebuf, line)`, a C-string append that
+        // stops at the first '\0'. A `.netrc` containing an embedded NUL — e.g.
+        // `password<NUL> hello` — therefore truncates at the NUL, so the
+        // `password` keyword is left with no following value and resolves to an
+        // empty password (oracle: tests/data/test792, test793). Without this the
+        // tokenizer (which treats NUL as a token terminator, byte <= ' ') would
+        // skip the NUL and wrongly read `hello` as the password.
+        let line = match line.iter().position(|&b| b == 0) {
+            Some(nul) => &line[..nul],
+            None => line,
+        };
+
         out.extend_from_slice(line);
         out.push(b'\n');
         start = next;

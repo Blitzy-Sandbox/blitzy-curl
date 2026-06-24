@@ -1626,7 +1626,9 @@ pub(crate) unsafe fn httppost_chain_to_body(
     let mime = core::mime::httppost_to_mime(&mut hp).ok()?;
     let boundary = String::from_utf8_lossy(mime.boundary_str()).into_owned();
     let content_type = format!("multipart/form-data; boundary={boundary}");
-    let body = mime.into_form_body().ok()?;
+    // `curl_formget` (the legacy form API) has no form-escape option, so it
+    // always uses the default WHATWG percent-escaping (`formescape = false`).
+    let body = mime.into_form_body(false).ok()?;
     Some((body, content_type))
 }
 

@@ -333,6 +333,22 @@ pub trait WriteCallbacks: Send {
     fn ignorebody(&self) -> bool {
         false
     }
+
+    /// Inform the front-end that the transfer's *effective* scheme changed — the
+    /// engine's `CURLINFO_SCHEME` was rewritten by a cross-protocol redirect
+    /// hand-off (e.g. an HTTP `PUT` whose `Location:` points at an `ftp://`
+    /// target; `apply_protocol_handoff`). A front-end whose header callback gates
+    /// behavior on the scheme (the CLI's `tool_header_cb`, which echoes headers
+    /// to the body for `-i`/`--include` only for `http`/`https`/`rtsp`/`file`)
+    /// reads the *effective* scheme from `curl_easy_getinfo(CURLINFO_SCHEME)`. The
+    /// CLI moves its easy handle out for the duration of the transfer, so getinfo
+    /// is unavailable there; the engine therefore pushes the post-hand-off scheme
+    /// here so the callback gates on the protocol actually producing each line.
+    /// Without this, FTP control responses drained as `INFO` after an HTTP→FTP
+    /// redirect would be mis-gated on the original `http` scheme and wrongly
+    /// echoed onto stdout under `-i`. The default *ignores* the notification (a
+    /// sink with no scheme-dependent behavior). Oracle: tests/data/test1055.
+    fn set_effective_scheme(&mut self, _scheme: &str) {}
 }
 
 /// The kind of a [`WriteCallbacks::debug`] trace event — the core's mirror of
@@ -2427,12 +2443,26 @@ pub async fn drive_transfer<P: ProtocolExchange>(
                 }
             }
             ResponseEvent::End => {
-                // Deliver end-of-stream: flush the content decoder and the
-                // terminal (possibly zero-length) body callback.
+                // Deliver end-of-stream: a `BODY | EOS` write so the content
+                // decoder flushes its final bytes (the `EOS` flag drives
+                // `flush_all`). Crucially this does NOT set `ZERO_LEN`: curl's
+                // generic response path emits exactly `CLIENTWRITE_BODY |
+                // CLIENTWRITE_EOS` (lib/transfer.c `Curl_xfer_write_resp`), and
+                // `CLIENTWRITE_0LEN` is set ONLY by the WebSocket writer
+                // (lib/ws.c) — never for HTTP/FTP/etc. The `cw-out` writer
+                // therefore suppresses the user write callback for a zero-length
+                // body (it flushes a 0-length buffer only when tagged
+                // `CW_OUT_BODY_0LEN`), so a bodyless response (a `304 Not
+                // Modified`, a `204`, or any empty body) never invokes the
+                // client write callback. That is what lets `--etag-compare` on a
+                // `304` leave the `-o` file untouched: the CLI opens the file
+                // lazily on the first body byte, which never arrives, and the
+                // empty-file creation for a genuinely-empty `200` is instead done
+                // by the CLI's `post_per_transfer` (gated on
+                // `CURLINFO_CONDITION_UNMET`, so a `304` is skipped) — exactly
+                // mirroring curl's `tool_operate.c` (oracle: tests/data/test1566).
                 writer.write(
-                    ClientWriteType::BODY
-                        .union(ClientWriteType::EOS)
-                        .union(ClientWriteType::ZERO_LEN),
+                    ClientWriteType::BODY.union(ClientWriteType::EOS),
                     &[],
                     write_cb,
                 )?;
@@ -3178,6 +3208,36 @@ mod tests {
         w.write(ClientWriteType::HEADER, b"X-A: 1\r\n", &mut cb)
             .unwrap();
         assert_eq!(cb.body, b"X-A: 1\r\n");
+    }
+
+    #[test]
+    fn cw_include_trailers_after_body_reach_both_streams() {
+        // Oracle: tests/data/test1116 — chunked trailers delivered AFTER the
+        // body, with CURLOPT_HEADER (`--include`), must reach BOTH the header
+        // stream (`-D`) and the body/stdout stream, in order. A body write
+        // followed by two trailer HEADER writes must place both trailer lines on
+        // the body stream after the body bytes.
+        let mut cb = CollectCb::new();
+        let mut w = ClientWriter::with_options(true, true);
+        w.write(ClientWriteType::BODY, b"abcabc\n", &mut cb).unwrap();
+        w.write(
+            ClientWriteType::HEADER,
+            b"chunky-trailer: header data\r\n",
+            &mut cb,
+        )
+        .unwrap();
+        w.write(ClientWriteType::HEADER, b"another-header: yes\r\n", &mut cb)
+            .unwrap();
+        assert_eq!(
+            cb.body,
+            b"abcabc\nchunky-trailer: header data\r\nanother-header: yes\r\n",
+            "both trailers must follow the body on the body stream"
+        );
+        assert_eq!(
+            cb.headers,
+            b"chunky-trailer: header data\r\nanother-header: yes\r\n",
+            "both trailers must reach the header stream"
+        );
     }
 
     #[test]

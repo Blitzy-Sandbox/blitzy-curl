@@ -165,11 +165,26 @@ impl GlobError {
             // `%*s` with width `pos - 1` and the single-space argument " "
             // yields exactly `pos - 1` spaces, placing `^` under column `pos`.
             let spaces = " ".repeat(self.pos - 1);
-            format!(
+            let full = format!(
                 "{} in URL position {}:\n{}\n{}^",
                 self.msg, self.pos, url, spaces
-            )
+            );
+            // C `globerror()` does not format this directly to the stream: it
+            // renders into a fixed `char text[512]` via
+            // `curl_msnprintf(text, sizeof(text), ...)`. `curl_msnprintf`
+            // stores at most `maxlength` bytes and then NUL-terminates,
+            // overwriting the final byte when the buffer fills (lib/mprintf.c
+            // `addbyter`/`curl_mvsnprintf`), so the emitted C string is capped
+            // at `sizeof(text) - 1 == 511` bytes. For a pathologically long URL
+            // this truncates the rendered URL mid-string and can drop the
+            // trailing newline + caret entirely — observable, and asserted, by
+            // tests/data/test761. Reproduce that fixed-buffer cap byte-for-byte.
+            truncate_to_c_text_buffer(&full)
         } else {
+            // C takes the `t = glob->error` branch when `glob->pos == 0`, i.e.
+            // it points `t` straight at the static message and never routes it
+            // through the `text[]` buffer, so the bare message is emitted
+            // untruncated.
             self.msg.clone()
         }
     }
@@ -197,6 +212,38 @@ impl fmt::Display for GlobError {
 }
 
 impl std::error::Error for GlobError {}
+
+/// Caps `s` at the capacity of C `globerror()`'s `char text[512]` diagnostic
+/// buffer.
+///
+/// `curl_msnprintf(text, sizeof(text), ...)` writes at most `sizeof(text)`
+/// bytes and then NUL-terminates; when the buffer fills, `curl_mvsnprintf`
+/// overwrites the final stored byte with the terminator (lib/mprintf.c), so the
+/// resulting C string holds at most `512 - 1 == 511` bytes. We reproduce that
+/// exact cap.
+///
+/// The cut is performed on a UTF-8 character boundary so the returned `String`
+/// stays valid. The glob diagnostics that can exceed 511 bytes are built from
+/// the (ASCII) error label, a decimal position, and the user-supplied URL; for
+/// the ASCII inputs this path handles in practice the boundary-safe cut lands
+/// on the same byte C would cut at, making the output byte-for-byte identical
+/// (see tests/data/test761).
+fn truncate_to_c_text_buffer(s: &str) -> String {
+    /// `sizeof(text)` in `globerror()` is 512; one byte is reserved for the
+    /// terminating NUL, leaving 511 bytes of content.
+    const C_TEXT_CAP: usize = 511;
+
+    if s.len() <= C_TEXT_CAP {
+        return s.to_string();
+    }
+    // Walk back to the nearest char boundary at or below the cap so slicing
+    // never splits a multi-byte sequence (a no-op for ASCII content).
+    let mut end = C_TEXT_CAP;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
 
 // ===========================================================================
 // Pattern types (mirroring `struct URLPattern` and `enum globtype`)

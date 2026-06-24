@@ -398,7 +398,7 @@ fn junkscan(url: &str, allow_space: bool) -> UResult<usize> {
 /// A scheme is `ALPHA *( ALNUM / "+" / "-" / "." )` followed by `:`. In
 /// guess/default mode curl additionally requires the `:` to be followed by `/`
 /// (otherwise a bare `host:port` would be misread as `scheme:opaque`).
-fn is_absolute_url(url: &str, guessing: bool) -> (usize, Option<String>) {
+pub(crate) fn is_absolute_url(url: &str, guessing: bool) -> (usize, Option<String>) {
     let b = url.as_bytes();
     let mut i = 0usize;
     if b.first().is_some_and(u8::is_ascii_alphabetic) {

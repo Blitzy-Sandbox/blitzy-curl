@@ -149,7 +149,17 @@ use crate::tls::{alpn_protocols, ALPN_H2, ALPN_HTTP_1_0};
 // overrides), the per-easy TLS config, the scheme descriptors, the option
 // accessors, and the transfer-engine driver and its parts.
 // ---------------------------------------------------------------------------
-use crate::conn::connect::{eyeballs_factory, tls_factory, SetupConfig};
+use crate::conn::connect::{
+    eyeballs_factory_bound, haproxy_factory, tls_factory, FilterFactory, SetupConfig,
+};
+use crate::conn::socket::BindConfig;
+// `--unix-socket`/`--abstract-unix-socket` dial a UNIX-domain socket directly,
+// bypassing name resolution. These helpers are `cfg(unix)` (Tokio's
+// `UnixStream` is UNIX-only); the AAP build matrix is Linux + macOS.
+#[cfg(unix)]
+use crate::conn::happy_eyeballs::create_ip_happy_filter_unix;
+#[cfg(unix)]
+use crate::conn::socket::UnixTarget;
 use crate::conn::{
     establish_connection, ConnSetup, SchemeDescriptor, CURL_CF_SSL_DISABLE, CURL_CF_SSL_ENABLE,
     FIRSTSOCKET, TRNSPRT_TCP,
@@ -550,6 +560,12 @@ struct HopInputs {
     /// strips the custom `Host:` line from `custom_headers` so the builder emits
     /// the current host (tests 184/185).
     suppress_custom_host: bool,
+    /// Drop the custom request verb (`-X`/`CURLOPT_CUSTOMREQUEST`) for this hop,
+    /// sending a plain `GET` instead (curl's `data->state.http_ignorecustom`).
+    /// Set once a 301/302/303 downgrades the method to `GET` under `--follow`
+    /// (`CURLFOLLOW_OBEYCODE`); see the loop-local `ignore_custom_request`
+    /// (oracle: tests/data/test794, test796).
+    ignore_custom_request: bool,
 }
 
 impl HopInputs {
@@ -573,6 +589,8 @@ impl HopInputs {
             // A single-shot transfer is never a follow, so the custom `Host:`
             // (if any) is always sent (curl's `!this_is_a_follow`).
             suppress_custom_host: false,
+            // A single-shot transfer never follows, so the custom verb is honored.
+            ignore_custom_request: false,
         }
     }
 }
@@ -587,6 +605,27 @@ struct HopResult {
     status: i32,
     /// The `Location` header value, if present.
     location: Option<String>,
+    /// The `Authorization` value to carry PREEMPTIVELY to the next hop when a
+    /// reactive negotiation on this hop settled on a stateless scheme (Basic /
+    /// Bearer). `None` for non-auth hops, still-negotiating multi-scheme masks,
+    /// and the connection-bound schemes. The redirect loop forwards it (gated by
+    /// the same cross-host `auth_allowed_this_host` rule as the origin's
+    /// preemptive value) so a `--location-trusted` redirect to a host that does
+    /// not re-challenge still sends the credential (curl's persistent
+    /// `data->state.authhost.picked`; oracle: tests/data/test1088).
+    picked_preemptive: Option<String>,
+    /// The settled **Digest** state to carry PREEMPTIVELY to the next hop. Unlike
+    /// `picked_preemptive` (a verbatim Basic/Bearer value), a Digest credential
+    /// must be RECOMPUTED for each subsequent request's method+URI with an
+    /// incremented nonce-count, so the carried state (nonce, cnonce, realm, algo,
+    /// qop, the `nc` counter, plus the credentials and IE-style flag) is forwarded
+    /// rather than a fixed header. `Some` only once a Digest negotiation settled
+    /// (a nonce was received); the redirect loop re-emits it on every in-scope
+    /// hop, gated by the same cross-host rule as `picked_preemptive`. This mirrors
+    /// curl's persistent `data->state.digest` + `authhost.picked == CURLAUTH_DIGEST`
+    /// re-send (oracle: tests/data/test1286 — the nonce-count must increase across
+    /// the `--location` redirect: `nc=00000001` then `nc=00000002`).
+    picked_digest: Option<auth_engine::DigestCarry>,
     /// All `Set-Cookie` header values from this hop's response, in order, for
     /// the cookie engine to store (curl's `Curl_cookie_add` per response).
     #[cfg(feature = "cookies")]
@@ -886,6 +925,15 @@ struct HopSink<'s> {
     /// 33) after the exchange, and the body is discarded (the local file is left
     /// untouched), matching curl's `http_firstwrite` `CURLE_RANGE_ERROR` return.
     range_error: bool,
+    /// Latch: a second, different `Location:` header was seen in one response
+    /// block. curl rejects this with `CURLE_WEIRD_SERVER_REPLY` (8) via
+    /// `failf(data, "Multiple Location headers")` (`lib/http.c` http_header,
+    /// the `Location:` branch) — an empty or exact-repeat `Location:` is ignored,
+    /// but two non-empty values that differ are a hard error, regardless of
+    /// whether redirects are being followed. `note_header` cannot return a
+    /// `CURLcode`, so the condition is latched here and surfaced by the
+    /// orchestrator after the exchange (regression oracle: tests/data/test772).
+    multiple_location: bool,
     /// The time-condition selector (`CURLOPT_TIMECONDITION`, `-z`): `0` = none,
     /// `1` = if-modified-since, `2` = if-unmodified-since. Set by the orchestrator
     /// after construction. Drives the client-side response time-condition check
@@ -908,6 +956,22 @@ struct HopSink<'s> {
     /// treated as met, matching `Curl_meets_timecondition`). Reset on each new
     /// status line. Consulted by the first-body-write time-condition check.
     timeofdoc: i64,
+    /// Whether the document modification time should be captured for
+    /// `CURLINFO_FILETIME[_T]` (curl's `data->set.get_filetime`, set by
+    /// `CURLOPT_FILETIME`, the CLI `--remote-time`). Set by the orchestrator
+    /// after construction; persists across an auth resend. When set, a parsed
+    /// `Last-Modified` is recorded into [`filetime`](Self::filetime).
+    get_filetime: bool,
+    /// The parsed `Last-Modified` instant captured for `CURLINFO_FILETIME[_T]`
+    /// when [`get_filetime`](Self::get_filetime) is active, mirroring curl's
+    /// `http_header_l` storing `k->timeofdoc` into `data->info.filetime`
+    /// (`lib/http.c`). `None` until a `Last-Modified` is seen (so a transfer
+    /// with no such header leaves `info.filetime` at its `-1` "unknown"
+    /// default); a `Some(0)` records an unparseable date, exactly as the C
+    /// `Curl_getdate_capped` failure path sets `timeofdoc = 0`. The orchestrator
+    /// propagates this to `data.info.filetime` after the exchange. Re-evaluated
+    /// on each auth resend alongside `timeofdoc`.
+    filetime: Option<i64>,
     /// Set by the first-body-write time-condition check when the response did not
     /// satisfy the configured `If-Modified-Since`/`If-Unmodified-Since` condition.
     /// The orchestrator surfaces this as a simulated `304` (`data.info.timecond =
@@ -952,10 +1016,13 @@ impl<'s> HopSink<'s> {
             content_range_seen: false,
             body_size: None,
             range_error: false,
+            multiple_location: false,
             timecondition: 0,
             timevalue: 0,
             range_present: false,
             timeofdoc: 0,
+            get_filetime: false,
+            filetime: None,
             condition_unmet: false,
         }
     }
@@ -1082,15 +1149,31 @@ impl<'s> HopSink<'s> {
                 }
                 self.retry_after = Some(secs);
             }
-            // The response document's modification time (curl's `http_header_l`):
-            // parse `Last-Modified` into `timeofdoc` only when a time condition is
-            // active, exactly as curl gates on `data->set.timecondition ||
-            // data->set.get_filetime`. The first-body-write check compares it
-            // against `timevalue`. An unparseable date caps to `0` (the condition
-            // is then treated as met — `Curl_getdate_capped` setting `timeofdoc =
-            // 0` on failure).
-            if self.timecondition != 0 && name.eq_ignore_ascii_case("last-modified") {
-                self.timeofdoc = crate::util::parsedate::getdate_capped(value).unwrap_or(0);
+            // The response document's modification time (curl's `http_header_l`,
+            // lib/http.c L3376-L3384): parse `Last-Modified` into `timeofdoc`
+            // when EITHER a time condition is active OR the file time is wanted,
+            // exactly as curl gates on `data->set.timecondition ||
+            // data->set.get_filetime`. The first-body-write check compares
+            // `timeofdoc` against `timevalue`. An unparseable date caps to `0`
+            // (the condition is then treated as met — `Curl_getdate_capped`
+            // setting `k->timeofdoc = 0` on failure). When the file time was
+            // requested (`--remote-time` / `CURLOPT_FILETIME`), the same parsed
+            // instant is additionally captured for `CURLINFO_FILETIME[_T]`,
+            // mirroring curl's `if(data->set.get_filetime) data->info.filetime =
+            // k->timeofdoc;`. The capture is `Some(..)` only once a
+            // `Last-Modified` is actually seen, so a response without the header
+            // leaves `info.filetime` at its `-1` "unknown" default; pre-1970
+            // documents yield the correct NEGATIVE timestamp (oracle test762 /
+            // test1443: a 1940 `Last-Modified` produces filetime
+            // `-922349651`).
+            if (self.timecondition != 0 || self.get_filetime)
+                && name.eq_ignore_ascii_case("last-modified")
+            {
+                let parsed = crate::util::parsedate::getdate_capped(value).unwrap_or(0);
+                self.timeofdoc = parsed;
+                if self.get_filetime {
+                    self.filetime = Some(parsed);
+                }
             }
             if name.eq_ignore_ascii_case("location") {
                 // An empty `Location:` header is ignored — curl does not follow
@@ -1102,8 +1185,29 @@ impl<'s> HopSink<'s> {
                 // so a `Location:` with only whitespace is treated as empty.
                 // (Regression oracle: tests/data/test54 — "HTTP with blank
                 // Location:" expects exactly one request and rc=0.)
+                //
+                // A non-empty value that differs from a previously-stored one is
+                // a hard error: curl's `Location:` branch does
+                // `if(data->req.location) { failf("Multiple Location headers");
+                // return CURLE_WEIRD_SERVER_REPLY; }` (lib/http.c). An exact
+                // repeat (`!strcmp`) is silently ignored. Since `note_header`
+                // cannot return a `CURLcode`, the error is latched in
+                // `multiple_location` and surfaced by the orchestrator after the
+                // exchange (oracle: tests/data/test772 — two differing
+                // `Location:` headers fail with rc=8, even without `-L`).
                 if !value.is_empty() {
-                    self.location = Some(value.to_string());
+                    match self.location.as_deref() {
+                        // Exact repeat of the stored value: ignore.
+                        Some(existing) if existing == value => {}
+                        // A different value while one is already stored: reject.
+                        Some(_) => {
+                            self.multiple_location = true;
+                        }
+                        // First non-empty value: store it.
+                        None => {
+                            self.location = Some(value.to_string());
+                        }
+                    }
                 }
             } else if name.eq_ignore_ascii_case("www-authenticate")
                 || name.eq_ignore_ascii_case("proxy-authenticate")
@@ -1183,11 +1287,14 @@ impl<'s> HopSink<'s> {
         self.content_range_seen = false;
         self.body_size = None;
         self.range_error = false;
+        self.multiple_location = false;
         // The configured time condition (`timecondition`/`timevalue`/
-        // `range_present`) likewise persists across an auth resend, while the
-        // per-response `Last-Modified` observation and the unmet latch are
-        // re-evaluated on the retry's response.
+        // `range_present`) and the `get_filetime` capture flag likewise persist
+        // across an auth resend, while the per-response `Last-Modified`
+        // observations (`timeofdoc` and the `filetime` capture) and the unmet
+        // latch are re-evaluated on the retry's response.
         self.timeofdoc = 0;
+        self.filetime = None;
         self.condition_unmet = false;
         #[cfg(feature = "cookies")]
         self.set_cookies.clear();
@@ -1800,7 +1907,6 @@ mod auth_engine {
     use crate::conn::h1_proxy::ProxyConnectAuth;
     use crate::error::Result;
     use crate::netrc::{self, CurlNetrcOption};
-    use crate::url::CURLU_URLDECODE;
     use std::path::Path;
 
     /// Resolved host credentials (curl's `data->state.aptr.user`/`passwd`).
@@ -1870,7 +1976,9 @@ mod auth_engine {
         // credentials. A multi-scheme mask (anyauth) is intentionally excluded by
         // the exact-equality test so it does not pre-send Basic.
         if auth == CURLAUTH_BASIC {
-            let creds = resolve(data, host, url)?;
+            // A `.netrc` parse error is surfaced up front by `precheck_netrc`
+            // (called in `perform_http`); here it collapses to "no credentials".
+            let creds = resolve(data, host, url).ok().flatten()?;
             let line = http_basic_header(&creds.user, &creds.password, false).ok()?;
             return Some(reduce_to_value(&line));
         }
@@ -1905,6 +2013,51 @@ mod auth_engine {
         want: u32,
     }
 
+    /// The settled HTTP **Digest** state, carried across redirect/subsequent hops
+    /// so each in-scope request can preemptively re-send `Authorization: Digest`
+    /// — curl's persistent `data->state.digest` paired with
+    /// `data->state.authhost.picked == CURLAUTH_DIGEST`. Unlike Basic/Bearer
+    /// (whose header is a verbatim value carried by
+    /// [`settled_preemptive_value`](HttpAuthController::settled_preemptive_value)),
+    /// a Digest credential is **recomputed per request**: the response hash binds
+    /// the request method and URI, and the nonce-count (`nc`) increments on every
+    /// `qop`-bearing response while the SAME server nonce is reused. The carried
+    /// state therefore holds the live [`DigestData`] (nonce, cnonce, realm, algo,
+    /// qop, and the running `nc`), the resolved credentials, and the IE-style
+    /// flag. Oracle: tests/data/test1286 (`nc=00000001` on the first authenticated
+    /// request, then `nc=00000002` on the `--location` redirect target).
+    #[derive(Clone)]
+    pub(super) struct DigestCarry {
+        digest: DigestData,
+        iestyle: bool,
+        user: String,
+        password: String,
+    }
+
+    impl DigestCarry {
+        /// Produce the preemptive `Authorization: Digest` **value** (header line
+        /// reduced to just the value, as the h1 builder expects) for a subsequent
+        /// in-scope request to `method`+`target`, advancing the nonce-count.
+        ///
+        /// Mutates `self.digest.nc` exactly as curl's `Curl_output_digest`
+        /// re-send does (`create_digest_http_message` emits the current `nc` then
+        /// increments it). Returns `None` only on an unreachable build error
+        /// (the challenge is already settled, so a header is always produced).
+        pub(super) fn preemptive_value(&mut self, method: &str, target: &str) -> Option<String> {
+            let out = output_digest(
+                &mut self.digest,
+                false,
+                self.iestyle,
+                method.as_bytes(),
+                target.as_bytes(),
+                self.user.as_bytes(),
+                self.password.as_bytes(),
+            )
+            .ok()?;
+            out.header.map(|line| reduce_to_value(&line))
+        }
+    }
+
     /// Build the reactive-auth seed for the origin host, or `None` when reactive
     /// auth does not apply (a challenge-free single scheme, or no credentials at
     /// all to attempt with). A `--negotiate -u :` request with no usable
@@ -1916,7 +2069,9 @@ mod auth_engine {
             return None;
         }
         let bearer = data.set.str(StrId::Bearer).map(str::to_string);
-        let (user, password) = match resolve(data, host, url) {
+        // A `.netrc` parse error is surfaced up front by `precheck_netrc`; here
+        // it collapses to "no credentials".
+        let (user, password) = match resolve(data, host, url).ok().flatten() {
             Some(c) => (c.user, c.password),
             None => (String::new(), String::new()),
         };
@@ -2075,7 +2230,7 @@ mod auth_engine {
             challenges: &[String],
             method: &str,
             target: &str,
-        ) -> Option<String> {
+        ) -> Result<Option<String>> {
             // (1) Fold every challenge into the auth state (ORs the advertised
             //     `avail` bits) and detect a rejected Basic/Bearer (the creds or
             //     token we already sent were refused → curl gives up).
@@ -2085,7 +2240,7 @@ mod auth_engine {
                 authproblem |= parsed.authproblem;
             }
             if authproblem {
-                return None;
+                return Ok(None);
             }
 
             // (2) Pick the single strongest acceptable scheme curl would
@@ -2094,10 +2249,13 @@ mod auth_engine {
             //     as curl's `pickoneauth`.
             let mask = build_auth_mask(self.bearer.is_some());
             if !pick_one_auth(&mut self.state, mask) {
-                return None;
+                return Ok(None);
             }
 
-            // (3) Emit the header for the picked scheme.
+            // (3) Emit the header for the picked scheme. A genuine credential-
+            //     build failure (notably the NTLM Type-3 overflow) propagates as
+            //     a hard error rather than a soft "no credential" stop, matching
+            //     curl's `Curl_http_output_auth` returning the scheme's `CURLcode`.
             self.produce_header(method, target, challenges)
         }
 
@@ -2129,6 +2287,67 @@ mod auth_engine {
         /// every request and therefore never report as connection-authenticated.
         pub(super) fn connection_authenticated(&self) -> bool {
             self.state.picked == CURLAUTH_NTLM && matches!(self.ntlm.state(), NtlmState::Type3)
+        }
+
+        /// The `Authorization` value to re-send PREEMPTIVELY on a subsequent
+        /// request once a stateless scheme has been settled via a reactive
+        /// negotiation (notably `--anyauth`). curl keeps `data->state.authhost`
+        /// across requests and `output_auth_headers` re-emits the picked scheme's
+        /// header on every later in-scope request keyed on `authhost.picked` — so
+        /// after a `401` selects Basic, the FOLLOWING request (including a
+        /// `--location-trusted` cross-host redirect that the server answers with
+        /// `200` directly, never re-challenging) still carries the credential.
+        ///
+        /// Returns the value only for the single-pass, verbatim-re-sendable
+        /// schemes — Basic (credentials) and Bearer (token) — and only once the
+        /// scheme is settled (`!last_authneg`). It is `None` for the
+        /// connection-bound NTLM/Negotiate handshakes (re-authenticated per
+        /// connection rather than carried as a preemptive header across a new
+        /// connection) and for Digest (whose `nonce` is connection/realm-scoped),
+        /// and `None` while a multi-scheme mask is still negotiating (no scheme
+        /// picked yet). Oracle: tests/data/test1088 (`--anyauth --location-trusted`
+        /// forwarding Basic to the redirect's new host).
+        pub(super) fn settled_preemptive_value(&self) -> Option<String> {
+            if self.last_authneg {
+                return None;
+            }
+            match self.state.picked {
+                CURLAUTH_BASIC => http_basic_header(&self.user, &self.password, false)
+                    .ok()
+                    .map(|line| reduce_to_value(&line)),
+                CURLAUTH_BEARER => {
+                    let token = self.bearer.as_deref()?;
+                    http_bearer_header(token)
+                        .ok()
+                        .map(|line| reduce_to_value(&line))
+                }
+                _ => None,
+            }
+        }
+
+        /// The settled Digest state to carry to the NEXT hop for a preemptive
+        /// re-send, or `None` when Digest was not the negotiated scheme.
+        ///
+        /// Returns `Some` only once a Digest negotiation has settled — Digest was
+        /// picked (`authhost.picked == CURLAUTH_DIGEST`) AND a server nonce was
+        /// received (`digest.nonce.is_some()`), i.e. the `401` challenge was
+        /// answered on this hop. The carried [`DigestCarry`] holds the live
+        /// `DigestData` (including the running `nc`), the credentials, and the
+        /// IE-style flag, so the redirect loop can recompute the `Authorization:
+        /// Digest` header for each subsequent in-scope request with an incremented
+        /// nonce-count — curl's persistent `data->state.digest` re-send keyed on
+        /// `data->state.authhost.picked` (oracle: tests/data/test1286).
+        pub(super) fn settled_digest_carry(&self) -> Option<DigestCarry> {
+            if self.state.picked == CURLAUTH_DIGEST && self.digest.nonce.is_some() {
+                Some(DigestCarry {
+                    digest: self.digest.clone(),
+                    iestyle: self.state.iestyle,
+                    user: self.user.clone(),
+                    password: self.password.clone(),
+                })
+            } else {
+                None
+            }
         }
 
         /// Whether the auth handshake is still negotiating (curl's
@@ -2175,31 +2394,49 @@ mod auth_engine {
         }
 
         /// Produce the `Authorization` value for the currently picked scheme.
+        ///
+        /// Returns `Ok(Some(value))` with the credential to re-send, `Ok(None)`
+        /// when the challenge cannot be answered (no acceptable scheme, missing
+        /// token, or rejected credentials — curl's `authproblem`, in which case
+        /// the `401`/`407` is the real answer), or `Err(e)` when *building* the
+        /// credential fails. The error is a HARD transfer failure that propagates
+        /// to the caller, exactly as C's `Curl_output_ntlm` / `Curl_input_ntlm`
+        /// return their `CURLcode` (lib/http_ntlm.c L84, L251) rather than
+        /// delivering the challenge body — most notably the NTLM Type-3 overflow
+        /// (`CurlError::TooLarge` → exit 100, oracle test776).
         fn produce_header(
             &mut self,
             method: &str,
             target: &str,
             challenges: &[String],
-        ) -> Option<String> {
+        ) -> Result<Option<String>> {
             match self.state.picked {
                 CURLAUTH_BASIC => {
-                    let line = http_basic_header(&self.user, &self.password, false).ok()?;
+                    let line = http_basic_header(&self.user, &self.password, false)?;
                     // Basic is single-pass: the credential is final.
                     self.last_authneg = false;
-                    Some(reduce_to_value(&line))
+                    Ok(Some(reduce_to_value(&line)))
                 }
                 CURLAUTH_BEARER => {
-                    let token = self.bearer.as_deref()?;
-                    let line = http_bearer_header(token).ok()?;
+                    let Some(token) = self.bearer.as_deref() else {
+                        return Ok(None);
+                    };
+                    let line = http_bearer_header(token)?;
                     // Bearer is single-pass: the token is final.
                     self.last_authneg = false;
-                    Some(reduce_to_value(&line))
+                    Ok(Some(reduce_to_value(&line)))
                 }
                 CURLAUTH_DIGEST => {
                     // Feed the Digest challenge (records the nonce; a stale-less
                     // re-challenge after a prior response errors → bad creds, stop).
-                    self.feed_digest(challenges)?;
-                    let out = output_digest(
+                    if self.feed_digest(challenges).is_none() {
+                        return Ok(None);
+                    }
+                    // A Digest response that cannot be built (malformed challenge
+                    // state) is an unanswerable challenge — stop and let the
+                    // `401`/`407` be delivered (curl's bad-creds path), not a hard
+                    // transport error.
+                    let Ok(out) = output_digest(
                         &mut self.digest,
                         false,
                         self.state.iestyle,
@@ -2207,27 +2444,48 @@ mod auth_engine {
                         target.as_bytes(),
                         self.user.as_bytes(),
                         self.password.as_bytes(),
-                    )
-                    .ok()?;
+                    ) else {
+                        return Ok(None);
+                    };
                     // Digest is single-pass: the response is final.
                     self.last_authneg = false;
-                    out.header.map(|line| reduce_to_value(&line))
+                    Ok(out.header.map(|line| reduce_to_value(&line)))
                 }
                 CURLAUTH_NTLM => {
                     // Advance the NTLM handshake with the server's challenge
                     // (bare `NTLM` → queue Type-1; `NTLM <type2>` → ready Type-3).
-                    self.feed_ntlm(challenges)?;
-                    let out = self.ntlm.output(false, &self.user, &self.password).ok()?;
+                    // A FAILED handshake INPUT is a SOFT stop, not a transfer error:
+                    // a bare `NTLM` re-challenge after we already sent our Type-3
+                    // means the server REJECTED our credentials (wrong password).
+                    // curl handles this in `Curl_input_ntlm` by clearing the NTLM
+                    // state and treating the `401`/`407` as the terminal answer —
+                    // its body (the server's "wrong password" error page) is
+                    // delivered and the transfer ends exit 0 (oracle: tests/data/
+                    // test68, whose `<datacheck>` includes BOTH `401` bodies and
+                    // sets no `<errorcode>`). So an input rejection yields `Ok(None)`
+                    // (let the `401` be delivered), NOT a hard error.
+                    if self.feed_ntlm(challenges).is_none() {
+                        return Ok(None);
+                    }
+                    // Building the Type-3, by contrast, can fail HARD — most notably
+                    // `CurlError::TooLarge` when an over-long username or the
+                    // server's oversized Target Info would overflow `NTLM_BUFSIZE`
+                    // (curl's `CURLE_TOO_LARGE`, lib/vauth/ntlm.c L776). curl
+                    // propagates this from `Curl_output_ntlm` (lib/http_ntlm.c L251)
+                    // as a transfer failure (exit 100), NOT as an answered challenge
+                    // — so it MUST NOT be swallowed into a soft "no credential" stop
+                    // (oracle: tests/data/test775, test776).
+                    let out = self.ntlm.output(false, &self.user, &self.password)?;
                     // NTLM is multi-pass: the Type-1 initial message is still
                     // negotiating (`out.done == false`); only the Type-3
                     // authenticate message is final (`out.done == true`).
                     self.last_authneg = !out.done;
-                    out.header.map(|line| reduce_to_value(&line))
+                    Ok(out.header.map(|line| reduce_to_value(&line)))
                 }
                 // Negotiate is not built in (no SPNEGO backend) and is masked out
                 // at `setopt` time; AWS SigV4 is signed elsewhere. Neither is
                 // driven by this loop.
-                _ => None,
+                _ => Ok(None),
             }
         }
 
@@ -2247,12 +2505,25 @@ mod auth_engine {
             None
         }
 
-        /// Advance the NTLM handshake with the server's challenge. Returns `None`
-        /// (stop) if the handshake errors (e.g. the server rejected Type-3).
+        /// Advance the NTLM handshake with the server's challenge. Returns
+        /// `Some(())` when the challenge was consumed and the handshake can
+        /// proceed to build the next message, or `None` (a SOFT stop) when the
+        /// input was REJECTED.
+        ///
+        /// A rejection is the server-rejected-credentials case: a bare `NTLM`
+        /// re-challenge received after our Type-3 was sent (curl's
+        /// `Curl_input_ntlm` "NTLM handshake rejected" / "auth restarted" path,
+        /// lib/http_ntlm.c L92-L104 — the handshake state is torn down and the
+        /// `401`/`407` becomes the terminal answer whose body is delivered, exit 0;
+        /// oracle test68). It is deliberately NOT a hard transfer error: only the
+        /// *output* (Type-3 build) failure is hard (`CURLE_TOO_LARGE`; oracle
+        /// test775/776), handled by the `?` on `ntlm.output()` in the caller.
         fn feed_ntlm(&mut self, challenges: &[String]) -> Option<()> {
             for value in challenges {
                 let v = value.trim_start();
                 if v.len() >= 4 && v.as_bytes()[..4].eq_ignore_ascii_case(b"NTLM") {
+                    // A rejected input (bare `NTLM` after Type-3) stops softly so
+                    // the `401`/`407` body is delivered, matching curl.
                     self.ntlm.input(v).ok()?;
                     return Some(());
                 }
@@ -2350,7 +2621,10 @@ mod auth_engine {
                 self.controller
                     .on_challenge(&self.challenges, "CONNECT", &self.authority);
             self.challenges.clear();
-            match produced {
+            // A hard credential-build error (e.g. an oversized NTLM Type-3 →
+            // `CurlError::TooLarge`) propagates as a transfer failure, exactly as
+            // curl's `Curl_output_ntlm` returns its `CURLcode` to the CONNECT loop.
+            match produced? {
                 Some(value) => {
                     self.current = Some(format!("Proxy-Authorization: {value}\r\n"));
                     Ok(true)
@@ -2400,21 +2674,52 @@ mod auth_engine {
     /// URL carried a username, so `Curl_parsenetrc` searches "specific" and keeps
     /// that login). Consulting only `-u` (the prior behavior) ran a "general"
     /// search and wrongly took the first block.
-    fn resolve(data: &Easy, host: &str, url: &CurlUrl) -> Option<HostCreds> {
+    fn resolve(data: &Easy, host: &str, url: &CurlUrl) -> Result<Option<HostCreds>> {
         // explicit `-u` (CURLOPT_USERNAME/PASSWORD).
         let explicit_user = data.set.str(StrId::Username).map(str::to_string);
         let explicit_pass = data.set.str(StrId::Password).map(str::to_string);
 
         // URL userinfo (empty userinfo is treated as absent, matching the C
         // `CURLUE_NO_USER`/`CURLUE_NO_PASSWORD` handling).
-        let url_user = url
-            .get(CurlUPart::User, CURLU_URLDECODE)
+        //
+        // curl deliberately does NOT decode the URL-supplied login through the
+        // URL API here, because that decoder always rejects a decoded control
+        // byte (`REJECT_CTRL`). Instead `override_login` decodes the stored
+        // userinfo itself (`lib/url.c` L1769-L1796) with the reject policy
+        // chosen by the scheme: schemes carrying `PROTOPT_USERPWDCTRL`
+        // (HTTP/HTTPS and WS/WSS) permit control characters in the user and
+        // password and reject only a decoded NUL (`REJECT_ZERO`); every other
+        // scheme keeps `REJECT_CTRL`. That distinction is what lets, e.g.,
+        // `user%0aname` survive as `user\nname` for an HTTP request while still
+        // being rejected for an `ftp://` transfer driven over an HTTP proxy.
+        // We reproduce that exactly rather than calling
+        // `url.get(.., CURLU_URLDECODE)`.
+        let userpwd_ctrl = url
+            .get(CurlUPart::Scheme, 0)
             .ok()
-            .filter(|u| !u.is_empty());
-        let url_pass = url
-            .get(CurlUPart::Password, CURLU_URLDECODE)
-            .ok()
-            .filter(|p| !p.is_empty());
+            .and_then(|s| crate::protocols::scheme_descriptor(&s))
+            .is_some_and(|sch| sch.flags & crate::protocols::PROTOPT_USERPWDCTRL != 0);
+        let cred_reject = if userpwd_ctrl {
+            crate::escape::UrlReject::Zero
+        } else {
+            crate::escape::UrlReject::Ctrl
+        };
+        // Decode one still-percent-encoded credential component with the
+        // scheme's reject policy. An absent component, a decode rejection, or an
+        // empty decoded result all collapse to `None` (curl treats empty
+        // userinfo as absent, matching `CURLUE_NO_USER`/`CURLUE_NO_PASSWORD`).
+        let decode_cred = |part| -> Option<String> {
+            let raw = url.get(part, 0).ok()?;
+            let decoded = crate::escape::urldecode(raw.as_bytes(), cred_reject).ok()?;
+            // Match the URL API's lossy-UTF-8 fallback (`urlget_format`): a
+            // decoded byte sequence that is not valid UTF-8 is still surfaced as
+            // text rather than dropped.
+            let text = String::from_utf8(decoded)
+                .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned());
+            (!text.is_empty()).then_some(text)
+        };
+        let url_user = decode_cred(CurlUPart::User);
+        let url_pass = decode_cred(CurlUPart::Password);
 
         // `CURLOPT_NETRC` mode (0=ignored / 1=optional / 2=required).
         let netrc_opt = CurlNetrcOption::from_long(i64::from(data.set.use_netrc))
@@ -2452,7 +2757,15 @@ mod auth_engine {
             // `--netrc-file` overrides the default `~/.netrc` location.
             let file = data.set.str(StrId::NetrcFile).map(Path::new);
             let hint = url_user.as_deref();
-            if let Ok(Some(entry)) = netrc::resolve(netrc_opt, file, host, hint) {
+            // Propagate a `.netrc` failure (curl's `override_login` returning
+            // `CURLE_READ_ERROR` for a syntax error or, in `CURL_NETRC_REQUIRED`
+            // mode, a missing file — `netrc::resolve` already encodes the
+            // optional/required policy). A `NoMatch` is benign (`Ok(None)`) in
+            // every mode (oracle test680). The `?` here makes the lazy
+            // credential builders fallible; they convert the error back to "no
+            // credentials" (`.ok().flatten()`) since the hard error is surfaced
+            // up front by `precheck_netrc` in `perform_http`.
+            if let Some(entry) = netrc::resolve(netrc_opt, file, host, hint)? {
                 // The host matched a `.netrc` block that yielded usable
                 // credentials (curl's `NETRC_OK` → `conn->bits.netrc = TRUE`).
                 from_netrc = true;
@@ -2465,14 +2778,30 @@ mod auth_engine {
             }
         }
 
-        match (user, password) {
+        Ok(match (user, password) {
             (None, None) => None,
             (u, p) => Some(HostCreds {
                 user: u.unwrap_or_default(),
                 password: p.unwrap_or_default(),
                 from_netrc,
             }),
-        }
+        })
+    }
+
+    /// Early `.netrc` validation, mirroring curl invoking `override_login`
+    /// (`lib/url.c`) from `create_conn`: a `CURL_NETRC_REQUIRED` lookup against a
+    /// malformed (syntax-error) or missing `.netrc` must fail the whole transfer
+    /// with `CURLE_READ_ERROR` (26) **before** name resolution, regardless of the
+    /// requested auth scheme. The lazy credential builders ([`preemptive_value`],
+    /// [`resolve_auth_inputs`]) consult `.netrc` only when an auth header is
+    /// actually needed and treat a parse error as "no credentials"; this precheck
+    /// surfaces the error unconditionally. It reuses the full [`resolve`] gating
+    /// (URL userinfo / `-u` override / password-present guard), so it errors in
+    /// exactly the cases curl's `override_login` does and stays silent otherwise
+    /// (oracle test680: `--netrc` + a `.netrc` whose quoted password is missing
+    /// its closing quote ⇒ exit 26, even though the URL host never resolves).
+    pub(super) fn precheck_netrc(data: &Easy, host: &str, url: &CurlUrl) -> Result<()> {
+        resolve(data, host, url).map(|_| ())
     }
 
     /// The resolved host login (`user`, `password`) — URL userinfo overridden by
@@ -2488,7 +2817,12 @@ mod auth_engine {
         host: &str,
         url: &CurlUrl,
     ) -> Option<(String, String)> {
-        resolve(data, host, url).map(|c| (c.user, c.password))
+        // A `.netrc` parse error is surfaced up front by `precheck_netrc`; here
+        // it collapses to "no credentials".
+        resolve(data, host, url)
+            .ok()
+            .flatten()
+            .map(|c| (c.user, c.password))
     }
 
     /// The per-hop preemptive Basic header for a redirect target, restricted to
@@ -2507,7 +2841,9 @@ mod auth_engine {
         if data.set.httpauth != CURLAUTH_BASIC {
             return None;
         }
-        let creds = resolve(data, host, url)?;
+        // A `.netrc` parse error is surfaced up front by `precheck_netrc`;
+        // here it collapses to "no credentials".
+        let creds = resolve(data, host, url).ok().flatten()?;
         if !creds.from_netrc {
             return None;
         }
@@ -2770,6 +3106,18 @@ pub(crate) async fn perform_http(
         let _ = url.set(CurlUPart::Port, Some(&data.set.use_port.to_string()), 0);
     }
 
+    // (1b) Validate `.netrc` BEFORE any name resolution, mirroring curl invoking
+    //      `override_login` from `create_conn` (lib/url.c): in
+    //      `CURL_NETRC_REQUIRED` mode a malformed or missing `.netrc` fails the
+    //      transfer with `CURLE_READ_ERROR` (26) regardless of the auth scheme
+    //      or whether the URL host ever resolves (oracle test680). The lazy
+    //      credential builders below treat a parse error as "no credentials";
+    //      this precheck is what surfaces the hard error, exactly as curl does.
+    {
+        let (_scheme, _is_https, netrc_host, _port) = http_url_parts(&url)?;
+        auth_engine::precheck_netrc(data, &netrc_host, &url)?;
+    }
+
     let ipver = IpVersion::from_raw(i64::from(data.set.ipver));
     let httpwant = data.set.httpwant;
 
@@ -2834,6 +3182,14 @@ pub(crate) async fn perform_http(
     let mut method = data.set.method;
     let mut no_body = data.set.opt_no_body;
     let mut referer_override: Option<String> = None;
+    // curl's `data->state.http_ignorecustom`: once a 301/302/303 downgrades the
+    // method to GET under `--follow` (`CURLFOLLOW_OBEYCODE`), the custom request
+    // verb (`-X`/`CURLOPT_CUSTOMREQUEST`) is dropped for all subsequent requests
+    // and a plain `GET` is sent (`http_switch_to_get`, lib/http.c L1098-L1113).
+    // Under `-L` (`CURLFOLLOW_ALL`) curl instead keeps the custom verb name, so
+    // this stays `false` there (oracle: tests/data/test794, test796 — both end
+    // in OBEYCODE because `--follow` is parsed last and overrides `--location`).
+    let mut ignore_custom_request = false;
 
     // Activate the cookie engine once for the whole redirect chain: resolve the
     // jar (shared via `CURLOPT_SHARE` or per-handle) and load `-b` files. The
@@ -2873,10 +3229,40 @@ pub(crate) async fn perform_http(
     // against the *origin* host below; the origin host is also the gate for
     // cross-host credential forwarding on redirects (`--location-trusted`).
     let (oh_scheme, _oh_https, origin_host, oh_port) = http_url_parts(&url)?;
-    let preemptive_auth = auth_engine::preemptive_value(data, &origin_host, &url);
+    // Mutable across the redirect chain: curl's `data->state.aptr.user`/`passwd`
+    // PERSIST across same-host hops (so the origin value below already carries
+    // through, governed by the `auth_allowed_this_host` gate), but are UPDATED
+    // by `override_login` whenever a followed `Location:` carries its OWN
+    // userinfo (`conn->user`/`conn->passwd` parsed from the new URL — lib/url.c
+    // `override_login`). We mirror that exactly: the value below seeds the
+    // origin and every same-host forward, and the redirect arm recomputes it
+    // from the new target ONLY when that target embeds userinfo of its own, so a
+    // `302` to `http://user:pass@samehost/...` re-derives the Basic header from
+    // `user:pass` while a credential-free `Location:` keeps the persistent value
+    // (oracle: tests/data/test899). `-u` precedence and the bearer/anyauth cases
+    // are handled inside `preemptive_value`, making the recompute idempotent in
+    // every case except the userinfo override.
+    let mut preemptive_auth = auth_engine::preemptive_value(data, &origin_host, &url);
     // Reactive-auth seed (Digest/NTLM/`--anyauth`): `None` for the challenge-free
     // single-scheme cases handled by `preemptive_auth` above.
     let reactive_auth = auth_engine::resolve_auth_inputs(data, &origin_host, &url);
+    // The credential PICKED by a reactive negotiation on a prior hop, to be
+    // re-sent preemptively on the next hop (curl's persistent
+    // `data->state.authhost.picked`). `None` until an `--anyauth`/multi-scheme
+    // exchange settles on a stateless scheme (Basic/Bearer); thereafter the
+    // value is forwarded to the redirect target under the SAME cross-host gate
+    // as the origin's preemptive value, so a `--location-trusted` redirect to a
+    // host that answers `200` without re-challenging still carries the
+    // credential (oracle: tests/data/test1088).
+    let mut carried_preemptive: Option<String> = None;
+    // The settled Digest state carried from a prior hop (curl's persistent
+    // `data->state.digest` + `authhost.picked == CURLAUTH_DIGEST`). Unlike
+    // `carried_preemptive` (a verbatim Basic/Bearer value) the Digest credential
+    // is recomputed per hop — the response binds the method+URI and the
+    // nonce-count increments while the same server nonce is reused — so the live
+    // state is carried and the header is regenerated below. `None` until a Digest
+    // negotiation settles (oracle: tests/data/test1286, the increasing `nc`).
+    let mut carried_digest: Option<auth_engine::DigestCarry> = None;
 
     // curl's `override_login` writes the resolved login back onto the URL handle
     // (`curl_url_set(data->state.uh, CURLUPART_USER/PASSWORD, …, CURLU_URLENCODE)`,
@@ -2950,6 +3336,39 @@ pub(crate) async fn perform_http(
         let suppress_custom_host =
             redirect_state.followlocation > 0 && !cur_host.eq_ignore_ascii_case(&origin_host);
 
+        // Preemptive Digest for this hop. When a prior hop settled on Digest auth
+        // (`carried_digest` is `Some`), curl's persistent `data->state.digest` +
+        // `authhost.picked == CURLAUTH_DIGEST` re-emit the credential on the NEXT
+        // request WITHOUT waiting for a fresh `401`: the response is recomputed for
+        // THIS hop's method+URI and the nonce-count (`nc`) advances while the
+        // server nonce is reused. The reactive `auth` seed below stays idle on a
+        // redirect target that answers `200`/`404` rather than re-challenging, so
+        // without this the followed request would carry NO `Authorization` at all.
+        // It is recomputed (not carried verbatim like Basic/Bearer) because the
+        // Digest response binds the request method and URI and the `nc` increments
+        // per emission. Gated by `auth_allowed_this_host` so a cross-origin
+        // redirect strips it exactly like the preemptive Basic/Bearer value, and
+        // computed against this hop's resolved verb (`resolve_http_method`, honoring
+        // `CURLOPT_CUSTOMREQUEST`) and origin-form URI (`auth_uri_target`, the same
+        // `data->state.up.path` curl's `HA2 = MD5(method:uri)` hashes over). This
+        // mutates `carried_digest` (advancing `nc`) exactly once per hop where the
+        // credential is sent (oracle: tests/data/test1286 — the followed
+        // `GET /12860001` must send `Digest … nc=00000002 uri="/12860001"`).
+        let digest_preemptive: Option<String> = match carried_digest.as_mut() {
+            Some(carry) if auth_allowed_this_host => {
+                let m = h1::resolve_http_method(
+                    method,
+                    no_body,
+                    data.set.str(StrId::Customrequest),
+                    false,
+                    method == HttpReq::Put,
+                )?;
+                let t = h1::auth_uri_target(&url, data.set.str(StrId::Target))?;
+                carry.preemptive_value(m.method.as_str(), &t)
+            }
+            _ => None,
+        };
+
         let hop_inputs = HopInputs {
             method,
             no_body,
@@ -2967,10 +3386,17 @@ pub(crate) async fn perform_http(
             // redirect to a different host picks up that host's `.netrc` entry
             // (tests 257/479), while a `-u`/URL credential remains confined to the
             // origin (tests 317 and the F8 auth-across-redirects behavior).
-            authorization: match preemptive_auth.as_deref() {
-                Some(v) if auth_allowed_this_host => Some(v.to_string()),
-                _ => auth_engine::preemptive_netrc_value(data, &cur_host, &url),
-            },
+            // A carried Digest credential (already gated above) wins over the
+            // verbatim Basic/Bearer preemptive value and `.netrc` — once a transfer
+            // picks Digest that is the scheme curl keeps sending (the schemes are
+            // mutually exclusive in practice, so this only orders the picked one
+            // first). Falls through to the Basic/Bearer/`.netrc` path otherwise.
+            authorization: digest_preemptive.or_else(|| {
+                match preemptive_auth.as_deref().or(carried_preemptive.as_deref()) {
+                    Some(v) if auth_allowed_this_host => Some(v.to_string()),
+                    _ => auth_engine::preemptive_netrc_value(data, &cur_host, &url),
+                }
+            }),
             // Reactive challenge-response auth (Digest/NTLM/`--anyauth`) seed,
             // gated identically. Rebuilt per hop from the resolved credentials so
             // the per-connection Digest/NTLM state starts fresh on each hop.
@@ -3013,8 +3439,16 @@ pub(crate) async fn perform_http(
             // resolved `Proxy` (URL userinfo unified with the explicit overlay).
             proxy_user: None,
             proxy_pass: None,
-            request_target_override: None,
+            // `CURLOPT_REQUEST_TARGET` (`--request-target`): an explicit override
+            // for the request-line target, read each hop from `data->set.str
+            // [STRING_TARGET]` (curl's `http_target`, lib/http.c). It wins verbatim
+            // over BOTH the origin-form path and the forward-proxy absolute-URI
+            // form, so `--request-target '*'` through a proxy emits
+            // `OPTIONS * HTTP/1.1` rather than the rebuilt absolute URI (oracle:
+            // tests/data/test1613).
+            request_target_override: data.set.str(StrId::Target).map(str::to_string),
             suppress_custom_host,
+            ignore_custom_request,
         };
 
         // Thread the upload source through so a streamed body is pulled
@@ -3035,6 +3469,29 @@ pub(crate) async fn perform_http(
             Ok(hop) => hop,
             Err(err) => break Err(err),
         };
+
+        // Persist a reactive-auth scheme picked on this hop (Basic/Bearer via
+        // `--anyauth`) so the NEXT hop re-sends it preemptively — curl keeps
+        // `data->state.authhost.picked` for the whole transfer, so once a scheme
+        // is chosen it is never un-picked by a later response that does not
+        // re-challenge. Only overwrite when this hop actually settled on one
+        // (`Some`); a hop that did not negotiate leaves any earlier pick intact
+        // (oracle: tests/data/test1088).
+        if hop.picked_preemptive.is_some() {
+            carried_preemptive = hop.picked_preemptive.clone();
+        }
+
+        // Persist a Digest state settled on this hop (the controller negotiated a
+        // `401` Digest challenge to completion) so the NEXT hop re-sends it
+        // preemptively with an advanced `nc`. Mirrors `carried_preemptive` for the
+        // recomputed Digest scheme: only overwrite when this hop actually settled
+        // Digest (`Some`); a hop that did not negotiate Digest (e.g. a redirect
+        // target that answered without a challenge, whose fresh controller holds no
+        // nonce) leaves the carried state intact so `nc` keeps progressing across
+        // the redirect chain (oracle: tests/data/test1286).
+        if hop.picked_digest.is_some() {
+            carried_digest = hop.picked_digest.clone();
+        }
 
         // Store this hop's `Set-Cookie`s against the URL the request was sent to,
         // before a redirect reassigns `url` (curl captures per hop so a cookie set
@@ -3059,13 +3516,28 @@ pub(crate) async fn perform_http(
         #[cfg(not(any(feature = "hsts", feature = "alt-svc")))]
         let _ = &cur_host;
 
-        // Follow a 3xx that carries a `Location`, when `-L` is in effect.
-        if follow_enabled && is_redirect_status(hop.status) {
+        // A 3xx that carries a `Location`: follow it when following is enabled
+        // (`-L`/`--follow`), otherwise compute and record the would-be target in
+        // `CURLINFO_REDIRECT_URL` (curl's `FOLLOW_FAKE` path: multi.c:2042 →
+        // http.c:1261 `data->info.wouldredirect = follow_url`). curl records this
+        // even when it does NOT follow — including a `Location` whose scheme is
+        // unsupported (the FAKE resolve uses `CURLU_NON_SUPPORT_SCHEME` and, on a
+        // parse failure, falls back to the raw target verbatim) — so
+        // `%{redirect_url}` reports the URL a redirect would have taken (oracle:
+        // tests/data/test1029, test1080, test1081, test1159).
+        if is_redirect_status(hop.status) {
             if let Some(loc) = hop.location.as_deref() {
+                // `Redir` actually follows (with the method/credential/referer
+                // rewrites); `Fake` only resolves the target for `redirect_url`.
+                let ftype = if follow_enabled {
+                    FollowType::Redir
+                } else {
+                    FollowType::Fake
+                };
                 let freq = FollowRequest {
                     base: &url,
                     newurl: loc,
-                    ftype: FollowType::Redir,
+                    ftype,
                     status: hop.status,
                     method: http_method_of(method),
                 };
@@ -3081,9 +3553,39 @@ pub(crate) async fn perform_http(
                         // be moved out without partial-move-from-`Box` concerns.
                         let fr = *fr;
                         url = fr.url;
+                        // If the followed target embeds its OWN userinfo
+                        // (`http://user:pass@host/...`), re-derive the preemptive
+                        // credentials from it — curl's `override_login` updates
+                        // `data->state.aptr.user`/`passwd` from the new URL's
+                        // `conn->user`/`passwd` (lib/url.c). A credential-free
+                        // `Location:` leaves the persistent value untouched so
+                        // same-host creds carry through unchanged. `-u` still
+                        // wins inside `preemptive_value`, so this is a no-op
+                        // whenever an explicit `--user` was given (oracle:
+                        // tests/data/test899).
+                        if url
+                            .get(CurlUPart::User, 0)
+                            .ok()
+                            .is_some_and(|u| !u.is_empty())
+                        {
+                            let new_host = http_url_parts(&url)
+                                .map(|p| p.2)
+                                .unwrap_or_default();
+                            preemptive_auth =
+                                auth_engine::preemptive_value(data, &new_host, &url);
+                        }
                         if fr.switched_to_get {
                             method = HttpReq::Get;
                             no_body = false;
+                            // OBEYCODE (`--follow`): also drop any custom `-X`
+                            // verb for the remaining requests (curl's
+                            // `http_switch_to_get` sets `state.http_ignorecustom`
+                            // only for `CURLFOLLOW_OBEYCODE`). Under `-L`
+                            // (`CURLFOLLOW_ALL` = 1) the custom verb name is kept.
+                            // CURLFOLLOW_OBEYCODE == 2.
+                            if data.set.http_follow_mode == 2 {
+                                ignore_custom_request = true;
+                            }
                         }
                         referer_override = fr.referer;
                         data.info.redirect_count = redirect_state.followlocation;
@@ -3103,15 +3605,45 @@ pub(crate) async fn perform_http(
                         ) {
                             break Err(CurlError::UnsupportedProtocol);
                         }
+                        // Cross-protocol redirect hand-off. The HTTP engine's
+                        // redirect loop only drives `http`/`https` (and the
+                        // `ws`/`wss` upgrade, which shares this engine). When a
+                        // followed `Location:` names any *other* scheme — e.g.
+                        // `imap://`, `ftp://`, `pop3://` reached under
+                        // `--proto-redir` — curl rewrites `data->state.url` and
+                        // the top-level transfer loop re-selects the handler for
+                        // the new scheme (lib/transfer.c re-runs `Curl_connect`
+                        // after `Curl_follow`). Our protocol engines are
+                        // dispatched once per `perform`, so the running HTTP
+                        // engine cannot itself switch protocols: instead deposit
+                        // the fully-resolved absolute target URL on the handle and
+                        // return Ok. The dispatcher
+                        // ([`perform_transfer_inner`](crate::protocols::perform_transfer_inner))
+                        // observes the hand-off, rewrites the handle's
+                        // URL/scheme info, and re-dispatches to the engine for
+                        // the new scheme. The `--proto-redir`/`--proto` allow-list
+                        // was just enforced above, so a deposited URL is already
+                        // authorized. Oracle: tests/data/test779 (HTTP→IMAP,
+                        // `--oauth2-bearer`), test795 (HTTP→IMAP, `-u` creds).
+                        if !matches!(new_scheme.as_str(), "http" | "https" | "ws" | "wss") {
+                            if let Ok(abs) = url.get(CurlUPart::Url, 0) {
+                                data.set_protocol_handoff(abs);
+                            }
+                            break Ok(());
+                        }
                         continue;
                     }
                     Ok(FollowOutcome::TooManyRedirects { would_redirect }) => {
                         data.info.redirect_url = CString::new(would_redirect).ok();
                         break Err(CurlError::TooManyRedirects);
                     }
-                    // A `Fake` follow (e.g. a redirect curl would record but not
-                    // chase) ends the loop with the current hop as the result.
-                    Ok(FollowOutcome::Fake { .. }) => break Ok(()),
+                    // Not following (`-L`/`--follow` off): record the would-be
+                    // redirect target in `CURLINFO_REDIRECT_URL` / `%{redirect_url}`
+                    // and end the loop with the current hop as the result.
+                    Ok(FollowOutcome::Fake { would_redirect }) => {
+                        data.info.redirect_url = CString::new(would_redirect).ok();
+                        break Ok(());
+                    }
                     Err(err) => break Err(err),
                 }
             }
@@ -3123,6 +3655,20 @@ pub(crate) async fn perform_http(
     if let Ok(eff) = url.get(CurlUPart::Url, 0) {
         data.info.effective_url = CString::new(eff).ok();
     }
+
+    // CURLINFO_REFERER / `%{referer}`: the `Referer:` value last in effect
+    // (curl's `data->state.referer`). With `CURLOPT_AUTOREFERER` (the `;auto`
+    // suffix on `--referer`) a followed redirect rewrites it to the previous
+    // URL — with credentials and fragment stripped — via `build_referer`
+    // (captured in `referer_override`); otherwise it is the explicit
+    // `CURLOPT_REFERER`. Set fresh each transfer (a state-derived field C does
+    // not clear in `Curl_initinfo`), so an absent referer reports empty rather
+    // than leaking a prior transfer's value (oracle: tests/data/test1067,
+    // test2081).
+    data.info.referer = referer_override
+        .clone()
+        .or_else(|| data.set.str(StrId::SetReferer).map(str::to_string))
+        .and_then(|r| CString::new(r).ok());
 
     // Flush the jar to `-c`'s destination at transfer end (curl's cleanup-time
     // `cookie_output`). A write failure is best-effort and never overrides the
@@ -3174,20 +3720,51 @@ async fn http_connect_hop(
         // preserved; for an `ftp://` URL driven AS HTTP over a forward proxy (the
         // PROTOPT_PROXY_AS_HTTP swap performed by the dispatcher) the scheme is
         // `ftp`, so the `ftp_proxy` environment variable is honored (test 563).
-        // `data.info.scheme` is the preflight-recorded scheme (upper-cased);
-        // lower-case it for the env lookup and fall back to the `is_https` split
-        // if it is somehow unset (HTTP/3 is https-only and handled separately).
+        // The env-var name is built from `info.effective_url` (the request URL),
+        // NOT from `info.scheme`. For an `ftp://` request driven AS HTTP over a
+        // forward proxy the dispatcher sets `info.scheme = "http"` to match
+        // curl's post-swap `CURLINFO_SCHEME` (`PROTOPT_PROXY_AS_HTTP`), but the
+        // `<scheme>_proxy` lookup must still use the ORIGINAL scheme: curl's
+        // `detect_proxy` runs on `conn->scheme->name` (`ftp`) BEFORE the swap, so
+        // `ftp_proxy` is honored (test563/lib562). `effective_url` keeps the
+        // original `ftp://` scheme and is never rewritten by the swap; for a
+        // normal `http`/`https` request its scheme equals the `is_https` split,
+        // so behavior is unchanged. The URL scheme is already stored lower-cased;
+        // fall back to the `is_https` split if the effective URL is somehow unset
+        // or schemeless (HTTP/3 is https-only and handled separately).
         let scheme = data
             .info
-            .scheme
+            .effective_url
             .as_ref()
-            .and_then(|s| s.to_str().ok())
-            .map(str::to_ascii_lowercase)
+            .and_then(|u| u.to_str().ok())
+            .and_then(|u| u.split_once("://"))
+            .map(|(s, _)| s.to_ascii_lowercase())
             .unwrap_or_else(|| if is_https { "https" } else { "http" }.to_string());
         proxy_engine::config(data, &scheme)?
     };
     #[cfg(feature = "proxy")]
     let hop_proxy = crate::proxy::proxy_for_target(&proxy_cfg, &host);
+
+    // `--connect-to` (`CURLOPT_CONNECT_TO`) interaction with an HTTP proxy
+    // (oracle `lib/url.c` L3379-L3402). curl applies the connect-to override,
+    // cancels it where it equals the origin host/port (the equality guards at
+    // url.c:3379-3390 clear `conn_to_host`/`conn_to_port`), and THEN — if any
+    // connect-to component survives AND an HTTP proxy is in use — forces
+    // `conn->bits.tunnel_proxy = TRUE` (url.c:3401). The proxy is then asked to
+    // `CONNECT` to the connect-to *authority* (`Curl_http_proxy_get_destination`,
+    // http_proxy.c:165 — host = `conn_to_host` when set else origin, port =
+    // `conn_to_port` when set else `remote_port`), while the tunneled origin
+    // request keeps the URL's own `Host:`. `connect_target` returns the origin
+    // host/port verbatim when no entry matches or a field is empty, so an
+    // inactive connect-to leaves both `*_active` flags false and is fully inert
+    // (the wire is byte-for-byte identical to before).
+    #[cfg(feature = "proxy")]
+    let (connect_to_host, connect_to_port, conn_to_host_active, conn_to_port_active, conn_to_active) = {
+        let (ch, cp) = connect_target(data, &host, port);
+        let host_active = !ch.eq_ignore_ascii_case(&host);
+        let port_active = cp != port;
+        (ch, cp, host_active, port_active, host_active || port_active)
+    };
 
     // Forward HTTP-proxy per-REQUEST headers — the Basic `Proxy-Authorization`
     // value and the `Proxy-Connection: Keep-Alive` hint — are a property of the
@@ -3204,7 +3781,10 @@ async fn http_connect_hop(
     // auth inside its handshake, so neither sets a forward-request header here.
     #[cfg(feature = "proxy")]
     if let Some(px) = hop_proxy {
-        let tunnel = is_https || data.set.tunnel_thru_httpproxy;
+        // A `--connect-to` target distinct from the origin forces a tunnel over
+        // an HTTP proxy (url.c:3401), so the forward (absolute-URI) per-request
+        // header seeding below is skipped — the CONNECT path carries those.
+        let tunnel = is_https || data.set.tunnel_thru_httpproxy || conn_to_active;
         if !px.is_socks() && !tunnel {
             // Seed the PREEMPTIVE forward-proxy `Proxy-Authorization` (Basic) only
             // when none is already set. This block re-runs on every
@@ -3260,17 +3840,33 @@ async fn http_connect_hop(
         }
     };
 
+    // `CURLOPT_UNIX_SOCKET_PATH` / `CURLOPT_ABSTRACT_UNIX_SOCKET`
+    // (`--unix-socket` / `--abstract-unix-socket`): when set, every hop dials a
+    // UNIX-domain socket directly instead of resolving and connecting to
+    // `dial_host`. The socket path is captured here so it can (a) bypass DNS at
+    // the transport-factory step below and (b) participate in the reuse key, so
+    // transfers targeting different sockets — or a socket vs. a TCP route — never
+    // share a pooled connection (curl keys its connection bundle on the unix
+    // path the same way).
+    let unix_socket = data
+        .set
+        .str(StrId::UnixSocketPath)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
     // ---- Connection reuse: check out an idle keep-alive connection (Issue 3) ---
     // The scheme-aware reuse key is also stored as the connection's `destination`
     // (the pool bundle key), so check-in keys identically. A direct vs a proxied
-    // route (`dial` != `remote`) and `http` vs `https` never share a connection.
+    // route (`dial` != `remote`) and `http` vs `https` never share a connection,
+    // and neither do two routes over different UNIX-domain sockets.
     let reuse_key = format!(
-        "{}|{}:{}|{}:{}",
+        "{}|{}:{}|{}:{}|{}",
         if is_https { "https" } else { "http" },
         dial_host,
         dial_port,
         remote_host,
-        remote_port
+        remote_port,
+        unix_socket.as_deref().unwrap_or(""),
     );
     // `CURLOPT_FRESH_CONNECT` forces a new connection; `CURLOPT_FORBID_REUSE`
     // forbids reuse in both directions. Otherwise consult the pool first.
@@ -3350,7 +3946,81 @@ async fn http_connect_hop(
         }
     }
 
-    let addrs = resolve_addrs(data, &dial_host, dial_port, ipver, verbose).await?;
+    // Build the bottom transport factory. With a UNIX-domain socket configured,
+    // dial it directly and skip name resolution entirely (curl's `TRNSPRT_UNIX`
+    // path); otherwise resolve the dial host and arm the Happy-Eyeballs TCP race.
+    //
+    // The local interface / port binding (`CURLOPT_INTERFACE`,
+    // `CURLOPT_LOCALPORT`/`CURLOPT_LOCALPORTRANGE`) is folded into the race here
+    // so that every connect attempt binds first (curl's `bindlocal`). An
+    // unbindable interface (e.g. a non-existent host passed to `--interface`)
+    // makes the bind fail with `CURLE_INTERFACE_FAILED` (45); an IP literal or a
+    // resolvable local IP binds the source address. When neither an interface
+    // nor a local port is set, `BindConfig` is inactive and this is a no-op.
+    let bind = BindConfig::from_interface(
+        data.set.str(StrId::Device),
+        data.set.str(StrId::Interface),
+        data.set.str(StrId::Bindhost),
+        data.set.localport,
+        data.set.localportrange,
+    );
+    // Decide the bottom-hop UNIX-domain dial target, if any:
+    //  * a SOCKS proxy reached over a UNIX socket (`--socks5 localhost/path` /
+    //    `--proxy socks5h://localhost/path`) dials the PROXY's socket — curl's
+    //    `TRNSPRT_UNIX` bottom hop (parse_proxy rewrote the proxy host to the
+    //    `localhost`+path form and recorded the socket path); the SOCKS
+    //    handshake installed below then reaches the origin over it. This takes
+    //    precedence over the origin `--unix-socket`.
+    //  * otherwise the origin `--unix-socket` / `--abstract-unix-socket` dials
+    //    the ORIGIN's socket directly (no proxy in front).
+    // Oracle: tests/data/test1467 (SOCKS5 over UNIX), test1468 (SOCKS5h over UNIX).
+    #[cfg(unix)]
+    let unix_dial_target: Option<UnixTarget> = {
+        #[cfg(feature = "proxy")]
+        let proxy_unix = hop_proxy.and_then(|px| px.unix_socket_path.as_deref());
+        #[cfg(not(feature = "proxy"))]
+        let proxy_unix: Option<&str> = None;
+
+        if let Some(proxy_path) = proxy_unix {
+            // The proxy's UNIX socket is always a filesystem path (curl's
+            // `UNIX_SOCKET_PREFIX + path`), never an abstract name.
+            Some(UnixTarget::path(proxy_path))
+        } else {
+            unix_socket.as_deref().map(|unix_path| {
+                if data.set.abstract_unix_socket {
+                    UnixTarget::abstract_name(unix_path)
+                } else {
+                    UnixTarget::path(unix_path)
+                }
+            })
+        }
+    };
+    #[cfg(unix)]
+    let eyeballs: FilterFactory = if let Some(target) = unix_dial_target {
+        Box::new(move || create_ip_happy_filter_unix(target))
+    } else {
+        let addrs = resolve_addrs(data, &dial_host, dial_port, ipver, verbose).await?;
+        eyeballs_factory_bound(
+            TRNSPRT_TCP,
+            ipver,
+            data.set.happy_eyeballs_timeout,
+            data.set.connecttimeout,
+            addrs,
+            bind,
+        )
+    };
+    #[cfg(not(unix))]
+    let eyeballs: FilterFactory = {
+        let addrs = resolve_addrs(data, &dial_host, dial_port, ipver, verbose).await?;
+        eyeballs_factory_bound(
+            TRNSPRT_TCP,
+            ipver,
+            data.set.happy_eyeballs_timeout,
+            data.set.connecttimeout,
+            addrs,
+            bind,
+        )
+    };
     // CURLINFO_NAMELOOKUP_TIME milestone: name resolution for this hop is done.
     let t_resolved = Instant::now();
 
@@ -3370,8 +4040,6 @@ async fn http_connect_hop(
     } else {
         CURL_CF_SSL_DISABLE
     };
-    let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, data.set.connecttimeout, addrs);
-
     // The target TLS filter (origin TLS) is installed whenever the *target* URL
     // is https, independent of any proxy in front — it rides on top of the SOCKS
     // tunnel or the HTTP CONNECT tunnel (curl adds the target `ssl` filter last).
@@ -3462,11 +4130,34 @@ async fn http_connect_hop(
                 // A CONNECT tunnel is used for an https target, or when
                 // `--proxytunnel` forces it for a plain-http target; otherwise the
                 // proxy forwards an absolute-URI request.
-                let tunnel = is_https || data.set.tunnel_thru_httpproxy;
+                // A CONNECT tunnel is also forced when `--connect-to` redirects
+                // the connection to an authority distinct from the origin while an
+                // HTTP proxy is in use (curl `lib/url.c` L3395-L3402): the proxy
+                // cannot be told the rewritten target via an absolute-URI request,
+                // so curl tunnels and issues the (origin-form) request inside.
+                let tunnel = is_https || data.set.tunnel_thru_httpproxy || conn_to_active;
                 conn.bits.httpproxy = true;
                 conn.bits.tunnel_proxy = tunnel;
 
                 if tunnel {
+                    // The CONNECT *authority* (what the proxy is asked to reach):
+                    // the `--connect-to` host/port when that component is active,
+                    // else the origin — exactly `Curl_http_proxy_get_destination`
+                    // (`http_proxy.c` L165: host = `conn_to_host` when set else
+                    // `host.name`; port = `conn_to_port` when set else
+                    // `remote_port`). The tunneled request itself still carries the
+                    // origin `Host:` (built from `host`/`host_ace`), so only the
+                    // CONNECT line/`Host` change. test2050.
+                    let connect_host = if conn_to_host_active {
+                        connect_to_host.clone()
+                    } else {
+                        host_ace.clone()
+                    };
+                    let connect_port = if conn_to_port_active {
+                        connect_to_port
+                    } else {
+                        port
+                    };
                     // Tunnel: the CONNECT carries the `Proxy-Authorization`
                     // (primed by `StandardProxyAuth`), and the target TLS rides on
                     // top once the tunnel is open. The request is origin-form.
@@ -3502,8 +4193,10 @@ async fn http_connect_hop(
                                 let controller = auth_engine::HttpAuthController::new(inputs);
                                 // The CONNECT authority — identical to the request
                                 // line authority produced by `H1ProxyConfig`
-                                // (Digest `uri=` / `HA2` target).
-                                let authority = format!("{host_ace}:{port}");
+                                // (Digest `uri=` / `HA2` target). Uses the
+                                // `--connect-to` destination when active (matches
+                                // `Curl_http_proxy_get_destination`).
+                                let authority = format!("{connect_host}:{connect_port}");
                                 Box::new(auth_engine::ConnectTunnelAuth::new(controller, authority))
                             }
                             None => Box::new(StandardProxyAuth::new(px.clone(), data.set.proxyauth)),
@@ -3513,7 +4206,14 @@ async fn http_connect_hop(
                     // can override the auto `Host`/`User-Agent`/`Proxy-Connection`
                     // (e.g. `--proxy-header "User-Agent: …"`, test287).
                     let proxy_custom_headers = collect_connect_custom_headers(data);
-                    let h1cfg = H1ProxyConfig::new(host_ace.clone(), port)
+                    // An IPv6 literal target must be bracketed in the CONNECT
+                    // request-line authority and `Host` (C: `conn->bits.ipv6_ip`
+                    // drives the `"[%s]:%d"` form in `http_proxy.c` L212). The
+                    // ACE host here is already bracket-stripped, so a remaining
+                    // colon means an IPv6 address (hostnames and IPv4 never
+                    // contain `:`). test1230.
+                    let h1cfg = H1ProxyConfig::new(connect_host.clone(), connect_port)
+                        .with_ipv6(connect_host.contains(':'))
                         .with_http_minor(proxy_http_minor)
                         .with_user_agent(proxy_user_agent)
                         .with_custom_headers(proxy_custom_headers)
@@ -3538,6 +4238,17 @@ async fn http_connect_hop(
     #[cfg(not(feature = "proxy"))]
     if let Some(ssl) = target_ssl {
         setup = setup.with_ssl(ssl);
+    }
+
+    // `CURLOPT_HAPROXYPROTOCOL` (`--haproxy-protocol`): prepend the HAProxy
+    // PROXY-protocol header to the connection. The filter is spliced in just
+    // above the transport (after any SOCKS/HTTP-proxy step, beneath target TLS)
+    // so the PROXY line is sent in cleartext immediately after connect, exactly
+    // as curl's `data->set.haproxyprotocol` path does. `--haproxy-clientip`
+    // overrides the advertised client address.
+    if data.set.haproxyprotocol {
+        let client_ip = data.set.str(StrId::HaproxyClientIp).map(str::to_string);
+        setup = setup.with_haproxy(haproxy_factory(unix_socket.is_some(), client_ip));
     }
 
     let dispatch = ConnSetup::Default(setup);
@@ -3593,6 +4304,28 @@ async fn http_connect_hop(
                         off += n;
                     }
                 }
+            }
+        }
+        // Bridge the connection-level failure diagnostic to the easy handle.
+        //
+        // In curl, `failf()` writes `data->state.errorbuf` (the handle's error
+        // buffer, surfaced as `curl: (N) <msg>` and `CURLOPT_ERRORBUFFER`)
+        // directly, because every layer is handed the `Curl_easy *`. Here the
+        // connection-filter chain cannot borrow the `Easy` handle (it would
+        // alias `data`), so its `failf` writes the connection's own
+        // `FilterData::error_buffer` instead. Without this copy, a specific
+        // connect-phase message — most visibly the CONNECT-tunnel filter's
+        // "CONNECT tunnel failed, response <code>" (lib/cf-h1-proxy.c L648), but
+        // also any TLS/transport `failf` — is stranded on the connection and the
+        // front-end falls back to the generic `curl_easy_strerror(code)` text.
+        // Copying it across restores curl's exact diagnostic (oracle:
+        // tests/data/test749 expects `curl: (56) CONNECT tunnel failed,
+        // response 400`). An empty buffer leaves `last_error` unset so the
+        // strerror fallback still applies, matching curl's
+        // `errorbuf[0] ? errorbuf : strerror` selection.
+        if let Some(msg) = conn.filter_data.error_buffer.as_deref() {
+            if !msg.is_empty() {
+                data.set_last_error(msg);
             }
         }
         return Err(e);
@@ -3681,6 +4414,29 @@ async fn http_connect_hop(
         }
     }
 
+    // ---- Surface CONNECT-tunnel informational trace to stderr ---------------
+    // While parsing the proxy's CONNECT response, curl emits a few user-visible
+    // `infof` lines (e.g. "Ignoring Content-Length in CONNECT 200 response" —
+    // RFC 7231 4.3.6 says a client MUST ignore CL/TE in a successful CONNECT
+    // reply; oracle: test1287). The connection-filter that parses that response
+    // has no debug-callback handle, so it captured those lines; emit them now as
+    // `CURLINFO_TEXT` (`* ` lines on stderr), gated only on verbose. This is the
+    // debug/stderr stream and is independent of the data-stream header surfacing
+    // below; in particular it is NOT suppressed by `--suppress-connect-headers`
+    // (which only opts out of passing the CONNECT headers to the write/header
+    // callbacks) and applies regardless of whether the origin is TLS.
+    #[cfg(feature = "proxy")]
+    if verbose && conn.bits.tunnel_proxy {
+        if let Some(texts) = conn.cfilter[FIRSTSOCKET].connect_info_text() {
+            for t in &texts {
+                sink.debug(
+                    crate::transfer::DebugInfoType::Text,
+                    format!("{t}\n").as_bytes(),
+                );
+            }
+        }
+    }
+
     // ---- Surface the CONNECT-tunnel response to the data stream -------------
     // When a fresh CONNECT tunnel is negotiated for a *plain-HTTP* origin
     // (`--proxytunnel`/`-p` to an `http://` URL), curl writes the proxy's
@@ -3706,6 +4462,23 @@ async fn http_connect_hop(
     // This runs only on the fresh-connection path: the reuse branch returned
     // above before any tunnel negotiation, matching curl — a reused tunnel
     // performs no new CONNECT and so writes no CONNECT response.
+    //
+    // `CURLINFO_HEADER_SIZE` accounting (oracle: test1288): every CONNECT
+    // response header line is folded into the inbound-header byte total via
+    // `Curl_bump_headersize` (lib/cf-h1-proxy.c `single_header`) — and crucially
+    // this happens BEFORE, and independent of, the `--suppress-connect-headers`
+    // display gate (lib/sendf.c gates only the client-write, not the size bump).
+    // So the byte total must count the CONNECT response even when its display is
+    // suppressed ("Must not suppress in statistics"). Capture it here, once per
+    // freshly established tunnel, ungated by `suppress_connect_headers` and
+    // `is_https`; `drive_one` adds the origin response's header bytes on top when
+    // it publishes `data.info.header_size`.
+    #[cfg(feature = "proxy")]
+    if conn.bits.tunnel_proxy {
+        if let Some(lines) = conn.cfilter[FIRSTSOCKET].connect_response_headers() {
+            data.info.connect_header_size = lines.iter().map(|l| l.len() as i64).sum();
+        }
+    }
     #[cfg(feature = "proxy")]
     if conn.bits.tunnel_proxy && !is_https && !data.set.suppress_connect_headers {
         if let Some(lines) = conn.cfilter[FIRSTSOCKET].connect_response_headers() {
@@ -3933,6 +4706,32 @@ async fn perform_http_hop(
             hop.proxy_authorization = Some(initial);
         }
     }
+    // The cookie jar for this hop, and the cookie-scoping host override, resolved
+    // for the auth-retry capture below. curl's cookie engine captures `Set-Cookie`
+    // from EVERY response — including an intermediate `401`/`407` auth challenge —
+    // and re-derives the `Cookie:` request header for the authenticated retry from
+    // the jar (lib/http.c re-runs `Curl_add_cookie_header` per request, and
+    // `Curl_cookie_add` runs on every response's headers). A forward-proxy `407`
+    // in particular may set a cookie the retried, authenticated request must echo
+    // (oracle: tests/data/test1331 — a `--proxy-anyauth` 407 sets
+    // `proxycookie=weirdo`, echoed as `Cookie: proxycookie=weirdo` on the
+    // authenticated retry). The `HopSink` clears its per-response `set_cookies` on
+    // `reset_for_retry`, so the retry block captures them into the jar and
+    // recomputes `hop.cookie` BEFORE the reset. This is the SAME
+    // `Arc<Mutex<CookieJar>>` the outer redirect loop holds (both resolved from
+    // `data`), so the final (non-retry) response's cookies — captured by the outer
+    // loop against the per-hop `HopResult` — are not duplicated here.
+    #[cfg(feature = "cookies")]
+    let hop_cookie_jar: Option<cookie_engine::JarHandle> = if cookie_engine::active(data) {
+        Some(data.cookie_jar_handle())
+    } else {
+        None
+    };
+    #[cfg(feature = "cookies")]
+    let hop_cookie_host_override: Option<String> = {
+        let custom = collect_custom_headers(data);
+        h1::find_custom_header_value(&custom, "Host").and_then(cookie_host_from_header_value)
+    };
     // When auth negotiation is active, a `401`/`407` body is buffered rather than
     // streamed to the application, so an intermediate auth-probe error page is
     // not delivered when the request is about to be re-issued with credentials.
@@ -3962,6 +4761,11 @@ async fn perform_http_hop(
     hop_sink.timecondition = data.set.timecondition;
     hop_sink.timevalue = data.set.timevalue;
     hop_sink.range_present = effective_range(data).is_some();
+    // Arm the `CURLINFO_FILETIME[_T]` capture for `--remote-time` /
+    // `CURLOPT_FILETIME` (curl's `data->set.get_filetime`): when set, a parsed
+    // `Last-Modified` is recorded on the sink and propagated to
+    // `data.info.filetime` after the exchange (see the post-hop block below).
+    hop_sink.get_filetime = data.set.get_filetime;
     let drive_result = match version {
         HttpVersion::Http10 | HttpVersion::Http11 => {
             // The version negotiated for this hop before any in-transfer
@@ -4042,6 +4846,21 @@ async fn perform_http_hop(
             // auth and of `-L` (test357).
             let mut disable_expect_resend = false;
             let mut expect_resend_done = false;
+            // Set when the loop breaks because *building* a reactive credential
+            // failed hard (e.g. an NTLM Type-3 that overflows `NTLM_BUFSIZE` →
+            // `CurlError::TooLarge`). In curl this case has already set
+            // `data->req.ignorebody = TRUE` (the `401`/`407` was answerable, so a
+            // retry was intended) BEFORE `Curl_output_ntlm` is called to build the
+            // next request — so when that build returns its `CURLcode` the buffered
+            // challenge body is discarded, never written. We mirror that by
+            // suppressing the terminal `flush_auth_body` below on this path, so the
+            // challenge response's body does not leak into `--include` output
+            // (oracle: tests/data/test775 — the over-long-username NTLM transfer
+            // ends exit 100 with ONLY the `401` headers in the output, not the
+            // `"This is not the real page either!"` body). An *unanswerable*
+            // challenge (`Ok(None)`) keeps the flush: that body IS the real answer
+            // (tests 152/162).
+            let mut auth_credential_build_failed = false;
             let result = loop {
                 // (curl's `http_request_version` → `http_may_use_1_1`): once a
                 // `1.0` response has been seen on this transfer (`rcvd_min == 10`,
@@ -4052,7 +4871,14 @@ async fn perform_http_hop(
                 // drops to `1.0`. A forced `1.0`, or an `h2`/`h3` hop, is left
                 // unchanged (this arm only handles the h1 codec anyway).
                 let effective_version =
-                    if base_version == HttpVersion::Http11 && data.http_rcvd_min() == 10 {
+                    if base_version == HttpVersion::Http11
+                        && (data.http_rcvd_min() == 10 || conn.httpversion_seen == 10)
+                    {
+                        // A `1.0` reply seen on THIS transfer (`rcvd_min`, e.g.
+                        // across redirect hops) OR previously on THIS reused
+                        // connection (`conn.httpversion_seen`, e.g. an earlier
+                        // transfer over the same kept-alive tunnel — test1078)
+                        // forces HTTP/1.0, exactly as curl's `http_may_use_1_1`.
                         HttpVersion::Http10
                     } else {
                         base_version
@@ -4267,6 +5093,17 @@ async fn perform_http_hop(
                 // redirect's first request — downgrade to HTTP/1.0 once a `1.0`
                 // reply has been seen.
                 data.note_http_response_version(i64::from(hop_sink.version));
+                // Also stamp the CONNECTION (C: `conn->httpversion_seen =
+                // k->httpversion`). Unlike the per-transfer `rcvd_min` above
+                // (reset at each transfer start), this persists on the pooled
+                // connection, so a *later* transfer reusing this kept-alive
+                // connection downgrades its first request to HTTP/1.0 once a
+                // `1.0` reply has been observed here — `http_may_use_1_1`'s
+                // `conn->httpversion_seen == 10` arm (oracle: tests/data/test1078,
+                // the second GET over a reused proxy tunnel).
+                if hop_sink.version > 0 {
+                    conn.httpversion_seen = hop_sink.version;
+                }
 
                 // A transport/protocol error normally ends the hop. But a *reused*
                 // connection that died before delivering any response — the case
@@ -4509,24 +5346,56 @@ async fn perform_http_hop(
                 // targets and whether the picked scheme is connection-bound (NTLM
                 // past its Type-1). The controller is borrowed only for the call,
                 // so `authneg` can be recomputed from both controllers afterward.
-                let challenge: Option<(String, bool, bool)> = match hop_sink.status {
-                    407 => proxy_auth_controller.as_mut().and_then(|c| {
-                        c.on_challenge(&hop_sink.www_authenticate, method.method.as_str(), &target)
-                            .map(|next| (next, true, c.requires_same_connection()))
-                    }),
-                    401 => auth_controller.as_mut().and_then(|c| {
-                        c.on_challenge(&hop_sink.www_authenticate, method.method.as_str(), &target)
-                            .map(|next| (next, false, c.requires_same_connection()))
-                    }),
-                    _ => None,
+                // Route the challenge to the matching controller. `on_challenge`
+                // returns `Ok(Some(value))` to retry with a credential, `Ok(None)`
+                // when the challenge is unanswerable (the `401`/`407` is the real
+                // answer), or `Err(e)` when *building* the credential is a HARD
+                // failure (e.g. an NTLM Type-3 that overflows `NTLM_BUFSIZE` →
+                // `CurlError::TooLarge` / exit 100, matching curl's
+                // `Curl_output_ntlm` propagating its `CURLcode`; oracle test776).
+                let challenge: Result<Option<(String, bool, bool)>> = match hop_sink.status {
+                    407 => match proxy_auth_controller.as_mut() {
+                        Some(c) => match c.on_challenge(
+                            &hop_sink.www_authenticate,
+                            method.method.as_str(),
+                            &target,
+                        ) {
+                            Ok(Some(next)) => Ok(Some((next, true, c.requires_same_connection()))),
+                            Ok(None) => Ok(None),
+                            Err(e) => Err(e),
+                        },
+                        None => Ok(None),
+                    },
+                    401 => match auth_controller.as_mut() {
+                        Some(c) => match c.on_challenge(
+                            &hop_sink.www_authenticate,
+                            method.method.as_str(),
+                            &target,
+                        ) {
+                            Ok(Some(next)) => Ok(Some((next, false, c.requires_same_connection()))),
+                            Ok(None) => Ok(None),
+                            Err(e) => Err(e),
+                        },
+                        None => Ok(None),
+                    },
+                    _ => Ok(None),
                 };
-                // No answerable challenge (a non-`401`/`407` status, no matching
-                // controller, no acceptable scheme, or rejected credentials): the
-                // current response is the real answer. The deferred `failonerror`
-                // verdict below turns a terminal `401`/`407` into exit 22 (tests
-                // 152, 162).
-                let Some((next, is_proxy, same_conn_required)) = challenge else {
-                    break result;
+                // A hard credential-build error fails the transfer (curl returns
+                // the `CURLcode` from `Curl_http_output_auth`). An unanswerable
+                // challenge (`Ok(None)`) means the current response is the real
+                // answer; the deferred `failonerror` verdict below turns a terminal
+                // `401`/`407` into exit 22 (tests 152, 162).
+                let (next, is_proxy, same_conn_required) = match challenge {
+                    Ok(Some(t)) => t,
+                    Ok(None) => break result,
+                    Err(e) => {
+                        // Hard credential-build failure: curl had already marked
+                        // the challenge body to be ignored (a retry was intended),
+                        // so suppress the terminal body flush below (oracle
+                        // test775).
+                        auth_credential_build_failed = true;
+                        break Err(e);
+                    }
                 };
                 // Decide whether the existing connection can carry the retry. curl
                 // reuses a still-open keep-alive connection but RECONNECTS when the
@@ -4609,6 +5478,34 @@ async fn perform_http_hop(
                     }
                     rewound = true;
                 }
+                // Capture this challenge response's `Set-Cookie`s into the jar and
+                // re-derive `hop.cookie`, so the authenticated retry echoes them.
+                // curl captures cookies from EVERY response (including the
+                // intermediate `401`/`407`) and rebuilds the `Cookie:` header per
+                // request — a forward-proxy `407` that sets a cookie must have it
+                // echoed on the authenticated retry (oracle: tests/data/test1331,
+                // `proxycookie=weirdo`). Done BEFORE `reset_for_retry` clears the
+                // HopSink's per-response `set_cookies`. Applies to both the host
+                // (`401`) and proxy (`407`) retry, matching curl's per-response
+                // capture; the recomputed value supersedes the hop's original
+                // `Cookie:` so a cookie newly set by the challenge is added while
+                // any inline `CURLOPT_COOKIE` value is preserved (it is re-appended
+                // by `request_header`).
+                #[cfg(feature = "cookies")]
+                if hop_cookie_jar.is_some() {
+                    cookie_engine::capture(
+                        &hop_cookie_jar,
+                        &hop_sink.set_cookies,
+                        url,
+                        hop_cookie_host_override.as_deref(),
+                    );
+                    hop.cookie = cookie_engine::request_header(
+                        &hop_cookie_jar,
+                        data.set.str(StrId::Cookie),
+                        url,
+                        hop_cookie_host_override.as_deref(),
+                    );
+                }
                 // Drop the buffered probe body and reset the per-attempt observable
                 // state for the retry.
                 hop_sink.discard_auth_body();
@@ -4673,8 +5570,14 @@ async fn perform_http_hop(
                 result = Err(CurlError::HttpReturnedError);
             }
             // Deliver the body of a terminal `401`/`407` (an unanswerable
-            // challenge's error page) that was buffered during negotiation.
-            hop_sink.flush_auth_body();
+            // challenge's error page) that was buffered during negotiation —
+            // EXCEPT when the break was a hard credential-build failure, where curl
+            // had already marked the body ignored before the failing build (the
+            // retry was intended), so the buffered body is discarded rather than
+            // written (oracle: tests/data/test775).
+            if !auth_credential_build_failed {
+                hop_sink.flush_auth_body();
+            }
             result
         }
         HttpVersion::H2 => {
@@ -4744,6 +5647,16 @@ async fn perform_http_hop(
     if hop_sink.range_error {
         return Err(CurlError::RangeError);
     }
+    // Surface a "Multiple Location headers" rejection detected during header
+    // parsing (curl's `Location:` branch returning `CURLE_WEIRD_SERVER_REPLY`).
+    // Like the range error this is latched on the sink because `note_header`
+    // cannot return a `CURLcode`; it is checked before `drive_result` so the
+    // header-level rejection takes precedence over any body-write abort, exactly
+    // as curl fails the transfer the moment the second differing `Location:` is
+    // parsed (oracle: tests/data/test772).
+    if hop_sink.multiple_location {
+        return Err(CurlError::WeirdServerReply);
+    }
     // Surface a client-side time-condition miss detected at first-body-write
     // (curl's `http_firstwrite` "Simulate an HTTP 304 response"): `HopSink`
     // discarded the body, and curl reports a synthetic `304` with
@@ -4755,6 +5668,17 @@ async fn perform_http_hop(
     if hop_sink.condition_unmet {
         data.info.timecond = true;
         data.info.response_code = 304;
+    }
+    // Publish the document modification time for `CURLINFO_FILETIME[_T]` when
+    // `--remote-time` / `CURLOPT_FILETIME` was requested and this response
+    // carried a `Last-Modified` (curl's `http_header_l` doing
+    // `data->info.filetime = k->timeofdoc`). The value is the parsed instant —
+    // including a NEGATIVE epoch for a pre-1970 document — so the CLI's
+    // `--remote-time` sets the saved file's mtime correctly (oracle test762 /
+    // test1443). A response without a `Last-Modified` leaves `info.filetime` at
+    // its `-1` "unknown" default.
+    if let Some(ft) = hop_sink.filetime {
+        data.info.filetime = ft;
     }
     drive_result?;
 
@@ -4836,9 +5760,28 @@ async fn perform_http_hop(
     }
     // Otherwise `conn` drops at function end, closing its socket.
 
+    // If a reactive negotiation on this hop settled on a stateless scheme
+    // (Basic/Bearer via `--anyauth`), capture the credential to re-send
+    // preemptively on the next hop — curl's persistent `data->state.authhost`
+    // (oracle: test1088). `None` for non-auth/connection-bound/still-negotiating.
+    let picked_preemptive = auth_controller
+        .as_ref()
+        .and_then(auth_engine::HttpAuthController::settled_preemptive_value);
+
+    // If a Digest negotiation settled on this hop, carry the live Digest state
+    // (nonce + running `nc` + credentials) so the next in-scope hop preemptively
+    // re-sends `Authorization: Digest` with an incremented nonce-count, recomputed
+    // for the new method+URI — curl's persistent `data->state.digest` re-send
+    // (oracle: tests/data/test1286).
+    let picked_digest = auth_controller
+        .as_ref()
+        .and_then(auth_engine::HttpAuthController::settled_digest_carry);
+
     Ok(HopResult {
         status,
         location,
+        picked_preemptive,
+        picked_digest,
         #[cfg(feature = "cookies")]
         set_cookies,
         #[cfg(feature = "hsts")]
@@ -5400,7 +6343,12 @@ async fn drive_one<P: ProtocolExchange>(
     data.info.total_time_us = progress.total_time().as_micros();
     data.info.starttransfer_time_us = progress.starttransfer_time().as_micros();
     data.info.pretransfer_time_us = progress.pretransfer_time().as_micros();
-    data.info.header_size = request.headerbytecount as i64;
+    // For a proxy tunnel, `connect_header_size` (seeded once when the tunnel was
+    // established) carries the CONNECT response's header bytes, which curl folds
+    // into the same `header_size` total via `Curl_bump_headersize` regardless of
+    // `--suppress-connect-headers` (oracle: test1288). It is `0` for every
+    // non-tunnel transfer, leaving the origin-only accounting unchanged.
+    data.info.header_size = request.headerbytecount as i64 + data.info.connect_header_size;
 
     // Latch the decompression-bomb diagnostic so the front-end's `curl: (61)
     // <msg>` line and `%{errormsg}` carry curl's specific `failf` text rather
@@ -5412,6 +6360,30 @@ async fn drive_one<P: ProtocolExchange>(
     // transfer error's diagnostic text changes.
     if matches!(outcome, Err(CurlError::TooManyContentEncodings)) {
         data.set_last_error(CurlError::TooManyContentEncodings.description());
+    }
+
+    // Latch the FAILONERROR diagnostic so `%{errormsg}` carries curl's specific
+    // `failf` text `"The requested URL returned error: <code>"` rather than the
+    // generic `CURLE_HTTP_RETURNED_ERROR` description "HTTP response code said
+    // error". curl writes this via
+    // `failf(data, "The requested URL returned error: %d", k->httpcode)` on the
+    // `-f`/`--fail` abort (lib/http.c:4049 / :614); the safe core records the
+    // equivalent on the handle (the C `CURLOPT_ERRORBUFFER` cannot be written
+    // from the transfer engine — the documented foundation limitation). The
+    // CLI's `curl: (22)` line already reconstructs this identical text in
+    // `post_check_result` from `CURLINFO_RESPONSE_CODE`, so that line is
+    // unchanged; this latch additionally reaches `%{errormsg}`, which reads the
+    // handle's error buffer at write-out time (which runs *before* that
+    // diagnostic). `request.httpcode` is the final status just published to
+    // `data.info.response_code` above, so the wording matches byte-for-byte for
+    // every failing code (404, 401, 407, …). Scoped to this one cause so no
+    // other transfer error's diagnostic text changes. (Oracle: tests/data/test1188,
+    // tests/data/test24.)
+    if matches!(outcome, Err(CurlError::HttpReturnedError)) {
+        data.set_last_error(format!(
+            "The requested URL returned error: {}",
+            request.httpcode
+        ));
     }
 
     // Surface any transfer error only after the info store is recorded.
@@ -5513,6 +6485,45 @@ fn any_custom_header(lines: &[String], target: &str) -> bool {
             Some(sep) if sep > 0 => line[..sep].eq_ignore_ascii_case(target),
             _ => false,
         }
+    })
+}
+
+/// Whether the application's custom `target` header carries `content` in its
+/// value, case-insensitively — the curl-rs port of `Curl_compareheader(ptr,
+/// "<target>:", "<content>")` (lib/http.c). Used by `addexpect` to decide
+/// whether a user-supplied `Expect:` header announces `100-continue` (so the
+/// engine must wait for the interim `100` before sending the body), exactly as
+/// curl computes `*announced_exp100 = Curl_compareheader(ptr, "Expect:",
+/// "100-continue")` when `Curl_checkheaders(data, "Expect")` returns non-NULL.
+///
+/// Matching mirrors curl: the header NAME is the span up to the first `:`/`;`
+/// compared case-insensitively (as in [`any_custom_header`]); only the `:`
+/// (value-bearing) form is considered — the `Header;` "send empty" directive
+/// has no value and therefore never matches. The value is whitespace-trimmed
+/// (curl's `curlx_str_trimblanks`) and then searched for `content`
+/// case-insensitively (curl's content-find loop). The search is ASCII
+/// case-insensitive substring containment, which faithfully covers the real
+/// header forms (`Expect: 100-continue`, `Expect:  100-continue `, mixed case).
+fn custom_header_value_contains(lines: &[String], target: &str, content: &str) -> bool {
+    let content_lower = content.to_ascii_lowercase();
+    lines.iter().any(|line| {
+        let bytes = line.as_bytes();
+        // Only a colon-delimited (value-bearing) header can match; a `;`-form
+        // directive (`-H "Expect;"`) sends an empty value, which curl's
+        // `Curl_compareheader` reports as no match.
+        let Some(colon) = bytes.iter().position(|&b| b == b':' || b == b';') else {
+            return false;
+        };
+        if colon == 0 || bytes[colon] != b':' {
+            return false;
+        }
+        if !line[..colon].eq_ignore_ascii_case(target) {
+            return false;
+        }
+        // Trim surrounding ASCII whitespace from the value (curl trims blanks),
+        // then test case-insensitive containment of `content`.
+        let value = line[colon + 1..].trim_matches(|c: char| c.is_ascii_whitespace());
+        value.to_ascii_lowercase().contains(&content_lower)
     })
 }
 
@@ -5898,7 +6909,12 @@ fn read_upload_blocks(source: &mut dyn ReadCallback) -> Result<Vec<Vec<u8>>> {
 /// connect host/port; otherwise the request host/port are used unchanged. The
 /// `Host:` header and SNI keep the original host (the caller passes the request
 /// host to the request builder), matching curl's `conn->conn_to_host` behavior.
-fn connect_target(data: &Easy, host: &str, port: u16) -> (String, u16) {
+///
+/// `pub(crate)` so the FTP engine ([`crate::protocols::ftp`]) can reuse the
+/// identical `--connect-to` matching for its control-channel dial target (curl
+/// applies `conn_to_host`/`conn_to_port` uniformly across protocols in
+/// `create_conn`; tests/data/test713).
+pub(crate) fn connect_target(data: &Easy, host: &str, port: u16) -> (String, u16) {
     let Some(list) = data.set.connect_to.as_ref() else {
         return (host.to_string(), port);
     };
@@ -6347,24 +7363,43 @@ fn effective_range(data: &Easy) -> Option<Cow<'_, str>> {
 ///   `Curl_checkheaders(data, "Content-Range")` precedence).
 fn effective_content_range(data: &Easy, custom_headers: &[String]) -> Option<String> {
     let resume_from = data.set.set_resume_from;
-    if resume_from <= 0 {
-        return None;
-    }
+    // Only PUT/POST uploads carry a `Content-Range` (C: the `httpreq ==
+    // HTTPREQ_POST || httpreq == HTTPREQ_PUT` arm of `http_range`).
     if !matches!(data.set.method, HttpReq::Put | HttpReq::Post) {
         return None;
     }
+    // An application-supplied `Content-Range:` header wins (curl's
+    // `Curl_checkheaders(data, "Content-Range")`).
     if any_custom_header(custom_headers, "Content-Range") {
         return None;
     }
     // The full declared upload size (`CURLOPT_INFILESIZE`/`POSTFIELDSIZE`); an
     // indeterminate upload yields `None`, so no `Content-Range` is emitted.
     let total = known_upload_length(data)?;
-    if total <= 0 || resume_from >= total {
-        // A non-positive total has no range to express; a resume offset at or
-        // past the end means there is nothing to upload (handled as
-        // `CURLE_PARTIAL_FILE` in `build_request_body`), so emit no header.
+    if total <= 0 {
+        // A non-positive total has no range to express.
         return None;
     }
+    if resume_from < 0 {
+        // `-C -`: upload auto-resume where the remote size is unknown. curl has
+        // no way to tell how much the server already holds (it issues no HEAD),
+        // so it re-sends the WHOLE file and advertises
+        // `Content-Range: bytes 0-<clen-1>/<clen>` over the full declared length
+        // (C: the `data->set.set_resume_from < 0` branch of `http_range`;
+        // oracle: `tests/data/test1041`). The body is NOT repositioned — the
+        // entire file is sent — so the advertised `Content-Length` is the full
+        // size.
+        return Some(format!("bytes 0-{}/{}", total - 1, total));
+    }
+    if resume_from == 0 || resume_from >= total {
+        // No resume offset, or an offset at/past the end (which `build_request_body`
+        // reports as `CURLE_PARTIAL_FILE`) ⇒ no header.
+        return None;
+    }
+    // `-C <n>` with `n > 0`: an explicit byte-offset resume (C: the
+    // `data->state.resume_from` branch — `bytes <from>-<total-1>/<total>`). The
+    // body is repositioned to `from` in `build_request_body`, so the advertised
+    // `Content-Length` is the post-seek remainder.
     Some(format!("bytes {}-{}/{}", resume_from, total - 1, total))
 }
 
@@ -6407,14 +7442,30 @@ fn make_inputs<'a>(
         conn,
         method_kind: hop.method,
         no_body: hop.no_body,
-        custom_request: data.set.str(StrId::Customrequest),
+        // Honor curl's `state.http_ignorecustom`: a 301/302/303→GET downgrade
+        // under `--follow` drops the custom verb so a plain `GET` is sent.
+        custom_request: if hop.ignore_custom_request {
+            None
+        } else {
+            data.set.str(StrId::Customrequest)
+        },
         is_websocket,
         is_upload: hop.method == HttpReq::Put,
         host,
         port,
         is_https,
         host_header_present: any_custom_header(custom_headers, "Host"),
-        user_agent: data.set.str(StrId::Useragent),
+        // H1_HD_USER_AGENT default. Port of `http_useragent` (lib/http.c): a
+        // user-supplied `User-Agent` custom header (`Curl_checkheaders`) erases
+        // the default `aptr.uagent` (`free`/`= NULL`), so the auto value is
+        // suppressed here and ONLY the custom header is emitted later in the
+        // H1_HD_CUSTOM slot — otherwise both would appear on the wire (oracle:
+        // tests/data/test1802, the tunneled GET with `--header "User-Agent: …"`).
+        user_agent: if any_custom_header(custom_headers, "User-Agent") {
+            None
+        } else {
+            data.set.str(StrId::Useragent)
+        },
         authorization: hop.authorization.as_deref(),
         proxy_authorization: hop.proxy_authorization.as_deref(),
         range: effective_range(data),
@@ -6429,7 +7480,14 @@ fn make_inputs<'a>(
         te_gzip: data.set.http_transfer_encoding && !any_custom_header(custom_headers, "TE"),
         accept_encoding: data.set.str(StrId::Encoding),
         referer: hop.referer.as_deref(),
-        proxy_connection_keepalive: hop.proxy_connection_keepalive,
+        // H1_HD_PROXY_CONNECTION. Port of the guard in `lib/http.c` (L2942-2946):
+        // the auto `Proxy-Connection: Keep-Alive` is suppressed when the
+        // application supplied its own `Proxy-Connection` via `-H`
+        // (`Curl_checkheaders`), letting the custom header win in the
+        // H1_HD_CUSTOM slot rather than emitting the header twice (oracle:
+        // tests/data/test1180, a forward-proxy GET with `-H "Proxy-Connection: …"`).
+        proxy_connection_keepalive: hop.proxy_connection_keepalive
+            && !any_custom_header(custom_headers, "Proxy-Connection"),
         cookie: hop.cookie.as_deref(),
         body,
         // `CURLOPT_MIMEPOST` (`-F`): the `multipart/form-data; boundary=…`
@@ -6443,7 +7501,19 @@ fn make_inputs<'a>(
         client_upload_len,
         disable_expect: false,
         expect_present: any_custom_header(custom_headers, "Expect"),
-        custom_expect_100: false,
+        // Port of `addexpect`'s custom-header branch: when the application
+        // supplied its own `Expect:` header, curl waits for the interim `100`
+        // only if that header's value announces `100-continue`
+        // (`*announced_exp100 = Curl_compareheader(ptr, "Expect:",
+        // "100-continue")`). Hard-coding this to `false` made a user-supplied
+        // `-H "Expect: 100-continue"` send the body immediately without waiting
+        // (oracle test1130/test1131): the engine must honor the announced
+        // expectation and gate the body on the interim response.
+        custom_expect_100: custom_header_value_contains(
+            custom_headers,
+            "Expect",
+            "100-continue",
+        ),
         is_upgrade: false,
         custom_headers,
         proxy_headers: &[],
@@ -7416,6 +8486,36 @@ mod tests {
         data.set.method = HttpReq::Put;
         data.set.filesize = 50;
         data.set.set_resume_from = 50;
+        assert_eq!(effective_content_range(&data, &[]), None);
+
+        // `-C -` on an upload (set_resume_from < 0): the remote size is unknown,
+        // so curl re-sends the whole file and advertises the full length as
+        // `bytes 0-<total-1>/<total>` (tests/data/test1041: 100-byte PUT ⇒
+        // `Content-Range: bytes 0-99/100`).
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Put;
+        data.set.filesize = 100;
+        data.set.set_resume_from = -1;
+        assert_eq!(
+            effective_content_range(&data, &[]).as_deref(),
+            Some("bytes 0-99/100")
+        );
+
+        // `-C -` on a sized POST likewise re-sends the whole body.
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Post;
+        data.set.postfieldsize = 200;
+        data.set.set_resume_from = -1;
+        assert_eq!(
+            effective_content_range(&data, &[]).as_deref(),
+            Some("bytes 0-199/200")
+        );
+
+        // `-C -` with an unknown upload size still emits nothing.
+        let mut data = Easy::new();
+        data.set.method = HttpReq::Put;
+        data.set.filesize = -1;
+        data.set.set_resume_from = -1;
         assert_eq!(effective_content_range(&data, &[]), None);
     }
 

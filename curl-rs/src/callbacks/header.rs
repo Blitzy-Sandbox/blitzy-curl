@@ -696,18 +696,50 @@ fn parse_status_line_code(line: &[u8]) -> Option<i64> {
     tokens.next()?.parse::<i64>().ok()
 }
 
-/// Whether `url`'s scheme is `http` or `https` (case-insensitive). Gates the
-/// etag / content-disposition header handling to HTTP(S) transfers — the CLI's
-/// stand-in for `getinfo(SCHEME) ∈ {http, https}`, taken from the transfer URL
-/// because the live handle is unavailable in the header callback.
-fn url_is_http_or_https(url: &str) -> bool {
+/// Resolve the effective scheme of `url`, lower-cased — the CLI's stand-in for
+/// `curl_easy_getinfo(per->curl, CURLINFO_SCHEME)` inside `tool_header_cb`. The
+/// live easy handle is moved out of `per` for the duration of the transfer
+/// (`perform_with_cli_io`), so getinfo would return the default (empty); curl
+/// instead reads the *resolved* scheme that the URL parser settled on, which for
+/// a scheme-less URL is the value picked by `CURLU_GUESS_SCHEME`.
+///
+/// This mirrors that resolution in two steps:
+///   1. An explicit `scheme://` prefix wins verbatim (lower-cased).
+///   2. Otherwise curl guesses from the host prefix (`lib/url.c`'s
+///      legacy guessing: `ftp.`/`dict.`/`ldap.`/`imap.`/`smtp.`/`pop3.` select
+///      their namesake scheme, everything else defaults to `http`).
+///
+/// The harness drives curl-rs with scheme-less URLs (e.g. `127.0.0.1:PORT/N`),
+/// so without this guessing the http/https gate below would never fire and
+/// `-J` / `--etag-save` / the `-i` header echo would all be skipped — exactly the
+/// `-J` cluster failures (test1310/test1312/test1492).
+fn resolve_scheme(url: &str) -> String {
     let u = url.trim_start();
-    match u.find("://") {
-        Some(pos) => {
-            let scheme = &u[..pos];
-            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
-        }
-        None => false,
+    if let Some(pos) = u.find("://") {
+        return u[..pos].to_ascii_lowercase();
+    }
+    // Scheme-less: guess from the host prefix (curl's `guess_scheme`). Isolate the
+    // authority (up to the first `/`, `?` or `#`), drop any `user:pass@` userinfo,
+    // then strip the `:port` to leave the bare host.
+    let auth_end = u.find(['/', '?', '#']).unwrap_or(u.len());
+    let authority = &u[..auth_end];
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = hostport.split(':').next().unwrap_or(hostport);
+    let lower = host.to_ascii_lowercase();
+    if lower.starts_with("ftp.") {
+        "ftp".to_string()
+    } else if lower.starts_with("dict.") {
+        "dict".to_string()
+    } else if lower.starts_with("ldap.") {
+        "ldap".to_string()
+    } else if lower.starts_with("imap.") {
+        "imap".to_string()
+    } else if lower.starts_with("smtp.") {
+        "smtp".to_string()
+    } else if lower.starts_with("pop3.") {
+        "pop3".to_string()
+    } else {
+        "http".to_string()
     }
 }
 
@@ -784,13 +816,40 @@ pub fn tool_header_cb(buffer: &[u8], per: &mut PerTransfer, global: &mut GlobalC
     // ---- Scheme retained only for the `-i`/`--include` header echo ---------
     // curl's `tool_header_cb` reads getinfo(SCHEME) from the live handle. Here
     // the real easy handle is moved out for the duration of the CLI transfer
-    // (`perform_with_cli_io`), so getinfo returns the default (empty) — and the
-    // `-i` header echo further below is in any case driven independently by the
-    // core's `CURLOPT_HEADER` merge (set from `show_headers` in `setopt`). This
-    // value is therefore retained purely to preserve that block's original gate.
-    let scheme = match per.easy.getinfo(CurlInfo::Scheme) {
-        Ok(InfoValue::Str(Some(c))) => c.to_string_lossy().to_ascii_lowercase(),
-        _ => String::new(),
+    // (`perform_with_cli_io`), so getinfo returns the default (empty). We instead
+    // resolve the scheme from the transfer URL exactly as curl's URL parser would
+    // (`CURLU_GUESS_SCHEME`), so scheme-less URLs — which the test harness always
+    // uses — still gate the etag/`-J`/`-i` blocks below correctly. See
+    // `resolve_scheme` for the guessing rules ported from `lib/url.c`.
+    //
+    // Exception — FTP driven AS HTTP over a forward HTTP proxy: curl's URL
+    // parser swaps the connection scheme to HTTP for a `PROTOPT_PROXY_AS_HTTP`
+    // protocol behind a non-tunneling forward proxy (`lib/url.c:2381`) and then
+    // persists that swapped name as `CURLINFO_SCHEME` (`lib/url.c:3627`). The
+    // response that streams back through this callback is therefore a genuine
+    // HTTP response, and curl's `tool_header_cb` (reading getinfo(SCHEME)="http")
+    // echoes its headers under `-i`/`--include`. The handle is moved out here so
+    // getinfo is unavailable; `per.proxy_as_http` is precomputed before the move
+    // (`perform_with_cli_io`) and stands in for that getinfo read. Oracle:
+    // tests/data/test79, test208, test299, test1077, test1092, test1098.
+    let scheme = if per.proxy_as_http {
+        "http".to_string()
+    } else if let Some(eff) = per.effective_scheme.as_deref() {
+        // A cross-protocol redirect hand-off (e.g. HTTP PUT → FTP STOR,
+        // test1055) rewrote the engine's `CURLINFO_SCHEME`; the core pushed the
+        // new scheme here via `WriteCallbacks::set_effective_scheme`. curl reads
+        // this *effective* scheme from `getinfo(CURLINFO_SCHEME)` in
+        // `tool_header_cb`, so the `-i` echo / etag / `-J` gates use the protocol
+        // actually producing each line. Crucially the FTP control responses
+        // streamed back AFTER the redirect (drained as `INFO`) see scheme `ftp`
+        // and are therefore NOT echoed onto the body under `-i` (C gate: scheme ∈
+        // {http,https,rtsp,file}); only the original HTTP 307 headers — written
+        // while the scheme was still `http`, before this field was set — are
+        // echoed. The handle is moved out during the CLI transfer, so this pushed
+        // value stands in for that getinfo read.
+        eff.to_ascii_lowercase()
+    } else {
+        per.url.as_deref().map(resolve_scheme).unwrap_or_default()
     };
 
     // ---- Track the response code from the status line ----------------------
@@ -808,11 +867,11 @@ pub fn tool_header_cb(buffer: &[u8], per: &mut PerTransfer, global: &mut GlobalC
 
     // ---- Scheme / response gating for --etag-save and -J -------------------
     // curl: only http/https carry a response code, and only 2xx/3xx responses
-    // care about etag / content-disposition (`tool_cb_hdr.c`). The scheme is
-    // taken from the transfer URL (`per.url`) — equivalent to getinfo(SCHEME) for
-    // this http/https gate — and the response code from the status line tracked
-    // above, because the live handle is unavailable mid-transfer.
-    let http_like = per.url.as_deref().is_some_and(url_is_http_or_https);
+    // care about etag / content-disposition (`tool_cb_hdr.c`). The scheme was
+    // resolved from the transfer URL above (the getinfo(SCHEME) stand-in), and
+    // the response code from the status line tracked above, because the live
+    // handle is unavailable mid-transfer.
+    let http_like = matches!(scheme.as_str(), "http" | "https");
     if http_like {
         let response = per.hdrcbdata.last_response_code;
         let class = response / 100;
@@ -1107,15 +1166,45 @@ mod tests {
     }
 
     #[test]
-    fn url_is_http_or_https_matches_scheme_case_insensitively() {
-        assert!(url_is_http_or_https("http://h/x"));
-        assert!(url_is_http_or_https("https://h/x"));
-        assert!(url_is_http_or_https("HTTP://h/x"));
-        assert!(url_is_http_or_https("HtTpS://h/x"));
-        assert!(!url_is_http_or_https("ftp://h/x"));
-        assert!(!url_is_http_or_https("file:///x"));
-        assert!(!url_is_http_or_https("no-scheme-here"));
-        assert!(!url_is_http_or_https(""));
+    fn resolve_scheme_uses_explicit_scheme_lowercased() {
+        // An explicit `scheme://` prefix wins verbatim, lower-cased.
+        assert_eq!(resolve_scheme("http://h/x"), "http");
+        assert_eq!(resolve_scheme("https://h/x"), "https");
+        assert_eq!(resolve_scheme("HTTP://h/x"), "http");
+        assert_eq!(resolve_scheme("HtTpS://h/x"), "https");
+        assert_eq!(resolve_scheme("ftp://h/x"), "ftp");
+        assert_eq!(resolve_scheme("file:///x"), "file");
+        assert_eq!(resolve_scheme("rtsp://h/x"), "rtsp");
+    }
+
+    #[test]
+    fn resolve_scheme_guesses_scheme_less_urls_like_curl() {
+        // Scheme-less URLs (exactly what the test harness passes) guess from the
+        // host prefix, mirroring `lib/url.c`'s legacy guessing. The common case —
+        // a bare IP or ordinary host — guesses `http`, which is what makes the
+        // `-J` / `-i` gates fire for harness-driven transfers.
+        assert_eq!(resolve_scheme("127.0.0.1:8990/1312"), "http");
+        assert_eq!(resolve_scheme("example.com/path"), "http");
+        assert_eq!(resolve_scheme("user:pass@host:80/p"), "http");
+        assert_eq!(resolve_scheme("ftp.example.com/x"), "ftp");
+        assert_eq!(resolve_scheme("dict.example.com/x"), "dict");
+        assert_eq!(resolve_scheme("ldap.example.com/x"), "ldap");
+        assert_eq!(resolve_scheme("imap.example.com/x"), "imap");
+        assert_eq!(resolve_scheme("smtp.example.com/x"), "smtp");
+        assert_eq!(resolve_scheme("pop3.example.com/x"), "pop3");
+        // Empty input degrades to the http default rather than panicking.
+        assert_eq!(resolve_scheme(""), "http");
+    }
+
+    #[test]
+    fn resolve_scheme_gates_match_curl_http_like() {
+        // The http/https gate used for etag/-J.
+        for u in ["http://h/x", "https://h/x", "127.0.0.1:80/x", "host/x"] {
+            assert!(matches!(resolve_scheme(u).as_str(), "http" | "https"));
+        }
+        for u in ["ftp://h/x", "file:///x", "ftp.h/x"] {
+            assert!(!matches!(resolve_scheme(u).as_str(), "http" | "https"));
+        }
     }
 
     /// A read+write temp `OutStruct` bound to `path`, used as the `--etag-save`
@@ -1208,6 +1297,31 @@ mod tests {
         tool_header_cb(b"ETag: W/\"asdf\"\r\n", &mut per, &mut global);
         per.etag_save.stream = None;
         assert!(fs::read(&path).unwrap().is_empty());
+    }
+
+    /// An `ftp://` URL driven AS HTTP over a forward HTTP proxy
+    /// (`per.proxy_as_http == true`) must be treated as the `http` scheme: curl's
+    /// URL parser swaps the connection scheme to HTTP (`lib/url.c:2381`) and
+    /// `CURLINFO_SCHEME` reports "http" (`lib/url.c:3627`), so `tool_header_cb`
+    /// applies the http/https etag gate and the response's etag IS saved — the
+    /// mirror image of `tool_header_cb_skips_etag_on_non_http_scheme`. Oracle:
+    /// tests/data/test79, test208, test299, test1077, test1092, test1098.
+    #[test]
+    fn tool_header_cb_treats_ftp_over_http_proxy_as_http() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("etagproxy");
+        let mut global = GlobalConfig::new();
+        global.operations[0].etag_save_file = Some(path.to_string_lossy().into_owned());
+        let mut per = PerTransfer::new(0);
+        per.url = Some("ftp://127.0.0.1/x".to_string());
+        // The transfer is an `ftp://` URL but is being forwarded AS HTTP through a
+        // non-tunneling HTTP proxy, so the scheme stand-in must resolve to "http".
+        per.proxy_as_http = true;
+        per.etag_save = etag_sink(&path);
+        tool_header_cb(b"HTTP/1.1 200 OK\r\n", &mut per, &mut global);
+        tool_header_cb(b"ETag: W/\"asdf\"\r\n", &mut per, &mut global);
+        per.etag_save.stream = None;
+        assert_eq!(fs::read(&path).unwrap(), b"W/\"asdf\"\n");
     }
 
     // ---- tool_write_headers -------------------------------------------------

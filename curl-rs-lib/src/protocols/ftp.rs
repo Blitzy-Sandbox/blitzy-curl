@@ -1074,6 +1074,21 @@ impl PingPongProtocol for FtpConn {
                 data.info.response_code = i64::from(code);
             }
 
+            // C `ftp_readresp` (lib/ftp.c L607-617): a `421` may arrive at any
+            // point in the dialogue (idle-timeout / "closing control
+            // connection") and is treated generically as
+            // `CURLE_OPERATION_TIMEDOUT` before the per-state switch. The
+            // connect-phase reader mirrors that here so a `421` during login is
+            // handled identically to one during transfer (see `read_one`).
+            if code == 421 {
+                if data.set.verbose {
+                    sendf::infof(true, "We got a 421 - timeout");
+                }
+                self.ctl_valid = false;
+                self.set_state(FtpState::Stop);
+                return Err(CurlError::OperationTimedout);
+            }
+
             self.advance(data, conn, code).await
         })
     }
@@ -1156,9 +1171,19 @@ impl FtpConn {
             FtpState::Pwd => self.state_pwd_resp(data, conn, code).await,
             FtpState::Syst => self.state_syst_resp(data, conn, code).await,
             FtpState::Namefmt => {
-                // Whatever the `SITE NAMEFMT` reply, the connect phase is done.
-                self.set_state(FtpState::Stop);
-                Ok(())
+                // C `case FTP_NAMEFMT` (lib/ftp.c L3226-3232): on a `250` (name
+                // format change accepted) the initial path is *reloaded* with a
+                // second `PWD` — `ftp_state_pwd(data, ftpc)` — so subsequent
+                // `CWD`/`RETR` use the now-UNIX-style entry path; any other reply
+                // simply ends the connect phase. The second `PWD` reply re-enters
+                // `state_pwd_resp`, but `server_os` is already set by now so the
+                // `SYST` probe is not repeated (no loop). Oracle: tests/data/test1102.
+                if code == 250 {
+                    self.send_pwd(data, conn).await
+                } else {
+                    self.set_state(FtpState::Stop);
+                    Ok(())
+                }
             }
             // Stop / Last and the transfer-phase states are accepted no-ops in
             // the connect-phase drive; the transfer drive (do_it/do_more)
@@ -1247,6 +1272,22 @@ impl FtpConn {
         conn: &mut Connection,
         code: i32,
     ) -> Result<()> {
+        // Pipelining in the AUTH response is forbidden: the server must not send
+        // any bytes after the response line and before the TLS handshake, or
+        // those plaintext bytes could be a command injection by a network
+        // attacker. Mirrors C `case FTP_AUTH` (`ftp.c` L3076-3077):
+        // `if(pp->overflow) return CURLE_WEIRD_SERVER_REPLY;`, checked *before*
+        // the response code so a pipelined reply is rejected regardless of the
+        // 234/334 accept status. Without this guard the buffered extra lines are
+        // consumed as replies to later commands, corrupting the session
+        // (tests/data/test983).
+        if self.pp.has_overflow() {
+            crate::failf!(
+                &mut conn.filter_data.error_buffer,
+                "Reply to AUTH contained pipelined data"
+            );
+            return Err(CurlError::WeirdServerReply);
+        }
         if code == 234 || code == 334 {
             // AUTH accepted: upgrade the control channel to TLS *now*, before
             // `USER`. The Rust analog of C's `Curl_ssl_cfilter_add(FIRSTSOCKET)`
@@ -1717,11 +1758,37 @@ impl FtpConn {
         // is installed (C tears the second socket down in `ftp_done`).
         conn.cfilter[SECONDARYSOCKET].discard_all();
 
-        // Resolve the advertised data endpoint (usually an IP literal from the
-        // PASV/EPSV reply — a no-op resolve — but a hostname is handled too).
         let ipver = IpVersion::from_raw(i64::from(data.set.ipver));
         let verbose = data.set.verbose;
-        let addrs = resolve_ftp_addrs(&host, port, ipver, verbose).await?;
+
+        // FTP-over-HTTP(S)-proxy CONNECT tunnel: when the control channel tunnels
+        // through a proxy, the data channel opens its OWN `CONNECT` through the
+        // SAME proxy to the `PASV`/`EPSV` endpoint — curl's `ftp_state_pasv_resp`
+        // `if(conn->bits.proxy)` re-resolves the proxy host, dials it, and sets up
+        // `SECONDARYSOCKET` with a `CONNECT` to `conn->secondaryhostname:port`
+        // (= the data host above). The proxy is re-resolved from `data.set` (the
+        // origin host for the `no_proxy` match is the recorded control remote,
+        // which under a tunnel is the ORIGIN FTP host). `None` for a direct or
+        // SOCKS route leaves the existing behavior untouched.
+        #[cfg(all(feature = "ftp", feature = "http", feature = "proxy"))]
+        let data_proxy = if conn.bits.tunnel_proxy {
+            ftp_tunnel_proxy(data, &conn.remote_host, conn.remote_port).map(|tp| tp.proxy)
+        } else {
+            None
+        };
+
+        // The data-channel **dial** target: the proxy when tunneling, else the
+        // advertised data endpoint (usually an IP literal from the PASV/EPSV
+        // reply — a no-op resolve — but a hostname is handled too).
+        #[cfg(all(feature = "ftp", feature = "http", feature = "proxy"))]
+        let (dial_host, dial_port) = match &data_proxy {
+            Some(px) => (px.host.clone(), px.port),
+            None => (host.clone(), port),
+        };
+        #[cfg(not(all(feature = "ftp", feature = "http", feature = "proxy")))]
+        let (dial_host, dial_port) = (host.clone(), port);
+
+        let addrs = resolve_ftp_addrs(&dial_host, dial_port, ipver, verbose).await?;
 
         // Connect ONLY the TCP layer of the data channel here. For FTPS `PROT P`
         // the data-channel TLS handshake is intentionally **deferred** until
@@ -1737,7 +1804,16 @@ impl FtpConn {
         // is uniformly post-`150` regardless of passive/active. (Plaintext `ftp`
         // is unaffected — it never gets a TLS filter at all.)
         let eyeballs = eyeballs_factory(TRNSPRT_TCP, ipver, data.set.happy_eyeballs_timeout, data.set.connecttimeout, addrs);
-        let dispatch = ConnSetup::Default(SetupConfig::new(CURL_CF_SSL_DISABLE, false, eyeballs));
+        let mut setup = SetupConfig::new(CURL_CF_SSL_DISABLE, false, eyeballs);
+        // Splice the HTTP(S)-proxy CONNECT tunnel for the data channel, targeting
+        // the PASV/EPSV data endpoint (`host:port`). The proxy returns a second
+        // "200 Connection established" block which `run_do_phase` surfaces onto
+        // the body stream (oracle: tests/data/test714, test715).
+        #[cfg(all(feature = "ftp", feature = "http", feature = "proxy"))]
+        if let Some(px) = &data_proxy {
+            setup = ftp_apply_proxy_connect(setup, data, px, &host, port, conn);
+        }
+        let dispatch = ConnSetup::Default(setup);
         establish_connection(conn, SECONDARYSOCKET, CURL_CF_SSL_DISABLE, dispatch, false).await
     }
 
@@ -1915,13 +1991,95 @@ impl FtpConn {
     /// driving the TCP-accept filter on `SECONDARYSOCKET` to a connected state
     /// (bounded by [`DEFAULT_ACCEPT_TIMEOUT`]). Clears
     /// [`FtpConn::wait_data_conn`] once the connection is established.
-    pub async fn accept_data_active(&mut self, conn: &mut Connection) -> Result<()> {
-        let result = Curl_conn_connect(conn, SECONDARYSOCKET, false).await;
-        self.wait_data_conn = false;
-        match result {
-            Ok(()) => Ok(()),
-            Err(CurlError::OperationTimedout) => Err(CurlError::FtpAcceptTimeout),
-            Err(_) => Err(CurlError::FtpAcceptFailed),
+    ///
+    /// # Watching the control channel during the accept wait
+    ///
+    /// A server that *cannot* open the data connection does not simply leave
+    /// curl hanging on the accept — it reports the failure on the **control**
+    /// channel, typically as `150 Opening data connection` immediately followed
+    /// by `425 Can't open data connection` (or `421`). curl must notice that
+    /// negative reply and fail with `CURLE_FTP_ACCEPT_FAILED` (10) *without*
+    /// waiting out the full accept timeout (and, under `--max-time`, without
+    /// hitting the global timeout and reporting `28` instead). This is the Rust
+    /// analog of C's `ftp_check_ctrl_on_data_wait` (lib/ftp.c L458), which curl's
+    /// `ftp_do_more` runs each pass it finds the server has not yet connected
+    /// (L2196-L2218): it checks the control socket — first any reply already
+    /// buffered behind the `1xx`, then a zero-timeout readability poll — and on a
+    /// reply whose first digit is `> '3'` (`ftpcode/100 > 3`) returns
+    /// `CURLE_FTP_ACCEPT_FAILED`. (Oracle: `tests/data/test1206`, where the wire
+    /// ends `RETR 1206` then `QUIT` and the exit code is `10`.)
+    ///
+    /// The C cooperative poll-loop becomes a short-window loop here: each pass
+    /// (a) consumes and inspects any pending control reply *non-destructively*
+    /// first (so a well-behaved server — which sends nothing on the control
+    /// channel until the post-transfer `226` — is never read against, incurring
+    /// no latency or behavior change), then (b) attempts the accept for a bounded
+    /// window. The accept filter's listener persists until a connection is
+    /// accepted and its budget counts from a fixed `started_at`, so cancelling an
+    /// idle short window and retrying is safe (`TcpListener::accept` is
+    /// cancel-safe) and the overall `DEFAULT_ACCEPT_TIMEOUT` still expires.
+    pub async fn accept_data_active(
+        &mut self,
+        data: &mut Easy,
+        conn: &mut Connection,
+    ) -> Result<()> {
+        use std::time::Duration;
+        // How long each accept attempt runs before we re-poll the control
+        // channel. Short enough that a pipelined-but-slightly-delayed `425` is
+        // caught promptly (well under any `--max-time`), long enough that a
+        // healthy server's immediate connect-back is accepted in the first pass.
+        const ACCEPT_POLL_MS: u64 = 200;
+        loop {
+            // (a) C `ftp_check_ctrl_on_data_wait`: look for a server-sent
+            // negative reply on the CONTROL channel. The bytes can be waiting
+            // either already in the pingpong receive buffer (read in the same
+            // segment as the `1xx`, `moredata`) or unread in the socket
+            // (`input_pending` from a zero-timeout `poll_peek`, the analog of
+            // C's `SOCKET_READABLE(ctrl_sock, 0)`). Reading is only attempted
+            // when data is actually present, so `read_one` cannot block here and
+            // is never cancelled (preserving its non-cancel-safe `mem::take`).
+            let (_alive, input_pending) = Curl_conn_is_alive(conn);
+            if self.pp.moredata() || input_pending {
+                let code = self.read_one(data, conn).await?;
+                if data.set.verbose {
+                    sendf::infof(true, &format!("FTP code: {code:03}"));
+                }
+                // C: `if(ftpcode / 100 > 3) return CURLE_FTP_ACCEPT_FAILED;`.
+                if code >= 400 {
+                    self.wait_data_conn = false;
+                    return Err(CurlError::FtpAcceptFailed);
+                }
+                // A positive/intermediate reply during the wait (e.g. a stray
+                // `226` arriving before the data socket is noticed): C keeps
+                // waiting for the data connection, so loop back to the accept.
+            }
+
+            // (b) Bounded accept attempt.
+            match tokio::time::timeout(
+                Duration::from_millis(ACCEPT_POLL_MS),
+                Curl_conn_connect(conn, SECONDARYSOCKET, false),
+            )
+            .await
+            {
+                // Server connected back: the active-mode data channel is up.
+                Ok(Ok(())) => {
+                    self.wait_data_conn = false;
+                    return Ok(());
+                }
+                // The accept filter exhausted its own budget / errored. Preserve
+                // the original error mapping exactly.
+                Ok(Err(CurlError::OperationTimedout)) => {
+                    self.wait_data_conn = false;
+                    return Err(CurlError::FtpAcceptTimeout);
+                }
+                Ok(Err(_)) => {
+                    self.wait_data_conn = false;
+                    return Err(CurlError::FtpAcceptFailed);
+                }
+                // Our short poll window elapsed without a connection: loop to
+                // re-check the control channel and re-attempt the accept.
+                Err(_elapsed) => {}
+            }
         }
     }
 }
@@ -2078,7 +2236,7 @@ impl FtpConn {
                     // Establish the data connection, list, parse, and select.
                     if data.set.ftp_use_port {
                         self.setup_active(data, conn).await?;
-                        self.accept_data_active(conn).await?;
+                        self.accept_data_active(data, conn).await?;
                     } else {
                         self.send_pasv(data, conn).await?;
                         self.connect_data_passive(data, conn).await?;
@@ -2145,6 +2303,16 @@ impl FtpConn {
     /// response and advances the machine — the C "call repeatedly until `*done`"
     /// pattern collapsed into this single `await`ed loop.
     async fn run_login(&mut self, data: &mut Easy, conn: &mut Connection) -> Result<()> {
+        // Opt in to the "response lines as headers" capture before the greeting
+        // is read, so the (possibly multi-line) `220` welcome and the
+        // `USER`/`PASS`/`PWD` replies are recorded for the `-D`/`--dump-header`
+        // sink — mirroring C `Curl_pp_readresp`'s unconditional
+        // `Curl_client_write(CLIENTWRITE_INFO)` (lib/pingpong.c L304-310). The
+        // captured lines are flushed to the header sink after the transfer's
+        // completion handshake by `perform_ftp`. Idempotent; on a reused
+        // connection login is skipped and capture is (re)enabled at the start of
+        // `run_do_phase` instead. Oracle: tests/data/test1349.
+        self.pp.enable_info_capture();
         self.set_state(FtpState::Wait220);
         while self.state != FtpState::Stop {
             self.statemachine(data, conn).await?;
@@ -2258,10 +2426,32 @@ pub async fn ftp_drain_pool(pool: &crate::conn::SharedPool, verbose: bool) {
             // in with a still-valid control channel reach here, so `disconnect`
             // sends the `QUIT` exactly as the prior inline path did.
             let _ = handler.disconnect(&mut throwaway, &mut conn, false).await;
+        } else {
+            // Non-FTP pooled connections. An authenticated IMAP control
+            // connection parked for reuse (see [`perform_imap`]'s tail) defers
+            // its `LOGOUT` to this end-of-run drain so that two consecutive
+            // same-origin `imap://` transfers share one session and emit exactly
+            // one trailing `LOGOUT` (oracle: tests/data/test815, test816).
+            // Dispatch it to [`ImapHandler::disconnect`], which — like FTP's
+            // `disconnect` — reads only `data.set.verbose` from the handle, so
+            // the throwaway [`Easy`] drives it faithfully. Gated on the `imap`
+            // feature so the FTP-only build never names IMAP items.
+            #[cfg(feature = "imap")]
+            if conn
+                .proto_state_ref::<crate::protocols::imap::ImapConn>()
+                .is_some()
+            {
+                let imap_handler =
+                    crate::protocols::imap::ImapHandler::new(&crate::protocols::SCHEME_IMAP);
+                let _ = imap_handler
+                    .disconnect(&mut throwaway, &mut conn, false)
+                    .await;
+            }
         }
-        // `conn` drops at the end of the loop body: a non-FTP connection (or an
-        // FTP one after its `QUIT`) has its sockets force-closed here, matching
-        // the connection pool's previous `Drop`-time teardown.
+        // `conn` drops at the end of the loop body: any connection without a
+        // recognized still-live proto-state (or one already torn down above) has
+        // its sockets force-closed here, matching the connection pool's previous
+        // `Drop`-time teardown.
     }
 }
 
@@ -2776,6 +2966,21 @@ impl FtpConn {
                 }
             };
             if code != 0 {
+                // C `ftp_readresp` (lib/ftp.c L607-617): a `421` ("Service not
+                // available, closing control connection") can arrive at any point
+                // — FTP servers use it to signal an idle-session timeout — and is
+                // treated generically as `CURLE_OPERATION_TIMEDOUT`. The control
+                // connection is now dead, so clear `ctl_valid` (teardown sends no
+                // `QUIT`) and stop. Without this a `421` (e.g. on `CWD`) would be
+                // mis-handled by the per-state logic. Oracle: tests/data/test1120.
+                if code == 421 {
+                    if data.set.verbose {
+                        sendf::infof(true, "We got a 421 - timeout");
+                    }
+                    self.ctl_valid = false;
+                    self.set_state(FtpState::Stop);
+                    return Err(CurlError::OperationTimedout);
+                }
                 return Ok(code);
             }
         }
@@ -2870,6 +3075,15 @@ impl FtpConn {
         sink: &mut dyn WriteCallbacks,
         source: &mut dyn ReadCallback,
     ) -> Result<()> {
+        // Ensure the "response lines as headers" capture is on for the DO-phase
+        // control replies (`CWD`/`EPSV`/`TYPE`/`SIZE`/`RETR`/…). On a freshly
+        // dialed connection `run_login` already enabled it (capturing the
+        // greeting + `USER`/`PASS`/`PWD`); on a *reused* pooled connection login
+        // is skipped, so enable it here — the drained-empty buffer then captures
+        // only this transfer's DO replies, matching curl's per-transfer
+        // `-D`/`--dump-header` dump on a kept-alive control channel. Idempotent.
+        self.pp.enable_info_capture();
+
         // A path that failed to url-decode under `REJECT_CTRL` (a control byte
         // such as a percent-encoded `%00`) is malformed. C raises this at the
         // very top of `ftp_parse_url_path` — the url-decode step (lib/ftp.c
@@ -3043,9 +3257,111 @@ impl FtpConn {
         // listener and advertises it via EPRT/PORT, deferring the accept.
         let active = data.set.ftp_use_port;
         if active {
+            // C `ftp_state_prepare_transfer` (lib/ftp.c L1333-1356): the
+            // `data->set.ftp_use_port` branch goes straight to PORT/EPRT — PRET
+            // is *not* sent in active mode, since PRET only prepares the server
+            // for an upcoming PASV.
             self.negotiate_active_noaccept(data, conn).await?;
         } else {
+            // PRET (proftpd "PRE Transfer" extension, `--ftp-pret` →
+            // `CURLOPT_FTP_USE_PRET`) must precede the PASV/EPSV when requested,
+            // mirroring C `ftp_state_prepare_transfer` (lib/ftp.c L1339-1352):
+            // the server is told the upcoming data command so it can pre-open
+            // the passive port (required behind certain proxies/load-balancers
+            // such as Drupal/Pure-FTPd in mirror mode). The reply must be `200`;
+            // anything else aborts the transfer with `CURLE_FTP_PRET_FAILED`
+            // (C `case FTP_PRET`, lib/ftp.c L3331-3335 — "there only is this one
+            // standard OK return code"). Gated on `ftp_use_pret` (default off),
+            // so non-PRET transfers issue the identical wire sequence as before.
+            // Oracle: tests/data/test1107 (`PRET RETR <file>` → 200 → proceed
+            // to EPSV/TYPE/SIZE/RETR) and tests/data/test1108 (`PRET RETR
+            // <file>` → 550 → exit 84, no data channel opened).
+            if data.set.ftp_use_pret {
+                let pret_cmd = match &self.file {
+                    // No file in the URL → directory listing. C selects the
+                    // custom request if set, else `NLST`/`LIST` per
+                    // `--list-only` (`data->state.list_only`).
+                    None => {
+                        let listcmd = if self.list_only { "NLST" } else { "LIST" };
+                        format!("PRET {listcmd}")
+                    }
+                    // A named file: `PRET STOR` for an upload, `PRET RETR` for a
+                    // download (C `data->state.upload` branch).
+                    Some(f) if is_upload => format!("PRET STOR {f}"),
+                    Some(f) => format!("PRET RETR {f}"),
+                };
+                self.send_cmd(data, conn, &pret_cmd).await?;
+                let code = self.read_one(data, conn).await?;
+                if code != 200 {
+                    crate::failf!(
+                        &mut conn.filter_data.error_buffer,
+                        "PRET command not accepted: {code:03}"
+                    );
+                    return Err(CurlError::FtpPretFailed);
+                }
+            }
             self.negotiate_passive(data, conn).await?;
+        }
+
+        // FTP-over-HTTP-proxy CONNECT (tunnel): surface the DATA-channel CONNECT
+        // response (status line + headers + blank line) onto the body stream,
+        // producing the SECOND "200 Connection established" block ahead of the
+        // transferred content (oracle: tests/data/test714, test715). The passive
+        // data connection was opened just above by `connect_data_passive`, which
+        // performed the `CONNECT` to the PASV/EPSV endpoint through the proxy;
+        // its captured response lives on the `SECONDARYSOCKET` filter. Gated like
+        // the control-channel surface in `perform_ftp` and curl's
+        // `CLIENTWRITE_CONNECT` path: only for a passive tunneled transfer, and
+        // only when `--suppress-connect-headers` is not set. Active mode is not
+        // reachable through a CONNECT tunnel (no test exercises it).
+        #[cfg(all(feature = "ftp", feature = "http", feature = "proxy"))]
+        if !active && conn.bits.tunnel_proxy && !data.set.suppress_connect_headers {
+            if let Some(lines) = conn.cfilter[SECONDARYSOCKET].connect_response_headers() {
+                for line in &lines {
+                    let mut off = 0;
+                    while off < line.len() {
+                        let n = sink.write_body(&line[off..]);
+                        if n == 0 {
+                            break;
+                        }
+                        off += n;
+                    }
+                }
+            }
+        }
+
+        // (2c) Range validation (C `ftp_do_more` → `Curl_range`, lib/ftp.c
+        // L2237). curl validates `CURLOPT_RANGE` right after the data connection
+        // is established (EPSV/PASV are already on the wire above) and BEFORE any
+        // TYPE/SIZE/REST/RETR. A malformed or out-of-range specification — for
+        // instance a leading offset that overflows `curl_off_t`
+        // (`-r 36893488147419103232-`) — makes `Curl_range` return
+        // `CURLE_RANGE_ERROR`, but C does **not** treat that as a fatal transfer
+        // error: the download branch hits `if(result) ;` — an *empty statement*
+        // (lib/ftp.c L2249) that merely SKIPS the TYPE/REST/RETR setup — and the
+        // trailing `result = ftp_statemach(...)` (lib/ftp.c L2273) then
+        // OVERWRITES the range error with the (OK) state-machine result. The net
+        // observable effect is: the data channel is set up, NO TYPE/SIZE/RETR is
+        // sent, and the transfer completes SUCCESSFULLY (exit 0) with a graceful
+        // `QUIT`. This was verified empirically against curl 8.14.1, whose
+        // `stderr` is empty and whose wire is exactly `USER`/`PASS`/`PWD`/`EPSV`/
+        // `QUIT`. Mirror that here: on a parse failure, skip the remaining
+        // download commands and finish the DO phase `Ok(())`. `dont_check`
+        // suppresses the (absent) trailing `226`/`250` completion read, and
+        // `ctl_valid` is left untouched, so the end-of-run teardown emits `QUIT`.
+        // A *well-formed* range is re-parsed in step (4b) below for the
+        // resume/`maxdownload` offsets (`parse_range` is pure). Oracle:
+        // tests/data/test1449.
+        if direction == TransferDirection::Download
+            && kind == TransferKind::Retr
+            && data
+                .set
+                .str(StrId::SetRange)
+                .is_some_and(|range| crate::protocols::file::parse_range(range).is_err())
+        {
+            self.dont_check = true;
+            self.maxdownload = -1;
+            return Ok(());
         }
 
         // (3) TYPE — pick the transfer mode exactly as curl's `ftp_do` does
@@ -3287,7 +3603,7 @@ impl FtpConn {
         // its inbound data connection (correct ordering — the accept must follow
         // RETR/STOR, not the earlier PORT).
         if active {
-            self.accept_data_active(conn).await?;
+            self.accept_data_active(data, conn).await?;
         }
 
         // (7b) Data-channel TLS handshake for FTPS `PROT P` — deferred until *after*
@@ -3424,12 +3740,46 @@ impl FtpConn {
         self.send_pasv(data, conn).await?;
         let code = self.read_one(data, conn).await?;
         self.state_pasv_resp(data, conn, code).await?;
-        // An EPSV refusal disabled EPSV and re-sent PASV; read its reply.
+        // An EPSV *reply* refusal (non-229) disabled EPSV and re-sent PASV; read
+        // its reply. (This is distinct from the data-connect failure handled
+        // below: here the server rejected the `EPSV` command itself.)
         if self.data_host.is_none() {
             let code = self.read_one(data, conn).await?;
             self.state_pasv_resp(data, conn, code).await?;
         }
-        self.connect_data_passive(data, conn).await
+
+        // Connect the data channel. A *successful* `EPSV` reply (`229`) can still
+        // advertise an unreachable data port (e.g. a firewalled/bogus port, or a
+        // broken NAT helper); curl handles this in `ftp_do_more`, whose three
+        // data-connect-failure sites (lib/ftp.c L2003/L2069/L2168) call
+        // `ftp_epsv_disable` to disable EPSV, re-send `PASV`, and retry — exactly
+        // the behavior `tests/data/test1233` exercises (EPSV → 229 (|||1|) →
+        // connect fails → `PASV` → `227` → data connect succeeds → RETR).
+        match self.connect_data_passive(data, conn).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Only EPSV (`count1 == 0`) has a PASV fallback. C's
+                // `ftp_epsv_disable` refuses to disable EPSV on a genuine IPv6
+                // control channel (PASV cannot express an IPv6 data endpoint),
+                // returning `CURLE_WEIRD_SERVER_REPLY`; mirror that by only
+                // retrying when the control connection is IPv4. On IPv6 (or if a
+                // PASV attempt itself failed) the original connect error stands.
+                let used_epsv = self.count1 == 0;
+                let control_is_ipv6 = Curl_conn_get_ip_info(conn, FIRSTSOCKET)
+                    .map(|(is_ipv6, _)| is_ipv6)
+                    .unwrap_or(false);
+                if used_epsv && !control_is_ipv6 {
+                    // `epsv_disable` latches EPSV off and sends `PASV`; read and
+                    // parse its `227` reply, then retry the data connect.
+                    self.epsv_disable(data, conn).await?;
+                    let code = self.read_one(data, conn).await?;
+                    self.state_pasv_resp(data, conn, code).await?;
+                    self.connect_data_passive(data, conn).await
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// Active data-channel setup **without** accepting: bind a local listener,
@@ -3957,7 +4307,7 @@ impl FtpConn {
                     break;
                 }
             }
-            self.accept_data_active(conn).await?;
+            self.accept_data_active(data, conn).await?;
         } else {
             // Passive mode: request, parse the endpoint (with EPSV→PASV
             // fallback), then connect the secondary socket out to it.
@@ -4166,6 +4516,151 @@ impl FtpConn {
 }
 
 // ===========================================================================
+// FTP-over-HTTP(S)-proxy CONNECT tunnel (the FTP analog of curl's
+// `conn->bits.tunnel_proxy` handling in `lib/ftp.c`).
+// ===========================================================================
+
+/// The resolved HTTP(S)-proxy CONNECT-tunnel routing for a native FTP transfer.
+///
+/// When an `ftp://`/`ftps://` request runs through an HTTP proxy with
+/// `--proxytunnel` (or through an HTTPS proxy, which always tunnels), curl opens
+/// a `CONNECT` tunnel to the FTP server for the **control** channel and a second
+/// `CONNECT` to the `PASV`/`EPSV` endpoint for the **data** channel
+/// (`lib/ftp.c` `ftp_state_pasv_resp` `if(conn->bits.proxy)`). This struct
+/// captures, once, what both legs need: which proxy to dial and what authority
+/// the control-channel `CONNECT` names.
+#[cfg(all(feature = "ftp", feature = "http", feature = "proxy"))]
+struct FtpTunnelProxy {
+    /// The HTTP/HTTPS proxy actually dialed (TCP) for both channels.
+    proxy: crate::proxy::Proxy,
+    /// The control-channel `CONNECT` target host — the `--connect-to` override
+    /// when active, else the origin FTP host (curl's
+    /// `Curl_http_proxy_get_destination` for `FIRSTSOCKET`).
+    connect_host: String,
+    /// The control-channel `CONNECT` target port.
+    connect_port: u16,
+}
+
+/// Resolve a possible HTTP(S)-proxy CONNECT tunnel for an FTP transfer to
+/// `origin_host:origin_port`.
+///
+/// Returns `Some` only for a **non-SOCKS** proxy that this transfer must
+/// `CONNECT`-tunnel through. A SOCKS proxy returns `None` here so the existing
+/// direct-dial behavior is preserved (tests 712/713, where the SOCKS proxy is
+/// not actually traversed and the `--connect-to` override reaches the FTP server
+/// directly). A bypassed (`no_proxy`) or absent proxy also returns `None`,
+/// leaving every non-proxied FTP transfer byte-for-byte unchanged.
+///
+/// The proxy is resolved for the original `ftp` scheme exactly as curl's
+/// `detect_proxy`/`parse_proxy` (so `-x`/`CURLOPT_PROXY`, `ftp_proxy`, and
+/// `all_proxy` all apply, honoring `no_proxy`). Reaching the native FTP engine
+/// with a non-SOCKS proxy already implies a tunnel: the dispatcher
+/// ([`crate::protocols::ftp_driven_as_http_proxy`]) routes a *forward* HTTP-proxy
+/// FTP request to the HTTP engine instead, so an HTTP proxy is seen here only
+/// when `--proxytunnel` forced `CONNECT` (or for `ftps://`, which always
+/// tunnels). The control-channel `CONNECT` authority is the `--connect-to`
+/// override when active, else the origin (curl's
+/// `Curl_http_proxy_get_destination`).
+#[cfg(all(feature = "ftp", feature = "http", feature = "proxy"))]
+fn ftp_tunnel_proxy(data: &Easy, origin_host: &str, origin_port: u16) -> Option<FtpTunnelProxy> {
+    // Resolve the proxy for the original `ftp` scheme (so `ftp_proxy`/`all_proxy`
+    // env vars apply), honoring the `no_proxy` bypass list.
+    let cfg = crate::protocols::http::proxy_engine::config(data, "ftp").ok()?;
+    let px = crate::proxy::proxy_for_target(&cfg, origin_host)?;
+    // SOCKS proxies keep the existing direct-dial behavior (Cluster B); only
+    // HTTP/HTTPS proxies use the CONNECT-tunnel path here.
+    if px.is_socks() {
+        return None;
+    }
+    // The control-channel CONNECT authority: the `--connect-to` override when a
+    // component is active, else the origin (mirrors the HTTP path's
+    // `connect_host`/`connect_port`, `lib/http_proxy.c` L165).
+    let (connect_host, connect_port) =
+        crate::protocols::http::connect_target(data, origin_host, origin_port);
+    Some(FtpTunnelProxy {
+        proxy: px.clone(),
+        connect_host,
+        connect_port,
+    })
+}
+
+/// Splice an HTTP(S)-proxy `CONNECT`-tunnel filter chain onto an FTP
+/// connection's [`SetupConfig`], targeting `connect_host:connect_port`.
+///
+/// This is the FTP analog of the HTTP engine's proxy filter assembly
+/// (`http::http_connect_hop`): for an HTTPS proxy it first layers the proxy-leg
+/// TLS (`with_ssl_proxy`), then in all cases adds the HTTP/1.x `CONNECT` filter
+/// (`with_http_proxy`). The bottom transport (eyeballs) already dials the proxy;
+/// this filter performs the `CONNECT host:port` handshake and then passes the
+/// FTP control/data bytes through transparently. `conn.bits.httpproxy` /
+/// `tunnel_proxy` (and `proxy_ssl` for an HTTPS proxy) are set so the
+/// CONNECT-response-surfacing gates downstream fire.
+#[cfg(all(feature = "ftp", feature = "http", feature = "proxy"))]
+fn ftp_apply_proxy_connect(
+    mut setup: SetupConfig,
+    data: &Easy,
+    px: &crate::proxy::Proxy,
+    connect_host: &str,
+    connect_port: u16,
+    conn: &mut Connection,
+) -> SetupConfig {
+    use crate::conn::connect::{h1_proxy_factory, tls_proxy_factory};
+    use crate::conn::h1_proxy::{H1ProxyConfig, StandardProxyAuth};
+
+    // An HTTPS proxy speaks TLS on the proxy leg first, then behaves exactly
+    // like an HTTP proxy for the CONNECT (curl pins/validates the proxy leg
+    // independently of the origin).
+    if px.is_https() {
+        conn.bits.proxy_ssl = true;
+        // The CONNECT request is HTTP/1.x, so the proxy-leg ALPN offers only
+        // `http/1.1` (when ALPN is enabled). `alpn_protocols` is private to the
+        // HTTP module, so the single-entry list is built directly here.
+        let palpn: Vec<Vec<u8>> = if data.set.ssl_enable_alpn {
+            vec![b"http/1.1".to_vec()]
+        } else {
+            Vec::new()
+        };
+        let ptls = px.tls.clone().unwrap_or_else(|| tls_config_from_easy(data));
+        // `CURLOPT_PROXY_PINNEDPUBLICKEY` (`--proxy-pinnedpubkey`) enforced on
+        // the HTTPS proxy leaf — `None` would silently disable the pin.
+        let proxy_pinned_pubkey = data
+            .set
+            .str(StrId::SslPinnedPublicKeyProxy)
+            .map(str::to_string);
+        setup = setup.with_ssl_proxy(tls_proxy_factory(
+            ptls,
+            px.host.clone(),
+            px.port,
+            proxy_pinned_pubkey,
+            palpn,
+        ));
+    }
+
+    conn.bits.httpproxy = true;
+    conn.bits.tunnel_proxy = true;
+
+    // The CONNECT request's HTTP minor version: `--proxy1.0` forces HTTP/1.0,
+    // every other HTTP proxy type uses HTTP/1.1 (`cf-h1-proxy.c` `start_CONNECT`).
+    let proxy_http_minor = if px.proxytype.is_http_1_0() { 0 } else { 1 };
+    // The CONNECT `User-Agent` comes from the same `STRING_USERAGENT` source as
+    // the main request; the builder omits it when empty.
+    let proxy_user_agent = data.set.str(StrId::Useragent).map(str::to_string);
+    // No-auth / proactive-Basic proxy auth (tests 714/715 use no proxy
+    // credentials; `StandardProxyAuth` emits nothing then).
+    let proxy_auth = Box::new(StandardProxyAuth::new(px.clone(), data.set.proxyauth));
+    // An IPv6-literal CONNECT target must be bracketed in the request-line
+    // authority and `Host` (the ACE host here is bracket-stripped, so a residual
+    // colon means IPv6).
+    let h1cfg = H1ProxyConfig::new(connect_host.to_string(), connect_port)
+        .with_ipv6(connect_host.contains(':'))
+        .with_http_minor(proxy_http_minor)
+        .with_user_agent(proxy_user_agent)
+        .with_scheme("ftp", true)
+        .with_auth(proxy_auth);
+    setup.with_http_proxy(h1_proxy_factory(h1cfg))
+}
+
+// ===========================================================================
 // Top-level FTP / FTPS transfer driver — the `protocols::mod::perform_transfer`
 // network seam for the `ftp` and `ftps` schemes (the analog of
 // `http::perform_http`).
@@ -4250,6 +4745,53 @@ pub(crate) async fn perform_ftp(
 
     let handler = FtpHandler::new(scheme_const);
 
+    // `--connect-to` (`CURLOPT_CONNECT_TO`): curl applies `conn->conn_to_host` /
+    // `conn->conn_to_port` uniformly across protocols in `create_conn`, so an
+    // entry matching the FTP origin redirects the *control-channel dial* (and,
+    // via the reused control address, the passive `EPSV`/`PASV` data channel) to
+    // the substituted host/port, while the URL — hence the `USER`/`PASS`
+    // credentials and, for `ftps://`, the TLS SNI/verification host — keep the
+    // original origin. With no matching entry this returns the origin unchanged,
+    // so every FTP transfer without `--connect-to` is byte-for-byte identical
+    // (the dial target equals the origin and all four uses below collapse to the
+    // prior code). Oracle: tests/data/test713 (`ftp://ftp.example.com/… --proxy
+    // socks5://… --connect-to ::HOST:PORT`, where the origin host is deliberately
+    // unresolvable and only the connect-to override makes the dial succeed). The
+    // `--connect-to` matcher lives in the HTTP module (curl shares a single
+    // implementation across protocols); when the `http` feature is compiled out
+    // there is no override and the origin is dialed directly.
+    #[cfg(feature = "http")]
+    let (dial_host, dial_port) = crate::protocols::http::connect_target(data, &host, port);
+    #[cfg(not(feature = "http"))]
+    let (dial_host, dial_port) = (host.clone(), port);
+
+    // FTP-over-HTTP(S)-proxy CONNECT tunnel (`--proxytunnel`, an HTTPS proxy, or
+    // a `--connect-to` override over an HTTP proxy). When one applies, the
+    // **control channel dials the proxy** and the proxy is asked to `CONNECT` to
+    // the FTP server; the data channel later opens its own `CONNECT` through the
+    // same proxy (handled in `connect_data_passive`). This is the FTP analog of
+    // curl's `conn->bits.tunnel_proxy` path (`lib/ftp.c`); a SOCKS proxy or no
+    // proxy leaves `tunnel_proxy == None` and every existing FTP route unchanged.
+    // Oracle: tests/data/test714 (HTTP proxytunnel), test715 (+ SOCKS preproxy).
+    #[cfg(all(feature = "ftp", feature = "http", feature = "proxy"))]
+    let tunnel_proxy = ftp_tunnel_proxy(data, &host, port);
+
+    // The control-channel **dial** target (where the TCP connection is opened):
+    // the proxy when a CONNECT tunnel applies, else the `--connect-to`-overridden
+    // (Cluster B) / direct origin computed above. The recorded **remote**
+    // (`conn.remote_host`/`remote_port`, reused by `EPSV` as the data host) stays
+    // the ORIGIN FTP host under a tunnel — matching curl's `ftp_control_addr_dup`,
+    // which returns `conn->host.name` when `tunnel_proxy`/`socksproxy` is set — so
+    // the data channel's own `CONNECT` names the FTP server, not the proxy.
+    #[cfg(all(feature = "ftp", feature = "http", feature = "proxy"))]
+    let (dial_host, dial_port, remote_host, remote_port) = match &tunnel_proxy {
+        Some(tp) => (tp.proxy.host.clone(), tp.proxy.port, host.clone(), port),
+        None => (dial_host.clone(), dial_port, dial_host, dial_port),
+    };
+    #[cfg(not(all(feature = "ftp", feature = "http", feature = "proxy")))]
+    let (dial_host, dial_port, remote_host, remote_port) =
+        (dial_host.clone(), dial_port, dial_host, dial_port);
+
     // (2)/(3) Obtain the control connection. On the CLI path — the only path
     //     with a guaranteed end-of-run pool drain (`external_pool_drain`, set
     //     solely by `set_conn_pool`) — first try to reuse a pooled same-host
@@ -4264,7 +4806,14 @@ pub(crate) async fn perform_ftp(
     //     never populated, checkout never hits, and this is byte-identical to a
     //     fresh dial — the connection is then QUITed inline at teardown
     //     (reg-baseline; see the teardown note and `tests/data/test529`/`test539`).
-    let reuse_key = format!("{host}:{port}");
+    // Keyed by the *dial* target (the `--connect-to` override when active, else
+    // the origin): two transfers to the same origin but different connect-to
+    // routes must not share a pooled control channel, and a transfer with no
+    // override keys identically to before (dial == origin). Under a CONNECT
+    // tunnel the dial is the shared proxy, so the key folds in the CONNECT
+    // *authority* (`remote_host:remote_port`, the origin) as well, ensuring two
+    // FTP servers tunneled through the same proxy never share a control channel.
+    let reuse_key = format!("{dial_host}:{dial_port}|{remote_host}:{remote_port}");
     let mut conn = {
         let mut reused: Option<Connection> = None;
         if data.external_pool_drain && !data.set.reuse_fresh && !data.set.reuse_forbid {
@@ -4303,7 +4852,7 @@ pub(crate) async fn perform_ftp(
                 // filter now (implicit TLS, encrypted from the first byte);
                 // `ftp://` is a plain TCP chain — the optional `AUTH TLS` upgrade
                 // is performed mid-login by `FtpConn::upgrade_control_tls`.
-                let addrs = resolve_ftp_addrs(&host, port, ipver, verbose).await?;
+                let addrs = resolve_ftp_addrs(&dial_host, dial_port, ipver, verbose).await?;
                 let desc = SchemeDescriptor::new(
                     scheme_const.name,
                     scheme_const.default_port,
@@ -4312,7 +4861,13 @@ pub(crate) async fn perform_ftp(
                 );
                 let mut conn = Connection::new(reuse_key.clone(), TRNSPRT_TCP, desc)
                     .with_verbose(verbose);
-                conn.set_remote(host.clone(), port);
+                // The connection's recorded remote is the *dial* target so the
+                // passive data channel (EPSV reuses `conn.remote_host`) reaches
+                // the same endpoint as the control channel under `--connect-to`.
+                // Under a CONNECT tunnel the recorded remote is instead the ORIGIN
+                // FTP host (the dial is the proxy), matching curl's
+                // `ftp_control_addr_dup`, so EPSV names the FTP server.
+                conn.set_remote(remote_host.clone(), remote_port);
 
                 let eyeballs = eyeballs_factory(
                     TRNSPRT_TCP,
@@ -4321,23 +4876,64 @@ pub(crate) async fn perform_ftp(
                     data.set.connecttimeout,
                     addrs,
                 );
-                let (ssl_mode, dispatch) = if is_ftps {
-                    // FTP control channels do not negotiate ALPN; offer none.
+                // The control channel's filter chain. For a CONNECT tunnel the
+                // chain is eyeballs(→proxy) → [proxy TLS] → CONNECT → [origin TLS
+                // for ftps]; otherwise it is the plain/implicit-TLS chain.
+                let ssl_mode = if is_ftps {
+                    CURL_CF_SSL_ENABLE
+                } else {
+                    CURL_CF_SSL_DISABLE
+                };
+                let mut setup = SetupConfig::new(ssl_mode, is_ftps, eyeballs);
+                // Splice the HTTP(S)-proxy CONNECT tunnel for the control channel,
+                // targeting the connect-to authority (else origin).
+                #[cfg(all(feature = "ftp", feature = "http", feature = "proxy"))]
+                if let Some(tp) = &tunnel_proxy {
+                    setup = ftp_apply_proxy_connect(
+                        setup,
+                        data,
+                        &tp.proxy,
+                        &tp.connect_host,
+                        tp.connect_port,
+                        &mut conn,
+                    );
+                }
+                // Implicit `ftps://` control-channel TLS rides on TOP of any
+                // CONNECT tunnel (curl adds the origin `ssl` filter last). FTP
+                // control channels do not negotiate ALPN; offer none.
+                if is_ftps {
                     let tls = tls_config_from_easy(data);
                     let ssl = tls_factory(tls, host.clone(), port, None, Vec::new());
-                    (
-                        CURL_CF_SSL_ENABLE,
-                        ConnSetup::Default(
-                            SetupConfig::new(CURL_CF_SSL_ENABLE, true, eyeballs).with_ssl(ssl),
-                        ),
-                    )
-                } else {
-                    (
-                        CURL_CF_SSL_DISABLE,
-                        ConnSetup::Default(SetupConfig::new(CURL_CF_SSL_DISABLE, false, eyeballs)),
-                    )
-                };
+                    setup = setup.with_ssl(ssl);
+                }
+                let dispatch = ConnSetup::Default(setup);
                 establish_connection(&mut conn, FIRSTSOCKET, ssl_mode, dispatch, true).await?;
+
+                // FTP-over-HTTP-proxy CONNECT (tunnel): surface the
+                // control-channel CONNECT response (status line + headers +
+                // terminating blank line) onto the body stream, mirroring curl's
+                // `CLIENTWRITE_CONNECT` → `cw_download_write` forwarding for a
+                // non-TLS origin (`http::http_connect_hop`). This produces the
+                // FIRST "200 Connection established" block in the output
+                // (oracle: tests/data/test714, test715). Gated like the HTTP path:
+                // a CONNECT tunnel was used, the origin is not (implicit-)TLS — an
+                // ftps origin keeps the plaintext CONNECT response off the
+                // encrypted stream — and `--suppress-connect-headers` opts out.
+                #[cfg(all(feature = "ftp", feature = "http", feature = "proxy"))]
+                if conn.bits.tunnel_proxy && !is_ftps && !data.set.suppress_connect_headers {
+                    if let Some(lines) = conn.cfilter[FIRSTSOCKET].connect_response_headers() {
+                        for line in &lines {
+                            let mut off = 0;
+                            while off < line.len() {
+                                let n = sink.write_body(&line[off..]);
+                                if n == 0 {
+                                    break;
+                                }
+                                off += n;
+                            }
+                        }
+                    }
+                }
                 conn
             }
         }
@@ -4363,6 +4959,30 @@ pub(crate) async fn perform_ftp(
     let result = ftpc.run_do_phase(data, &mut conn, sink, source).await;
     let premature = result.is_err();
     let done = ftpc.ftp_done(data, &mut conn, result, premature).await;
+
+    // Flush the captured FTP control responses to the header sink as
+    // `CLIENTWRITE_INFO` — the Rust analog of C `Curl_pp_readresp`'s per-line
+    // `Curl_client_write(data, CLIENTWRITE_INFO, line, length)` ("the response
+    // lines can be seen as a kind of headers", lib/pingpong.c L304-310). This
+    // populates the `-D`/`--dump-header` file with every control reply from the
+    // greeting through the transfer-completion `226`/`250` (read just above by
+    // `ftp_done`), in arrival order. The drain happens BEFORE teardown, so the
+    // `221` reply to the eventual `QUIT` is excluded — it is not part of this
+    // transfer (oracle: tests/data/test1349 `<file2>`, whose trailing comment
+    // explicitly notes the final `221` "will not be recorded"). For a non-`-D`
+    // transfer the header sink discards the bytes (the CLI `tool_header_cb`
+    // writes nothing without a `-D` target and never echoes FTP-scheme `INFO`
+    // onto stdout under `-i`, since its echo is gated on an http/https scheme),
+    // so this is wire-neutral for every FTP transfer that does not request a
+    // header dump. Best-effort: a header-sink write failure must not mask the
+    // transfer's own outcome (`done`), which is what `perform_ftp` returns.
+    if let Some(captured) = ftpc.pp.drain_info_capture() {
+        if !captured.is_empty() {
+            let mut writer = ClientWriter::with_options(data.set.include_header, false);
+            let _ = writer.write(ClientWriteType::INFO, &captured, sink);
+        }
+    }
+
     // Snapshot the control-channel validity before parking the state back: a
     // still-valid channel is reuse-eligible (and would have received a graceful
     // `QUIT`); a cleared one means a dead connection that must be torn down now
@@ -5683,5 +6303,732 @@ mod tests {
             .unwrap();
         assert_eq!(ftpc3.entrypath, None);
         assert_eq!(ftpc3.state, FtpState::Stop);
+    }
+
+    // =====================================================================
+    // Added coverage: pure codec helpers, the QUOTE pipeline, CWD MKD
+    // recovery, the INFO (`--head`) metadata phase, and full passive
+    // data-channel download/upload drives over a real loopback data socket.
+    // =====================================================================
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Minimal body/header-collecting [`WriteCallbacks`] sink for the drive
+    /// tests (the engine's real client sink without any front-end hooks).
+    #[derive(Default)]
+    struct VecSink {
+        body: Vec<u8>,
+        headers: Vec<u8>,
+    }
+    impl WriteCallbacks for VecSink {
+        fn write_body(&mut self, data: &[u8]) -> usize {
+            self.body.extend_from_slice(data);
+            data.len()
+        }
+        fn write_header(&mut self, data: &[u8]) -> Option<usize> {
+            self.headers.extend_from_slice(data);
+            Some(data.len())
+        }
+    }
+
+    /// Minimal in-memory [`ReadCallback`] upload source: hands out a fixed byte
+    /// vector then signals EOF (a `0`-length read), exactly as a finite file
+    /// source would.
+    struct SliceSource {
+        data: Vec<u8>,
+        pos: usize,
+    }
+    impl ReadCallback for SliceSource {
+        fn read(&mut self, buf: &mut [u8]) -> usize {
+            let n = (self.data.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            n
+        }
+    }
+
+    #[test]
+    fn crlf_convert_chunk_expands_lone_lf_only() {
+        // A lone LF becomes CRLF; an existing CRLF pair is left untouched.
+        let mut prev_cr = false;
+        let mut out = Vec::new();
+        crlf_convert_chunk(b"a\nb\r\nc", &mut prev_cr, &mut out);
+        assert_eq!(out, b"a\r\nb\r\nc");
+        assert!(!prev_cr, "last byte 'c' is not CR");
+
+        // A trailing CR sets `prev_cr` so an LF opening the next chunk is
+        // recognized as an already-converted pair (no doubling across the
+        // chunk boundary).
+        let mut prev_cr = false;
+        let mut out = Vec::new();
+        crlf_convert_chunk(b"x\r", &mut prev_cr, &mut out);
+        assert!(prev_cr, "chunk ended on CR");
+        crlf_convert_chunk(b"\ny", &mut prev_cr, &mut out);
+        assert_eq!(out, b"x\r\ny");
+        assert!(!prev_cr);
+    }
+
+    #[test]
+    fn parse_decimal_consumes_digits_and_enforces_max() {
+        // Leading digits are consumed; the non-digit remainder is returned.
+        let (v, rest) = parse_decimal(b"2048rest", 65535).unwrap();
+        assert_eq!(v, 2048);
+        assert_eq!(rest, b"rest");
+        // A value exceeding `max` fails the bound check.
+        assert!(parse_decimal(b"70000", 65535).is_none());
+        // No leading digit consumes nothing → None.
+        assert!(parse_decimal(b"abc", 100).is_none());
+        // Exactly at the bound is accepted.
+        let (v, rest) = parse_decimal(b"255", 255).unwrap();
+        assert_eq!(v, 255);
+        assert!(rest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_quote_list_sends_each_and_accepts_2xx() {
+        let recv = Arc::new(Mutex::new(b"200 NOOP ok\r\n250 dir changed\r\n".to_vec()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+
+        let list = vec![
+            std::ffi::CString::new("NOOP").unwrap(),
+            std::ffi::CString::new("CWD x").unwrap(),
+        ];
+        ftpc.send_quote_list(&mut data, &mut conn, &list)
+            .await
+            .unwrap();
+        let wire = sent_str(&sent);
+        assert!(wire.contains("NOOP\r\n"), "wire: {wire:?}");
+        assert!(wire.contains("CWD x\r\n"), "wire: {wire:?}");
+    }
+
+    #[tokio::test]
+    async fn send_quote_list_star_prefix_tolerates_failure_else_aborts() {
+        // A `*`-prefixed command is allowed to fail (the `*` is stripped before
+        // sending), so a 500 reply is accepted.
+        let recv = Arc::new(Mutex::new(b"500 nope\r\n".to_vec()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        let ok = vec![std::ffi::CString::new("*SITE BOGUS").unwrap()];
+        ftpc.send_quote_list(&mut data, &mut conn, &ok).await.unwrap();
+        assert!(sent_str(&sent).contains("SITE BOGUS\r\n"));
+
+        // The same failing command without the `*` aborts with QuoteError.
+        let recv2 = Arc::new(Mutex::new(b"500 nope\r\n".to_vec()));
+        let sent2 = Arc::new(Mutex::new(Vec::new()));
+        let mut conn2 = make_conn(recv2.clone(), sent2.clone());
+        let mut ftpc2 = FtpConn::new();
+        ftpc2.pp.init(timeval::curlx_now());
+        let bad = vec![std::ffi::CString::new("SITE BOGUS").unwrap()];
+        let err = ftpc2
+            .send_quote_list(&mut data, &mut conn2, &bad)
+            .await
+            .unwrap_err();
+        assert_eq!(err, CurlError::QuoteError);
+    }
+
+    #[tokio::test]
+    async fn cwd_navigate_creates_missing_dir_then_retries() {
+        // `--ftp-create-dirs` (level 2): a denied `CWD` (550) recovers via
+        // `MKD` (257) and a retried `CWD` (250).
+        let recv = Arc::new(Mutex::new(
+            b"550 No such dir\r\n257 \"/new\" created\r\n250 CWD ok\r\n".to_vec(),
+        ));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        data.set.ftp_create_missing_dirs = 2;
+
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.dirs = vec![PathComp {
+            name: "new".to_string(),
+        }];
+
+        ftpc.cwd_navigate(&mut data, &mut conn).await.unwrap();
+        assert!(ftpc.cwddone);
+        let wire = sent_str(&sent);
+        assert!(wire.contains("MKD new\r\n"), "wire: {wire:?}");
+        // The `CWD` is issued, then retried after the `MKD`.
+        assert!(
+            wire.matches("CWD new\r\n").count() >= 2,
+            "expected CWD retry, wire: {wire:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_info_phase_emits_metadata_headers() {
+        // `--head` on a file: MDTM (213) + TYPE (200) + SIZE (213) + REST 0
+        // (350) → Content-Length + Accept-ranges written to the sink.
+        let recv = Arc::new(Mutex::new(
+            b"213 20240101000000\r\n200 Type set to I\r\n213 4096\r\n350 Restart OK\r\n".to_vec(),
+        ));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        data.set.get_filetime = true;
+
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.file = Some("data.bin".to_string());
+
+        let mut sink = VecSink::default();
+        ftpc.run_info_phase(&mut data, &mut conn, &mut sink)
+            .await
+            .unwrap();
+
+        let wire = sent_str(&sent);
+        assert!(wire.contains("MDTM data.bin\r\n"), "wire: {wire:?}");
+        assert!(wire.contains("TYPE I\r\n"), "wire: {wire:?}");
+        assert!(wire.contains("SIZE data.bin\r\n"), "wire: {wire:?}");
+        assert!(wire.contains("REST 0\r\n"), "wire: {wire:?}");
+        let headers = String::from_utf8_lossy(&sink.headers);
+        assert!(
+            headers.contains("Content-Length: 4096\r\n"),
+            "headers: {headers:?}"
+        );
+        assert!(
+            headers.contains("Accept-ranges: bytes\r\n"),
+            "headers: {headers:?}"
+        );
+        assert_eq!(ftpc.known_filesize, 4096);
+        assert!(ftpc.dont_check);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn passive_download_moves_body_over_real_data_socket() {
+        // Bind a real loopback listener as the data endpoint and advertise its
+        // port in the EPSV reply; the engine connects out and reads the body.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = b"hello ftp download body\n".to_vec(); // 24 bytes
+        let body_clone = body.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(&body_clone).await.unwrap();
+            // Dropping `sock` closes the connection → the client sees EOF.
+        });
+
+        // Control responses, in the exact order `run_do_phase` reads them:
+        // EPSV(229) → TYPE(200) → SIZE(213) → RETR(150).
+        let recv = Arc::new(Mutex::new(
+            format!(
+                "229 Entering Extended Passive Mode (|||{port}|)\r\n\
+                 200 Type set to I\r\n\
+                 213 24\r\n\
+                 150 Opening BINARY mode data connection\r\n"
+            )
+            .into_bytes(),
+        ));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        data.set.ftp_use_epsv = true;
+
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.file = Some("download.bin".to_string());
+
+        let mut sink = VecSink::default();
+        let mut source = SliceSource {
+            data: Vec::new(),
+            pos: 0,
+        };
+        ftpc.run_do_phase(&mut data, &mut conn, &mut sink, &mut source)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(sink.body, body, "downloaded body mismatch");
+        let wire = sent_str(&sent);
+        assert!(wire.contains("EPSV\r\n"), "wire: {wire:?}");
+        assert!(wire.contains("TYPE I\r\n"), "wire: {wire:?}");
+        assert!(wire.contains("RETR download.bin\r\n"), "wire: {wire:?}");
+        assert_eq!(data.info.size_download, body.len() as i64);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn passive_upload_sends_body_over_real_data_socket() {
+        // Loopback listener that READS the uploaded body to EOF.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let collected2 = collected.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            sock.read_to_end(&mut buf).await.unwrap();
+            *collected2.lock().unwrap() = buf;
+        });
+
+        // Control responses: EPSV(229) → TYPE(200) → STOR(150).
+        let recv = Arc::new(Mutex::new(
+            format!(
+                "229 Entering Extended Passive Mode (|||{port}|)\r\n\
+                 200 Type set to I\r\n\
+                 150 Ok to send data\r\n"
+            )
+            .into_bytes(),
+        ));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        data.set.ftp_use_epsv = true;
+        data.set.method = HttpReq::Put;
+        let payload = b"upload payload bytes 12345".to_vec();
+        data.set.filesize = payload.len() as i64;
+
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.file = Some("upload.bin".to_string());
+
+        let mut sink = VecSink::default();
+        let mut source = SliceSource {
+            data: payload.clone(),
+            pos: 0,
+        };
+        ftpc.run_do_phase(&mut data, &mut conn, &mut sink, &mut source)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(*collected.lock().unwrap(), payload, "uploaded body mismatch");
+        let wire = sent_str(&sent);
+        assert!(wire.contains("STOR upload.bin\r\n"), "wire: {wire:?}");
+        assert_eq!(data.info.size_upload, payload.len() as i64);
+    }
+
+    // ---- ftp_done: trailing completion handshake -------------------------
+
+    /// A clean download completion (C `ftp_done`): read the trailing `226`,
+    /// run `CURLOPT_POSTQUOTE` while the control channel is still up, then
+    /// remember the working directory (`prevpath`) for connection reuse. With
+    /// the default MULTICWD method the leaf file name is stripped from the
+    /// raw path to yield the directory.
+    #[tokio::test]
+    async fn ftp_done_reads_226_runs_postquote_and_remembers_prevpath() {
+        let recv = Arc::new(Mutex::new(
+            b"226 Transfer complete\r\n250 DELE command successful\r\n".to_vec(),
+        ));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        // POSTQUOTE runs only after a clean, non-premature transfer.
+        let mut postquote = crate::slist::SList::new();
+        postquote.append("DELE old.tmp").unwrap();
+        data.set.postquote = Some(postquote);
+
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.ctl_valid = true;
+        ftpc.rawpath = "pub/data/file.bin".to_string();
+        ftpc.file = Some("file.bin".to_string());
+
+        ftpc.ftp_done(&mut data, &mut conn, Ok(()), false)
+            .await
+            .unwrap();
+
+        let wire = sent_str(&sent);
+        assert!(wire.contains("DELE old.tmp\r\n"), "wire: {wire:?}");
+        // MULTICWD (default) strips the leaf → the directory is remembered.
+        assert_eq!(ftpc.prevpath.as_deref(), Some("pub/data/"));
+        // The per-transfer data endpoint is cleared for reuse.
+        assert_eq!(ftpc.data_host, None);
+        assert_eq!(ftpc.data_port, 0);
+    }
+
+    /// A capped-range download (`maxdownload > 0`, e.g. `-r 0-15`) ends with
+    /// the data socket still open: `ftp_done` sends `ABOR`, closes the data
+    /// socket, and reads the single queued trailing response — without the
+    /// normal completion-code check (C deliberately does not verify it).
+    #[tokio::test]
+    async fn ftp_done_capped_range_sends_abor_then_reads_trailer() {
+        let recv = Arc::new(Mutex::new(b"226 Abort successful\r\n".to_vec()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.ctl_valid = true;
+        ftpc.maxdownload = 16; // bounded range → ABOR path
+
+        ftpc.ftp_done(&mut data, &mut conn, Ok(()), false)
+            .await
+            .unwrap();
+
+        let wire = sent_str(&sent);
+        assert!(wire.contains("ABOR\r\n"), "wire: {wire:?}");
+        assert_eq!(ftpc.data_host, None);
+        assert_eq!(ftpc.data_port, 0);
+    }
+
+    /// `ftp_done` maps a `552` completion ("Exceeded storage allocation") to
+    /// `CURLE_REMOTE_DISK_FULL` (C `ftp_done`, lib/ftp.c L3634-3647).
+    #[tokio::test]
+    async fn ftp_done_552_maps_to_disk_full() {
+        let recv = Arc::new(Mutex::new(b"552 Exceeded storage allocation\r\n".to_vec()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.ctl_valid = true;
+        let res = ftpc.ftp_done(&mut data, &mut conn, Ok(()), false).await;
+        assert!(matches!(res, Err(CurlError::RemoteDiskFull)), "got {res:?}");
+    }
+
+    /// `ftp_done`: any other non-`2xx` trailing completion → `CURLE_PARTIAL_FILE`.
+    #[tokio::test]
+    async fn ftp_done_non2xx_completion_is_partial_file() {
+        let recv = Arc::new(Mutex::new(b"451 Requested action aborted\r\n".to_vec()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.ctl_valid = true;
+        let res = ftpc.ftp_done(&mut data, &mut conn, Ok(()), false).await;
+        assert!(matches!(res, Err(CurlError::PartialFile)), "got {res:?}");
+    }
+
+    /// A *hard* error (one not in curl's "control connection stays alive" set,
+    /// here `CURLE_URL_MALFORMAT`) wedges the control channel: `ftp_done`
+    /// clears `ctl_valid`, forgets `prevpath`, and — being premature — skips the
+    /// completion read entirely.
+    #[tokio::test]
+    async fn ftp_done_hard_error_wedges_control_and_clears_prevpath() {
+        let recv = Arc::new(Mutex::new(Vec::new())); // no completion read expected
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.ctl_valid = true;
+        ftpc.prevpath = Some("pub/".to_string());
+
+        let res = ftpc
+            .ftp_done(&mut data, &mut conn, Err(CurlError::UrlMalformat), true)
+            .await;
+        assert!(res.is_err());
+        assert!(!ftpc.ctl_valid, "hard error must wedge the control channel");
+        assert_eq!(ftpc.prevpath, None);
+        // No completion handshake (and no ABOR) was attempted.
+        assert!(sent_str(&sent).is_empty(), "wire: {:?}", sent_str(&sent));
+    }
+
+    // ---- Active mode (PORT/EPRT) -----------------------------------------
+
+    /// Active-mode (`EPRT`) download driven end-to-end through `run_do_phase`.
+    /// The engine binds a local listener and advertises it via `EPRT`; this
+    /// test plays the *server* — it parses the advertised port off the control
+    /// wire, connects back, and streams the body. Exercises
+    /// `negotiate_active_noaccept` → `setup_active` → `state_port_resp` →
+    /// `accept_data_active` and the active branch of `run_do_phase`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_mode_download_over_real_data_socket() {
+        let body = b"active mode download body!\n".to_vec(); // 27 bytes
+        let body_clone = body.clone();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_for_task = sent.clone();
+
+        // Server task: wait for the EPRT advertisement, parse `EPRT |1|host|PORT|`,
+        // connect back to 127.0.0.1:PORT, and stream the body.
+        let server = tokio::spawn(async move {
+            let port = loop {
+                {
+                    let wire =
+                        String::from_utf8_lossy(&sent_for_task.lock().unwrap()).to_string();
+                    if let Some(idx) = wire.find("EPRT |") {
+                        let fields: Vec<&str> = wire[idx..].split('|').collect();
+                        if fields.len() >= 4 {
+                            if let Ok(p) = fields[3].parse::<u16>() {
+                                break p;
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            };
+            let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            sock.write_all(&body_clone).await.unwrap();
+            // Drop closes the connection → the client reads EOF.
+        });
+
+        // Control replies in the order active-mode `run_do_phase` reads them:
+        // EPRT(200) → TYPE(200) → SIZE(213) → RETR(150).
+        let recv = Arc::new(Mutex::new(
+            b"200 EPRT command successful\r\n\
+              200 Type set to I\r\n\
+              213 27\r\n\
+              150 Opening BINARY mode data connection\r\n"
+                .to_vec(),
+        ));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        data.set.ftp_use_port = true; // active mode
+        data.set.ftp_use_eprt = true; // prefer EPRT over PORT
+
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.file = Some("active.bin".to_string());
+
+        let mut sink = VecSink::default();
+        let mut source = SliceSource {
+            data: Vec::new(),
+            pos: 0,
+        };
+        ftpc.run_do_phase(&mut data, &mut conn, &mut sink, &mut source)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(sink.body, body, "active-mode body mismatch");
+        let wire = sent_str(&sent);
+        assert!(wire.contains("EPRT |1|"), "wire: {wire:?}");
+        assert!(wire.contains("RETR active.bin\r\n"), "wire: {wire:?}");
+        assert_eq!(data.info.size_download, body.len() as i64);
+    }
+
+    // ---- Directory listing (LIST) ----------------------------------------
+
+    /// A directory listing: no leaf file name ⇒ `TransferKind::List`, which
+    /// forces `TYPE A` (listings are always ASCII) and a bare `LIST`. The
+    /// listing text flows over a real data socket. Exercises the listing
+    /// classification and the `TYPE A`/`LIST` arms of `run_do_phase`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn passive_listing_uses_type_a_and_list() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let listing = b"-rw-r--r-- 1 user group 42 Jan  1 00:00 a.txt\r\n".to_vec();
+        let listing_clone = listing.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(&listing_clone).await.unwrap();
+        });
+
+        // EPSV(229) → TYPE A(200) → LIST(150). A listing issues no SIZE.
+        let recv = Arc::new(Mutex::new(
+            format!(
+                "229 Entering Extended Passive Mode (|||{port}|)\r\n\
+                 200 Type set to A\r\n\
+                 150 Here comes the directory listing\r\n"
+            )
+            .into_bytes(),
+        ));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        data.set.ftp_use_epsv = true;
+
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.file = None; // no leaf → directory listing (kind == List)
+
+        let mut sink = VecSink::default();
+        let mut source = SliceSource {
+            data: Vec::new(),
+            pos: 0,
+        };
+        ftpc.run_do_phase(&mut data, &mut conn, &mut sink, &mut source)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(sink.body, listing, "listing body mismatch");
+        let wire = sent_str(&sent);
+        assert!(wire.contains("TYPE A\r\n"), "wire: {wire:?}");
+        assert!(wire.contains("LIST\r\n"), "wire: {wire:?}");
+    }
+
+    // ---- Time-condition + resume -----------------------------------------
+
+    /// A time-conditioned download (`-z`, `CURL_TIMECOND_IFMODSINCE`) whose
+    /// remote file is NOT newer than the configured time: `run_do_phase` queries
+    /// `MDTM`, parses the modification time, finds the condition unmet, sets
+    /// `CURLINFO_CONDITION_UNMET`, and stops without opening a data channel (no
+    /// `EPSV`/`RETR`). Exercises the MDTM + time-condition gate (control-only).
+    #[tokio::test]
+    async fn download_time_condition_unmet_skips_after_mdtm() {
+        // MDTM: file modified 2001-01-01 (~9.78e8 epoch), older than the
+        // configured `timevalue` (2.0e9) ⇒ IFMODSINCE "not modified" ⇒ skip.
+        let recv = Arc::new(Mutex::new(b"213 20010101000000\r\n".to_vec()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        data.set.timecondition = 1; // CURL_TIMECOND_IFMODSINCE
+        data.set.timevalue = 2_000_000_000; // far ahead of the MDTM time
+        data.set.ftp_use_epsv = true;
+
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.file = Some("stale.txt".to_string());
+
+        let mut sink = VecSink::default();
+        let mut source = SliceSource {
+            data: Vec::new(),
+            pos: 0,
+        };
+        ftpc.run_do_phase(&mut data, &mut conn, &mut sink, &mut source)
+            .await
+            .unwrap();
+
+        assert!(data.info.timecond, "condition should be unmet (skipped)");
+        assert!(data.info.filetime > 0, "filetime parsed from MDTM");
+        let wire = sent_str(&sent);
+        assert!(wire.contains("MDTM stale.txt\r\n"), "wire: {wire:?}");
+        assert!(!wire.contains("EPSV"), "must not open data channel: {wire:?}");
+        assert!(!wire.contains("RETR"), "must not RETR: {wire:?}");
+        assert!(ftpc.dont_check);
+    }
+
+    /// A resumed download (`-C 4`, `CURLOPT_RESUME_FROM`): with a known size from
+    /// `SIZE`, `run_do_phase` issues `REST 4` (expecting `350`) before `RETR`,
+    /// then transfers only the remaining bytes over a real data socket.
+    /// Exercises the range/resume bookkeeping and `send_rest`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn download_resume_from_sends_rest_over_real_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let remaining = b"WXYZ-remaining-tail!".to_vec(); // 20 bytes (= 24 - 4)
+        let remaining_clone = remaining.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(&remaining_clone).await.unwrap();
+        });
+
+        // EPSV(229) → TYPE I(200) → SIZE(213 24) → REST(350) → RETR(150).
+        let recv = Arc::new(Mutex::new(
+            format!(
+                "229 Entering Extended Passive Mode (|||{port}|)\r\n\
+                 200 Type set to I\r\n\
+                 213 24\r\n\
+                 350 Restarting at 4\r\n\
+                 150 Opening BINARY mode data connection\r\n"
+            )
+            .into_bytes(),
+        ));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        data.set.ftp_use_epsv = true;
+        data.set.set_resume_from = 4;
+
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.file = Some("resume.bin".to_string());
+
+        let mut sink = VecSink::default();
+        let mut source = SliceSource {
+            data: Vec::new(),
+            pos: 0,
+        };
+        ftpc.run_do_phase(&mut data, &mut conn, &mut sink, &mut source)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(sink.body, remaining, "resumed body mismatch");
+        let wire = sent_str(&sent);
+        assert!(wire.contains("REST 4\r\n"), "wire: {wire:?}");
+        assert!(wire.contains("RETR resume.bin\r\n"), "wire: {wire:?}");
+    }
+
+    /// Active-mode `EPRT`→`PORT` fallback (C `ftp_state_port_resp`): an `EPRT`
+    /// refusal (`500`) latches EPRT off for the connection, re-advertises the
+    /// listener with `PORT`, and accepts the `PORT` reply. Driven through
+    /// `negotiate_active_noaccept` (no data accept needed — control-only).
+    #[tokio::test]
+    async fn active_eprt_refused_falls_back_to_port() {
+        let recv = Arc::new(Mutex::new(
+            b"500 EPRT not understood\r\n200 PORT command successful\r\n".to_vec(),
+        ));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        data.set.ftp_use_port = true;
+        data.set.ftp_use_eprt = true;
+
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.port_cmd = PortCmd::Eprt;
+
+        ftpc.negotiate_active_noaccept(&mut data, &mut conn)
+            .await
+            .unwrap();
+
+        let wire = sent_str(&sent);
+        assert!(wire.contains("EPRT |1|"), "wire: {wire:?}");
+        assert!(wire.contains("PORT "), "wire: {wire:?}");
+        assert!(ftpc.eprt_disabled, "EPRT must latch off after a refusal");
+        assert_eq!(ftpc.port_cmd, PortCmd::Port);
+    }
+
+    /// A resumed upload (`-C 4`, `CURLOPT_RESUME_FROM` > 0): curl forces `APPE`
+    /// and advances the source past the first 4 bytes (no seek callback ⇒
+    /// read-and-discard), appending only the remaining bytes over a real data
+    /// socket. Exercises the upload-resume bookkeeping, `APPE` selection, and
+    /// `run_upload_body`'s skip loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_resume_appends_with_appe_over_real_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let collected2 = collected.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            sock.read_to_end(&mut buf).await.unwrap();
+            *collected2.lock().unwrap() = buf;
+        });
+
+        // EPSV(229) → TYPE I(200) → APPE(150). A positive `-C` sends no SIZE.
+        let recv = Arc::new(Mutex::new(
+            format!(
+                "229 Entering Extended Passive Mode (|||{port}|)\r\n\
+                 200 Type set to I\r\n\
+                 150 Ok to send data\r\n"
+            )
+            .into_bytes(),
+        ));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = make_conn(recv.clone(), sent.clone());
+        let mut data = Easy::new();
+        data.set.ftp_use_epsv = true;
+        data.set.method = HttpReq::Put;
+        let full = b"SKIPpayload-after-skip".to_vec(); // first 4 ("SKIP") are skipped
+        data.set.filesize = full.len() as i64;
+        data.set.set_resume_from = 4;
+
+        let mut ftpc = FtpConn::new();
+        ftpc.pp.init(timeval::curlx_now());
+        ftpc.file = Some("resume_up.bin".to_string());
+
+        let mut sink = VecSink::default();
+        let mut source = SliceSource {
+            data: full.clone(),
+            pos: 0,
+        };
+        ftpc.run_do_phase(&mut data, &mut conn, &mut sink, &mut source)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(
+            *collected.lock().unwrap(),
+            full[4..].to_vec(),
+            "only the bytes after the resume offset should be appended"
+        );
+        let wire = sent_str(&sent);
+        assert!(wire.contains("APPE resume_up.bin\r\n"), "wire: {wire:?}");
     }
 }

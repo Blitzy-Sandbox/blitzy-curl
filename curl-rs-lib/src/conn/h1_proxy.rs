@@ -515,6 +515,14 @@ struct H1TunnelState {
     /// `CLIENTWRITE_HEADER | CLIENTWRITE_CONNECT` semantics (C: `single_header`
     /// → `Curl_client_write`). Each entry includes its trailing CRLF.
     response_headers: Vec<Vec<u8>>,
+    /// User-visible informational trace lines produced while parsing the CONNECT
+    /// response — the connection-filter counterpart of curl's `infof` calls in
+    /// `cf-h1-proxy.c` (e.g. "Ignoring Content-Length in CONNECT 200 response").
+    /// The filter layer has no debug-callback handle, so these are captured here
+    /// and surfaced by the transfer engine as `CURLINFO_TEXT` (`* ` lines on
+    /// stderr) once the tunnel is established — mirroring `response_headers`.
+    /// Each entry is the bare message with no `* ` prefix or trailing newline.
+    connect_info_text: Vec<String>,
 }
 
 impl H1TunnelState {
@@ -538,6 +546,7 @@ impl H1TunnelState {
             newurl: false,
             chunk: ChunkSkipper::new(),
             response_headers: Vec::new(),
+            connect_info_text: Vec::new(),
         };
         me.reinit();
         me
@@ -558,10 +567,11 @@ impl H1TunnelState {
         self.maybe_folded = false;
         self.leading_unfold = false;
         self.chunk = ChunkSkipper::new();
-        // NOTE: `httpproxycode`, `newurl`, and `response_headers` persist across
-        // a reinit within one connect (curl clears `httpcode`/`newurl` at the
-        // FAILED/ESTABLISHED transitions and `start_CONNECT` respectively); they
-        // are reset explicitly at those points.
+        // NOTE: `httpproxycode`, `newurl`, `response_headers`, and
+        // `connect_info_text` persist across a reinit within one connect (curl
+        // clears `httpcode`/`newurl` at the FAILED/ESTABLISHED transitions and
+        // `start_CONNECT` respectively, and re-emits its `infof` lines on each
+        // pass); they are reset explicitly at those points.
     }
 
     /// Whether the tunnel reached ESTABLISHED (C: `tunnel_is_established`).
@@ -765,6 +775,65 @@ fn copy_header_value(line: &[u8]) -> &[u8] {
         }
         None => &[],
     }
+}
+
+/// Validate a *non-status* CONNECT response header line exactly as curl's
+/// `Curl_headers_push` (`lib/headers.c`) does before storing it, reproducing the
+/// error it would surface through `Curl_client_write(CLIENTWRITE_HEADER ...)`.
+///
+/// curl runs every received CONNECT response line through the header-collection
+/// client-writer, which calls `Curl_headers_push` for each line that is **not**
+/// the status line (the status line carries `CLIENTWRITE_STATUS`, which the
+/// collector skips). `Curl_headers_push` then:
+///
+/// * ignores the blank body-separator line (returns `CURLE_OK`),
+/// * requires a CR/LF terminator and a non-blank name, else
+///   [`CurlError::WeirdServerReply`] (`CURLE_WEIRD_SERVER_REPLY`, 8),
+/// * and finally calls `namevalue`, which rejects a line that contains no colon
+///   with `CURLE_BAD_FUNCTION_ARGUMENT` (43) — the "Invalid response header"
+///   failure. A proxy that answers `CONNECT` with a raw HTML error body and then
+///   closes (test 750) hits exactly this path: the first line is treated as the
+///   status line, and the next line (`<h1>400 Bad request</h1>`) has no colon,
+///   so curl fails with `(43) Invalid response header` rather than reading on to
+///   the eventual connection close (`(56) Proxy CONNECT aborted`).
+///
+/// `line` is the raw line as accumulated in `rcvbuf`, still bearing its trailing
+/// CR/LF.
+fn validate_connect_resp_header(line: &[u8]) -> Result<()> {
+    // Body separator: curl returns `CURLE_OK` before any validation.
+    if matches!(line.first(), Some(b'\r') | Some(b'\n')) {
+        return Ok(());
+    }
+    let ilen = line.len();
+    // Trim a single trailing LF then CR (C: trim '\n', then '\r').
+    let mut hlen = ilen;
+    if hlen > 0 && line[hlen - 1] == b'\n' {
+        hlen -= 1;
+    }
+    if hlen > 0 && line[hlen - 1] == b'\r' {
+        hlen -= 1;
+    }
+    // A line with neither CR nor LF as terminator is not a valid header.
+    if hlen == ilen {
+        return Err(CurlError::WeirdServerReply);
+    }
+    // Skip leading blanks; an all-blank name is invalid.
+    let mut h = &line[..hlen];
+    while let [first, rest @ ..] = h {
+        if is_blank(*first) {
+            h = rest;
+        } else {
+            break;
+        }
+    }
+    if h.is_empty() {
+        return Err(CurlError::WeirdServerReply);
+    }
+    // `namevalue`: a `CURLH_CONNECT` header must contain a colon delimiter.
+    if !h.contains(&b':') {
+        return Err(CurlError::BadFunctionArgument);
+    }
+    Ok(())
 }
 
 /// Whether the header `line` is named `name` and its value contains the token
@@ -1093,11 +1162,12 @@ impl CfH1Proxy {
         } else if checkprefix("Content-Length:", &line) {
             if code / 100 == 2 {
                 // "A client MUST ignore any Content-Length ... in a successful
-                // response to CONNECT." RFC 7231 4.3.6.
-                sendf::infof(
-                    data.verbose,
-                    &format!("Ignoring Content-Length in CONNECT {code:03} response"),
-                );
+                // response to CONNECT." RFC 7231 4.3.6. curl emits this as a
+                // user-visible `infof` line; capture it for the engine to surface
+                // as `CURLINFO_TEXT` (the filter has no debug-callback handle).
+                self.tunnel
+                    .connect_info_text
+                    .push(format!("Ignoring Content-Length in CONNECT {code:03} response"));
             } else {
                 match parse_content_length(copy_header_value(&line)) {
                     Some(n) => self.tunnel.cl = n,
@@ -1112,10 +1182,10 @@ impl CfH1Proxy {
         } else if checkprefix("Transfer-Encoding:", &line) {
             if code / 100 == 2 {
                 // Likewise ignored for a successful CONNECT (RFC 7231 4.3.6).
-                sendf::infof(
-                    data.verbose,
-                    &format!("Ignoring Transfer-Encoding in CONNECT {code:03} response"),
-                );
+                // Captured as a user-visible `CURLINFO_TEXT` line (see above).
+                self.tunnel
+                    .connect_info_text
+                    .push(format!("Ignoring Transfer-Encoding in CONNECT {code:03} response"));
             } else if compareheader(&line, "Transfer-Encoding:", "chunked") {
                 sendf::infof(data.verbose, "CONNECT responded chunked");
                 self.tunnel.chunked_encoding = true;
@@ -1176,6 +1246,30 @@ impl CfH1Proxy {
                 self.tunnel.keepon = Keepon::Done;
             }
             return Ok(());
+        }
+
+        // Validate the line as curl's header collector would (C:
+        // `Curl_client_write(CLIENTWRITE_HEADER ...)` → `Curl_headers_push` →
+        // `namevalue`). The status line (`headerlines == 1`) carries
+        // `CLIENTWRITE_STATUS` and is exempt; every later non-blank line must
+        // parse as `name: value`. A colon-less line — a proxy that answers
+        // CONNECT with a raw HTML error body and closes (test750) — fails with
+        // `CURLE_BAD_FUNCTION_ARGUMENT` (43) "Invalid response header" rather
+        // than being silently consumed until the eventual close (which would
+        // surface the misleading `(56) Proxy CONNECT aborted`). The buffer is
+        // still intact here (it is reset only at the end of this function), so
+        // we validate it in place. Only the colon failure carries curl's
+        // explicit message; the (in practice unreachable, since lines are
+        // LF-terminated and the blank line was handled above) malformed-name
+        // cases return `CURLE_WEIRD_SERVER_REPLY` with its default text, exactly
+        // as `Curl_headers_push` does.
+        if self.tunnel.headerlines >= 2 {
+            if let Err(e) = validate_connect_resp_header(self.tunnel.rcvbuf.curlx_dyn_ptr()) {
+                if matches!(e, CurlError::BadFunctionArgument) {
+                    sendf::failf(&mut data.error_buffer, "Invalid response header");
+                }
+                return Err(e);
+            }
         }
 
         // A normal header line: interpret then clear the buffer for the next.
@@ -1660,6 +1754,16 @@ impl ConnectionFilter for CfH1Proxy {
     /// the connection.
     fn connect_response_headers(&self) -> Option<Vec<Vec<u8>>> {
         Some(self.tunnel.response_headers.clone())
+    }
+
+    /// The user-visible informational trace lines captured while parsing the
+    /// CONNECT response (C: `infof` inside `cf-h1-proxy.c`, e.g. "Ignoring
+    /// Content-Length in CONNECT 200 response"). The transfer engine emits these
+    /// as `CURLINFO_TEXT` (`* ` lines on stderr) once the tunnel is established,
+    /// because the connection-filter layer has no debug-callback handle. They
+    /// persist for the life of the connection (see `is_established()`).
+    fn connect_info_text(&self) -> Option<Vec<String>> {
+        Some(self.tunnel.connect_info_text.clone())
     }
 
     /// The proxy's parsed `CONNECT` status code (C: `data->info.httpproxycode`),
@@ -2236,6 +2340,23 @@ mod tests {
             err.as_deref(),
             Some("CONNECT tunnel failed, response 502")
         );
+    }
+
+    #[test]
+    fn non_2xx_400_then_close_reports_tunnel_failed() {
+        // test749: proxy returns "400 Bad request" + "Connection: close" then
+        // closes. curl reports `CONNECT tunnel failed, response 400` (CURLE 56),
+        // NOT a generic recv error — the complete response must be parsed before
+        // the EOF is observed.
+        let mock = MockProxy::new(vec![
+            b"HTTP/1.1 400 Bad request\r\nConnection: close\r\n\r\n".to_vec(),
+        ]);
+        let mut cf = filter_with(Box::new(mock), H1ProxyConfig::new("test.example", 80));
+
+        let (res, err) = drive_connect(&mut cf);
+        assert_eq!(res, Err(CurlError::RecvError));
+        assert!(cf.tunnel.is_failed());
+        assert_eq!(err.as_deref(), Some("CONNECT tunnel failed, response 400"));
     }
 
     #[test]

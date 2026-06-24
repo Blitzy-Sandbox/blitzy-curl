@@ -50,9 +50,10 @@
 //!
 //! # Output
 //!
-//! The bar is always written to **stderr** (curl's `tool_stderr`), modeled by
-//! [`ProgressOut`]. Frames are emitted as raw bytes and flushed immediately so
-//! the carriage-return (`\r`) overwrites work; no line buffering is applied.
+//! The bar is written to curl's `tool_stderr` — the redirectable diagnostic
+//! stream (`--stderr`), modeled by [`ProgressOut`] over [`crate::messages`].
+//! Frames are emitted as raw bytes and flushed immediately so the
+//! carriage-return (`\r`) overwrites work; no line buffering is applied.
 //!
 //! # Dependencies
 //!
@@ -61,7 +62,6 @@
 //! plus the sibling [`crate::config`] and [`crate::operate`] types it is handed.
 //! It links no C library and contains no `unsafe` (AAP §0.7.1 / §0.8.2).
 
-use std::io::Write;
 use std::time::Instant;
 
 use curl_rs_lib::easy::CURLPAUSE_CONT;
@@ -163,14 +163,17 @@ static SINUS: [i32; 200] = [
 /// Where the progress bar writes its frames.
 ///
 /// curl's `struct ProgressData` holds a `FILE *out` that `progressbarinit`
-/// always sets to `tool_stderr`. Modeling it as an enum keeps the production
-/// path (stderr) while letting tests capture frames into an in-memory buffer for
-/// byte-exact parity assertions. Frames are written as raw bytes and flushed
-/// immediately so the carriage-return overwrite behaves like curl's
-/// `fputs`/`fflush` (no line buffering).
+/// always sets to `tool_stderr` — the redirectable diagnostic stream, not the
+/// raw process `stderr`. Modeling it as an enum keeps the production path
+/// (the shared [`crate::messages`] diagnostic sink, which `--stderr` controls)
+/// while letting tests capture frames into an in-memory buffer for byte-exact
+/// parity assertions. Frames are written as raw bytes and flushed immediately so
+/// the carriage-return overwrite behaves like curl's `fputs`/`fflush` (no line
+/// buffering).
 #[derive(Debug, Default)]
 pub enum ProgressOut {
-    /// Write frames to the process's standard error stream (curl `tool_stderr`).
+    /// Write frames to the shared diagnostic sink (curl's `tool_stderr`, the
+    /// stream `--stderr` retargets), via [`crate::messages::emit_raw`].
     #[default]
     Stderr,
     /// Capture frames in memory — used by this module's tests to assert the
@@ -185,9 +188,15 @@ impl ProgressOut {
     /// curl ignores the return of `fputs`/`curl_mfprintf` when drawing the bar.
     fn write_all(&mut self, buf: &[u8]) {
         match self {
-            ProgressOut::Stderr => {
-                let _ = std::io::stderr().write_all(buf);
-            }
+            // Route frames through the shared diagnostic sink (curl's
+            // `tool_stderr`) rather than the raw process `stderr`, so a
+            // `--stderr <file>` / `--stderr -` redirection is honored — curl's
+            // `progressbarinit` sets `bar->out = tool_stderr`, the very stream
+            // `tool_set_stderr_file` retargets. `emit_raw` flushes on every
+            // write, giving the immediate `\r`-overwrite visibility the bar
+            // needs (oracle test1148: `-# --stderr <file>` must capture the
+            // `####… 100.0%` bar into the file, not the real stderr).
+            ProgressOut::Stderr => crate::messages::emit_raw(buf),
             #[cfg(test)]
             ProgressOut::Buffer(v) => v.extend_from_slice(buf),
         }
@@ -197,9 +206,11 @@ impl ProgressOut {
     /// frame is visible immediately. The in-memory buffer needs no flush.
     fn flush(&mut self) {
         match self {
-            ProgressOut::Stderr => {
-                let _ = std::io::stderr().flush();
-            }
+            // No-op: frames are written via `crate::messages::emit_raw`, whose
+            // underlying sink (`write_diagnostic`) already flushes after every
+            // write, so the `fflush(bar->out)` semantics are satisfied at write
+            // time and there is nothing further to flush here.
+            ProgressOut::Stderr => {}
             #[cfg(test)]
             ProgressOut::Buffer(_) => {}
         }
@@ -232,7 +243,8 @@ pub struct ProgressData {
     /// Current bar width in columns (`bar->width`), set by [`update_width`] and
     /// clamped to `[MIN_BARLENGTH, MAX_BARLENGTH]`.
     pub width: i32,
-    /// The output sink (`bar->out`), always stderr in production.
+    /// The output sink (`bar->out`): the diagnostic stream (curl's
+    /// `tool_stderr`, redirectable by `--stderr`) in production.
     pub out: ProgressOut,
     /// Resume offset for `--continue-at` transfers (`bar->initial_size`); lets
     /// the bar show progress toward the whole file. Negative means "size to be

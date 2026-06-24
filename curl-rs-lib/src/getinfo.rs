@@ -356,7 +356,7 @@ pub enum CurlInfo {
     /// `CURLINFO_PROTOCOL` (deprecated; use [`Scheme`](Self::Scheme)) — the
     /// protocol used, as a `CURLPROTO_*` bit.
     Protocol = CURLINFO_LONG + 48,
-    /// `CURLINFO_SCHEME` — the URL scheme used, uppercased.
+    /// `CURLINFO_SCHEME` — the URL scheme used, lower-cased (e.g. `http`).
     Scheme = CURLINFO_STRING + 49,
     /// `CURLINFO_TOTAL_TIME_T` — total transfer time, in microseconds.
     TotalTimeT = CURLINFO_OFF_T + 50,
@@ -813,6 +813,16 @@ pub struct Info {
     pub timecond: bool,
     /// Total size of all received headers (C: `info.header_size`).
     pub header_size: i64,
+    /// Internal scratch: the byte total of a proxy `CONNECT` response's header
+    /// lines (status line + headers + the terminating blank line), captured once
+    /// per established tunnel. curl folds these into `info.header_size` via
+    /// `Curl_bump_headersize` in `single_header` (lib/cf-h1-proxy.c) REGARDLESS
+    /// of `--suppress-connect-headers` (which hides them from display/dump only,
+    /// not from the byte statistics). The transfer engine adds this to the origin
+    /// response's header bytes when publishing `CURLINFO_HEADER_SIZE`
+    /// (`%{size_header}`). Not itself exposed as a `CURLINFO_*` value (oracle:
+    /// tests/data/test1288).
+    pub connect_header_size: i64,
     /// Total size of all issued requests (C: `info.request_size`).
     pub request_size: i64,
     /// Bitmask of HTTP auth methods the server offered
@@ -837,7 +847,8 @@ pub struct Info {
     pub redirect_url: Option<CString>,
     /// `Retry-After` value in seconds (C: `info.retry_after`).
     pub retry_after: i64,
-    /// URL scheme used, uppercased (C: `info.conn_scheme`), owned.
+    /// URL scheme used, lower-cased (C: `info.conn_scheme = conn->scheme->name`,
+    /// the lowercase `Curl_scheme.name`), owned.
     pub scheme: Option<CString>,
     /// Protocol used, as a `CURLPROTO_*` bit (C: `info.conn_protocol`).
     /// `CURLINFO_PROTOCOL` (deprecated).
@@ -1009,6 +1020,7 @@ impl Info {
             filetime: -1,
             timecond: false,
             header_size: 0,
+            connect_header_size: 0,
             request_size: 0,
             httpauth_avail: 0,
             proxyauth_avail: 0,
@@ -1113,6 +1125,7 @@ impl Info {
         self.filetime = -1; // -1 is an illegal time and thus means "unknown"
         self.timecond = false;
         self.header_size = 0;
+        self.connect_header_size = 0;
         self.request_size = 0;
         self.proxyauth_avail = 0;
         self.httpauth_avail = 0;
@@ -1537,7 +1550,7 @@ mod tests {
         i.redirect_url = Some(CString::new("https://example.com/next").unwrap());
         i.primary_ip = Some(CString::new("93.184.216.34").unwrap());
         i.local_ip = Some(CString::new("10.0.0.2").unwrap());
-        i.scheme = Some(CString::new("HTTPS").unwrap());
+        i.scheme = Some(CString::new("https").unwrap());
         i.referer = Some(CString::new("https://ref.example/").unwrap());
         i.rtsp_session_id = Some(CString::new("ABCD1234").unwrap());
         // longs
@@ -1713,7 +1726,7 @@ mod tests {
             other => panic!("expected Str, got {other:?}"),
         }
         match retrieve(&info, CurlInfo::Scheme).unwrap() {
-            InfoValue::Str(Some(s)) => assert_eq!(s.to_bytes(), b"HTTPS"),
+            InfoValue::Str(Some(s)) => assert_eq!(s.to_bytes(), b"https"),
             other => panic!("expected Str, got {other:?}"),
         }
     }

@@ -283,6 +283,23 @@ pub struct PingPong {
     /// `BIT(pending_resp)`). Set when a command is sent; cleared once the last
     /// response line has been read.
     pending_resp: bool,
+
+    /// Opt-in accumulator for the "response lines as headers" routing that C
+    /// performs unconditionally in `Curl_pp_readresp` via
+    /// `Curl_client_write(data, CLIENTWRITE_INFO, line, length)` (lib/pingpong.c
+    /// L304-310 — "The response lines can be seen as a kind of headers").
+    /// curl-rs keeps the engine free of the client-write chain, so a consumer
+    /// that needs this routing (FTP, for the `-D`/`--dump-header` file and the
+    /// general response-as-headers semantics) opts in via
+    /// [`enable_info_capture`](PingPong::enable_info_capture); thereafter every
+    /// complete response line (intermediate *and* final, CR/LF preserved) read
+    /// by [`readresp`](PingPong::readresp) is appended here verbatim. The
+    /// protocol layer drains it via [`drain_info_capture`](PingPong::drain_info_capture)
+    /// and forwards the bytes to the header sink as `ClientWriteType::INFO`.
+    /// `None` (the default) means no capture — the mail protocols
+    /// (SMTP/IMAP/POP3, which manage their own service-command capture) leave it
+    /// disabled, so this is a zero-cost no-op for them.
+    info_capture: Option<Vec<u8>>,
 }
 
 impl PingPong {
@@ -639,6 +656,23 @@ impl PingPong {
                     sendf::infof(true, shown.trim_end_matches(['\r', '\n']));
                 }
 
+                // "Response lines as headers" capture (C `Curl_pp_readresp`'s
+                // unconditional `Curl_client_write(CLIENTWRITE_INFO, line)`,
+                // lib/pingpong.c L304-310). When a consumer has opted in (FTP,
+                // for `-D`/`--dump-header`), accumulate this line — intermediate
+                // continuation lines (e.g. a multi-line `220-` greeting) as well
+                // as the final line — verbatim with its CR/LF, so the protocol
+                // layer can deliver them to the header sink. The temporary copy
+                // keeps the `recvbuf` borrow disjoint from the `info_capture`
+                // mutable borrow; control-response lines are short, so the copy
+                // is negligible. A no-op when capture is disabled (mail).
+                if self.info_capture.is_some() {
+                    let line = self.recvbuf[..length].to_vec();
+                    if let Some(buf) = self.info_capture.as_mut() {
+                        buf.extend_from_slice(&line);
+                    }
+                }
+
                 // Ask the protocol whether this is the final line. The borrow of
                 // `recvbuf` for the slice ends with this call (NLL), freeing us
                 // to mutate the buffer afterwards.
@@ -691,6 +725,48 @@ impl PingPong {
     #[must_use]
     pub fn moredata(&self) -> bool {
         self.sendleft == 0 && self.recvbuf.len() > self.nfinal
+    }
+
+    /// Whether the last response left pipelined bytes buffered behind the final
+    /// line (C `pp->overflow`). A protocol can use this to reject a server that
+    /// pipelines data when it must not — most importantly to forbid data sent
+    /// after the `STARTTLS` response and before the TLS handshake, which would
+    /// otherwise be a plaintext-injection vector (`smtp_state_starttls_resp`'s
+    /// `if(smtpc->pp.overflow) return CURLE_WEIRD_SERVER_REPLY`).
+    #[must_use]
+    pub fn has_overflow(&self) -> bool {
+        self.overflow > 0
+    }
+
+    /// Opt in to the "response lines as headers" capture (see
+    /// [`info_capture`](PingPong::info_capture)). After this call every complete
+    /// response line read by [`readresp`](PingPong::readresp) — intermediate and
+    /// final, CR/LF preserved — is accumulated so the protocol layer can forward
+    /// it to the header sink as `ClientWriteType::INFO`, reproducing C
+    /// `Curl_pp_readresp`'s unconditional `Curl_client_write(CLIENTWRITE_INFO)`
+    /// (lib/pingpong.c L304-310). Idempotent: a second call on an
+    /// already-capturing engine leaves the accumulated bytes untouched, so a
+    /// pooled connection that is set up afresh for each transfer keeps any
+    /// not-yet-drained lines. Used by FTP for `-D`/`--dump-header`.
+    pub fn enable_info_capture(&mut self) {
+        if self.info_capture.is_none() {
+            self.info_capture = Some(Vec::new());
+        }
+    }
+
+    /// Take the captured "response lines as headers" bytes accumulated since the
+    /// last drain, leaving capture **enabled** with an empty buffer (so the next
+    /// transfer on a reused connection starts clean). Returns `None` when capture
+    /// was never enabled (the mail protocols), and `Some(bytes)` — possibly empty
+    /// — when it was. The FTP layer drains this after the transfer-completion
+    /// `226`/`250` is read but **before** the teardown `QUIT`, so the `221` to
+    /// `QUIT` is excluded from the dump (it is not part of the transfer — see
+    /// `tests/data/test1349`).
+    pub fn drain_info_capture(&mut self) -> Option<Vec<u8>> {
+        match self.info_capture.as_mut() {
+            Some(buf) => Some(std::mem::take(buf)),
+            None => None,
+        }
     }
 
     /// Detach already-buffered bytes that follow the last matched final
@@ -997,6 +1073,70 @@ mod tests {
                 .expect("second readresp");
             assert_eq!(code2, 226, "pipelined response parsed from overflow");
             assert_eq!(pp.overflow, 0, "overflow consumed");
+        });
+    }
+
+    #[test]
+    fn info_capture_accumulates_response_lines_with_crlf() {
+        run(async {
+            let mut data = Easy::new();
+            // A two-line response: a `220-` continuation banner and the final
+            // `220 ready` line, in a single read.
+            let (mut conn, _sent) = conn_with(vec![b"220-banner\r\n220 ready\r\n".to_vec()]);
+            let mut pp = PingPong::new();
+            pp.init(timeval::curlx_now());
+            // Opt in to the "response lines as headers" capture BEFORE reading
+            // (the FTP `-D` / IMAP `-D` path; C `Curl_pp_readresp`'s per-line
+            // `CLIENTWRITE_INFO`).
+            pp.enable_info_capture();
+            let mut proto = FtpStyle;
+
+            let (code, _size) = pp
+                .readresp(&mut data, &mut conn, FIRSTSOCKET, &mut proto)
+                .await
+                .expect("readresp");
+            assert_eq!(code, 220);
+
+            // Both the intermediate continuation line AND the final line are
+            // accumulated verbatim, CR/LF preserved.
+            let captured = pp.drain_info_capture().expect("capture enabled");
+            assert_eq!(&captured, b"220-banner\r\n220 ready\r\n");
+
+            // Drain leaves capture ENABLED with an empty buffer, so a reused
+            // connection starts the next transfer clean.
+            let again = pp
+                .drain_info_capture()
+                .expect("still enabled after drain");
+            assert!(again.is_empty(), "buffer reset after drain");
+        });
+    }
+
+    #[test]
+    fn info_capture_disabled_by_default_returns_none() {
+        // Without `enable_info_capture` (the mail-protocol default), the capture
+        // buffer is never allocated and `drain_info_capture` yields `None`.
+        let mut pp = PingPong::new();
+        assert!(pp.drain_info_capture().is_none());
+    }
+
+    #[test]
+    fn enable_info_capture_is_idempotent_and_preserves_buffered_lines() {
+        run(async {
+            let mut data = Easy::new();
+            let (mut conn, _sent) = conn_with(vec![b"220 ready\r\n".to_vec()]);
+            let mut pp = PingPong::new();
+            pp.init(timeval::curlx_now());
+            pp.enable_info_capture();
+            let mut proto = FtpStyle;
+            let _ = pp
+                .readresp(&mut data, &mut conn, FIRSTSOCKET, &mut proto)
+                .await
+                .expect("readresp");
+            // A second enable on an already-capturing engine must NOT discard the
+            // accumulated line (a pooled connection set up afresh per transfer).
+            pp.enable_info_capture();
+            let captured = pp.drain_info_capture().expect("capture enabled");
+            assert_eq!(&captured, b"220 ready\r\n");
         });
     }
 

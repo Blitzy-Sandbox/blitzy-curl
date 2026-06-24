@@ -439,6 +439,18 @@ pub struct Connection {
     pub connection_id: i64,
     /// The per-connection status bits (C `conn->bits`).
     pub bits: ConnectionBits,
+    /// The HTTP version of the most recent response seen on THIS connection
+    /// (C `conn->httpversion_seen`), encoded as `10`/`11`/`20`/`30`; `0` until a
+    /// response has been parsed. curl records it after every response
+    /// (`lib/http.c`: `conn->httpversion_seen = k->httpversion`) and consults it
+    /// in `http_may_use_1_1`: once a `1.0` response has been seen on the
+    /// connection, every subsequent request reusing that connection is sent as
+    /// HTTP/1.0. Unlike the per-transfer `data->state.http_neg.rcvd_min` (reset
+    /// at each transfer start), this lives on the pooled connection and so
+    /// survives across separate transfers that reuse the same kept-alive
+    /// connection (oracle: tests/data/test1078 — a second GET over a reused
+    /// proxy tunnel downgrades to HTTP/1.0 after the first reply was HTTP/1.0).
+    pub httpversion_seen: u8,
     /// The forward HTTP proxy descriptor, if any (C `conn->http_proxy`).
     pub http_proxy: Option<ProxyDescriptor>,
     /// The SOCKS proxy descriptor, if any (C `conn->socks_proxy`).
@@ -516,6 +528,7 @@ impl Connection {
             transport_wanted,
             connection_id: -1,
             bits: ConnectionBits::default(),
+            httpversion_seen: 0,
             http_proxy: None,
             socks_proxy: None,
             scheme,

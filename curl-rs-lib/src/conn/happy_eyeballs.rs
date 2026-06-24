@@ -880,9 +880,34 @@ pub fn create_ip_happy_filter_with_timeout(
     connect_timeout_ms: i64,
     addrs: ResolvedAddrs,
 ) -> Box<dyn ConnectionFilter> {
+    create_ip_happy_filter_bound(
+        transport,
+        ip_version,
+        happy_eyeballs_timeout,
+        connect_timeout_ms,
+        addrs,
+        BindConfig::default(),
+    )
+}
+
+/// Like [`create_ip_happy_filter_with_timeout`] but also applies a local
+/// **interface / port binding** (`CURLOPT_INTERFACE`, `CURLOPT_LOCALPORT`) to
+/// every connect attempt in the race. C: the `bindlocal` call performed inside
+/// `cf_socket_open` before each `connect`. An inactive [`BindConfig`] (the
+/// default) makes this identical to [`create_ip_happy_filter_with_timeout`].
+#[must_use]
+pub fn create_ip_happy_filter_bound(
+    transport: u8,
+    ip_version: IpVersion,
+    happy_eyeballs_timeout: i64,
+    connect_timeout_ms: i64,
+    addrs: ResolvedAddrs,
+    bind: BindConfig,
+) -> Box<dyn ConnectionFilter> {
     Box::new(
         HappyEyeballsFilter::new(transport, ip_version, happy_eyeballs_timeout, addrs)
-            .with_connect_timeout_ms(connect_timeout_ms),
+            .with_connect_timeout_ms(connect_timeout_ms)
+            .with_bind_config(bind),
     )
 }
 

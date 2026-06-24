@@ -246,6 +246,28 @@ pub struct PerTransfer {
     /// The transfer's URL exactly as resolved for this iteration
     /// (C `per->url`).
     pub url: Option<String>,
+    /// Whether this transfer's `ftp://` request is driven AS HTTP over a forward
+    /// HTTP proxy (curl's `PROTOPT_PROXY_AS_HTTP` handler swap), so its effective
+    /// `CURLINFO_SCHEME` is `http`, not `ftp`. Precomputed from the easy handle
+    /// in [`perform_with_cli_io`] *before* the handle is moved into the async I/O
+    /// bridge (after which `getinfo` cannot be read), and consumed by
+    /// `tool_header_cb` to gate the `--include` header echo on the effective
+    /// scheme — exactly as curl reads `CURLINFO_SCHEME` there. `false` for every
+    /// non-proxied transfer, so the header callback's URL-derived scheme is used
+    /// unchanged. Oracle: tests/data/test79, test208, test299, test1077/1092/1098.
+    pub proxy_as_http: bool,
+    /// The transfer's *effective* (post-redirect) scheme, lower-cased, once a
+    /// cross-protocol redirect hand-off has rewritten `CURLINFO_SCHEME` (e.g. an
+    /// HTTP `PUT` redirected to an `ftp://` target). The engine pushes this
+    /// through [`WriteCallbacks::set_effective_scheme`] during the transfer (the
+    /// easy handle is moved out, so `getinfo(CURLINFO_SCHEME)` is unavailable
+    /// here). `tool_header_cb` prefers this over the URL-derived scheme when
+    /// present, so the `-i`/`--include` body echo gates on the protocol actually
+    /// producing each line — keeping FTP control responses off stdout after an
+    /// HTTP→FTP redirect. `None` until (and unless) such a hand-off occurs, so
+    /// the URL-derived scheme is used for every ordinary single-protocol
+    /// transfer. Oracle: tests/data/test1055.
+    pub effective_scheme: Option<String>,
     /// The 1-based ordinal within a globbed URL set (C `per->urlnum`), surfaced
     /// as `%{urlnum}`.
     pub urlnum: i64,
@@ -362,6 +384,8 @@ impl PerTransfer {
             start: now,
             retrystart: now,
             url: None,
+            proxy_as_http: false,
+            effective_scheme: None,
             urlnum: 0,
             outfile: None,
             infile: None,
@@ -743,6 +767,30 @@ fn get_url_file_name(global: &GlobalConfig, url: &str) -> Result<String, CurlCod
 /// filename of its own (C `add_file_name_to_url`, `src/tool_operhlp.c`). When
 /// the URL already carries a query or a filename the URL is returned unchanged.
 fn add_file_name_to_url(inurl: &str, filename: &str) -> Result<String, CurlCode> {
+    // Faithful to C `add_file_name_to_url` (src/tool_operhlp.c): the very first
+    // thing curl does is round-trip the URL through the URL API
+    // (`curl_url_set(CURLUPART_URL, *inurlp, CURLU_GUESS_SCHEME |
+    // CURLU_NON_SUPPORT_SCHEME)`), which *validates* the input. A malformed URL
+    // — e.g. one carrying an unencoded space or other control byte that
+    // `Curl_junkscan` rejects — is reported here as `CURLE_URL_MALFORMAT` (3),
+    // and crucially this happens in `create_single` BEFORE `pre_transfer` opens
+    // the `-T` upload file. Without this check curl-rs reached the file open
+    // first and returned `CURLE_READ_ERROR` (26) for a nonexistent upload file,
+    // masking the URL error. The flags match the main transfer parse in
+    // `Easy::pre_perform`, so any URL that the transfer would accept still
+    // passes here unchanged. Oracle: tests/data/test1469.
+    {
+        use curl_rs_lib::url::{CurlUPart, CURLU_GUESS_SCHEME, CURLU_NON_SUPPORT_SCHEME};
+        let mut uh = curl_rs_lib::Url::new();
+        if let Err(e) = uh.set(
+            CurlUPart::Url,
+            Some(inurl),
+            CURLU_GUESS_SCHEME | CURLU_NON_SUPPORT_SCHEME,
+        ) {
+            return Err(urlerr_cvt(e as i32));
+        }
+    }
+
     // A query string means the path part is considered complete (C returns OK
     // without modifying the URL).
     if inurl.contains('?') {
@@ -1474,6 +1522,40 @@ impl Driver {
                 return e.code();
             }
 
+            // (16b) Emit the `--libcurl <file>` C source when requested. curl
+            // accumulates this during config2setopts and dumps it once at the
+            // end of the operation (dumpeasysrc). Every `--libcurl` regression
+            // test is a single transfer, so writing here — guarded by a
+            // `take()` so only the first glob iteration writes — is equivalent
+            // and avoids carrying generator state into the transfer loop.
+            if global.libcurl.is_some() {
+                // curl emits `CURLOPT_INFILESIZE_LARGE` into the `--libcurl`
+                // source for a regular-file `-T` upload. The transfer-time size
+                // (`per.uploadfilesize`) is computed later in `pre_transfer`,
+                // but curl's easysrc dump runs post-transfer once the size is
+                // known (tool_operate.c), so compute it here with a read-only
+                // stat (idempotent with `pre_transfer`). Non-regular files and
+                // stdin leave it `-1` (no emission), matching `pre_transfer`'s
+                // `S_ISREG` gate, so the HTTP `--libcurl` tests are unaffected.
+                let gen_uploadsize: i64 = match per.uploadfile.as_deref() {
+                    Some(f) if !stdin_upload(f) => std::fs::metadata(f)
+                        .ok()
+                        .filter(std::fs::Metadata::is_file)
+                        .map_or(-1, |m| m.len() as i64),
+                    _ => -1,
+                };
+                let src = crate::libcurl_src::generate(
+                    global,
+                    &global.operations[config_idx],
+                    &per.sp.url,
+                    per.uploadfile.as_deref(),
+                    gen_uploadsize,
+                );
+                if let Some(path) = global.libcurl.take() {
+                    crate::libcurl_src::dump(global, &path, &src);
+                }
+            }
+
             // (17) Seed retry bookkeeping for the serial/parallel loops.
             per.retry_sleep_default = global.operations[config_idx].retry_delay_ms;
             per.retry_remaining = global.operations[config_idx].req_retry;
@@ -1960,6 +2042,19 @@ impl WriteCallbacks for CliWriteSink<'_> {
         Some(crate::callbacks::header::tool_header_cb(data, per, global))
     }
 
+    fn set_effective_scheme(&mut self, scheme: &str) {
+        // The engine rewrote `CURLINFO_SCHEME` on a cross-protocol redirect
+        // hand-off (e.g. an HTTP `PUT` redirected to an `ftp://` target). Record
+        // the new effective scheme so `tool_header_cb` gates the `-i`/`--include`
+        // body echo on the protocol actually producing each line — the handle is
+        // moved out for the transfer, so it cannot read `getinfo(CURLINFO_SCHEME)`
+        // the way curl's `tool_header_cb` does. This keeps the FTP control
+        // responses (drained as `INFO`) off stdout once the effective scheme is
+        // `ftp`. Oracle: tests/data/test1055 (HTTP PUT Location: → FTP STOR).
+        let mut st = self.state.lock().expect("CLI I/O bridge mutex poisoned");
+        st.per.effective_scheme = Some(scheme.to_ascii_lowercase());
+    }
+
     fn debug(&mut self, infotype: DebugInfoType, data: &[u8]) {
         // CURLOPT_DEBUGFUNCTION: route the engine's trace events to curl's
         // `tool_debug_cb`, which renders the `-v` plain trace (the `* `/`> `/`< `
@@ -2032,6 +2127,26 @@ impl ReadCallback for CliReadSource<'_> {
         let CliIoState { per, global } = &mut *st;
         crate::callbacks::read::tool_read_cb(buf, per, global).to_curl_return()
     }
+
+    fn rewind(&mut self) {
+        // curl's `CURLOPT_SEEKFUNCTION` for the CLI (`src/tool_cb_see.c`
+        // `tool_seek_cb`): seek the `-T` upload fd back to the start so the body
+        // can be re-read when libcurl rewinds before a credentialed resend
+        // (`401`/`407`) or re-issues it after a body-preserving redirect
+        // (`307`/`308`) — including a cross-protocol HTTP `PUT` → FTP `STOR`
+        // hand-off (tests/data/test1055). `per.uploadedsofar` is the CLI's own
+        // consumed-byte counter (`tool_read_cb`'s done-check / size cap); reset
+        // it so the upload restarts cleanly for the re-read. A best-effort seek
+        // matches `tool_seek_cb`, which lets libcurl fall back if the source is
+        // unseekable (stdin), and `infile == None` (stdin) is left untouched.
+        use std::io::Seek as _;
+        let mut st = self.state.lock().expect("CLI I/O bridge mutex poisoned");
+        let CliIoState { per, .. } = &mut *st;
+        if let Some(file) = per.infile.as_mut() {
+            let _ = file.seek(std::io::SeekFrom::Start(0));
+        }
+        per.uploadedsofar = 0;
+    }
 }
 
 /// Drive one transfer through [`Easy::perform_with`](curl_rs_lib::Easy::perform_with),
@@ -2059,6 +2174,17 @@ async fn perform_with_cli_io(
     per: &mut PerTransfer,
     global: &mut GlobalConfig,
 ) -> Result<(), CurlError> {
+    // Precompute the effective `CURLINFO_SCHEME` gate for `tool_header_cb`'s
+    // `--include` header echo WHILE the configured handle is still in place: an
+    // `ftp://` request driven AS HTTP over a forward HTTP proxy reports scheme
+    // `http` (curl's `PROTOPT_PROXY_AS_HTTP` swap), and the header callback must
+    // echo the proxy's HTTP response headers accordingly. curl's tool reads this
+    // via `curl_easy_getinfo(CURLINFO_SCHEME)` inside the callback, but the CLI
+    // cannot — the handle is moved out below for the async I/O bridge, so a
+    // mid-transfer getinfo would see only the placeholder. Capture it now.
+    // Oracle: tests/data/test79, test208, test299, test1077/1092/1098.
+    per.proxy_as_http = per.easy.ftp_driven_as_http_proxy();
+
     // Move the real handle out (leaving `Easy::default()`) so `perform_with`
     // borrows it disjointly from the `per` the bridge holds. `Easy` has no custom
     // `Drop`, so dropping the placeholder on restore is a benign field-wise drop.
@@ -2331,6 +2457,22 @@ impl ReadCallback for ParallelReadSource {
         };
         c.uploadedsofar += rc as i64;
         rc
+    }
+
+    fn rewind(&mut self) {
+        // The `Send` analogue of `CliReadSource::rewind` for a multi-driven
+        // (`-Z/--parallel`) transfer: seek the moved-out `-T` upload fd back to
+        // the start and reset the cell's consumed-byte counter so a rewind
+        // before a credentialed resend or a body-preserving redirect re-reads
+        // the body from byte 0. Best-effort seek (matches `tool_seek_cb`);
+        // `infile == None` (stdin) is left untouched.
+        use std::io::Seek as _;
+        let mut guard = self.cell.lock().expect("parallel I/O cell mutex poisoned");
+        let c = &mut *guard;
+        if let Some(file) = c.infile.as_mut() {
+            let _ = file.seek(std::io::SeekFrom::Start(0));
+        }
+        c.uploadedsofar = 0;
     }
 }
 
@@ -3268,8 +3410,18 @@ fn post_per_transfer(
         }
 
         // If the custom progress bar drew anything, close it with a newline.
+        // curl's `tool_operate.c` (L753-757) does `fputs("\n", per->progressbar.out)`
+        // — and `per->progressbar.out` is `tool_stderr` (`progressbarinit` sets
+        // `bar->out = tool_stderr`), the redirectable diagnostic stream, NOT the
+        // raw process stderr. The bar frames themselves are written through
+        // `crate::messages::emit_raw` (the `tool_stderr` model that `--stderr`
+        // retargets), so the closing newline MUST go to that same sink; using
+        // `eprintln!()` here would send it to the real fd 2 instead, leaving a
+        // `--stderr <file>` capture missing its trailing newline. Oracle:
+        // tests/data/test1148 (`-# --stderr <file>` expects the bar line to be
+        // newline-terminated inside the file).
         if global.progressmode == CURL_PROGRESS_BAR && per.progressbar.calls > 0 {
-            eprintln!();
+            crate::messages::emit_raw(b"\n");
         }
 
         result = post_close_output(global, per, result);
@@ -3355,7 +3507,24 @@ fn post_check_result(global: &GlobalConfig, per: &PerTransfer, result: CurlCode)
                 // `CURLE_COULDNT_RESOLVE_PROXY` names the *proxy* host, not the
                 // URL host, so it intentionally keeps the generic description.)
                 match resolve_failure_host(per) {
-                    Some(host) => format!("Could not resolve host: {host}"),
+                    // RFC 7686: curl refuses to resolve `.onion` addresses with
+                    // a dedicated message (`failf(data, "Not resolving .onion
+                    // address (RFC 7686)")`, lib/hostip.c). The resolver returns
+                    // the same `CURLE_COULDNT_RESOLVE_HOST` code as an ordinary
+                    // lookup failure, so the two are distinguished here by the
+                    // offending host, applying the resolver's identical guard
+                    // (length >= 7 plus a `.onion`/`.onion.` suffix, matched
+                    // case-insensitively as curl's `curl_strequal` does).
+                    Some(host) => {
+                        let lower = host.to_ascii_lowercase();
+                        if host.len() >= 7
+                            && (lower.ends_with(".onion") || lower.ends_with(".onion."))
+                        {
+                            "Not resolving .onion address (RFC 7686)".to_string()
+                        } else {
+                            format!("Could not resolve host: {host}")
+                        }
+                    }
                     None => CurlError::from_code(result).description().to_string(),
                 }
             } else {
@@ -4411,6 +4580,20 @@ mod tests {
             add_file_name_to_url("http://host", "a b~c.txt").unwrap(),
             "http://host/a%20b~c.txt"
         );
+    }
+
+    /// A malformed upload URL — one carrying an unencoded space (or other
+    /// control byte rejected by `Curl_junkscan`) — is reported as
+    /// `CURLE_URL_MALFORMAT` (3) by `add_file_name_to_url` itself, mirroring C's
+    /// initial `curl_url_set(CURLUPART_URL, ...)` validation. This guarantees
+    /// the exit code is 3 even when the (irrelevant) `-T` upload file does not
+    /// exist, because validation precedes the file open in `pre_transfer`.
+    /// Oracle: tests/data/test1469.
+    #[test]
+    fn add_file_name_rejects_malformed_url_with_space() {
+        let err = add_file_name_to_url("ftp://host:21/1469%/with space/", "irrelevant")
+            .expect_err("a URL with an unencoded space must be rejected");
+        assert_eq!(err, codes::CURLE_URL_MALFORMAT);
     }
 
     /// SSL-session export is not a capability of this build, so the gate is

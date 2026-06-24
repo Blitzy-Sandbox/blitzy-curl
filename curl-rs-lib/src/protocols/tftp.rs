@@ -601,6 +601,12 @@ pub struct TftpConn {
     deadline: CurlTime,
     /// Download size advertised by the server's `tsize` option, if any.
     download_size: Option<u64>,
+    /// Cumulative count of *payload* bytes transferred — DATA payload written
+    /// to the body sink (download) or read from the upload source and sent
+    /// (upload). This is the analog of curl's `progress.downloaded` /
+    /// `progress.uploaded` counters and is the input to the low-speed-limit
+    /// rate check ([`Curl_speedcheck`-equivalent in `run_transfer`]).
+    transferred: u64,
 }
 
 impl TftpConn {
@@ -637,6 +643,7 @@ impl TftpConn {
             spacket: Vec::new(),
             deadline: CurlTime::zero(),
             download_size: None,
+            transferred: 0,
         }
     }
 
@@ -823,6 +830,10 @@ impl TftpConn {
                 // empty block is acknowledged but not duplicated into the body.
                 if self.rbytes > 4 && next_blocknum(self.block) == block_of(&self.rpacket) {
                     sink.write(&self.rpacket[4..self.rbytes])?;
+                    // Count the freshly delivered payload toward the transfer
+                    // rate (curl's `progress.downloaded`). Retransmitted or
+                    // duplicate blocks are not double-counted.
+                    self.transferred = self.transferred.saturating_add((self.rbytes - 4) as u64);
                 }
             }
             TftpEvent::Error => {
@@ -1157,6 +1168,11 @@ impl TftpConn {
                 }
                 payload.truncate(total);
                 self.sbytes = total;
+                // Count the freshly read payload toward the transfer rate
+                // (curl's `progress.uploaded`). A retransmission resends
+                // `spacket` from the `Timeout` arm without rebuilding, so it is
+                // never counted twice.
+                self.transferred = self.transferred.saturating_add(self.sbytes as u64);
 
                 let packet = encode_data(self.block, &payload);
                 self.spacket = packet.clone();
@@ -1346,6 +1362,63 @@ pub trait TftpDataSource: Send {
 // Drive loop
 // =============================================================================
 
+/// The low-speed-limit decision for one sampling tick — curl's `Curl_speedcheck`
+/// (`lib/speedcheck.c`), reduced to its pure timer logic so it can be unit
+/// tested deterministically.
+///
+/// Given the cumulative payload byte count `transferred`, the transfer-start
+/// instant `xfer_start`, the sampling instant `now`, and the user's
+/// `low_speed_limit` (the bytes/sec floor) and `low_speed_time` (the window in
+/// seconds), this updates the `keeps_speed` timer in place and returns `true`
+/// once the measured rate has stayed below the floor for at least the window —
+/// the point at which curl aborts the transfer with
+/// [`CurlError::OperationTimedout`].
+///
+/// The C timer is mirrored exactly:
+/// * the first sample below the floor *starts* `keeps_speed`;
+/// * a later sample still below the floor fires once `now - keeps_speed`
+///   reaches `low_speed_time` seconds;
+/// * any sample at or above the floor *rearms* the timer (clears `keeps_speed`).
+///
+/// The rate is the average over the whole transfer so far
+/// (`transferred * 1000 / elapsed_ms`); a not-yet-started clock
+/// (`elapsed_ms <= 0`) is treated as "exactly at the floor" so an empty first
+/// tick can neither divide by zero nor abort spuriously. The caller is
+/// responsible for invoking this only when the check is armed (both options
+/// non-zero), matching curl, which never consults `low_speed_*` when either is
+/// zero.
+fn low_speed_exceeded(
+    transferred: u64,
+    xfer_start: CurlTime,
+    now: CurlTime,
+    low_speed_limit: i64,
+    low_speed_time: u16,
+    keeps_speed: &mut Option<CurlTime>,
+) -> bool {
+    let elapsed_ms = curlx_timediff(now, xfer_start);
+    let current_speed = if elapsed_ms > 0 {
+        transferred.saturating_mul(1000) / (elapsed_ms as u64)
+    } else {
+        // Too early to have a meaningful rate; count as "at the floor".
+        low_speed_limit as u64
+    };
+    if current_speed < low_speed_limit as u64 {
+        match *keeps_speed {
+            None => {
+                // First slow sample: arm the timer, do not yet abort.
+                *keeps_speed = Some(now);
+                false
+            }
+            // Already slow: abort once the gap reaches the window.
+            Some(since) => curlx_timediff(now, since) >= i64::from(low_speed_time) * 1000,
+        }
+    } else {
+        // Fast enough: rearm the timer.
+        *keeps_speed = None;
+        false
+    }
+}
+
 /// Drive a TFTP transfer to completion over the supplied transport.
 ///
 /// This is the async counterpart of `tftp.c`'s `tftp_multi_statemach` loop. It
@@ -1360,12 +1433,19 @@ pub trait TftpDataSource: Send {
 ///
 /// Returns a [`CurlError`] for any protocol failure, transport error, or
 /// timeout, exactly as curl's TFTP handler would.
+// The drive loop legitimately needs the request, the three I/O traits, the
+// transfer deadline, the low-speed floor/window, the verbose flag, and the
+// error-buffer sink — the same shape as the sibling protocol drivers
+// (`smtp`, `ssh::sftp`, `file`) that carry the identical allow.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_transfer(
     req: TftpRequest,
     io: &mut dyn TftpIo,
     sink: &mut dyn TftpDataSink,
     source: &mut dyn TftpDataSource,
     timeleft_ms: i64,
+    low_speed_limit: i64,
+    low_speed_time: u16,
     verbose: bool,
     errbuf: &mut Option<String>,
 ) -> Result<()> {
@@ -1374,6 +1454,19 @@ pub async fn run_transfer(
     conn.set_deadline_ms(timeleft_ms);
     // Initial timeout parameters (the C `tftp_connect` calls set_timeouts once).
     conn.refresh_timeouts(errbuf)?;
+
+    // Low-speed-limit abort state — curl's `Curl_speedcheck` (lib/speedcheck.c),
+    // which the generic transfer loop applies to every protocol. It is armed
+    // *only* when the caller set BOTH `CURLOPT_LOW_SPEED_LIMIT` (`-Y`) and
+    // `CURLOPT_LOW_SPEED_TIME` (`-y`); every transfer that does not — which is
+    // every other TFTP test — leaves `speedcheck` false, so the entire block
+    // below is inert and the wire-visible retransmission cadence is untouched.
+    // `xfer_start` anchors the average-rate clock (shared with the deadline
+    // clock, `curlx_now`), and `keeps_speed` records the instant the measured
+    // rate first dropped below the floor.
+    let speedcheck = low_speed_limit > 0 && low_speed_time > 0;
+    let xfer_start = curlx_now();
+    let mut keeps_speed: Option<CurlTime> = None;
 
     // INIT: send the first RRQ/WRQ.
     let first = conn.step(TftpEvent::Init, source, errbuf)?;
@@ -1405,6 +1498,34 @@ pub async fn run_transfer(
             }
             None => TftpEvent::Timeout,
         };
+
+        // Abort if the transfer has stayed below the low-speed floor for longer
+        // than the low-speed window — curl's `Curl_speedcheck`. The average rate
+        // is taken over the whole transfer so far, which tends to zero for a
+        // stalled server and so trips the timer; this is the behavior `test1238`
+        // (`-Y1000 -y2` against a server that pauses before the first DATA block)
+        // expects — `CURLE_OPERATION_TIMEDOUT` (28) rather than exhausting the
+        // retransmission retries into a connect failure (7). When the check is
+        // not armed (`speedcheck == false`) the helper is never called.
+        if speedcheck
+            && low_speed_exceeded(
+                conn.transferred,
+                xfer_start,
+                curlx_now(),
+                low_speed_limit,
+                low_speed_time,
+                &mut keeps_speed,
+            )
+        {
+            conn.error = TftpError::Timeout;
+            failf(
+                errbuf,
+                &format!(
+                    "Operation too slow. Less than {low_speed_limit} bytes/sec transferred the last {low_speed_time} seconds"
+                ),
+            );
+            return Err(CurlError::OperationTimedout);
+        }
 
         let outcome = conn.step(event, source, errbuf)?;
         if let Some(packet) = outcome.send {
@@ -1695,6 +1816,11 @@ pub(crate) async fn perform_tftp(
         &mut tftp_sink,
         &mut tftp_source,
         timeleft_ms,
+        // Low-speed-limit abort (`-Y`/`-y`). curl applies the generic
+        // `Curl_speedcheck` to TFTP just like any other protocol; passing the
+        // user's options through arms it (and leaves it inert when unset).
+        data.set.low_speed_limit,
+        data.set.low_speed_time,
         verbose,
         &mut errbuf,
     )
@@ -2157,7 +2283,7 @@ mod tests {
         let mut src = EmptySource;
         let mut eb = None;
 
-        run_transfer(req, &mut io, &mut sink, &mut src, 60_000, false, &mut eb)
+        run_transfer(req, &mut io, &mut sink, &mut src, 60_000, 0, 0, false, &mut eb)
             .await
             .unwrap();
 
@@ -2190,7 +2316,7 @@ mod tests {
         let mut src = EmptySource;
         let mut eb = None;
 
-        run_transfer(req, &mut io, &mut sink, &mut src, 60_000, false, &mut eb)
+        run_transfer(req, &mut io, &mut sink, &mut src, 60_000, 0, 0, false, &mut eb)
             .await
             .unwrap();
 
@@ -2223,7 +2349,7 @@ mod tests {
         let mut src = VecSource::new(payload.clone());
         let mut eb = None;
 
-        run_transfer(req, &mut io, &mut sink, &mut src, 60_000, false, &mut eb)
+        run_transfer(req, &mut io, &mut sink, &mut src, 60_000, 0, 0, false, &mut eb)
             .await
             .unwrap();
 
@@ -2260,7 +2386,7 @@ mod tests {
         let mut src = VecSource::new(payload.clone());
         let mut eb = None;
 
-        run_transfer(req, &mut io, &mut sink, &mut src, 60_000, false, &mut eb)
+        run_transfer(req, &mut io, &mut sink, &mut src, 60_000, 0, 0, false, &mut eb)
             .await
             .unwrap();
 
@@ -2290,7 +2416,7 @@ mod tests {
         let mut src = EmptySource;
         let mut eb = None;
 
-        let result = run_transfer(req, &mut io, &mut sink, &mut src, 60_000, false, &mut eb).await;
+        let result = run_transfer(req, &mut io, &mut sink, &mut src, 60_000, 0, 0, false, &mut eb).await;
         assert!(matches!(result, Err(CurlError::TftpNotfound)));
     }
 
@@ -2312,11 +2438,66 @@ mod tests {
         let mut eb = None;
 
         // 15s budget → retry_max == 3, so the request is sent then retried.
-        let result = run_transfer(req, &mut io, &mut sink, &mut src, 15_000, false, &mut eb).await;
+        let result = run_transfer(req, &mut io, &mut sink, &mut src, 15_000, 0, 0, false, &mut eb).await;
         assert!(matches!(result, Err(CurlError::CouldntConnect)));
         // The initial RRQ plus retransmissions were all sent.
         assert!(io.sent.len() >= 2);
         assert!(io.sent.iter().all(|p| opcode_of(p) == TFTP_OPCODE_RRQ));
+    }
+
+    // ---- Low-speed-limit (Curl_speedcheck) -----------------------------------
+
+    /// A `CurlTime` `secs` seconds from a fixed origin, for deterministic timer
+    /// arithmetic in [`low_speed_exceeded`].
+    fn at(secs: u64) -> CurlTime {
+        CurlTime::from_duration(Duration::from_secs(secs))
+    }
+
+    #[test]
+    fn low_speed_arms_then_aborts_after_window() {
+        // A stalled transfer (0 bytes) under a 1000 B/s floor with a 2 s window.
+        let start = at(100);
+        let mut keeps = None;
+
+        // First slow sample only ARMS the timer (curl: start `keeps_speed`).
+        assert!(!low_speed_exceeded(0, start, at(105), 1000, 2, &mut keeps));
+        assert_eq!(keeps, Some(at(105)));
+
+        // A later slow sample still inside the window (106 - 105 = 1 s < 2 s)
+        // does not yet abort, and leaves the armed instant unchanged.
+        assert!(!low_speed_exceeded(0, start, at(106), 1000, 2, &mut keeps));
+        assert_eq!(keeps, Some(at(105)));
+
+        // Once the gap reaches the window (107 - 105 = 2 s >= 2 s) → abort.
+        assert!(low_speed_exceeded(0, start, at(107), 1000, 2, &mut keeps));
+    }
+
+    #[test]
+    fn low_speed_fast_sample_rearms_timer() {
+        // 10_000 bytes over 5 s = 2000 B/s >= the 1000 floor → clear an armed
+        // timer and never abort.
+        let mut keeps = Some(at(3));
+        assert!(!low_speed_exceeded(10_000, at(0), at(5), 1000, 2, &mut keeps));
+        assert_eq!(keeps, None);
+    }
+
+    #[test]
+    fn low_speed_unstarted_clock_is_not_slow() {
+        // elapsed == 0 must neither divide by zero nor abort; it counts as
+        // "exactly at the floor", which rearms rather than arms the timer.
+        let t = at(42);
+        let mut keeps = None;
+        assert!(!low_speed_exceeded(0, t, t, 1000, 2, &mut keeps));
+        assert_eq!(keeps, None);
+    }
+
+    #[test]
+    fn low_speed_exactly_at_floor_does_not_arm() {
+        // 2000 bytes over 2 s = exactly 1000 B/s; `< floor` is false, so the
+        // transfer is considered fast enough and the timer is not armed.
+        let mut keeps = None;
+        assert!(!low_speed_exceeded(2000, at(10), at(12), 1000, 2, &mut keeps));
+        assert_eq!(keeps, None);
     }
 
     // ---- Transport (real loopback sockets) ----------------------------------
@@ -2378,5 +2559,509 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(conn.transport_wanted, TRNSPRT_UDP);
+    }
+
+    // ---- TftpError mapping (every arm) --------------------------------------
+
+    #[test]
+    fn tftp_error_from_code_covers_all_named_and_other() {
+        assert!(matches!(TftpError::from_code(0), TftpError::Undef));
+        assert!(matches!(TftpError::from_code(1), TftpError::Notfound));
+        assert!(matches!(TftpError::from_code(2), TftpError::Perm));
+        assert!(matches!(TftpError::from_code(3), TftpError::Diskfull));
+        assert!(matches!(TftpError::from_code(4), TftpError::Illegal));
+        assert!(matches!(TftpError::from_code(5), TftpError::Unknownid));
+        assert!(matches!(TftpError::from_code(6), TftpError::Exists));
+        assert!(matches!(TftpError::from_code(7), TftpError::Nosuchuser));
+        assert!(matches!(TftpError::from_code(99), TftpError::Other(99)));
+    }
+
+    #[test]
+    fn tftp_error_translate_covers_all_arms() {
+        assert!(TftpError::None.translate().is_ok());
+        assert!(matches!(
+            TftpError::Notfound.translate(),
+            Err(CurlError::TftpNotfound)
+        ));
+        assert!(matches!(
+            TftpError::Perm.translate(),
+            Err(CurlError::TftpPerm)
+        ));
+        assert!(matches!(
+            TftpError::Diskfull.translate(),
+            Err(CurlError::RemoteDiskFull)
+        ));
+        assert!(matches!(
+            TftpError::Undef.translate(),
+            Err(CurlError::TftpIllegal)
+        ));
+        assert!(matches!(
+            TftpError::Illegal.translate(),
+            Err(CurlError::TftpIllegal)
+        ));
+        assert!(matches!(
+            TftpError::Unknownid.translate(),
+            Err(CurlError::TftpUnknownid)
+        ));
+        assert!(matches!(
+            TftpError::Exists.translate(),
+            Err(CurlError::RemoteFileExists)
+        ));
+        assert!(matches!(
+            TftpError::Nosuchuser.translate(),
+            Err(CurlError::TftpNosuchuser)
+        ));
+        assert!(matches!(
+            TftpError::Timeout.translate(),
+            Err(CurlError::OperationTimedout)
+        ));
+        assert!(matches!(
+            TftpError::Noresponse.translate(),
+            Err(CurlError::CouldntConnect)
+        ));
+        assert!(matches!(
+            TftpError::Other(42).translate(),
+            Err(CurlError::AbortedByCallback)
+        ));
+    }
+
+    // ---- rx() state-machine branches (download) -----------------------------
+
+    /// A connection pre-positioned in the `RX` state with the given negotiated
+    /// block size, last-acked block, and a retry budget so the timeout arms can
+    /// be driven without a real deadline.
+    fn rx_conn(blksize: usize, block: u16) -> TftpConn {
+        let mut c = dl_conn(blksize as u16);
+        c.state = TftpState::Rx;
+        c.blksize = blksize;
+        c.block = block;
+        c.retry_max = 3;
+        c
+    }
+
+    #[test]
+    fn rx_expected_full_block_acks_and_continues() {
+        let mut c = rx_conn(512, 4);
+        c.retries = 2;
+        c.set_received(&encode_data(5, &[b'X'; 512]));
+        let mut eb = None;
+        let out = c.rx(TftpEvent::Data, &mut eb).unwrap();
+        assert_eq!(out.send, Some(encode_ack(5)));
+        assert!(!out.done);
+        assert_eq!(c.state(), TftpState::Rx);
+        assert_eq!(c.block, 5);
+        assert_eq!(c.retries, 0, "a fresh expected block clears the retry count");
+    }
+
+    #[test]
+    fn rx_short_final_block_finishes() {
+        let mut c = rx_conn(512, 4);
+        c.set_received(&encode_data(5, &[b'X'; 10]));
+        let mut eb = None;
+        let out = c.rx(TftpEvent::Data, &mut eb).unwrap();
+        assert_eq!(out.send, Some(encode_ack(5)));
+        assert!(out.done);
+        assert_eq!(c.state(), TftpState::Fin);
+    }
+
+    #[test]
+    fn rx_duplicate_last_block_reacks_without_finishing() {
+        let mut c = rx_conn(512, 5);
+        c.set_received(&encode_data(5, &[b'X'; 512]));
+        let mut eb = None;
+        let out = c.rx(TftpEvent::Data, &mut eb).unwrap();
+        assert_eq!(out.send, Some(encode_ack(5)));
+        assert!(!out.done);
+    }
+
+    #[test]
+    fn rx_out_of_order_block_is_ignored() {
+        let mut c = rx_conn(512, 5);
+        c.set_received(&encode_data(9, &[b'X'; 512]));
+        let mut eb = None;
+        let out = c.rx(TftpEvent::Data, &mut eb).unwrap();
+        assert_eq!(out.send, None);
+        assert!(!out.done);
+        assert_eq!(c.block, 5, "an out-of-order block must not advance the cursor");
+    }
+
+    #[test]
+    fn rx_oack_acks_block_zero() {
+        let mut c = rx_conn(512, 7);
+        let mut eb = None;
+        let out = c.rx(TftpEvent::Oack, &mut eb).unwrap();
+        assert_eq!(out.send, Some(encode_ack(0)));
+        assert!(!out.done);
+        assert_eq!(c.block, 0);
+        assert_eq!(c.state(), TftpState::Rx);
+    }
+
+    #[test]
+    fn rx_timeout_resends_then_gives_up() {
+        let mut c = rx_conn(512, 3);
+        c.retry_max = 1;
+        c.spacket = encode_ack(3);
+        let mut eb = None;
+        // retries 1 (<= max) -> resend the last ACK.
+        let out = c.rx(TftpEvent::Timeout, &mut eb).unwrap();
+        assert_eq!(out.send, Some(encode_ack(3)));
+        assert!(!out.done);
+        // retries 2 (> max) -> give up.
+        let out = c.rx(TftpEvent::Timeout, &mut eb).unwrap();
+        assert!(out.done);
+        assert_eq!(c.state(), TftpState::Fin);
+        assert!(matches!(c.error, TftpError::Timeout));
+    }
+
+    #[test]
+    fn rx_error_event_finishes_with_error_reply() {
+        let mut c = rx_conn(512, 2);
+        let mut eb = None;
+        let out = c.rx(TftpEvent::Error, &mut eb).unwrap();
+        assert_eq!(out.send, Some(encode_error_reply(2)));
+        assert!(out.done);
+        assert_eq!(c.state(), TftpState::Fin);
+    }
+
+    #[test]
+    fn rx_illegal_event_errors() {
+        let mut c = rx_conn(512, 1);
+        let mut eb = None;
+        assert!(matches!(
+            c.rx(TftpEvent::Ack, &mut eb),
+            Err(CurlError::TftpIllegal)
+        ));
+    }
+
+    // ---- tx() state-machine branches (upload) -------------------------------
+
+    /// A connection pre-positioned in the `TX` state for an upload.
+    fn tx_conn(blksize: usize, block: u16) -> TftpConn {
+        let mut c = TftpConn::new(TftpRequest {
+            filename: "up".to_string(),
+            mode: TftpMode::Octet,
+            upload: true,
+            requested_blksize: blksize as u16,
+            no_options: true,
+            infilesize: -1,
+        });
+        c.state = TftpState::Tx;
+        c.blksize = blksize;
+        c.block = block;
+        c.retry_max = 3;
+        c
+    }
+
+    #[test]
+    fn tx_ack_advances_and_sends_next_data() {
+        let mut c = tx_conn(512, 1);
+        c.sbytes = 512; // the previous (block 1) send was a full block, so not EOF
+        c.set_received(&encode_ack(1));
+        let mut src = VecSource::new(vec![0x42; 512]);
+        let mut eb = None;
+        let out = c.tx(TftpEvent::Ack, &mut src, &mut eb).unwrap();
+        assert_eq!(c.block, 2);
+        let pkt = out.send.unwrap();
+        assert_eq!(opcode_of(&pkt), TFTP_OPCODE_DATA);
+        assert_eq!(block_of(&pkt), 2);
+        assert_eq!(pkt.len(), 4 + 512);
+    }
+
+    #[test]
+    fn tx_ack_mismatch_resends_then_gives_up() {
+        let mut c = tx_conn(512, 3);
+        c.retry_max = 1;
+        c.spacket = encode_data(3, &[0u8; 4]);
+        c.set_received(&encode_ack(99));
+        let mut src = EmptySource;
+        let mut eb = None;
+        // retries 1 (<= max) -> resend the in-flight DATA.
+        let out = c.tx(TftpEvent::Ack, &mut src, &mut eb).unwrap();
+        assert_eq!(out.send, Some(encode_data(3, &[0u8; 4])));
+        // retries 2 (> max) -> SendError.
+        let r = c.tx(TftpEvent::Ack, &mut src, &mut eb);
+        assert!(matches!(r, Err(CurlError::SendError)));
+    }
+
+    #[test]
+    fn tx_first_ack_wraparound_tolerated() {
+        // tftpd-hpa replies to a WRQ with ACK(0xffff) instead of ACK(0); the
+        // very first ACK tolerates that off-by-one wraparound.
+        let mut c = tx_conn(512, 0);
+        c.set_received(&encode_ack(0xffff));
+        let mut src = VecSource::new(vec![0x11; 100]);
+        let mut eb = None;
+        let out = c.tx(TftpEvent::Ack, &mut src, &mut eb).unwrap();
+        assert_eq!(c.block, 1);
+        assert_eq!(block_of(&out.send.unwrap()), 1);
+    }
+
+    #[test]
+    fn tx_oack_sends_first_data_as_block_one() {
+        let mut c = tx_conn(512, 0);
+        let mut src = VecSource::new(vec![0x33; 200]);
+        let mut eb = None;
+        let out = c.tx(TftpEvent::Oack, &mut src, &mut eb).unwrap();
+        assert_eq!(c.block, 1);
+        let pkt = out.send.unwrap();
+        assert_eq!(block_of(&pkt), 1);
+        assert_eq!(pkt.len(), 4 + 200);
+    }
+
+    #[test]
+    fn tx_short_previous_send_signals_eof() {
+        let mut c = tx_conn(512, 1);
+        c.sbytes = 10; // the previous DATA send was short -> EOF after its ACK
+        c.set_received(&encode_ack(1));
+        let mut src = EmptySource;
+        let mut eb = None;
+        let out = c.tx(TftpEvent::Ack, &mut src, &mut eb).unwrap();
+        assert!(out.done);
+        assert_eq!(c.state(), TftpState::Fin);
+        assert_eq!(out.send, None);
+    }
+
+    #[test]
+    fn tx_timeout_resends_then_gives_up() {
+        let mut c = tx_conn(512, 2);
+        c.retry_max = 1;
+        c.spacket = encode_data(2, &[7u8; 8]);
+        let mut src = EmptySource;
+        let mut eb = None;
+        let out = c.tx(TftpEvent::Timeout, &mut src, &mut eb).unwrap();
+        assert_eq!(out.send, Some(encode_data(2, &[7u8; 8])));
+        assert!(!out.done);
+        let out = c.tx(TftpEvent::Timeout, &mut src, &mut eb).unwrap();
+        assert!(out.done);
+        assert!(matches!(c.error, TftpError::Timeout));
+    }
+
+    #[test]
+    fn tx_error_event_finishes_with_error_reply() {
+        let mut c = tx_conn(512, 4);
+        let mut src = EmptySource;
+        let mut eb = None;
+        let out = c.tx(TftpEvent::Error, &mut src, &mut eb).unwrap();
+        assert_eq!(out.send, Some(encode_error_reply(4)));
+        assert!(out.done);
+    }
+
+    #[test]
+    fn tx_unexpected_event_is_a_noop_outcome() {
+        let mut c = tx_conn(512, 1);
+        let mut src = EmptySource;
+        let mut eb = None;
+        // A `Data` event in the TX state is the C "internal error" arm: no send,
+        // not done.
+        let out = c.tx(TftpEvent::Data, &mut src, &mut eb).unwrap();
+        assert_eq!(out.send, None);
+        assert!(!out.done);
+    }
+
+    // ---- send_first() (START state) -----------------------------------------
+
+    #[test]
+    fn send_first_emits_rrq_with_options() {
+        let mut c = dl_conn(512);
+        c.retry_max = 3;
+        let mut src = EmptySource;
+        let mut eb = None;
+        let out = c.send_first(TftpEvent::Init, &mut src, &mut eb).unwrap();
+        let pkt = out.send.unwrap();
+        assert_eq!(opcode_of(&pkt), TFTP_OPCODE_RRQ);
+        assert!(!out.done);
+    }
+
+    #[test]
+    fn send_first_no_response_after_retry_cap() {
+        let mut c = dl_conn(512);
+        c.retry_max = 0; // the first timeout already exceeds the cap
+        let mut src = EmptySource;
+        let mut eb = None;
+        let out = c.send_first(TftpEvent::Timeout, &mut src, &mut eb).unwrap();
+        assert!(out.done);
+        assert_eq!(c.state(), TftpState::Fin);
+        assert!(matches!(c.error, TftpError::Noresponse));
+    }
+
+    #[test]
+    fn send_first_filename_too_long_is_rejected() {
+        let mut c = TftpConn::new(TftpRequest {
+            filename: "x".repeat(600),
+            mode: TftpMode::Octet,
+            upload: false,
+            requested_blksize: 512,
+            no_options: true,
+            infilesize: -1,
+        });
+        c.retry_max = 3;
+        c.blksize = 512;
+        let mut src = EmptySource;
+        let mut eb = None;
+        assert!(matches!(
+            c.send_first(TftpEvent::Init, &mut src, &mut eb),
+            Err(CurlError::TftpIllegal)
+        ));
+    }
+
+    #[test]
+    fn send_first_oack_event_transitions_to_rx() {
+        let mut c = dl_conn(512);
+        c.set_deadline_ms(60_000); // so refresh_timeouts does not time out
+        let mut src = EmptySource;
+        let mut eb = None;
+        let out = c.send_first(TftpEvent::Oack, &mut src, &mut eb).unwrap();
+        assert_eq!(c.state(), TftpState::Rx);
+        assert_eq!(out.send, Some(encode_ack(0)));
+    }
+
+    // ---- on_receive() event classification ----------------------------------
+
+    #[test]
+    fn on_receive_short_packet_is_timeout() {
+        let mut c = dl_conn(512);
+        c.set_received(&[0, 3]); // 2 bytes < the 4-byte header minimum
+        let mut sink = NullSink;
+        let mut eb = None;
+        assert!(matches!(
+            c.on_receive(&mut sink, &mut eb).unwrap(),
+            TftpEvent::Timeout
+        ));
+    }
+
+    #[test]
+    fn on_receive_fresh_data_is_written_to_sink() {
+        let mut c = dl_conn(512);
+        c.block = 4;
+        c.set_received(&encode_data(5, b"hello"));
+        let mut sink = VecSink::default();
+        let mut eb = None;
+        assert!(matches!(
+            c.on_receive(&mut sink, &mut eb).unwrap(),
+            TftpEvent::Data
+        ));
+        assert_eq!(sink.data, b"hello");
+    }
+
+    #[test]
+    fn on_receive_duplicate_data_is_not_written() {
+        let mut c = dl_conn(512);
+        c.block = 5;
+        c.set_received(&encode_data(5, b"dup")); // current block, not the next
+        let mut sink = VecSink::default();
+        let mut eb = None;
+        assert!(matches!(
+            c.on_receive(&mut sink, &mut eb).unwrap(),
+            TftpEvent::Data
+        ));
+        assert!(sink.data.is_empty());
+    }
+
+    #[test]
+    fn on_receive_error_records_named_error() {
+        let mut c = dl_conn(512);
+        c.set_received(&make_error(1, "nope"));
+        let mut sink = NullSink;
+        let mut eb = None;
+        assert!(matches!(
+            c.on_receive(&mut sink, &mut eb).unwrap(),
+            TftpEvent::Error
+        ));
+        assert!(matches!(c.error, TftpError::Notfound));
+    }
+
+    // ---- parse_option_ack() boundaries --------------------------------------
+
+    #[test]
+    fn parse_option_ack_accepts_valid_blksize_and_tsize() {
+        let mut c = dl_conn(1024);
+        let mut eb = None;
+        c.parse_option_ack(b"blksize\x00512\x00tsize\x004096\x00", &mut eb)
+            .unwrap();
+        assert_eq!(c.blksize(), 512);
+        assert_eq!(c.download_size(), Some(4096));
+    }
+
+    #[test]
+    fn parse_option_ack_rejects_blksize_over_requested() {
+        let mut c = dl_conn(512);
+        let mut eb = None;
+        assert!(matches!(
+            c.parse_option_ack(b"blksize\x001024\x00", &mut eb),
+            Err(CurlError::TftpIllegal)
+        ));
+    }
+
+    #[test]
+    fn parse_option_ack_rejects_zero_blksize() {
+        let mut c = dl_conn(512);
+        let mut eb = None;
+        assert!(matches!(
+            c.parse_option_ack(b"blksize\x000\x00", &mut eb),
+            Err(CurlError::TftpIllegal)
+        ));
+    }
+
+    #[test]
+    fn parse_option_ack_rejects_blksize_below_min() {
+        let mut c = dl_conn(512);
+        let mut eb = None;
+        // 1 is below TFTP_BLKSIZE_MIN (8).
+        assert!(matches!(
+            c.parse_option_ack(b"blksize\x001\x00", &mut eb),
+            Err(CurlError::TftpIllegal)
+        ));
+    }
+
+    #[test]
+    fn parse_option_ack_rejects_blksize_over_max() {
+        let mut c = dl_conn(512);
+        let mut eb = None;
+        // 99999 exceeds TFTP_BLKSIZE_MAX (65464).
+        assert!(matches!(
+            c.parse_option_ack(b"blksize\x0099999\x00", &mut eb),
+            Err(CurlError::TftpIllegal)
+        ));
+    }
+
+    #[test]
+    fn parse_option_ack_rejects_malformed_body() {
+        let mut c = dl_conn(512);
+        let mut eb = None;
+        assert!(matches!(
+            c.parse_option_ack(b"blksize", &mut eb),
+            Err(CurlError::TftpIllegal)
+        ));
+    }
+
+    #[test]
+    fn parse_option_ack_rejects_zero_tsize_on_download() {
+        let mut c = dl_conn(512);
+        let mut eb = None;
+        assert!(matches!(
+            c.parse_option_ack(b"tsize\x000\x00", &mut eb),
+            Err(CurlError::TftpIllegal)
+        ));
+    }
+
+    #[test]
+    fn parse_option_ack_ignores_tsize_on_upload() {
+        let mut c = TftpConn::new(TftpRequest {
+            filename: "up".to_string(),
+            mode: TftpMode::Octet,
+            upload: true,
+            requested_blksize: 512,
+            no_options: false,
+            infilesize: 100,
+        });
+        let mut eb = None;
+        c.parse_option_ack(b"tsize\x004096\x00", &mut eb).unwrap();
+        assert_eq!(c.download_size(), None);
+    }
+
+    #[test]
+    fn event_from_opcode_unknown_is_none() {
+        assert!(matches!(TftpEvent::from_opcode(999), TftpEvent::None));
+        assert!(matches!(TftpEvent::from_opcode(0), TftpEvent::None));
     }
 }

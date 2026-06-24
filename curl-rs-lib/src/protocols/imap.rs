@@ -68,12 +68,13 @@
 //! [RFC 3501]: https://www.rfc-editor.org/rfc/rfc3501
 
 use crate::auth::sasl::{
-    decode_mech, Sasl, SaslParams, SaslProgress, SaslProto, SASL_AUTH_DEFAULT, SASL_FLAG_BASE64,
+    decode_mech, Sasl, SaslParams, SaslProgress, SaslProto, SASL_AUTH_DEFAULT, SASL_AUTH_NONE,
+    SASL_FLAG_BASE64,
 };
 use crate::conn::https_connect::create_tls_filter;
 use crate::conn::{
-    BoxFuture, Connection, Curl_conn_cf_add, Curl_conn_connect, Curl_conn_is_ssl, Curl_conn_send,
-    FIRSTSOCKET, PROTOPT_SSL,
+    BoxFuture, Connection, Curl_conn_cf_add, Curl_conn_connect, Curl_conn_is_alive,
+    Curl_conn_is_ssl, Curl_conn_send, FIRSTSOCKET, PROTOPT_SSL,
 };
 use crate::easy::Easy;
 use crate::error::{CurlError, Result};
@@ -111,6 +112,9 @@ const IMAP_RESP_CONTINUATION: i32 = b'+' as i32;
 // Authentication-type preference flags (C `imap.h` `IMAP_TYPE_*`).
 // ===========================================================================
 
+/// No acceptable authentication style (C `IMAP_TYPE_NONE`). Set when the URL
+/// `;AUTH=` option selected a SASL preference that resolved to no mechanism.
+const IMAP_TYPE_NONE: u8 = 0;
 /// The server/user permits cleartext `LOGIN` (C `IMAP_TYPE_CLEARTEXT`).
 const IMAP_TYPE_CLEARTEXT: u8 = 1 << 0;
 /// The server/user permits SASL `AUTHENTICATE` (C `IMAP_TYPE_SASL`).
@@ -628,6 +632,71 @@ impl Imapc {
         }
     }
 
+    /// Parse the URL/login `;options` string (C `imap_parse_url_options`).
+    ///
+    /// Iterates `key=value` pairs separated by `;`. The only recognized key is
+    /// `AUTH`: `AUTH=+LOGIN` forces cleartext `LOGIN` over any SASL (clearing
+    /// the SASL preference), while `AUTH=<mech>` (or `AUTH=*`) sets the SASL
+    /// `prefmech` via [`Sasl::parse_url_auth_option`]. After parsing, the
+    /// preferred auth *type* ([`Self::preftype`]) is derived from the resulting
+    /// preference exactly as C does. An unrecognized key is a
+    /// [`CurlError::UrlMalformat`].
+    ///
+    /// Without this step the URL's `;AUTH=EXTERNAL` (and `--login-options`)
+    /// never reach `prefmech`, so the engine would silently fall back to
+    /// cleartext `LOGIN` for any explicitly-requested mechanism.
+    fn parse_url_options(&mut self, sasl: &mut Sasl, options: &[u8]) -> Result<()> {
+        let mut result: Result<()> = Ok(());
+        let mut prefer_login = false;
+        let n = options.len();
+        let mut ptr = 0usize;
+
+        while result.is_ok() && ptr < n {
+            let key_start = ptr;
+            while ptr < n && options[ptr] != b'=' {
+                ptr += 1;
+            }
+            // Value begins just after '=' (or at end if there is no '=').
+            let value_start = (ptr + 1).min(n);
+            while ptr < n && options[ptr] != b';' {
+                ptr += 1;
+            }
+            let value = &options[value_start..ptr];
+            let key = &options[key_start..];
+
+            // C `curl_strnequal(key, "AUTH=+LOGIN", 11)`: prefer plaintext LOGIN
+            // over any SASL (including SASL LOGIN). Checked before the generic
+            // `AUTH=` so it is not consumed as a mechanism name.
+            if key.len() >= 11 && key[..11].eq_ignore_ascii_case(b"AUTH=+LOGIN") {
+                prefer_login = true;
+                sasl.prefmech = SASL_AUTH_NONE;
+            } else if key.len() >= 5 && key[..5].eq_ignore_ascii_case(b"AUTH=") {
+                prefer_login = false;
+                result = sasl.parse_url_auth_option(value);
+            } else {
+                prefer_login = false;
+                result = Err(CurlError::UrlMalformat);
+            }
+
+            if ptr < n && options[ptr] == b';' {
+                ptr += 1;
+            }
+        }
+
+        // C post-loop switch: derive the preferred auth type.
+        if prefer_login {
+            self.preftype = IMAP_TYPE_CLEARTEXT;
+        } else {
+            self.preftype = match sasl.prefmech {
+                SASL_AUTH_NONE => IMAP_TYPE_NONE,
+                SASL_AUTH_DEFAULT => IMAP_TYPE_ANY,
+                _ => IMAP_TYPE_SASL,
+            };
+        }
+
+        result
+    }
+
     /// Whether an untagged `line` matches what the `LIST` state expects.
     ///
     /// Mirrors the `IMAP_LIST` arm of C `imap_endofresp`: a plain `LIST` for the
@@ -966,6 +1035,57 @@ fn parse_literal_size(bytes: &[u8]) -> Option<u64> {
     }
 }
 
+/// Whether a custom-request parameter string denotes a *listing*-style
+/// message-set query — `" 1:* (FLAGS …"` or `" 1,2,3 (FLAGS …"` — rather than a
+/// single-message body fetch.
+///
+/// Mirrors C `is_custom_fetch_listing_match` (lib/imap.c L1180): the parameter
+/// run must start with a space, followed by one or more digits, then a `:`
+/// (range) or `,` (enumeration). `custom_params` carries its leading space (see
+/// [`Imap::parse_custom_request`], matching C `imap_parse_custom_request`), so
+/// the leading-space check applies directly. A trailing digit run with no `:`
+/// / `,` (e.g. `" 123 BODY[1]"`) is *not* a listing — its untagged responses
+/// carry a `{size}` literal body that must be streamed.
+fn is_custom_fetch_listing_match(params: &[u8]) -> bool {
+    // First byte must be the separating space.
+    if params.first() != Some(&b' ') {
+        return false;
+    }
+    let mut i = 1;
+    while i < params.len() && params[i].is_ascii_digit() {
+        i += 1;
+    }
+    matches!(params.get(i), Some(&b':') | Some(&b','))
+}
+
+/// Whether the in-flight custom request is a `FETCH`/`UID FETCH` *listing*
+/// query whose untagged `*` responses must NOT be treated as literal bodies.
+///
+/// Mirrors C `is_custom_fetch_listing` (lib/imap.c L1198): only `FETCH` (with
+/// params matched directly) and `UID` (with a `" FETCH "` prefix, matched from
+/// the embedded params) can be listings; every other verb returns `false`,
+/// leaving the normal literal-detection path to run. `custom`/`custom_params`
+/// come straight off the per-request [`Imap`] state.
+fn is_custom_fetch_listing(custom: Option<&str>, custom_params: Option<&str>) -> bool {
+    let Some(custom) = custom else {
+        return false;
+    };
+    if custom.eq_ignore_ascii_case("FETCH") {
+        custom_params.is_some_and(|p| is_custom_fetch_listing_match(p.as_bytes()))
+    } else if custom.eq_ignore_ascii_case("UID") {
+        // C: `curl_strnequal(custom_params, " FETCH ", 7)`, then match from
+        // `custom_params + 6` (i.e. the space before the message set).
+        custom_params.is_some_and(|p| {
+            let b = p.as_bytes();
+            b.len() >= 7
+                && b[..7].eq_ignore_ascii_case(b" FETCH ")
+                && is_custom_fetch_listing_match(&b[6..])
+        })
+    } else {
+        false
+    }
+}
+
 // ===========================================================================
 // Command performers + the response-dispatch state machine. These are async
 // because they send via `PingPong::sendf`. Each `perform_*` mirrors the C
@@ -1288,7 +1408,17 @@ impl Imapc {
                 return Err(CurlError::UrlMalformat);
             }
         };
-        let infilesize = data.set.filesize;
+        // The APPEND literal size: for a `-F` MIME post the body was assembled
+        // eagerly into `mime_body`, so its byte length is the known size; for a
+        // `-T` upload it is `CURLOPT_INFILESIZE` (`data.set.filesize`). C derives
+        // the same value from `data->state.infilesize`, which libcurl sets to the
+        // serialized MIME size for a MIME post (`Curl_mime_size`). Oracle:
+        // tests/data/test647 expects `APPEND 647 (\Seen) {940}` — 940 being the
+        // assembled multipart body length.
+        let infilesize = match &data.set.mime_body {
+            Some(body) => body.len() as i64,
+            None => data.set.filesize,
+        };
         if infilesize < 0 {
             crate::failf!(&mut conn.filter_data.error_buffer, "Cannot APPEND with unknown input file size");
             return Err(CurlError::UploadFailed);
@@ -1348,6 +1478,24 @@ impl Imapc {
                 }
             }
             ImapState::StartTls => {
+                // Pipelining in the STARTTLS response is forbidden: the server
+                // must not send any bytes after the response line and before the
+                // TLS handshake, or those plaintext bytes could be a command
+                // injection by a network attacker (the STARTTLS "plaintext
+                // command injection" class). Mirrors `imap_state_starttls_resp`
+                // (`imap.c` L1109-1110): `if(imapc->pp.overflow) return
+                // CURLE_WEIRD_SERVER_REPLY;`, checked *before* the response code
+                // so a pipelined reply is rejected regardless of OK/BAD status.
+                // Without this guard the buffered extra lines desynchronise the
+                // tagged command/response exchange and the transfer hangs
+                // (tests/data/test981).
+                if pp.has_overflow() {
+                    crate::failf!(
+                        &mut conn.filter_data.error_buffer,
+                        "Reply to STARTTLS contained pipelined data"
+                    );
+                    return Err(CurlError::WeirdServerReply);
+                }
                 if code != IMAP_RESP_OK {
                     if data.set.use_ssl != CURLUSESSL_TRY {
                         crate::failf!(&mut conn.filter_data.error_buffer, "STARTTLS denied");
@@ -1379,17 +1527,61 @@ impl Imapc {
             // --- Do phase ------------------------------------------------------
             ImapState::List | ImapState::Search => {
                 if code == IMAP_RESP_UNTAGGED {
-                    // The untagged `* …` data lines ARE the listing/search body.
-                    // A LIST/SEARCH response carries no up-front literal size, so
-                    // (unlike a sized FETCH body) these bytes are not streamed off
-                    // the socket by the transfer loop — they are consumed here as
-                    // protocol lines. Capture each one verbatim (with its trailing
-                    // CRLF, exactly as received in `resp_line`) so `transfer` can
-                    // hand them to the client writer once the dialogue completes.
-                    // Mirrors C `imap.c` writing each line with
-                    // `Curl_client_write(CLIENTWRITE_BODY, …)` as it is parsed.
-                    self.data_resp.extend_from_slice(&self.resp_line);
-                    Ok(())
+                    // An untagged `* …` data line in a LIST/SEARCH/custom response.
+                    // Mirrors C `imap_state_listsearch_resp` (lib/imap.c L1217).
+                    //
+                    // A custom `FETCH`/`UID FETCH` body request (e.g.
+                    // `-X 'FETCH 123 BODY[1]'`) returns a `{size}` literal
+                    // introducer on this line: `* 123 FETCH (BODY[1] {70}`. The
+                    // header line itself IS part of the body, and exactly `size`
+                    // raw bytes of literal follow — bytes that may *look* like
+                    // protocol (`+ …`, `--`, blank lines) but are opaque data and
+                    // must not be parsed. We therefore (a) keep the header line as
+                    // the body prefix, (b) record `size` as the download length so
+                    // the transfer loop streams precisely the literal, and (c) end
+                    // the DO phase, leaving the closing `)` + tagged completion for
+                    // `done`. A *listing* message-set query (C `is_custom_fetch_
+                    // listing`, e.g. `FETCH 1:* (FLAGS …`) is excluded: its untagged
+                    // lines are plain protocol and are captured verbatim, as before.
+                    let literal = if is_custom_fetch_listing(
+                        req.custom.as_deref(),
+                        req.custom_params.as_deref(),
+                    ) {
+                        None
+                    } else {
+                        // Search for `{NNN}` only within the line proper (before the
+                        // trailing CRLF), exactly as C bounds it with the first
+                        // `\r` (`memchr(line, '\r', len)`).
+                        let line = &self.resp_line;
+                        let cr = line
+                            .iter()
+                            .position(|&b| b == b'\r')
+                            .unwrap_or(line.len());
+                        imap_find_literal(&line[..cr])
+                            .and_then(|idx| parse_literal_size(&line[idx + 1..cr]))
+                    };
+                    match literal {
+                        Some(size) => {
+                            // Header line is body; the literal is streamed next.
+                            self.data_resp.extend_from_slice(&self.resp_line);
+                            self.download_size = Some(size);
+                            crate::infof!(verbose, "Found {size} bytes to download");
+                            self.state = ImapState::Stop; // end of DO phase
+                            Ok(())
+                        }
+                        None => {
+                            // No literal: the untagged `* …` data lines ARE the
+                            // listing/search body. These are consumed here as
+                            // protocol lines (not streamed off the socket); capture
+                            // each verbatim (with its trailing CRLF, exactly as
+                            // received in `resp_line`) so `transfer` can hand them
+                            // to the client writer once the dialogue completes.
+                            // Mirrors C writing each line with
+                            // `Curl_client_write(CLIENTWRITE_BODY, …)` as parsed.
+                            self.data_resp.extend_from_slice(&self.resp_line);
+                            Ok(())
+                        }
+                    }
                 } else if code != IMAP_RESP_OK {
                     Err(CurlError::QuoteError)
                 } else {
@@ -1671,6 +1863,28 @@ fn resolve_credentials(data: &Easy) -> Result<(String, String)> {
     Ok((user, passwd))
 }
 
+/// Resolve the effective IMAP login `;options` string (C `conn->options`).
+///
+/// `CURLOPT_LOGIN_OPTIONS` (`--login-options`, stored in [`StrId::Options`])
+/// overrides the URL userinfo `;options` when set, mirroring C `override_login`
+/// (lib/url.c L2581-2586). Returns `None` when neither source supplies options.
+fn resolve_login_options(data: &Easy) -> Option<String> {
+    // `--login-options` takes precedence over the URL options when present.
+    if let Some(opts) = data.set.str(StrId::Options) {
+        return Some(opts.to_string());
+    }
+    // Otherwise fall back to the URL's `;options` component (only schemes that
+    // carry URL options populate this; for `imap`/`imaps` it is the userinfo
+    // `user;AUTH=…` suffix).
+    let url_str = data.url()?.to_string();
+    let mut url = CurlUrl::new();
+    url.set(CurlUPart::Url, Some(&url_str), CURLU_DEFAULT_PORT)
+        .ok()?;
+    url.get(CurlUPart::Options, CURLU_URLDECODE)
+        .ok()
+        .filter(|o| !o.is_empty())
+}
+
 /// Extract the **raw** URL path and the **URL-decoded** query for the `do`
 /// phase.
 ///
@@ -1821,6 +2035,19 @@ impl Protocol for ImapHandler {
 
             // Resolve the connection-level inputs before building the state.
             let (user, passwd) = resolve_credentials(data)?;
+            // `--sasl-authzid` (`CURLOPT_SASL_AUTHZID`) supplies the SASL
+            // authorization identity used by PLAIN (and others); without this
+            // the `AUTHENTICATE PLAIN` payload would omit the requested
+            // alternative authorization identity (C reads
+            // `data->set.sasl_authzid` inside the SASL engine).
+            let sasl_authzid = data
+                .set
+                .str(StrId::SaslAuthzid)
+                .map(str::to_string)
+                .unwrap_or_default();
+            // The effective login `;options` (URL `;AUTH=…` or
+            // `--login-options`), parsed below into the SASL `prefmech`.
+            let login_options = resolve_login_options(data);
             let httpauth = data.set.httpauth;
             let connection_id = conn.connection_id;
             let host = conn.remote_host.clone();
@@ -1829,6 +2056,7 @@ impl Protocol for ImapHandler {
             let mut state = ImapConn::new(httpauth, connection_id);
             state.proto.user = user;
             state.proto.passwd = passwd;
+            state.proto.sasl_authzid = sasl_authzid;
             state.proto.host = host;
             state.proto.port = port;
             // Reflect an already-secured channel (implicit `imaps`).
@@ -1844,6 +2072,37 @@ impl Protocol for ImapHandler {
                 mut proto,
                 mut req,
             } = state;
+            // Apply the URL/login `;options` to the SASL preference before the
+            // dialogue starts (C `imap_parse_url_options`, called from
+            // `imap_connect`). A malformed option aborts the connect.
+            //
+            // C calls `imap_parse_url_options` UNCONDITIONALLY (lib/imap.c
+            // `imap_connect` L1971), even when `conn->options` is NULL/empty:
+            // its post-loop switch re-derives `preftype` from the SASL
+            // `prefmech` (seeded from `CURLOPT_HTTPAUTH` in `Curl_sasl_init`).
+            // Skipping the call when there are no options would wrongly leave
+            // `preftype` at its `IMAP_TYPE_ANY` default. That matters whenever
+            // `prefmech` is a *specific* mechanism set — e.g. `--oauth2-bearer`
+            // makes `prefmech = OAUTHBEARER|XOAUTH2`, which must yield
+            // `preftype = IMAP_TYPE_SASL` (no cleartext `LOGIN` fallback). With
+            // the bearer unusable (cleared across a cross-protocol redirect),
+            // no SASL mechanism is selectable and the engine must reach
+            // `Curl_sasl_is_blocked` → `CURLE_LOGIN_DENIED` (exit 67) rather
+            // than silently downgrading to `LOGIN`. Pass an empty option
+            // string when none was supplied so the switch still runs.
+            let opt_bytes = login_options.as_deref().unwrap_or("");
+            proto.parse_url_options(&mut sasl, opt_bytes.as_bytes())?;
+            // "Response lines as headers" capture (C `Curl_pp_readresp`'s
+            // unconditional `Curl_client_write(CLIENTWRITE_INFO, line)`,
+            // lib/pingpong.c L304-310): opt in BEFORE the greeting read so the
+            // server greeting and every subsequent control-response line
+            // (`CAPABILITY`/`LOGIN`/`SELECT`/`FETCH`/…) is accumulated for a
+            // `-D`/`--dump-header` dump. `perform_imap` drains it to the header
+            // sink after the FETCH/APPEND completion is read but before LOGOUT.
+            // Idempotent (a reused connection keeps capture enabled) and
+            // wire-neutral without `-D` (the header sink discards IMAP-scheme
+            // INFO). Oracle: tests/data/test897.
+            pp.enable_info_capture();
             let result =
                 run_imap_statemachine(&mut proto, &mut pp, &mut sasl, &mut req, data, conn).await;
 
@@ -1867,7 +2126,17 @@ impl Protocol for ImapHandler {
         Box::pin(async move {
             // Per-transfer inputs (read before borrowing the connection state).
             let no_body = data.set.opt_no_body;
-            let upload = data.set.method == HttpReq::Put || !data.set.mimepost.is_null();
+            // C `imap_perform`: APPEND (upload) is selected by `data->state.upload`
+            // (`-T`/`CURLOPT_UPLOAD`) OR `IS_MIME_POST(data)` (a `-F` MIME post).
+            // For the mail protocols the CLI assembles the `-F` tree eagerly with
+            // curl's mail strategy and parks the finished bytes via
+            // `Easy::set_mime_body` (it does NOT populate `mimepost`), so the Rust
+            // analog of `IS_MIME_POST` here is a configured `mime_body` — exactly
+            // as SMTP's `do_it` detects a mail send (`mime_body.is_some()`). Oracle:
+            // tests/data/test647 (IMAP APPEND of a multipart MIME message).
+            let upload = data.set.method == HttpReq::Put
+                || !data.set.mimepost.is_null()
+                || data.set.mime_body.is_some();
             let infilesize = data.set.filesize;
 
             // Build the request shape from the URL path/query + CUSTOMREQUEST.
@@ -1894,6 +2163,12 @@ impl Protocol for ImapHandler {
             proto.custom_request = req.custom.is_some();
             proto.custom_name = req.custom.clone();
             proto.download_size = None;
+            // Start each DO phase with an empty body-accumulation buffer. The
+            // LIST/SEARCH performers also clear it, but a plain `FETCH` performer
+            // does not, and on a reused connection a prior custom-FETCH transfer
+            // could otherwise leave its header-line prefix behind — clearing here
+            // guarantees the FETCH-literal Download path sees an empty prefix.
+            proto.data_resp.clear();
 
             // C `imap_perform`: is the requested mailbox already selected (with a
             // matching UIDVALIDITY when one was pinned)?
@@ -1980,7 +2255,11 @@ impl Protocol for ImapHandler {
                 Err(_) => return status,
             };
             let connect_only = data.set.connect_only;
-            let upload = data.set.method == HttpReq::Put || !data.set.mimepost.is_null();
+            // Same APPEND/upload predicate as `do_it` (C `IS_MIME_POST` ∨
+            // `state.upload`): a `-F` mail MIME body is parked in `mime_body`.
+            let upload = data.set.method == HttpReq::Put
+                || !data.set.mimepost.is_null()
+                || data.set.mime_body.is_some();
 
             let ImapConn {
                 mut pp,
@@ -2109,6 +2388,35 @@ impl Protocol for ImapHandler {
 ///
 /// Any connection-establishment, session, authentication, command, body, or
 /// transport error surfaced by the IMAP handler or the body loop.
+/// Compute the IMAP connection-reuse key — the bundle key under which an
+/// authenticated, mailbox-stateful control connection is parked in (and
+/// recovered from) the shared pool. Keyed by `scheme | host:port | user` so that
+/// two transfers with different credentials never share a session and
+/// `imap`/`imaps` never collide. Returns the key plus the bare host (for the
+/// `-v` reuse trace). The bracket-stripping mirrors [`connect_network_scheme`]'s
+/// host normalization so a literal-IPv6 origin keys identically on dial and
+/// check-in.
+fn imap_reuse_key(data: &Easy, scheme: &Scheme) -> Result<(String, String)> {
+    let url_str = data.url().ok_or(CurlError::UrlMalformat)?.to_string();
+    let mut url = CurlUrl::new();
+    url.set(CurlUPart::Url, Some(&url_str), CURLU_DEFAULT_PORT)
+        .map_err(|_| CurlError::UrlMalformat)?;
+    let host_bracketed = url.get(CurlUPart::Host, CURLU_URLDECODE).unwrap_or_default();
+    let host = host_bracketed
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(&host_bracketed)
+        .to_string();
+    let port = url
+        .get(CurlUPart::Port, 0)
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(scheme.default_port);
+    let (user, _passwd) = resolve_credentials(data)?;
+    let key = format!("{}|{}:{}|{}", scheme.name, host, port, user);
+    Ok((key, host))
+}
+
 pub(crate) async fn perform_imap(
     data: &mut Easy,
     sink: &mut dyn WriteCallbacks,
@@ -2122,14 +2430,64 @@ pub(crate) async fn perform_imap(
         .and_then(|s| s.to_str().ok())
         .is_some_and(|s| s.eq_ignore_ascii_case("imaps"));
     let scheme: &'static Scheme = if is_imaps { &SCHEME_IMAPS } else { &SCHEME_IMAP };
-
-    // (1) Establish the (optionally TLS) connection.
-    let mut conn = connect_network_scheme(data, scheme).await?;
-
-    // (2) Run the connect-phase session (greeting / CAPABILITY / STARTTLS /
-    //     authentication).
     let handler = ImapHandler::new(scheme);
-    handler.connect(data, &mut conn).await?;
+
+    // (1)/(2) Obtain the control connection. Connection reuse (curl's IMAP
+    //     connection cache): on the CLI path — the only path with a guaranteed
+    //     end-of-run pool drain (`external_pool_drain`, set solely by
+    //     `set_conn_pool`) — try to reuse a pooled, already-authenticated
+    //     control connection for this origin+login. A pool hit skips the TCP/TLS
+    //     dial AND the greeting/CAPABILITY/STARTTLS/authentication session,
+    //     resuming the live IMAP session exactly as curl does: the cached
+    //     `ImapConn` carries the SASL state, the monotonic command-tag counter
+    //     (`Imapc.cmdid`/`conn_letter` ⇒ continuous `A001…A006` tags across
+    //     transfers), and the currently-`SELECT`ed mailbox (so `do_it`'s
+    //     `selected` check elides a redundant re-`SELECT`).
+    //     `CURLOPT_FRESH_CONNECT`/`CURLOPT_FORBID_REUSE` opt out (identical to
+    //     the HTTP/FTP reuse gate). On the FFI easy-perform and multi-interface
+    //     paths `external_pool_drain` is false, so the pool is never populated,
+    //     checkout never hits, and this is byte-identical to a fresh dial +
+    //     inline LOGOUT. Oracle: tests/data/test804 (no re-`SELECT` on reuse),
+    //     test815/test816 (one connection, continuous tags, single trailing
+    //     LOGOUT).
+    let (reuse_key, host) = imap_reuse_key(data, scheme)?;
+    let mut conn = {
+        let mut reused: Option<Connection> = None;
+        if data.external_pool_drain && !data.set.reuse_fresh && !data.set.reuse_forbid {
+            let pool = data.conn_pool_handle();
+            if let Some(mut candidate) = crate::conn::pool_checkout(&pool, &reuse_key) {
+                // Liveness probe (curl's `Curl_conn_is_alive`): reuse only a
+                // control channel still open AND carrying no unexpected pending
+                // bytes — a server-side `* BYE`/close or stray data makes a
+                // supposedly-idle session unsafe to reuse.
+                let (alive, pending) = Curl_conn_is_alive(&mut candidate);
+                if alive && !pending {
+                    // Mark pool-reused (curl's `conn->bits.reuse`).
+                    candidate.bits.reuse = true;
+                    crate::infof!(
+                        data.set.verbose,
+                        "Re-using existing connection with host {host}"
+                    );
+                    reused = Some(candidate);
+                }
+                // Dead / unexpected pending data: `candidate` drops here (closing
+                // its socket) and we fall through to a fresh dial.
+            }
+        }
+        match reused {
+            Some(c) => c,
+            None => {
+                // Fresh dial: establish the (optionally TLS) connection, stamp it
+                // with the reuse key (the pool bundle key used at check-in), then
+                // run the connect-phase session (greeting / CAPABILITY /
+                // STARTTLS / authentication).
+                let mut c = connect_network_scheme(data, scheme).await?;
+                c.destination = reuse_key.clone();
+                handler.connect(data, &mut c).await?;
+                c
+            }
+        }
+    };
 
     // (3) DO phase + body movement.
     let result: Result<()> = async {
@@ -2142,13 +2500,27 @@ pub(crate) async fn perform_imap(
                     // stream exactly `size` bytes (prefix + bounded socket reads)
                     // to the client, leaving the closing `)` + tagged status for
                     // `done`.
-                    let prefix = {
+                    //
+                    // For a *custom* FETCH (`-X 'FETCH n BODY[..]'`, C
+                    // `imap_state_listsearch_resp`) the untagged header line
+                    // `* n FETCH (… {size}` is itself part of the body and was
+                    // captured in `data_resp`; it precedes the literal. For a
+                    // *plain* FETCH (C `imap_state_fetch_resp`) the header line is
+                    // NOT body and `data_resp` is empty. Prepending `data_resp`
+                    // therefore handles both: `header_len` is 0 for a plain FETCH,
+                    // and the total delivered is `header_len + size`.
+                    let (header, buffered) = {
                         let mut state = take_imap_conn(&mut conn)?;
+                        let header = std::mem::take(&mut state.proto.data_resp);
                         let body = state.pp.take_buffered_body(size as usize);
                         conn.set_proto_state(state);
-                        body
+                        (header, body)
                     };
-                    stream_body_to_sink(data, &mut conn, sink, &prefix, Some(size)).await?;
+                    let header_len = header.len() as u64;
+                    let mut prefix = header;
+                    prefix.extend_from_slice(&buffered);
+                    stream_body_to_sink(data, &mut conn, sink, &prefix, Some(header_len + size))
+                        .await?;
                 } else {
                     // A LIST/SEARCH listing has no up-front literal size: its body
                     // is the set of untagged `* …` data lines captured verbatim
@@ -2170,31 +2542,68 @@ pub(crate) async fn perform_imap(
                 }
             }
             TransferDirection::Upload => {
-                // APPEND: stream the message body from the client source to the
-                // server (the literal whose size `do_it` already announced).
-                let total_len = if data.set.filesize >= 0 {
-                    Some(data.set.filesize as u64)
-                } else {
-                    None
-                };
-                let mut reader = UploadReader::new(total_len, false);
-                let mut buf = vec![0u8; 64 * 1024];
-                let mut total: i64 = 0;
-                // `read` yields `Data` until EOF (and never `Paused`, since
-                // `can_pause = false`), so the loop ends on the first non-`Data`.
-                while let ReadStep::Data(n) = reader.read(&mut buf, source)? {
+                // APPEND: stream the message body (the literal whose size `do_it`
+                // already announced) to the server.
+                //
+                // A deferred MIME body content-transfer-encoder error (the
+                // `7bit` encoder rejecting a high-bit byte) is replayed here:
+                // curl streams the body lazily and reports `CURLE_READ_ERROR`
+                // only during the literal transfer. The CLI assembles the body
+                // eagerly and parked the error as `mime_body_read_error` (with
+                // an empty body), so reproduce it now rather than silently
+                // sending an empty literal. Mark the connection non-reusable, as
+                // the literal transfer was left incomplete (C `connclose`).
+                if data.set.mime_body_read_error {
+                    conn.bits.no_reuse = true;
+                    crate::failf!(
+                        &mut conn.filter_data.error_buffer,
+                        "Failed to read data from the application"
+                    );
+                    return Err(CurlError::ReadError);
+                }
+                if let Some(body) = data.set.mime_body.clone() {
+                    // `-F` MIME post: the body was assembled eagerly by the CLI
+                    // (curl's mail strategy) and parked in `mime_body`; send those
+                    // exact bytes, exactly as SMTP streams its `mime_body`. There
+                    // is no client read source for a MIME post (`-F` does not wire
+                    // one), so it must come from here rather than from `source`.
+                    // Oracle: tests/data/test647.
                     let mut off = 0usize;
-                    while off < n {
+                    while off < body.len() {
                         let wrote =
-                            Curl_conn_send(&mut conn, FIRSTSOCKET, &buf[off..n], false).await?;
+                            Curl_conn_send(&mut conn, FIRSTSOCKET, &body[off..], false).await?;
                         if wrote == 0 {
                             return Err(CurlError::UploadFailed);
                         }
                         off += wrote;
                     }
-                    total += n as i64;
+                    data.info.size_upload = body.len() as i64;
+                } else {
+                    // `-T` upload: stream from the client read source.
+                    let total_len = if data.set.filesize >= 0 {
+                        Some(data.set.filesize as u64)
+                    } else {
+                        None
+                    };
+                    let mut reader = UploadReader::new(total_len, false);
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut total: i64 = 0;
+                    // `read` yields `Data` until EOF (and never `Paused`, since
+                    // `can_pause = false`), so the loop ends on the first non-`Data`.
+                    while let ReadStep::Data(n) = reader.read(&mut buf, source)? {
+                        let mut off = 0usize;
+                        while off < n {
+                            let wrote =
+                                Curl_conn_send(&mut conn, FIRSTSOCKET, &buf[off..n], false).await?;
+                            if wrote == 0 {
+                                return Err(CurlError::UploadFailed);
+                            }
+                            off += wrote;
+                        }
+                        total += n as i64;
+                    }
+                    data.info.size_upload = total;
                 }
-                data.info.size_upload = total;
             }
             TransferDirection::None | TransferDirection::Bidirectional => {}
         }
@@ -2202,10 +2611,59 @@ pub(crate) async fn perform_imap(
     }
     .await;
 
-    // (4) Finalize (reads the tagged completion for FETCH/APPEND) then `LOGOUT`.
+    // (4) Finalize (reads the tagged completion for FETCH/APPEND), then either
+    //     park the live session in the pool for a subsequent same-origin
+    //     transfer to reuse (deferring LOGOUT to the end-of-run drain) or send
+    //     LOGOUT inline.
     let premature = result.is_err();
     let done = handler.done(data, &mut conn, result, premature).await;
-    let _ = handler.disconnect(data, &mut conn, done.is_err()).await;
+
+    // Drain the "response lines as headers" capture (the greeting + every
+    // control-response line read for this transfer — including the untagged
+    // `* … FETCH (… {N}` header line, the trailing envelope that follows a
+    // `{N}` literal body, and the tagged completion) to the header sink as
+    // `ClientWriteType::INFO`. This runs AFTER `done` has read the FETCH/APPEND
+    // completion but BEFORE LOGOUT (deferred to the pool drain on reuse, or sent
+    // inline by `disconnect`), so the `-D` dump excludes the LOGOUT exchange —
+    // mirroring FTP's drain-before-`QUIT` and C `Curl_pp_readresp`'s per-line
+    // `CLIENTWRITE_INFO` (lib/pingpong.c L304-310). Wire-neutral without `-D`
+    // (the CLI header sink discards IMAP-scheme INFO). Best-effort: a header-
+    // sink write failure must not mask the transfer outcome (`done`), and a
+    // missing state (which cannot occur — `done` re-parks it) just skips the
+    // dump. Oracle: tests/data/test897.
+    if let Ok(mut state) = take_imap_conn(&mut conn) {
+        if let Some(captured) = state.pp.drain_info_capture() {
+            if !captured.is_empty() {
+                let mut writer =
+                    crate::transfer::ClientWriter::with_options(data.set.include_header, false);
+                let _ = writer.write(crate::transfer::ClientWriteType::INFO, &captured, sink);
+            }
+        }
+        conn.set_proto_state(state);
+    }
+
+    let reusable =
+        data.external_pool_drain && done.is_ok() && !conn.bits.no_reuse && !conn.is_closed();
+    if reusable {
+        // Defer LOGOUT: check the authenticated session back in so the next
+        // same-origin transfer reuses it. The single trailing LOGOUT is issued
+        // by the end-of-run pool drain ([`ftp_drain_pool`], which dispatches a
+        // pooled `ImapConn` to [`ImapHandler::disconnect`]). Oracle:
+        // tests/data/test815, test816 — exactly one LOGOUT, after both transfers.
+        let pool = data.conn_pool_handle();
+        let maxconnects = data.set.maxconnects;
+        crate::conn::pool_checkin(&pool, conn, maxconnects);
+    } else {
+        // Inline teardown. Pass `dead = conn.is_closed()` (NOT `done.is_err()`):
+        // a transfer-level error that leaves the socket alive — e.g. a
+        // UIDVALIDITY mismatch (`CURLE_REMOTE_FILE_NOT_FOUND`) — must still send
+        // LOGOUT, matching curl's `imap_disconnect`, which gates LOGOUT on the
+        // connection being live, not on the transfer outcome. Only a genuinely
+        // dead socket suppresses LOGOUT. Oracle: tests/data/test803 (SELECT
+        // UIDVALIDITY failure still emits A004 LOGOUT, errorcode 78).
+        let dead = conn.is_closed();
+        let _ = handler.disconnect(data, &mut conn, dead).await;
+    }
     done
 }
 
