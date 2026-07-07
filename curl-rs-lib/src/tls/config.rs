@@ -773,16 +773,14 @@ fn select_ciphers_from_list(
                     .copied()
                     .find(|s| u16::from(s.suite()) == id && is_tls13(*s) == tls13);
                 match found {
-                    Some(suite) => {
-                        if !selected.iter().any(|s| s.suite() == suite.suite()) {
-                            selected.push(suite);
-                        }
+                    // Add the matching suite once, in list order.
+                    Some(suite) if !selected.iter().any(|s| s.suite() == suite.suite()) => {
+                        selected.push(suite);
                     }
-                    None => {
-                        // Recognized name, but not of this TLS version — skip
-                        // here; it will be picked up on the other version's
-                        // pass if applicable.
-                    }
+                    // Nothing to add: either the suite is already selected, or the
+                    // recognized name is not of this TLS version — the latter is
+                    // picked up on the other version's pass if applicable.
+                    _ => {}
                 }
             }
             None => {
@@ -795,7 +793,10 @@ fn select_ciphers_from_list(
 /// Splits a curl cipher list into tokens on the same separators as
 /// `Curl_cipher_suite_walk_str` / `cs_is_separator`: space, tab, `:`, `,`, `;`.
 fn tokenize_cipher_list(list: &str) -> impl Iterator<Item = &str> {
-    list.split(|c: char| matches!(c, ' ' | '\t' | ':' | ',' | ';'))
+    // Same separator set as curl's `cs_is_separator`: space, tab, `:`, `,`, `;`.
+    // An array of `char` implements `str::pattern::Pattern` (stable since Rust
+    // 1.71, within MSRV 1.75) and is the idiomatic form clippy expects.
+    list.split([' ', '\t', ':', ',', ';'])
         .filter(|s| !s.is_empty())
 }
 

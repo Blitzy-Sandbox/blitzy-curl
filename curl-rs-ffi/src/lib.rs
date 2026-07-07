@@ -687,21 +687,28 @@ fn build_version_info() -> VersionInfo {
 /// `"curl-rs/8.19.0-DEV rustls flate2 brotli zstd hyper quinn russh"`.
 ///
 /// C callers treat the returned pointer as a static borrow and must **not** free it; the string
-/// is built once into a `static OnceLock<CString>` and its pointer returned on every call. The
-/// C prototype returns `char *`; returning `*const c_char` is ABI-compatible and preferred (the
-/// caller must still neither mutate nor free it).
+/// is built once into a `static OnceLock<CString>` and its pointer returned on every call.
+///
+/// The committed `include/curl/curl.h` declares `char *curl_version(void)` — a **non-`const`**
+/// `char *` — so the return type is `*mut c_char` for byte-exact cbindgen parity (cbindgen renders
+/// `*const c_char` as `const char *`, which would diverge from the reference header). The `*mut`
+/// is an ABI-shape requirement only: the pointed-to storage is process-lifetime and immutable in
+/// practice, and callers must still neither mutate nor free it.
 //
 // NOTE: the canonical string is defined locally (`CURL_RS_VERSION_STRING`) with the exact spec
 // value, because the core crate does not yet re-export `curl_rs_lib::version()`. Reconcile to
 // delegate to `curl_rs_lib::version()` once that accessor lands; the value cannot drift.
 #[no_mangle]
-pub extern "C" fn curl_version() -> *const c_char {
+pub extern "C" fn curl_version() -> *mut c_char {
     static VERSION_CSTRING: OnceLock<CString> = OnceLock::new();
+    // `as_ptr()` yields `*const c_char`; the `as *mut c_char` cast only reshapes the pointer type
+    // to match the C `char *` prototype (a pointer cast is safe — dereferencing would not be, and
+    // never happens on this side). The storage is never mutated through the returned pointer.
     VERSION_CSTRING
         .get_or_init(|| {
             CString::new(CURL_RS_VERSION_STRING).expect("version string has no interior NUL")
         })
-        .as_ptr()
+        .as_ptr() as *mut c_char
 }
 
 /// `curl_version_info_data *curl_version_info(CURLversion age)` — return runtime version info.
@@ -710,14 +717,23 @@ pub extern "C" fn curl_version() -> *const c_char {
 /// curl 8.x (`lib/version.c`), the requested `age` does **not** change which data is returned —
 /// the full struct pointer is always returned, and the struct's own `age` field
 /// ([`CURLVERSION_NOW`]) tells the caller how many trailing fields are valid.
+///
+/// The return type is `*mut curl_version_info_data` (not `*const`) to byte-match the
+/// **non-`const`** `curl_version_info_data *` declaration in the committed `include/curl/curl.h`
+/// (cbindgen renders `*const` as `const …*`, which would diverge). The pointed-to struct is a
+/// process-lifetime singleton that callers must treat as read-only — the `*mut` is an ABI-shape
+/// requirement only and the struct is never mutated through it.
 #[no_mangle]
-pub extern "C" fn curl_version_info(age: CURLversion) -> *const curl_version_info_data {
+pub extern "C" fn curl_version_info(age: CURLversion) -> *mut curl_version_info_data {
     // curl ignores the requested age for data selection (`(void)stamp;` in lib/version.c); the
     // `age` FIELD of the returned struct is the version marker. The parameter is retained for
     // exact signature parity.
     let _ = age;
     static VERSION_INFO: OnceLock<VersionInfo> = OnceLock::new();
+    // The trailing `as *mut …` only reshapes the pointer type to the C `curl_version_info_data *`
+    // prototype (a pointer cast is safe; the singleton is never written through this pointer).
     &VERSION_INFO.get_or_init(build_version_info).0 as *const curl_version_info_data
+        as *mut curl_version_info_data
 }
 
 // ===========================================================================

@@ -48,6 +48,8 @@ use crate::auth::{
 };
 use crate::error::{Error, Result};
 
+use std::fmt;
+
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
@@ -407,7 +409,10 @@ pub trait SaslProto {
 /// single owned bundle keeps the SASL engine self-contained and unit-testable and
 /// avoids a dependency on the (not-yet-ported) connection layer. The consuming
 /// protocol handler populates this from the live transfer state before each call.
-#[derive(Debug, Clone, Default)]
+// NOTE: `Debug` is intentionally NOT derived — it is implemented manually below so that the
+// secret fields (`passwd`, `bearer`) are redacted and can never leak through `{:?}`, trace
+// logging, or panic messages. `Clone` / `Default` are still derived.
+#[derive(Clone, Default)]
 pub struct SaslCredentials {
     /// The login user name (`conn->user`).
     pub user: String,
@@ -428,6 +433,27 @@ pub struct SaslCredentials {
     /// Whether the application allows an initial SASL response
     /// (`data->set.sasl_ir`).
     pub sasl_ir: bool,
+}
+
+impl fmt::Debug for SaslCredentials {
+    /// Redacts the credential material so a password or bearer token never leaks
+    /// through debug output (`{:?}`), `--trace` diagnostics, or panic messages.
+    /// `passwd` is always shown as `"<redacted>"`; `bearer`'s `Some`/`None` shape
+    /// is preserved (so its presence remains visible for debugging) while its
+    /// value is redacted. All non-secret fields are shown verbatim. This mirrors
+    /// the redacting `Debug` impl on [`crate::auth::scram::ScramClient`].
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SaslCredentials")
+            .field("user", &self.user)
+            .field("passwd", &"<redacted>")
+            .field("authzid", &self.authzid)
+            .field("bearer", &self.bearer.as_ref().map(|_| "<redacted>"))
+            .field("service_name", &self.service_name)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("sasl_ir", &self.sasl_ir)
+            .finish()
+    }
 }
 
 /// The internal representation of an outgoing SASL response before it is written.
@@ -1669,6 +1695,39 @@ mod tests {
             port: 143,
             ..SaslCredentials::default()
         }
+    }
+
+    /// The redacting `Debug` impl must never print the password or bearer token,
+    /// while non-secret fields (user, host) remain visible for debugging.
+    #[test]
+    fn debug_impl_redacts_credentials() {
+        let mut c = creds("alice", "s3cr3t-pw");
+        c.bearer = Some("ya29.super-secret-token".to_string());
+        let rendered = format!("{c:?}");
+        // Secret values must be absent and replaced by the redaction marker.
+        assert!(
+            !rendered.contains("s3cr3t-pw"),
+            "password leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("ya29.super-secret-token"),
+            "bearer leaked: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "no redaction marker: {rendered}"
+        );
+        // The bearer's Some(...) shape is preserved (presence still visible).
+        assert!(
+            rendered.contains("Some("),
+            "bearer presence lost: {rendered}"
+        );
+        // Non-secret fields remain visible.
+        assert!(rendered.contains("alice"), "user missing: {rendered}");
+        assert!(
+            rendered.contains("mail.example.com"),
+            "host missing: {rendered}"
+        );
     }
 
     // -----------------------------------------------------------------------

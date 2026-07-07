@@ -1051,12 +1051,18 @@ where
         }
         // Download cap (CURLOPT_MAX_RECV_SPEED_LARGE): configure the bucket and
         // tune its step from the expected total size (req.size, -1 if unknown).
-        if self.config.max_recv_speed > 0 {
+        // `!= 0` (not `> 0`): 0 means "no cap" (skip), while a NEGATIVE value must
+        // still be routed to the setter so its validation rejects it with
+        // CURLE_BAD_FUNCTION_ARGUMENT rather than being silently treated as
+        // unlimited.
+        if self.config.max_recv_speed != 0 {
             rate.set_max_recv_speed(self.config.max_recv_speed, now)?;
             rate.start_recv(now, req.size);
         }
         // Upload cap (CURLOPT_MAX_SEND_SPEED_LARGE): curl passes -1 as the total.
-        if self.config.max_send_speed > 0 {
+        // `!= 0` for the same reason as the receive cap above: a negative value is
+        // an error surfaced by the setter, not a silent "unlimited".
+        if self.config.max_send_speed != 0 {
             rate.set_max_send_speed(self.config.max_send_speed, now)?;
             rate.start_send(now);
         }
@@ -2802,6 +2808,45 @@ mod tests {
         assert!(cap.lock().unwrap().body.is_empty());
         assert_eq!(req.bytecount, 0);
         assert!(xfer.recv_half().data_pending());
+    }
+
+    #[test]
+    fn configure_rate_limits_rejects_negative_caps() {
+        // A negative CURLOPT_MAX_RECV_SPEED_LARGE / _SEND_SPEED_LARGE must surface
+        // as CURLE_BAD_FUNCTION_ARGUMENT (routed through the validating setter),
+        // NOT be silently treated as "unlimited" (the `!= 0` gate, not `> 0`).
+        let now = Instant::now();
+        for config in [
+            TransferConfig {
+                max_recv_speed: -1,
+                ..TransferConfig::default()
+            },
+            TransferConfig {
+                max_send_speed: -1,
+                ..TransferConfig::default()
+            },
+        ] {
+            let mut xfer = transfer_with(MockRecv::new(vec![]), MockSend::default(), config);
+            let req = fresh_req();
+            let mut pg = progress();
+            let mut rl = rate();
+            let err = xfer
+                .configure_rate_limits(&req, &mut pg, &mut rl, now)
+                .unwrap_err();
+            assert_eq!(err.code(), CurlCode::BadFunctionArgument);
+        }
+        // Zero stays "no cap": configuration succeeds and arms nothing.
+        let mut xfer = transfer_with(
+            MockRecv::new(vec![]),
+            MockSend::default(),
+            TransferConfig::default(),
+        );
+        let req = fresh_req();
+        let mut pg = progress();
+        let mut rl = rate();
+        assert!(xfer
+            .configure_rate_limits(&req, &mut pg, &mut rl, now)
+            .is_ok());
     }
 
     // =======================================================================

@@ -79,13 +79,16 @@ sftp = ["ssh", "dep:russh-sftp"]         # SFTP rides SSH and adds the SFTP subs
 scp = ["ssh"]                            # SCP rides raw SSH `exec`; no extra dependency
 
 # --- Authentication gates (optional OS GSSAPI/Kerberos for Negotiate) ---
-# DEFAULT-OFF and currently carrying EMPTY dependency lists: they conditionally compile the
-# GSSAPI (Kerberos) and SPNEGO (Negotiate) portions of the `auth` subtree via
-# `#[cfg(feature = "...")]` (see `auth::kerberos` / `auth::negotiate` and the gated fields of
-# `auth::ConnAuthState`). Negotiate is SPNEGO-wrapped Kerberos, so `spnego` enables `gssapi`.
-# The optional OS GSSAPI linkage these will gate is the ONLY C dependency retained anywhere in
-# the workspace (AAP §0.5.2); no such dependency is added at this checkpoint.
-gssapi = []                              # HAVE_GSSAPI (Kerberos V5)
+# DEFAULT-OFF: they conditionally compile the GSSAPI (Kerberos) and SPNEGO (Negotiate)
+# portions of the `auth` subtree via `#[cfg(feature = "...")]` (see `auth::kerberos` /
+# `auth::negotiate` and the gated fields of `auth::ConnAuthState`). Negotiate is
+# SPNEGO-wrapped Kerberos, so `spnego` enables `gssapi`.
+# `gssapi` pulls in the optional `libgssapi` crate (a SAFE wrapper over the platform GSSAPI /
+# OS krb5), which is the API `auth::kerberos` already consumes with zero `unsafe`. This
+# optional OS GSSAPI linkage is the ONLY C dependency retained anywhere in the workspace
+# (AAP §0.5.2); it is inert unless `gssapi`/`spnego` is explicitly enabled, so default builds
+# and the default-feature MSRV 1.75 gate link no C library.
+gssapi = ["dep:libgssapi"]               # HAVE_GSSAPI (Kerberos V5)
 spnego = ["gssapi"]                      # USE_SPNEGO  (Negotiate; builds on GSSAPI)
 
 # --- Optional-dependency gates ---
@@ -151,6 +154,12 @@ hmac = { workspace = true }
 des = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
+
+# --- Authentication: optional OS GSSAPI/Kerberos — pulled in only by `gssapi` / `spnego` ---
+# Safe Rust wrapper over the platform GSSAPI (links the OS krb5 GSSAPI); consumed by
+# `auth::kerberos` / `auth::negotiate` with zero `unsafe` in this crate. This is the sole
+# optional C linkage retained in the workspace (AAP §0.5.2) and is DEFAULT-OFF.
+libgssapi = { workspace = true, optional = true }
 
 # --- Content-encoding ---
 # gzip/deflate is core (curl has no disable for it) so `flate2` is non-optional; brotli and

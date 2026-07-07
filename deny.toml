@@ -44,11 +44,43 @@ version = 2
 # Reject crates whose published version has been yanked from the registry; a
 # yanked crate is treated as a hard error rather than a warning.
 yanked = "deny"
-# No advisories are ignored. The RustSec DB defaults are used as-is so the gate
-# blocks on every vulnerability. A specific advisory ID may be added here ONLY
-# with an inline comment justifying it (e.g. an accepted-risk with no fixed
-# upstream release); today none are justified, so the list stays empty.
-ignore = []
+# A specific advisory ID may be ignored ONLY with an inline comment justifying it.
+# Every entry below is an ACCEPTED RISK for one of two reasons: (a) the only upstream
+# fix requires a Rust version newer than the pinned MSRV 1.75 (rust-toolchain.toml,
+# §0.6.5) and so cannot be adopted without breaking the mandatory `cargo +1.75 check`
+# merge gate and the §0.5.1 version pins, or (b) no fixed release exists yet / it is an
+# unmaintained-only warning with no CVE. Empirically verified: EVERY fixed release of
+# quinn-proto (>=0.11.15 -> rustc 1.85) and time (>=0.3.47 -> rustc 1.88) raises the
+# crate MSRV above 1.75, so the "upgrade" path is not available under the mandated
+# toolchain — these advisories are documented accepted-risks pending a future MSRV bump,
+# exactly like the optional/default-off crates below. Revisit whenever MSRV is raised.
+ignore = [
+    # --- Default-ON crates: fix exists but requires rustc > MSRV 1.75 (accepted risk) ---
+    # quinn-proto (QUIC/HTTP-3; §0.5.1 pins quinn 0.11.9). RUSTSEC-2026-0185 is fixed in
+    # >=0.11.15, but every such release declares rust-version 1.85, which breaks the pinned
+    # MSRV 1.75. Held at the newest MSRV-1.75-compatible release (0.11.14).
+    "RUSTSEC-2026-0185", # quinn-proto: out-of-order stream reassembly memory exhaustion.
+    # time (used via chrono / CLI). RUSTSEC-2026-0009 is fixed in >=0.3.47, but those
+    # releases require rustc 1.88; the newest MSRV-1.75-compatible release is 0.3.41.
+    "RUSTSEC-2026-0009", # time: DoS via stack exhaustion in parsing.
+    # --- Default-OFF optional crates: not in a default build (verified ABSENT from tree) ---
+    # hickory-proto — pulled in ONLY by the default-off `hickory-dns` feature
+    # (`dep:hickory-resolver`); the default DNS path is Tokio's system resolver.
+    "RUSTSEC-2026-0118", # NSEC3 closest-encloser proof: unbounded loop; no fixed release available.
+    "RUSTSEC-2026-0119", # O(n^2) name-compression CPU exhaustion; fix not pulled while feature is off.
+    # russh family — pulled in ONLY by the default-off `ssh`/`sftp`/`scp` features
+    # (`dep:russh`, `dep:russh-keys`, `dep:russh-sftp`). The SSH protocol modules are a
+    # later checkpoint; these crates are declared per §0.5.1 but unused in a default build.
+    # The fixes land in russh >=0.60.3, which requires edition2024 / Rust 1.82 and breaks
+    # the pinned MSRV 1.75; russh 0.53.0 is the newest MSRV-1.75-compatible release.
+    "RUSTSEC-2026-0154", # russh: unbounded 32-bit allocation.
+    "RUSTSEC-2026-0153", # russh-cryptovec: unchecked CryptoVec allocation/growth handling.
+    "RUSTSEC-2023-0071", # rsa (transitive via russh): Marvin timing sidechannel; no fixed release exists.
+    # --- Unmaintained-only warning (informational; not a CVE) ---
+    # rustls-pemfile — the crate is functionally correct; migrating to the rustls-pki-types
+    # PEM API is a future action.
+    "RUSTSEC-2025-0134",
+]
 
 # ---------------------------------------------------------------------------
 # Licenses — allow-list of SPDX license identifiers permitted in the workspace

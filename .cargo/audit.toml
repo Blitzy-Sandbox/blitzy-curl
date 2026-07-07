@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: curl
+# SPDX-FileCopyrightText: Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# cargo-audit configuration for the blitzy-curl workspace.
+# ========================================================
+# This file is the `cargo audit` counterpart of the [advisories].ignore list in
+# `deny.toml`: `cargo audit` and `cargo deny check advisories` are the paired
+# halves of the §0.6.4 "Security audit" merge gate, but each reads its OWN config,
+# so the ignore set MUST be kept identical in both places.
+#
+# Every advisory ignored here is an ACCEPTED RISK for one of two reasons: (a) the only
+# upstream fix requires a Rust version newer than the pinned MSRV 1.75 (rust-toolchain.toml,
+# §0.6.5) and cannot be adopted without breaking the mandatory `cargo +1.75 check` gate and
+# the §0.5.1 version pins, or (b) no fixed release exists yet / it is an unmaintained-only
+# warning with no CVE. Empirically verified: EVERY fixed release of quinn-proto (>=0.11.15
+# -> rustc 1.85) and time (>=0.3.47 -> rustc 1.88) raises the crate MSRV above 1.75, so the
+# "upgrade" path is unavailable under the mandated toolchain. Revisit whenever MSRV is raised.
+[advisories]
+ignore = [
+    # --- Default-ON crates: fix exists but requires rustc > MSRV 1.75 (accepted risk) ---
+    # quinn-proto (QUIC/HTTP-3; §0.5.1 pins quinn 0.11.9). Fix >=0.11.15 requires rustc 1.85;
+    # held at the newest MSRV-1.75-compatible release (0.11.14).
+    "RUSTSEC-2026-0185", # quinn-proto: out-of-order stream reassembly memory exhaustion.
+    # time (via chrono / CLI). Fix >=0.3.47 requires rustc 1.88; held at 0.3.41.
+    "RUSTSEC-2026-0009", # time: DoS via stack exhaustion in parsing.
+    # --- Default-OFF optional crates: not in a default build (verified ABSENT from tree) ---
+    # hickory-proto — pulled in ONLY by the default-off `hickory-dns` feature
+    # (`dep:hickory-resolver`); the default DNS path is Tokio's system resolver.
+    "RUSTSEC-2026-0118", # NSEC3 closest-encloser proof: unbounded loop; no fixed release available.
+    "RUSTSEC-2026-0119", # O(n^2) name-compression CPU exhaustion; fix not pulled while feature is off.
+    # russh family — pulled in ONLY by the default-off `ssh`/`sftp`/`scp` features
+    # (`dep:russh`, `dep:russh-keys`, `dep:russh-sftp`). The SSH protocol modules are a
+    # later checkpoint; declared per §0.5.1 but unused in a default build. Fixes land in
+    # russh >=0.60.3, which requires edition2024 / Rust 1.82 and breaks the pinned MSRV
+    # 1.75; russh 0.53.0 is the newest MSRV-1.75-compatible release.
+    "RUSTSEC-2026-0154", # russh: unbounded 32-bit allocation.
+    "RUSTSEC-2026-0153", # russh-cryptovec: unchecked CryptoVec allocation/growth handling.
+    "RUSTSEC-2023-0071", # rsa (transitive via russh): Marvin timing sidechannel; no fixed release exists.
+    # --- Unmaintained-only warning (informational; not a CVE) ---
+    # rustls-pemfile — the crate is functionally correct; migrating to the rustls-pki-types
+    # PEM API is a future action.
+    "RUSTSEC-2025-0134",
+]

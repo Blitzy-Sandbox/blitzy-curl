@@ -2639,10 +2639,12 @@ impl Easy {
                     self.state.httpreq = HttpReq::Get;
                 }
             }
-            303 => {
-                if self.state.httpreq != HttpReq::Get && (!is_post || !self.set.post303) {
-                    self.state.httpreq = HttpReq::Get;
-                }
+            // A 303 switches any non-GET method to GET, except a POST that
+            // CURLOPT_POSTREDIR opts to preserve. Written as a match guard so the
+            // "leave the method unchanged" case falls through to the catch-all
+            // arm below (identical behavior to the previous inner `if`).
+            303 if self.state.httpreq != HttpReq::Get && (!is_post || !self.set.post303) => {
+                self.state.httpreq = HttpReq::Get;
             }
             _ => {}
         }

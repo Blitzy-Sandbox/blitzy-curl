@@ -257,26 +257,32 @@ fn encode_7bit(data: &[u8]) -> Result<Vec<u8>> {
 /// CRLF.
 fn encode_base64(data: &[u8]) -> Vec<u8> {
     let encoded = BASE64_STANDARD.encode(data);
-    let bytes = encoded.as_bytes();
-    if bytes.is_empty() {
-        return Vec::new();
-    }
+    let mut out = Vec::with_capacity(encoded.len());
+    let mut col = 0usize;
+    append_base64_wrapped(&mut out, &mut col, encoded.as_bytes());
+    out
+}
 
-    // Pre-size: encoded length plus 2 bytes per inserted CRLF.
-    let crlf_pairs = (bytes.len() - 1) / MAX_ENCODED_LINE_LENGTH;
-    let mut out = Vec::with_capacity(bytes.len() + crlf_pairs * 2);
-
-    let mut idx = 0;
-    while idx < bytes.len() {
-        if idx > 0 {
+/// Appends base64 characters to `out`, inserting a CRLF whenever the current
+/// output line reaches [`MAX_ENCODED_LINE_LENGTH`] characters. curl wraps base64
+/// at 76 columns with a CRLF *between* lines and **no** trailing CRLF.
+///
+/// `col` (the number of characters already on the current line) is threaded
+/// through by the caller so the very same wrapping is produced whether the
+/// base64 stream is emitted in one shot (the in-memory Data path via
+/// [`encode_base64`]) or incrementally group-by-group (the streaming
+/// [`EncoderStream::Base64`] path). This shared helper is what guarantees the
+/// two paths wrap byte-identically.
+fn append_base64_wrapped(out: &mut Vec<u8>, col: &mut usize, chars: &[u8]) {
+    for &c in chars {
+        if *col == MAX_ENCODED_LINE_LENGTH {
             out.push(b'\r');
             out.push(b'\n');
+            *col = 0;
         }
-        let end = usize::min(idx + MAX_ENCODED_LINE_LENGTH, bytes.len());
-        out.extend_from_slice(&bytes[idx..end]);
-        idx = end;
+        out.push(c);
+        *col += 1;
     }
-    out
 }
 
 /// Quoted-printable character classes (mirrors `qp_class` in `lib/mime.c`).
@@ -335,18 +341,46 @@ fn qp_lookahead_eol(data: &[u8], pos: usize, n: usize) -> bool {
     qp_class(data[idx]) == QpClass::Cr && qp_class(data[idx + 1]) == QpClass::Lf
 }
 
-/// `quoted-printable` encoder producing curl-identical output.
+/// `quoted-printable` encoder producing curl-identical output for the in-memory
+/// Data path.
 ///
-/// This is a faithful port of `encoder_qp_read` operating over the whole input
-/// (the streaming buffer boundaries in curl do not affect the final bytes, since
-/// the algorithm consumes input deterministically and only defers when it needs
-/// a lookahead that a larger buffer would satisfy).
+/// This is a faithful port of `encoder_qp_read` operating over the whole input.
+/// It is a thin wrapper over [`qp_encode_window`] run to completion (`ateof =
+/// true`) from column 0 — the same window function that drives the incremental
+/// [`EncoderStream::QuotedPrintable`] path — so the one-shot and streaming
+/// encoders share a single implementation and can never drift apart.
 fn encode_quoted_printable(data: &[u8]) -> Vec<u8> {
+    qp_encode_window(data, 0, true).0
+}
+
+/// Encodes a quoted-printable *window* of `data` beginning at output column
+/// `start_col`, returning `(encoded_bytes, input_bytes_consumed, end_col)`.
+///
+/// The quoted-printable algorithm only depends on cross-position state through
+/// (a) the current output column and (b) a bounded lookahead of at most two
+/// bytes (`data[i+2]`, for the space-before-EOL and exact-line-fill rules). This
+/// function externalizes both so a body can be encoded incrementally:
+///
+/// * When `ateof` is `false`, the window stops before any byte that lacks its
+///   full (≤2-byte) lookahead within the currently-available `data` — those
+///   trailing bytes are left unconsumed for the caller to retry once more input
+///   arrives. Because the maximum lookahead is two bytes, it is always safe to
+///   process byte `i` while at least three bytes remain (`data.len() - i >= 3`).
+///   This mirrors how curl's `encoder_qp_read` defers when `!ateof`.
+/// * When `ateof` is `true`, lookahead past the end of `data` is treated as
+///   end-of-data (exactly as [`qp_lookahead_eol`] already does), yielding the
+///   byte-for-byte whole-buffer result.
+fn qp_encode_window(data: &[u8], start_col: usize, ateof: bool) -> (Vec<u8>, usize, usize) {
     let mut out = Vec::with_capacity(data.len());
-    let mut pos: usize = 0; // column position on the current output line
+    let mut pos: usize = start_col; // column position on the current output line
     let mut i: usize = 0;
 
     while i < data.len() {
+        // Streaming (`!ateof`): defer any byte whose ≤2-byte lookahead would read
+        // past the currently-available data; three remaining bytes always suffice.
+        if !ateof && data.len() - i < 3 {
+            break;
+        }
         let b = data[i];
         // Candidate output for this input byte: either the byte itself, or its
         // `=XX` hexadecimal escape.
@@ -416,7 +450,7 @@ fn encode_quoted_printable(data: &[u8]) -> Vec<u8> {
         i += consumed;
     }
 
-    out
+    (out, i, pos)
 }
 
 // ===========================================================================
@@ -1269,21 +1303,240 @@ fn multipart_size(mime: &Mime, strategy: MimeStrategy, child_disposition: Option
 // Streaming reader (mirrors Curl_mime_read)
 // ===========================================================================
 
+/// Number of raw bytes pulled from a file/callback per streaming step before
+/// they are run through a content-transfer-encoder. This bounds the working-set
+/// memory of an encoded [`Source::Encoded`] segment regardless of body size, so
+/// a large encoded upload is never materialized whole (the streaming-parity
+/// requirement). It matches curl's `MIME_RD_BUF` order of magnitude.
+const MIME_STREAM_CHUNK: usize = 8192;
+
 /// One segment of a serialized MIME body.
 enum Source {
     /// Fully materialized bytes (headers, boundaries, in-memory data, or
-    /// encoder-transformed content), consumed via a cursor.
+    /// encoder-transformed *in-memory* Data-part content), consumed via a cursor.
     Mem { data: Vec<u8>, pos: usize },
     /// A file whose content is streamed directly (no encoder applied).
     File(File),
     /// A callback whose content is streamed directly (no encoder applied).
     Callback { cb: Box<dyn MimeReadCallback> },
+    /// A file or callback whose content is streamed through a content-transfer
+    /// encoder incrementally, so the whole (encoded) payload is never buffered.
+    /// `out`/`out_pos` hold the encoded bytes produced from the most recent raw
+    /// chunk that have not yet been handed to the caller; `done` is set once the
+    /// raw source has reached EOF and the encoder's final flush has run.
+    Encoded {
+        raw: RawSource,
+        enc: EncoderStream,
+        out: Vec<u8>,
+        out_pos: usize,
+        done: bool,
+    },
 }
 
 impl Source {
     /// Wraps owned bytes as a [`Source::Mem`] positioned at the start.
     fn mem(data: Vec<u8>) -> Source {
         Source::Mem { data, pos: 0 }
+    }
+
+    /// Builds a streaming encoded segment from a raw byte source and an encoder.
+    fn encoded(raw: RawSource, enc: Encoding) -> Source {
+        Source::Encoded {
+            raw,
+            enc: EncoderStream::new(enc),
+            out: Vec::new(),
+            out_pos: 0,
+            done: false,
+        }
+    }
+}
+
+/// A raw (un-encoded) byte source feeding a streaming [`EncoderStream`]: either
+/// an open file or a data-read callback. This is the streaming analogue of the
+/// bytes that [`Source::File`] / [`Source::Callback`] emit directly, but here
+/// they are pulled a bounded chunk at a time and transformed by an encoder.
+enum RawSource {
+    /// A file streamed a chunk at a time.
+    File(File),
+    /// A callback streamed a chunk at a time.
+    Callback(Box<dyn MimeReadCallback>),
+}
+
+impl RawSource {
+    /// Reads up to `buf.len()` raw bytes, returning `Ok(0)` at end of input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Read`] on a file I/O error **and** when a read callback
+    /// reports more bytes than were requested (`n > buf.len()`) — curl treats a
+    /// callback that over-returns as a `CURLE_READ_ERROR` read-contract
+    /// violation rather than silently truncating. Callback abort/pause map to
+    /// [`Error::AbortedByCallback`] and a `CURLE_AGAIN` context error.
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        match self {
+            RawSource::File(f) => f.read(buf).map_err(|_| Error::Read),
+            RawSource::Callback(cb) => match cb.read(buf) {
+                ReadOutcome::Bytes(0) => Ok(0),
+                ReadOutcome::Bytes(n) => {
+                    if n > buf.len() {
+                        return Err(Error::Read);
+                    }
+                    Ok(n)
+                }
+                ReadOutcome::Abort => Err(Error::AbortedByCallback),
+                ReadOutcome::Pause => Err(Error::with_context(
+                    CurlCode::Again,
+                    "mime data callback paused",
+                )),
+            },
+        }
+    }
+}
+
+/// Incremental content-transfer-encoder state.
+///
+/// Each variant transforms input bytes fed via [`push`](EncoderStream::push) and
+/// flushes any trailing state via [`finish`](EncoderStream::finish), producing
+/// output that is byte-for-byte identical to the corresponding whole-buffer
+/// encoder ([`encode_base64`] / [`encode_quoted_printable`] / [`encode_7bit`] /
+/// the `binary`/`8bit` pass-through) regardless of how the input is chunked.
+/// The base64 and quoted-printable variants share their core logic with those
+/// whole-buffer functions ([`append_base64_wrapped`] and [`qp_encode_window`]),
+/// so parity holds by construction (and is pinned by tests).
+enum EncoderStream {
+    /// `binary` / `8bit`: pass-through, no transformation.
+    Passthrough,
+    /// `7bit`: pass-through, but every byte must be 7-bit clean.
+    SevenBit,
+    /// `base64`: carries the 0–2 input bytes that do not yet complete a 3-byte
+    /// group, plus the output column used for 76-character line wrapping.
+    Base64 {
+        carry: [u8; 2],
+        carry_len: usize,
+        col: usize,
+    },
+    /// `quoted-printable`: carries pending input bytes that still need lookahead
+    /// (at most a couple), plus the output column.
+    QuotedPrintable { pending: Vec<u8>, col: usize },
+}
+
+impl EncoderStream {
+    /// Creates the streaming encoder for a given [`Encoding`].
+    fn new(enc: Encoding) -> Self {
+        match enc {
+            Encoding::Binary | Encoding::EightBit => EncoderStream::Passthrough,
+            Encoding::SevenBit => EncoderStream::SevenBit,
+            Encoding::Base64 => EncoderStream::Base64 {
+                carry: [0u8; 2],
+                carry_len: 0,
+                col: 0,
+            },
+            Encoding::QuotedPrintable => EncoderStream::QuotedPrintable {
+                pending: Vec::new(),
+                col: 0,
+            },
+        }
+    }
+
+    /// Feeds `input` through the encoder, appending encoded bytes to `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Read`] for a [`EncoderStream::SevenBit`] stream that
+    /// contains a byte with the high bit set (matching `encoder_7bit_read`).
+    fn push(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        match self {
+            EncoderStream::Passthrough => out.extend_from_slice(input),
+            EncoderStream::SevenBit => {
+                for &b in input {
+                    if b & 0x80 != 0 {
+                        return Err(Error::Read);
+                    }
+                }
+                out.extend_from_slice(input);
+            }
+            EncoderStream::Base64 {
+                carry,
+                carry_len,
+                col,
+            } => {
+                let mut idx = 0;
+                // 1) Complete a pending group left over from a previous chunk.
+                if *carry_len > 0 {
+                    let need = 3 - *carry_len;
+                    let take = need.min(input.len());
+                    let mut group = [0u8; 3];
+                    group[..*carry_len].copy_from_slice(&carry[..*carry_len]);
+                    group[*carry_len..*carry_len + take].copy_from_slice(&input[..take]);
+                    idx = take;
+                    if *carry_len + take == 3 {
+                        // A multiple-of-3 slice base64-encodes with no padding.
+                        let enc = BASE64_STANDARD.encode(group);
+                        append_base64_wrapped(out, col, enc.as_bytes());
+                        *carry_len = 0;
+                    } else {
+                        // Still short of a full group; stash and wait for more.
+                        carry[..*carry_len + take].copy_from_slice(&group[..*carry_len + take]);
+                        *carry_len += take;
+                        return Ok(());
+                    }
+                }
+                // 2) Encode all complete 3-byte groups from the remainder.
+                let rem = &input[idx..];
+                let full = (rem.len() / 3) * 3;
+                if full > 0 {
+                    let enc = BASE64_STANDARD.encode(&rem[..full]);
+                    append_base64_wrapped(out, col, enc.as_bytes());
+                }
+                // 3) Stash the trailing 0–2 bytes as the new carry.
+                let tail = &rem[full..];
+                carry[..tail.len()].copy_from_slice(tail);
+                *carry_len = tail.len();
+            }
+            EncoderStream::QuotedPrintable { pending, col } => {
+                pending.extend_from_slice(input);
+                // Encode everything that has its full lookahead available; keep
+                // the (bounded) unconsumed tail for the next chunk / finish.
+                let (encoded, consumed, new_col) = qp_encode_window(pending, *col, false);
+                out.extend_from_slice(&encoded);
+                *col = new_col;
+                pending.drain(..consumed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Flushes any state held after the last [`push`](EncoderStream::push):
+    /// base64 emits its final (padded) group, quoted-printable encodes the
+    /// remaining bytes with end-of-data lookahead. Pass-through / 7bit hold no
+    /// state and emit nothing.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the same errors as [`push`](EncoderStream::push).
+    fn finish(&mut self, out: &mut Vec<u8>) -> Result<()> {
+        match self {
+            EncoderStream::Passthrough | EncoderStream::SevenBit => {}
+            EncoderStream::Base64 {
+                carry,
+                carry_len,
+                col,
+            } => {
+                if *carry_len > 0 {
+                    // A 1- or 2-byte tail base64-encodes to 4 chars with padding.
+                    let enc = BASE64_STANDARD.encode(&carry[..*carry_len]);
+                    append_base64_wrapped(out, col, enc.as_bytes());
+                    *carry_len = 0;
+                }
+            }
+            EncoderStream::QuotedPrintable { pending, col } => {
+                let (encoded, _consumed, new_col) = qp_encode_window(pending, *col, true);
+                out.extend_from_slice(&encoded);
+                *col = new_col;
+                pending.clear();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1303,9 +1556,10 @@ impl MimeReader {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Read`] on a file read error, [`Error::AbortedByCallback`]
-    /// if a callback aborts, and a `CURLE_AGAIN` context error if a callback
-    /// pauses.
+    /// Returns [`Error::Read`] on a file read error or when a read callback
+    /// over-returns (reports more bytes than requested — a `CURLE_READ_ERROR`
+    /// contract violation), [`Error::AbortedByCallback`] if a callback aborts,
+    /// and a `CURLE_AGAIN` context error if a callback pauses.
     pub fn fill(&mut self, buf: &mut [u8]) -> Result<usize> {
         while let Some(front) = self.sources.front_mut() {
             match front {
@@ -1334,7 +1588,13 @@ impl MimeReader {
                             self.sources.pop_front();
                         }
                         ReadOutcome::Bytes(n) => {
-                            return Ok(usize::min(n, buf.len()));
+                            // A callback reporting more than requested violates
+                            // the read contract; curl surfaces this as
+                            // CURLE_READ_ERROR rather than silently truncating.
+                            if n > buf.len() {
+                                return Err(Error::Read);
+                            }
+                            return Ok(n);
                         }
                         ReadOutcome::Abort => return Err(Error::AbortedByCallback),
                         ReadOutcome::Pause => {
@@ -1342,6 +1602,43 @@ impl MimeReader {
                                 CurlCode::Again,
                                 "mime data callback paused",
                             ))
+                        }
+                    }
+                }
+                Source::Encoded {
+                    raw,
+                    enc,
+                    out,
+                    out_pos,
+                    done,
+                } => {
+                    if buf.is_empty() {
+                        return Ok(0);
+                    }
+                    // Hand out any encoded bytes produced from the previous chunk.
+                    if *out_pos < out.len() {
+                        let n = usize::min(buf.len(), out.len() - *out_pos);
+                        buf[..n].copy_from_slice(&out[*out_pos..*out_pos + n]);
+                        *out_pos += n;
+                        return Ok(n);
+                    }
+                    // Encoded buffer drained: either finish, or pull and encode
+                    // the next bounded raw chunk (never materializing the whole
+                    // payload). A refill may legitimately yield no output yet
+                    // (e.g. base64 awaiting a complete 3-byte group); the outer
+                    // loop simply reads again until bytes are available or EOF.
+                    if *done {
+                        self.sources.pop_front();
+                    } else {
+                        out.clear();
+                        *out_pos = 0;
+                        let mut scratch = [0u8; MIME_STREAM_CHUNK];
+                        let n = raw.read(&mut scratch)?;
+                        if n == 0 {
+                            enc.finish(out)?;
+                            *done = true;
+                        } else {
+                            enc.push(&scratch[..n], out)?;
                         }
                     }
                 }
@@ -1355,30 +1652,6 @@ impl Read for MimeReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.fill(buf).map_err(|e| io::Error::other(e.message()))
     }
-}
-
-/// Drains a callback-backed source into a byte vector (used when an encoder
-/// must transform callback content before it is emitted).
-fn drain_callback(mut cb: Box<dyn MimeReadCallback>) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        match cb.read(&mut buf) {
-            ReadOutcome::Bytes(0) => break,
-            ReadOutcome::Bytes(n) => {
-                let n = usize::min(n, buf.len());
-                out.extend_from_slice(&buf[..n]);
-            }
-            ReadOutcome::Abort => return Err(Error::AbortedByCallback),
-            ReadOutcome::Pause => {
-                return Err(Error::with_context(
-                    CurlCode::Again,
-                    "mime data callback paused",
-                ))
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// Appends the segments for a whole multipart body to `sources`, emitting the
@@ -1441,31 +1714,23 @@ fn push_part(
         }
         MimeKind::File => {
             let path = part.filepath.ok_or(Error::Read)?;
+            let f = File::open(&path).map_err(|_| Error::Read)?;
             match part.encoder {
-                Some(enc) => {
-                    let mut content = Vec::new();
-                    File::open(&path)
-                        .map_err(|_| Error::Read)?
-                        .read_to_end(&mut content)
-                        .map_err(|_| Error::Read)?;
-                    sources.push_back(Source::mem(enc.encode(&content)?));
-                }
-                None => {
-                    let f = File::open(&path).map_err(|_| Error::Read)?;
-                    sources.push_back(Source::File(f));
-                }
+                // Encoded file part: stream the file through the encoder a
+                // bounded chunk at a time instead of reading the whole file into
+                // memory and encoding it in one shot.
+                Some(enc) => sources.push_back(Source::encoded(RawSource::File(f), enc)),
+                None => sources.push_back(Source::File(f)),
             }
         }
         MimeKind::Callback => {
             if let Some(cb) = part.callback {
                 match part.encoder {
-                    Some(enc) => {
-                        let content = drain_callback(cb)?;
-                        sources.push_back(Source::mem(enc.encode(&content)?));
-                    }
-                    None => {
-                        sources.push_back(Source::Callback { cb });
-                    }
+                    // Encoded callback part: stream the callback through the
+                    // encoder a bounded chunk at a time instead of draining the
+                    // whole callback into memory before encoding.
+                    Some(enc) => sources.push_back(Source::encoded(RawSource::Callback(cb), enc)),
+                    None => sources.push_back(Source::Callback { cb }),
                 }
             }
         }
@@ -2733,5 +2998,233 @@ mod tests {
         let body = normalize(&mime.to_bytes(MimeStrategy::Mail).unwrap(), &boundary);
         assert!(body.contains("Content-Type: text/html"));
         assert!(body.contains("Content-Transfer-Encoding: 8bit"));
+    }
+
+    // --- Streaming content-transfer encoders ------------------------------
+
+    /// Runs an [`EncoderStream`] over `input`, pushing it in fixed-size `chunk`
+    /// slices and flushing at the end — the streaming counterpart of the
+    /// whole-buffer [`Encoding::encode`].
+    fn stream_encode(enc: Encoding, input: &[u8], chunk: usize) -> Result<Vec<u8>> {
+        let mut s = EncoderStream::new(enc);
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < input.len() {
+            let end = (i + chunk).min(input.len());
+            s.push(&input[i..end], &mut out)?;
+            i = end;
+        }
+        s.finish(&mut out)?;
+        Ok(out)
+    }
+
+    /// Fully drains a [`MimeReader`] using a `bufsize`-byte read buffer,
+    /// returning the concatenated body. A small `bufsize` forces the streaming
+    /// segments through many `fill` iterations.
+    fn read_all(mut reader: MimeReader, bufsize: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; bufsize];
+        loop {
+            let n = reader.fill(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        Ok(out)
+    }
+
+    /// A varied corpus that exercises base64 group boundaries, the 76-column
+    /// wrap, and the quoted-printable escape / space-EOL / soft-break / CRLF
+    /// lookahead rules.
+    fn parity_inputs() -> Vec<Vec<u8>> {
+        let mut inputs: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"a".to_vec(),
+            b"ab".to_vec(),
+            b"abc".to_vec(),
+            b"abcd".to_vec(),
+            b"abcde".to_vec(),
+            b"Hello, World!".to_vec(),
+            vec![b'A'; 60],
+            vec![b'A'; 76],
+            vec![b'A'; 77],
+            vec![b'X'; 200],
+            b"foo=bar".to_vec(),
+            b"a b".to_vec(),
+            b"a ".to_vec(),
+            b"trailing tab\t".to_vec(),
+            b"line1\r\nline2\r\nlast".to_vec(),
+            b"tab\there\tthere".to_vec(),
+            (0u8..=255).collect(),
+            vec![b'='; 100],
+            b"y".repeat(74),
+            b"y".repeat(75),
+            b"y".repeat(76),
+            b"y".repeat(77),
+        ];
+        // A deterministic pseudo-random binary blob.
+        let mut blob = Vec::new();
+        let mut x: u32 = 0x1234_5678;
+        for _ in 0..500 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            blob.push((x >> 16) as u8);
+        }
+        inputs.push(blob);
+        inputs
+    }
+
+    #[test]
+    fn encoder_stream_matches_whole_buffer_across_all_chunkings() {
+        let chunk_sizes = [1usize, 2, 3, 4, 5, 7, 8, 13, 64, 76, 77, 8192];
+        for input in parity_inputs() {
+            for enc in [
+                Encoding::Base64,
+                Encoding::QuotedPrintable,
+                Encoding::Binary,
+                Encoding::EightBit,
+            ] {
+                let whole = enc.encode(&input).unwrap();
+                for &chunk in &chunk_sizes {
+                    let streamed = stream_encode(enc, &input, chunk).unwrap();
+                    assert_eq!(
+                        streamed,
+                        whole,
+                        "enc={enc:?} chunk={chunk} len={}",
+                        input.len()
+                    );
+                }
+            }
+            // 7bit parity only over 7-bit-clean inputs (others error in both).
+            if input.iter().all(|b| b & 0x80 == 0) {
+                let whole = Encoding::SevenBit.encode(&input).unwrap();
+                for &chunk in &chunk_sizes {
+                    let streamed = stream_encode(Encoding::SevenBit, &input, chunk).unwrap();
+                    assert_eq!(streamed, whole, "7bit chunk={chunk} len={}", input.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoder_stream_7bit_rejects_high_bit_like_whole_buffer() {
+        let bad = b"ok\xffbad";
+        assert!(Encoding::SevenBit.encode(bad).is_err());
+        for chunk in [1usize, 2, 3, 8, 8192] {
+            assert!(
+                stream_encode(Encoding::SevenBit, bad, chunk).is_err(),
+                "streamed 7bit should reject high bit (chunk={chunk})"
+            );
+        }
+    }
+
+    /// A misbehaving callback that always reports more bytes than requested.
+    struct OverReader;
+    impl MimeReadCallback for OverReader {
+        fn read(&mut self, buf: &mut [u8]) -> ReadOutcome {
+            // Contract violation: claim to have produced more than `buf` holds.
+            ReadOutcome::Bytes(buf.len() + 1)
+        }
+    }
+
+    fn drain_reader_error(mut reader: MimeReader) -> Option<Error> {
+        let mut buf = [0u8; 64];
+        loop {
+            match reader.fill(&mut buf) {
+                Ok(0) => return None,
+                Ok(_) => continue,
+                Err(e) => return Some(e),
+            }
+        }
+    }
+
+    #[test]
+    fn callback_over_return_is_read_error_plain() {
+        // Un-encoded callback part: over-return surfaces as CURLE_READ_ERROR.
+        let mut mime = Mime::new();
+        {
+            let p = mime.addpart();
+            p.set_name(Some("x")).unwrap();
+            p.set_data_cb(10, Box::new(OverReader)).unwrap();
+        }
+        let reader = mime.into_reader(MimeStrategy::Form).unwrap();
+        assert!(
+            matches!(drain_reader_error(reader), Some(Error::Read)),
+            "plain callback over-return must be Error::Read"
+        );
+    }
+
+    #[test]
+    fn callback_over_return_is_read_error_encoded() {
+        // Encoded (base64) callback part: the streaming raw read also enforces
+        // the callback contract and surfaces CURLE_READ_ERROR.
+        let mut mime = Mime::new();
+        {
+            let p = mime.addpart();
+            p.set_name(Some("x")).unwrap();
+            p.set_data_cb(10, Box::new(OverReader)).unwrap();
+            p.set_encoder(Some("base64")).unwrap();
+        }
+        let reader = mime.into_reader(MimeStrategy::Form).unwrap();
+        assert!(
+            matches!(drain_reader_error(reader), Some(Error::Read)),
+            "encoded callback over-return must be Error::Read"
+        );
+    }
+
+    #[test]
+    fn encoded_callback_streamed_body_equals_whole_buffer_base64() {
+        // The streamed encoded segment (read through a tiny buffer, so both the
+        // raw reads and the encoded hand-off are heavily chunked) must contain
+        // exactly the whole-buffer base64 of the payload.
+        let payload: Vec<u8> = (0u8..=255).cycle().take(1000).collect();
+        let mut mime = Mime::new();
+        {
+            let p = mime.addpart();
+            p.set_name(Some("f")).unwrap();
+            p.set_data_cb(
+                payload.len() as i64,
+                Box::new(VecReader {
+                    data: payload.clone(),
+                    pos: 0,
+                }),
+            )
+            .unwrap();
+            p.set_encoder(Some("base64")).unwrap();
+        }
+        let reader = mime.into_reader(MimeStrategy::Form).unwrap();
+        let body = read_all(reader, 7).unwrap();
+        let expected = Encoding::Base64.encode(&payload).unwrap();
+        assert!(
+            body.windows(expected.len())
+                .any(|w| w == expected.as_slice()),
+            "streamed base64 callback body does not match the whole-buffer encoding"
+        );
+    }
+
+    #[test]
+    fn encoded_file_streamed_body_equals_whole_buffer_base64() {
+        use std::io::Write;
+        let payload: Vec<u8> = (0u8..=255).cycle().take(1000).collect();
+        let mut tf = tempfile::NamedTempFile::new().unwrap();
+        tf.write_all(&payload).unwrap();
+        tf.flush().unwrap();
+        let path = tf.path().to_owned();
+
+        let mut mime = Mime::new();
+        {
+            let p = mime.addpart();
+            p.set_name(Some("f")).unwrap();
+            p.set_filedata(&path).unwrap();
+            p.set_encoder(Some("base64")).unwrap();
+        }
+        let reader = mime.into_reader(MimeStrategy::Form).unwrap();
+        let body = read_all(reader, 5).unwrap();
+        let expected = Encoding::Base64.encode(&payload).unwrap();
+        assert!(
+            body.windows(expected.len())
+                .any(|w| w == expected.as_slice()),
+            "streamed base64 file body does not match the whole-buffer encoding"
+        );
     }
 }

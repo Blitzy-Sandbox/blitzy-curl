@@ -131,6 +131,21 @@ des = "0.8"               # DES for NTLM LM/NT hash computation
 base64 = "0.22"           # Base64 encoding/decoding
 rand = "0.8"              # random number generation for auth nonces/keys
 
+# --- Authentication: optional OS GSSAPI / Kerberos (Negotiate) ---
+# libgssapi is the ONE optional C linkage the AAP explicitly retains: §0.5.2 keeps "OS
+# GSSAPI/Kerberos" as "the only optional C linkage, for Negotiate auth", and §0.1.1 / §0.6.1
+# reiterate that optional OS GSSAPI is the sole permitted C dependency in the whole workspace.
+# §0.6.1 sanctions the capability but names no crate, so the concrete crate is chosen here:
+# `libgssapi` provides a SAFE Rust wrapper over the platform GSSAPI (linking the OS krb5
+# GSSAPI at build time via libgssapi-sys), which is exactly the API the already-written
+# `curl-rs-lib/src/auth/kerberos.rs` (and, transitively, `auth/negotiate.rs`) consumes
+# (`ClientCtx`, `Name`, `CtxFlags`, `GSS_MECH_KRB5`, `GSS_NT_HOSTBASED_SERVICE`) with zero
+# `unsafe` in the library. It is pulled in ONLY behind the DEFAULT-OFF `gssapi` / `spnego`
+# features in curl-rs-lib, so stock/default builds and the default-feature MSRV 1.75 gate
+# (§0.6.4) link no C library and are unaffected. 0.11 is the current release and is the
+# version whose safe surface matches the existing auth code.
+libgssapi = "0.11"
+
 # --- Compression (content-encoding) ---
 flate2 = "1"              # gzip/deflate decompression
 brotli = "8"              # Brotli decompression

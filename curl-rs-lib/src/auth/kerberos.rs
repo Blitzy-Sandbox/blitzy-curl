@@ -92,7 +92,9 @@ pub fn create_gssapi_user_message(
     _mutual_auth: bool,
     _challenge: Option<&[u8]>,
 ) -> crate::error::Result<Option<Vec<u8>>> {
-    Err(crate::error::Error::from(crate::error::CurlCode::NotBuiltIn))
+    Err(crate::error::Error::from(
+        crate::error::CurlCode::NotBuiltIn,
+    ))
 }
 
 /// Generates a GSS-API (Kerberos V5) security-layer message.
@@ -104,7 +106,9 @@ pub fn create_gssapi_security_message(
     _authzid: Option<&str>,
     _challenge: &[u8],
 ) -> crate::error::Result<Vec<u8>> {
-    Err(crate::error::Error::from(crate::error::CurlCode::NotBuiltIn))
+    Err(crate::error::Error::from(
+        crate::error::CurlCode::NotBuiltIn,
+    ))
 }
 
 /// Releases the Kerberos V5 state.
@@ -164,10 +168,7 @@ pub struct Kerberos5Data {
 impl std::fmt::Debug for Kerberos5Data {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Kerberos5Data")
-            .field(
-                "context",
-                &self.context.as_ref().map(|_| "<gss_ctx_id_t>"),
-            )
+            .field("context", &self.context.as_ref().map(|_| "<gss_ctx_id_t>"))
             .finish()
     }
 }
@@ -304,9 +305,8 @@ pub fn create_gssapi_security_message(
     // Extract the security layer and the maximum message size. (krb5_gssapi.c
     // L224-228)
     let sec_layer = plaintext[0];
-    let mut max_size = (u32::from(plaintext[1]) << 16)
-        | (u32::from(plaintext[2]) << 8)
-        | u32::from(plaintext[3]);
+    let mut max_size =
+        (u32::from(plaintext[1]) << 16) | (u32::from(plaintext[2]) << 8) | u32::from(plaintext[3]);
 
     // The server must offer the "no security layer" option. (krb5_gssapi.c
     // L233-239)

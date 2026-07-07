@@ -98,8 +98,21 @@ fn generate_verification_header() {
     // Load this crate's cbindgen configuration explicitly. `cbindgen.toml` is config-only (it
     // intentionally sets no output path); the output location is decided here so the committed
     // header can never be clobbered.
-    let config = cbindgen::Config::from_file(format!("{crate_dir}/cbindgen.toml"))
-        .expect("failed to read curl-rs-ffi/cbindgen.toml");
+    //
+    // Loading is best-effort, exactly like the generation step below: a missing or malformed
+    // `cbindgen.toml` is downgraded to a `cargo:warning` and returns cleanly — never a panic —
+    // so a transient tooling issue can never break the build or block downstream crates (module
+    // docs, "# Robustness"). The committed include/curl/curl.h stays authoritative regardless.
+    let config = match cbindgen::Config::from_file(format!("{crate_dir}/cbindgen.toml")) {
+        Ok(config) => config,
+        Err(err) => {
+            println!(
+                "cargo:warning=curl-rs-ffi: cbindgen config load skipped ({err}); \
+                 the committed include/curl/curl.h remains authoritative"
+            );
+            return;
+        }
+    };
 
     // Build the bindings from this crate's `extern "C"` surface. See the module docs for why
     // `with_only_target_dependencies(true)` is required and must come after `with_config`.
@@ -114,9 +127,21 @@ fn generate_verification_header() {
             // Primary, non-clobbering artifact in the per-build scratch directory.
             bindings.write_to_file(PathBuf::from(&out_dir).join("curl.h"));
 
-            // Optional opt-in verification path for the CI byte-diff step.
+            // Optional opt-in verification path for the CI byte-diff step. Guard it so it can
+            // never clobber the committed `include/curl/curl.h` even if a caller points the env
+            // var straight at it (directly, or via a symlink / `..` path): that header is kept
+            // byte-identical to curl 8.x and owned by the `include/` folder, and refreshing it is
+            // a deliberate, separately reviewed maintainer action — a plain build must never
+            // mutate it (module docs, "# Non-clobbering contract").
             if let Ok(extra) = std::env::var(HEADER_OUT_ENV) {
-                bindings.write_to_file(extra);
+                if resolves_to_committed_header(&crate_dir, &extra) {
+                    println!(
+                        "cargo:warning=curl-rs-ffi: {HEADER_OUT_ENV} resolves to the committed \
+                         include/curl/curl.h; refusing to overwrite it (wrote $OUT_DIR/curl.h only)"
+                    );
+                } else {
+                    bindings.write_to_file(extra);
+                }
             }
         }
         Err(err) => {
@@ -127,5 +152,25 @@ fn generate_verification_header() {
                  the committed include/curl/curl.h remains authoritative"
             );
         }
+    }
+}
+
+/// Returns `true` when `target` resolves to the same file as the committed
+/// `include/curl/curl.h` (the curl-8.x-identical reference header), so the opt-in
+/// [`HEADER_OUT_ENV`] write can be refused rather than clobbering it.
+///
+/// The committed header sits at `{crate_dir}/../include/curl/curl.h`. Both paths are compared
+/// after [`std::fs::canonicalize`], which resolves symlinks and `..` segments, so an indirect
+/// path cannot smuggle the write through. If either path fails to canonicalize the paths are
+/// treated as distinct and the write proceeds: the committed header already exists on disk, so a
+/// `target` that cannot be canonicalized (because it does not exist yet) provably is not it.
+fn resolves_to_committed_header(crate_dir: &str, target: &str) -> bool {
+    let committed = PathBuf::from(crate_dir).join("../include/curl/curl.h");
+    match (
+        committed.canonicalize(),
+        PathBuf::from(target).canonicalize(),
+    ) {
+        (Ok(committed), Ok(target)) => committed == target,
+        _ => false,
     }
 }

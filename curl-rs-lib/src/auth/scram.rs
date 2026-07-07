@@ -89,8 +89,7 @@ const CLIENT_NONCE_LEN: usize = 32;
 /// Alphabet for the random client nonce. All characters are printable ASCII and
 /// none is `,` (the SASL attribute separator), so the value is a valid SCRAM
 /// `printable` nonce token.
-const NONCE_ALPHABET: &[u8] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+const NONCE_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 /// A hash primitive: `H(data) -> digest`.
 type HashFn = fn(&[u8]) -> Vec<u8>;
@@ -412,11 +411,7 @@ impl fmt::Debug for ScramClient {
 
 impl ScramClient {
     /// Creates a SCRAM client with a freshly generated random client nonce.
-    pub fn new(
-        hash: ScramHash,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Self {
+    pub fn new(hash: ScramHash, username: impl Into<String>, password: impl Into<String>) -> Self {
         Self::with_nonce(hash, username, password, generate_nonce())
     }
 
@@ -509,8 +504,7 @@ impl ScramClient {
         self.server_first = server_first.to_string();
 
         // client-final-message-without-proof = "c=biws,r=<combined nonce>".
-        let client_final_without_proof =
-            format!("c={GS2_HEADER_B64},r={}", parsed.combined_nonce);
+        let client_final_without_proof = format!("c={GS2_HEADER_B64},r={}", parsed.combined_nonce);
 
         // AuthMessage = client-first-bare "," server-first "," client-final-
         // without-proof  (RFC 5802 §3).
@@ -558,9 +552,7 @@ impl ScramClient {
         }
 
         let verifier_b64 = primary.strip_prefix("v=").ok_or_else(|| {
-            Error::bad_content_encoding(
-                "SCRAM: malformed server-final-message (expected v= or e=)",
-            )
+            Error::bad_content_encoding("SCRAM: malformed server-final-message (expected v= or e=)")
         })?;
         let server_signature = BASE64.decode(verifier_b64).map_err(|e| {
             Error::bad_content_encoding(format!("SCRAM: invalid base64 server signature: {e}"))
@@ -587,8 +579,12 @@ mod tests {
     /// three-step [`ScramClient::step`] state machine.
     #[test]
     fn rfc5802_scram_sha1_full_exchange() {
-        let mut client =
-            ScramClient::with_nonce(ScramHash::Sha1, "user", "pencil", "fyko+d2lbbFgONRv9qkxdawL");
+        let mut client = ScramClient::with_nonce(
+            ScramHash::Sha1,
+            "user",
+            "pencil",
+            "fyko+d2lbbFgONRv9qkxdawL",
+        );
 
         // Step 1: empty input -> client-first message.
         let client_first = client.step(b"").unwrap();
@@ -673,7 +669,10 @@ mod tests {
         let a = ScramClient::new(ScramHash::Sha256, "u", "p");
         let b = ScramClient::new(ScramHash::Sha256, "u", "p");
         assert_eq!(a.client_nonce.len(), CLIENT_NONCE_LEN);
-        assert!(a.client_nonce.bytes().all(|byte| NONCE_ALPHABET.contains(&byte)));
+        assert!(a
+            .client_nonce
+            .bytes()
+            .all(|byte| NONCE_ALPHABET.contains(&byte)));
         // Two independent nonces essentially never collide.
         assert_ne!(a.client_nonce, b.client_nonce);
     }
@@ -718,14 +717,14 @@ mod tests {
     #[test]
     fn malformed_server_first_messages_are_rejected() {
         let cases: &[&[u8]] = &[
-            b"s=QSXCR+Q6sek8bf92,i=4096",                    // missing r=
-            b"r=clientnonceX,i=4096",                        // missing s=
-            b"r=clientnonceX,s=QSXCR+Q6sek8bf92",            // missing i=
-            b"r=clientnonceX,s=!!not-base64!!,i=4096",       // invalid base64 salt
-            b"r=clientnonceX,s=QSXCR+Q6sek8bf92,i=notanint", // non-numeric i
-            b"r=clientnonceX,s=QSXCR+Q6sek8bf92,i=0",        // zero iteration count
+            b"s=QSXCR+Q6sek8bf92,i=4096",                            // missing r=
+            b"r=clientnonceX,i=4096",                                // missing s=
+            b"r=clientnonceX,s=QSXCR+Q6sek8bf92",                    // missing i=
+            b"r=clientnonceX,s=!!not-base64!!,i=4096",               // invalid base64 salt
+            b"r=clientnonceX,s=QSXCR+Q6sek8bf92,i=notanint",         // non-numeric i
+            b"r=clientnonceX,s=QSXCR+Q6sek8bf92,i=0",                // zero iteration count
             b"m=mandatory,r=clientnonceX,s=QSXCR+Q6sek8bf92,i=4096", // unknown mandatory ext
-            b"noequalsign",                                  // attribute without '='
+            b"noequalsign",                                          // attribute without '='
         ];
         for case in cases {
             let mut client =
@@ -744,8 +743,12 @@ mod tests {
     /// A wrong `ServerSignature` denies the login (`CURLE_LOGIN_DENIED`).
     #[test]
     fn server_signature_mismatch_denies_login() {
-        let mut client =
-            ScramClient::with_nonce(ScramHash::Sha1, "user", "pencil", "fyko+d2lbbFgONRv9qkxdawL");
+        let mut client = ScramClient::with_nonce(
+            ScramHash::Sha1,
+            "user",
+            "pencil",
+            "fyko+d2lbbFgONRv9qkxdawL",
+        );
         client.step(b"").unwrap();
         client
             .step(b"r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096")
@@ -759,8 +762,12 @@ mod tests {
     /// A server-error (`e=`) in the final message denies the login.
     #[test]
     fn server_error_message_denies_login() {
-        let mut client =
-            ScramClient::with_nonce(ScramHash::Sha1, "user", "pencil", "fyko+d2lbbFgONRv9qkxdawL");
+        let mut client = ScramClient::with_nonce(
+            ScramHash::Sha1,
+            "user",
+            "pencil",
+            "fyko+d2lbbFgONRv9qkxdawL",
+        );
         client.step(b"").unwrap();
         client
             .step(b"r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096")
@@ -772,8 +779,12 @@ mod tests {
     /// A malformed server-final (neither `v=` nor `e=`) is bad content encoding.
     #[test]
     fn malformed_server_final_is_rejected() {
-        let mut client =
-            ScramClient::with_nonce(ScramHash::Sha1, "user", "pencil", "fyko+d2lbbFgONRv9qkxdawL");
+        let mut client = ScramClient::with_nonce(
+            ScramHash::Sha1,
+            "user",
+            "pencil",
+            "fyko+d2lbbFgONRv9qkxdawL",
+        );
         client.step(b"").unwrap();
         client
             .step(b"r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096")
@@ -785,8 +796,12 @@ mod tests {
     /// Trailing extensions after the verifier are ignored.
     #[test]
     fn server_final_with_trailing_extension_verifies() {
-        let mut client =
-            ScramClient::with_nonce(ScramHash::Sha1, "user", "pencil", "fyko+d2lbbFgONRv9qkxdawL");
+        let mut client = ScramClient::with_nonce(
+            ScramHash::Sha1,
+            "user",
+            "pencil",
+            "fyko+d2lbbFgONRv9qkxdawL",
+        );
         client.step(b"").unwrap();
         client
             .step(b"r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096")
@@ -801,8 +816,12 @@ mod tests {
     /// surfaces as `CURLE_AUTH_ERROR`.
     #[test]
     fn step_after_completion_is_an_auth_error() {
-        let mut client =
-            ScramClient::with_nonce(ScramHash::Sha1, "user", "pencil", "fyko+d2lbbFgONRv9qkxdawL");
+        let mut client = ScramClient::with_nonce(
+            ScramHash::Sha1,
+            "user",
+            "pencil",
+            "fyko+d2lbbFgONRv9qkxdawL",
+        );
         client.step(b"").unwrap();
         client
             .step(b"r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096")
