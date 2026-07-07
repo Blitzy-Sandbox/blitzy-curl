@@ -641,6 +641,12 @@ pub enum CURLoption {
     CURLOPT_TCP_KEEPCNT = 326,
     CURLOPT_UPLOAD_FLAGS = 327,
     CURLOPT_SSL_SIGNATURE_ALGORITHMS = 10328,
+    /// `CURLOPT_LASTENTRY` — curl's "last unused" sentinel (`include/curl/curl.h`). It carries no
+    /// setopt semantics; it exists so the generated `curl.h` and the easyoption metadata table
+    /// (`crate::options::CURL_EASYOPTS`) can name a terminating id byte-exactly. Its value is the
+    /// C auto-increment after `CURLOPT_SSL_SIGNATURE_ALGORITHMS = 10328`, i.e. `10329`
+    /// (`10329 % 10000 == 329`, matching curl's `Curl_easyopts_check()` invariant).
+    CURLOPT_LASTENTRY = 10329,
 }
 
 // ===========================================================================
