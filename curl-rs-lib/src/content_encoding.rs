@@ -73,6 +73,48 @@ pub const MAX_ENCODE_STACK: usize = 5;
 /// zlib/deflate path.
 pub const DECOMPRESS_BUFFER_SIZE: usize = 16_384;
 
+/// Default upper bound, in bytes, on the decoded output a **single**
+/// [`Unencoder::write`] / [`Unencoder::finish`] call may produce at any one
+/// decoding stage (see [`Unencoder::set_max_decoded_per_write`]).
+///
+/// # Why this exists (decompression-bomb defense, CWE-400)
+///
+/// A tiny highly-compressible input can expand by many orders of magnitude
+/// (a "decompression bomb"). Left unchecked, one small malicious chunk could
+/// drive an unbounded allocation and exhaust memory before any downstream
+/// backpressure applies. curl's C writer chain bounds this structurally: it
+/// inflates into a fixed [`DECOMPRESS_BUFFER_SIZE`] buffer and flushes each
+/// block to the next writer, so its working set per stage is ~16 KiB and a
+/// bomb is merely *streamed* rather than materialized.
+///
+/// This pure-Rust pipeline returns the decoded output of a chunk as an owned
+/// [`Bytes`], so it instead enforces an explicit per-call ceiling: each
+/// decoding stage may emit at most this many bytes for one input chunk before
+/// the decode is rejected with [`Error::TooLarge`] ([`CurlCode::TooLarge`],
+/// integer `100`). The bound is applied **per call**, not cumulatively over
+/// the transfer, so legitimate streaming downloads of unbounded total size are
+/// unaffected (each network-sized chunk expands well under the ceiling) while a
+/// single pathological chunk can allocate no more than this before it is
+/// stopped — preserving functional parity for real content while closing the
+/// bomb vector. The nesting guard [`MAX_ENCODE_STACK`] still independently caps
+/// how many stages can be chained.
+///
+/// The default is deliberately generous (64 MiB): far above any plausible
+/// single-chunk expansion of legitimate content, yet a hard cap against
+/// runaway allocation. Callers that must accept larger single-chunk expansions
+/// can raise it (or disable it with `usize::MAX`) via
+/// [`Unencoder::set_max_decoded_per_write`].
+pub const DEFAULT_MAX_DECODED_PER_WRITE: usize = 64 * 1024 * 1024;
+
+// The default ceiling must be a real finite bound: positive (so some output is
+// always permitted) and strictly below `usize::MAX` (which is the sentinel that
+// *disables* the bound). Enforced at compile time so the invariant can never
+// silently regress.
+const _: () = assert!(
+    DEFAULT_MAX_DECODED_PER_WRITE > 0 && DEFAULT_MAX_DECODED_PER_WRITE < usize::MAX,
+    "DEFAULT_MAX_DECODED_PER_WRITE must be a finite, positive decompression-bomb ceiling",
+);
+
 /// A single recognized (or unrecognized) content coding.
 ///
 /// This mirrors the entries of curl's `general_unencoders` table plus the
@@ -219,27 +261,106 @@ trait Decoder: Send {
     /// An empty `input` is a no-op that must succeed (mirroring curl's writers,
     /// which forward zero-length writes untouched). Returns
     /// [`Error::BadContentEncoding`] on a malformed stream.
-    fn decode(&mut self, input: &[u8], out: &mut BytesMut) -> Result<()>;
+    ///
+    /// `limit` is the maximum number of decoded bytes this single call may emit
+    /// (the decompression-bomb ceiling; see [`DEFAULT_MAX_DECODED_PER_WRITE`]).
+    /// A decoder that would exceed it must stop and return [`Error::TooLarge`]
+    /// rather than allocate past the bound.
+    fn decode(&mut self, input: &[u8], out: &mut BytesMut, limit: usize) -> Result<()>;
 
     /// Signals end-of-body, flushing any decoder-internal residual into `out`.
     ///
     /// Like curl's `do_close`, this is lenient about a truncated stream: it
     /// flushes whatever is available and does not, on its own, treat an
-    /// incomplete stream as an error.
-    fn finish(&mut self, out: &mut BytesMut) -> Result<()>;
+    /// incomplete stream as an error. `limit` bounds the flushed output exactly
+    /// as in [`decode`](Decoder::decode).
+    fn finish(&mut self, out: &mut BytesMut, limit: usize) -> Result<()>;
 }
 
-/// Moves everything accumulated in a decoder's `Vec` sink into the output
+/// A bounded `Write` sink for the write-adapter decoders (`gzip`, `br`, `zstd`).
+///
+/// The `flate2`/`brotli`/`zstd` write adapters decode by *writing* their
+/// decompressed output into an inner writer. Using a plain `Vec<u8>` there lets
+/// a single `write_all` of a small compressed chunk balloon the vector without
+/// limit — the decompression-bomb vector called out in the review. `BoundedSink`
+/// closes it: it refuses (with an [`io::Error`]) any write that would push the
+/// bytes accumulated **for the current decode call** past [`limit`], so the
+/// adapter's `write_all` aborts partway and the transient allocation is capped
+/// at ~`limit` rather than growing to gigabytes. The accumulated bytes are
+/// drained into the transfer's output buffer after each call via
+/// [`drain_sink`], and `limit` is refreshed from the owning [`Unencoder`] before
+/// every call so a runtime change to the ceiling always takes effect.
+struct BoundedSink {
+    /// Bytes decoded so far in the current call, awaiting drain.
+    buf: Vec<u8>,
+    /// Maximum bytes this call may accumulate before the write is rejected.
+    limit: usize,
+    /// Set once a write has been rejected for exceeding [`limit`], so the
+    /// decoder can map the adapter's generic I/O failure to [`Error::TooLarge`]
+    /// rather than a malformed-stream error.
+    overflowed: bool,
+}
+
+impl BoundedSink {
+    /// Creates an empty sink. `limit` is set to the permissive `usize::MAX`
+    /// until the owning [`Unencoder`] supplies the real ceiling before the
+    /// first write.
+    fn new() -> Self {
+        BoundedSink {
+            buf: Vec::new(),
+            limit: usize::MAX,
+            overflowed: false,
+        }
+    }
+}
+
+impl std::io::Write for BoundedSink {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        // Reject *before* extending the buffer so the allocation never exceeds
+        // `limit`. `saturating_add` avoids overflow on absurd inputs.
+        if self.buf.len().saturating_add(data.len()) > self.limit {
+            self.overflowed = true;
+            return Err(std::io::Error::other(
+                "decoded output exceeded the configured per-write limit",
+            ));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Moves everything accumulated in a decoder's [`BoundedSink`] into the output
 /// buffer and clears the sink for reuse.
 ///
 /// Used by the write-adapter–based decoders (`gzip`, `br`, `zstd`), which emit
-/// their decoded output into an owned `Vec<u8>` that is drained after each
-/// write so intermediate memory stays bounded.
+/// their decoded output into the sink that is drained after each write so
+/// intermediate memory stays bounded.
 #[inline]
-fn drain_sink(sink: &mut Vec<u8>, out: &mut BytesMut) {
-    if !sink.is_empty() {
-        out.extend_from_slice(sink.as_slice());
-        sink.clear();
+fn drain_sink(sink: &mut BoundedSink, out: &mut BytesMut) {
+    if !sink.buf.is_empty() {
+        out.extend_from_slice(sink.buf.as_slice());
+        sink.buf.clear();
+    }
+}
+
+/// Maps a write-adapter failure to the appropriate [`Error`].
+///
+/// The `gzip`, `br`, and `zstd` decoders wrap a [`BoundedSink`]. When the
+/// underlying `write_all` fails there are two distinct causes to tell apart:
+/// the sink tripped the decompression-bomb ceiling (`overflowed == true`),
+/// which is a resource-limit condition reported as [`Error::TooLarge`]
+/// (`CURLE_TOO_LARGE`); or the compressed stream was malformed, reported as a
+/// content-encoding error just like curl's `*_do_close` diagnostics.
+#[inline]
+fn sink_write_error(overflowed: bool, _err: std::io::Error, what: &str) -> Error {
+    if overflowed {
+        Error::TooLarge
+    } else {
+        Error::bad_content_encoding(format!("Error while processing {what} content"))
     }
 }
 
@@ -255,12 +376,14 @@ impl Decoder for IdentityDecoder {
         "identity"
     }
 
-    fn decode(&mut self, input: &[u8], out: &mut BytesMut) -> Result<()> {
+    fn decode(&mut self, input: &[u8], out: &mut BytesMut, _limit: usize) -> Result<()> {
+        // Pass-through: output size equals input size (no expansion), so the
+        // decompression-bomb ceiling does not apply here.
         out.extend_from_slice(input);
         Ok(())
     }
 
-    fn finish(&mut self, _out: &mut BytesMut) -> Result<()> {
+    fn finish(&mut self, _out: &mut BytesMut, _limit: usize) -> Result<()> {
         Ok(())
     }
 }
@@ -284,7 +407,7 @@ impl Decoder for ErrorDecoder {
         "ce-error"
     }
 
-    fn decode(&mut self, input: &[u8], _out: &mut BytesMut) -> Result<()> {
+    fn decode(&mut self, input: &[u8], _out: &mut BytesMut, _limit: usize) -> Result<()> {
         if input.is_empty() {
             // Mirrors curl: a zero-length write is forwarded, not an error.
             return Ok(());
@@ -294,7 +417,7 @@ impl Decoder for ErrorDecoder {
         ))
     }
 
-    fn finish(&mut self, _out: &mut BytesMut) -> Result<()> {
+    fn finish(&mut self, _out: &mut BytesMut, _limit: usize) -> Result<()> {
         Ok(())
     }
 }
@@ -303,6 +426,29 @@ impl Decoder for ErrorDecoder {
 // deflate — zlib or raw DEFLATE, auto-detected (curl's zlib_writer/deflate)
 // -------------------------------------------------------------------------
 
+/// Failure modes of [`run_inflate`].
+///
+/// Distinguishing these matters for the `deflate` decoder: a [`Decompress`]
+/// error on the pristine first chunk is the trigger for curl's zlib→raw
+/// fallback, whereas a [`TooLarge`](RunInflateError::TooLarge) limit hit is a
+/// hard stop that must abort immediately (retrying a bomb in raw mode would
+/// simply hit the ceiling again).
+enum RunInflateError {
+    /// The underlying zlib inflate reported malformed data. curl's
+    /// `process_zlib_error` collapses every zlib failure into one generic
+    /// diagnostic, so the specific [`flate2::DecompressError`] carries no
+    /// parity-relevant information and is intentionally not retained.
+    Decompress,
+    /// The decode would exceed the per-call decompression-bomb ceiling.
+    TooLarge,
+}
+
+impl From<flate2::DecompressError> for RunInflateError {
+    fn from(_e: flate2::DecompressError) -> Self {
+        RunInflateError::Decompress
+    }
+}
+
 /// Runs a [`flate2::Decompress`] over `input`, appending decoded bytes to
 /// `out`, iterating with a fixed [`DECOMPRESS_BUFFER_SIZE`] scratch buffer.
 ///
@@ -310,13 +456,22 @@ impl Decoder for ErrorDecoder {
 /// inflating into a bounded buffer and flushing it downstream until the stream
 /// ends, the input is exhausted, or the decoder can make no further progress
 /// (needing more input). It returns the terminal [`flate2::Status`] on success,
-/// or the underlying [`flate2::DecompressError`] on a malformed stream so the
-/// caller can decide whether the `deflate` raw-stream fallback applies.
+/// [`RunInflateError::Decompress`] on a malformed stream (so the caller can
+/// decide whether the `deflate` raw-stream fallback applies), or
+/// [`RunInflateError::TooLarge`] if the bytes emitted during this call would
+/// exceed `limit` — the decompression-bomb ceiling. Because it flushes each
+/// [`DECOMPRESS_BUFFER_SIZE`] block as it goes, the check fires after the block
+/// that crosses the bound, capping the transient allocation at
+/// `limit + DECOMPRESS_BUFFER_SIZE`.
 fn run_inflate(
     decomp: &mut flate2::Decompress,
     mut input: &[u8],
     out: &mut BytesMut,
-) -> std::result::Result<flate2::Status, flate2::DecompressError> {
+    limit: usize,
+) -> std::result::Result<flate2::Status, RunInflateError> {
+    // Bytes already in `out` before this call: the ceiling applies to the
+    // output *produced here*, not to any upstream residual already buffered.
+    let base = out.len();
     let mut buf = [0u8; DECOMPRESS_BUFFER_SIZE];
     loop {
         let in_before = decomp.total_in();
@@ -326,6 +481,11 @@ fn run_inflate(
         let produced = (decomp.total_out() - out_before) as usize;
         if produced > 0 {
             out.extend_from_slice(&buf[..produced]);
+            // Enforce the decompression-bomb ceiling incrementally: stop as soon
+            // as this call's cumulative output crosses `limit`.
+            if out.len() - base > limit {
+                return Err(RunInflateError::TooLarge);
+            }
         }
         input = &input[consumed..];
         match status {
@@ -396,13 +556,13 @@ impl Decoder for DeflateDecoder {
         "deflate"
     }
 
-    fn decode(&mut self, input: &[u8], out: &mut BytesMut) -> Result<()> {
+    fn decode(&mut self, input: &[u8], out: &mut BytesMut, limit: usize) -> Result<()> {
         if input.is_empty() || self.finished {
             return Ok(());
         }
 
         let out_start = out.len();
-        match run_inflate(&mut self.decomp, input, out) {
+        match run_inflate(&mut self.decomp, input, out, limit) {
             Ok(status) => {
                 if out.len() > out_start {
                     self.started = true;
@@ -412,13 +572,17 @@ impl Decoder for DeflateDecoder {
                 }
                 Ok(())
             }
-            Err(_) => {
+            // A decompression-bomb ceiling hit is a hard stop: retrying in raw
+            // mode would only re-expand the same bytes and hit the ceiling
+            // again, so surface the resource-limit error immediately.
+            Err(RunInflateError::TooLarge) => Err(Error::TooLarge),
+            Err(RunInflateError::Decompress) => {
                 // Attempt curl's raw-DEFLATE fallback, but only while still in
                 // the pristine state (no output emitted, not yet retried).
                 if !self.started && !self.raw_fallback_done && out.len() == out_start {
                     self.raw_fallback_done = true;
                     self.decomp = flate2::Decompress::new(false); // raw, no header
-                    match run_inflate(&mut self.decomp, input, out) {
+                    match run_inflate(&mut self.decomp, input, out, limit) {
                         Ok(status) => {
                             if out.len() > out_start {
                                 self.started = true;
@@ -428,7 +592,8 @@ impl Decoder for DeflateDecoder {
                             }
                             Ok(())
                         }
-                        Err(_) => Err(Self::zlib_error()),
+                        Err(RunInflateError::TooLarge) => Err(Error::TooLarge),
+                        Err(RunInflateError::Decompress) => Err(Self::zlib_error()),
                     }
                 } else {
                     Err(Self::zlib_error())
@@ -437,7 +602,7 @@ impl Decoder for DeflateDecoder {
         }
     }
 
-    fn finish(&mut self, _out: &mut BytesMut) -> Result<()> {
+    fn finish(&mut self, _out: &mut BytesMut, _limit: usize) -> Result<()> {
         // zlib inflate emits output eagerly during `decode`, so there is never
         // any buffered residual to flush here. curl's `deflate_do_close` is
         // likewise lenient about a truncated stream, so end-of-body is a no-op.
@@ -455,18 +620,19 @@ impl Decoder for DeflateDecoder {
 /// letting zlib parse the gzip header, member, and trailer. The low-level
 /// [`flate2::Decompress`] API does not expose gzip window bits, so this decoder
 /// uses [`flate2::write::MultiGzDecoder`] — a `Write` adapter that decodes gzip
-/// (tolerating concatenated members) into an owned `Vec<u8>` sink, which is
-/// drained into the output buffer after every write to keep memory bounded.
+/// (tolerating concatenated members) into a [`BoundedSink`], which is drained
+/// into the output buffer after every write to keep memory bounded and which
+/// enforces the per-call decompression-bomb ceiling before bytes are buffered.
 struct GzipDecoder {
-    inner: flate2::write::MultiGzDecoder<Vec<u8>>,
+    inner: flate2::write::MultiGzDecoder<BoundedSink>,
     finished: bool,
 }
 
 impl GzipDecoder {
-    /// Creates a `gzip` decoder writing into a fresh, empty sink.
+    /// Creates a `gzip` decoder writing into a fresh, empty bounded sink.
     fn new() -> Self {
         GzipDecoder {
-            inner: flate2::write::MultiGzDecoder::new(Vec::new()),
+            inner: flate2::write::MultiGzDecoder::new(BoundedSink::new()),
             finished: false,
         }
     }
@@ -477,19 +643,21 @@ impl Decoder for GzipDecoder {
         "gzip"
     }
 
-    fn decode(&mut self, input: &[u8], out: &mut BytesMut) -> Result<()> {
+    fn decode(&mut self, input: &[u8], out: &mut BytesMut, limit: usize) -> Result<()> {
         if input.is_empty() || self.finished {
             return Ok(());
         }
         use std::io::Write as _;
-        self.inner
-            .write_all(input)
-            .map_err(|_| Error::bad_content_encoding("Error while processing gzip content"))?;
+        self.inner.get_mut().limit = limit;
+        if let Err(e) = self.inner.write_all(input) {
+            let overflowed = self.inner.get_ref().overflowed;
+            return Err(sink_write_error(overflowed, e, "gzip"));
+        }
         drain_sink(self.inner.get_mut(), out);
         Ok(())
     }
 
-    fn finish(&mut self, out: &mut BytesMut) -> Result<()> {
+    fn finish(&mut self, out: &mut BytesMut, limit: usize) -> Result<()> {
         if self.finished {
             return Ok(());
         }
@@ -497,8 +665,13 @@ impl Decoder for GzipDecoder {
         use std::io::Write as _;
         // Flush any bytes the adapter still holds, then drain the sink. Flush
         // failures on a truncated stream are ignored to match curl's lenient
-        // `gzip_do_close`.
+        // `gzip_do_close`, but a ceiling breach latched during the flush is
+        // still surfaced as a resource-limit error.
+        self.inner.get_mut().limit = limit;
         let _ = self.inner.flush();
+        if self.inner.get_ref().overflowed {
+            return Err(Error::TooLarge);
+        }
         drain_sink(self.inner.get_mut(), out);
         Ok(())
     }
@@ -513,10 +686,11 @@ impl Decoder for GzipDecoder {
 /// Mirrors curl's `brotli_writer`, which streams input through
 /// `BrotliDecoderDecompressStream`. Here the pure-Rust [`brotli`] crate's
 /// [`brotli::DecompressorWriter`] plays the same role: a `Write` adapter that
-/// decodes into an owned `Vec<u8>` sink, drained after every write.
+/// decodes into a [`BoundedSink`], drained after every write and enforcing the
+/// per-call decompression-bomb ceiling before bytes are buffered.
 #[cfg(feature = "brotli")]
 struct BrotliDecoder {
-    inner: brotli::DecompressorWriter<Vec<u8>>,
+    inner: brotli::DecompressorWriter<BoundedSink>,
     finished: bool,
 }
 
@@ -526,7 +700,7 @@ impl BrotliDecoder {
     /// per-step decompression buffer.
     fn new() -> Self {
         BrotliDecoder {
-            inner: brotli::DecompressorWriter::new(Vec::new(), DECOMPRESS_BUFFER_SIZE),
+            inner: brotli::DecompressorWriter::new(BoundedSink::new(), DECOMPRESS_BUFFER_SIZE),
             finished: false,
         }
     }
@@ -538,25 +712,31 @@ impl Decoder for BrotliDecoder {
         "br"
     }
 
-    fn decode(&mut self, input: &[u8], out: &mut BytesMut) -> Result<()> {
+    fn decode(&mut self, input: &[u8], out: &mut BytesMut, limit: usize) -> Result<()> {
         if input.is_empty() || self.finished {
             return Ok(());
         }
         use std::io::Write as _;
-        self.inner
-            .write_all(input)
-            .map_err(|_| Error::bad_content_encoding("Error while processing brotli content"))?;
+        self.inner.get_mut().limit = limit;
+        if let Err(e) = self.inner.write_all(input) {
+            let overflowed = self.inner.get_ref().overflowed;
+            return Err(sink_write_error(overflowed, e, "brotli"));
+        }
         drain_sink(self.inner.get_mut(), out);
         Ok(())
     }
 
-    fn finish(&mut self, out: &mut BytesMut) -> Result<()> {
+    fn finish(&mut self, out: &mut BytesMut, limit: usize) -> Result<()> {
         if self.finished {
             return Ok(());
         }
         self.finished = true;
         use std::io::Write as _;
+        self.inner.get_mut().limit = limit;
         let _ = self.inner.flush();
+        if self.inner.get_ref().overflowed {
+            return Err(Error::TooLarge);
+        }
         drain_sink(self.inner.get_mut(), out);
         Ok(())
     }
@@ -571,10 +751,11 @@ impl Decoder for BrotliDecoder {
 /// Mirrors curl's `zstd_writer`, which streams input through
 /// `ZSTD_decompressStream`. Here the [`zstd`] crate's
 /// [`zstd::stream::write::Decoder`] plays the same role: a `Write` adapter that
-/// decodes into an owned `Vec<u8>` sink, drained after every write.
+/// decodes into a [`BoundedSink`], drained after every write and enforcing the
+/// per-call decompression-bomb ceiling before bytes are buffered.
 #[cfg(feature = "zstd")]
 struct ZstdDecoder {
-    inner: zstd::stream::write::Decoder<'static, Vec<u8>>,
+    inner: zstd::stream::write::Decoder<'static, BoundedSink>,
     finished: bool,
 }
 
@@ -584,8 +765,8 @@ impl ZstdDecoder {
     /// underlying decompression context cannot be created — the parity mapping
     /// of curl's `ZSTD_createDStream` returning `NULL` (`CURLE_OUT_OF_MEMORY`).
     fn new() -> Result<Self> {
-        let inner =
-            zstd::stream::write::Decoder::new(Vec::new()).map_err(|_| Error::OutOfMemory)?;
+        let inner = zstd::stream::write::Decoder::new(BoundedSink::new())
+            .map_err(|_| Error::OutOfMemory)?;
         Ok(ZstdDecoder {
             inner,
             finished: false,
@@ -599,25 +780,31 @@ impl Decoder for ZstdDecoder {
         "zstd"
     }
 
-    fn decode(&mut self, input: &[u8], out: &mut BytesMut) -> Result<()> {
+    fn decode(&mut self, input: &[u8], out: &mut BytesMut, limit: usize) -> Result<()> {
         if input.is_empty() || self.finished {
             return Ok(());
         }
         use std::io::Write as _;
-        self.inner
-            .write_all(input)
-            .map_err(|_| Error::bad_content_encoding("Error while processing zstd content"))?;
+        self.inner.get_mut().limit = limit;
+        if let Err(e) = self.inner.write_all(input) {
+            let overflowed = self.inner.get_ref().overflowed;
+            return Err(sink_write_error(overflowed, e, "zstd"));
+        }
         drain_sink(self.inner.get_mut(), out);
         Ok(())
     }
 
-    fn finish(&mut self, out: &mut BytesMut) -> Result<()> {
+    fn finish(&mut self, out: &mut BytesMut, limit: usize) -> Result<()> {
         if self.finished {
             return Ok(());
         }
         self.finished = true;
         use std::io::Write as _;
+        self.inner.get_mut().limit = limit;
         let _ = self.inner.flush();
+        if self.inner.get_ref().overflowed {
+            return Err(Error::TooLarge);
+        }
         drain_sink(self.inner.get_mut(), out);
         Ok(())
     }
@@ -686,10 +873,25 @@ fn make_decoder(enc: ContentEncoding) -> Option<Box<dyn Decoder>> {
 /// body.extend_from_slice(&dec.write(&chunk2)?);
 /// body.extend_from_slice(&dec.finish()?);
 /// ```
-#[derive(Default)]
 pub struct Unencoder {
     /// Decoders in application-reverse order: index 0 runs first on input.
     decoders: Vec<Box<dyn Decoder>>,
+    /// The decompression-bomb ceiling handed to every decoder on each
+    /// [`write`](Unencoder::write) / [`finish`](Unencoder::finish) call: the
+    /// maximum number of decoded bytes a single stage may emit for one call
+    /// before the decode is aborted with [`Error::TooLarge`]. Defaults to
+    /// [`DEFAULT_MAX_DECODED_PER_WRITE`]; set [`usize::MAX`] to disable the
+    /// bound. See [`set_max_decoded_per_write`](Unencoder::set_max_decoded_per_write).
+    max_decoded_per_write: usize,
+}
+
+impl Default for Unencoder {
+    fn default() -> Self {
+        Unencoder {
+            decoders: Vec::new(),
+            max_decoded_per_write: DEFAULT_MAX_DECODED_PER_WRITE,
+        }
+    }
 }
 
 impl std::fmt::Debug for Unencoder {
@@ -705,11 +907,43 @@ impl std::fmt::Debug for Unencoder {
 impl Unencoder {
     /// Creates an empty stack (an identity pass-through until codings are
     /// pushed).
+    ///
+    /// The decompression-bomb ceiling starts at [`DEFAULT_MAX_DECODED_PER_WRITE`];
+    /// adjust it with [`set_max_decoded_per_write`](Unencoder::set_max_decoded_per_write)
+    /// or [`with_max_decoded_per_write`](Unencoder::with_max_decoded_per_write).
     #[must_use]
     pub fn new() -> Self {
-        Unencoder {
-            decoders: Vec::new(),
-        }
+        Unencoder::default()
+    }
+
+    /// Sets the decompression-bomb ceiling: the maximum number of decoded bytes
+    /// any single decoder stage may emit for one [`write`](Unencoder::write) or
+    /// [`finish`](Unencoder::finish) call before the decode is aborted with
+    /// [`Error::TooLarge`] (`CURLE_TOO_LARGE`).
+    ///
+    /// The bound guards against a compressed "bomb" — a tiny input that inflates
+    /// to an enormous output — forcing unbounded allocation before the caller
+    /// can apply backpressure (CWE-400). It applies per call and per stage, so
+    /// working memory during a decode is capped at roughly
+    /// `limit + DECOMPRESS_BUFFER_SIZE` regardless of the input's expansion
+    /// ratio. Pass [`usize::MAX`] to disable the bound entirely.
+    pub fn set_max_decoded_per_write(&mut self, limit: usize) {
+        self.max_decoded_per_write = limit;
+    }
+
+    /// Builder form of [`set_max_decoded_per_write`](Unencoder::set_max_decoded_per_write),
+    /// consuming and returning `self` for fluent construction.
+    #[must_use]
+    pub fn with_max_decoded_per_write(mut self, limit: usize) -> Self {
+        self.max_decoded_per_write = limit;
+        self
+    }
+
+    /// Returns the current decompression-bomb ceiling (decoded bytes per stage
+    /// per call). [`usize::MAX`] means the bound is disabled.
+    #[must_use]
+    pub fn max_decoded_per_write(&self) -> usize {
+        self.max_decoded_per_write
     }
 
     /// Builds a stack from a comma-separated coding list, e.g. the value of a
@@ -804,16 +1038,17 @@ impl Unencoder {
     /// encounters a malformed stream (including the deferred error decoder on
     /// its first non-empty chunk).
     pub fn write(&mut self, input: &[u8]) -> Result<Bytes> {
+        let limit = self.max_decoded_per_write;
         let mut iter = self.decoders.iter_mut();
         let Some(first) = iter.next() else {
             // No codings: identity pass-through.
             return Ok(Bytes::copy_from_slice(input));
         };
         let mut current = BytesMut::new();
-        first.decode(input, &mut current)?;
+        first.decode(input, &mut current, limit)?;
         for decoder in iter {
             let mut next = BytesMut::new();
-            decoder.decode(&current, &mut next)?;
+            decoder.decode(&current, &mut next, limit)?;
             current = next;
         }
         Ok(current.freeze())
@@ -830,15 +1065,16 @@ impl Unencoder {
     ///
     /// Propagates [`Error::BadContentEncoding`] from any decoder in the chain.
     pub fn finish(&mut self) -> Result<Bytes> {
+        let limit = self.max_decoded_per_write;
         let mut carry = BytesMut::new();
         for (index, decoder) in self.decoders.iter_mut().enumerate() {
             let mut out = BytesMut::new();
             // Feed the residual produced by the previous stage before flushing
             // this one; the first stage has no upstream residual.
             if index > 0 && !carry.is_empty() {
-                decoder.decode(&carry, &mut out)?;
+                decoder.decode(&carry, &mut out, limit)?;
             }
-            decoder.finish(&mut out)?;
+            decoder.finish(&mut out, limit)?;
             carry = out;
         }
         Ok(carry.freeze())
@@ -1144,5 +1380,137 @@ mod tests {
         let result = unencoder.write(&garbage).and_then(|_| unencoder.finish());
         let err = result.expect_err("corrupt gzip must fail");
         assert_eq!(err.code() as i32, 61);
+    }
+
+    // ---------------------------------------------------------------------
+    // Decompression-bomb ceiling (CWE-400)
+    // ---------------------------------------------------------------------
+
+    /// A trivially compressible payload: `n` zero bytes shrink to a tiny
+    /// compressed stream but expand back to `n` bytes on decode — the shape of
+    /// a decompression bomb.
+    fn zeros(n: usize) -> Vec<u8> {
+        vec![0u8; n]
+    }
+
+    #[test]
+    fn default_ceiling_is_finite_and_configurable() {
+        // A fresh stack starts at the finite default (the constant's finiteness
+        // is proven at compile time by the `const _` assertion above), and the
+        // setter/builder/accessor must round-trip.
+        assert_eq!(
+            Unencoder::new().max_decoded_per_write(),
+            DEFAULT_MAX_DECODED_PER_WRITE
+        );
+
+        let mut u = Unencoder::new();
+        u.set_max_decoded_per_write(4096);
+        assert_eq!(u.max_decoded_per_write(), 4096);
+
+        let u = Unencoder::new().with_max_decoded_per_write(usize::MAX);
+        assert_eq!(u.max_decoded_per_write(), usize::MAX);
+    }
+
+    #[test]
+    fn gzip_bomb_exceeding_limit_is_rejected() {
+        // 512 KiB of zeros compresses to a few hundred bytes; decoding it under
+        // a 32 KiB ceiling must abort with CURLE_TOO_LARGE (100) rather than
+        // allocate the full 512 KiB.
+        let encoded = gzip_compress(&zeros(512 * 1024));
+        let mut unencoder = Unencoder::from_content_encoding("gzip").unwrap();
+        unencoder.set_max_decoded_per_write(32 * 1024);
+        let err = unencoder
+            .write(&encoded)
+            .and_then(|_| unencoder.finish())
+            .expect_err("gzip bomb must be rejected");
+        assert_eq!(err.code(), CurlCode::TooLarge);
+        assert_eq!(err.code() as i32, 100);
+    }
+
+    #[test]
+    fn deflate_bomb_exceeding_limit_is_rejected() {
+        // Same bomb shape through the zlib/deflate inflate loop, which enforces
+        // the ceiling cumulatively inside `run_inflate`.
+        let encoded = zlib_compress(&zeros(512 * 1024));
+        let mut unencoder = Unencoder::from_content_encoding("deflate").unwrap();
+        unencoder.set_max_decoded_per_write(32 * 1024);
+        let err = unencoder
+            .write(&encoded)
+            .and_then(|_| unencoder.finish())
+            .expect_err("deflate bomb must be rejected");
+        assert_eq!(err.code(), CurlCode::TooLarge);
+        assert_eq!(err.code() as i32, 100);
+    }
+
+    #[test]
+    fn raw_deflate_bomb_exceeding_limit_is_rejected() {
+        // The headerless raw-DEFLATE fallback path must honor the ceiling too:
+        // a raw stream that expands past the limit is rejected as TooLarge, not
+        // masked by the fallback retry.
+        let encoded = raw_deflate_compress(&zeros(512 * 1024));
+        let mut unencoder = Unencoder::from_content_encoding("deflate").unwrap();
+        unencoder.set_max_decoded_per_write(32 * 1024);
+        let err = unencoder
+            .write(&encoded)
+            .and_then(|_| unencoder.finish())
+            .expect_err("raw-deflate bomb must be rejected");
+        assert_eq!(err.code(), CurlCode::TooLarge);
+        assert_eq!(err.code() as i32, 100);
+    }
+
+    #[test]
+    fn gzip_within_ceiling_still_roundtrips() {
+        // Legitimate content whose decoded size stays under the configured
+        // ceiling must decode unharmed — the bound only rejects overflow.
+        let data = sample();
+        assert!(data.len() < 512 * 1024);
+        let encoded = gzip_compress(&data);
+        let mut unencoder = Unencoder::from_content_encoding("gzip").unwrap();
+        unencoder.set_max_decoded_per_write(512 * 1024);
+        let mut out = BytesMut::new();
+        out.extend_from_slice(&unencoder.write(&encoded).unwrap());
+        out.extend_from_slice(&unencoder.finish().unwrap());
+        assert_eq!(out.to_vec(), data);
+    }
+
+    #[test]
+    fn deflate_within_ceiling_still_roundtrips() {
+        let data = sample();
+        assert!(data.len() < 512 * 1024);
+        let encoded = zlib_compress(&data);
+        let mut unencoder = Unencoder::from_content_encoding("deflate").unwrap();
+        unencoder.set_max_decoded_per_write(512 * 1024);
+        let mut out = BytesMut::new();
+        out.extend_from_slice(&unencoder.write(&encoded).unwrap());
+        out.extend_from_slice(&unencoder.finish().unwrap());
+        assert_eq!(out.to_vec(), data);
+    }
+
+    #[cfg(feature = "brotli")]
+    #[test]
+    fn brotli_bomb_exceeding_limit_is_rejected() {
+        let encoded = brotli_compress(&zeros(512 * 1024));
+        let mut unencoder = Unencoder::from_content_encoding("br").unwrap();
+        unencoder.set_max_decoded_per_write(32 * 1024);
+        let err = unencoder
+            .write(&encoded)
+            .and_then(|_| unencoder.finish())
+            .expect_err("brotli bomb must be rejected");
+        assert_eq!(err.code(), CurlCode::TooLarge);
+        assert_eq!(err.code() as i32, 100);
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_bomb_exceeding_limit_is_rejected() {
+        let encoded = zstd_compress(&zeros(512 * 1024));
+        let mut unencoder = Unencoder::from_content_encoding("zstd").unwrap();
+        unencoder.set_max_decoded_per_write(32 * 1024);
+        let err = unencoder
+            .write(&encoded)
+            .and_then(|_| unencoder.finish())
+            .expect_err("zstd bomb must be rejected");
+        assert_eq!(err.code(), CurlCode::TooLarge);
+        assert_eq!(err.code() as i32, 100);
     }
 }

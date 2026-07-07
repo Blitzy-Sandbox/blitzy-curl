@@ -72,3 +72,9 @@ libstandaloneengine.a
 tests/string
 tests/config
 tests/ech-log/
+
+# Rust workspace (curl-rs-lib / curl-rs / curl-rs-ffi) build output.
+# Cargo.lock is intentionally NOT ignored: this workspace ships a binary
+# (curl-rs) and a cdylib (curl-rs-ffi), and the committed lock pins the
+# MSRV-1.75-verified dependency graph.
+/target/

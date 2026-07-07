@@ -60,6 +60,23 @@ below are the resolved pins from the root `Cargo.toml`):
 - Errors: `thiserror` 2 (library), `anyhow` 1 (CLI)
 - FFI & codegen: `cbindgen` 0.29.2 (build-dependency), `libc` 0.2
 
+Two of these pins deviate from the versions named in the original technical
+specification, because those versions do not resolve or build and would fail the
+mandatory *buildable workspace* and *MSRV 1.75* gates:
+
+- `h3` is pinned to **0.0.8** rather than 0.0.7. The specified `h3-quinn`
+  0.0.10 itself depends on `h3` 0.0.8, so pinning `h3` 0.0.7 alongside it pulls
+  two incompatible `h3` versions into the graph and fails to compile. `h3` 0.0.8
+  unifies the graph and is the version `h3-quinn` 0.0.10 is built against.
+- `russh` is pinned to **0.53.0** rather than 0.54.6. `russh` 0.54.6 is
+  unresolvable: it pulls the transitive crate `libcrux-ml-kem` 0.0.3, which is
+  *yanked* from crates.io. The 0.53.x line (with `russh-sftp` 2.1.1 and
+  `russh-keys` 0.49.2) resolves cleanly, while the newer 0.62.x line raises its
+  own MSRV above 1.75 and so cannot be used under the pinned toolchain.
+
+These are the only deviations; the root `Cargo.toml` carries the same rationale
+inline, and every other pin matches the specification.
+
 The only optional C linkage retained is OS GSSAPI/Kerberos, used for Negotiate
 authentication. Every other former C dependency has been removed: OpenSSL,
 GnuTLS, mbedTLS, wolfSSL, Schannel, and Apple Secure Transport (replaced by
@@ -80,8 +97,8 @@ The build and validation toolchain is Cargo-based:
 - `cargo build` / `cargo test` — compile the workspace and run its test suite
 - `cargo clippy -- -D warnings` — lint gate (warnings treated as errors)
 - `rustfmt` (via `cargo fmt`) — formatting gate
-- `cbindgen` 0.29.2 — generates `include/curl/curl.h` (invoked from
-  `curl-rs-ffi/build.rs`)
+- `cbindgen` 0.29.2 — renders an `include/curl/curl.h` verification artifact
+  (invoked from `curl-rs-ffi/build.rs`; the committed header is never overwritten)
 - `cargo-deny` — license / advisory / source policy
 - `cargo audit` — CVE scanning
 - Miri (on the nightly toolchain) — undefined-behavior checking of the safe core
@@ -96,9 +113,11 @@ modules — instead of the C `Curl_` prefix plus `static` convention.
 
 The public C ABI is exposed only from the `curl-rs-ffi` crate, as
 `#[no_mangle] pub extern "C"` functions that carry the historical `curl_` names.
-`cbindgen` regenerates `include/curl/curl.h` from those annotations, so downstream
-C/C++ consumers include the same header path and relink against `libcurl_rs_ffi`
-without source changes. The public surface reproduces the curl 8.x `CURL_EXTERN`
+At build time `cbindgen` renders those annotations into a header *verification
+artifact* (written under the Cargo build output directory) that is checked
+against the committed `include/curl/curl.h`; the committed header is never
+overwritten. Downstream C/C++ consumers keep including the same header path and
+relink against `libcurl_rs_ffi` without source changes. The public surface reproduces the curl 8.x `CURL_EXTERN`
 functions (about 101 across the 13 public headers), and the `CURLcode`,
 `CURLoption`, and `CURLINFO` integer values are frozen for ABI parity.
 

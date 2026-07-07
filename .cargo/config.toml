@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: curl
+# SPDX-FileCopyrightText: Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# Cargo configuration for the blitzy-curl workspace.
+# ==================================================
+# MSRV-aware dependency resolution. With `incompatible-rust-versions = "fallback"`, Cargo
+# prefers dependency versions whose declared `rust-version` is compatible with this
+# workspace's MSRV (1.75 — see rust-toolchain.toml and the root Cargo.toml `rust-version`)
+# over newer releases that raised their own MSRV. Without it, transitive dependencies that
+# now require Cargo's unstable `edition2024` feature / Rust >= 1.85 (for example the
+# `cpufeatures`/`chacha20`/`rand` chain pulled in transitively by `quinn-proto`) are selected
+# and break both the pinned-1.75 default build and the mandatory `cargo +1.75 check` merge
+# gate (AAP §0.6.4).
+#
+# This key is honored by Cargo >= 1.84 (the toolchains CI uses to resolve and lock the
+# dependency graph) and is harmlessly ignored by the pinned 1.75 Cargo, which consumes the
+# already-MSRV-correct Cargo.lock. It does not pin or override any specific version; it only
+# changes selection preference, keeping the Minimal Change Mandate intact.
+[resolver]
+incompatible-rust-versions = "fallback"

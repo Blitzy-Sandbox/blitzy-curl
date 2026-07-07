@@ -40,8 +40,10 @@ version of 1.75, pinned by `rust-toolchain.toml`. Install the toolchain with
 
 Because `rustls` is the single audited default, certificate validation is on by
 default, matching `CURLOPT_SSL_VERIFYPEER = 1` and `CURLOPT_SSL_VERIFYHOST = 2`.
-Peer certificates are validated against the bundled `webpki-roots` trust
-anchors, and against the platform trust store where applicable.
+Peer certificates are validated against the compiled-in Mozilla
+root-certificate bundle provided by `webpki-roots`. This WebPKI trust-anchor set
+is the default and only trust source; no platform or OS trust-store integration
+is configured.
 
 The `--insecure` (`-k`) option disables verification. Before it proceeds, curl
 prints a warning to stderr, so the security downgrade is always visible. The

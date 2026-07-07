@@ -201,10 +201,10 @@ pub fn user_contains_domain(user: Option<&str>) -> bool {
 /// Inputs to [`allowed_to_host`], mirroring the fields `Curl_auth_allowed_to_host`
 /// reads off `struct Curl_easy` / `struct connectdata`.
 ///
-// TODO(wiring): callers in `crate::protocols::http` / `crate::conn` must populate
-// this bundle from the live transfer/connection state once those types are
-// finalized. Keeping the inputs in a plain struct keeps [`allowed_to_host`] a
-// pure, trivially unit-testable function.
+/// The HTTP and connection layers populate this bundle from the live transfer and
+/// connection state before calling [`allowed_to_host`]. Modeling the inputs as a plain
+/// owned struct keeps [`allowed_to_host`] a pure, side-effect-free function that is
+/// trivially unit-testable in isolation.
 #[derive(Debug, Clone)]
 pub struct AllowedToHostCtx<'a> {
     /// `data->state.this_is_a_follow` — `true` when handling a redirect.

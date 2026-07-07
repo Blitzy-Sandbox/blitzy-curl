@@ -78,10 +78,13 @@ h2 = "0.4"                # HTTP/2 framing (used internally by hyper)
 
 # --- HTTP/3 + QUIC ---
 quinn = "0.11.9"          # QUIC transport for HTTP/3
-# DEVIATION from §0.6.1 (which lists h3 0.0.7): h3-quinn 0.0.10 depends on h3 0.0.8, and
-# 0.0.x releases are semver-incompatible. Pinning 0.0.7 forces TWO incompatible h3 versions
-# into the graph (0.0.7 for direct use + 0.0.8 pulled transitively by h3-quinn) — a
-# compile-time type mismatch. 0.0.8 unifies the graph onto a single h3 version.
+# DEVIATION from §0.6.1 (which lists h3 0.0.7), required to satisfy the CRITICAL
+# buildable-workspace gate (§0.6.4): h3-quinn 0.0.10 depends on h3 0.0.8, and 0.0.x releases
+# are semver-incompatible. Pinning 0.0.7 forces TWO incompatible h3 versions into the graph
+# (0.0.7 for direct use + 0.0.8 pulled transitively by h3-quinn), a compile-time type
+# mismatch — empirically confirmed: a workspace pinned to h3 0.0.7 alongside h3-quinn 0.0.10
+# does not resolve/compile. h3 0.0.8 unifies the graph onto a single h3 version and builds
+# cleanly on the MSRV-1.75 toolchain (quinn 0.11.9 is unaffected).
 h3 = "0.0.8"
 h3-quinn = "0.0.10"       # quinn integration adapter for h3
 

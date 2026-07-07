@@ -42,10 +42,13 @@ The Rust code is organized as a Cargo workspace with three member crates:
 - `curl-rs` — the [`clap`](https://docs.rs/clap)-based command-line binary that
   preserves the full curl flag surface. It replaces the C `src/` tree.
 - `curl-rs-ffi` — the C-ABI compatibility layer. It exposes
-  `libcurl`-compatible `curl_*` symbols and regenerates `include/curl/curl.h`
-  via [`cbindgen`](https://github.com/mozilla/cbindgen), so existing C/C++
-  consumers relink against it without recompilation. It replaces the
-  hand-authored public header generation.
+  `libcurl`-compatible `curl_*` symbols; its build runs
+  [`cbindgen`](https://github.com/mozilla/cbindgen) to produce a header
+  *verification artifact* (written under the Cargo build output directory) that
+  is checked against the committed `include/curl/curl.h` — the committed header
+  is never overwritten. Existing C/C++ consumers keep including the same header
+  path and relink against `libcurl_rs_ffi` without recompilation. It replaces
+  the hand-authored public header generation.
 
 ## Build
 

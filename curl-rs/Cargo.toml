@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: curl
+# SPDX-FileCopyrightText: Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# curl-rs — CLI binary member manifest
+# ====================================
+# `curl-rs` is the command-line tool of the three-crate, idiomatic-Rust rewrite of
+# curl / libcurl 8.19.0-DEV. It is a language rewrite of the `src/` C tree (`tool_*.c`) and
+# consumes the safe-Rust core (`curl-rs-lib`). In FUNCTION it supersedes `src/CMakeLists.txt`
+# and `src/Makefile.am` (which produced the `curl` executable); those C build files remain in
+# the tree as preserved source-of-truth references.
+#
+# Design rules honored here (AAP §0.7):
+#   * Tokio is the ONLY async runtime, and the CLI uses its CURRENT-THREAD flavor to match
+#     curl 8.x's single-threaded tool model (§0.3.2) — hence the trimmed tokio feature set.
+#   * `clap` argument definitions are derived 1:1 from `docs/cmdline-opts/`; no flag is
+#     invented and no default is altered (Minimal Change Mandate).
+#   * Every dependency version is owned by the root [workspace.dependencies]; this manifest
+#     only selects features. No `[profile.*]` sections, no speculative dependencies.
+
+[package]
+name = "curl-rs"
+# Shared metadata inherited from the root [workspace.package] (single source of truth):
+# version -> "8.19.0-dev", edition -> "2021", rust-version -> "1.75" (MSRV), license -> "curl".
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "curl - command line tool for transferring data with URLs (idiomatic Rust rewrite of the curl CLI)"
+
+[[bin]]
+# The produced executable is `curl-rs` (curl 8.x's `curl`, renamed to coexist with a
+# system curl).
+name = "curl-rs"
+path = "src/main.rs"
+
+[dependencies]
+# The safe-Rust core: protocol handlers, TLS, auth, DNS, transfer engine.
+# Explicit `version` (not just `path`) so cargo-deny's `wildcards = "deny"` policy
+# (deny.toml) is satisfied for this workspace-internal dependency; the path still
+# governs resolution, and the version is kept in lockstep with the workspace version.
+curl-rs-lib = { path = "../curl-rs-lib", version = "8.19.0-dev" }
+# Current-thread runtime only: `rt` provides the single-threaded scheduler and `macros`
+# provides the `#[tokio::main]` attribute. `rt-multi-thread` is deliberately NOT enabled — the
+# CLI is single-threaded (the multi-thread flavor belongs to the library's multi handle).
+tokio = { workspace = true, features = ["rt", "macros"] }
+# Argument parsing (derive API), 1:1 with docs/cmdline-opts/.
+clap = { workspace = true, features = ["derive"] }
+# Contextual error chaining for the tool's top-level error reporting.
+anyhow = { workspace = true }
+
+# NOTE: no [dev-dependencies] are declared here. The black-box CLI smoke test
+# (tests/cli.rs) drives the real binary through `std::process::Command`, locating it via the
+# `CARGO_BIN_EXE_curl-rs` path Cargo injects for integration tests, so it needs no external test
+# harness. The `assert_cmd` / `predicates` version pins remain catalogued in the root
+# [workspace.dependencies] for the fuller CLI assertion suites that later checkpoints will add.

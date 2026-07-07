@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: curl
+# SPDX-FileCopyrightText: Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# curl-rs-ffi — C-ABI layer member manifest
+# ==========================================
+# `curl-rs-ffi` is the `extern "C"` compatibility shim of the three-crate, idiomatic-Rust
+# rewrite of curl / libcurl 8.19.0-DEV. It re-exposes the safe-Rust core (`curl-rs-lib`) as
+# `libcurl`-compatible C symbols and is the ONLY workspace member permitted to contain
+# `unsafe` (AAP §0.7.2). In FUNCTION it supersedes the hand-written public header
+# `include/curl/curl.h`, which `cbindgen` regenerates (as a verification artifact) from this
+# crate's annotations; the C header remains in the tree as the authoritative reference.
+#
+# Design rules honored here (AAP §0.7):
+#   * Depends ONLY on the sibling core crate plus `libc` for C types; it links no C TLS /
+#     transport library.
+#   * `cbindgen` is a DEFAULT-OFF, optional build-dependency (behind the `capi` feature) so a
+#     stock build and the mandatory `cargo +1.75 check` MSRV gate never compile it — see
+#     `build.rs`.
+#   * Minimal Change Mandate — no speculative dependencies, no `[profile.*]` sections.
+
+[package]
+# Hyphenated crate name; the library target is renamed to `curl_rs_ffi` via [lib] below so the
+# produced shared object is `libcurl_rs_ffi.{so,dylib}` / static `libcurl_rs_ffi.a`.
+name = "curl-rs-ffi"
+# Shared metadata inherited from the root [workspace.package] (single source of truth):
+# version -> "8.19.0-dev", edition -> "2021", rust-version -> "1.75" (MSRV), license -> "curl".
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "libcurl-compatible C ABI layer for the curl-rs Rust rewrite (cbindgen-generated headers)"
+
+[lib]
+# Rust identifiers cannot contain hyphens, so the target is named `curl_rs_ffi`; this also
+# fixes the output artifact name to `libcurl_rs_ffi.*`.
+name = "curl_rs_ffi"
+# `cdylib` + `staticlib` are the C-consumable outputs (shared / static libcurl replacement);
+# `rlib` lets the sibling `curl-rs` CLI link the same code in-process for callback parity.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+# `capi` turns on the optional `cbindgen` build-dependency so `build.rs` can render the C
+# verification header. It is deliberately DEFAULT-OFF: a stock `cargo build --workspace` and
+# the `cargo +1.75 check` MSRV gate must not compile cbindgen (whose own toolchain floor is
+# independent of this workspace's MSRV 1.75). CI enables `--features capi` on the stable
+# toolchain to produce and byte-diff the header.
+capi = ["dep:cbindgen"]
+
+[dependencies]
+# The safe-Rust core. This is the whole point of the crate: expose `curl-rs-lib` over C.
+# Explicit `version` (not just `path`) so cargo-deny's `wildcards = "deny"` policy
+# (deny.toml) is satisfied; the path still governs resolution and the version tracks
+# the workspace version.
+curl-rs-lib = { path = "../curl-rs-lib", version = "8.19.0-dev" }
+# Raw C type bridge (`c_char`, `c_int`, `size_t`, ...) used at the `extern "C"` boundary.
+libc = { workspace = true }
+
+[build-dependencies]
+# Optional + gated by `capi` (see [features]). Used by build.rs to emit the verification
+# header into OUT_DIR only; it never overwrites the committed include/curl/curl.h.
+cbindgen = { workspace = true, optional = true }

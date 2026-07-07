@@ -146,9 +146,20 @@ jobs:
       - name: 'Gate: cargo deny check (advisories/licenses/sources/bans)'
         run: cargo deny check
 
-  # Gate 9 (tech-spec 0.6.2): the safe core curl-rs-lib MUST contain zero unsafe.
-  # grep exits 0 when it finds a match (our FAILURE condition) and exits 1 when it
-  # finds nothing (our SUCCESS condition), so the exit code is inverted explicitly.
+  # Gate 9 (tech-spec 0.6.2): the safe core curl-rs-lib MUST contain zero `unsafe`
+  # USAGE. Enforcement is two-layered: (1) the crate root declares
+  # `#![forbid(unsafe_code)]` (REQUIRED by the curl-rs-lib crate-root finding and
+  # the "safe core" AAP rule), which turns any `unsafe` block/fn/impl/trait into a
+  # hard COMPILE error — not merely a lint; and (2) this defense-in-depth audit.
+  #
+  # The mandated `#![forbid(unsafe_code)]` attribute (lint token `unsafe_code`) and
+  # the crate's safety-policy doc-comments legitimately contain the string
+  # "unsafe": they are the ENFORCEMENT of the invariant, not a violation of it. A
+  # naive `grep -rn 'unsafe'` would false-fail on that mandated attribute, so this
+  # audit strips comments (`sed 's://.*$::'`) and then matches the `unsafe` keyword
+  # as a whole word (`\bunsafe\b`, which excludes `unsafe_code`). It still FAILS on
+  # any real `unsafe { }` / `unsafe fn` / `unsafe impl` / `unsafe trait`, fully
+  # preserving the tech-spec 0.6.2 "zero unsafe" intent (verified by negative test).
   unsafe-audit:
     name: 'unsafe containment audit (curl-rs-lib)'
     runs-on: 'ubuntu-latest'
@@ -156,13 +167,15 @@ jobs:
     steps:
       - name: 'Checkout'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: 'Unsafe containment audit (curl-rs-lib must have zero unsafe)'
+      - name: 'Unsafe containment audit (curl-rs-lib must have zero unsafe usage)'
         run: |
-          if grep -rn 'unsafe' curl-rs-lib/src/; then
-            echo '::error::unsafe code found in curl-rs-lib/src (safe core must be 100% safe)'
+          hits="$(grep -rn --include='*.rs' 'unsafe' curl-rs-lib/src/ | sed 's://.*$::' | grep -P '\bunsafe\b' || true)"
+          if [ -n "$hits" ]; then
+            printf '%s\n' "$hits"
+            echo '::error::unsafe usage found in curl-rs-lib/src (safe core must be 100% safe)'
             exit 1
           fi
-          echo 'OK: no unsafe found in curl-rs-lib/src'
+          echo 'OK: no unsafe usage in curl-rs-lib/src (only the mandated #![forbid(unsafe_code)] attribute + safety-policy docs)'
 
   # Gate 10 (tech-spec 0.6.4 supplementary): confirm all code + dependencies
   # compile on the pinned MSRV 1.75 (root rust-toolchain.toml channel = "1.75.0").
@@ -178,26 +191,43 @@ jobs:
       - name: 'Gate: cargo +1.75 check --workspace (tech-spec 0.6.4)'
         run: cargo +1.75 check --workspace
 
-  # Gate 8 (tech-spec 0.6.4): behavioral parity via the unmodified curl 8.x
-  # harness tests/runtests.pl is the DEFINITIVE oracle, but per tech-spec 0.6.5 it
-  # is a KNOWN, DOCUMENTED BLOCKER pending include/curl/curl.h reconciliation
-  # (dual-header / feature-gated cbindgen output). This leg is intentionally
-  # non-merge-blocking (continue-on-error) so CI documents the intended parity
-  # gate without failing on the known blocker. Test definitions are NEVER edited.
+  # Gate 8 (tech-spec 0.6.4): behavioral parity via the UNMODIFIED curl 8.x
+  # harness tests/runtests.pl — the DEFINITIVE parity oracle. This is a HARD,
+  # merge-blocking gate (NO continue-on-error): it builds the Rust workspace and
+  # drives the harness against the produced `curl-rs` binary using runtests.pl's
+  # documented `-c <path>` option. The harness and the test definitions in
+  # tests/data are used verbatim and are NEVER edited (they are the acceptance
+  # oracle, out of scope for modification).
+  #
+  # Per tech-spec 0.6.5 the harness is a KNOWN, DOCUMENTED blocker *to resolve*
+  # (pending include/curl/curl.h reconciliation). That is transparency about
+  # what must be fixed to reach parity — NOT a license to downgrade a mandated
+  # hard gate. Until the blocker is resolved this gate is expected to fail, which
+  # correctly keeps the checkpoint red instead of masking it with an
+  # allowed-failure. Gate 8 is enforced, not skipped.
   parity:
-    name: 'behavioral parity (curl 8.x harness) [known blocker]'
+    name: 'behavioral parity (curl 8.x harness, tests/runtests.pl)'
     runs-on: 'ubuntu-latest'
-    timeout-minutes: 30
-    continue-on-error: true
+    timeout-minutes: 60
     steps:
       - name: 'Checkout'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: 'Behavioral parity oracle (allowed failure until header reconciliation)'
+      - name: 'Install Rust stable toolchain'
         run: |
-          echo 'Behavioral parity oracle: tests/runtests.pl (unmodified curl 8.x harness).'
-          echo 'Known blocker per tech-spec 0.6.5: pending include/curl/curl.h reconciliation.'
-          echo 'This leg is intentionally non-merge-blocking until the blocker is resolved.'
-          echo 'Test definitions in tests/data are never edited.'
+          rustup toolchain install stable --profile minimal
+          rustc +stable --version --verbose
+      - name: 'Ensure Perl is available for the harness'
+        run: perl --version
+      - name: 'Build the Rust workspace (produces target/release/curl-rs)'
+        run: cargo +stable build --release --workspace
+      - name: 'Gate: run the unmodified curl 8.x parity harness against the Rust build'
+        working-directory: tests
+        run: |
+          # Execute the DEFINITIVE behavioral-parity oracle. runtests.pl and the
+          # test definitions under tests/data are unmodified; the harness's
+          # documented `-c` flag points it at the Rust-built curl binary. A
+          # non-zero exit here fails the merge, as mandated by tech-spec 0.6.4.
+          perl ./runtests.pl -c "../target/release/curl-rs"
 
   # Gate 11 (tech-spec 0.6.5 supplementary, OPTIONAL): assert rustls is the sole
   # TLS backend with certificate validation ON by default (SSL_VERIFYPEER=1 /
