@@ -4,23 +4,41 @@
 # curl-rs — CLI binary member manifest
 # ====================================
 # `curl-rs` is the command-line tool of the three-crate, idiomatic-Rust rewrite of
-# curl / libcurl 8.19.0-DEV. It is a language rewrite of the `src/` C tree (`tool_*.c`) and
-# consumes the safe-Rust core (`curl-rs-lib`). In FUNCTION it supersedes `src/CMakeLists.txt`
-# and `src/Makefile.am` (which produced the `curl` executable); those C build files remain in
-# the tree as preserved source-of-truth references.
+# curl / libcurl 8.19.0-DEV. It is a language rewrite of the `src/` C tree (~43 `tool_*.c`
+# files) and reproduces the full curl 8.x flag surface 1:1 — no flag is invented and no
+# semantic/default is altered — producing the `curl-rs` executable. In FUNCTION it supersedes
+# the C build definitions `src/CMakeLists.txt` and `src/Makefile.am` (which produced the
+# `curl` binary linked against libcurl); those C build files remain in the tree as preserved
+# source-of-truth references and are intentionally NOT deleted.
 #
 # Design rules honored here (AAP §0.7):
 #   * Tokio is the ONLY async runtime, and the CLI uses its CURRENT-THREAD flavor to match
-#     curl 8.x's single-threaded tool model (§0.3.2) — hence the trimmed tokio feature set.
+#     curl 8.x's single-threaded tool model (§0.3.2 / tech-spec line 684:
+#     `#[tokio::main(flavor = "current_thread")]`). `rt-multi-thread` is deliberately NOT
+#     enabled here — that flavor belongs to the library's multi handle. Feature unification
+#     with `curl-rs-lib` (which does enable `rt-multi-thread`) is expected and harmless: the
+#     CLI still constructs its own `current_thread` runtime in `main.rs`.
 #   * `clap` argument definitions are derived 1:1 from `docs/cmdline-opts/`; no flag is
-#     invented and no default is altered (Minimal Change Mandate).
-#   * Every dependency version is owned by the root [workspace.dependencies]; this manifest
-#     only selects features. No `[profile.*]` sections, no speculative dependencies.
+#     invented and no default is altered (Minimal Change Mandate, §0.7.3).
+#   * rustls exclusivity / no C TLS and Tokio-only runtime: no `openssl` / `openssl-sys` /
+#     `native-tls` / `async-std` / `smol`, and no dependency feature that would pull a C TLS
+#     library (§0.7.2). Every transport/TLS/crypto/QUIC/SSH crate is transitive via
+#     `curl-rs-lib` and is NEVER declared directly here (Minimal Change Mandate).
+#   * Every crates.io dependency VERSION is owned by the root `[workspace.dependencies]` (the
+#     single source of truth); this member references each with `<dep>.workspace = true` and
+#     selects only the feature set it needs. No crates.io version string appears in this file.
+#   * Minimal Change Mandate — only what functional parity requires is declared: no
+#     `[profile.*]` sections, no `[features]` matrix (the protocol/TLS/auth/DNS feature matrix
+#     is OWNED by `curl-rs-lib`; this binary consumes that crate's DEFAULT feature set so the
+#     shipped `curl-rs` presents the full protocol surface for `curl --help all` parity), no
+#     speculative dependencies, and no non-essential metadata.
 
 [package]
 name = "curl-rs"
 # Shared metadata inherited from the root [workspace.package] (single source of truth):
-# version -> "8.19.0-dev", edition -> "2021", rust-version -> "1.75" (MSRV), license -> "curl".
+# version -> "8.19.0-dev", edition -> "2021", rust-version -> "1.75" (MSRV, MANDATORY per
+# §0.7.3 — all code and dependencies must compile on Rust 1.75), license -> SPDX "curl"
+# (confirmed across the `src/*.c` SPDX headers).
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -28,31 +46,95 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "curl - command line tool for transferring data with URLs (idiomatic Rust rewrite of the curl CLI)"
+# Crate-specific literal description so the CLI crate is self-describing on crates.io/docs.rs.
+description = "curl command-line tool reimplemented in safe Rust (clap-based; full curl 8.x flag surface)"
 
 [[bin]]
-# The produced executable is `curl-rs` (curl 8.x's `curl`, renamed to coexist with a
-# system curl).
+# The produced executable is `curl-rs` (curl 8.x's `curl`, renamed to coexist with a system
+# curl). Flag-surface parity is about the ARGUMENTS, not the program name. Since the package
+# name is already `curl-rs` this is the default binary; declaring it explicitly is
+# self-documenting and pins the entrypoint module. `default-run` is intentionally omitted —
+# there is exactly one binary target.
 name = "curl-rs"
 path = "src/main.rs"
 
 [dependencies]
-# The safe-Rust core: protocol handlers, TLS, auth, DNS, transfer engine.
-# Explicit `version` (not just `path`) so cargo-deny's `wildcards = "deny"` policy
-# (deny.toml) is satisfied for this workspace-internal dependency; the path still
-# governs resolution, and the version is kept in lockstep with the workspace version.
+# --- Internal path dependencies (the CLI wiring, AAP §0.4.2) ---
+# The safe-Rust core, consumed DIRECTLY for the easy/multi handle builder API, the
+# protocol/transfer engine, TLS, auth, DNS, cookies, etc. Its DEFAULT feature set (the full
+# protocol surface) is inherited unchanged — `default-features` is deliberately NOT disabled
+# so the CLI exposes the complete surface required for `curl --help all` parity.
+#
+# The explicit `version` (kept in lock-step with the workspace version, "8.19.0-dev") is
+# REQUIRED — not decorative: cargo-deny's `wildcards = "deny"` policy (deny.toml) is a
+# merge-blocking gate (AAP §0.6.4), and a `path` dependency with no version requirement is
+# treated as a `*` wildcard and rejected. Declaring the workspace version satisfies the gate
+# while the `path` still fully governs resolution. This is the workspace's OWN version, not a
+# crates.io version pin, so it does not violate the "versions live only in
+# [workspace.dependencies]" rule; it mirrors the identical, already-established convention in
+# the sibling `curl-rs-ffi/Cargo.toml`.
 curl-rs-lib = { path = "../curl-rs-lib", version = "8.19.0-dev" }
-# Current-thread runtime only: `rt` provides the single-threaded scheduler and `macros`
-# provides the `#[tokio::main]` attribute. `rt-multi-thread` is deliberately NOT enabled — the
-# CLI is single-threaded (the multi-thread flavor belongs to the library's multi handle).
-tokio = { workspace = true, features = ["rt", "macros"] }
-# Argument parsing (derive API), 1:1 with docs/cmdline-opts/.
-clap = { workspace = true, features = ["derive"] }
-# Contextual error chaining for the tool's top-level error reporting.
+# Consumed INTERNALLY for CALLBACK PARITY (tech-spec §5.1.3.1 / AAP §0.4.2): the
+# `callbacks/*` modules mirror libcurl's C callback signatures (`curl_write_callback`,
+# `curl_progress_callback`, `curl_debug_callback`, and the HSTS read/write callbacks) that
+# the FFI crate defines. `curl-rs-ffi`'s `[lib] crate-type` includes `rlib` expressly so this
+# CLI can link it as a normal in-process Rust dependency. There is NO dependency cycle
+# (`curl-rs -> {curl-rs-lib, curl-rs-ffi}` and `curl-rs-ffi -> curl-rs-lib`). The `version`
+# key is present for the same cargo-deny `wildcards = "deny"` reason documented above.
+curl-rs-ffi = { path = "../curl-rs-ffi", version = "8.19.0-dev" }
+
+# --- CLI framework ---
+# `derive` powers the `#[derive(Parser)]` arg structs in `args.rs` (1:1 with
+# `docs/cmdline-opts/*.md`); `cargo` sources the version from the manifest; `wrap_help` wraps
+# help text to the terminal width for `--help` output parity.
+clap = { workspace = true, features = ["derive", "cargo", "wrap_help"] }
+# Shell-completion generation (parity with curl's completion support); used by `args.rs`.
+clap_complete = { workspace = true }
+# CLI-level contextual error chaining in `main.rs`/`operate.rs` (§0.5.1 assigns `anyhow` to
+# the CLI; the library uses `thiserror`, never `anyhow`).
 anyhow = { workspace = true }
 
-# NOTE: no [dev-dependencies] are declared here. The black-box CLI smoke test
-# (tests/cli.rs) drives the real binary through `std::process::Command`, locating it via the
-# `CARGO_BIN_EXE_curl-rs` path Cargo injects for integration tests, so it needs no external test
-# harness. The `assert_cmd` / `predicates` version pins remain catalogued in the root
-# [workspace.dependencies] for the fuller CLI assertion suites that later checkpoints will add.
+# --- Async runtime — Tokio current-thread flavor (§0.3.2) ---
+# `rt` + `macros` enable `#[tokio::main(flavor = "current_thread")]` in `main.rs` — the
+# single-threaded model matching curl 8.x. `rt-multi-thread` is deliberately NOT enabled
+# (that is the library's multi-handle concern). The remaining features support the CLI's
+# async I/O (`io-util`), sockets (`net`), timeouts (`time`), file output (`fs`), signal
+# handling — curl ignores SIGPIPE (`signal`; available on the Linux/macOS target set), and
+# task coordination (`sync`).
+tokio = { workspace = true, features = ["rt", "macros", "io-util", "net", "time", "fs", "signal", "sync"] }
+
+# --- Observability — `--trace` / `--verbose` (§0.5.1 + §0.6.3) ---
+# Emit/consume structured diagnostic events; the `--trace`/`--verbose` vocabulary is preserved
+# verbatim for parity.
+tracing = { workspace = true }
+# The SUBSCRIBER that formats trace/verbose output lives in the CLI crate (curl-rs-lib
+# excludes `tracing-subscriber`); wired up in `main.rs`. `fmt` renders events; `env-filter`
+# provides level/target filtering.
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
+
+# --- CLI utilities ---
+# Filesystem-style glob matching where the CLI needs it (curl-rs-lib EXCLUDES `glob`); curl's
+# own `{a,b}` / `[1-10]` URL globbing is reimplemented separately in `urlglob.rs`.
+glob = { workspace = true }
+# `--write-out '%{json}'` structured output (`writeout_json.rs`).
+serde_json = { workspace = true }
+# (De)serializable structures used by write-out/JSON and structured config.
+serde = { workspace = true, features = ["derive"] }
+# Date/time handling for `filetime.rs` (`--time-cond`, setting output mtime from
+# `Last-Modified`) and write-out time fields.
+chrono = { workspace = true }
+# Narrow OS-integration primitives for `xattr.rs` (extended attributes), `terminal.rs`
+# (terminal width via `TIOCGWINSZ`), and `getpass.rs` (termios no-echo password prompt). Per
+# AAP §0.6.2 `unsafe` outside the FFI crate is permitted ONLY in such narrow OS-integration
+# primitives, and every `unsafe` block MUST carry a `// SAFETY:` comment (a fully-safe
+# implementation is preferred wherever feasible).
+libc = { workspace = true }
+
+[dev-dependencies]
+# CLI integration testing (§0.5.1 assigns these to the CLI; curl-rs-lib excludes them).
+# Spawn and assert on the built `curl-rs` binary — behavior / exit-code / stderr parity.
+assert_cmd = { workspace = true }
+# Output and exit-status assertion predicates, used together with `assert_cmd`.
+predicates = { workspace = true }
+# Per-test temporary files (output targets, `.curlrc`/config fixtures, cookie/state files).
+tempfile = { workspace = true }
