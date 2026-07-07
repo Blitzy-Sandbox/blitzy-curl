@@ -3,17 +3,18 @@
 
 //! Build script for `curl-rs-ffi`.
 //!
-//! Its sole job is optional **verification** of the generated C header: when the `capi`
-//! feature is enabled it invokes `cbindgen` to render this crate's `extern "C"` surface into
-//! `$OUT_DIR/curl_verification.h`. That artifact exists only so CI can byte-diff the generated
-//! `CURLcode` declaration against the authoritative, committed `include/curl/curl.h`; the build
-//! script **never** writes over that committed header.
+//! Its sole job is **verification** of the generated C header: it invokes `cbindgen` to render
+//! this crate's `extern "C"` surface into `$OUT_DIR/curl_verification.h`. That artifact exists
+//! only so CI can byte-diff the generated `CURLcode` declaration against the authoritative,
+//! committed `include/curl/curl.h` (AAP §0.6.1); the build script **never** writes over that
+//! committed header.
 //!
-//! `cbindgen` is a default-OFF, optional build-dependency (gated by `capi`) precisely so a
-//! stock `cargo build` and the mandatory `cargo +1.75 check` MSRV gate never compile it — the
-//! header-verification path is a CI concern and must not perturb the workspace's build or its
-//! Minimum Supported Rust Version. When `capi` is disabled this script only records the
-//! rerun triggers below.
+//! `cbindgen` is a plain, non-optional build-dependency: it declares `rust-version = "1.74"`
+//! and its full transitive graph compiles on the workspace MSRV 1.75, so invoking it here does
+//! not perturb the stock `cargo build` or the mandatory `cargo +1.75 check` gate. Header
+//! generation is intentionally non-fatal (see [`generate_verification_header`]): any cbindgen
+//! error is downgraded to a `cargo:warning`, so a transient tooling issue can never break the
+//! build, and the committed header always remains authoritative.
 
 fn main() {
     // Re-run whenever the ABI source or the cbindgen configuration changes so a stale
@@ -21,7 +22,6 @@ fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
 
-    #[cfg(feature = "capi")]
     generate_verification_header();
 }
 
@@ -32,7 +32,6 @@ fn main() {
 /// remains the single authoritative artifact. Any cbindgen failure is non-fatal: it emits a
 /// cargo warning and leaves the committed header untouched, so a transient tooling issue can
 /// never break the build.
-#[cfg(feature = "capi")]
 fn generate_verification_header() {
     use std::path::PathBuf;
 
@@ -42,10 +41,10 @@ fn generate_verification_header() {
         PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is always set for build scripts"))
             .join("curl_verification.h");
 
-    match cbindgen::generate(&crate_dir) {
+    match cbindgen::generate(crate_dir) {
         Ok(bindings) => {
             // `write_to_file` only rewrites the file when the contents actually change.
-            bindings.write_to_file(&out_path);
+            bindings.write_to_file(out_path);
         }
         Err(err) => {
             println!(

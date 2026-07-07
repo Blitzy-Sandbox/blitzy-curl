@@ -2,28 +2,46 @@
 # SPDX-FileCopyrightText: Daniel Stenberg, <daniel@haxx.se>, et al.
 #
 # curl-rs-ffi — C-ABI layer member manifest
-# ==========================================
+# =========================================
 # `curl-rs-ffi` is the `extern "C"` compatibility shim of the three-crate, idiomatic-Rust
 # rewrite of curl / libcurl 8.19.0-DEV. It re-exposes the safe-Rust core (`curl-rs-lib`) as
-# `libcurl`-compatible C symbols and is the ONLY workspace member permitted to contain
-# `unsafe` (AAP §0.7.2). In FUNCTION it supersedes the hand-written public header
-# `include/curl/curl.h`, which `cbindgen` regenerates (as a verification artifact) from this
-# crate's annotations; the C header remains in the tree as the authoritative reference.
+# `libcurl`-compatible C symbols so existing C/C++ consumers relink against the Rust
+# implementation WITHOUT recompilation, and it is the ONLY workspace member permitted to
+# contain `unsafe` (AAP §0.7.2). In FUNCTION it, together with `build.rs` + `cbindgen.toml`,
+# supersedes the hand-authored generation of the public header `include/curl/curl.h`
+# (`cbindgen` regenerates a verification copy from this crate's annotations); the C build
+# files and headers remain in the tree as preserved source-of-truth references and are
+# intentionally NOT deleted.
 #
 # Design rules honored here (AAP §0.7):
-#   * Depends ONLY on the sibling core crate plus `libc` for C types; it links no C TLS /
-#     transport library.
-#   * `cbindgen` is a DEFAULT-OFF, optional build-dependency (behind the `capi` feature) so a
-#     stock build and the mandatory `cargo +1.75 check` MSRV gate never compile it — see
-#     `build.rs`.
-#   * Minimal Change Mandate — no speculative dependencies, no `[profile.*]` sections.
+#   * Depends ONLY on the sibling core crate (`curl-rs-lib`, via a `path` dependency) plus
+#     `libc` for C-compatible primitive types at the boundary. It links NO C TLS / transport
+#     library — the C libcurl's `libssl` / `libssh2` / `nghttp2` / `c-ares` link inputs
+#     (see `lib/CMakeLists.txt` / `lib/Makefile.am`) are ALL eliminated; the sole optional OS
+#     C linkage (GSSAPI/Kerberos) lives in `curl-rs-lib`, never here. No `links` key is set.
+#   * `rustls` exclusivity / Tokio-only async runtime: no `openssl` / `openssl-sys` /
+#     `native-tls` / `async-std` / `smol`, and no dependency feature that would pull a C TLS
+#     library (§0.7.2). Those transport/TLS/runtime crates are transitive via `curl-rs-lib`
+#     and are never declared directly here.
+#   * Dependency VERSIONS are owned by the root `[workspace.dependencies]` (the single source
+#     of truth); this member references each crates.io dependency with `<dep>.workspace =
+#     true` and never restates a version string. The only version literal below is the
+#     workspace's OWN version on the internal `path` dependency, required by the cargo-deny
+#     merge gate (see the `[dependencies]` note).
+#   * Minimal Change Mandate (§0.7.3): only what functional parity requires is declared — no
+#     speculative dependencies, no `[dev-dependencies]`, no `[profile.*]` sections, no
+#     `[[bin]]`, and no `[features]` matrix (the protocol/TLS/auth/DNS feature matrix is OWNED
+#     by `curl-rs-lib`; this drop-in simply inherits that crate's DEFAULT feature set).
 
 [package]
 # Hyphenated crate name; the library target is renamed to `curl_rs_ffi` via [lib] below so the
-# produced shared object is `libcurl_rs_ffi.{so,dylib}` / static `libcurl_rs_ffi.a`.
+# produced shared object is `libcurl_rs_ffi.{so,dylib}` and the static archive is
+# `libcurl_rs_ffi.a` on the four supported targets.
 name = "curl-rs-ffi"
-# Shared metadata inherited from the root [workspace.package] (single source of truth):
-# version -> "8.19.0-dev", edition -> "2021", rust-version -> "1.75" (MSRV), license -> "curl".
+# Shared metadata is inherited from the root [workspace.package] (single source of truth):
+# version -> "8.19.0-dev", edition -> "2021", rust-version -> "1.75" (MSRV, MANDATORY per
+# §0.7.3 — every dependency, including the non-optional `cbindgen` build-dependency, compiles
+# on Rust 1.75), license -> SPDX "curl".
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -31,34 +49,46 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "libcurl-compatible C ABI layer for the curl-rs Rust rewrite (cbindgen-generated headers)"
+# Crate-specific literal description so the C-ABI layer is self-describing on crates.io/docs.rs.
+description = "libcurl-compatible C ABI layer over curl-rs-lib (cbindgen-generated curl.h; libcurl.so drop-in)"
 
 [lib]
 # Rust identifiers cannot contain hyphens, so the target is named `curl_rs_ffi`; this also
-# fixes the output artifact name to `libcurl_rs_ffi.*`.
+# fixes the output artifact base name to `libcurl_rs_ffi.*`.
 name = "curl_rs_ffi"
-# `cdylib` + `staticlib` are the C-consumable outputs (shared / static libcurl replacement);
-# `rlib` lets the sibling `curl-rs` CLI link the same code in-process for callback parity.
+# The crux of the drop-in strategy — three linkable outputs from one crate:
+#   * cdylib   -> `libcurl_rs_ffi.{so,dylib}`, the shared object C/C++ consumers relink
+#                 against (symbol parity verified by `nm -gD` vs curl 8.x `libcurl.so`, §0.6.1).
+#   * staticlib-> `libcurl_rs_ffi.a`, for static linking and the C `tests/libtest/*.c` link
+#                 modes (parity with libcurl's static-library deliverable).
+#   * rlib     -> lets the sibling `curl-rs` CLI link this crate in-process for callback
+#                 parity (AAP §0.4.2 "CLI wiring").
 crate-type = ["cdylib", "staticlib", "rlib"]
 
-[features]
-# `capi` turns on the optional `cbindgen` build-dependency so `build.rs` can render the C
-# verification header. It is deliberately DEFAULT-OFF: a stock `cargo build --workspace` and
-# the `cargo +1.75 check` MSRV gate must not compile cbindgen (whose own toolchain floor is
-# independent of this workspace's MSRV 1.75). CI enables `--features capi` on the stable
-# toolchain to produce and byte-diff the header.
-capi = ["dep:cbindgen"]
-
 [dependencies]
-# The safe-Rust core. This is the whole point of the crate: expose `curl-rs-lib` over C.
-# Explicit `version` (not just `path`) so cargo-deny's `wildcards = "deny"` policy
-# (deny.toml) is satisfied; the path still governs resolution and the version tracks
-# the workspace version.
+# The safe-Rust core — the whole purpose of this crate is to expose `curl-rs-lib` over C. The
+# path governs resolution; the crate's DEFAULT feature set (the full protocol/TLS/auth/DNS
+# matrix) is inherited unchanged, which is exactly what a drop-in libcurl must ship, so
+# `default-features` is deliberately NOT disabled.
+#
+# The explicit `version` (kept in lock-step with the workspace version, "8.19.0-dev") is
+# REQUIRED — not decorative: cargo-deny's `wildcards = "deny"` policy (deny.toml) is a
+# merge-blocking gate (AAP §0.6.4), and a `path` dependency with no version requirement is
+# treated as a `*` wildcard and rejected ("error[wildcard] ... bans FAILED"). Declaring the
+# workspace version satisfies the gate while the `path` still fully governs resolution. This
+# mirrors the identical, already-established convention in the sibling `curl-rs/Cargo.toml`.
+# (This is the workspace's OWN version, not a crates.io version pin, so it does not violate
+# the "versions live only in [workspace.dependencies]" rule.)
 curl-rs-lib = { path = "../curl-rs-lib", version = "8.19.0-dev" }
-# Raw C type bridge (`c_char`, `c_int`, `size_t`, ...) used at the `extern "C"` boundary.
+# C-compatible primitive types (`c_char`, `c_int`, `c_long`, `size_t`, `c_void`, `FILE`, ...)
+# used at the `extern "C"` boundary. Version inherited from [workspace.dependencies].
 libc = { workspace = true }
 
 [build-dependencies]
-# Optional + gated by `capi` (see [features]). Used by build.rs to emit the verification
-# header into OUT_DIR only; it never overwrites the committed include/curl/curl.h.
-cbindgen = { workspace = true, optional = true }
+# C header generation (cbindgen 0.29.2, resolved from [workspace.dependencies]). Consumed by
+# `build.rs` to render this crate's `#[no_mangle] extern "C"` surface into a verification
+# header used to byte-diff the generated declarations against the committed
+# `include/curl/curl.h` (AAP §0.6.1). It is a plain, non-optional build-dependency: cbindgen
+# 0.29.x declares `rust-version = "1.74"` and its full transitive graph compiles on the
+# workspace MSRV 1.75, so it never jeopardizes the `cargo +1.75 check` gate.
+cbindgen = { workspace = true }
