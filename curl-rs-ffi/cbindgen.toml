@@ -1,0 +1,315 @@
+# =============================================================================
+# cbindgen configuration for the `curl-rs-ffi` crate
+# =============================================================================
+# Consumed by `curl-rs-ffi/build.rs` (cbindgen 0.29.2) to generate a C header
+# from this crate's `#[no_mangle] extern "C"` functions and `#[repr(C)]` /
+# `#[repr(i32)]` ABI types.
+#
+# GOAL — DECLARATION PARITY, NOT BYTE-IDENTITY (AAP §0.6.1, §0.6.5 approach "a"):
+#   The committed `include/curl/curl.h` is kept byte-for-byte identical to
+#   curl 8.x by the `include/` folder agent. cbindgen CANNOT reproduce that
+#   whole file — it cannot emit curl.h's hand-written prose comments, the bottom
+#   `#include "easy.h" ... "typecheck-gcc.h"` aggregation, the
+#   `#ifndef CURL_NO_OLDIES` deprecation-alias block, or the
+#   argument-count-enforcement macros. Instead, this config makes cbindgen emit
+#   C with curl's typedef style, curl's include-guard macro, and NO name
+#   mangling/prefixing, so CI can byte-diff the *declarations* — function
+#   signatures, enum integer values, struct layouts, typedefs, and callback
+#   function-pointer types — against curl 8.x to confirm ABI stability.
+#
+#   The generated header is a VERIFICATION artifact written by `build.rs` to a
+#   build/verify location; it NEVER replaces the committed
+#   `include/curl/curl.h`. Accordingly, this file is CONFIG ONLY and
+#   deliberately sets NO output path (the output path is controlled entirely by
+#   `build.rs`, which must never clobber the committed header).
+#
+# KEY-SPELLING DISCIPLINE:
+#   cbindgen silently IGNORES unknown/misspelled keys (causing silent config
+#   drift), but it VALIDATES and rejects invalid enum *values* at config load.
+#   Every key below was verified against the cbindgen 0.29.2 schema (the
+#   installed 0.29.2 binary's embedded serde field names + docs.rs `Config`);
+#   every enum value below was verified accepted by the 0.29.2 binary.
+#
+# MINIMAL CHANGE MANDATE:
+#   Only options required for declaration parity are configured. No speculative
+#   sections (e.g. `[defines]`) are added: the exported ABI surface is not
+#   `#[cfg]`-gated in the default drop-in build, so there are no cfg->#ifdef
+#   mappings to declare.
+# =============================================================================
+
+# --- Output language & declaration style ------------------------------------
+
+# curl.h is a C header (its public API and bottom #include aggregation are C,
+# guarded by `#ifdef __cplusplus extern "C" {`). Emit C, not C++.
+language = "C"
+
+# Emit BOTH a struct/enum tag AND a typedef for each aggregate, e.g.
+#   typedef struct curl_slist { char *data; struct curl_slist *next; } curl_slist;
+# This is required for correctness and is the closest fit to curl's MIXED
+# convention:
+#   * curl's structs are self-referential (`struct curl_slist { ...; struct
+#     curl_slist *next; };`, `struct curl_httppost { ...; struct curl_httppost
+#     *next; };`). A self-reference needs a struct TAG, so an anonymous
+#     `typedef struct { ... } X;` (what `style = "type"` emits) does NOT COMPILE
+#     — gcc/g++ reject `X *next;` because the typedef name is not yet in scope.
+#     Verified: `style = "type"` fails to compile; `"both"` compiles clean.
+#   * curl uses pure-tag structs for most types (`struct curl_slist`,
+#     `struct curl_blob`, `struct curl_httppost`, ...), which `"both"` renders
+#     with the exact `struct curl_X { ... }` body and matches in function
+#     signatures (`curl_slist_append(struct curl_slist *list, ...)`).
+#   * curl ALSO typedefs several types (`curl_version_info_data`, `CURLMsg`,
+#     `curl_mime`, `curl_mimepart`, `curl_ssl_backend`) so they are usable as
+#     BARE names; `"both"` emits those typedefs so such references resolve.
+# For field-less integer enums (CURLcode, CURLoption, CURLINFO, ...) cbindgen's
+# C output is identical under every style — `enum CURLcode { CURLE_OK = 0, ... }`
+# plus `typedef int32_t CURLcode;` — so the enum integer values (the ABI
+# keystone) are preserved regardless; `"both"` costs nothing there.
+# NOTE (deviation from the file spec's suggested `style = "type"`): `"type"`
+# was suggested to mirror curl's `typedef enum { } CURLcode;`, but cbindgen does
+# NOT emit that form for C under any style, and `"type"` additionally produces
+# non-compiling self-referential structs. `"both"` is therefore the correct,
+# compilable choice that best reproduces curl's declaration forms.
+style = "both"
+
+# curl.h wraps its declarations in `#ifdef __cplusplus` / `extern "C" {` ...
+# `}` (include/curl/curl.h lines ~105-107). Emit that C++ guard so the
+# generated header is includable from C++ exactly like curl.h.
+cpp_compat = true
+
+# EXACT match to curl.h's include-guard macro: `#ifndef CURLINC_CURL_H`.
+include_guard = "CURLINC_CURL_H"
+
+# curl.h uses a classic `#ifndef` include guard, not `#pragma once`.
+pragma_once = false
+
+# curl's .editorconfig sets `[*.{c,h}] indent_size = 2` and
+# `max_line_length = 79`. Match curl's 2-space, ~79-column style so generated
+# declarations align with curl.h and the diff stays clean.
+tab_width = 2
+line_length = 79
+
+# curl.h is heavily commented; emit Rust doc comments as C `/* ... */` blocks.
+# (Comment byte-identity is NOT required per approach "a"; this only keeps the
+# generated output readable and close to curl.h.)
+documentation = true
+documentation_style = "c"
+
+# curl's public ABI uses `size_t` pervasively (e.g. `curl_write_callback`
+# returns `size_t`; buffer lengths and `curl_blob.len` are `size_t`). Idiomatic
+# Rust uses `usize`. Mapping `usize` -> `size_t` (and `isize` -> `ptrdiff_t`)
+# makes the generated declarations TEXTUALLY match curl.h. Without this,
+# cbindgen emits `uintptr_t`/`intptr_t` — identical in size/ABI but textually
+# divergent, which would add noise to the declaration diff. This directly
+# serves declaration parity; it is a harmless no-op wherever the FFI source
+# already uses `libc::size_t` explicitly.
+usize_is_size_t = true
+
+# Preserve source declaration order (do NOT reorder). The FFI `src/*.rs`
+# modules are authored to approximate curl.h's declaration order, easing the
+# byte-diff. `sort_by` is a top-level key and is the default sort key for both
+# functions and constants.
+sort_by = "None"
+
+# Extra system headers the generated declarations depend on that cbindgen does
+# NOT already emit in its default include block:
+#   <stdio.h>      -> FILE* (write/read/debug callbacks, curl_mprintf family)
+#   <sys/types.h>  -> platform integer/socket types (curl.h pulls this in)
+#   <time.h>       -> time_t (curl_getdate, info fields)
+# `size_t` (<stddef.h>) and `va_list` (<stdarg.h>) are intentionally OMITTED:
+# with `no_includes = false` (the default), cbindgen ALWAYS emits its default
+# block `#include <stdarg.h> <stdbool.h> <stddef.h> <stdint.h> <stdlib.h>`, so
+# listing stddef.h/stdarg.h here would only produce duplicate #include lines.
+# Kept minimal — only what the declarations require and cbindgen does not supply.
+sys_includes = ["stdio.h", "sys/types.h", "time.h"]
+
+# The curl SPDX license banner (reproduced verbatim from the top of
+# include/curl/curl.h) followed by an autogeneration notice.
+#
+# A TOML multi-line *literal* string ('''...''') is REQUIRED here: the ASCII-art
+# banner contains backslashes (e.g. `\___|`) and double-quotes (`"AS IS"`) that
+# a basic "..."-quoted string would misinterpret as escape sequences. A literal
+# string preserves every character verbatim. (The banner contains no single
+# quotes, so the ''' delimiter is safe.) The leading newline right after the
+# opening ''' is trimmed by TOML, so the emitted header begins with `/***`.
+header = '''
+/***************************************************************************
+ *                                  _   _ ____  _
+ *  Project                     ___| | | |  _ \| |
+ *                             / __| | | | |_) | |
+ *                            | (__| |_| |  _ <| |___
+ *                             \___|\___/|_| \_\_____|
+ *
+ * Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+ *
+ * This software is licensed as described in the file COPYING, which
+ * you should have received as part of this distribution. The terms
+ * are also available at https://curl.se/docs/copyright.html.
+ *
+ * You may opt to use, copy, modify, merge, publish, distribute and/or sell
+ * copies of the Software, and permit persons to whom the Software is
+ * furnished to do so, under the terms of the COPYING file.
+ *
+ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
+ * KIND, either express or implied.
+ *
+ * SPDX-License-Identifier: curl
+ *
+ ***************************************************************************/
+
+/* Generated by cbindgen from curl-rs-ffi — declaration-parity artifact; the
+   committed include/curl/curl.h remains the authoritative curl 8.x header. */'''
+
+# Emitted at each major section to deter manual editing of the generated header.
+autogen_warning = "/* WARNING: this file is auto-generated by cbindgen for ABI declaration verification. Do not edit; the committed include/curl/curl.h is authoritative. */"
+
+# --- [export]: symbol selection & naming ------------------------------------
+[export]
+# Do NOT add any prefix to symbol names. curl's symbols are `curl_*` / `CURL*`
+# verbatim, and the Rust side uses `#[no_mangle]`, so names are already exact.
+prefix = ""
+
+# Force-include the full curl 8.x public ABI type surface.
+#
+# WHY THIS IS REQUIRED (not speculative): cbindgen only emits a type if it is
+# reachable from an exported `extern "C"` function's CONCRETE signature. A large
+# part of curl's ABI is reachable ONLY through variadic entry points —
+# `curl_easy_setopt(h, opt, ...)`, `curl_easy_getinfo(h, info, ...)`,
+# `curl_multi_setopt`, `curl_share_setopt`, `curl_formadd(..., ...)` — or through
+# callback function-pointer typedefs that are themselves only referenced via
+# those variadic calls. cbindgen cannot see through the `...`, so those types
+# (e.g. `curl_blob`, `curl_forms`, `curl_certinfo`, `curl_tlssessioninfo`, the
+# `curl_*_callback` typedefs, and value-only enums such as `curl_proxytype` /
+# `curl_TimeCond`) would be PRUNED, leaving the generated header missing
+# declarations that the curl 8.x byte-diff (AAP §0.6.1) requires.
+#
+# This list is the authoritative curl public type inventory extracted from the
+# 13 headers in include/curl/. Listing it here is safe and self-adjusting:
+#   * cbindgen's `include` is ADDITIVE — types already reachable from concrete
+#     functions are emitted once and simply de-duplicated (verified), so there
+#     is no double-emission and source order is still honored (sort_by = "None").
+#   * A name not defined in the crate is SILENTLY IGNORED (verified: exit 0),
+#     so this upper-bound list adapts to whatever the FFI `src/*.rs` defines
+#     without ever erroring.
+# The FFI source names these types exactly as curl (the cbindgen FFI convention),
+# so the entries match the Rust item names.
+include = [
+  # -- status / option / info enums (integer values are the frozen ABI keystone) --
+  "CURLcode", "CURLMcode", "CURLSHcode", "CURLUcode", "CURLHcode",
+  "CURLproxycode", "CURLFORMcode", "CURLSTScode", "CURLsslset",
+  "CURLoption", "CURLMoption", "CURLSHoption", "CURLINFO", "CURLMSG",
+  "CURLMinfo_offt", "CURLUPart", "CURLformoption", "CURLversion",
+  "curl_TimeCond", "curl_closepolicy", "curl_easytype", "curl_infotype",
+  "curl_ftpauth", "curl_ftpccc", "curl_ftpcreatedir", "curl_ftpmethod",
+  "curl_lock_access", "curl_lock_data", "curl_proxytype", "curl_sslbackend",
+  "curl_usessl", "curl_khmatch", "curl_khstat", "curl_khtype",
+  "CURL_NETRC_OPTION", "CURL_TLSAUTH",
+  # -- public structs (self-referential ones need the tag; see `style`) --
+  "curl_slist", "curl_httppost", "curl_forms", "curl_blob", "curl_fileinfo",
+  "curl_sockaddr", "curl_khkey", "curl_hstsentry", "curl_index",
+  "curl_certinfo", "curl_tlssessioninfo", "curl_ssl_backend",
+  "curl_version_info_data", "curl_header", "curl_easyoption", "curl_ws_frame",
+  "curl_waitfd", "CURLMsg",
+  # -- callback function-pointer typedefs (referenced only via variadic setopt) --
+  "curl_write_callback", "curl_read_callback", "curl_progress_callback",
+  "curl_xferinfo_callback", "curl_debug_callback", "curl_seek_callback",
+  "curl_ioctl_callback", "curl_chunk_bgn_callback", "curl_chunk_end_callback",
+  "curl_fnmatch_callback", "curl_sshkeycallback", "curl_sshhostkeycallback",
+  "curl_opensocket_callback", "curl_closesocket_callback", "curl_sockopt_callback",
+  "curl_ssl_ctx_callback", "curl_conv_callback", "curl_resolver_start_callback",
+  "curl_prereq_callback", "curl_trailer_callback", "curl_hstsread_callback",
+  "curl_hstswrite_callback", "curl_formget_callback", "curl_malloc_callback",
+  "curl_free_callback", "curl_realloc_callback", "curl_calloc_callback",
+  "curl_strdup_callback", "curl_lock_function", "curl_unlock_function",
+  "curl_multi_timer_callback", "curl_socket_callback", "curl_push_callback",
+]
+
+# Emit the full declaration surface. Every curl ABI item is one of these kinds:
+#   enums     -> CURLcode, CURLMcode, CURLSHcode, CURLUcode, CURLHcode,
+#                CURLoption, CURLINFO, ...
+#   structs   -> curl_slist, curl_blob, curl_httppost, curl_version_info_data,
+#                curl_header, curl_ws_frame, curl_easyoption, ...
+#   unions    -> (any #[repr(C)] unions used in ABI payloads)
+#   typedefs  -> callback function-pointer types (curl_write_callback,
+#                curl_progress_callback, curl_debug_callback, HSTS read/write, ...)
+#   opaque    -> CURL, CURLM, CURLSH, CURLU (opaque handles)
+#   functions -> the CURL_EXTERN surface (curl_easy_*, curl_multi_*, ...)
+#   constants -> exported `pub const` values
+# curl's public ABI defines no mutable global variables, so "globals" is
+# intentionally omitted.
+item_types = ["enums", "structs", "unions", "typedefs", "opaque", "functions", "constants"]
+
+# --- [fn]: function formatting ----------------------------------------------
+[fn]
+# curl.h wraps long / variadic signatures vertically (e.g. `curl_multi_setopt`
+# and `curl_slist_append` span multiple aligned lines). `"vertical"` mirrors
+# that multi-line style and eases the declaration diff. Variadic extern fns —
+# `curl_easy_setopt(CURL *, CURLoption, ...)`, `curl_easy_getinfo`,
+# `curl_multi_setopt`, `curl_share_setopt`, and the `curl_mprintf` family —
+# render with a trailing `...` from the Rust variadic `...` arguments.
+args = "vertical"
+
+# --- [struct]: C struct layout ----------------------------------------------
+[struct]
+# curl's ABI structs are plain C aggregates needing no C++ conveniences; the
+# Rust side carries `#[repr(C)]`, which fixes field order and layout, e.g.
+#   struct curl_slist { char *data; struct curl_slist *next; };
+#   struct curl_blob  { void *data; size_t len; unsigned int flags; };
+# All operator/constructor derives are explicitly OFF so no C++ helper methods
+# pollute the C declaration surface. (These only affect C++ output, so with
+# language = "C" they are already no-ops; setting them false documents the
+# intent and guards against any future default change.)
+derive_constructor = false
+derive_eq = false
+derive_neq = false
+derive_lt = false
+derive_lte = false
+derive_gt = false
+derive_gte = false
+
+# --- [enum]: FROZEN integer values (the ABI keystone) -----------------------
+[enum]
+# Enum integer stability is the single most important ABI contract: a consumer
+# relying on `CURLE_OPERATION_TIMEDOUT == 28` (or `CURLE_OK == 0`,
+# `CURLE_ECH_REQUIRED == 101`) MUST keep working (AAP §0.6.1). The Rust
+# `#[repr(C)]` / `#[repr(i32)]` enums carry explicit discriminants that cbindgen
+# preserves; the options below ensure cbindgen does not rename, re-prefix, or
+# augment that frozen value surface.
+
+# Emit variant names verbatim — the Rust source already names them to match
+# curl (e.g. `CURLE_OK`, `CURLE_OPERATION_TIMEDOUT`).
+rename_variants = "None"
+
+# Do NOT prefix variants with the enum name; curl variants are bare
+# (`CURLE_OK`, not `CURLcode_CURLE_OK`).
+prefix_with_name = false
+
+# Do NOT auto-append a sentinel variant. curl's sentinels (`CURL_LAST`,
+# `CURLU_LAST`, ...) are declared explicitly in the Rust source with their
+# exact integer values; an injected sentinel would corrupt the frozen surface.
+add_sentinel = false
+
+# --- [parse]: where cbindgen resolves ABI type definitions ------------------
+[parse]
+# The ABI enums/structs/typedefs may be defined directly in `curl-rs-ffi` OR
+# defined in `curl-rs-lib` and re-exported by `curl-rs-ffi` behind `extern "C"`
+# (AAP §0.4.2: "the FFI crate re-exports library types behind extern C").
+# Parsing dependencies lets cbindgen resolve the definitions in either case, so
+# the generated declarations are complete regardless of which crate owns a
+# given `#[repr(...)]` type.
+parse_deps = true
+
+# Whitelist the ONLY dependency cbindgen is allowed to parse. This keeps the
+# parse fast and predictable — the transport/crypto crates (tokio, hyper,
+# rustls, quinn, russh, h2, h3, ...) are never traversed. The root crate
+# (`curl-rs-ffi`) is always parsed regardless of this list.
+include = ["curl-rs-lib"]
+
+# Also generate bindings for ABI types that originate in `curl-rs-lib` and are
+# re-exported by `curl-rs-ffi`, not only types defined in the root crate.
+extra_bindings = ["curl-rs-lib"]
+
+# --- [macro_expansion] ------------------------------------------------------
+[macro_expansion]
+# The ABI uses plain integer enums/constants, NOT the `bitflags` crate, so
+# bitflags macro expansion is disabled.
+bitflags = false

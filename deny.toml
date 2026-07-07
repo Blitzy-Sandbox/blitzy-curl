@@ -1,0 +1,119 @@
+# SPDX-License-Identifier: curl
+# SPDX-FileCopyrightText: Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# blitzy-curl — cargo-deny supply-chain policy
+# ============================================
+# Configuration for `cargo-deny` (https://github.com/EmbarkStudios/cargo-deny),
+# targeting the current schema (validated against cargo-deny 0.19.x). This file
+# governs the whole three-crate workspace (curl-rs-lib, curl-rs, curl-rs-ffi).
+#
+# It serves two distinct roles:
+#
+#   1. SECURITY-GOVERNANCE GATE (technical-specifications.md §0.6.4). Together with
+#      `cargo audit`, `cargo deny check` is the "Security audit" merge gate whose
+#      threshold is ZERO critical CVEs in the resolved dependency tree
+#      (§0.6.4 gate table; §"cargo audit MUST report zero critical CVEs"). The
+#      [advisories] section fails the build on RustSec security vulnerabilities.
+#
+#   2. MECHANICAL RULE ENFORCEMENT (§0.7.3). Two hard project rules are enforced by
+#      the dependency graph itself rather than by convention:
+#        - TLS exclusivity: rustls is the ONLY TLS backend — "no OpenSSL, no
+#          native-tls, no C TLS library linkage at any build configuration".
+#        - Async-runtime exclusivity: Tokio is the SOLE async runtime — "no
+#          alternative async runtimes (no async-std, no smol)".
+#      The [bans] section denies the forbidden crates so any dependency (direct or
+#      transitive) that would re-introduce them breaks the build.
+#
+# Per the Minimal Change Mandate (§0.7.3) this file configures EXACTLY four
+# concerns — advisories, licenses, sources, and bans — and adds no speculative
+# entries. All runtime dependencies are sourced exclusively from crates.io
+# (§0.5 / §0.7.3); the [sources] section enforces that.
+#
+# Root [graph] / [output] tables are intentionally omitted so cargo-deny's
+# defaults apply (all default targets are checked).
+
+# ---------------------------------------------------------------------------
+# Advisories — RustSec security-advisory database checks.
+# This is the §0.6.4 "Security audit" gate (paired with `cargo audit`): the
+# build MUST fail on security vulnerabilities so that no critical CVE ships.
+# ---------------------------------------------------------------------------
+[advisories]
+# Opt into the modern (v2) advisories schema so vulnerabilities always error and
+# the deprecated per-kind lint-level keys are not used.
+version = 2
+# Reject crates whose published version has been yanked from the registry; a
+# yanked crate is treated as a hard error rather than a warning.
+yanked = "deny"
+# No advisories are ignored. The RustSec DB defaults are used as-is so the gate
+# blocks on every vulnerability. A specific advisory ID may be added here ONLY
+# with an inline comment justifying it (e.g. an accepted-risk with no fixed
+# upstream release); today none are justified, so the list stays empty.
+ignore = []
+
+# ---------------------------------------------------------------------------
+# Licenses — allow-list of SPDX license identifiers permitted in the workspace
+# and its (pure-Rust) dependency graph. With version = 2, any crate whose
+# license is not covered by this list — or that is unlicensed — is a hard error.
+# The list below was tuned to the resolved dependency tree: `cargo deny check
+# licenses` reports no "unlicensed"/"not allowed" crates against it.
+# ---------------------------------------------------------------------------
+[licenses]
+version = 2
+# How closely detected license text must match a canonical SPDX license (0.0–1.0).
+confidence-threshold = 0.8
+allow = [
+    # --- Project's own license set (COPYING / REUSE.toml / LICENSES/) ---
+    "curl",             # the project license (SPDX-License-Identifier: curl, MIT-like)
+    "ISC",              # carried in LICENSES/ISC.txt; also used by several deps
+    "BSD-4-Clause-UC",  # carried in LICENSES/BSD-4-Clause-UC.txt (project license set)
+
+    # --- Permissive licenses present across the pure-Rust dependency stack ---
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",  # e.g. wasi / some low-level crates
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",                     # current Unicode license (idna / unicode-* crates)
+    "Unicode-DFS-2016",                # legacy Unicode license (older unicode-* crate versions)
+    "Zlib",
+    "CDLA-Permissive-2.0",             # e.g. webpki-roots trust data
+    "MPL-2.0",                         # weak-copyleft, file-scope; permitted for leaf deps
+]
+
+# ---------------------------------------------------------------------------
+# Sources — restrict where crates may come from. Per §0.5 / §0.7.3, every
+# runtime dependency is sourced EXCLUSIVELY from crates.io; no C cryptographic
+# or transport library is linked and no git/vendored sources are permitted.
+# ---------------------------------------------------------------------------
+[sources]
+# Any crate from a registry not in `allow-registry` is a hard error.
+unknown-registry = "deny"
+# Any crate pulled directly from a git repository is a hard error.
+unknown-git = "deny"
+# crates.io is the one and only allowed registry.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# No git sources are allowed (no vendoring exception is required by the plan).
+allow-git = []
+
+# ---------------------------------------------------------------------------
+# Bans — deny specific crates to mechanically enforce the project's TLS and
+# async-runtime exclusivity rules (§0.7.3). If any dependency (direct OR
+# transitive) pulls one of these in, `cargo deny check bans` fails the build.
+# ---------------------------------------------------------------------------
+[bans]
+# Transitive duplicate versions of a crate are common in a large graph and must
+# not hard-block; surface them as a warning instead.
+multiple-versions = "warn"
+# Forbid `*` version requirements. The workspace uses caret requirements and
+# crates.io itself forbids `*` in published crates, so this is safe and stricter.
+wildcards = "deny"
+deny = [
+    # TLS exclusivity — rustls is the only TLS backend; no C TLS library is
+    # linked at any build configuration (§0.7.3).
+    { crate = "openssl", reason = "TLS exclusivity: rustls is the only TLS backend (no OpenSSL) — §0.7.3" },
+    { crate = "openssl-sys", reason = "TLS exclusivity: no C TLS library linkage (OpenSSL FFI bindings) — §0.7.3" },
+    { crate = "native-tls", reason = "TLS exclusivity: no platform/C TLS backend (rustls only) — §0.7.3" },
+    # Async-runtime exclusivity — Tokio is the sole async runtime (§0.7.3).
+    { crate = "async-std", reason = "Async-runtime exclusivity: Tokio is the sole async runtime — §0.7.3" },
+    { crate = "smol", reason = "Async-runtime exclusivity: Tokio is the sole async runtime — §0.7.3" },
+]
