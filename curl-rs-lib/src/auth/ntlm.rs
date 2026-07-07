@@ -369,7 +369,7 @@ fn mk_lm_hash(password: &str) -> [u8; 21] {
 /// first 16 bytes, and the buffer is zero-padded to 21 bytes.
 fn mk_nt_hash(password: &str) -> [u8; 21] {
     let unicode_pw = ascii_to_unicode_le(password.as_bytes());
-    let digest = Md4::digest(&unicode_pw);
+    let digest = Md4::digest(unicode_pw);
     let mut nt = [0u8; 21];
     nt[0..16].copy_from_slice(&digest);
     // nt[16..21] remains zero.

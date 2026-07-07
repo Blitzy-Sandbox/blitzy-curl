@@ -12,14 +12,20 @@
 //!
 //! ## Submodules
 //!
-//! At this foundation checkpoint the following pieces are implemented; the remaining pieces of
-//! the layout (`config`, `session_cache`, and the top-level connector) are added in later
-//! checkpoints, each derived from its `lib/vtls/` source-of-truth.
-//!
+//! * [`config`] — [`rustls::ClientConfig`] construction from curl's SSL option
+//!   surface (from `lib/vtls/vtls.c`, `lib/vtls/rustls.c`, and
+//!   `lib/vtls/cipher_suite.c`). Certificate validation is on by default and
+//!   `--insecure` warns before disabling it.
 //! * [`hostname`] — RFC 6125 hostname verification (from `lib/vtls/hostcheck.c`).
 //! * [`keylog`] — `SSLKEYLOGFILE` key-material logging for TLS debugging (from
 //!   `lib/vtls/keylog.c`).
+//! * [`session_cache`] — TLS session-resumption store (from
+//!   `lib/vtls/vtls_scache.c`).
+//!
+//! The remaining piece of the layout (the top-level connector) is added in a
+//! later checkpoint, derived from its `lib/vtls/` source-of-truth.
 
+pub mod config;
 pub mod hostname;
 pub mod keylog;
 pub mod session_cache;

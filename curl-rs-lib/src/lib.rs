@@ -63,6 +63,8 @@ pub mod progress;
 pub mod psl;
 pub mod ratelimit;
 pub mod request;
+pub mod transfer;
+pub mod url;
 pub mod urlapi;
 
 // ---------------------------------------------------------------------------

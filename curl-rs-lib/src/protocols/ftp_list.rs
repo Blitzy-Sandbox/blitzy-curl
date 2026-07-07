@@ -1217,18 +1217,24 @@ impl FtpListParser {
             // ---- date "MM-DD-YY" (exactly eight chars, then a space) ----
             WinNtState::Date => {
                 self.item_length += 1;
-                if self.item_length < 9 {
-                    if !char_in_set(b"0123456789-", c) {
+                // "MM-DD-YY" is exactly eight characters, followed by a single
+                // space at position nine; anything longer is malformed.
+                match self.item_length.cmp(&9) {
+                    std::cmp::Ordering::Less => {
+                        if !char_in_set(b"0123456789-", c) {
+                            return Err(bad_file_list());
+                        }
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if c == b' ' {
+                            self.state = State::WinNt(WinNtState::TimePrespace);
+                        } else {
+                            return Err(bad_file_list());
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {
                         return Err(bad_file_list());
                     }
-                } else if self.item_length == 9 {
-                    if c == b' ' {
-                        self.state = State::WinNt(WinNtState::TimePrespace);
-                    } else {
-                        return Err(bad_file_list());
-                    }
-                } else {
-                    return Err(bad_file_list());
                 }
                 Ok(())
             }

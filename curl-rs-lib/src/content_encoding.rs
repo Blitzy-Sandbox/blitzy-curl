@@ -110,6 +110,11 @@ pub const DEFAULT_MAX_DECODED_PER_WRITE: usize = 64 * 1024 * 1024;
 // always permitted) and strictly below `usize::MAX` (which is the sentinel that
 // *disables* the bound). Enforced at compile time so the invariant can never
 // silently regress.
+//
+// This is a deliberate compile-time (const-context) assertion, so clippy's
+// `assertions_on_constants` lint is intentionally allowed here: the whole point
+// is to fail the build if the constant ever violates the invariant.
+#[allow(clippy::assertions_on_constants)]
 const _: () = assert!(
     DEFAULT_MAX_DECODED_PER_WRITE > 0 && DEFAULT_MAX_DECODED_PER_WRITE < usize::MAX,
     "DEFAULT_MAX_DECODED_PER_WRITE must be a finite, positive decompression-bomb ceiling",

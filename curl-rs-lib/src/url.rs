@@ -1,0 +1,3349 @@
+// SPDX-License-Identifier: curl
+// SPDX-FileCopyrightText: Daniel Stenberg, <daniel@haxx.se>, et al.
+
+//! # Handle / connection URL setup and easy-handle option storage
+//!
+//! This module is a language rewrite of curl's `lib/url.c` (≈3,900 lines) — one
+//! of the largest core modules in libcurl. It is responsible for turning a
+//! *configured easy handle* plus a *URL* into a ready-to-connect transfer:
+//!
+//! * It owns the easy-handle configuration store — [`UserDefined`] (the C
+//!   `struct UserDefined`, i.e. the `set.*` options) and the operational
+//!   [`Easy`] state (`struct Curl_easy`). The idiomatic Rust builder in
+//!   `lib.rs` and the `curl_easy_setopt` FFI shim both write into these,
+//!   preserving curl's option **defaults byte-for-byte** (for example
+//!   [`UserDefined::maxredirs`] `= 30`, and TLS verification on by default —
+//!   `verifypeer = 1`, `verifyhost = 2`; AAP §0.7.3).
+//! * It performs the `Curl_connect`/`create_conn` work: parse the URL (via
+//!   [`crate::urlapi`]), resolve proxy / no-proxy (the `lib/noproxy.c`
+//!   behavior), select the protocol handler by scheme, and either reuse a
+//!   pooled connection from [`ConnCache`] or create a fresh one — preserving
+//!   curl's connection-reuse matching rules ([`Connection::matches`], the
+//!   `ConnectionExists`/`url_match_conn` logic) bug-for-bug.
+//! * It builds redirect targets ([`Easy::follow`], curl's `Curl_http_follow`):
+//!   relative-URL resolution through the URL API, [`UserDefined::maxredirs`]
+//!   enforcement, `CURLOPT_REDIR_PROTOCOLS` gating, and credential stripping on
+//!   cross-origin redirects.
+//! * It wires credential resolution: URL userinfo parsing plus `.netrc`
+//!   lookups through [`crate::netrc`] when `--netrc` is requested.
+//! * It manages disconnect/cleanup ([`ConnCache::disconnect`], curl's
+//!   `Curl_disconnect`): returning connections to the cache or closing them.
+//!
+//! ## Memory safety
+//!
+//! Like the rest of `curl-rs-lib`, this module is 100% safe Rust — the manual
+//! `malloc`/`free` of `struct Curl_easy` and `struct connectdata` in `url.c`
+//! becomes ownership and borrowing. The crate-wide `#![forbid(unsafe_code)]`
+//! (see `lib.rs`) makes any `unsafe` here a hard compile error.
+//!
+//! ## Scheme gating and dropped protocols
+//!
+//! Each scheme handler is attached under the matching Cargo `#[cfg(feature =
+//! "…")]` (mirroring curl's `CURL_DISABLE_*`). The RTMP family (`rtmp`,
+//! `rtmpt`, `rtmpe`, `rtmpte`, `rtmps`, `rtmpts`) is **not** registered — the
+//! protocol was dropped from this rewrite (AAP §0.2.2) because no pure-Rust
+//! `librtmp` equivalent exists — so those schemes are reported as unsupported.
+
+use std::cmp::Ordering;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::PathBuf;
+
+use crate::error::{CurlCode, Error, Result};
+use crate::escape;
+use crate::idn;
+use crate::netrc::{Netrc, NetrcCode};
+use crate::urlapi::{self, CurlUPart, Url};
+
+// ===========================================================================
+// Parity constants — buffer sizes and reuse limits (from `lib/urldata.h` and
+// `include/curl/curl.h`). These are reproduced verbatim so that a handle's
+// observable defaults match curl 8.x exactly.
+// ===========================================================================
+
+/// The maximum size of a single write-callback delivery (`CURL_MAX_WRITE_SIZE`,
+/// `include/curl/curl.h`). Also the default receive-buffer size.
+pub const CURL_MAX_WRITE_SIZE: usize = 16384;
+
+/// The maximum receive-buffer size accepted for `CURLOPT_BUFFERSIZE`
+/// (`CURL_MAX_READ_SIZE`, `include/curl/curl.h`).
+pub const CURL_MAX_READ_SIZE: usize = 10 * 1024 * 1024;
+
+/// Default receive-buffer size (`READBUFFER_SIZE` = `CURL_MAX_WRITE_SIZE`).
+pub const READBUFFER_SIZE: usize = CURL_MAX_WRITE_SIZE;
+
+/// Upper clamp for the receive buffer (`READBUFFER_MAX`).
+pub const READBUFFER_MAX: usize = CURL_MAX_READ_SIZE;
+
+/// Lower clamp for the receive buffer (`READBUFFER_MIN`).
+pub const READBUFFER_MIN: usize = 1024;
+
+/// Default upload-buffer size (`UPLOADBUFFER_DEFAULT`).
+pub const UPLOADBUFFER_DEFAULT: usize = 65536;
+
+/// Upper clamp for the upload buffer (`UPLOADBUFFER_MAX`).
+pub const UPLOADBUFFER_MAX: usize = 2 * 1024 * 1024;
+
+/// Lower clamp for the upload buffer (`UPLOADBUFFER_MIN` = `CURL_MAX_WRITE_SIZE`).
+pub const UPLOADBUFFER_MIN: usize = CURL_MAX_WRITE_SIZE;
+
+/// Default connection-cache size for an easy handle (`DEFAULT_CONNCACHE_SIZE`,
+/// `lib/urldata.h`).
+pub const DEFAULT_CONNCACHE_SIZE: usize = 5;
+
+/// Default Happy-Eyeballs timeout in milliseconds (`CURL_HET_DEFAULT`,
+/// `include/curl/curl.h`).
+pub const CURL_HET_DEFAULT: u64 = 200;
+
+/// Default connection-upkeep interval in milliseconds
+/// (`CURL_UPKEEP_INTERVAL_DEFAULT`, `include/curl/curl.h`).
+pub const CURL_UPKEEP_INTERVAL_DEFAULT: u64 = 60000;
+
+/// The default value of `CURLOPT_MAXREDIRS` as set by `Curl_init_userdefined`
+/// (`set->maxredirs = 30`). A value of `-1` means "unlimited".
+pub const DEFAULT_MAXREDIRS: i64 = 30;
+
+// ===========================================================================
+// CURLPROTO_* protocol bit flags (`include/curl/curl.h`, lines 1076-1107).
+//
+// `curl_prot_t` is an unsigned 32-bit mask; these are the bit positions. The
+// RTMP family (bits 19-24) is intentionally omitted from the named set because
+// the protocol is dropped (AAP §0.2.2), but the numeric layout of every other
+// flag is preserved so `CURLOPT_PROTOCOLS`/`CURLOPT_REDIR_PROTOCOLS` masks
+// remain integer-compatible with curl 8.x.
+// ===========================================================================
+
+/// The `CURLPROTO_*` protocol-selection bit flags, reproduced with their exact
+/// curl 8.x bit positions.
+pub mod proto {
+    /// `CURLPROTO_HTTP`.
+    pub const HTTP: u32 = 1 << 0;
+    /// `CURLPROTO_HTTPS`.
+    pub const HTTPS: u32 = 1 << 1;
+    /// `CURLPROTO_FTP`.
+    pub const FTP: u32 = 1 << 2;
+    /// `CURLPROTO_FTPS`.
+    pub const FTPS: u32 = 1 << 3;
+    /// `CURLPROTO_SCP`.
+    pub const SCP: u32 = 1 << 4;
+    /// `CURLPROTO_SFTP`.
+    pub const SFTP: u32 = 1 << 5;
+    /// `CURLPROTO_TELNET`.
+    pub const TELNET: u32 = 1 << 6;
+    /// `CURLPROTO_LDAP`.
+    pub const LDAP: u32 = 1 << 7;
+    /// `CURLPROTO_LDAPS`.
+    pub const LDAPS: u32 = 1 << 8;
+    /// `CURLPROTO_DICT`.
+    pub const DICT: u32 = 1 << 9;
+    /// `CURLPROTO_FILE`.
+    pub const FILE: u32 = 1 << 10;
+    /// `CURLPROTO_TFTP`.
+    pub const TFTP: u32 = 1 << 11;
+    /// `CURLPROTO_IMAP`.
+    pub const IMAP: u32 = 1 << 12;
+    /// `CURLPROTO_IMAPS`.
+    pub const IMAPS: u32 = 1 << 13;
+    /// `CURLPROTO_POP3`.
+    pub const POP3: u32 = 1 << 14;
+    /// `CURLPROTO_POP3S`.
+    pub const POP3S: u32 = 1 << 15;
+    /// `CURLPROTO_SMTP`.
+    pub const SMTP: u32 = 1 << 16;
+    /// `CURLPROTO_SMTPS`.
+    pub const SMTPS: u32 = 1 << 17;
+    /// `CURLPROTO_RTSP`.
+    pub const RTSP: u32 = 1 << 18;
+    // Bits 19-24 (RTMP, RTMPT, RTMPE, RTMPTE, RTMPS, RTMPTS) are deliberately
+    // left undefined: the RTMP family is dropped from this rewrite.
+    /// `CURLPROTO_GOPHER`.
+    pub const GOPHER: u32 = 1 << 25;
+    /// `CURLPROTO_SMB`.
+    pub const SMB: u32 = 1 << 26;
+    /// `CURLPROTO_SMBS`.
+    pub const SMBS: u32 = 1 << 27;
+    /// `CURLPROTO_MQTT`.
+    pub const MQTT: u32 = 1 << 28;
+    /// `CURLPROTO_GOPHERS`.
+    pub const GOPHERS: u32 = 1 << 29;
+    /// `CURLPROTO_MQTTS`.
+    pub const MQTTS: u32 = 1 << 30;
+
+    /// `CURLPROTO_WS` — WebSocket. curl defines this internally
+    /// (`lib/urldata.h`) at bit 30, deliberately overlapping [`MQTTS`]; the two
+    /// are never used by the same handle, so the overlap is a harmless
+    /// space-saving detail preserved here for numeric parity.
+    pub const WS: u32 = 1 << 30;
+    /// `CURLPROTO_WSS` — WebSocket over TLS, at bit 31 (`lib/urldata.h`).
+    pub const WSS: u32 = 1 << 31;
+
+    /// `CURLPROTO_ALL` — enable everything (all 32 bits set).
+    pub const ALL: u32 = 0xffff_ffff;
+
+    /// `CURLPROTO_REDIR` — the protocols a redirect is permitted to target by
+    /// default (`lib/urldata.h`): HTTP, HTTPS, FTP and FTPS.
+    pub const REDIR: u32 = HTTP | HTTPS | FTP | FTPS;
+}
+
+// ===========================================================================
+// CURLAUTH_* HTTP authentication bit flags (`include/curl/curl.h`, lines
+// 828-847). Stored in `unsigned long` fields in curl; represented as `u64`
+// here to match `unsigned long` semantics on LP64 targets.
+// ===========================================================================
+
+/// The `CURLAUTH_*` authentication-method bit flags.
+pub mod authmask {
+    /// `CURLAUTH_NONE` — no authentication.
+    pub const NONE: u64 = 0;
+    /// `CURLAUTH_BASIC`.
+    pub const BASIC: u64 = 1 << 0;
+    /// `CURLAUTH_DIGEST`.
+    pub const DIGEST: u64 = 1 << 1;
+    /// `CURLAUTH_NEGOTIATE` (also `CURLAUTH_GSSAPI` / `CURLAUTH_GSSNEGOTIATE`).
+    pub const NEGOTIATE: u64 = 1 << 2;
+    /// `CURLAUTH_GSSAPI` — alias of [`NEGOTIATE`] (SOCKS5 GSS-API).
+    pub const GSSAPI: u64 = NEGOTIATE;
+    /// `CURLAUTH_NTLM`.
+    pub const NTLM: u64 = 1 << 3;
+    /// `CURLAUTH_DIGEST_IE`.
+    pub const DIGEST_IE: u64 = 1 << 4;
+    /// `CURLAUTH_NTLM_WB` (retained for numeric compatibility).
+    pub const NTLM_WB: u64 = 1 << 5;
+    /// `CURLAUTH_BEARER`.
+    pub const BEARER: u64 = 1 << 6;
+    /// `CURLAUTH_AWS_SIGV4`.
+    pub const AWS_SIGV4: u64 = 1 << 7;
+    /// `CURLAUTH_ONLY`.
+    pub const ONLY: u64 = 1 << 31;
+}
+
+/// The HTTP request method, mirroring curl's `Curl_HttpReq` (`lib/http.h`).
+///
+/// The discriminants match the C enumeration order (`HTTPREQ_GET` is `0`), and
+/// [`HttpReq::Get`] is the default set by `Curl_init_userdefined`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HttpReq {
+    /// `HTTPREQ_GET` — the default request.
+    #[default]
+    Get = 0,
+    /// `HTTPREQ_POST` — a plain `POST` (`CURLOPT_POSTFIELDS`).
+    Post = 1,
+    /// `HTTPREQ_POST_FORM` — a multipart form built the legacy way.
+    PostForm = 2,
+    /// `HTTPREQ_POST_MIME` — a multipart form built via the MIME API.
+    PostMime = 3,
+    /// `HTTPREQ_PUT`.
+    Put = 4,
+    /// `HTTPREQ_HEAD`.
+    Head = 5,
+}
+
+impl HttpReq {
+    /// Returns `true` for the three `POST`-family methods (`HTTPREQ_POST`,
+    /// `HTTPREQ_POST_FORM`, `HTTPREQ_POST_MIME`), matching the grouped tests
+    /// curl performs in its redirect method-switching logic.
+    #[must_use]
+    pub fn is_post_family(self) -> bool {
+        matches!(self, HttpReq::Post | HttpReq::PostForm | HttpReq::PostMime)
+    }
+}
+
+/// The `.netrc` usage level, mirroring the `CURL_NETRC_*` enumeration
+/// (`include/curl/curl.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetrcLevel {
+    /// `CURL_NETRC_IGNORED` — never read `.netrc` (the default).
+    #[default]
+    Ignored = 0,
+    /// `CURL_NETRC_OPTIONAL` — URL credentials win over `.netrc`.
+    Optional = 1,
+    /// `CURL_NETRC_REQUIRED` — `.netrc` wins over URL credentials.
+    Required = 2,
+}
+
+/// The IP-version resolve preference, mirroring `CURL_IPRESOLVE_*`
+/// (`include/curl/curl.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpResolve {
+    /// `CURL_IPRESOLVE_WHATEVER` — use any address family (the default).
+    #[default]
+    Whatever = 0,
+    /// `CURL_IPRESOLVE_V4` — IPv4 only.
+    V4 = 1,
+    /// `CURL_IPRESOLVE_V6` — IPv6 only.
+    V6 = 2,
+}
+
+/// The proxy type, mirroring the `CURLPROXY_*` enumeration
+/// (`include/curl/curl.h`). [`ProxyType::Http`] (`0`) is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProxyType {
+    /// `CURLPROXY_HTTP` — HTTP proxy (default).
+    #[default]
+    Http = 0,
+    /// `CURLPROXY_HTTP_1_0` — force `CONNECT` over HTTP/1.0.
+    Http1_0 = 1,
+    /// `CURLPROXY_HTTPS` — HTTPS proxy, HTTP/1 only.
+    Https = 2,
+    /// `CURLPROXY_HTTPS2` — HTTPS proxy, may negotiate HTTP/2.
+    Https2 = 3,
+    /// `CURLPROXY_SOCKS4`.
+    Socks4 = 4,
+    /// `CURLPROXY_SOCKS5`.
+    Socks5 = 5,
+    /// `CURLPROXY_SOCKS4A`.
+    Socks4a = 6,
+    /// `CURLPROXY_SOCKS5_HOSTNAME` — SOCKS5, resolve host name proxy-side.
+    Socks5Hostname = 7,
+}
+
+impl ProxyType {
+    /// Returns `true` if this is one of the SOCKS proxy variants.
+    #[must_use]
+    pub fn is_socks(self) -> bool {
+        matches!(
+            self,
+            ProxyType::Socks4 | ProxyType::Socks5 | ProxyType::Socks4a | ProxyType::Socks5Hostname
+        )
+    }
+
+    /// Returns `true` if this is an HTTPS (TLS) proxy variant
+    /// (`IS_HTTPS_PROXY` in curl).
+    #[must_use]
+    pub fn is_https(self) -> bool {
+        matches!(self, ProxyType::Https | ProxyType::Https2)
+    }
+}
+
+/// The kind of redirect follow being performed, mirroring curl's `followtype`
+/// enumeration (`lib/http.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowType {
+    /// `FOLLOW_FAKE` — only record the would-be-redirect target, do not follow
+    /// (used once `maxredirs` has been reached, and for `wouldredirect`).
+    Fake,
+    /// `FOLLOW_RETRY` — a request retry rather than a true redirect.
+    Retry,
+    /// `FOLLOW_REDIR` — a full, real redirect (a `3xx` `Location:` follow).
+    Redir,
+}
+
+/// Where the currently-effective credentials came from, mirroring curl's
+/// `enum creds_source` used to arbitrate URL vs option vs `.netrc` precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CredsFrom {
+    /// No credentials resolved yet.
+    #[default]
+    None,
+    /// Credentials came from an explicit option (`CURLOPT_USERNAME`/`_PASSWORD`
+    /// or `CURLOPT_USERPWD`).
+    Option,
+    /// Credentials came from the URL userinfo.
+    Url,
+    /// Credentials came from a `.netrc` lookup.
+    Netrc,
+}
+
+// ===========================================================================
+// Protocol option flags (`PROTOPT_*`, `lib/urldata.h` lines 526-558) and the
+// per-scheme handler descriptor.
+// ===========================================================================
+
+/// The `PROTOPT_*` per-protocol option flags, reproduced with curl's exact bit
+/// positions. These describe intrinsic properties of a scheme's handler and
+/// drive connection-reuse decisions (for example [`SSL`](protopt::SSL) and
+/// [`CREDSPERREQUEST`](protopt::CREDSPERREQUEST)).
+pub mod protopt {
+    /// `PROTOPT_NONE` — no special properties.
+    pub const NONE: u32 = 0;
+    /// `PROTOPT_SSL` — the protocol uses TLS at the transport layer.
+    pub const SSL: u32 = 1 << 0;
+    /// `PROTOPT_DUAL` — the protocol uses two connections (e.g. FTP).
+    pub const DUAL: u32 = 1 << 1;
+    /// `PROTOPT_CLOSEACTION` — needs an action before the socket closes.
+    pub const CLOSEACTION: u32 = 1 << 2;
+    /// `PROTOPT_DIRLOCK` — directory-listing lock (SCP).
+    pub const DIRLOCK: u32 = 1 << 3;
+    /// `PROTOPT_NONETWORK` — the protocol does not use the network (FILE).
+    pub const NONETWORK: u32 = 1 << 4;
+    /// `PROTOPT_NEEDSPWD` — a password is required if none is set.
+    pub const NEEDSPWD: u32 = 1 << 5;
+    /// `PROTOPT_NOURLQUERY` — the protocol cannot handle a URL query part.
+    pub const NOURLQUERY: u32 = 1 << 6;
+    /// `PROTOPT_CREDSPERREQUEST` — credentials are supplied per request, so a
+    /// connection may be reused across differing credentials (HTTP).
+    pub const CREDSPERREQUEST: u32 = 1 << 7;
+    /// `PROTOPT_ALPN` — negotiate ALPN on the TLS connection.
+    pub const ALPN: u32 = 1 << 8;
+    /// `PROTOPT_URLOPTIONS` — an `;options` field is allowed in the userinfo
+    /// (IMAP/POP3/SMTP).
+    pub const URLOPTIONS: u32 = 1 << 10;
+    /// `PROTOPT_PROXY_AS_HTTP` — this non-HTTP scheme may tunnel over an HTTP
+    /// proxy.
+    pub const PROXY_AS_HTTP: u32 = 1 << 11;
+    /// `PROTOPT_WILDCARD` — the protocol supports wildcard matching (FTP).
+    pub const WILDCARD: u32 = 1 << 12;
+    /// `PROTOPT_USERPWDCTRL` — control bytes (`< 0x20`) are permitted in the
+    /// user and password fields.
+    pub const USERPWDCTRL: u32 = 1 << 13;
+    /// `PROTOPT_NOTCPPROXY` — this protocol cannot proxy over TCP (TFTP).
+    pub const NOTCPPROXY: u32 = 1 << 14;
+    /// `PROTOPT_SSL_REUSE` — an existing TLS connection of the family may be
+    /// reused for this scheme.
+    pub const SSL_REUSE: u32 = 1 << 15;
+    /// `PROTOPT_CONN_REUSE` — this protocol can reuse connections.
+    pub const CONN_REUSE: u32 = 1 << 16;
+}
+
+/// A scheme handler descriptor — the metadata portion of curl's
+/// `struct Curl_handler` (`lib/urldata.h`): the scheme name, its `CURLPROTO_*`
+/// protocol bit, its protocol *family* bit, the default port, and its
+/// `PROTOPT_*` flags.
+///
+/// In curl the handler also carries a vtable of protocol I/O callbacks (`->run`);
+/// that behavioral part lives in `crate::protocols`. This descriptor is the URL
+/// layer's view — exactly what `Curl_get_scheme`/`findprotocol` consult to map a
+/// scheme string onto a protocol and to make connection-reuse and
+/// redirect-gating decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemeHandler {
+    /// The lowercase scheme name, e.g. `"https"` (curl `->scheme`).
+    pub name: &'static str,
+    /// The `CURLPROTO_*` bit identifying this exact scheme (curl `->protocol`).
+    pub protocol: u32,
+    /// The `CURLPROTO_*` bit of this scheme's protocol *family* — the base
+    /// protocol used for family-compatible reuse (curl `->family`). For example
+    /// `https`, `ws` and `wss` all report the `http` family bit.
+    pub family: u32,
+    /// The default TCP/UDP port (curl `->defport`). `0` for schemes with no
+    /// network port (FILE).
+    pub default_port: u16,
+    /// The `PROTOPT_*` flag set (curl `->flags`).
+    pub flags: u32,
+}
+
+impl SchemeHandler {
+    /// Builds a descriptor. `const` so the whole scheme registry can be
+    /// evaluated at compile time.
+    #[must_use]
+    const fn new(
+        name: &'static str,
+        protocol: u32,
+        family: u32,
+        default_port: u16,
+        flags: u32,
+    ) -> Self {
+        SchemeHandler {
+            name,
+            protocol,
+            family,
+            default_port,
+            flags,
+        }
+    }
+
+    /// Returns `true` if the flag set contains `flag`.
+    #[must_use]
+    pub const fn has_flag(&self, flag: u32) -> bool {
+        (self.flags & flag) != 0
+    }
+
+    /// `true` if the scheme uses TLS (`PROTOPT_SSL`).
+    #[must_use]
+    pub const fn is_ssl(&self) -> bool {
+        self.has_flag(protopt::SSL)
+    }
+
+    /// `true` if credentials are supplied per request (`PROTOPT_CREDSPERREQUEST`),
+    /// meaning a connection may be reused across differing credentials.
+    #[must_use]
+    pub const fn is_creds_per_request(&self) -> bool {
+        self.has_flag(protopt::CREDSPERREQUEST)
+    }
+
+    /// `true` if an `;options` field is allowed in the userinfo
+    /// (`PROTOPT_URLOPTIONS`).
+    #[must_use]
+    pub const fn allows_url_options(&self) -> bool {
+        self.has_flag(protopt::URLOPTIONS)
+    }
+
+    /// `true` if control bytes are permitted in credentials
+    /// (`PROTOPT_USERPWDCTRL`); governs whether URL credential decoding rejects
+    /// control characters.
+    #[must_use]
+    pub const fn allows_userpwd_ctrl(&self) -> bool {
+        self.has_flag(protopt::USERPWDCTRL)
+    }
+
+    /// `true` if the protocol does not use the network (`PROTOPT_NONETWORK`,
+    /// i.e. FILE).
+    #[must_use]
+    pub const fn is_nonetwork(&self) -> bool {
+        self.has_flag(protopt::NONETWORK)
+    }
+
+    /// Returns the protocol *family* bit — curl's `get_protocol_family`.
+    #[must_use]
+    pub const fn protocol_family(&self) -> u32 {
+        self.family
+    }
+}
+
+// Precomputed flag combinations matching the curl handler definitions, kept as
+// module-private aliases so the registry reads cleanly and stays in sync with
+// `lib/*.c`.
+const F_HTTP: u32 = protopt::CREDSPERREQUEST | protopt::USERPWDCTRL | protopt::CONN_REUSE;
+const F_HTTPS: u32 = protopt::SSL
+    | protopt::CREDSPERREQUEST
+    | protopt::ALPN
+    | protopt::USERPWDCTRL
+    | protopt::CONN_REUSE;
+const F_WS: u32 = protopt::CREDSPERREQUEST | protopt::USERPWDCTRL;
+const F_WSS: u32 = protopt::SSL | protopt::CREDSPERREQUEST | protopt::USERPWDCTRL;
+const F_FTP: u32 = protopt::DUAL
+    | protopt::CLOSEACTION
+    | protopt::NEEDSPWD
+    | protopt::NOURLQUERY
+    | protopt::WILDCARD
+    | protopt::SSL_REUSE
+    | protopt::CONN_REUSE;
+const F_FTPS: u32 = protopt::SSL
+    | protopt::DUAL
+    | protopt::CLOSEACTION
+    | protopt::NEEDSPWD
+    | protopt::NOURLQUERY
+    | protopt::WILDCARD
+    | protopt::CONN_REUSE;
+#[cfg(feature = "sftp")]
+const F_SFTP: u32 = protopt::NEEDSPWD;
+#[cfg(feature = "scp")]
+const F_SCP: u32 = protopt::DIRLOCK | protopt::CLOSEACTION | protopt::NEEDSPWD;
+const F_IMAP: u32 = protopt::CLOSEACTION
+    | protopt::NEEDSPWD
+    | protopt::URLOPTIONS
+    | protopt::SSL_REUSE
+    | protopt::CONN_REUSE;
+const F_IMAPS: u32 = protopt::CLOSEACTION
+    | protopt::SSL
+    | protopt::NEEDSPWD
+    | protopt::URLOPTIONS
+    | protopt::CONN_REUSE;
+const F_POP3: u32 = protopt::CLOSEACTION
+    | protopt::NEEDSPWD
+    | protopt::URLOPTIONS
+    | protopt::SSL_REUSE
+    | protopt::CONN_REUSE;
+const F_POP3S: u32 = protopt::CLOSEACTION
+    | protopt::SSL
+    | protopt::NEEDSPWD
+    | protopt::NOURLQUERY
+    | protopt::URLOPTIONS
+    | protopt::CONN_REUSE;
+const F_SMTP: u32 = protopt::URLOPTIONS | protopt::SSL_REUSE | protopt::CONN_REUSE;
+const F_SMTPS: u32 = protopt::CLOSEACTION
+    | protopt::SSL
+    | protopt::NOURLQUERY
+    | protopt::URLOPTIONS
+    | protopt::CONN_REUSE;
+const F_TELNET: u32 = protopt::NONE | protopt::NOURLQUERY;
+const F_DICT: u32 = protopt::NONE | protopt::NOURLQUERY;
+const F_TFTP: u32 = protopt::NOTCPPROXY | protopt::NOURLQUERY;
+const F_LDAP: u32 = protopt::NONE | protopt::NOURLQUERY;
+const F_LDAPS: u32 = protopt::SSL | protopt::NOURLQUERY;
+const F_SMB: u32 = protopt::CONN_REUSE;
+const F_SMBS: u32 = protopt::SSL | protopt::CONN_REUSE;
+const F_RTSP: u32 = protopt::CONN_REUSE;
+const F_GOPHER: u32 = protopt::NONE;
+const F_GOPHERS: u32 = protopt::SSL;
+const F_MQTT: u32 = protopt::NONE;
+const F_MQTTS: u32 = protopt::SSL;
+const F_FILE: u32 = protopt::NONETWORK | protopt::NOURLQUERY;
+
+/// Looks up the built-in handler for a scheme, curl's `Curl_get_scheme`.
+///
+/// The comparison is case-insensitive (curl lowercases the scheme first). Each
+/// scheme is gated by the Cargo feature that mirrors its curl `CURL_DISABLE_*`
+/// guard; schemes with no dedicated feature in this workspace (`file`, `ldap`,
+/// `smb`, `gopher`, `ws` and their TLS variants) are always available. The RTMP
+/// family is intentionally absent — see the module docs — so `rtmp://` &c.
+/// resolve to `None`.
+#[must_use]
+pub fn get_scheme_handler(scheme: &str) -> Option<SchemeHandler> {
+    // curl's `Curl_get_scheme` matches on a lowercased copy of the scheme.
+    let lower = scheme.to_ascii_lowercase();
+    match lower.as_str() {
+        #[cfg(feature = "http")]
+        "http" => Some(SchemeHandler::new(
+            "http",
+            proto::HTTP,
+            proto::HTTP,
+            80,
+            F_HTTP,
+        )),
+        #[cfg(feature = "http")]
+        "https" => Some(SchemeHandler::new(
+            "https",
+            proto::HTTPS,
+            proto::HTTP,
+            443,
+            F_HTTPS,
+        )),
+        // WebSockets ride the HTTP handler in curl and share its family; there
+        // is no dedicated `websockets` feature in this workspace, so they are
+        // always registered (curl gates them on CURL_DISABLE_WEBSOCKETS).
+        "ws" => Some(SchemeHandler::new("ws", proto::WS, proto::HTTP, 80, F_WS)),
+        "wss" => Some(SchemeHandler::new(
+            "wss",
+            proto::WSS,
+            proto::HTTP,
+            443,
+            F_WSS,
+        )),
+        #[cfg(feature = "ftp")]
+        "ftp" => Some(SchemeHandler::new("ftp", proto::FTP, proto::FTP, 21, F_FTP)),
+        #[cfg(feature = "ftp")]
+        "ftps" => Some(SchemeHandler::new(
+            "ftps",
+            proto::FTPS,
+            proto::FTP,
+            990,
+            F_FTPS,
+        )),
+        #[cfg(feature = "sftp")]
+        "sftp" => Some(SchemeHandler::new(
+            "sftp",
+            proto::SFTP,
+            proto::SFTP,
+            22,
+            F_SFTP,
+        )),
+        #[cfg(feature = "scp")]
+        "scp" => Some(SchemeHandler::new("scp", proto::SCP, proto::SCP, 22, F_SCP)),
+        #[cfg(feature = "imap")]
+        "imap" => Some(SchemeHandler::new(
+            "imap",
+            proto::IMAP,
+            proto::IMAP,
+            143,
+            F_IMAP,
+        )),
+        #[cfg(feature = "imap")]
+        "imaps" => Some(SchemeHandler::new(
+            "imaps",
+            proto::IMAPS,
+            proto::IMAP,
+            993,
+            F_IMAPS,
+        )),
+        #[cfg(feature = "pop3")]
+        "pop3" => Some(SchemeHandler::new(
+            "pop3",
+            proto::POP3,
+            proto::POP3,
+            110,
+            F_POP3,
+        )),
+        #[cfg(feature = "pop3")]
+        "pop3s" => Some(SchemeHandler::new(
+            "pop3s",
+            proto::POP3S,
+            proto::POP3,
+            995,
+            F_POP3S,
+        )),
+        #[cfg(feature = "smtp")]
+        "smtp" => Some(SchemeHandler::new(
+            "smtp",
+            proto::SMTP,
+            proto::SMTP,
+            25,
+            F_SMTP,
+        )),
+        #[cfg(feature = "smtp")]
+        "smtps" => Some(SchemeHandler::new(
+            "smtps",
+            proto::SMTPS,
+            proto::SMTP,
+            465,
+            F_SMTPS,
+        )),
+        #[cfg(feature = "telnet")]
+        "telnet" => Some(SchemeHandler::new(
+            "telnet",
+            proto::TELNET,
+            proto::TELNET,
+            23,
+            F_TELNET,
+        )),
+        #[cfg(feature = "dict")]
+        "dict" => Some(SchemeHandler::new(
+            "dict",
+            proto::DICT,
+            proto::DICT,
+            2628,
+            F_DICT,
+        )),
+        #[cfg(feature = "tftp")]
+        "tftp" => Some(SchemeHandler::new(
+            "tftp",
+            proto::TFTP,
+            proto::TFTP,
+            69,
+            F_TFTP,
+        )),
+        #[cfg(feature = "rtsp")]
+        "rtsp" => Some(SchemeHandler::new(
+            "rtsp",
+            proto::RTSP,
+            proto::RTSP,
+            554,
+            F_RTSP,
+        )),
+        #[cfg(feature = "mqtt")]
+        "mqtt" => Some(SchemeHandler::new(
+            "mqtt",
+            proto::MQTT,
+            proto::MQTT,
+            1883,
+            F_MQTT,
+        )),
+        #[cfg(feature = "mqtt")]
+        "mqtts" => Some(SchemeHandler::new(
+            "mqtts",
+            proto::MQTTS,
+            proto::MQTT,
+            8883,
+            F_MQTTS,
+        )),
+        // Schemes without a dedicated Cargo feature: always registered.
+        "ldap" => Some(SchemeHandler::new(
+            "ldap",
+            proto::LDAP,
+            proto::LDAP,
+            389,
+            F_LDAP,
+        )),
+        "ldaps" => Some(SchemeHandler::new(
+            "ldaps",
+            proto::LDAPS,
+            proto::LDAP,
+            636,
+            F_LDAPS,
+        )),
+        "smb" => Some(SchemeHandler::new(
+            "smb",
+            proto::SMB,
+            proto::SMB,
+            445,
+            F_SMB,
+        )),
+        "smbs" => Some(SchemeHandler::new(
+            "smbs",
+            proto::SMBS,
+            proto::SMB,
+            445,
+            F_SMBS,
+        )),
+        "gopher" => Some(SchemeHandler::new(
+            "gopher",
+            proto::GOPHER,
+            proto::GOPHER,
+            70,
+            F_GOPHER,
+        )),
+        "gophers" => Some(SchemeHandler::new(
+            "gophers",
+            proto::GOPHERS,
+            proto::GOPHER,
+            70,
+            F_GOPHERS,
+        )),
+        "file" => Some(SchemeHandler::new(
+            "file",
+            proto::FILE,
+            proto::FILE,
+            0,
+            F_FILE,
+        )),
+        _ => None,
+    }
+}
+
+/// Selects the protocol handler for a scheme, curl's `findprotocol`
+/// (`lib/url.c`).
+///
+/// The scheme must resolve to a built-in handler ([`get_scheme_handler`]) that
+/// is permitted by `allowed_protocols` (`CURLOPT_PROTOCOLS`). When this lookup
+/// happens as the result of a redirect (`is_follow == true`), the scheme must
+/// additionally be permitted by `redir_protocols` (`CURLOPT_REDIR_PROTOCOLS`).
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedProtocol`] (curl's `CURLE_UNSUPPORTED_PROTOCOL`)
+/// when the scheme is unknown, disabled by the protocol mask, or — on a
+/// redirect — not in the redirect-permitted set.
+pub fn findprotocol(
+    scheme: &str,
+    allowed_protocols: u32,
+    redir_protocols: u32,
+    is_follow: bool,
+) -> Result<SchemeHandler> {
+    if let Some(handler) = get_scheme_handler(scheme) {
+        // Protocol found and supported. Check if allowed for a normal request.
+        if (allowed_protocols & handler.protocol) != 0 {
+            // Extra check when this is the result of a redirect.
+            if is_follow && (redir_protocols & handler.protocol) == 0 {
+                // Not permitted as a redirect target: fall through to the error.
+            } else {
+                return Ok(handler);
+            }
+        }
+    }
+    Err(Error::UnsupportedProtocol)
+}
+
+/// Maps a URL-API error code to the transfer-level [`CurlCode`], curl's
+/// `Curl_uc_to_curlcode` (`lib/url.c`).
+///
+/// The mapping is exact: `CURLUE_UNSUPPORTED_SCHEME` becomes
+/// `CURLE_UNSUPPORTED_PROTOCOL`, `CURLUE_OUT_OF_MEMORY` becomes
+/// `CURLE_OUT_OF_MEMORY`, `CURLUE_USER_NOT_ALLOWED` becomes
+/// `CURLE_LOGIN_DENIED`, and every other URL error becomes
+/// `CURLE_URL_MALFORMAT`.
+#[must_use]
+pub fn uc_to_curlcode(uc: urlapi::UrlCode) -> CurlCode {
+    match uc {
+        urlapi::UrlCode::UnsupportedScheme => CurlCode::UnsupportedProtocol,
+        urlapi::UrlCode::OutOfMemory => CurlCode::OutOfMemory,
+        urlapi::UrlCode::UserNotAllowed => CurlCode::LoginDenied,
+        _ => CurlCode::UrlMalformat,
+    }
+}
+
+/// Converts a URL-API result into a crate [`Result`], applying
+/// [`uc_to_curlcode`] to any error — the idiomatic form of curl's pervasive
+/// `return Curl_uc_to_curlcode(uc);` idiom.
+fn uc<T>(res: core::result::Result<T, urlapi::UrlCode>) -> Result<T> {
+    res.map_err(|code| Error::from(uc_to_curlcode(code)))
+}
+
+/// `CURL_HTTP_VERSION_NONE` — the default `CURLOPT_HTTP_VERSION` (do not care).
+pub const CURL_HTTP_VERSION_NONE: i64 = 0;
+
+/// `CURL_SSLVERSION_DEFAULT` — the default `CURLOPT_SSLVERSION`.
+pub const CURL_SSLVERSION_DEFAULT: i64 = 0;
+
+/// `CURLSSH_AUTH_ANY` / `CURLSSH_AUTH_DEFAULT` — allow any SSH auth type. curl
+/// defines this as `~0`, which stored in the `long` `ssh_auth_types` field is
+/// `-1`.
+pub const CURLSSH_AUTH_ANY: i64 = -1;
+
+/// The FTP file-retrieval directory-traversal method, mirroring curl's
+/// `curl_ftpfile` enumeration (`include/curl/curl.h`). The default set by
+/// `Curl_init_userdefined` is [`FtpFileMethod::MultiCwd`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FtpFileMethod {
+    /// `FTPFILE_MULTICWD` — one `CWD` per path segment (the default).
+    #[default]
+    MultiCwd = 1,
+    /// `FTPFILE_NOCWD` — no `CWD` at all; use the full path.
+    NoCwd = 2,
+    /// `FTPFILE_SINGLECWD` — a single `CWD` to the target directory.
+    SingleCwd = 3,
+}
+
+/// The TLS configuration for a transfer, mirroring the fields of curl's
+/// `struct ssl_primary_config` that participate in connection-reuse matching
+/// and that carry non-trivial defaults.
+///
+/// **Defaults enforce TLS verification** (AAP §0.7.3): [`verify_peer`] is `true`
+/// (`CURLOPT_SSL_VERIFYPEER = 1`) and [`verify_host`] is `2`
+/// (`CURLOPT_SSL_VERIFYHOST = 2`), exactly as `Curl_ssl_easy_config_init`
+/// (`lib/vtls/vtls.c`) sets them. The CLI's `--insecure` is the only way to
+/// lower them, and it must warn before proceeding.
+///
+/// [`verify_peer`]: SslConfig::verify_peer
+/// [`verify_host`]: SslConfig::verify_host
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SslConfig {
+    /// `CURLOPT_SSL_VERIFYPEER` — verify the peer certificate chain. Default
+    /// `true` (option value `1`).
+    pub verify_peer: bool,
+    /// `CURLOPT_SSL_VERIFYHOST` — verify the certificate's host name. Default
+    /// `2` (the historical "verify" value; `0` disables). Stored as the option
+    /// integer so the default reads back as `2`.
+    pub verify_host: u8,
+    /// `CURLOPT_SSL_VERIFYSTATUS` — verify the certificate's OCSP status.
+    /// Default `false`.
+    pub verify_status: bool,
+    /// `CURLOPT_SSLVERSION` — minimum/maximum TLS version selector. Default
+    /// [`CURL_SSLVERSION_DEFAULT`] (`0`).
+    pub version: i64,
+    /// `CURLOPT_CAINFO` — path to a CA certificate bundle.
+    pub ca_info: Option<String>,
+    /// `CURLOPT_CAPATH` — path to a directory of CA certificates.
+    pub ca_path: Option<String>,
+    /// `CURLOPT_SSLCERT` — client certificate.
+    pub cert: Option<String>,
+    /// `CURLOPT_SSLKEY` — client private key.
+    pub key: Option<String>,
+    /// `CURLOPT_SSL_CIPHER_LIST` — allowed cipher list.
+    pub ciphers: Option<String>,
+    /// `CURLOPT_PINNEDPUBLICKEY` — pinned public key.
+    pub pinned_key: Option<String>,
+}
+
+impl Default for SslConfig {
+    /// Reproduces `Curl_ssl_easy_config_init` — verification **on** by default.
+    fn default() -> Self {
+        SslConfig {
+            verify_peer: true,
+            verify_host: 2,
+            verify_status: false,
+            version: CURL_SSLVERSION_DEFAULT,
+            ca_info: None,
+            ca_path: None,
+            cert: None,
+            key: None,
+            ciphers: None,
+            pinned_key: None,
+        }
+    }
+}
+
+impl SslConfig {
+    /// Returns `true` if two TLS configurations are equivalent for the purpose
+    /// of connection reuse — curl's `Curl_ssl_conn_config_match`. Every field
+    /// that would change the negotiated security properties must match.
+    #[must_use]
+    pub fn matches(&self, other: &SslConfig) -> bool {
+        self.verify_peer == other.verify_peer
+            && self.verify_host == other.verify_host
+            && self.verify_status == other.verify_status
+            && self.version == other.version
+            && self.ca_info == other.ca_info
+            && self.ca_path == other.ca_path
+            && self.cert == other.cert
+            && self.key == other.key
+            && self.ciphers == other.ciphers
+            && self.pinned_key == other.pinned_key
+    }
+}
+
+/// The easy-handle configuration store — the `set.*` options.
+///
+/// This is a Rust rewrite of curl's `struct UserDefined` (`lib/urldata.h`),
+/// holding the user-tunable options for a transfer. Both the idiomatic builder
+/// in `lib.rs` and the `curl_easy_setopt` FFI shim write into an instance of
+/// this struct, so its field defaults are the single source of truth for a
+/// freshly-opened handle's behavior.
+///
+/// [`UserDefined::default`] reproduces `Curl_init_userdefined` field-for-field;
+/// any drift from curl's defaults is a parity bug. Only the options consulted by
+/// the URL/connection layer (and the ones with non-trivial defaults) are modeled
+/// here — the exhaustive option set is filled in as sibling modules that own
+/// each option are implemented.
+#[derive(Debug, Clone)]
+pub struct UserDefined {
+    // --- transfer sizing ---
+    /// `CURLOPT_INFILESIZE` — known upload size, `-1` if unknown (default).
+    pub filesize: i64,
+    /// `CURLOPT_POSTFIELDSIZE` — POST body size, `-1` if unknown (default).
+    pub postfieldsize: i64,
+    /// `CURLOPT_BUFFERSIZE` — receive buffer size. Default [`READBUFFER_SIZE`].
+    pub buffer_size: usize,
+    /// `CURLOPT_UPLOAD_BUFFERSIZE` — upload buffer size. Default
+    /// [`UPLOADBUFFER_DEFAULT`].
+    pub upload_buffer_size: usize,
+
+    // --- HTTP request / redirect ---
+    /// `CURLOPT_CUSTOMREQUEST`-independent request method. Default
+    /// [`HttpReq::Get`].
+    pub method: HttpReq,
+    /// `CURLOPT_MAXREDIRS` — redirect limit. Default [`DEFAULT_MAXREDIRS`]
+    /// (`30`); `-1` means unlimited.
+    pub maxredirs: i64,
+    /// `CURLOPT_FOLLOWLOCATION` — follow `Location:` redirects. Default `false`.
+    pub follow_location: bool,
+    /// `CURLOPT_FOLLOWLOCATION == CURLFOLLOW_FIRSTONLY` — drop a custom method
+    /// after the first redirect. Default `false`.
+    pub follow_first_only: bool,
+    /// `CURLOPT_POSTREDIR & CURL_REDIR_POST_301` — keep `POST` across a 301.
+    /// Default `false` (so a 301 switches `POST`→`GET`).
+    pub post301: bool,
+    /// `CURLOPT_POSTREDIR & CURL_REDIR_POST_302` — keep `POST` across a 302.
+    pub post302: bool,
+    /// `CURLOPT_POSTREDIR & CURL_REDIR_POST_303` — keep `POST` across a 303.
+    pub post303: bool,
+    /// `CURLOPT_AUTOREFERER` — automatically set the `Referer:` header to the
+    /// previous URL when following a redirect. Default `false`.
+    pub http_auto_referer: bool,
+    /// `CURLOPT_PORT` — an explicit remote-port override that supersedes the
+    /// port embedded in the URL (when [`EasyState::allow_port`] is set). `0`
+    /// means "unset — use the URL's port". Default `0`.
+    pub use_port: u16,
+    /// `CURLOPT_UNRESTRICTED_AUTH` — keep sending credentials across hosts on
+    /// redirect. Default `false` (credentials are stripped cross-origin).
+    pub allow_auth_to_other_hosts: bool,
+    /// `CURLOPT_PATH_AS_IS` — do not squash `..`/`.` in the path. Default
+    /// `false`.
+    pub path_as_is: bool,
+    /// `CURLOPT_HTTP_VERSION`. Default [`CURL_HTTP_VERSION_NONE`].
+    pub httpwant: i64,
+    /// `CURLOPT_HTTP09_ALLOWED`. Default `false`.
+    pub http09_allowed: bool,
+
+    // --- protocol gating ---
+    /// `CURLOPT_PROTOCOLS(_STR)` — permitted protocols. Default
+    /// [`proto::ALL`].
+    pub allowed_protocols: u32,
+    /// `CURLOPT_REDIR_PROTOCOLS(_STR)` — protocols permitted as redirect
+    /// targets. Default [`proto::REDIR`].
+    pub redir_protocols: u32,
+
+    // --- authentication ---
+    /// `CURLOPT_HTTPAUTH` — HTTP auth methods. Default [`authmask::BASIC`].
+    pub httpauth: u64,
+    /// `CURLOPT_PROXYAUTH` — proxy auth methods. Default [`authmask::BASIC`].
+    pub proxyauth: u64,
+    /// `CURLOPT_SOCKS5_AUTH` — SOCKS5 auth methods. Default
+    /// [`authmask::BASIC`]` | `[`authmask::GSSAPI`].
+    pub socks5auth: u64,
+
+    // --- credentials (string options) ---
+    /// `CURLOPT_USERNAME`.
+    pub username: Option<String>,
+    /// `CURLOPT_PASSWORD`.
+    pub password: Option<String>,
+    /// `CURLOPT_OPTIONS` (the login `;options`, e.g. for IMAP/POP3/SMTP).
+    pub login_options: Option<String>,
+
+    // --- .netrc ---
+    /// `CURLOPT_NETRC` — `.netrc` usage level. Default [`NetrcLevel::Ignored`].
+    pub use_netrc: NetrcLevel,
+    /// `CURLOPT_NETRC_FILE` — explicit `.netrc` path, if any.
+    pub netrc_file: Option<PathBuf>,
+
+    // --- addressing ---
+    /// `CURLOPT_IPRESOLVE`. Default [`IpResolve::Whatever`].
+    pub ipver: IpResolve,
+    /// `CURLOPT_LOCALPORT` — bind to a specific local port (`0` = any).
+    pub localport: u16,
+    /// `CURLOPT_LOCALPORTRANGE` — number of local ports to try.
+    pub localportrange: u16,
+    /// `CURLOPT_INTERFACE` — bind to a specific local device/interface.
+    pub localdev: Option<String>,
+
+    // --- proxy ---
+    /// `CURLOPT_PROXY` — proxy URL, if any.
+    pub proxy: Option<String>,
+    /// `CURLOPT_NOPROXY` — comma-separated no-proxy host list.
+    pub no_proxy: Option<String>,
+    /// `CURLOPT_PROXYTYPE`. Default [`ProxyType::Http`].
+    pub proxytype: ProxyType,
+    /// `CURLOPT_PROXYPORT`. Default `0` (use the proxy scheme's default).
+    pub proxyport: u16,
+    /// `CURLOPT_PROXYUSERNAME`.
+    pub proxy_user: Option<String>,
+    /// `CURLOPT_PROXYPASSWORD`.
+    pub proxy_password: Option<String>,
+    /// `socks5_gssapi_nec` — permit unprotected SOCKS5 GSS-API negotiation.
+    /// Default `false`.
+    pub socks5_gssapi_nec: bool,
+
+    // --- TLS ---
+    /// The server TLS configuration (see [`SslConfig`]).
+    pub ssl: SslConfig,
+    /// The proxy TLS configuration (HTTPS proxies).
+    pub proxy_ssl: SslConfig,
+    /// `CURLOPT_SSL_ENABLE_ALPN`. Default `true`.
+    pub ssl_enable_alpn: bool,
+
+    // --- FTP ---
+    /// `CURLOPT_FTP_USE_EPSV`. Default `true`.
+    pub ftp_use_epsv: bool,
+    /// `CURLOPT_FTP_USE_EPRT`. Default `true`.
+    pub ftp_use_eprt: bool,
+    /// `CURLOPT_FTP_USE_PRET`. Default `false`.
+    pub ftp_use_pret: bool,
+    /// `CURLOPT_FTP_SKIP_PASV_IP`. Default `true`.
+    pub ftp_skip_ip: bool,
+    /// `CURLOPT_FTP_FILEMETHOD`. Default [`FtpFileMethod::MultiCwd`].
+    pub ftp_filemethod: FtpFileMethod,
+    /// `CURLOPT_WILDCARDMATCH`. Default `false`.
+    pub wildcard_enabled: bool,
+
+    // --- SSH ---
+    /// `CURLOPT_SSH_AUTH_TYPES`. Default [`CURLSSH_AUTH_ANY`].
+    pub ssh_auth_types: i64,
+    /// `CURLOPT_NEW_DIRECTORY_PERMS`. Default `0o755`.
+    pub new_directory_perms: u32,
+    /// `CURLOPT_NEW_FILE_PERMS`. Default `0o644`.
+    pub new_file_perms: u32,
+
+    // --- TCP / connection tuning ---
+    /// `CURLOPT_TCP_KEEPALIVE`. Default `false`.
+    pub tcp_keepalive: bool,
+    /// `CURLOPT_TCP_KEEPINTVL` (seconds). Default `60`.
+    pub tcp_keepintvl: i64,
+    /// `CURLOPT_TCP_KEEPIDLE` (seconds). Default `60`.
+    pub tcp_keepidle: i64,
+    /// `CURLOPT_TCP_KEEPCNT`. Default `9`.
+    pub tcp_keepcnt: i64,
+    /// `CURLOPT_TCP_FASTOPEN`. Default `false`.
+    pub tcp_fastopen: bool,
+    /// `CURLOPT_TCP_NODELAY`. Default `true`.
+    pub tcp_nodelay: bool,
+    /// `CURLOPT_EXPECT_100_TIMEOUT_MS`. Default `1000`.
+    pub expect_100_timeout: i64,
+    /// Whether header lists are kept separate. Default `true`.
+    pub sep_headers: bool,
+
+    // --- DNS / cache / reuse ---
+    /// `CURLOPT_DNS_CACHE_TIMEOUT` (ms). Default `60000`.
+    pub dns_cache_timeout_ms: i64,
+    /// CA-cache timeout (seconds). Default `86400` (24h).
+    pub ca_cache_timeout: i64,
+    /// `CURLOPT_MAXCONNECTS`. Default [`DEFAULT_CONNCACHE_SIZE`] (`5`).
+    pub maxconnects: usize,
+    /// `CURLOPT_MAXLIFETIME_CONN` — max connection idle time (ms). Default
+    /// `118000` (118s).
+    pub conn_max_idle_ms: i64,
+    /// `CURLOPT_MAXAGE_CONN` — max connection age (ms). Default `86400000`
+    /// (24h).
+    pub conn_max_age_ms: i64,
+    /// `CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS`. Default [`CURL_HET_DEFAULT`] (`200`).
+    pub happy_eyeballs_timeout: u64,
+    /// `CURLOPT_UPKEEP_INTERVAL_MS`. Default [`CURL_UPKEEP_INTERVAL_DEFAULT`]
+    /// (`60000`).
+    pub upkeep_interval_ms: u64,
+
+    // --- DoH ---
+    /// `CURLOPT_DOH_SSL_VERIFYHOST`. Default `true`.
+    pub doh_verifyhost: bool,
+    /// `CURLOPT_DOH_SSL_VERIFYPEER`. Default `true`.
+    pub doh_verifypeer: bool,
+
+    // --- misc ---
+    /// `CURLOPT_QUICK_EXIT`. Default `false`.
+    pub quick_exit: bool,
+    /// WebSocket raw mode (`CURLWS_RAW_MODE`). Default `false`.
+    pub ws_raw_mode: bool,
+    /// WebSocket: suppress automatic `PONG`. Default `false`.
+    pub ws_no_auto_pong: bool,
+    /// `CURLOPT_CONNECT_ONLY`. Default `false`.
+    pub connect_only: bool,
+}
+
+impl Default for UserDefined {
+    /// Reproduces `Curl_init_userdefined` (`lib/url.c`) exactly — every default
+    /// here is a byte-for-byte match with curl 8.x.
+    fn default() -> Self {
+        UserDefined {
+            filesize: -1,
+            postfieldsize: -1,
+            buffer_size: READBUFFER_SIZE,
+            upload_buffer_size: UPLOADBUFFER_DEFAULT,
+
+            method: HttpReq::Get,
+            maxredirs: DEFAULT_MAXREDIRS,
+            follow_location: false,
+            follow_first_only: false,
+            post301: false,
+            post302: false,
+            post303: false,
+            http_auto_referer: false,
+            use_port: 0,
+            allow_auth_to_other_hosts: false,
+            path_as_is: false,
+            httpwant: CURL_HTTP_VERSION_NONE,
+            http09_allowed: false,
+
+            allowed_protocols: proto::ALL,
+            redir_protocols: proto::REDIR,
+
+            httpauth: authmask::BASIC,
+            proxyauth: authmask::BASIC,
+            socks5auth: authmask::BASIC | authmask::GSSAPI,
+
+            username: None,
+            password: None,
+            login_options: None,
+
+            use_netrc: NetrcLevel::Ignored,
+            netrc_file: None,
+
+            ipver: IpResolve::Whatever,
+            localport: 0,
+            localportrange: 0,
+            localdev: None,
+
+            proxy: None,
+            no_proxy: None,
+            proxytype: ProxyType::Http,
+            proxyport: 0,
+            proxy_user: None,
+            proxy_password: None,
+            socks5_gssapi_nec: false,
+
+            ssl: SslConfig::default(),
+            proxy_ssl: SslConfig::default(),
+            ssl_enable_alpn: true,
+
+            ftp_use_epsv: true,
+            ftp_use_eprt: true,
+            ftp_use_pret: false,
+            ftp_skip_ip: true,
+            ftp_filemethod: FtpFileMethod::MultiCwd,
+            wildcard_enabled: false,
+
+            ssh_auth_types: CURLSSH_AUTH_ANY,
+            new_directory_perms: 0o755,
+            new_file_perms: 0o644,
+
+            tcp_keepalive: false,
+            tcp_keepintvl: 60,
+            tcp_keepidle: 60,
+            tcp_keepcnt: 9,
+            tcp_fastopen: false,
+            tcp_nodelay: true,
+            expect_100_timeout: 1000,
+            sep_headers: true,
+
+            dns_cache_timeout_ms: 60000,
+            ca_cache_timeout: 24 * 60 * 60,
+            maxconnects: DEFAULT_CONNCACHE_SIZE,
+            conn_max_idle_ms: 118 * 1000,
+            conn_max_age_ms: 24 * 3600 * 1000,
+            happy_eyeballs_timeout: CURL_HET_DEFAULT,
+            upkeep_interval_ms: CURL_UPKEEP_INTERVAL_DEFAULT,
+
+            doh_verifyhost: true,
+            doh_verifypeer: true,
+
+            quick_exit: false,
+            ws_raw_mode: false,
+            ws_no_auto_pong: false,
+            connect_only: false,
+        }
+    }
+}
+
+impl UserDefined {
+    /// Creates a fully-defaulted option store, curl's `Curl_init_userdefined`.
+    #[must_use]
+    pub fn new() -> Self {
+        UserDefined::default()
+    }
+}
+
+// ===========================================================================
+// The easy handle: operational state (`struct Curl_easy`) plus the info curl
+// exposes about the last/active connection (`struct PureInfo`).
+// ===========================================================================
+
+/// Read-back information about the active/most-recent connection, a subset of
+/// curl's `struct PureInfo` (`lib/urldata.h`) needed by the redirect logic.
+///
+/// These fields are populated once a connection is established and are consulted
+/// by [`Easy::follow`] to decide whether a redirect crosses an origin boundary
+/// (and must therefore strip credentials).
+#[derive(Debug, Clone, Default)]
+pub struct Info {
+    /// The remote port of the current connection (`info.conn_remote_port`).
+    pub conn_remote_port: u16,
+    /// The `CURLPROTO_*` bit of the current connection's protocol
+    /// (`info.conn_protocol`).
+    pub conn_protocol: u32,
+    /// The scheme name of the current connection (`info.conn_scheme`).
+    pub conn_scheme: Option<String>,
+    /// The would-be redirect target recorded when following is disabled or the
+    /// redirect limit is hit (`info.wouldredirect`).
+    pub wouldredirect: Option<String>,
+    /// The HTTP status code of the most recent response (`info.httpcode` /
+    /// `req.httpcode`). Consulted by [`Easy::follow`] to decide `POST`→`GET`
+    /// method switching and whether a redirect is auth-related (`401`/`407`).
+    pub httpcode: i32,
+}
+
+/// The mutable, per-transfer operational state of an easy handle — the parts of
+/// curl's `struct Curl_easy` (its `->state` sub-struct) that the URL/redirect
+/// layer manipulates.
+#[derive(Debug, Default)]
+pub struct EasyState {
+    /// The URL-API handle holding the current (and, during a redirect, the
+    /// base) URL — curl's `state.uh`. Populated by [`Easy::set_url`].
+    pub uh: Option<Url>,
+    /// The number of `Location:` redirects followed so far — curl's
+    /// `state.followlocation`. Compared against [`UserDefined::maxredirs`].
+    pub followlocation: i64,
+    /// The total number of real requests issued (including redirect follows) —
+    /// curl's `state.requests`.
+    pub requests: i64,
+    /// Whether the current URL was reached by following a redirect — curl's
+    /// `state.this_is_a_follow`. Gates `CURLOPT_REDIR_PROTOCOLS`.
+    pub this_is_a_follow: bool,
+    /// Whether a custom port is permitted for the current URL — curl's
+    /// `state.allow_port`. Cleared for absolute redirect targets.
+    pub allow_port: bool,
+    /// Where the currently-effective credentials came from — curl's
+    /// `state.creds_from` — used to arbitrate URL vs option vs `.netrc`.
+    pub creds_from: CredsFrom,
+    /// The resolved user name (curl's `state.aptr.user`).
+    pub aptr_user: Option<String>,
+    /// The resolved password (curl's `state.aptr.passwd`).
+    pub aptr_passwd: Option<String>,
+    /// The auto-referer value for the next request (curl's `state.referer`).
+    pub referer: Option<String>,
+    /// The `.netrc` store, cached across lookups (curl's `state.netrc`).
+    pub netrc: Netrc,
+    /// The HTTP status code of the response that triggered the current redirect
+    /// (curl's `state.httpreq`/`req.httpcode` context); tracked so
+    /// [`Easy::follow`] can decide `POST`→`GET` switching.
+    pub httpreq: HttpReq,
+}
+
+/// A libcurl easy handle — a Rust rewrite of curl's `struct Curl_easy` as it is
+/// created and configured by `lib/url.c`.
+///
+/// An `Easy` bundles the user options ([`set`](Easy::set)), the operational
+/// state ([`state`](Easy::state)), and the connection info
+/// ([`info`](Easy::info)). It is created with [`Easy::open`] (curl's
+/// `Curl_open`) and copied with [`Easy::duphandle`] (curl's
+/// `curl_easy_duphandle`).
+#[derive(Debug, Default)]
+pub struct Easy {
+    /// The user-defined options (`data->set`).
+    pub set: UserDefined,
+    /// The operational state (`data->state`).
+    pub state: EasyState,
+    /// Read-back connection info (`data->info`).
+    pub info: Info,
+}
+
+impl Easy {
+    /// Creates and initializes a fresh easy handle — curl's `Curl_open`.
+    ///
+    /// The options are set to their `Curl_init_userdefined` defaults and all
+    /// operational state starts empty, mirroring `Curl_open` followed by
+    /// `Curl_init_userdefined`.
+    #[must_use]
+    pub fn open() -> Self {
+        Easy::default()
+    }
+
+    /// Duplicates the handle — curl's `curl_easy_duphandle`.
+    ///
+    /// The **options** ([`set`](Easy::set)) are copied verbatim, while the live
+    /// operational state ([`state`](Easy::state)) and connection info
+    /// ([`info`](Easy::info)) are reset to a freshly-opened condition. This
+    /// matches curl, which duplicates the configuration but never the active
+    /// transfer/connection of the source handle.
+    #[must_use]
+    pub fn duphandle(&self) -> Easy {
+        Easy {
+            set: self.set.clone(),
+            state: EasyState::default(),
+            info: Info::default(),
+        }
+    }
+
+    /// Installs the transfer URL, seeding the URL-API handle
+    /// (`state.uh`) used for parsing and later relative redirect resolution —
+    /// the effect of `parseurlandfillconn` setting `data->state.uh`.
+    ///
+    /// The URL is parsed permissively (`GUESS_SCHEME`), matching curl's default
+    /// behavior of accepting a schemeless URL like `example.com`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] derived from the URL-API failure (via
+    /// [`uc_to_curlcode`]) when the URL cannot be parsed.
+    pub fn set_url(&mut self, url: &str) -> Result<()> {
+        let flags = urlapi::GUESS_SCHEME
+            | urlapi::NON_SUPPORT_SCHEME
+            | if self.set.path_as_is {
+                urlapi::PATH_AS_IS
+            } else {
+                0
+            };
+        let parsed = uc(Url::parse(url, flags))?;
+        self.state.uh = Some(parsed);
+        // A freshly-set URL permits its embedded port (curl sets allow_port
+        // TRUE for the initial URL; only absolute redirect targets clear it).
+        self.state.allow_port = true;
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// Connection model (`struct connectdata`) and the connection pool
+// (`struct cpool`/`conncache`).
+//
+// NOTE: the concrete transport, filter chain, and multiplex state of a live
+// connection are owned by the connection subsystem (`crate::conn`). What lives
+// here is the URL layer's own view — the identity a connection is *created*
+// with and matched on for reuse: destination, credentials, TLS parameters and
+// proxy configuration. This is exactly the data curl's `create_conn` fills into
+// a "needle" `connectdata` and that `url_match_conn` compares.
+// ===========================================================================
+
+/// The per-connection boolean flags relevant to reuse matching — a subset of
+/// curl's `struct ConnectBits`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnBits {
+    /// This connection was obtained by reuse (`bits.reuse`).
+    pub reuse: bool,
+    /// This connection must be closed after the current transfer and must not
+    /// be reused (`bits.close`).
+    pub close: bool,
+    /// Reuse of this connection is explicitly forbidden (`bits.no_reuse`).
+    pub no_reuse: bool,
+    /// The handle is in `CURLOPT_CONNECT_ONLY` mode (`connect_only`).
+    pub connect_only: bool,
+    /// An HTTP proxy is in use (`bits.httpproxy`).
+    pub httpproxy: bool,
+    /// A SOCKS proxy is in use (`bits.socksproxy`).
+    pub socksproxy: bool,
+    /// The HTTP proxy is tunneled (`CONNECT`) rather than plain (`bits.tunnel_proxy`).
+    pub tunnel_proxy: bool,
+    /// A `--connect-to` host override is active (`bits.conn_to_host`).
+    pub conn_to_host: bool,
+    /// A `--connect-to` port override is active (`bits.conn_to_port`).
+    pub conn_to_port: bool,
+    /// The Unix-domain socket path is an abstract-namespace socket
+    /// (`bits.abstract_unix_socket`).
+    pub abstract_unix_socket: bool,
+    /// The credentials were obtained from a `.netrc` file (`bits.netrc`), so
+    /// they remain safe to reuse even after following a redirect to a
+    /// different host.
+    pub netrc: bool,
+}
+
+/// A proxy endpoint, mirroring the reuse-relevant fields of curl's
+/// `struct proxy_info`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProxyInfo {
+    /// The proxy type (`proxytype`).
+    pub proxytype: ProxyType,
+    /// The proxy host name (`host.name`).
+    pub host: String,
+    /// The proxy port (`port`).
+    pub port: u16,
+    /// The proxy user name, if any (`user`).
+    pub user: Option<String>,
+    /// The proxy password, if any (`passwd`).
+    pub passwd: Option<String>,
+}
+
+impl ProxyInfo {
+    /// curl's `proxy_info_matches`: same type, port and host (host compared
+    /// case-insensitively, like `curl_strequal`).
+    #[must_use]
+    pub fn matches(&self, other: &ProxyInfo) -> bool {
+        self.proxytype == other.proxytype
+            && self.port == other.port
+            && self.host.eq_ignore_ascii_case(&other.host)
+    }
+
+    /// curl's `socks_proxy_info_matches`: [`ProxyInfo::matches`] **and** an
+    /// exact (case-sensitive, per RFC 3986 §3.2.1) user/password match.
+    #[must_use]
+    pub fn socks_matches(&self, other: &ProxyInfo) -> bool {
+        self.matches(other) && self.user == other.user && self.passwd == other.passwd
+    }
+}
+
+/// The URL layer's view of a connection — a Rust rewrite of the reuse-relevant
+/// portion of curl's `struct connectdata`.
+///
+/// A `Connection` records the identity a connection is created with: its scheme
+/// handler, destination host/port, credentials, TLS parameters and proxy
+/// configuration. [`Connection::can_reuse_for`] implements curl's
+/// `url_match_conn` matching over exactly these fields.
+#[derive(Debug, Clone)]
+pub struct Connection {
+    /// A monotonically-increasing identifier assigned by [`ConnCache`]
+    /// (`conn->connection_id`).
+    pub connection_id: u64,
+    /// The scheme handler this connection speaks (`conn->handler`/`->scheme`).
+    pub handler: SchemeHandler,
+    /// The destination host name (`conn->host.name`). Compared
+    /// case-insensitively.
+    pub host: String,
+    /// The destination port (`conn->remote_port`).
+    pub port: u16,
+    /// The resolved user name (`conn->user`).
+    pub user: Option<String>,
+    /// The resolved password (`conn->passwd`).
+    pub passwd: Option<String>,
+    /// The login `;options` field (`conn->options`).
+    pub options: Option<String>,
+    /// The SASL authorization identity (`conn->sasl_authzid`).
+    pub sasl_authzid: Option<String>,
+    /// The OAuth 2.0 bearer token (`conn->oauth_bearer`).
+    pub oauth_bearer: Option<String>,
+    /// The IP-version family this connection resolved with (`conn->ip_version`).
+    pub ip_version: IpResolve,
+    /// The bound local device/interface, if any (`conn->localdev`).
+    pub localdev: Option<String>,
+    /// The bound local port, if any (`conn->localport`).
+    pub localport: u16,
+    /// The bound local-port range (`conn->localportrange`).
+    pub localportrange: u16,
+    /// The `--connect-to` host override, if active (`conn->conn_to_host.name`).
+    pub conn_to_host: Option<String>,
+    /// The `--connect-to` port override, if active (`conn->conn_to_port`).
+    pub conn_to_port: Option<u16>,
+    /// The Unix-domain socket path, if any (`conn->unix_domain_socket`).
+    pub unix_domain_socket: Option<String>,
+    /// The server TLS configuration this connection negotiated (`conn->ssl_config`).
+    pub ssl: SslConfig,
+    /// The proxy-side TLS configuration for an HTTPS proxy
+    /// (`conn->proxy_ssl_config`).
+    pub proxy_ssl: SslConfig,
+    /// The HTTP proxy endpoint (`conn->http_proxy`).
+    pub http_proxy: ProxyInfo,
+    /// The SOCKS proxy endpoint (`conn->socks_proxy`).
+    pub socks_proxy: ProxyInfo,
+    /// GSS-API credential-delegation policy (`conn->gssapi_delegation`).
+    pub gssapi_delegation: i64,
+    /// The per-connection boolean flags (`conn->bits`).
+    pub bits: ConnBits,
+}
+
+impl Connection {
+    /// Creates a connection prototype ("needle") for `handler` targeting
+    /// `host:port`, with every other field at its neutral default. The connect
+    /// flow fills in credentials, TLS and proxy details before matching.
+    #[must_use]
+    pub fn new(handler: SchemeHandler, host: impl Into<String>, port: u16) -> Self {
+        Connection {
+            connection_id: 0,
+            handler,
+            host: host.into(),
+            port,
+            user: None,
+            passwd: None,
+            options: None,
+            sasl_authzid: None,
+            oauth_bearer: None,
+            ip_version: IpResolve::Whatever,
+            localdev: None,
+            localport: 0,
+            localportrange: 0,
+            conn_to_host: None,
+            conn_to_port: None,
+            unix_domain_socket: None,
+            ssl: SslConfig::default(),
+            proxy_ssl: SslConfig::default(),
+            http_proxy: ProxyInfo::default(),
+            socks_proxy: ProxyInfo::default(),
+            gssapi_delegation: 0,
+            bits: ConnBits::default(),
+        }
+    }
+
+    // --- individual matchers, mirroring the `url_match_*` helpers in url.c ---
+
+    /// curl's `url_match_connect_config`: reject non-reusable connections and
+    /// require matching bind, `--connect-to` and Unix-socket settings.
+    fn match_connect_config(&self, needle: &Connection) -> bool {
+        // connect-only or to-be-closed connections will not be reused.
+        if self.bits.connect_only || self.bits.close || self.bits.no_reuse {
+            return false;
+        }
+
+        // ip_version must match when the needle constrains it.
+        if needle.ip_version != IpResolve::Whatever && needle.ip_version != self.ip_version {
+            return false;
+        }
+
+        // A bound local end (device or port) must match.
+        if needle.localdev.is_some() || needle.localport != 0 {
+            if self.localport != needle.localport || self.localportrange != needle.localportrange {
+                return false;
+            }
+            if needle.localdev.is_some() && self.localdev != needle.localdev {
+                return false;
+            }
+        }
+
+        // Do not mix connections that use "--connect-to host/port" with those
+        // that do not.
+        if needle.bits.conn_to_host != self.bits.conn_to_host {
+            return false;
+        }
+        if needle.bits.conn_to_port != self.bits.conn_to_port {
+            return false;
+        }
+
+        // Unix-domain socket must match exactly (both present & equal, or both
+        // absent).
+        match (&needle.unix_domain_socket, &self.unix_domain_socket) {
+            (Some(n), Some(c)) => {
+                if n != c || needle.bits.abstract_unix_socket != self.bits.abstract_unix_socket {
+                    return false;
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => return false,
+            (None, None) => {}
+        }
+
+        true
+    }
+
+    /// curl's `url_match_destination`: scheme (or SSL-family-compatible scheme),
+    /// `--connect-to` overrides, and — decisively — host name and remote port.
+    fn match_destination(&self, needle: &Connection) -> bool {
+        // These destination checks apply when talking TLS, or not going through
+        // an HTTP proxy, or tunneling through a proxy. For the direct and
+        // tunneled cases (the ones this URL layer models) they always apply.
+        if !needle.handler.name.eq_ignore_ascii_case(self.handler.name) {
+            // Different scheme names: only compatible if the candidate's
+            // protocol family equals the needle's protocol and the candidate is
+            // an SSL connection (the IMAPS-can-serve-IMAP case).
+            if self.handler.protocol_family() != needle.handler.protocol {
+                return false;
+            }
+            if !self.handler.is_ssl() {
+                return false;
+            }
+        }
+
+        // If the needle uses --connect-to, the candidate must match it.
+        if needle.bits.conn_to_host && needle.conn_to_host != self.conn_to_host {
+            return false;
+        }
+        if needle.bits.conn_to_port && needle.conn_to_port != self.conn_to_port {
+            return false;
+        }
+
+        // Host name (case-insensitive) and remote port must match.
+        self.host.eq_ignore_ascii_case(&needle.host) && self.port == needle.port
+    }
+
+    /// curl's `url_match_ssl_use`: an SSL needle requires an SSL candidate.
+    fn match_ssl_use(&self, needle: &Connection) -> bool {
+        if needle.handler.is_ssl() {
+            return self.handler.is_ssl();
+        }
+        // A non-SSL needle over an SSL candidate is only acceptable when the
+        // candidate permits SSL reuse and shares the protocol family; the URL
+        // layer keeps this conservative and treats family+SSL_REUSE as the gate.
+        if self.handler.is_ssl()
+            && (!self.handler.has_flag(protopt::SSL_REUSE)
+                || self.handler.protocol_family() != needle.handler.protocol)
+        {
+            return false;
+        }
+        true
+    }
+
+    /// curl's `url_match_proxy_use`: proxy presence and endpoint identity must
+    /// match; HTTPS proxies additionally require matching proxy TLS config.
+    fn match_proxy_use(&self, needle: &Connection) -> bool {
+        if needle.bits.httpproxy != self.bits.httpproxy
+            || needle.bits.socksproxy != self.bits.socksproxy
+        {
+            return false;
+        }
+
+        if needle.bits.socksproxy && !needle.socks_proxy.socks_matches(&self.socks_proxy) {
+            return false;
+        }
+
+        if needle.bits.httpproxy {
+            if needle.bits.tunnel_proxy != self.bits.tunnel_proxy {
+                return false;
+            }
+            if !needle.http_proxy.matches(&self.http_proxy) {
+                return false;
+            }
+            if needle.http_proxy.proxytype.is_https() {
+                // Match the proxy-side TLS configuration (the proxy type itself
+                // is already compared by `ProxyInfo::matches`).
+                if !needle.proxy_ssl.matches(&self.proxy_ssl) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// curl's `url_match_ssl_config`: an SSL needle requires matching server
+    /// TLS parameters.
+    fn match_ssl_config(&self, needle: &Connection) -> bool {
+        if needle.handler.is_ssl() {
+            return needle.ssl.matches(&self.ssl);
+        }
+        true
+    }
+
+    /// curl's `url_match_auth`: for protocols whose credentials are bound to the
+    /// connection (everything except HTTP's `PROTOPT_CREDSPERREQUEST`), the
+    /// user, password, SASL authzid and bearer token must match; GSS-API
+    /// delegation must always match.
+    fn match_auth(&self, needle: &Connection) -> bool {
+        if !needle.handler.is_creds_per_request()
+            && (self.user != needle.user
+                || self.passwd != needle.passwd
+                || self.sasl_authzid != needle.sasl_authzid
+                || self.oauth_bearer != needle.oauth_bearer)
+        {
+            return false;
+        }
+        self.gssapi_delegation == needle.gssapi_delegation
+    }
+
+    /// Returns `true` if this (existing, pooled) connection can be reused for a
+    /// transfer described by `needle` — curl's `url_match_conn` restricted to
+    /// the deterministic URL-layer criteria: general connect config,
+    /// destination, TLS use, proxy use, TLS parameters and per-connection
+    /// authentication.
+    ///
+    /// Multiplex limits and the NTLM/Negotiate "connection affinity" that curl
+    /// layers on top are decided by the connection/auth subsystems once a
+    /// live connection exists; here we implement the identity-level match the
+    /// URL layer is responsible for, in curl's exact short-circuit order.
+    #[must_use]
+    pub fn can_reuse_for(&self, needle: &Connection) -> bool {
+        self.match_connect_config(needle)
+            && self.match_destination(needle)
+            && self.match_ssl_use(needle)
+            && self.match_proxy_use(needle)
+            && self.match_ssl_config(needle)
+            && self.match_auth(needle)
+    }
+}
+
+/// The outcome of resolving a connection for a transfer — the identity of the
+/// connection to use and whether it was reused from the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectResult {
+    /// The identifier of the connection to use (`conn->connection_id`).
+    pub connection_id: u64,
+    /// `true` if an existing pooled connection was reused (`conn->bits.reuse`).
+    pub reused: bool,
+}
+
+/// The connection pool for an easy handle — a Rust rewrite of curl's connection
+/// cache (`struct cpool`) as consulted by `create_conn`.
+///
+/// Idle, reusable connections live here keyed by identity. [`ConnCache::find_or_create`]
+/// implements the reuse-or-create decision (`url_find_or_create_conn`), and
+/// [`ConnCache::disconnect`] implements the teardown side (`Curl_disconnect`).
+#[derive(Debug, Default)]
+pub struct ConnCache {
+    conns: Vec<Connection>,
+    maxconnects: usize,
+    next_id: u64,
+}
+
+impl ConnCache {
+    /// Creates an empty pool holding at most `maxconnects` idle connections
+    /// (curl's `CURLOPT_MAXCONNECTS`; use [`DEFAULT_CONNCACHE_SIZE`] for the
+    /// easy-handle default).
+    #[must_use]
+    pub fn new(maxconnects: usize) -> Self {
+        ConnCache {
+            conns: Vec::new(),
+            maxconnects,
+            next_id: 1,
+        }
+    }
+
+    /// The number of connections currently held in the pool.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.conns.len()
+    }
+
+    /// Whether the pool is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.conns.is_empty()
+    }
+
+    /// The configured maximum number of pooled connections.
+    #[must_use]
+    pub fn max_connects(&self) -> usize {
+        self.maxconnects
+    }
+
+    /// Borrows a pooled connection by id, if present.
+    #[must_use]
+    pub fn get(&self, connection_id: u64) -> Option<&Connection> {
+        self.conns.iter().find(|c| c.connection_id == connection_id)
+    }
+
+    /// Resolves a connection for `needle` — curl's `url_find_or_create_conn`.
+    ///
+    /// If an existing pooled connection matches ([`Connection::can_reuse_for`]),
+    /// it is marked reused and returned; otherwise `needle` is assigned a fresh
+    /// id, inserted (evicting the oldest closable connection first if the pool
+    /// is at capacity), and returned as a new connection.
+    pub fn find_or_create(&mut self, mut needle: Connection) -> ConnectResult {
+        // Try to reuse an existing connection (ConnectionExists).
+        if let Some(existing) = self.conns.iter_mut().find(|c| c.can_reuse_for(&needle)) {
+            existing.bits.reuse = true;
+            return ConnectResult {
+                connection_id: existing.connection_id,
+                reused: true,
+            };
+        }
+
+        // No match: create a new connection.
+        let id = self.next_id;
+        self.next_id += 1;
+        needle.connection_id = id;
+        needle.bits.reuse = false;
+
+        // Respect the pool capacity, evicting the oldest reusable (not in-use,
+        // not close-marked) connection, matching curl's cache-pruning behavior.
+        if self.maxconnects != 0 && self.conns.len() >= self.maxconnects {
+            if let Some(pos) = self.conns.iter().position(|c| !c.bits.close) {
+                self.conns.remove(pos);
+            } else {
+                self.conns.remove(0);
+            }
+        }
+
+        self.conns.push(needle);
+        ConnectResult {
+            connection_id: id,
+            reused: false,
+        }
+    }
+
+    /// Tears down a connection — curl's `Curl_disconnect`.
+    ///
+    /// The connection identified by `connection_id` is removed from the pool
+    /// (closed). When `dead` is `false` and the connection is reusable (its
+    /// `close`/`no_reuse` bits are clear and the pool is under capacity) it is
+    /// instead retained for future reuse, mirroring curl's decision to return a
+    /// still-good connection to the cache rather than close it.
+    ///
+    /// Returns `true` if the connection was closed (removed), `false` if it was
+    /// retained for reuse.
+    pub fn disconnect(&mut self, connection_id: u64, dead: bool) -> bool {
+        let Some(pos) = self
+            .conns
+            .iter()
+            .position(|c| c.connection_id == connection_id)
+        else {
+            return false;
+        };
+
+        let reusable = {
+            let conn = &self.conns[pos];
+            !dead
+                && !conn.bits.close
+                && !conn.bits.no_reuse
+                && !conn.bits.connect_only
+                && (self.maxconnects == 0 || self.conns.len() <= self.maxconnects)
+        };
+
+        if reusable {
+            // Return to the cache: clear the in-use reuse marker and keep it.
+            self.conns[pos].bits.reuse = false;
+            false
+        } else {
+            self.conns.remove(pos);
+            true
+        }
+    }
+}
+
+// ===========================================================================
+// Credential resolution: URL userinfo, login-string parsing, `.netrc`.
+// ===========================================================================
+
+/// The default user for protocols that require a login but were given none —
+/// curl's `CURL_DEFAULT_USER` (`"anonymous"`, for anonymous FTP).
+pub const CURL_DEFAULT_USER: &str = "anonymous";
+
+/// The default password paired with [`CURL_DEFAULT_USER`] — curl's
+/// `CURL_DEFAULT_PASSWORD` (`"ftp@example.com"`).
+pub const CURL_DEFAULT_PASSWORD: &str = "ftp@example.com";
+
+/// Splits a `user:password;options` login string into its three parts — a
+/// direct rewrite of curl's `Curl_parse_login_details`.
+///
+/// All of the following forms (and their partial variants) are recognized,
+/// with `:` separating the password and `;` separating the options, in either
+/// order:
+///
+/// ```text
+/// user            user:password            user:password;options
+/// user;options    user;options:password    :password
+/// :password;options   ;options             ;options:password
+/// ```
+///
+/// The returned user portion is always present (possibly empty, exactly like
+/// curl's always-allocated `ubuf`). The password is `Some` only when a `:`
+/// separator was present (`pbuf` allocated). The options are `Some` only when a
+/// `;` separator introduced a **non-empty** value (curl leaves `obuf` `NULL`
+/// for a zero-length options field).
+#[must_use]
+pub fn parse_login_details(login: &str) -> (String, Option<String>, Option<String>) {
+    let bytes = login.as_bytes();
+    let len = bytes.len();
+
+    // curl: memchr for ':' (password separator) and ';' (options separator).
+    let psep = bytes.iter().position(|&b| b == b':');
+    let osep = bytes.iter().position(|&b| b == b';');
+
+    // ulen: user runs to whichever separator comes first (or to end).
+    let ulen = match psep {
+        Some(p) => match osep {
+            Some(o) if p > o => o,
+            _ => p,
+        },
+        None => osep.unwrap_or(len),
+    };
+    let user = String::from_utf8_lossy(&bytes[..ulen]).into_owned();
+
+    // Password: only when ':' present; runs from just after ':' to the next
+    // ';' that follows it, else to end.
+    let password = psep.map(|p| {
+        let end = match osep {
+            Some(o) if o > p => o,
+            _ => len,
+        };
+        String::from_utf8_lossy(&bytes[p + 1..end]).into_owned()
+    });
+
+    // Options: only when ';' present *and* the value is non-empty.
+    let options = osep.and_then(|o| {
+        let end = match psep {
+            Some(p) if p > o => p,
+            _ => len,
+        };
+        if end - o - 1 > 0 {
+            Some(String::from_utf8_lossy(&bytes[o + 1..end]).into_owned())
+        } else {
+            None
+        }
+    });
+
+    (user, password, options)
+}
+
+/// Returns `true` if `s` contains any ASCII control character (`< 0x20` or the
+/// DEL `0x7f`) — curl's `str_has_ctrl` / `ISCNTRL` guard, used to reject
+/// control codes in `.netrc` credentials for protocols that forbid them.
+#[must_use]
+fn str_has_ctrl(s: &str) -> bool {
+    s.bytes().any(|b| b < 0x20 || b == 0x7f)
+}
+
+/// Percent-decodes a URL userinfo field (user or password), rejecting control
+/// codes unless the scheme permits them — curl's `Curl_urldecode` call with
+/// `REJECT_CTRL`/`REJECT_ZERO`.
+fn decode_userinfo(encoded: &str, reject_ctrl: bool) -> Result<String> {
+    let decoded = escape::unescape(encoded.as_bytes(), reject_ctrl)?;
+    Ok(String::from_utf8_lossy(&decoded).into_owned())
+}
+
+// --- no-proxy matching (a rewrite of lib/noproxy.c) -----------------------
+
+/// Parses the `/bits` suffix of a CIDR pattern — curl's
+/// `curlx_str_number(&p, &value, 128)` followed by the "no trailing chars"
+/// check. Returns `None` (reject the token) for a missing, non-numeric,
+/// oversized (`> 128`), or trailing-garbage value.
+fn parse_cidr_bits(s: &str) -> Option<u32> {
+    match s.parse::<u32>() {
+        Ok(v) if v <= 128 => Some(v),
+        _ => None,
+    }
+}
+
+/// curl's `Curl_cidr4_match`: is `ipv4` within `network/bits`?
+fn cidr4_match(ipv4: &str, network: &str, bits: u32) -> bool {
+    if bits > 32 {
+        return false;
+    }
+    let (Ok(addr), Ok(net)) = (ipv4.parse::<Ipv4Addr>(), network.parse::<Ipv4Addr>()) else {
+        return false;
+    };
+    let a = u32::from(addr);
+    let c = u32::from(net);
+    if bits != 0 && bits != 32 {
+        // Mask the top `bits` bits (network prefix) and require equality.
+        let mask: u32 = 0xffff_ffffu32 << (32 - bits);
+        (a ^ c) & mask == 0
+    } else {
+        // curl's quirk: /0 and /32 both fall through to an exact match.
+        a == c
+    }
+}
+
+/// curl's `Curl_cidr6_match`: is `ipv6` within `network/bits`?
+fn cidr6_match(ipv6: &str, network: &str, bits: u32) -> bool {
+    let bits = if bits == 0 { 128 } else { bits };
+    let bytes = (bits / 8) as usize;
+    let rest = (bits & 0x07) as usize;
+    if bytes > 16 || (bytes == 16 && rest != 0) {
+        return false;
+    }
+    let (Ok(addr), Ok(net)) = (ipv6.parse::<Ipv6Addr>(), network.parse::<Ipv6Addr>()) else {
+        return false;
+    };
+    let a = addr.octets();
+    let c = net.octets();
+    if bytes > 0 && a[..bytes] != c[..bytes] {
+        return false;
+    }
+    if rest != 0 {
+        let mask = 0xffu8 << (8 - rest);
+        if (a[bytes] ^ c[bytes]) & mask != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// curl's `match_ip`: match `name` (an IP literal) against a `network[/bits]`
+/// token.
+fn match_ip(is_v6: bool, token: &str, name: &str) -> bool {
+    // curl copies the token into a 128-byte buffer; an over-long token cannot
+    // match.
+    if token.len() >= 128 {
+        return false;
+    }
+    let (netstr, bits) = match token.split_once('/') {
+        Some((net, bitstr)) => match parse_cidr_bits(bitstr) {
+            Some(b) => (net, b),
+            None => return false,
+        },
+        None => (token, 0u32),
+    };
+    if is_v6 {
+        cidr6_match(name, netstr, bits)
+    } else {
+        cidr4_match(name, netstr, bits)
+    }
+}
+
+/// curl's `match_host`: match a host `name` against a no-proxy `token`,
+/// honoring leading/trailing-dot trimming and domain tail-matching.
+///
+/// * `A`: `example.com` matches token `example.com` (exact).
+/// * `B`: `www.example.com` matches token `example.com` (domain tail).
+/// * `C`: `nonexample.com` does **not** match token `example.com`.
+fn match_host(token: &str, name: &str) -> bool {
+    let tb = token.as_bytes();
+    let mut tokenlen = tb.len();
+    if tokenlen == 0 {
+        return false;
+    }
+    // Ignore a trailing dot in the token.
+    if tb[tokenlen - 1] == b'.' {
+        tokenlen -= 1;
+    }
+    // Ignore a leading dot in the token as well.
+    let mut start = 0usize;
+    if tokenlen > 0 && tb[start] == b'.' {
+        start += 1;
+        tokenlen -= 1;
+    }
+    let token = &token[start..start + tokenlen];
+
+    let nb = name.as_bytes();
+    let namelen = nb.len();
+    let tlen = token.len();
+    match tlen.cmp(&namelen) {
+        // Case A: exact, case-insensitive match.
+        Ordering::Equal => token.eq_ignore_ascii_case(name),
+        // Case B: tail-match a domain — the boundary char must be a dot.
+        Ordering::Less => {
+            nb[namelen - tlen - 1] == b'.' && name[namelen - tlen..].eq_ignore_ascii_case(token)
+        }
+        // Case C: token longer than name — never a match.
+        Ordering::Greater => false,
+    }
+}
+
+/// Returns `true` if `name` is covered by the comma-separated `no_proxy` list
+/// and the proxy should therefore **not** be used — a rewrite of curl's
+/// `Curl_check_noproxy`.
+///
+/// A lone `"*"` matches everything. Each token is matched either as a host
+/// pattern ([`match_host`]) or, when `name` is an IP literal, as a
+/// `network[/bits]` CIDR range ([`match_ip`]). The idiosyncratic tokenizer —
+/// which stops a token at whitespace or a comma and abandons the scan if a
+/// token is not comma-terminated — is preserved for bug-for-bug parity.
+#[must_use]
+pub fn check_noproxy(name: &str, no_proxy: &str) -> bool {
+    if name.is_empty() || no_proxy.is_empty() {
+        return false;
+    }
+    if no_proxy == "*" {
+        return true;
+    }
+
+    // Classify `name`: IPv4 literal, IPv6 literal, or host name (with a single
+    // trailing dot ignored).
+    let (is_ip, is_v6, name_for_match): (bool, bool, &str) = match name.parse::<IpAddr>() {
+        Ok(IpAddr::V4(_)) => (true, false, name),
+        Ok(IpAddr::V6(_)) => (true, true, name),
+        Err(_) => (false, false, name.strip_suffix('.').unwrap_or(name)),
+    };
+
+    let bytes = no_proxy.as_bytes();
+    let n = bytes.len();
+    let is_blank = |b: u8| b == b' ' || b == b'\t';
+    let mut i = 0usize;
+    while i < n {
+        // Pass leading blanks.
+        while i < n && is_blank(bytes[i]) {
+            i += 1;
+        }
+        // Read the token up to a blank or comma.
+        let start = i;
+        while i < n && !is_blank(bytes[i]) && bytes[i] != b',' {
+            i += 1;
+        }
+        if i > start {
+            let token = &no_proxy[start..i];
+            let matched = if is_ip {
+                match_ip(is_v6, token, name_for_match)
+            } else {
+                match_host(token, name_for_match)
+            };
+            if matched {
+                return true;
+            }
+        }
+        // Pass trailing blanks; the scan ends unless a comma follows.
+        while i < n && is_blank(bytes[i]) {
+            i += 1;
+        }
+        if i >= n || bytes[i] != b',' {
+            break;
+        }
+        while i < n && bytes[i] == b',' {
+            i += 1;
+        }
+    }
+    false
+}
+
+// ===========================================================================
+// Easy-handle credential wiring (`create_conn` login block + `override_login`
+// + `set_login`).
+// ===========================================================================
+
+impl Easy {
+    /// Fetches a URL part from the current handle, mapping the "part not
+    /// present" code (`missing`) to `None` and any other failure to a
+    /// [`CurlCode`] via [`uc_to_curlcode`].
+    fn url_get_part(
+        &self,
+        part: CurlUPart,
+        flags: u32,
+        missing: urlapi::UrlCode,
+    ) -> Result<Option<String>> {
+        match &self.state.uh {
+            Some(uh) => match uh.get(part, flags) {
+                Ok(value) => Ok(Some(value)),
+                Err(code) if code == missing => Ok(None),
+                Err(code) => Err(Error::from(uc_to_curlcode(code))),
+            },
+            None => Ok(None),
+        }
+    }
+
+    /// Extracts user/password/options from the URL userinfo into `conn` — the
+    /// credential block of curl's `create_conn`.
+    ///
+    /// Credentials supplied through their own options (`CURLOPT_USERNAME` /
+    /// `CURLOPT_PASSWORD`) take precedence over URL-embedded ones (the
+    /// `creds_from != CREDS_OPTION` guard); `.netrc` does **not** override the
+    /// URL here (that happens later, in [`Easy::override_login`]). Control
+    /// codes are permitted in the user/password only for schemes carrying
+    /// [`protopt::USERPWDCTRL`].
+    fn extract_url_credentials(&mut self, conn: &mut Connection) -> Result<()> {
+        let reject_ctrl = !conn.handler.allows_userpwd_ctrl();
+
+        // Password (option-guarded).
+        if self.state.aptr_passwd.is_none() || self.state.creds_from != CredsFrom::Option {
+            if let Some(enc) =
+                self.url_get_part(CurlUPart::Password, 0, urlapi::UrlCode::NoPassword)?
+            {
+                let decoded = decode_userinfo(&enc, reject_ctrl)?;
+                conn.passwd = Some(decoded.clone());
+                self.state.aptr_passwd = Some(decoded);
+                self.state.creds_from = CredsFrom::Url;
+            }
+        }
+
+        // User (option-guarded). curl deliberately avoids the URL API decoder
+        // here so control codes can be permitted per-scheme.
+        if self.state.aptr_user.is_none() || self.state.creds_from != CredsFrom::Option {
+            if let Some(enc) = self.url_get_part(CurlUPart::User, 0, urlapi::UrlCode::NoUser)? {
+                let decoded = decode_userinfo(&enc, reject_ctrl)?;
+                conn.user = Some(decoded.clone());
+                self.state.aptr_user = Some(decoded);
+                self.state.creds_from = CredsFrom::Url;
+            }
+        }
+
+        // Options (URL-decoded).
+        if let Some(opts) = self.url_get_part(
+            CurlUPart::Options,
+            urlapi::URLDECODE,
+            urlapi::UrlCode::NoOptions,
+        )? {
+            conn.options = Some(opts);
+        }
+
+        Ok(())
+    }
+
+    /// Applies `.netrc` lookups and propagates the effective credentials into
+    /// the handle and URL — a rewrite of curl's `override_login`.
+    ///
+    /// `CURLOPT_OPTIONS` overrides the URL options unconditionally. When
+    /// `--netrc`/`--netrc-optional` is requested and no `CURLOPT_USERNAME` was
+    /// given, [`crate::netrc`] is consulted for the destination host; a match
+    /// sets [`ConnBits::netrc`] so the credentials survive a later cross-host
+    /// redirect. Finally the effective user/password are mirrored into
+    /// `state.aptr.*` and written back into the URL handle (URL-encoded),
+    /// exactly as curl does before connection matching.
+    fn override_login(&mut self, conn: &mut Connection) -> Result<()> {
+        // CURLOPT_OPTIONS (set.str[STRING_OPTIONS]) overrides URL options.
+        if let Some(opts) = &self.set.login_options {
+            conn.options = Some(opts.clone());
+        }
+
+        // --- .netrc resolution ---
+        if self.set.use_netrc == NetrcLevel::Required {
+            conn.user = None;
+            conn.passwd = None;
+        }
+        conn.bits.netrc = false;
+
+        if self.set.use_netrc != NetrcLevel::Ignored && self.set.username.is_none() {
+            // A URL-supplied username (not itself from a prior netrc pass) is
+            // preferred as the lookup key and preserved over the netrc login.
+            let url_provided =
+                self.state.aptr_user.is_some() && self.state.creds_from != CredsFrom::Netrc;
+            let lookup_user = if url_provided {
+                self.state.aptr_user.clone()
+            } else {
+                conn.user.clone()
+            };
+
+            if conn.passwd.is_none() {
+                let host = conn.host.clone();
+                let netrcfile = self.set.netrc_file.clone();
+                match self
+                    .state
+                    .netrc
+                    .parse(&host, lookup_user.as_deref(), netrcfile.as_deref())
+                {
+                    Ok(creds) => {
+                        let new_user = creds.login.or_else(|| lookup_user.clone());
+                        let new_pass = creds.password;
+                        // Control-code guard for schemes that forbid them.
+                        if !conn.handler.allows_userpwd_ctrl()
+                            && (new_user.as_deref().is_some_and(str_has_ctrl)
+                                || new_pass.as_deref().is_some_and(str_has_ctrl))
+                        {
+                            return Err(Error::with_context(
+                                CurlCode::ReadError,
+                                "control code detected in .netrc credentials",
+                            ));
+                        }
+                        conn.bits.netrc = true;
+                        conn.user = new_user;
+                        conn.passwd = new_pass;
+                    }
+                    // Allocation failure maps straight through.
+                    Err(NetrcCode::OutOfMemory) => {
+                        return Err(Error::from(CurlCode::OutOfMemory));
+                    }
+                    // "No match" (or any failure under --netrc-optional) is
+                    // non-fatal: fall back to the defaults.
+                    Err(NetrcCode::NoMatch) => {}
+                    Err(_) if self.set.use_netrc == NetrcLevel::Optional => {}
+                    // A hard .netrc error under --netrc (required) is fatal.
+                    Err(_) => {
+                        return Err(Error::with_context(CurlCode::ReadError, ".netrc error"));
+                    }
+                }
+            }
+
+            if url_provided {
+                conn.user = lookup_user;
+            }
+            // A password but no user: use a blank user (curl's strdup("")).
+            if conn.user.is_none() && conn.passwd.is_some() {
+                conn.user = Some(String::new());
+            }
+        }
+
+        // --- propagate the effective credentials (tail of override_login) ---
+        if let Some(user) = conn.user.clone() {
+            if self.state.aptr_user.as_deref() != Some(user.as_str()) {
+                self.state.aptr_user = Some(user);
+                self.state.creds_from = CredsFrom::Netrc;
+            }
+        }
+        if let Some(auser) = self.state.aptr_user.clone() {
+            if let Some(uh) = &mut self.state.uh {
+                uc(uh.set(CurlUPart::User, Some(&auser), urlapi::URLENCODE))?;
+            }
+            if conn.user.is_none() {
+                conn.user = Some(auser);
+            }
+        }
+        if let Some(passwd) = conn.passwd.clone() {
+            self.state.aptr_passwd = Some(passwd);
+            self.state.creds_from = CredsFrom::Netrc;
+        }
+        if let Some(apass) = self.state.aptr_passwd.clone() {
+            if let Some(uh) = &mut self.state.uh {
+                uc(uh.set(CurlUPart::Password, Some(&apass), urlapi::URLENCODE))?;
+            }
+            if conn.passwd.is_none() {
+                conn.passwd = Some(apass);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Fills in default credentials for a connection that still has none — a
+    /// rewrite of curl's `set_login`.
+    ///
+    /// A protocol that needs a password ([`protopt::NEEDSPWD`], e.g. FTP) and
+    /// was given no username receives the anonymous defaults
+    /// ([`CURL_DEFAULT_USER`] / [`CURL_DEFAULT_PASSWORD`]); every other case
+    /// gets empty strings.
+    fn apply_default_login(&self, conn: &mut Connection) {
+        let (setuser, setpasswd) =
+            if conn.handler.has_flag(protopt::NEEDSPWD) && self.state.aptr_user.is_none() {
+                (CURL_DEFAULT_USER, CURL_DEFAULT_PASSWORD)
+            } else {
+                ("", "")
+            };
+        if conn.user.is_none() {
+            conn.user = Some(setuser.to_string());
+        }
+        if conn.passwd.is_none() {
+            conn.passwd = Some(setpasswd.to_string());
+        }
+    }
+
+    /// Resolves the credentials for `conn` end-to-end, in curl's order:
+    /// option credentials (highest precedence) → URL userinfo → `.netrc`
+    /// override → protocol defaults. This is the credential spine of
+    /// `create_conn`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates URL-decode failures, malformed URL parts, `.netrc` I/O and
+    /// syntax errors (under `--netrc`), and control codes in `.netrc`
+    /// credentials for schemes that forbid them.
+    pub fn resolve_login(&mut self, conn: &mut Connection) -> Result<()> {
+        // (1) Credentials from CURLOPT_USERNAME / CURLOPT_PASSWORD win over the
+        //     URL (curl seeds these into state.aptr with creds_from = OPTION in
+        //     Curl_pretransfer).
+        if self.set.username.is_some() || self.set.password.is_some() {
+            self.state.creds_from = CredsFrom::Option;
+        }
+        self.state.aptr_user = self.set.username.clone();
+        self.state.aptr_passwd = self.set.password.clone();
+
+        // (2) URL userinfo (option-guarded).
+        self.extract_url_credentials(conn)?;
+
+        // (3) .netrc override + effective-credential propagation.
+        self.override_login(conn)?;
+
+        // (4) Protocol default credentials.
+        self.apply_default_login(conn);
+
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// Host / proxy helpers used by the connect flow.
+// ===========================================================================
+
+/// Converts a host name to its IDNA/Punycode (ACE) form when it is not already
+/// ASCII — curl's `Curl_idnconvert_hostname`. ASCII hosts pass through
+/// unchanged.
+fn idnconvert_host(host: &str) -> Result<String> {
+    if idn::is_ascii_name(host) {
+        Ok(host.to_string())
+    } else {
+        idn::to_ascii(host)
+    }
+}
+
+/// Parses a proxy string (`[scheme://]host[:port]`) into a host and port. The
+/// explicit `CURLOPT_PROXYPORT` wins; otherwise the URL's port is used, falling
+/// back to curl's default proxy port (`1080`).
+fn parse_proxy_endpoint(proxy: &str, proxyport: u16) -> (String, u16) {
+    /// curl's fallback proxy port when none is otherwise specified.
+    const DEFAULT_PROXY_PORT: u16 = 1080;
+    // Parse permissively so a bare "host:port" (no scheme) is also accepted.
+    if let Ok(u) = Url::parse(proxy, urlapi::GUESS_SCHEME | urlapi::NON_SUPPORT_SCHEME) {
+        let host = u.get(CurlUPart::Host, 0).unwrap_or_default();
+        let port = if proxyport != 0 {
+            proxyport
+        } else {
+            u.get(CurlUPart::Port, 0)
+                .ok()
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(DEFAULT_PROXY_PORT)
+        };
+        (host, port)
+    } else {
+        (
+            proxy.to_string(),
+            if proxyport != 0 {
+                proxyport
+            } else {
+                DEFAULT_PROXY_PORT
+            },
+        )
+    }
+}
+
+/// Returns `true` if `url` begins with an explicit scheme (`scheme:/…`) — the
+/// URL-layer form of curl's `Curl_is_absolute_url` with `guess_scheme = false`.
+/// Used to decide whether a redirect target's custom port must be disallowed.
+fn is_absolute_url(url: &str) -> bool {
+    let bytes = url.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    let mut i = 1;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_alphanumeric() || c == b'+' || c == b'-' || c == b'.' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    // curl (guess_scheme = false) requires the scheme to be followed by ":/".
+    bytes.get(i) == Some(&b':') && bytes.get(i + 1) == Some(&b'/')
+}
+
+// ===========================================================================
+// Connect flow (`create_conn` / `Curl_connect`) and redirects
+// (`Curl_http_follow`).
+// ===========================================================================
+
+impl Easy {
+    /// Determines the effective remote port — curl's `parse_remote_port`
+    /// combined with the URL-API default-port lookup.
+    ///
+    /// A non-zero `CURLOPT_PORT` (with [`EasyState::allow_port`] set) overrides
+    /// the URL; otherwise the URL's port is used, defaulting to the scheme's
+    /// well-known port.
+    fn resolve_remote_port(&self, handler: &SchemeHandler) -> Result<u16> {
+        if self.set.use_port != 0 && self.state.allow_port {
+            return Ok(self.set.use_port);
+        }
+        match self.url_get_part(
+            CurlUPart::Port,
+            urlapi::DEFAULT_PORT,
+            urlapi::UrlCode::NoPort,
+        )? {
+            Some(port) => port
+                .parse::<u16>()
+                .map_err(|_| Error::from(CurlCode::UrlMalformat)),
+            None => Ok(handler.default_port),
+        }
+    }
+
+    /// Applies proxy / no-proxy resolution to the connection needle — the proxy
+    /// portion of curl's `create_conn` plus `Curl_check_noproxy`.
+    ///
+    /// A configured `CURLOPT_PROXY` is used unless the destination host matches
+    /// `CURLOPT_NOPROXY`. SOCKS proxy types populate [`Connection::socks_proxy`]
+    /// (and set [`ConnBits::socksproxy`]); HTTP/HTTPS proxy types populate
+    /// [`Connection::http_proxy`] (and set [`ConnBits::httpproxy`], tunneling
+    /// for TLS destinations).
+    fn resolve_proxy(&self, conn: &mut Connection) -> Result<()> {
+        let Some(proxy) = self.set.proxy.as_deref().filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+        if let Some(no_proxy) = self.set.no_proxy.as_deref() {
+            if check_noproxy(&conn.host, no_proxy) {
+                return Ok(());
+            }
+        }
+
+        let (host, port) = parse_proxy_endpoint(proxy, self.set.proxyport);
+        let info = ProxyInfo {
+            proxytype: self.set.proxytype,
+            host,
+            port,
+            user: self.set.proxy_user.clone(),
+            passwd: self.set.proxy_password.clone(),
+        };
+
+        if self.set.proxytype.is_socks() {
+            conn.socks_proxy = info;
+            conn.bits.socksproxy = true;
+        } else {
+            conn.http_proxy = info;
+            conn.bits.httpproxy = true;
+            // A TLS destination must be tunneled (CONNECT) through an HTTP proxy.
+            conn.bits.tunnel_proxy = conn.handler.is_ssl();
+            conn.proxy_ssl = self.set.proxy_ssl.clone();
+        }
+        Ok(())
+    }
+
+    /// Turns the configured handle plus its parsed URL into a ready-to-use
+    /// connection — a rewrite of curl's `create_conn` / `Curl_connect` core.
+    ///
+    /// The scheme selects a protocol [`SchemeHandler`] (rejecting unsupported or
+    /// dropped schemes such as RTMP, and honoring `CURLOPT_PROTOCOLS` /
+    /// `CURLOPT_REDIR_PROTOCOLS`); the host is IDN-converted; the port,
+    /// credentials, TLS config and proxy settings are resolved; and finally a
+    /// matching pooled connection is reused from `cache` or a new one is
+    /// created ([`ConnCache::find_or_create`], curl's `ConnectionExists`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CurlCode::UnsupportedProtocol`] for a missing/unknown/dropped
+    /// scheme, [`CurlCode::UrlMalformat`] for a malformed port, and any error
+    /// surfaced by credential resolution.
+    pub fn create_conn(&mut self, cache: &mut ConnCache) -> Result<ConnectResult> {
+        // Scheme → handler.
+        let scheme = self
+            .url_get_part(CurlUPart::Scheme, 0, urlapi::UrlCode::NoScheme)?
+            .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
+        let handler = findprotocol(
+            &scheme,
+            self.set.allowed_protocols,
+            self.set.redir_protocols,
+            self.state.this_is_a_follow,
+        )?;
+
+        // Assemble the connection needle from the handle configuration.
+        let mut conn = Connection::new(handler, String::new(), 0);
+        conn.bits.connect_only = self.set.connect_only;
+        conn.ip_version = self.set.ipver;
+        conn.localdev = self.set.localdev.clone();
+        conn.localport = self.set.localport;
+        conn.localportrange = self.set.localportrange;
+        conn.ssl = self.set.ssl.clone();
+
+        // Host + port (skipped for non-network schemes such as `file://`).
+        if !handler.is_nonetwork() {
+            if let Some(host) = self.url_get_part(CurlUPart::Host, 0, urlapi::UrlCode::NoHost)? {
+                conn.host = idnconvert_host(&host)?;
+            }
+            conn.port = self.resolve_remote_port(&handler)?;
+        }
+
+        // Credentials (option → URL → netrc → defaults).
+        self.resolve_login(&mut conn)?;
+
+        // Proxy / no-proxy.
+        self.resolve_proxy(&mut conn)?;
+
+        // Record the connection identity for later redirect decisions.
+        self.info.conn_remote_port = conn.port;
+        self.info.conn_protocol = handler.protocol;
+        self.info.conn_scheme = Some(handler.name.to_string());
+
+        // Reuse an existing pooled connection or create a fresh one.
+        Ok(cache.find_or_create(conn))
+    }
+
+    /// Sets the auto-referer for the next request from the current URL, stripping
+    /// credentials and the fragment — the `CURLOPT_AUTOREFERER` branch of
+    /// `Curl_http_follow`.
+    fn set_auto_referer(&mut self) {
+        if let Some(uh) = &self.state.uh {
+            let mut u = uh.dup();
+            // Best-effort: a failure to strip a part simply leaves it in place.
+            let _ = u.set(CurlUPart::Fragment, None, 0);
+            let _ = u.set(CurlUPart::User, None, 0);
+            let _ = u.set(CurlUPart::Password, None, 0);
+            if let Ok(referer) = u.get(CurlUPart::Url, 0) {
+                self.state.referer = Some(referer);
+            }
+        }
+    }
+
+    /// Clears the resolved credentials if a redirect crosses to a different port
+    /// or protocol — the cross-origin auth-stripping branch of
+    /// `Curl_http_follow` (gated by `CURLOPT_UNRESTRICTED_AUTH`).
+    fn maybe_clear_auth_on_redirect(&mut self) -> Result<()> {
+        // Determine the redirect target's port.
+        let new_port: i32 = if self.set.use_port != 0 && self.state.allow_port {
+            i32::from(self.set.use_port)
+        } else {
+            match self.url_get_part(
+                CurlUPart::Port,
+                urlapi::DEFAULT_PORT,
+                urlapi::UrlCode::NoPort,
+            )? {
+                Some(p) => p.parse::<i32>().unwrap_or(0),
+                None => 0,
+            }
+        };
+
+        let mut clear = new_port != i32::from(self.info.conn_remote_port);
+        if !clear {
+            // Same port: compare the scheme's protocol against the connection's.
+            if let Some(scheme) =
+                self.url_get_part(CurlUPart::Scheme, 0, urlapi::UrlCode::NoScheme)?
+            {
+                if let Some(h) = get_scheme_handler(&scheme) {
+                    if h.protocol != self.info.conn_protocol {
+                        clear = true;
+                    }
+                }
+            }
+        }
+
+        if clear {
+            self.state.aptr_user = None;
+            self.state.aptr_passwd = None;
+        }
+        Ok(())
+    }
+
+    /// Applies the RFC 7231 method switch after a redirect — the `switch`
+    /// statement of `Curl_http_follow`.
+    ///
+    /// A `POST` becomes a `GET` after a 301/302 (unless `CURLOPT_POSTREDIR`
+    /// preserves it); a 303 switches any non-`GET` method to `GET` (unless it is
+    /// a `POST` that `CURLOPT_POSTREDIR` preserves). All other codes leave the
+    /// method unchanged.
+    fn apply_redirect_method_switch(&mut self) {
+        let is_post = self.state.httpreq.is_post_family();
+        match self.info.httpcode {
+            301 => {
+                if is_post && !self.set.post301 {
+                    self.state.httpreq = HttpReq::Get;
+                }
+            }
+            302 => {
+                if is_post && !self.set.post302 {
+                    self.state.httpreq = HttpReq::Get;
+                }
+            }
+            303 => {
+                if self.state.httpreq != HttpReq::Get && (!is_post || !self.set.post303) {
+                    self.state.httpreq = HttpReq::Get;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Constructs the next URL from a `Location:` target and updates handle
+    /// state accordingly — a rewrite of curl's `Curl_http_follow`.
+    ///
+    /// `newurl` may be relative; it is resolved against the current URL through
+    /// the URL API (with `CURLU_URLENCODE` / `CURLU_ALLOW_SPACE` /
+    /// `CURLU_PATH_AS_IS` exactly as curl selects them). The redirect limit
+    /// ([`UserDefined::maxredirs`]) is enforced, credentials are stripped on a
+    /// cross-origin redirect, and the request method is switched per the HTTP
+    /// status code. In [`FollowType::Fake`] mode the resolved target is recorded
+    /// in [`Info::wouldredirect`] without issuing a request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CurlCode::TooManyRedirects`] when the redirect limit is hit,
+    /// or a URL-parse error code when a non-fake target cannot be parsed.
+    pub fn follow(&mut self, newurl: &str, follow_type: FollowType) -> Result<()> {
+        let mut ftype = follow_type;
+        let mut reached_max = false;
+
+        // Count real follows.
+        if ftype != FollowType::Fake {
+            self.state.requests += 1;
+        }
+
+        if ftype == FollowType::Redir {
+            if self.set.maxredirs != -1 && self.state.followlocation >= self.set.maxredirs {
+                // Hit the limit: switch to FAKE to still compute the target,
+                // then fail below.
+                reached_max = true;
+                ftype = FollowType::Fake;
+            } else {
+                self.state.followlocation += 1;
+                if self.set.http_auto_referer {
+                    self.set_auto_referer();
+                }
+            }
+        }
+
+        // An absolute redirect target (not from a 401/407) must not carry a
+        // custom port over to the new request.
+        let httpcode = self.info.httpcode;
+        let disallowport = ftype != FollowType::Retry
+            && httpcode != 401
+            && httpcode != 407
+            && is_absolute_url(newurl);
+
+        // Resolve the (possibly relative) target against the base URL.
+        let set_flags = if ftype == FollowType::Fake {
+            urlapi::NON_SUPPORT_SCHEME
+        } else {
+            (if ftype == FollowType::Redir {
+                urlapi::URLENCODE
+            } else {
+                0
+            }) | urlapi::ALLOW_SPACE
+                | if self.set.path_as_is {
+                    urlapi::PATH_AS_IS
+                } else {
+                    0
+                }
+        };
+
+        // A base URL handle must exist for relative resolution; create one so a
+        // fully-absolute target still resolves.
+        if self.state.uh.is_none() {
+            self.state.uh = Some(Url::new());
+        }
+
+        let follow_url = {
+            let uh = self.state.uh.as_mut().expect("URL handle just ensured");
+            match uh.set(CurlUPart::Url, Some(newurl), set_flags) {
+                Ok(()) => uc(uh.get(CurlUPart::Url, 0))?,
+                Err(code) => {
+                    if code == urlapi::UrlCode::OutOfMemory || ftype != FollowType::Fake {
+                        return Err(Error::from(uc_to_curlcode(code)));
+                    }
+                    // FAKE mode tolerates an unparsable target: keep it verbatim.
+                    newurl.to_string()
+                }
+            }
+        };
+
+        // Strip credentials on a cross-origin redirect (never in FAKE mode).
+        if ftype != FollowType::Fake && !self.set.allow_auth_to_other_hosts {
+            self.maybe_clear_auth_on_redirect()?;
+        }
+
+        if ftype == FollowType::Fake {
+            self.info.wouldredirect = Some(follow_url);
+            if reached_max {
+                return Err(Error::from(CurlCode::TooManyRedirects));
+            }
+            return Ok(());
+        }
+
+        if disallowport {
+            self.state.allow_port = false;
+        }
+
+        // The next request is a follow (gates CURLOPT_REDIR_PROTOCOLS), and the
+        // method may switch per the HTTP status code.
+        self.state.this_is_a_follow = true;
+        self.apply_redirect_method_switch();
+
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a bare connection needle for a known scheme.
+    fn mk_conn(scheme: &str, host: &str, port: u16) -> Connection {
+        let handler = get_scheme_handler(scheme).expect("known scheme");
+        Connection::new(handler, host, port)
+    }
+
+    // --- scheme → handler selection -----------------------------------------
+
+    #[test]
+    fn scheme_handler_core_schemes() {
+        let http = get_scheme_handler("http").expect("http");
+        assert_eq!(http.name, "http");
+        assert_eq!(http.protocol, proto::HTTP);
+        assert_eq!(http.default_port, 80);
+        assert!(!http.is_ssl());
+        assert!(http.is_creds_per_request());
+
+        let https = get_scheme_handler("https").expect("https");
+        assert_eq!(https.default_port, 443);
+        assert!(https.is_ssl());
+        assert!(https.has_flag(protopt::ALPN));
+
+        let ftp = get_scheme_handler("ftp").expect("ftp");
+        assert_eq!(ftp.default_port, 21);
+        assert!(ftp.has_flag(protopt::NEEDSPWD));
+        assert!(!ftp.is_creds_per_request());
+
+        let file = get_scheme_handler("file").expect("file");
+        assert!(file.is_nonetwork());
+    }
+
+    #[test]
+    fn scheme_handler_is_case_insensitive() {
+        // curl's Curl_get_scheme lowercases before matching.
+        assert_eq!(get_scheme_handler("HTTP").expect("HTTP").name, "http");
+        assert_eq!(get_scheme_handler("Https").expect("Https").name, "https");
+    }
+
+    #[test]
+    fn rtmp_family_is_not_registered() {
+        // RTMP/RTMPS are dropped (AAP §0.2.2): no handler, and findprotocol
+        // rejects them as unsupported.
+        for s in ["rtmp", "rtmps", "rtmpt", "rtmpe", "rtmpte", "rtmpts"] {
+            assert!(
+                get_scheme_handler(s).is_none(),
+                "{s} must not be registered"
+            );
+            let err = findprotocol(s, proto::ALL, proto::REDIR, false).unwrap_err();
+            assert_eq!(err.code(), CurlCode::UnsupportedProtocol);
+        }
+    }
+
+    #[test]
+    fn findprotocol_honors_allowed_and_redir_protocols() {
+        // Allowed on a normal request.
+        assert!(findprotocol("http", proto::ALL, proto::REDIR, false).is_ok());
+
+        // Disallowed when not in the allowed set.
+        let err = findprotocol("http", proto::FTP, proto::REDIR, false).unwrap_err();
+        assert_eq!(err.code(), CurlCode::UnsupportedProtocol);
+
+        // Allowed as a normal request but forbidden as a redirect target.
+        assert!(findprotocol("http", proto::ALL, proto::FTP, true).is_err());
+        // Permitted as a redirect target when REDIR includes it.
+        assert!(findprotocol("http", proto::ALL, proto::HTTP, true).is_ok());
+    }
+
+    #[test]
+    fn uc_to_curlcode_mapping_is_exact() {
+        assert_eq!(
+            uc_to_curlcode(urlapi::UrlCode::UnsupportedScheme),
+            CurlCode::UnsupportedProtocol
+        );
+        assert_eq!(
+            uc_to_curlcode(urlapi::UrlCode::OutOfMemory),
+            CurlCode::OutOfMemory
+        );
+        assert_eq!(
+            uc_to_curlcode(urlapi::UrlCode::UserNotAllowed),
+            CurlCode::LoginDenied
+        );
+        assert_eq!(
+            uc_to_curlcode(urlapi::UrlCode::MalformedInput),
+            CurlCode::UrlMalformat
+        );
+    }
+
+    // --- default option values ----------------------------------------------
+
+    #[test]
+    fn userdefined_defaults_match_curl() {
+        let s = UserDefined::default();
+        assert_eq!(s.maxredirs, DEFAULT_MAXREDIRS);
+        assert_eq!(s.maxredirs, 30);
+        assert_eq!(s.buffer_size, 16384);
+        assert_eq!(s.upload_buffer_size, 65536);
+        assert_eq!(s.method, HttpReq::Get);
+        assert_eq!(s.use_netrc, NetrcLevel::Ignored);
+        assert_eq!(s.allowed_protocols, proto::ALL);
+        assert_eq!(s.redir_protocols, proto::REDIR);
+        assert!(s.ftp_use_epsv);
+        assert!(s.ftp_use_eprt);
+        assert!(!s.ftp_use_pret);
+        assert_eq!(s.ftp_filemethod, FtpFileMethod::MultiCwd);
+        assert!(s.tcp_nodelay);
+        assert!(!s.tcp_keepalive);
+        assert!(s.ssl_enable_alpn);
+        assert_eq!(s.maxconnects, DEFAULT_CONNCACHE_SIZE);
+    }
+
+    #[test]
+    fn tls_verification_is_on_by_default() {
+        // The core safety default (AAP §0.7.3): verifypeer = 1, verifyhost = 2.
+        let s = UserDefined::default();
+        assert!(s.ssl.verify_peer);
+        assert_eq!(s.ssl.verify_host, 2);
+        assert!(!s.ssl.verify_status);
+        // The DoH verification defaults mirror the primary transfer.
+        assert!(s.doh_verifypeer);
+        assert!(s.doh_verifyhost);
+    }
+
+    #[test]
+    fn easy_open_has_curl_defaults() {
+        let e = Easy::open();
+        assert_eq!(e.set.maxredirs, 30);
+        assert!(e.set.ssl.verify_peer);
+        assert_eq!(e.set.ssl.verify_host, 2);
+        assert_eq!(e.state.followlocation, 0);
+        assert!(!e.state.this_is_a_follow);
+        assert_eq!(e.state.creds_from, CredsFrom::None);
+    }
+
+    #[test]
+    fn duphandle_copies_options_and_resets_state() {
+        let mut e = Easy::open();
+        e.set.maxredirs = 7;
+        e.set.username = Some("bob".to_string());
+        e.state.followlocation = 3;
+        e.set_url("http://example.com/").expect("set url");
+
+        let dup = e.duphandle();
+        // Options copied verbatim.
+        assert_eq!(dup.set.maxredirs, 7);
+        assert_eq!(dup.set.username.as_deref(), Some("bob"));
+        // Live state reset.
+        assert_eq!(dup.state.followlocation, 0);
+        assert!(dup.state.uh.is_none());
+    }
+
+    // --- login-string parsing (Curl_parse_login_details) --------------------
+
+    #[test]
+    fn parse_login_details_all_forms() {
+        assert_eq!(
+            parse_login_details("user"),
+            ("user".to_string(), None, None)
+        );
+        assert_eq!(
+            parse_login_details("user:pass"),
+            ("user".to_string(), Some("pass".to_string()), None)
+        );
+        assert_eq!(
+            parse_login_details("user:pass;opt"),
+            (
+                "user".to_string(),
+                Some("pass".to_string()),
+                Some("opt".to_string())
+            )
+        );
+        assert_eq!(
+            parse_login_details("user;opt"),
+            ("user".to_string(), None, Some("opt".to_string()))
+        );
+        assert_eq!(
+            parse_login_details("user;opt:pass"),
+            (
+                "user".to_string(),
+                Some("pass".to_string()),
+                Some("opt".to_string())
+            )
+        );
+        assert_eq!(
+            parse_login_details(":pass"),
+            (String::new(), Some("pass".to_string()), None)
+        );
+        assert_eq!(
+            parse_login_details(";opt"),
+            (String::new(), None, Some("opt".to_string()))
+        );
+        // Empty password after ':' is a deliberate (Some) empty string; empty
+        // options after ';' collapse to None (curl leaves obuf NULL).
+        assert_eq!(
+            parse_login_details("user:"),
+            ("user".to_string(), Some(String::new()), None)
+        );
+        assert_eq!(
+            parse_login_details("user;"),
+            ("user".to_string(), None, None)
+        );
+        assert_eq!(parse_login_details(""), (String::new(), None, None));
+    }
+
+    // --- no-proxy matching (Curl_check_noproxy) -----------------------------
+
+    #[test]
+    fn check_noproxy_host_patterns() {
+        assert!(check_noproxy("example.com", "*"));
+        assert!(check_noproxy("example.com", "example.com"));
+        // Domain tail match.
+        assert!(check_noproxy("www.example.com", "example.com"));
+        // Not a tail match — "nonexample.com" must not match "example.com".
+        assert!(!check_noproxy("nonexample.com", "example.com"));
+        // Comma/space separated list.
+        assert!(check_noproxy("example.com", "example.org, example.com"));
+        assert!(!check_noproxy("example.com", "example.org,example.net"));
+        // Leading dot in the token is ignored.
+        assert!(check_noproxy("host.example.com", ".example.com"));
+        // Trailing dots (in name and in token) are ignored.
+        assert!(check_noproxy("example.com.", "example.com"));
+        assert!(check_noproxy("example.com", "example.com."));
+    }
+
+    #[test]
+    fn check_noproxy_empty_inputs() {
+        assert!(!check_noproxy("", "*"));
+        assert!(!check_noproxy("example.com", ""));
+    }
+
+    #[test]
+    fn check_noproxy_ipv4_cidr() {
+        assert!(check_noproxy("192.168.1.5", "192.168.1.0/24"));
+        assert!(!check_noproxy("192.168.2.5", "192.168.1.0/24"));
+        assert!(check_noproxy("10.0.0.1", "10.0.0.1"));
+        assert!(check_noproxy("127.0.0.1", "127.0.0.0/8"));
+        assert!(!check_noproxy("10.0.0.1", "192.168.0.0/16"));
+    }
+
+    #[test]
+    fn check_noproxy_ipv6_cidr() {
+        assert!(check_noproxy("::1", "::1/128"));
+        assert!(check_noproxy("2001:db8::1", "2001:db8::/32"));
+        assert!(!check_noproxy("2001:dead::1", "2001:db8::/32"));
+    }
+
+    // --- connection reuse matching (url_match_conn) -------------------------
+
+    #[test]
+    fn reuse_exact_match() {
+        let a = mk_conn("http", "example.com", 80);
+        let b = mk_conn("http", "example.com", 80);
+        assert!(a.can_reuse_for(&b));
+        // Host comparison is case-insensitive.
+        let c = mk_conn("http", "EXAMPLE.COM", 80);
+        assert!(a.can_reuse_for(&c));
+    }
+
+    #[test]
+    fn reuse_rejects_host_or_port_mismatch() {
+        let a = mk_conn("http", "example.com", 80);
+        assert!(!a.can_reuse_for(&mk_conn("http", "other.com", 80)));
+        assert!(!a.can_reuse_for(&mk_conn("http", "example.com", 8080)));
+    }
+
+    #[test]
+    fn reuse_rejects_scheme_mismatch() {
+        // An http candidate cannot serve an https needle (needs TLS)...
+        let http = mk_conn("http", "example.com", 443);
+        assert!(!http.can_reuse_for(&mk_conn("https", "example.com", 443)));
+        // ...and an https candidate cannot serve a plain-http needle.
+        let https = mk_conn("https", "example.com", 80);
+        assert!(!https.can_reuse_for(&mk_conn("http", "example.com", 80)));
+    }
+
+    #[test]
+    fn reuse_credentials_matter_only_when_not_creds_per_request() {
+        // HTTP carries credentials per request: differing creds still match.
+        let mut a = mk_conn("http", "example.com", 80);
+        let mut b = mk_conn("http", "example.com", 80);
+        a.user = Some("alice".to_string());
+        b.user = Some("bob".to_string());
+        assert!(a.can_reuse_for(&b));
+
+        // FTP binds credentials to the connection: differing users do NOT match.
+        let mut fa = mk_conn("ftp", "ftp.example.com", 21);
+        let mut fb = mk_conn("ftp", "ftp.example.com", 21);
+        fa.user = Some("alice".to_string());
+        fa.passwd = Some("secret".to_string());
+        fb.user = Some("bob".to_string());
+        fb.passwd = Some("secret".to_string());
+        assert!(!fa.can_reuse_for(&fb));
+    }
+
+    #[test]
+    fn reuse_rejects_tls_config_mismatch() {
+        let a = mk_conn("https", "example.com", 443);
+        let mut b = mk_conn("https", "example.com", 443);
+        // A needle that disables peer verification must not reuse a verifying
+        // connection.
+        b.ssl.verify_peer = false;
+        assert!(!a.can_reuse_for(&b));
+    }
+
+    #[test]
+    fn reuse_rejects_proxy_mismatch_and_unusable_conn() {
+        let a = mk_conn("http", "example.com", 80);
+        let mut proxied = mk_conn("http", "example.com", 80);
+        proxied.bits.httpproxy = true;
+        proxied.http_proxy = ProxyInfo {
+            proxytype: ProxyType::Http,
+            host: "proxy.local".to_string(),
+            port: 3128,
+            user: None,
+            passwd: None,
+        };
+        // One goes through a proxy, the other does not.
+        assert!(!a.can_reuse_for(&proxied));
+
+        // A connect-only / to-be-closed candidate is never reusable.
+        let mut connect_only = mk_conn("http", "example.com", 80);
+        connect_only.bits.connect_only = true;
+        assert!(!connect_only.can_reuse_for(&mk_conn("http", "example.com", 80)));
+        let mut closing = mk_conn("http", "example.com", 80);
+        closing.bits.close = true;
+        assert!(!closing.can_reuse_for(&mk_conn("http", "example.com", 80)));
+    }
+
+    // --- connection cache (find_or_create / disconnect) ---------------------
+
+    #[test]
+    fn conn_cache_reuses_and_creates() {
+        let mut cache = ConnCache::new(DEFAULT_CONNCACHE_SIZE);
+        assert!(cache.is_empty());
+
+        let r1 = cache.find_or_create(mk_conn("http", "example.com", 80));
+        assert!(!r1.reused);
+        assert_eq!(cache.len(), 1);
+
+        // Identical needle → reuse the same connection.
+        let r2 = cache.find_or_create(mk_conn("http", "example.com", 80));
+        assert!(r2.reused);
+        assert_eq!(r2.connection_id, r1.connection_id);
+        assert_eq!(cache.len(), 1);
+
+        // Different destination → a brand new connection.
+        let r3 = cache.find_or_create(mk_conn("http", "other.com", 80));
+        assert!(!r3.reused);
+        assert_eq!(cache.len(), 2);
+        assert_ne!(r3.connection_id, r1.connection_id);
+    }
+
+    #[test]
+    fn conn_cache_disconnect_closes_or_retains() {
+        let mut cache = ConnCache::new(DEFAULT_CONNCACHE_SIZE);
+        let r = cache.find_or_create(mk_conn("http", "example.com", 80));
+
+        // A dead connection is closed (removed).
+        assert!(cache.disconnect(r.connection_id, true));
+        assert!(cache.is_empty());
+
+        // A healthy, reusable connection is retained for future reuse.
+        let r2 = cache.find_or_create(mk_conn("http", "example.com", 80));
+        assert!(!cache.disconnect(r2.connection_id, false));
+        assert!(cache.get(r2.connection_id).is_some());
+
+        // Disconnecting an unknown id is a no-op.
+        assert!(!cache.disconnect(9999, true));
+    }
+
+    // --- create_conn (connect flow) -----------------------------------------
+
+    #[test]
+    fn create_conn_selects_handler_and_resolves_endpoint() {
+        let mut e = Easy::open();
+        e.set_url("http://user:pass@example.com:8080/path")
+            .expect("set url");
+        let mut cache = ConnCache::new(DEFAULT_CONNCACHE_SIZE);
+
+        let r = e.create_conn(&mut cache).expect("create_conn");
+        assert!(!r.reused);
+        let c = cache.get(r.connection_id).expect("pooled conn");
+        assert_eq!(c.handler.name, "http");
+        assert_eq!(c.host, "example.com");
+        assert_eq!(c.port, 8080);
+        assert_eq!(c.user.as_deref(), Some("user"));
+        assert_eq!(c.passwd.as_deref(), Some("pass"));
+    }
+
+    #[test]
+    fn create_conn_reuses_second_time() {
+        let mut e = Easy::open();
+        e.set_url("http://example.com/").expect("set url");
+        let mut cache = ConnCache::new(DEFAULT_CONNCACHE_SIZE);
+
+        let r1 = e.create_conn(&mut cache).expect("first");
+        assert!(!r1.reused);
+        let r2 = e.create_conn(&mut cache).expect("second");
+        assert!(r2.reused);
+        assert_eq!(r1.connection_id, r2.connection_id);
+    }
+
+    #[test]
+    fn create_conn_rejects_rtmp_scheme() {
+        let mut e = Easy::open();
+        // set_url tolerates the unknown scheme (NON_SUPPORT_SCHEME); create_conn
+        // is where the dropped protocol is rejected.
+        if e.set_url("rtmp://media.example.com/live").is_ok() {
+            let mut cache = ConnCache::new(DEFAULT_CONNCACHE_SIZE);
+            let err = e.create_conn(&mut cache).unwrap_err();
+            assert_eq!(err.code(), CurlCode::UnsupportedProtocol);
+        }
+    }
+
+    #[test]
+    fn create_conn_applies_default_credentials() {
+        // FTP (needs a password) with no credentials → anonymous defaults.
+        let mut ftp = Easy::open();
+        ftp.set_url("ftp://ftp.example.com/file").expect("set url");
+        let mut cache = ConnCache::new(DEFAULT_CONNCACHE_SIZE);
+        let r = ftp.create_conn(&mut cache).expect("create_conn");
+        let c = cache.get(r.connection_id).expect("pooled");
+        assert_eq!(c.user.as_deref(), Some(CURL_DEFAULT_USER));
+        assert_eq!(c.passwd.as_deref(), Some(CURL_DEFAULT_PASSWORD));
+
+        // HTTP (no password required) with no credentials → empty strings.
+        let mut http = Easy::open();
+        http.set_url("http://example.com/").expect("set url");
+        let mut cache2 = ConnCache::new(DEFAULT_CONNCACHE_SIZE);
+        let r2 = http.create_conn(&mut cache2).expect("create_conn");
+        let c2 = cache2.get(r2.connection_id).expect("pooled");
+        assert_eq!(c2.user.as_deref(), Some(""));
+        assert_eq!(c2.passwd.as_deref(), Some(""));
+    }
+
+    // --- redirect handling (Curl_http_follow) -------------------------------
+
+    #[test]
+    fn follow_resolves_relative_target() {
+        let mut e = Easy::open();
+        e.set_url("http://example.com/a/b").expect("set url");
+        e.info.conn_remote_port = 80;
+        e.info.conn_protocol = proto::HTTP;
+        e.info.httpcode = 302;
+        e.state.httpreq = HttpReq::Get;
+
+        e.follow("/c/d", FollowType::Redir).expect("follow");
+        let resolved = e.state.uh.as_ref().unwrap().get(CurlUPart::Url, 0).unwrap();
+        assert_eq!(resolved, "http://example.com/c/d");
+        assert_eq!(e.state.followlocation, 1);
+    }
+
+    #[test]
+    fn follow_enforces_maxredirs() {
+        let mut e = Easy::open();
+        e.set.maxredirs = 0; // no redirects permitted
+        e.set_url("http://example.com/").expect("set url");
+        e.info.httpcode = 302;
+
+        let err = e
+            .follow("http://example.com/next", FollowType::Redir)
+            .unwrap_err();
+        assert_eq!(err.code(), CurlCode::TooManyRedirects);
+        // The would-be target is still recorded.
+        assert!(e.info.wouldredirect.is_some());
+    }
+
+    #[test]
+    fn follow_switches_post_to_get_on_301_302_303() {
+        for code in [301, 302, 303] {
+            let mut e = Easy::open();
+            e.set_url("http://example.com/").expect("set url");
+            e.info.conn_remote_port = 80;
+            e.info.conn_protocol = proto::HTTP;
+            e.info.httpcode = code;
+            e.state.httpreq = HttpReq::Post;
+            e.follow("http://example.com/next", FollowType::Redir)
+                .expect("follow");
+            assert_eq!(
+                e.state.httpreq,
+                HttpReq::Get,
+                "code {code} should switch POST→GET"
+            );
+        }
+    }
+
+    #[test]
+    fn follow_keeps_method_on_307() {
+        let mut e = Easy::open();
+        e.set_url("http://example.com/").expect("set url");
+        e.info.conn_remote_port = 80;
+        e.info.conn_protocol = proto::HTTP;
+        e.info.httpcode = 307;
+        e.state.httpreq = HttpReq::Post;
+        e.follow("http://example.com/next", FollowType::Redir)
+            .expect("follow");
+        assert_eq!(e.state.httpreq, HttpReq::Post);
+    }
+
+    #[test]
+    fn follow_keeps_post_when_postredir_set() {
+        let mut e = Easy::open();
+        e.set.post301 = true; // CURLOPT_POSTREDIR keeps POST across 301
+        e.set_url("http://example.com/").expect("set url");
+        e.info.conn_remote_port = 80;
+        e.info.conn_protocol = proto::HTTP;
+        e.info.httpcode = 301;
+        e.state.httpreq = HttpReq::Post;
+        e.follow("http://example.com/next", FollowType::Redir)
+            .expect("follow");
+        assert_eq!(e.state.httpreq, HttpReq::Post);
+    }
+
+    #[test]
+    fn follow_strips_credentials_across_origin() {
+        let mut e = Easy::open();
+        e.set_url("http://user:pass@example.com/").expect("set url");
+        e.info.conn_remote_port = 80;
+        e.info.conn_protocol = proto::HTTP;
+        e.info.httpcode = 302;
+        e.state.aptr_user = Some("user".to_string());
+        e.state.aptr_passwd = Some("pass".to_string());
+
+        // Redirect to a different port → credentials are cleared.
+        e.follow("http://example.com:8080/next", FollowType::Redir)
+            .expect("follow");
+        assert!(e.state.aptr_user.is_none());
+        assert!(e.state.aptr_passwd.is_none());
+    }
+
+    #[test]
+    fn follow_keeps_credentials_same_origin() {
+        let mut e = Easy::open();
+        e.set_url("http://user:pass@example.com/").expect("set url");
+        e.info.conn_remote_port = 80;
+        e.info.conn_protocol = proto::HTTP;
+        e.info.httpcode = 302;
+        e.state.aptr_user = Some("user".to_string());
+        e.state.aptr_passwd = Some("pass".to_string());
+
+        e.follow("http://example.com/other", FollowType::Redir)
+            .expect("follow");
+        assert_eq!(e.state.aptr_user.as_deref(), Some("user"));
+        assert_eq!(e.state.aptr_passwd.as_deref(), Some("pass"));
+    }
+
+    #[test]
+    fn follow_disallows_port_for_absolute_target() {
+        let mut e = Easy::open();
+        e.set_url("http://example.com/").expect("set url");
+        e.state.allow_port = true;
+        e.info.conn_remote_port = 80;
+        e.info.conn_protocol = proto::HTTP;
+        e.info.httpcode = 302;
+
+        // Absolute redirect target → custom port disallowed henceforth.
+        e.follow("http://example.com/x", FollowType::Redir)
+            .expect("follow");
+        assert!(!e.state.allow_port);
+    }
+
+    #[test]
+    fn follow_keeps_allow_port_for_relative_target() {
+        let mut e = Easy::open();
+        e.set_url("http://example.com/").expect("set url");
+        e.state.allow_port = true;
+        e.info.conn_remote_port = 80;
+        e.info.conn_protocol = proto::HTTP;
+        e.info.httpcode = 302;
+
+        e.follow("/relative", FollowType::Redir).expect("follow");
+        assert!(e.state.allow_port);
+    }
+
+    #[test]
+    fn is_absolute_url_detection() {
+        assert!(is_absolute_url("http://example.com/"));
+        assert!(is_absolute_url("https://example.com"));
+        assert!(is_absolute_url("ftp://host/"));
+        assert!(!is_absolute_url("/relative/path"));
+        assert!(!is_absolute_url("relative"));
+        assert!(!is_absolute_url("//scheme-relative"));
+    }
+}
