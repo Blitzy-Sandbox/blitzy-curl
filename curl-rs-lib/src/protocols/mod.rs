@@ -1,22 +1,1542 @@
 // SPDX-License-Identifier: curl
 // SPDX-FileCopyrightText: Daniel Stenberg, <daniel@haxx.se>, et al.
 
-//! # Protocol handlers
+//! Application-protocol handlers behind a common trait + scheme-dispatch table.
+//! Ported from curl `lib/url.c` protocol registration and the `struct
+//! Curl_protocol` vtable in `lib/urldata.h`. RTMP/RTMPS intentionally absent.
 //!
-//! Root of the protocol subtree, a language rewrite of curl's per-protocol `lib/*.c` handlers.
-//! In curl the supported protocol set is chosen with `CURL_DISABLE_*` `#ifdef` guards; here
-//! each handler module is attached under a matching `#[cfg(feature = "...")]`, so a disabled
-//! protocol compiles out exactly as it does in a stock curl build (AAP §0.5.3).
+//! # What this module is
 //!
-//! ## Submodules
+//! This is the **foundational root** of the protocol-handler subsystem. It is
+//! the language rewrite of two C artifacts:
 //!
-//! At this foundation checkpoint the following handler support is implemented; the remaining
-//! handlers named in the AAP §0.3.1 layout (the `http` subtree, `ftp`, the `ssh` subtree,
-//! `imap`/`pop3`/`smtp`, and the auxiliary protocols) are added in later checkpoints, each
-//! derived from its `lib/*.c` source-of-truth.
+//! * `struct Curl_protocol` (`lib/urldata.h`) — the per-protocol vtable of 17
+//!   function pointers (`do_it`, `done`, `connect_it`, `disconnect`, …). It
+//!   becomes the [`Protocol`] trait: polymorphic *runtime* dispatch replaces the
+//!   C function-pointer indirection and the `#ifdef CURL_DISABLE_*` branching.
+//! * `struct Curl_scheme` + the `Curl_get_scheme_handler` lookup (`lib/url.c`)
+//!   — the URL-scheme registration table. It becomes [`SchemeHandler`] plus the
+//!   [`scheme_handler`] lookup and the [`protocol_family`] mapping.
 //!
-//! * [`ftp_list`] — parser for FTP `LIST` directory-listing output, used by the FTP handler
-//!   (from `lib/ftplistparser.c`). Gated by the `ftp` feature (curl's `CURL_DISABLE_FTP`).
+//! Every other module in this folder (and the `http/` and `ssh/` subfolders)
+//! plugs into the machinery defined here: each imports the [`Protocol`] trait,
+//! the [`SchemeHandler`] record, and the [`PROTOPT_NONE`]-family and
+//! `CURLPROTO_*` constants from this module, and exposes a handler singleton
+//! that this module's scheme table points at (see *Sibling handler contract*).
+//!
+//! # Design (AAP §0.3.2)
+//!
+//! * **Trait-based dispatch.** curl selects protocol behavior with compile-time
+//!   `#ifdef` branches and a function-pointer vtable; here each protocol
+//!   implements [`Protocol`] and is dispatched through a `&dyn Protocol`,
+//!   exactly as curl calls through `conn->handler->do_it(...)`.
+//! * **Async on Tokio only.** The fallible async steps of [`Protocol`] return a
+//!   boxed [`ProtoFuture`] rather than using an `async fn` in the trait. That
+//!   keeps the trait object-safe (usable as `&dyn Protocol`, which the scheme
+//!   table requires) and compiles on the MSRV (Rust 1.75) with no
+//!   `async_fn_in_trait` lint — the same pattern the sibling [`crate::dns`]
+//!   `Resolver` trait uses. No `async-std`/`smol`, no `async-trait`.
+//! * **Memory safety.** The crate root's `#![forbid(unsafe_code)]` applies here;
+//!   `protocols/` is one of the no-`unsafe` zones (AAP §0.6.2, §0.7.2). There is
+//!   no FFI and there are no raw pointers in this subtree.
+//! * **Minimal change.** The supported scheme set, the flag bits, the default
+//!   ports, and the `CURLPROTO_*`/`PROTOPT_*` numeric identities reproduce curl
+//!   8.19.0-DEV exactly. **RTMP/RTMPS are dropped** (AAP §0.2.2, §1.3.2.5): no
+//!   `rtmp*` scheme is ever registered and no RTMP handler exists. The C
+//!   `lib/curl_rtmp.c` reference file is left untouched; the protocol is simply
+//!   never wired in.
+//!
+//! # Transfer lifecycle
+//!
+//! The [`Protocol`] methods mirror curl's multi state machine (`lib/multi.c`,
+//! the `MSTATE_*` phases). A protocol author overrides only the steps a
+//! protocol needs; everything else uses the faithful no-op default (exactly as
+//! curl leaves the corresponding C function pointer `NULL`). The driving loop
+//! itself lives in the consumers [`crate::multi`] / [`crate::transfer`], which
+//! call these methods in this order:
+//!
+//! ```text
+//! CONNECT     → setup_connection, then connect (repeated via connecting)
+//! DO          → do_it            (the required request-issuing step)
+//! DO_MORE     → do_more          (optional 2nd half of DO, e.g. FTP PASV/PORT)
+//! DOING       → doing            (repeated until the DO phase completes)
+//! PERFORM     → write_resp / write_resp_hd post-process streamed response bytes
+//! DONE        → done             (the required teardown step)
+//! (teardown)  → disconnect       (protocol-dependent connection shutdown)
+//! ```
+//!
+//! The `*_pollset` hooks feed the protocol's desired socket-readiness into the
+//! event loop during the matching phase; [`connection_check`] answers liveness
+//! probes for pooled connections; [`Protocol::attach`] binds a transfer to a
+//! connection; [`Protocol::follow`] decides whether a redirect is followed.
+//!
+//! # Sibling handler contract
+//!
+//! The scheme table in this module points each entry at the handler singleton
+//! **owned by that protocol's module**. By convention every protocol module
+//! exposes a `pub static HANDLER` whose type implements [`Protocol`]:
+//!
+//! * `http::HANDLER` serves both `http` and `https` (TLS is layered by the
+//!   connection filter chain, so the two schemes share one handler — exactly as
+//!   curl's `Curl_scheme_http` and `Curl_scheme_https` both point at
+//!   `Curl_protocol_http`). The same one-handler-per-family rule applies to
+//!   `ftp`/`ftps`, `imap`/`imaps`, `pop3`/`pop3s`, `smtp`/`smtps`,
+//!   `ldap`/`ldaps`, `smb`/`smbs`, `gopher`/`gophers`, `mqtt`/`mqtts`, and
+//!   `ws`/`wss`.
+//! * The `ssh` subfolder hosts two distinct handlers, `ssh::sftp::HANDLER` and
+//!   `ssh::scp::HANDLER`.
+//!
+//! This module owns the scheme *metadata* (name, protocol bit, family bit,
+//! [`PROTOPT_NONE`]-family flags, default port); the sibling module owns only
+//! the behavior (`HANDLER`).
 
+// The memory-safety cornerstone is inherited from the crate root
+// (`#![forbid(unsafe_code)]` in `lib.rs`): any `unsafe` token anywhere in this
+// file is a hard compile error, and a CI grep audit asserts the token never
+// appears under `curl-rs-lib/src/`.
+
+// DEP NOTE: protocol features {file,gopher,ldap,smb,websockets,ssh} must be declared in curl-rs-lib/Cargo.toml (curl default-on); the AAP §0.5.3 default-on set is {http,ftp,smtp,imap,pop3,tftp,telnet,dict,mqtt,rtsp}.
+
+// ===========================================================================
+// Submodule declarations — the entire protocol tree (feature-gated).
+//
+// This root module owns the declaration of every sibling handler module AND the
+// two subfolder modules (`http/`, `ssh/`). Each is gated by its Cargo feature,
+// reproducing curl's per-protocol `CURL_DISABLE_*` / `USE_*` guards (AAP
+// §0.5.3): a disabled protocol compiles out exactly as in a stock curl build.
+//
+// `http` and `ssh` are SUBFOLDER modules: this file only declares
+// `pub mod http;` / `pub mod ssh;`; the files inside those folders (including
+// their own `mod.rs`) are authored separately.
+// ===========================================================================
+
+// HTTP family (subfolder).
+#[cfg(feature = "http")]
+pub mod http;
+
+// FTP family.
+#[cfg(feature = "ftp")]
+pub mod ftp;
 #[cfg(feature = "ftp")]
 pub mod ftp_list;
+
+// Shared command/response engine for the text protocols (curl's `USE_PINGPONG`:
+// FTP/IMAP/POP3/SMTP all speak a line-based command/response dialogue).
+#[cfg(any(feature = "ftp", feature = "imap", feature = "pop3", feature = "smtp"))]
+pub mod pingpong;
+
+// Mail protocols.
+#[cfg(feature = "imap")]
+pub mod imap;
+#[cfg(feature = "pop3")]
+pub mod pop3;
+#[cfg(feature = "smtp")]
+pub mod smtp;
+
+// SSH family (subfolder — hosts `sftp` and `scp`).
+#[cfg(feature = "ssh")]
+pub mod ssh;
+
+// Auxiliary protocols.
+#[cfg(feature = "dict")]
+pub mod dict;
+#[cfg(feature = "file")]
+pub mod file;
+#[cfg(feature = "gopher")]
+pub mod gopher;
+#[cfg(feature = "ldap")]
+pub mod ldap;
+#[cfg(feature = "mqtt")]
+pub mod mqtt;
+#[cfg(feature = "rtsp")]
+pub mod rtsp;
+#[cfg(feature = "smb")]
+pub mod smb;
+#[cfg(feature = "telnet")]
+pub mod telnet;
+#[cfg(feature = "tftp")]
+pub mod tftp;
+#[cfg(feature = "websockets")]
+pub mod ws;
+
+use std::future::Future;
+use std::os::fd::RawFd;
+use std::pin::Pin;
+
+use crate::conn::Transport;
+use crate::error::Result;
+
+// ===========================================================================
+// PROTOPT_* — per-protocol characteristic flags (`lib/urldata.h`).
+//
+// These bit values are load-bearing and reproduce the C `#define PROTOPT_*`
+// macros exactly; they are stored in [`SchemeHandler::flags`]. Bit `1 << 9`
+// (formerly `PROTOPT_STREAM`) is intentionally left free, matching curl.
+// ===========================================================================
+
+/// Nothing extra (`PROTOPT_NONE`).
+pub const PROTOPT_NONE: u32 = 0;
+/// Uses SSL/TLS (`PROTOPT_SSL`).
+pub const PROTOPT_SSL: u32 = 1 << 0;
+/// This protocol uses two connections — FTP (`PROTOPT_DUAL`).
+pub const PROTOPT_DUAL: u32 = 1 << 1;
+/// Needs an action before the socket is closed (`PROTOPT_CLOSEACTION`).
+pub const PROTOPT_CLOSEACTION: u32 = 1 << 2;
+/// Protocol needs the connection's directory lock (`PROTOPT_DIRLOCK`).
+pub const PROTOPT_DIRLOCK: u32 = 1 << 3;
+/// Protocol does not use the network — FILE (`PROTOPT_NONETWORK`).
+pub const PROTOPT_NONETWORK: u32 = 1 << 4;
+/// Needs a password; a missing one defaults to the anonymous credential
+/// (`PROTOPT_NEEDSPWD`).
+pub const PROTOPT_NEEDSPWD: u32 = 1 << 5;
+/// Protocol cannot handle a URL query part (`PROTOPT_NOURLQUERY`).
+pub const PROTOPT_NOURLQUERY: u32 = 1 << 6;
+/// Requires login credentials to be sent on every request
+/// (`PROTOPT_CREDSPERREQUEST`).
+pub const PROTOPT_CREDSPERREQUEST: u32 = 1 << 7;
+/// Set ALPN for this protocol (`PROTOPT_ALPN`).
+pub const PROTOPT_ALPN: u32 = 1 << 8;
+// Bit `1 << 9` was `PROTOPT_STREAM`; it is now free and deliberately unused.
+/// Allow an options part in the userinfo (`PROTOPT_URLOPTIONS`).
+pub const PROTOPT_URLOPTIONS: u32 = 1 << 10;
+/// Allow this non-HTTP scheme to be tunneled over an HTTP proxy
+/// (`PROTOPT_PROXY_AS_HTTP`).
+pub const PROTOPT_PROXY_AS_HTTP: u32 = 1 << 11;
+/// Protocol supports wildcard matching (`PROTOPT_WILDCARD`).
+pub const PROTOPT_WILDCARD: u32 = 1 << 12;
+/// Allow "control bytes" (`< 32` ASCII) in the user/password
+/// (`PROTOPT_USERPWDCTRL`).
+pub const PROTOPT_USERPWDCTRL: u32 = 1 << 13;
+/// This protocol cannot proxy over TCP — TFTP (`PROTOPT_NOTCPPROXY`).
+pub const PROTOPT_NOTCPPROXY: u32 = 1 << 14;
+/// This protocol may reuse an existing (SSL) connection without itself having
+/// [`PROTOPT_SSL`] (`PROTOPT_SSL_REUSE`).
+pub const PROTOPT_SSL_REUSE: u32 = 1 << 15;
+/// This protocol can reuse connections (`PROTOPT_CONN_REUSE`).
+pub const PROTOPT_CONN_REUSE: u32 = 1 << 16;
+
+// ===========================================================================
+// CURLPROTO_* — protocol identity bits (`include/curl/curl.h`, plus the two
+// internal WebSocket bits from `lib/urldata.h`).
+//
+// These are part of the frozen public ABI (`CURLOPT_PROTOCOLS_STR`,
+// `CURLINFO_PROTOCOL`, `CURLOPT_PROTOCOLS`/`CURLOPT_REDIR_PROTOCOLS` masks). A
+// scheme stores its single protocol bit in [`SchemeHandler::protocol`] and its
+// family bit in [`SchemeHandler::family`]. The RTMP family (bits 19–24) is
+// deliberately left undefined: the protocol is dropped from this rewrite
+// (AAP §0.2.2), and its bits are owned by the FFI/`curl.h` layer.
+// ===========================================================================
+
+/// `CURLPROTO_HTTP`.
+pub const CURLPROTO_HTTP: u32 = 1 << 0;
+/// `CURLPROTO_HTTPS`.
+pub const CURLPROTO_HTTPS: u32 = 1 << 1;
+/// `CURLPROTO_FTP`.
+pub const CURLPROTO_FTP: u32 = 1 << 2;
+/// `CURLPROTO_FTPS`.
+pub const CURLPROTO_FTPS: u32 = 1 << 3;
+/// `CURLPROTO_SCP`.
+pub const CURLPROTO_SCP: u32 = 1 << 4;
+/// `CURLPROTO_SFTP`.
+pub const CURLPROTO_SFTP: u32 = 1 << 5;
+/// `CURLPROTO_TELNET`.
+pub const CURLPROTO_TELNET: u32 = 1 << 6;
+/// `CURLPROTO_LDAP`.
+pub const CURLPROTO_LDAP: u32 = 1 << 7;
+/// `CURLPROTO_LDAPS`.
+pub const CURLPROTO_LDAPS: u32 = 1 << 8;
+/// `CURLPROTO_DICT`.
+pub const CURLPROTO_DICT: u32 = 1 << 9;
+/// `CURLPROTO_FILE`.
+pub const CURLPROTO_FILE: u32 = 1 << 10;
+/// `CURLPROTO_TFTP`.
+pub const CURLPROTO_TFTP: u32 = 1 << 11;
+/// `CURLPROTO_IMAP`.
+pub const CURLPROTO_IMAP: u32 = 1 << 12;
+/// `CURLPROTO_IMAPS`.
+pub const CURLPROTO_IMAPS: u32 = 1 << 13;
+/// `CURLPROTO_POP3`.
+pub const CURLPROTO_POP3: u32 = 1 << 14;
+/// `CURLPROTO_POP3S`.
+pub const CURLPROTO_POP3S: u32 = 1 << 15;
+/// `CURLPROTO_SMTP`.
+pub const CURLPROTO_SMTP: u32 = 1 << 16;
+/// `CURLPROTO_SMTPS`.
+pub const CURLPROTO_SMTPS: u32 = 1 << 17;
+/// `CURLPROTO_RTSP`.
+pub const CURLPROTO_RTSP: u32 = 1 << 18;
+// Bits 19–24 (RTMP, RTMPT, RTMPE, RTMPTE, RTMPS, RTMPTS) are deliberately left
+// undefined: the RTMP family is dropped from this rewrite (AAP §0.2.2).
+/// `CURLPROTO_GOPHER`.
+pub const CURLPROTO_GOPHER: u32 = 1 << 25;
+/// `CURLPROTO_SMB`.
+pub const CURLPROTO_SMB: u32 = 1 << 26;
+/// `CURLPROTO_SMBS`.
+pub const CURLPROTO_SMBS: u32 = 1 << 27;
+/// `CURLPROTO_MQTT`.
+pub const CURLPROTO_MQTT: u32 = 1 << 28;
+/// `CURLPROTO_GOPHERS`.
+pub const CURLPROTO_GOPHERS: u32 = 1 << 29;
+/// `CURLPROTO_MQTTS`.
+///
+/// `CURLPROTO_GOPHERS` (bit 29) is the highest bit exposed in the public
+/// `curl.h` enum before this one; `MQTTS` occupies bit 30 there.
+pub const CURLPROTO_MQTTS: u32 = 1 << 30;
+/// `CURLPROTO_WS` — WebSocket (`lib/urldata.h`, internal).
+///
+/// curl defines this at bit 30, **deliberately overlapping** [`CURLPROTO_MQTTS`]
+/// (the `urldata.h` comment notes that GOPHERS at bit 29 is the highest publicly
+/// used bit and that WS/WSS are internal information reusing the top bits). The
+/// two are never used by the same handle, so the shared bit is a harmless
+/// space-saving detail, preserved here for numeric parity.
+pub const CURLPROTO_WS: u32 = 1 << 30;
+/// `CURLPROTO_WSS` — WebSocket over TLS (`lib/urldata.h`, internal, bit 31).
+pub const CURLPROTO_WSS: u32 = 1 << 31;
+
+// ===========================================================================
+// CURL_POLL_* — socket-readiness actions (`include/curl/multi.h`).
+//
+// These mirror the public `CURL_POLL_*` values and are the per-socket action
+// codes stored in a [`Pollset`] (curl's `easy_pollset.actions`, an
+// `unsigned char` array — hence `u8`).
+// ===========================================================================
+
+/// No readiness interest (`CURL_POLL_NONE`).
+pub const CURL_POLL_NONE: u8 = 0;
+/// Interested in readability (`CURL_POLL_IN`).
+pub const CURL_POLL_IN: u8 = 1;
+/// Interested in writability (`CURL_POLL_OUT`).
+pub const CURL_POLL_OUT: u8 = 2;
+/// Interested in both readability and writability (`CURL_POLL_INOUT`).
+pub const CURL_POLL_INOUT: u8 = CURL_POLL_IN | CURL_POLL_OUT;
+/// Remove the socket from the poll set (`CURL_POLL_REMOVE`).
+pub const CURL_POLL_REMOVE: u8 = 4;
+
+// ===========================================================================
+// Pollset — a protocol's desired socket-readiness set.
+//
+// Faithful rewrite of curl's `easy_pollset` (`lib/select.h`) and the
+// `Curl_pollset_*` helpers. A protocol's `*_pollset` hook contributes the
+// sockets it wants the event loop to watch (and with which interest) for the
+// current transfer phase. The connection filter chain and the multi event loop
+// (the consumers) drain this into the actual poll/epoll registration.
+//
+// curl's `curl_socket_t` is a file descriptor on the supported (Unix) target
+// platforms, so [`RawFd`] is the faithful socket-handle type here. Windows is
+// out of scope (AAP §0.6.5), so no Windows socket variant is modeled.
+// ===========================================================================
+
+/// A single socket plus the readiness interest requested for it.
+///
+/// `action` is a bitmask of [`CURL_POLL_IN`] / [`CURL_POLL_OUT`] (equivalently
+/// [`CURL_POLL_INOUT`]); it is never [`CURL_POLL_NONE`] for a socket that is
+/// present in a [`Pollset`] (a socket whose interest drops to nothing is
+/// removed instead — matching curl).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PollSocket {
+    /// The socket (file descriptor) to watch.
+    pub socket: RawFd,
+    /// Readiness interest bitmask: [`CURL_POLL_IN`] and/or [`CURL_POLL_OUT`].
+    pub action: u8,
+}
+
+/// The set of sockets a protocol wants watched for a given transfer phase.
+///
+/// Mirrors curl's `easy_pollset`: a small, order-preserving collection of
+/// `(socket, action)` pairs. It is intentionally minimal — a protocol's
+/// pollset hook typically adds zero or one socket beyond the connection's own.
+#[derive(Clone, Debug, Default)]
+pub struct Pollset {
+    sockets: Vec<PollSocket>,
+}
+
+impl Pollset {
+    /// Create an empty poll set (← the zeroed `easy_pollset`).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            sockets: Vec::new(),
+        }
+    }
+
+    /// Set the exact readiness interest for `socket` (← `Curl_pollset_set`).
+    ///
+    /// `action` is interpreted as a [`CURL_POLL_IN`]/[`CURL_POLL_OUT`] bitmask.
+    /// If the resulting interest is empty — i.e. [`CURL_POLL_NONE`] or
+    /// [`CURL_POLL_REMOVE`], neither of which carries an `IN`/`OUT` bit — the
+    /// socket is removed from the set. Otherwise the socket's interest is
+    /// inserted or updated in place, preserving insertion order.
+    pub fn set(&mut self, socket: RawFd, action: u8) {
+        let want = action & CURL_POLL_INOUT;
+        if want == CURL_POLL_NONE {
+            self.sockets.retain(|e| e.socket != socket);
+            return;
+        }
+        if let Some(entry) = self.sockets.iter_mut().find(|e| e.socket == socket) {
+            entry.action = want;
+        } else {
+            self.sockets.push(PollSocket {
+                socket,
+                action: want,
+            });
+        }
+    }
+
+    /// Add read (`IN`) interest for `socket` (← `Curl_pollset_add_in`),
+    /// preserving any existing write interest.
+    pub fn add_in(&mut self, socket: RawFd) {
+        let action = self.action_of(socket) | CURL_POLL_IN;
+        self.set(socket, action);
+    }
+
+    /// Add write (`OUT`) interest for `socket` (← `Curl_pollset_add_out`),
+    /// preserving any existing read interest.
+    pub fn add_out(&mut self, socket: RawFd) {
+        let action = self.action_of(socket) | CURL_POLL_OUT;
+        self.set(socket, action);
+    }
+
+    /// The current readiness interest for `socket`, or [`CURL_POLL_NONE`] if the
+    /// socket is not in the set.
+    #[must_use]
+    pub fn action_of(&self, socket: RawFd) -> u8 {
+        self.sockets
+            .iter()
+            .find(|e| e.socket == socket)
+            .map_or(CURL_POLL_NONE, |e| e.action)
+    }
+
+    /// The sockets in this set, in insertion order.
+    #[must_use]
+    pub fn sockets(&self) -> &[PollSocket] {
+        &self.sockets
+    }
+
+    /// Number of sockets in the set.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.sockets.len()
+    }
+
+    /// Whether the set is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sockets.is_empty()
+    }
+}
+
+// ===========================================================================
+// FollowType — redirect/retry disposition (`lib/http.h`, `enum followtype`).
+//
+// Consumed by [`Protocol::follow`] to decide how (and whether) a new target URL
+// is pursued. Values reproduce curl 8.19.0-DEV's `followtype` exactly.
+// ===========================================================================
+
+/// How a new target URL is to be followed (← `enum followtype`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FollowType {
+    /// Not a follow — no new URL is pursued (`FOLLOW_NONE`).
+    None = 0,
+    /// A "fake" follow: the redirect is accounted for (e.g. against the
+    /// redirect limit) but no new request is set up (`FOLLOW_FAKE`).
+    Fake = 1,
+    /// Retry the *same* request on a fresh connection (`FOLLOW_RETRY`).
+    Retry = 2,
+    /// A real redirect to a new URL (`Location:`), setting up a new request
+    /// (`FOLLOW_REDIR`).
+    Redir = 3,
+}
+
+// ===========================================================================
+// TransferCtx — provisional per-call context passed to every [`Protocol`] hook.
+// ===========================================================================
+
+/// The context threaded through every [`Protocol`] method — curl passes a
+/// `struct Curl_easy *data` (from which `data->conn` and the request/response
+/// state are reached) to each vtable function.
+///
+/// TODO(wiring): this is a **placeholder handle bundle**. The finalized context
+/// will carry the easy-handle state, the owning [`crate::conn::Connection`], and
+/// the in-flight request/response, coordinated with [`crate::transfer`] and
+/// [`crate::multi`] — the consumers that drive this trait. Those modules are
+/// deliberately *not* imported here (they depend on `protocols`, not the other
+/// way round; importing them would create a cycle). It is kept free of a
+/// lifetime parameter so [`Protocol`] stays object-safe (`&dyn Protocol`, as
+/// required by [`SchemeHandler`]) and its boxed futures stay simple; the borrow
+/// of the context is expressed on each method instead.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct TransferCtx {
+    // Intentionally empty for now; grows as `transfer.rs`/`multi.rs` finalize
+    // the shared handle type. `#[non_exhaustive]` signals that to consumers.
+}
+
+impl TransferCtx {
+    /// Create an empty placeholder context.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// The boxed, `Send` future returned by every fallible async [`Protocol`] step.
+///
+/// Using an explicit boxed future (rather than an `async fn` in the trait)
+/// keeps [`Protocol`] object-safe so it can be stored as
+/// `&'static dyn Protocol` in a [`SchemeHandler`], and keeps it free of the
+/// `async_fn_in_trait` lint on the MSRV (Rust 1.75). This mirrors the sibling
+/// [`crate::dns`] `Resolver` trait. `Send` (not `Sync`) is required so the
+/// future can be driven on Tokio's multi-threaded runtime.
+pub type ProtoFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+// ===========================================================================
+// Protocol — the per-protocol behavior trait (← `struct Curl_protocol`,
+// `lib/urldata.h`).
+//
+// Each of the 17 C function pointers becomes a trait method. curl's comment
+// marks exactly two pointers as mandatory — "These two functions MUST be set"
+// — namely `do_it` and `done`; those have no default here. Every other method
+// has a faithful no-op default, which is precisely how curl leaves an optional
+// function pointer `NULL` and falls back to generic behavior.
+// ===========================================================================
+
+/// Per-protocol behavior, dispatched polymorphically through `&dyn Protocol`.
+///
+/// This is the rewrite of curl's `struct Curl_protocol` vtable. Implementors
+/// override only the phases their protocol needs; the defaults reproduce curl's
+/// "pointer is `NULL`" fallback. See the module-level *Transfer lifecycle* for
+/// the order in which these fire.
+///
+/// The trait is `Send + Sync` so a handler singleton can be shared as
+/// `&'static dyn Protocol` across the multi handle's worker threads.
+pub trait Protocol: Send + Sync {
+    /// Prepare protocol state before the transfer "owns" the connection
+    /// (← `setup_connection`). Runs once, early. Default: succeed.
+    fn setup_connection<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, ()> {
+        let _ = ctx;
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Protocol-dependent step performed right after the transport connects
+    /// (← `connect_it`). Returns `true` when the protocol connect is already
+    /// complete, or `false` to continue via [`connecting`](Protocol::connecting).
+    /// Default: complete immediately (`true`).
+    fn connect<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
+        let _ = ctx;
+        Box::pin(async { Ok(true) })
+    }
+
+    /// Called repeatedly while the protocol connect is still in progress
+    /// (← `connecting`). Returns `true` once connected. Default: `true`.
+    fn connecting<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
+        let _ = ctx;
+        Box::pin(async { Ok(true) })
+    }
+
+    /// The **required** "DO" phase: issue the request (← `do_it`). Returns
+    /// `true` when the DO phase is complete, or `false` to continue via
+    /// [`doing`](Protocol::doing) / [`do_more`](Protocol::do_more). No default —
+    /// curl requires this pointer to be set.
+    fn do_it<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool>;
+
+    /// Optional second half of the DO phase (← `do_more`), e.g. FTP after
+    /// PASV/PORT establishes the data connection. The `i32` mirrors curl's
+    /// `*completed` out-parameter (`0` = not yet complete). Default: `0`.
+    fn do_more<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, i32> {
+        let _ = ctx;
+        Box::pin(async { Ok(0) })
+    }
+
+    /// Called repeatedly during the DOING phase (← `doing`). Returns `true` once
+    /// the DO phase is complete. Default: `true`.
+    fn doing<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
+        let _ = ctx;
+        Box::pin(async { Ok(true) })
+    }
+
+    /// The **required** teardown of a completed (or, if `premature`, an aborted)
+    /// transfer (← `done`). `status` is the transfer's outcome so the protocol
+    /// can react to failure. No default — curl requires this pointer to be set.
+    fn done<'a>(
+        &'a self,
+        ctx: &'a mut TransferCtx,
+        status: Result<()>,
+        premature: bool,
+    ) -> ProtoFuture<'a, ()>;
+
+    /// Protocol-dependent disconnection step (← `disconnect`). `dead_connection`
+    /// is `true` when the connection is already known to be unusable (skip
+    /// graceful shutdown chatter). Default: nothing to do.
+    fn disconnect<'a>(
+        &'a self,
+        ctx: &'a mut TransferCtx,
+        dead_connection: bool,
+    ) -> ProtoFuture<'a, ()> {
+        let _ = (ctx, dead_connection);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Let the protocol post-process a chunk of response *body* bytes on their
+    /// way to the client (← `write_resp`). `is_eos` marks the final chunk.
+    /// Default: pass through unchanged.
+    fn write_resp<'a>(
+        &'a self,
+        ctx: &'a mut TransferCtx,
+        buf: &'a [u8],
+        is_eos: bool,
+    ) -> ProtoFuture<'a, ()> {
+        let _ = (ctx, buf, is_eos);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Let the protocol post-process a single response *header* line
+    /// (← `write_resp_hd`). `is_eos` marks the final header. Default: pass
+    /// through unchanged.
+    fn write_resp_hd<'a>(
+        &'a self,
+        ctx: &'a mut TransferCtx,
+        hd: &'a [u8],
+        is_eos: bool,
+    ) -> ProtoFuture<'a, ()> {
+        let _ = (ctx, hd, is_eos);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Liveness/keepalive probe for a pooled connection (← `connection_check`).
+    /// `checks` is a bitmask of the checks to perform (curl's
+    /// `CONNCHECK_ISDEAD`/`CONNCHECK_KEEPALIVE`); the return is the
+    /// `CONNRESULT_*` bitmask of results. Synchronous, like curl. Default: `0`
+    /// (no result — treated as alive).
+    fn connection_check(&self, ctx: &mut TransferCtx, checks: u32) -> u32 {
+        let _ = (ctx, checks);
+        0
+    }
+
+    /// Associate a transfer with this connection (← `attach`). Synchronous.
+    /// Default: nothing to do.
+    fn attach(&self, ctx: &mut TransferCtx) {
+        let _ = ctx;
+    }
+
+    /// Decide whether a redirect/retry to `newurl` (of the given
+    /// [`FollowType`]) is followed (← `follow`). Return `Ok(())` to follow;
+    /// return an error (curl's `CURLE_TOO_MANY_REDIRECTS`) to refuse. Default:
+    /// follow.
+    fn follow<'a>(
+        &'a self,
+        ctx: &'a mut TransferCtx,
+        newurl: &'a str,
+        kind: FollowType,
+    ) -> ProtoFuture<'a, ()> {
+        let _ = (ctx, newurl, kind);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Contribute the sockets this protocol wants watched during the generic
+    /// transfer phase (← `proto_pollset`). Not overriding leaves the connection
+    /// filter chain's generic default in effect. Synchronous.
+    fn proto_pollset(&self, ctx: &mut TransferCtx, ps: &mut Pollset) {
+        let _ = (ctx, ps);
+    }
+
+    /// Contribute desired sockets during the DOING phase (← `doing_pollset`).
+    /// Default: none.
+    fn doing_pollset(&self, ctx: &mut TransferCtx, ps: &mut Pollset) {
+        let _ = (ctx, ps);
+    }
+
+    /// Contribute desired sockets during the DO_MORE phase (← `domore_pollset`),
+    /// e.g. FTP's second (data) connection. Default: none.
+    fn domore_pollset(&self, ctx: &mut TransferCtx, ps: &mut Pollset) {
+        let _ = (ctx, ps);
+    }
+
+    /// Contribute desired sockets during the PERFORM phase (← `perform_pollset`).
+    /// Default: none.
+    fn perform_pollset(&self, ctx: &mut TransferCtx, ps: &mut Pollset) {
+        let _ = (ctx, ps);
+    }
+}
+
+// ===========================================================================
+// SchemeHandler — a URL-scheme registration record (← `struct Curl_scheme`,
+// `lib/urldata.h`).
+//
+// One `SchemeHandler` per supported scheme, mirroring curl's `Curl_scheme_*`
+// constants. It binds the scheme name and its ABI/behavioral metadata to the
+// protocol module's handler singleton.
+// ===========================================================================
+
+/// A URL-scheme registration record (← `struct Curl_scheme`).
+///
+/// Combines the scheme's identity/ABI metadata with the [`Protocol`] handler
+/// that implements it. Handlers are `'static` singletons owned by the protocol
+/// modules; a TLS variant reuses the base scheme's handler (TLS is layered by
+/// the connection filter chain), exactly as curl's `Curl_scheme_https` reuses
+/// `Curl_protocol_http`.
+pub struct SchemeHandler {
+    /// The URL scheme name, in lowercase (← `Curl_scheme.name`). Lookup via
+    /// [`scheme_handler`] is case-insensitive, so `HTTP`, `Http`, and `http`
+    /// all resolve here.
+    pub name: &'static str,
+    /// This scheme's single `CURLPROTO_*` bit (← `Curl_scheme.protocol`).
+    pub protocol: u32,
+    /// This scheme's protocol-family `CURLPROTO_*` bit (← `Curl_scheme.family`);
+    /// e.g. `https`, `ws`, and `wss` all report the `HTTP` family.
+    pub family: u32,
+    /// The `PROTOPT_*` characteristic-flags bitset (← `Curl_scheme.flags`).
+    pub flags: u32,
+    /// The default port used when the URL omits one (← `Curl_scheme.defport`).
+    pub defport: u16,
+    /// The behavior implementation for this scheme (← `Curl_scheme.run`, the
+    /// `struct Curl_protocol *` vtable pointer).
+    pub handler: &'static (dyn Protocol + 'static),
+}
+
+impl SchemeHandler {
+    /// The transport this scheme's connection uses.
+    ///
+    /// Derived from the scheme's characteristics rather than stored (curl's
+    /// `Curl_scheme` has no transport field; the transport is chosen when the
+    /// connection is set up):
+    ///
+    /// * [`PROTOPT_NONETWORK`] schemes (`file`) use no transport
+    ///   ([`Transport::None`]).
+    /// * TFTP is datagram-based ([`Transport::Udp`]).
+    /// * everything else is stream-based ([`Transport::Tcp`]).
+    ///
+    /// HTTP/3's QUIC transport is *not* selected here: `https` can negotiate
+    /// HTTP/1.1, HTTP/2, or HTTP/3 at connection time, so the QUIC choice is
+    /// made inside the `http/` connection setup, not by the scheme.
+    #[must_use]
+    pub fn transport(&self) -> Transport {
+        if self.flags & PROTOPT_NONETWORK != 0 {
+            Transport::None
+        } else if self.protocol == CURLPROTO_TFTP {
+            Transport::Udp
+        } else {
+            Transport::Tcp
+        }
+    }
+
+    /// Whether this scheme is a TLS-secured scheme (← the [`PROTOPT_SSL`] flag).
+    #[must_use]
+    pub fn is_secure(&self) -> bool {
+        self.flags & PROTOPT_SSL != 0
+    }
+}
+
+// ===========================================================================
+// Scheme registration table (← the `Curl_scheme_*` constants).
+//
+// Each record is feature-gated exactly as its C counterpart is guarded by
+// `CURL_DISABLE_*` / `USE_*`. `name` is stored lowercase (curl stores `WS`,
+// `WSS`, `SFTP`, and `SCP` uppercase, but [`scheme_handler`] matches
+// case-insensitively, so the lowercase spelling is behavior-equivalent and
+// follows the documented "URL scheme name in lowercase" contract).
+//
+// Every record's `handler` points at the `HANDLER` singleton owned by that
+// scheme's protocol module (see the module-level *Sibling handler contract*).
+// ===========================================================================
+
+// --- HTTP family -----------------------------------------------------------
+
+/// `http` (← `Curl_scheme_http`).
+#[cfg(feature = "http")]
+pub static SCHEME_HTTP: SchemeHandler = SchemeHandler {
+    name: "http",
+    protocol: CURLPROTO_HTTP,
+    family: CURLPROTO_HTTP,
+    flags: PROTOPT_CREDSPERREQUEST | PROTOPT_USERPWDCTRL | PROTOPT_CONN_REUSE,
+    defport: 80,
+    handler: &http::HANDLER,
+};
+
+/// `https` (← `Curl_scheme_https`).
+#[cfg(feature = "http")]
+pub static SCHEME_HTTPS: SchemeHandler = SchemeHandler {
+    name: "https",
+    protocol: CURLPROTO_HTTPS,
+    family: CURLPROTO_HTTP,
+    flags: PROTOPT_SSL
+        | PROTOPT_CREDSPERREQUEST
+        | PROTOPT_ALPN
+        | PROTOPT_USERPWDCTRL
+        | PROTOPT_CONN_REUSE,
+    defport: 443,
+    handler: &http::HANDLER,
+};
+
+/// `ws` — WebSocket (← `Curl_scheme_ws`).
+#[cfg(feature = "websockets")]
+pub static SCHEME_WS: SchemeHandler = SchemeHandler {
+    name: "ws",
+    protocol: CURLPROTO_WS,
+    family: CURLPROTO_HTTP,
+    flags: PROTOPT_CREDSPERREQUEST | PROTOPT_USERPWDCTRL,
+    defport: 80,
+    handler: &ws::HANDLER,
+};
+
+/// `wss` — WebSocket over TLS (← `Curl_scheme_wss`).
+#[cfg(feature = "websockets")]
+pub static SCHEME_WSS: SchemeHandler = SchemeHandler {
+    name: "wss",
+    protocol: CURLPROTO_WSS,
+    family: CURLPROTO_HTTP,
+    flags: PROTOPT_SSL | PROTOPT_CREDSPERREQUEST | PROTOPT_USERPWDCTRL,
+    defport: 443,
+    handler: &ws::HANDLER,
+};
+
+// --- FTP family ------------------------------------------------------------
+
+/// `ftp` (← `Curl_scheme_ftp`).
+#[cfg(feature = "ftp")]
+pub static SCHEME_FTP: SchemeHandler = SchemeHandler {
+    name: "ftp",
+    protocol: CURLPROTO_FTP,
+    family: CURLPROTO_FTP,
+    flags: PROTOPT_DUAL
+        | PROTOPT_CLOSEACTION
+        | PROTOPT_NEEDSPWD
+        | PROTOPT_NOURLQUERY
+        | PROTOPT_PROXY_AS_HTTP
+        | PROTOPT_WILDCARD
+        | PROTOPT_SSL_REUSE
+        | PROTOPT_CONN_REUSE,
+    defport: 21,
+    handler: &ftp::HANDLER,
+};
+
+/// `ftps` (← `Curl_scheme_ftps`). Note: unlike `ftp`, curl grants `ftps`
+/// neither `PROTOPT_PROXY_AS_HTTP` nor `PROTOPT_SSL_REUSE`.
+#[cfg(feature = "ftp")]
+pub static SCHEME_FTPS: SchemeHandler = SchemeHandler {
+    name: "ftps",
+    protocol: CURLPROTO_FTPS,
+    family: CURLPROTO_FTP,
+    flags: PROTOPT_SSL
+        | PROTOPT_DUAL
+        | PROTOPT_CLOSEACTION
+        | PROTOPT_NEEDSPWD
+        | PROTOPT_NOURLQUERY
+        | PROTOPT_WILDCARD
+        | PROTOPT_CONN_REUSE,
+    defport: 990,
+    handler: &ftp::HANDLER,
+};
+
+// --- SSH family (subfolder handlers) ---------------------------------------
+
+/// `sftp` (← `Curl_scheme_sftp`).
+#[cfg(feature = "ssh")]
+pub static SCHEME_SFTP: SchemeHandler = SchemeHandler {
+    name: "sftp",
+    protocol: CURLPROTO_SFTP,
+    family: CURLPROTO_SFTP,
+    flags: PROTOPT_DIRLOCK | PROTOPT_CLOSEACTION | PROTOPT_NOURLQUERY | PROTOPT_CONN_REUSE,
+    defport: 22,
+    handler: &ssh::sftp::HANDLER,
+};
+
+/// `scp` (← `Curl_scheme_scp`).
+#[cfg(feature = "ssh")]
+pub static SCHEME_SCP: SchemeHandler = SchemeHandler {
+    name: "scp",
+    protocol: CURLPROTO_SCP,
+    family: CURLPROTO_SCP,
+    flags: PROTOPT_DIRLOCK | PROTOPT_CLOSEACTION | PROTOPT_NOURLQUERY | PROTOPT_CONN_REUSE,
+    defport: 22,
+    handler: &ssh::scp::HANDLER,
+};
+
+// --- Mail protocols --------------------------------------------------------
+
+/// `imap` (← `Curl_scheme_imap`).
+#[cfg(feature = "imap")]
+pub static SCHEME_IMAP: SchemeHandler = SchemeHandler {
+    name: "imap",
+    protocol: CURLPROTO_IMAP,
+    family: CURLPROTO_IMAP,
+    flags: PROTOPT_CLOSEACTION | PROTOPT_URLOPTIONS | PROTOPT_SSL_REUSE | PROTOPT_CONN_REUSE,
+    defport: 143,
+    handler: &imap::HANDLER,
+};
+
+/// `imaps` (← `Curl_scheme_imaps`).
+#[cfg(feature = "imap")]
+pub static SCHEME_IMAPS: SchemeHandler = SchemeHandler {
+    name: "imaps",
+    protocol: CURLPROTO_IMAPS,
+    family: CURLPROTO_IMAP,
+    flags: PROTOPT_CLOSEACTION | PROTOPT_SSL | PROTOPT_URLOPTIONS | PROTOPT_CONN_REUSE,
+    defport: 993,
+    handler: &imap::HANDLER,
+};
+
+/// `pop3` (← `Curl_scheme_pop3`).
+#[cfg(feature = "pop3")]
+pub static SCHEME_POP3: SchemeHandler = SchemeHandler {
+    name: "pop3",
+    protocol: CURLPROTO_POP3,
+    family: CURLPROTO_POP3,
+    flags: PROTOPT_CLOSEACTION
+        | PROTOPT_NOURLQUERY
+        | PROTOPT_URLOPTIONS
+        | PROTOPT_SSL_REUSE
+        | PROTOPT_CONN_REUSE,
+    defport: 110,
+    handler: &pop3::HANDLER,
+};
+
+/// `pop3s` (← `Curl_scheme_pop3s`).
+#[cfg(feature = "pop3")]
+pub static SCHEME_POP3S: SchemeHandler = SchemeHandler {
+    name: "pop3s",
+    protocol: CURLPROTO_POP3S,
+    family: CURLPROTO_POP3,
+    flags: PROTOPT_CLOSEACTION
+        | PROTOPT_SSL
+        | PROTOPT_NOURLQUERY
+        | PROTOPT_URLOPTIONS
+        | PROTOPT_CONN_REUSE,
+    defport: 995,
+    handler: &pop3::HANDLER,
+};
+
+/// `smtp` (← `Curl_scheme_smtp`).
+#[cfg(feature = "smtp")]
+pub static SCHEME_SMTP: SchemeHandler = SchemeHandler {
+    name: "smtp",
+    protocol: CURLPROTO_SMTP,
+    family: CURLPROTO_SMTP,
+    flags: PROTOPT_CLOSEACTION
+        | PROTOPT_NOURLQUERY
+        | PROTOPT_URLOPTIONS
+        | PROTOPT_SSL_REUSE
+        | PROTOPT_CONN_REUSE,
+    defport: 25,
+    handler: &smtp::HANDLER,
+};
+
+/// `smtps` (← `Curl_scheme_smtps`).
+#[cfg(feature = "smtp")]
+pub static SCHEME_SMTPS: SchemeHandler = SchemeHandler {
+    name: "smtps",
+    protocol: CURLPROTO_SMTPS,
+    family: CURLPROTO_SMTP,
+    flags: PROTOPT_CLOSEACTION
+        | PROTOPT_SSL
+        | PROTOPT_NOURLQUERY
+        | PROTOPT_URLOPTIONS
+        | PROTOPT_CONN_REUSE,
+    defport: 465,
+    handler: &smtp::HANDLER,
+};
+
+// --- Auxiliary protocols ---------------------------------------------------
+
+/// `tftp` (← `Curl_scheme_tftp`).
+#[cfg(feature = "tftp")]
+pub static SCHEME_TFTP: SchemeHandler = SchemeHandler {
+    name: "tftp",
+    protocol: CURLPROTO_TFTP,
+    family: CURLPROTO_TFTP,
+    flags: PROTOPT_NOTCPPROXY | PROTOPT_NOURLQUERY,
+    defport: 69,
+    handler: &tftp::HANDLER,
+};
+
+/// `telnet` (← `Curl_scheme_telnet`).
+#[cfg(feature = "telnet")]
+pub static SCHEME_TELNET: SchemeHandler = SchemeHandler {
+    name: "telnet",
+    protocol: CURLPROTO_TELNET,
+    family: CURLPROTO_TELNET,
+    flags: PROTOPT_NONE | PROTOPT_NOURLQUERY,
+    defport: 23,
+    handler: &telnet::HANDLER,
+};
+
+/// `dict` (← `Curl_scheme_dict`).
+#[cfg(feature = "dict")]
+pub static SCHEME_DICT: SchemeHandler = SchemeHandler {
+    name: "dict",
+    protocol: CURLPROTO_DICT,
+    family: CURLPROTO_DICT,
+    flags: PROTOPT_NONE | PROTOPT_NOURLQUERY,
+    defport: 2628,
+    handler: &dict::HANDLER,
+};
+
+/// `ldap` (← `Curl_scheme_ldap`).
+#[cfg(feature = "ldap")]
+pub static SCHEME_LDAP: SchemeHandler = SchemeHandler {
+    name: "ldap",
+    protocol: CURLPROTO_LDAP,
+    family: CURLPROTO_LDAP,
+    flags: PROTOPT_SSL_REUSE,
+    defport: 389,
+    handler: &ldap::HANDLER,
+};
+
+/// `ldaps` (← `Curl_scheme_ldaps`).
+#[cfg(feature = "ldap")]
+pub static SCHEME_LDAPS: SchemeHandler = SchemeHandler {
+    name: "ldaps",
+    protocol: CURLPROTO_LDAPS,
+    family: CURLPROTO_LDAP,
+    flags: PROTOPT_SSL,
+    defport: 636,
+    handler: &ldap::HANDLER,
+};
+
+/// `file` (← `Curl_scheme_file`).
+#[cfg(feature = "file")]
+pub static SCHEME_FILE: SchemeHandler = SchemeHandler {
+    name: "file",
+    protocol: CURLPROTO_FILE,
+    family: CURLPROTO_FILE,
+    flags: PROTOPT_NONETWORK | PROTOPT_NOURLQUERY,
+    defport: 0,
+    handler: &file::HANDLER,
+};
+
+/// `gopher` (← `Curl_scheme_gopher`).
+#[cfg(feature = "gopher")]
+pub static SCHEME_GOPHER: SchemeHandler = SchemeHandler {
+    name: "gopher",
+    protocol: CURLPROTO_GOPHER,
+    family: CURLPROTO_GOPHER,
+    flags: PROTOPT_NONE,
+    defport: 70,
+    handler: &gopher::HANDLER,
+};
+
+/// `gophers` (← `Curl_scheme_gophers`).
+#[cfg(feature = "gopher")]
+pub static SCHEME_GOPHERS: SchemeHandler = SchemeHandler {
+    name: "gophers",
+    protocol: CURLPROTO_GOPHERS,
+    family: CURLPROTO_GOPHER,
+    flags: PROTOPT_SSL,
+    defport: 70,
+    handler: &gopher::HANDLER,
+};
+
+/// `smb` (← `Curl_scheme_smb`).
+#[cfg(feature = "smb")]
+pub static SCHEME_SMB: SchemeHandler = SchemeHandler {
+    name: "smb",
+    protocol: CURLPROTO_SMB,
+    family: CURLPROTO_SMB,
+    flags: PROTOPT_CONN_REUSE,
+    defport: 445,
+    handler: &smb::HANDLER,
+};
+
+/// `smbs` (← `Curl_scheme_smbs`).
+#[cfg(feature = "smb")]
+pub static SCHEME_SMBS: SchemeHandler = SchemeHandler {
+    name: "smbs",
+    protocol: CURLPROTO_SMBS,
+    family: CURLPROTO_SMB,
+    flags: PROTOPT_SSL | PROTOPT_CONN_REUSE,
+    defport: 445,
+    handler: &smb::HANDLER,
+};
+
+/// `rtsp` (← `Curl_scheme_rtsp`).
+#[cfg(feature = "rtsp")]
+pub static SCHEME_RTSP: SchemeHandler = SchemeHandler {
+    name: "rtsp",
+    protocol: CURLPROTO_RTSP,
+    family: CURLPROTO_RTSP,
+    flags: PROTOPT_CONN_REUSE,
+    defport: 554,
+    handler: &rtsp::HANDLER,
+};
+
+/// `mqtt` (← `Curl_scheme_mqtt`).
+#[cfg(feature = "mqtt")]
+pub static SCHEME_MQTT: SchemeHandler = SchemeHandler {
+    name: "mqtt",
+    protocol: CURLPROTO_MQTT,
+    family: CURLPROTO_MQTT,
+    flags: PROTOPT_NONE,
+    defport: 1883,
+    handler: &mqtt::HANDLER,
+};
+
+/// `mqtts` (← `Curl_scheme_mqtts`). Its protocol bit [`CURLPROTO_MQTTS`] shares
+/// value `1 << 30` with [`CURLPROTO_WS`]; the authoritative family for this
+/// scheme is nonetheless [`CURLPROTO_MQTT`], recorded directly in `family`.
+#[cfg(feature = "mqtt")]
+pub static SCHEME_MQTTS: SchemeHandler = SchemeHandler {
+    name: "mqtts",
+    protocol: CURLPROTO_MQTTS,
+    family: CURLPROTO_MQTT,
+    flags: PROTOPT_SSL,
+    defport: 8883,
+    handler: &mqtt::HANDLER,
+};
+
+// ===========================================================================
+// Scheme lookup + family mapping (← `Curl_get_scheme_handler`,
+// `get_protocol_family`).
+// ===========================================================================
+
+/// Look up the [`SchemeHandler`] for a URL scheme (← `Curl_get_scheme_handler`).
+///
+/// Matching is **case-insensitive** — curl accepts `HTTP://`, `Ws://`, etc. An
+/// unknown or disabled scheme yields `None`; callers translate that to
+/// [`crate::error::CurlCode::UnsupportedProtocol`] (integer value `1`). A scheme
+/// whose Cargo feature is disabled is treated exactly like an unknown scheme, so
+/// it is not registered here and returns `None`, matching a stock curl build
+/// compiled without that protocol.
+#[must_use]
+pub fn scheme_handler(scheme: &str) -> Option<&'static SchemeHandler> {
+    // URL schemes are ASCII (RFC 3986); normalize to lowercase for matching.
+    let lower = scheme.to_ascii_lowercase();
+    match lower.as_str() {
+        #[cfg(feature = "http")]
+        "http" => Some(&SCHEME_HTTP),
+        #[cfg(feature = "http")]
+        "https" => Some(&SCHEME_HTTPS),
+        #[cfg(feature = "websockets")]
+        "ws" => Some(&SCHEME_WS),
+        #[cfg(feature = "websockets")]
+        "wss" => Some(&SCHEME_WSS),
+        #[cfg(feature = "ftp")]
+        "ftp" => Some(&SCHEME_FTP),
+        #[cfg(feature = "ftp")]
+        "ftps" => Some(&SCHEME_FTPS),
+        #[cfg(feature = "ssh")]
+        "sftp" => Some(&SCHEME_SFTP),
+        #[cfg(feature = "ssh")]
+        "scp" => Some(&SCHEME_SCP),
+        #[cfg(feature = "imap")]
+        "imap" => Some(&SCHEME_IMAP),
+        #[cfg(feature = "imap")]
+        "imaps" => Some(&SCHEME_IMAPS),
+        #[cfg(feature = "pop3")]
+        "pop3" => Some(&SCHEME_POP3),
+        #[cfg(feature = "pop3")]
+        "pop3s" => Some(&SCHEME_POP3S),
+        #[cfg(feature = "smtp")]
+        "smtp" => Some(&SCHEME_SMTP),
+        #[cfg(feature = "smtp")]
+        "smtps" => Some(&SCHEME_SMTPS),
+        #[cfg(feature = "tftp")]
+        "tftp" => Some(&SCHEME_TFTP),
+        #[cfg(feature = "telnet")]
+        "telnet" => Some(&SCHEME_TELNET),
+        #[cfg(feature = "dict")]
+        "dict" => Some(&SCHEME_DICT),
+        #[cfg(feature = "ldap")]
+        "ldap" => Some(&SCHEME_LDAP),
+        #[cfg(feature = "ldap")]
+        "ldaps" => Some(&SCHEME_LDAPS),
+        #[cfg(feature = "file")]
+        "file" => Some(&SCHEME_FILE),
+        #[cfg(feature = "gopher")]
+        "gopher" => Some(&SCHEME_GOPHER),
+        #[cfg(feature = "gopher")]
+        "gophers" => Some(&SCHEME_GOPHERS),
+        #[cfg(feature = "smb")]
+        "smb" => Some(&SCHEME_SMB),
+        #[cfg(feature = "smb")]
+        "smbs" => Some(&SCHEME_SMBS),
+        #[cfg(feature = "rtsp")]
+        "rtsp" => Some(&SCHEME_RTSP),
+        #[cfg(feature = "mqtt")]
+        "mqtt" => Some(&SCHEME_MQTT),
+        #[cfg(feature = "mqtt")]
+        "mqtts" => Some(&SCHEME_MQTTS),
+        _ => None,
+    }
+}
+
+/// Map a single `CURLPROTO_*` protocol bit to its protocol-family bit
+/// (← `get_protocol_family`).
+///
+/// This reproduces the family recorded on each scheme (`Curl_scheme.family`).
+/// It is a pure ABI mapping, independent of which Cargo features are enabled.
+///
+/// Note the one ambiguity inherited from curl's bit layout:
+/// [`CURLPROTO_WS`] and [`CURLPROTO_MQTTS`] share value `1 << 30`, so this
+/// function cannot tell them apart from the bit alone and resolves it to the
+/// `HTTP` family (the WebSocket interpretation). For `mqtts` specifically, the
+/// authoritative family is available without ambiguity as
+/// [`SCHEME_MQTTS`]`.family` ([`CURLPROTO_MQTT`]). Any unrecognized bit maps to
+/// `0`.
+#[must_use]
+pub fn protocol_family(proto: u32) -> u32 {
+    match proto {
+        // HTTP family: HTTP, HTTPS, WS (1<<30), WSS (1<<31). CURLPROTO_WS and
+        // CURLPROTO_MQTTS collide at 1<<30; WS wins here (see the doc note).
+        CURLPROTO_HTTP | CURLPROTO_HTTPS | CURLPROTO_WS | CURLPROTO_WSS => CURLPROTO_HTTP,
+        CURLPROTO_FTP | CURLPROTO_FTPS => CURLPROTO_FTP,
+        // SFTP and SCP are each their own family (per the scheme records).
+        CURLPROTO_SFTP => CURLPROTO_SFTP,
+        CURLPROTO_SCP => CURLPROTO_SCP,
+        CURLPROTO_IMAP | CURLPROTO_IMAPS => CURLPROTO_IMAP,
+        CURLPROTO_POP3 | CURLPROTO_POP3S => CURLPROTO_POP3,
+        CURLPROTO_SMTP | CURLPROTO_SMTPS => CURLPROTO_SMTP,
+        CURLPROTO_LDAP | CURLPROTO_LDAPS => CURLPROTO_LDAP,
+        CURLPROTO_GOPHER | CURLPROTO_GOPHERS => CURLPROTO_GOPHER,
+        CURLPROTO_SMB | CURLPROTO_SMBS => CURLPROTO_SMB,
+        CURLPROTO_TELNET => CURLPROTO_TELNET,
+        CURLPROTO_DICT => CURLPROTO_DICT,
+        CURLPROTO_FILE => CURLPROTO_FILE,
+        CURLPROTO_TFTP => CURLPROTO_TFTP,
+        CURLPROTO_RTSP => CURLPROTO_RTSP,
+        // CURLPROTO_MQTT only; MQTTS shares WS's bit and is handled above.
+        CURLPROTO_MQTT => CURLPROTO_MQTT,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // `Transport` is only referenced by the transport()-asserting tests, each of
+    // which is gated behind its own protocol feature (`http`/`tftp`/`file`). Gate
+    // the import identically so a minimal feature set (e.g. `--no-default-features`)
+    // does not surface an unused-import warning.
+    #[cfg(any(feature = "http", feature = "tftp", feature = "file"))]
+    use crate::conn::Transport;
+    use crate::error::{CurlCode, Result};
+    use std::sync::Arc;
+
+    /// A minimal, dependency-free executor that drives a future to completion.
+    ///
+    /// Every [`Protocol`] default and the [`MockProto`] futures used here are
+    /// ready on the first poll (nothing truly pends), so a no-op waker suffices.
+    /// This keeps the tests independent of which Tokio features `curl-rs-lib`
+    /// enables and MSRV-safe on Rust 1.75 (`Waker::noop()` only exists from
+    /// 1.85). Mirrors the sibling `dns` module's test executor. No `unsafe` —
+    /// `Waker::from(Arc<W: Wake>)` is the safe constructor.
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct NoopWake;
+        impl Wake for NoopWake {
+            fn wake(self: Arc<Self>) {}
+        }
+
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(fut);
+        loop {
+            if let Poll::Ready(value) = fut.as_mut().poll(&mut cx) {
+                return value;
+            }
+        }
+    }
+
+    // A minimal handler implementing only the two required methods, used to
+    // prove the trait is object-safe (`&dyn Protocol`) and that all defaults
+    // behave.
+    struct MockProto;
+    impl Protocol for MockProto {
+        fn do_it<'a>(&'a self, _ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
+            Box::pin(async { Ok(true) })
+        }
+        fn done<'a>(
+            &'a self,
+            _ctx: &'a mut TransferCtx,
+            _status: Result<()>,
+            _premature: bool,
+        ) -> ProtoFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[test]
+    fn protopt_bit_values_are_frozen() {
+        assert_eq!(PROTOPT_NONE, 0);
+        assert_eq!(PROTOPT_SSL, 1);
+        assert_eq!(PROTOPT_DUAL, 1 << 1);
+        assert_eq!(PROTOPT_CLOSEACTION, 1 << 2);
+        assert_eq!(PROTOPT_DIRLOCK, 1 << 3);
+        assert_eq!(PROTOPT_NONETWORK, 1 << 4);
+        assert_eq!(PROTOPT_NEEDSPWD, 1 << 5);
+        assert_eq!(PROTOPT_NOURLQUERY, 1 << 6);
+        assert_eq!(PROTOPT_CREDSPERREQUEST, 1 << 7);
+        assert_eq!(PROTOPT_ALPN, 1 << 8);
+        assert_eq!(PROTOPT_URLOPTIONS, 1 << 10);
+        assert_eq!(PROTOPT_PROXY_AS_HTTP, 1 << 11);
+        assert_eq!(PROTOPT_WILDCARD, 1 << 12);
+        assert_eq!(PROTOPT_USERPWDCTRL, 1 << 13);
+        assert_eq!(PROTOPT_NOTCPPROXY, 1 << 14);
+        assert_eq!(PROTOPT_SSL_REUSE, 1 << 15);
+        assert_eq!(PROTOPT_CONN_REUSE, 0x1_0000);
+        // Bit 1 << 9 (formerly PROTOPT_STREAM) is intentionally free.
+    }
+
+    #[test]
+    fn curlproto_bit_values_are_frozen() {
+        assert_eq!(CURLPROTO_HTTP, 1 << 0);
+        assert_eq!(CURLPROTO_HTTPS, 1 << 1);
+        assert_eq!(CURLPROTO_FTP, 1 << 2);
+        assert_eq!(CURLPROTO_FTPS, 1 << 3);
+        assert_eq!(CURLPROTO_SCP, 1 << 4);
+        assert_eq!(CURLPROTO_SFTP, 1 << 5);
+        assert_eq!(CURLPROTO_TELNET, 1 << 6);
+        assert_eq!(CURLPROTO_LDAP, 1 << 7);
+        assert_eq!(CURLPROTO_LDAPS, 1 << 8);
+        assert_eq!(CURLPROTO_DICT, 1 << 9);
+        assert_eq!(CURLPROTO_FILE, 1 << 10);
+        assert_eq!(CURLPROTO_TFTP, 1 << 11);
+        assert_eq!(CURLPROTO_IMAP, 1 << 12);
+        assert_eq!(CURLPROTO_IMAPS, 1 << 13);
+        assert_eq!(CURLPROTO_POP3, 1 << 14);
+        assert_eq!(CURLPROTO_POP3S, 1 << 15);
+        assert_eq!(CURLPROTO_SMTP, 1 << 16);
+        assert_eq!(CURLPROTO_SMTPS, 1 << 17);
+        assert_eq!(CURLPROTO_RTSP, 1 << 18);
+        assert_eq!(CURLPROTO_GOPHER, 1 << 25);
+        assert_eq!(CURLPROTO_SMB, 1 << 26);
+        assert_eq!(CURLPROTO_SMBS, 1 << 27);
+        assert_eq!(CURLPROTO_MQTT, 1 << 28);
+        assert_eq!(CURLPROTO_GOPHERS, 1 << 29);
+        assert_eq!(CURLPROTO_MQTTS, 1 << 30);
+        assert_eq!(CURLPROTO_WSS, 1 << 31);
+        // curl reuses bit 30 for WS and MQTTS; verify the (intentional) overlap.
+        assert_eq!(CURLPROTO_WS, CURLPROTO_MQTTS);
+    }
+
+    #[test]
+    fn curl_poll_values_match_multi_h() {
+        assert_eq!(CURL_POLL_NONE, 0);
+        assert_eq!(CURL_POLL_IN, 1);
+        assert_eq!(CURL_POLL_OUT, 2);
+        assert_eq!(CURL_POLL_INOUT, 3);
+        assert_eq!(CURL_POLL_REMOVE, 4);
+    }
+
+    #[test]
+    fn followtype_discriminants_match_c() {
+        assert_eq!(FollowType::None as i32, 0);
+        assert_eq!(FollowType::Fake as i32, 1);
+        assert_eq!(FollowType::Retry as i32, 2);
+        assert_eq!(FollowType::Redir as i32, 3);
+    }
+
+    #[test]
+    fn pollset_add_and_query() {
+        let mut ps = Pollset::new();
+        assert!(ps.is_empty());
+        assert_eq!(ps.len(), 0);
+
+        ps.add_in(5);
+        assert_eq!(ps.action_of(5), CURL_POLL_IN);
+        ps.add_out(5);
+        assert_eq!(ps.action_of(5), CURL_POLL_INOUT);
+        assert_eq!(ps.len(), 1);
+
+        ps.add_in(7);
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps.action_of(7), CURL_POLL_IN);
+
+        // Unknown socket → NONE.
+        assert_eq!(ps.action_of(99), CURL_POLL_NONE);
+        assert_eq!(ps.sockets().len(), 2);
+    }
+
+    #[test]
+    fn pollset_set_removes_on_empty_interest() {
+        let mut ps = Pollset::new();
+        ps.set(3, CURL_POLL_INOUT);
+        assert_eq!(ps.action_of(3), CURL_POLL_INOUT);
+        // NONE removes it.
+        ps.set(3, CURL_POLL_NONE);
+        assert!(ps.is_empty());
+        // REMOVE (which carries no IN/OUT bit) also removes.
+        ps.set(4, CURL_POLL_IN);
+        ps.set(4, CURL_POLL_REMOVE);
+        assert!(ps.is_empty());
+    }
+
+    #[test]
+    fn unknown_and_dropped_schemes_are_none() {
+        assert!(scheme_handler("definitely-not-a-scheme").is_none());
+        assert!(scheme_handler("").is_none());
+        // RTMP family is intentionally dropped from this rewrite.
+        for dropped in ["rtmp", "rtmpt", "rtmpe", "rtmpte", "rtmps", "rtmpts"] {
+            assert!(
+                scheme_handler(dropped).is_none(),
+                "{dropped} must not be registered"
+            );
+        }
+        // The unsupported-protocol error code the caller uses is the frozen 1.
+        assert_eq!(CurlCode::UnsupportedProtocol.to_i32(), 1);
+    }
+
+    #[test]
+    fn protocol_family_mapping() {
+        assert_eq!(protocol_family(CURLPROTO_HTTP), CURLPROTO_HTTP);
+        assert_eq!(protocol_family(CURLPROTO_HTTPS), CURLPROTO_HTTP);
+        assert_eq!(protocol_family(CURLPROTO_WS), CURLPROTO_HTTP);
+        assert_eq!(protocol_family(CURLPROTO_WSS), CURLPROTO_HTTP);
+        assert_eq!(protocol_family(CURLPROTO_FTPS), CURLPROTO_FTP);
+        assert_eq!(protocol_family(CURLPROTO_SFTP), CURLPROTO_SFTP);
+        assert_eq!(protocol_family(CURLPROTO_SCP), CURLPROTO_SCP);
+        assert_eq!(protocol_family(CURLPROTO_IMAPS), CURLPROTO_IMAP);
+        assert_eq!(protocol_family(CURLPROTO_POP3S), CURLPROTO_POP3);
+        assert_eq!(protocol_family(CURLPROTO_SMTPS), CURLPROTO_SMTP);
+        assert_eq!(protocol_family(CURLPROTO_LDAPS), CURLPROTO_LDAP);
+        assert_eq!(protocol_family(CURLPROTO_GOPHERS), CURLPROTO_GOPHER);
+        assert_eq!(protocol_family(CURLPROTO_SMBS), CURLPROTO_SMB);
+        assert_eq!(protocol_family(CURLPROTO_MQTT), CURLPROTO_MQTT);
+        assert_eq!(protocol_family(CURLPROTO_RTSP), CURLPROTO_RTSP);
+        // Unknown / RTMP bit → 0.
+        assert_eq!(protocol_family(1 << 19), 0);
+        assert_eq!(protocol_family(0xDEAD_BEEF), 0);
+    }
+
+    #[test]
+    fn protocol_trait_is_object_safe_and_defaults_work() {
+        let mock = MockProto;
+        let dynref: &dyn Protocol = &mock;
+        let mut ctx = TransferCtx::new();
+
+        // Required methods.
+        assert!(block_on(dynref.do_it(&mut ctx)).unwrap());
+        assert!(block_on(dynref.done(&mut ctx, Ok(()), false)).is_ok());
+
+        // Async defaults.
+        assert!(block_on(dynref.setup_connection(&mut ctx)).is_ok());
+        assert!(block_on(dynref.connect(&mut ctx)).unwrap());
+        assert!(block_on(dynref.connecting(&mut ctx)).unwrap());
+        assert_eq!(block_on(dynref.do_more(&mut ctx)).unwrap(), 0);
+        assert!(block_on(dynref.doing(&mut ctx)).unwrap());
+        assert!(block_on(dynref.disconnect(&mut ctx, false)).is_ok());
+        assert!(block_on(dynref.write_resp(&mut ctx, b"body", false)).is_ok());
+        assert!(block_on(dynref.write_resp_hd(&mut ctx, b"H: v", true)).is_ok());
+        assert!(block_on(dynref.follow(&mut ctx, "http://e/", FollowType::Redir)).is_ok());
+
+        // Sync defaults.
+        assert_eq!(dynref.connection_check(&mut ctx, 0), 0);
+        dynref.attach(&mut ctx);
+        let mut ps = Pollset::new();
+        dynref.proto_pollset(&mut ctx, &mut ps);
+        dynref.doing_pollset(&mut ctx, &mut ps);
+        dynref.domore_pollset(&mut ctx, &mut ps);
+        dynref.perform_pollset(&mut ctx, &mut ps);
+        assert!(ps.is_empty());
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn http_scheme_lookup_is_case_insensitive() {
+        for spelling in ["http", "HTTP", "HtTp"] {
+            let h = scheme_handler(spelling).expect("http is registered");
+            assert_eq!(h.name, "http");
+            assert_eq!(h.protocol, CURLPROTO_HTTP);
+            assert_eq!(h.family, CURLPROTO_HTTP);
+            assert_eq!(h.defport, 80);
+            assert_eq!(h.transport(), Transport::Tcp);
+            assert!(!h.is_secure());
+        }
+        let hs = scheme_handler("https").unwrap();
+        assert_eq!(hs.protocol, CURLPROTO_HTTPS);
+        assert_eq!(hs.family, CURLPROTO_HTTP);
+        assert_eq!(hs.defport, 443);
+        assert!(hs.is_secure());
+        assert_ne!(hs.flags & PROTOPT_ALPN, 0);
+    }
+
+    #[cfg(feature = "ftp")]
+    #[test]
+    fn ftp_and_ftps_flags_match_c() {
+        let ftp = scheme_handler("ftp").unwrap();
+        assert_eq!(ftp.defport, 21);
+        assert_ne!(ftp.flags & PROTOPT_DUAL, 0);
+        assert_ne!(ftp.flags & PROTOPT_PROXY_AS_HTTP, 0);
+        assert_ne!(ftp.flags & PROTOPT_SSL_REUSE, 0);
+
+        let ftps = scheme_handler("ftps").unwrap();
+        assert_eq!(ftps.defport, 990);
+        assert!(ftps.is_secure());
+        assert_ne!(ftps.flags & PROTOPT_DUAL, 0);
+        // Verified against C: ftps carries NEITHER PROXY_AS_HTTP NOR SSL_REUSE.
+        assert_eq!(ftps.flags & PROTOPT_PROXY_AS_HTTP, 0);
+        assert_eq!(ftps.flags & PROTOPT_SSL_REUSE, 0);
+    }
+
+    #[cfg(feature = "pop3")]
+    #[test]
+    fn pop3_carries_nourlquery() {
+        // Verified against C: both pop3 and pop3s set PROTOPT_NOURLQUERY.
+        assert_ne!(
+            scheme_handler("pop3").unwrap().flags & PROTOPT_NOURLQUERY,
+            0
+        );
+        assert_ne!(
+            scheme_handler("pop3s").unwrap().flags & PROTOPT_NOURLQUERY,
+            0
+        );
+        assert_eq!(scheme_handler("pop3").unwrap().defport, 110);
+        assert_eq!(scheme_handler("pop3s").unwrap().defport, 995);
+    }
+
+    #[cfg(feature = "tftp")]
+    #[test]
+    fn tftp_uses_udp_transport() {
+        let t = scheme_handler("tftp").unwrap();
+        assert_eq!(t.defport, 69);
+        assert_eq!(t.transport(), Transport::Udp);
+    }
+
+    #[cfg(feature = "ssh")]
+    #[test]
+    fn ssh_schemes_carry_conn_reuse() {
+        // C stores the names uppercase ("SFTP"/"SCP"); we store lowercase and
+        // match case-insensitively, so an uppercase query still resolves.
+        let sftp = scheme_handler("SFTP").unwrap();
+        assert_eq!(sftp.name, "sftp");
+        assert_eq!(sftp.defport, 22);
+        assert_eq!(sftp.family, CURLPROTO_SFTP);
+        // Verified against C: sftp/scp set PROTOPT_CONN_REUSE.
+        assert_ne!(sftp.flags & PROTOPT_CONN_REUSE, 0);
+
+        let scp = scheme_handler("scp").unwrap();
+        assert_eq!(scp.defport, 22);
+        assert_eq!(scp.family, CURLPROTO_SCP);
+        assert_ne!(scp.flags & PROTOPT_CONN_REUSE, 0);
+    }
+
+    #[cfg(feature = "file")]
+    #[test]
+    fn file_scheme_uses_no_transport() {
+        let f = scheme_handler("file").unwrap();
+        assert_eq!(f.defport, 0);
+        assert_eq!(f.transport(), Transport::None);
+        assert_ne!(f.flags & PROTOPT_NONETWORK, 0);
+    }
+
+    #[cfg(feature = "websockets")]
+    #[test]
+    fn websocket_schemes_report_http_family() {
+        assert_eq!(scheme_handler("ws").unwrap().family, CURLPROTO_HTTP);
+        let wss = scheme_handler("WSS").unwrap();
+        assert_eq!(wss.name, "wss");
+        assert_eq!(wss.family, CURLPROTO_HTTP);
+        assert!(wss.is_secure());
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[test]
+    fn mqtts_family_is_mqtt_despite_ws_bit_overlap() {
+        let mqtts = scheme_handler("mqtts").unwrap();
+        assert_eq!(mqtts.protocol, CURLPROTO_MQTTS);
+        // Authoritative family for mqtts is MQTT, recorded directly, even though
+        // its protocol bit collides with CURLPROTO_WS.
+        assert_eq!(mqtts.family, CURLPROTO_MQTT);
+        assert_eq!(mqtts.defport, 8883);
+        assert!(mqtts.is_secure());
+    }
+}

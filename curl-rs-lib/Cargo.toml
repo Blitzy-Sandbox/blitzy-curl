@@ -69,6 +69,17 @@ mqtt = []      # CURL_DISABLE_MQTT
 rtsp = []      # CURL_DISABLE_RTSP
 cookies = []   # CURL_DISABLE_COOKIES
 
+# Additional protocol gates consumed by `protocols/mod.rs`. Not part of the AAP §0.5.3
+# default-on set {http,ftp,smtp,imap,pop3,tftp,telnet,dict,mqtt,rtsp}, so they are DEFAULT-OFF
+# (a scheme whose feature is off is simply not registered — `scheme_handler` returns None —
+# exactly like a stock curl compiled with the matching CURL_DISABLE_* guard). Empty dependency
+# lists: each only conditionally compiles its `protocols/` module.
+file = []          # CURL_DISABLE_FILE
+gopher = []        # CURL_DISABLE_GOPHER
+ldap = []          # CURL_DISABLE_LDAP
+smb = []           # CURL_DISABLE_SMB
+websockets = []    # CURL_DISABLE_WEBSOCKETS  (gates `protocols::ws` + the ws/wss schemes)
+
 # --- SSH protocol gates (SFTP/SCP over russh) ---
 # curl gated these on USE_LIBSSH / USE_LIBSSH2 (plus CURL_DISABLE_*); here the pure-Rust russh
 # stack is an optional dependency pulled in ONLY when an SSH-based protocol is enabled. All are
