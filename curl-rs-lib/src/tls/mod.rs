@@ -22,3 +22,4 @@
 
 pub mod hostname;
 pub mod keylog;
+pub mod session_cache;

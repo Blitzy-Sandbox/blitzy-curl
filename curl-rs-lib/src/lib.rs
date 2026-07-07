@@ -57,10 +57,13 @@ pub mod error;
 pub mod escape;
 pub mod hsts;
 pub mod idn;
+pub mod mime;
 pub mod netrc;
 pub mod progress;
 pub mod psl;
+pub mod ratelimit;
 pub mod request;
+pub mod urlapi;
 
 // ---------------------------------------------------------------------------
 // Authentication subsystem (root always present; optional GSSAPI/SPNEGO internals are

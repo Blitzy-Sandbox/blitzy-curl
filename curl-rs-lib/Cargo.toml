@@ -144,6 +144,7 @@ hickory-resolver = { workspace = true, optional = true }
 
 # --- Cryptography (pure-Rust; drives the auth mechanisms in auth/) ---
 sha2 = { workspace = true }
+sha1 = { workspace = true }
 md-5 = { workspace = true }
 md4 = { workspace = true }
 hmac = { workspace = true }

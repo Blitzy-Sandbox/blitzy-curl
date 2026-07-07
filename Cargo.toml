@@ -123,6 +123,7 @@ libc = "0.2"              # raw FFI bindings for C types at the `extern "C"` bou
 
 # --- Cryptography (authentication mechanisms; pure-Rust) ---
 sha2 = "0.10"             # SHA-256/SHA-512 for Digest auth and checksums
+sha1 = "0.10"             # SHA-1 for SCRAM-SHA-1 SASL auth (auth/scram.rs); RustCrypto Digest family
 md-5 = "0.10"             # MD5 for Digest and NTLM auth
 md4 = "0.10"              # MD4 for NTLM password hashing
 hmac = "0.12"             # HMAC for Digest auth and AWS SigV4
