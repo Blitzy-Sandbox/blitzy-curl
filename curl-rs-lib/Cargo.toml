@@ -117,7 +117,13 @@ socket2 = { workspace = true }
 # hyper 1.x gates these behind explicit features; `server` is intentionally omitted (no
 # in-process test server lives in this crate).
 hyper = { workspace = true, features = ["client", "http1", "http2"] }
-hyper-util = { workspace = true }
+# The `tokio` feature exposes `hyper_util::rt::{TokioIo, TokioExecutor}` — the bridge that
+# adapts a Tokio async stream to hyper's `Read`/`Write` IO traits and drives HTTP/2 client
+# connections on Tokio. It is REQUIRED by the DoH transport (`dns/doh.rs`), which runs an
+# internal hyper HTTP/2 client on Tokio (AAP §0.4 "DoH via hyper"). Hand-rolling the IO
+# adapter would require `unsafe`, which the crate root forbids, so `TokioIo` is mandatory.
+# The feature only pulls `tokio/rt` + `tokio/time` (already enabled above) — no new crates.
+hyper-util = { workspace = true, features = ["tokio"] }
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }

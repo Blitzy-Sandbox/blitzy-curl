@@ -36,6 +36,8 @@
 //! * [`auth`] — the authentication subsystem (Basic/Digest/Bearer/NTLM/Negotiate/SASL/SCRAM).
 //! * [`tls`] — the single rustls-based TLS layer.
 //! * [`protocols`] — the protocol-handler subtree.
+//! * [`dns`] — name resolution: the system resolver, DNS-over-HTTPS (RFC 8484), and the
+//!   optional hickory backend (feature `hickory-dns`).
 //!
 //! ## Feature matrix
 //!
@@ -53,11 +55,16 @@
 
 pub mod altsvc;
 pub mod content_encoding;
+// The cookie engine maps to curl's `CURL_DISABLE_COOKIES` guard: it is compiled only when
+// the (default-on) `cookies` feature is enabled, so a cookie-less build drops it entirely.
+#[cfg(feature = "cookies")]
+pub mod cookie;
 pub mod error;
 pub mod escape;
 pub mod hsts;
 pub mod idn;
 pub mod mime;
+pub mod multi;
 pub mod netrc;
 pub mod progress;
 pub mod psl;
@@ -86,3 +93,10 @@ pub mod tls;
 // ---------------------------------------------------------------------------
 
 pub mod protocols;
+
+// ---------------------------------------------------------------------------
+// DNS resolution subtree (system resolver + DNS-over-HTTPS; the optional hickory
+// backend is feature-gated within the subtree — see `dns::hickory`).
+// ---------------------------------------------------------------------------
+
+pub mod dns;

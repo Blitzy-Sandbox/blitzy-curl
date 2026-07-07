@@ -15,6 +15,14 @@
 //! No command-line flag is invented here: only the built-in `--help` / `--version` that
 //! `clap` provides are recognized, preserving the frozen curl flag contract.
 
+// CLI sub-modules — language rewrites of curl's `src/*.c`, wired in as they are added.
+mod terminal;
+
+// Interactive no-echo password prompt (Rust rewrite of `src/tool_getpass.c`). Consumed by the
+// argument- and operation-handling layer when a required password is not supplied on the command
+// line (for example `-u user:` with an empty password, `--proxy-user`, or an SSH key passphrase).
+mod getpass;
+
 use clap::Parser;
 
 /// First line of `--version` output, in curl's parity form
