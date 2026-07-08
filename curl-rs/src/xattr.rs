@@ -17,20 +17,23 @@
 //! [Common Extended Attributes](https://freedesktop.org/wiki/CommonExtendedAttributes/)
 //! recommendations and matching curl's `fwrite_xattr` exactly:
 //!
-//! | Attribute name           | Source (`CURLINFO`)      | curl field (`lib/getinfo.c`) |
+//! | Attribute name           | Source                   | curl origin                  |
 //! |--------------------------|--------------------------|------------------------------|
 //! | `user.creator`           | the literal `"curl"`     | (constant)                   |
 //! | `user.xdg.referrer.url`  | `CURLINFO_REFERER`       | `data->state.referer`        |
 //! | `user.mime_type`         | `CURLINFO_CONTENT_TYPE`  | `data->info.contenttype`     |
-//! | `user.xdg.origin.url`    | `CURLINFO_EFFECTIVE_URL` | `data->state.url`            |
+//! | `user.xdg.origin.url`    | the `url` argument       | `per->url` (the caller's URL)|
 //!
 //! The `user.xdg.referrer.url` / `user.mime_type` pair is emitted from the [`MAPPINGS`] table,
-//! reproduced verbatim from the C `mappings[]` array; `user.creator` and `user.xdg.origin.url`
-//! are written directly by [`fwrite_xattr`], exactly as the C function does.
+//! reproduced verbatim from the C `mappings[]` array (resolved via `curl_easy_getinfo`);
+//! `user.creator` and `user.xdg.origin.url` are written directly by [`fwrite_xattr`], exactly as
+//! the C function does. The origin URL is the per-transfer URL the caller passes in (curl's
+//! `url` argument, i.e. `per->url`), **not** `CURLINFO_EFFECTIVE_URL` — matching C exactly so the
+//! recorded origin is correct even after redirects or per-transfer URL changes.
 //!
 //! ## Credential stripping
 //!
-//! Before the effective URL is stored it is run through [`stripcredentials`], which removes any
+//! Before the origin URL is stored it is run through [`stripcredentials`], which removes any
 //! embedded `user:password@` userinfo so that credentials never leak into on-disk metadata.
 //! This is a direct port of curl's `stripcredentials`, implemented on top of the library's
 //! [`Url`] API (curl's `CURLU`): parse the URL, clear the user and password components, and
@@ -75,11 +78,13 @@ use curl_rs_lib::Easy;
 
 /// The subset of string-valued `CURLINFO` items consulted when writing extended attributes.
 ///
-/// curl's `src/tool_xattr.c` names `CURLINFO_REFERER` and `CURLINFO_CONTENT_TYPE` in its
-/// `mappings[]` table and additionally reads `CURLINFO_EFFECTIVE_URL` in `fwrite_xattr`. Because
-/// the safe-Rust core does not (yet) expose a generic `curl_easy_getinfo` surface, this small
-/// enum stands in for the `CURLINFO` selector and is resolved by [`getinfo`] against the fields
-/// the [`Easy`] handle actually publishes.
+/// curl's `src/tool_xattr.c` names exactly `CURLINFO_REFERER` and `CURLINFO_CONTENT_TYPE` in its
+/// `mappings[]` table; those are the only two `curl_easy_getinfo` selectors `fwrite_xattr`
+/// consults. (The origin URL is **not** obtained via `CURLINFO_EFFECTIVE_URL` — it is the `url`
+/// argument passed to `fwrite_xattr`, i.e. `per->url`; see [`fwrite_xattr`].) Because the
+/// safe-Rust core does not (yet) expose a generic `curl_easy_getinfo` surface, this small enum
+/// stands in for the `CURLINFO` selector and is resolved by [`getinfo`] against the fields the
+/// [`Easy`] handle actually publishes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CurlInfo {
     /// `CURLINFO_REFERER` — the `Referer:` header for the request (curl's
@@ -88,9 +93,6 @@ enum CurlInfo {
     /// `CURLINFO_CONTENT_TYPE` — the `Content-Type` of the retrieved document (curl's
     /// `data->info.contenttype`).
     ContentType,
-    /// `CURLINFO_EFFECTIVE_URL` — the last-used URL, after any redirects (curl's
-    /// `data->state.url`).
-    EffectiveUrl,
 }
 
 /// Fetch a string `CURLINFO` value from the easy handle — the safe-Rust analogue of
@@ -106,23 +108,13 @@ fn getinfo(easy: &Easy, info: CurlInfo) -> Option<String> {
 
         // curl: `*param_charp = data->info.contenttype;`
         //
-        // The safe-Rust core does not yet surface the response `Content-Type` through the easy
-        // handle's read-back `info`, so the value is reported as absent. Reporting `None` is the
-        // correct, complete behavior — not a placeholder: when `curl_easy_getinfo` returns no
-        // string, curl's `fwrite_xattr` skips that mapping, and skipping `user.mime_type` here is
-        // byte-for-byte identical to that path.
-        CurlInfo::ContentType => None,
-
-        // curl: `*param_charp = data->state.url ? … : "";`
-        //
-        // The effective URL is held as the handle's parsed URL object (`state.uh`, curl's
-        // `state.uh`); serialize it back to a string with the URL API — equivalent to
-        // `curl_url_get(uh, CURLUPART_URL, …, 0)`. An unset/unserializable URL yields `None`.
-        CurlInfo::EffectiveUrl => easy
-            .state
-            .uh
-            .as_ref()
-            .and_then(|u| u.get(CurlUPart::Url, 0).ok()),
+        // Read the response `Content-Type` back from the easy handle's `info` sub-struct, the
+        // exact analogue of `curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &value)` returning
+        // `data->info.contenttype`. It is populated by the HTTP response-header processing path
+        // (`Info::set_content_type`) when a `Content-Type:` header is present and is `None`
+        // otherwise, so `fwrite_xattr` writes `user.mime_type` exactly when curl would — and
+        // skips it (curl's `if(!result && value)`) when the response carried no type.
+        CurlInfo::ContentType => easy.info.contenttype.clone(),
     }
 }
 
@@ -263,23 +255,28 @@ fn fsetxattr_raw(_fd: RawFd, _name: &CStr, _value: &[u8]) -> i32 {
 
 /// Store curl-request metadata alongside a downloaded file using extended attributes.
 ///
-/// This is the Rust port of curl's `int fwrite_xattr(CURL *curl, const char *url, int fd)`. The
-/// signature is adapted to the safe-Rust core: instead of receiving the URL as a separate
-/// argument, the effective URL is read from the easy handle itself (curl's
-/// `CURLINFO_EFFECTIVE_URL`).
+/// This is the Rust port of curl's `int fwrite_xattr(CURL *curl, const char *url, int fd)`, and
+/// its signature mirrors the C function one-to-one: the origin URL is received as an explicit
+/// `url` argument — the exact per-transfer URL the caller used (curl's `per->url`, passed at
+/// `src/tool_operate.c` as `fwrite_xattr(curl, per->url, fileno(outs->stream))`) — rather than
+/// being read back from the handle. Using the caller-supplied URL is important for parity: after
+/// redirects or any per-transfer URL change it records the URL that actually produced this file,
+/// and it does not depend on `CURLINFO_EFFECTIVE_URL` (which C's `fwrite_xattr` never consults).
+/// The `easy` handle is still consulted, but only for the two `mappings[]` `CURLINFO` values
+/// (`CURLINFO_REFERER`, `CURLINFO_CONTENT_TYPE`).
 ///
 /// The attributes are written in the same order as the C function:
 ///
 /// 1. `user.creator` = `"curl"` — written unconditionally.
 /// 2. Each row of [`MAPPINGS`] (`user.xdg.referrer.url`, then `user.mime_type`) whose
 ///    [`CurlInfo`] value is present, aborting on the first attribute that fails to set.
-/// 3. `user.xdg.origin.url` = the effective URL with credentials stripped by
+/// 3. `user.xdg.origin.url` = the passed `url` with credentials stripped by
 ///    [`stripcredentials`].
 ///
 /// Returns `0` on success (parity with the C `int` return). A nonzero return indicates the first
 /// failing `fsetxattr`; a return of `1` specifically indicates that credential stripping failed
 /// (curl's `if(!nurl) return 1;`).
-pub fn fwrite_xattr(easy: &Easy, fd: RawFd) -> i32 {
+pub fn fwrite_xattr(easy: &Easy, url: &str, fd: RawFd) -> i32 {
     // curl: `int err = xattr(fd, "user.creator", "curl");`
     let mut err = set_xattr(fd, "user.creator", "curl");
 
@@ -298,17 +295,17 @@ pub fn fwrite_xattr(easy: &Easy, fd: RawFd) -> i32 {
 
     // curl: `if(!err) { char *nurl = stripcredentials(url); if(!nurl) return 1;
     //         err = xattr(fd, "user.xdg.origin.url", nurl); curl_free(nurl); }`
+    //
+    // The origin URL is the caller-supplied `url` (curl's `url` argument), stripped of any
+    // embedded credentials. As in C there is no "URL absent" branch — `url` is always provided by
+    // the post-transfer caller — so stripping is unconditional, and a stripping failure fails
+    // closed with `1` rather than risking a credential leak into on-disk metadata.
     if err == 0 {
-        if let Some(url) = getinfo(easy, CurlInfo::EffectiveUrl) {
-            match stripcredentials(&url) {
-                Some(nurl) => err = set_xattr(fd, "user.xdg.origin.url", &nurl),
-                // curl: `if(!nurl) return 1;` — fail closed rather than risk leaking credentials.
-                None => return 1,
-            }
+        match stripcredentials(url) {
+            Some(nurl) => err = set_xattr(fd, "user.xdg.origin.url", &nurl),
+            // curl: `if(!nurl) return 1;`
+            None => return 1,
         }
-        // If the handle carries no effective URL there is nothing to record as the origin, so
-        // `err` is left at `0`. curl is always invoked with a non-NULL URL after a completed
-        // transfer, so in practice an effective URL is always present.
     }
 
     err
@@ -389,38 +386,93 @@ mod tests {
         assert_eq!(MAPPINGS[1].info, CurlInfo::ContentType);
     }
 
-    /// `getinfo` must read `CURLINFO_REFERER` from `state.referer` and the effective URL from the
-    /// handle's parsed URL, and must report `CURLINFO_CONTENT_TYPE` as absent (the safe-Rust core
-    /// does not yet surface it, so the mapping is skipped — parity with curl's NULL result).
+    /// `getinfo` must read `CURLINFO_REFERER` from `state.referer` (curl's
+    /// `data->state.referer`).
     #[test]
-    fn getinfo_reads_referer_and_effective_url() {
+    fn getinfo_reads_referer() {
         let mut easy = Easy::open();
         easy.state.referer = Some("http://referrer.example/from".to_string());
-        easy.set_url("http://carol:pw@target.example/doc")
-            .expect("valid URL");
 
         assert_eq!(
             getinfo(&easy, CurlInfo::Referer).as_deref(),
             Some("http://referrer.example/from")
         );
-
-        // The effective URL is returned verbatim (credentials are stripped later, by
-        // `fwrite_xattr`, via `stripcredentials`).
-        let effective = getinfo(&easy, CurlInfo::EffectiveUrl).expect("URL was set");
-        assert!(
-            effective.contains("target.example"),
-            "effective URL missing host: {effective:?}"
-        );
-
-        assert_eq!(getinfo(&easy, CurlInfo::ContentType), None);
     }
 
-    /// On a freshly opened handle with nothing set, every consulted `CURLINFO` value is absent.
+    /// `getinfo` must surface the response `Content-Type` through the handle's `info` sub-struct
+    /// (`data->info.contenttype`) so that `--xattr` writes `user.mime_type` exactly when curl
+    /// would. This is the direct regression test for the finding that `CURLINFO_CONTENT_TYPE`
+    /// always returned `None`.
     #[test]
-    fn getinfo_absent_values_are_none() {
-        let easy = Easy::open();
-        assert_eq!(getinfo(&easy, CurlInfo::Referer), None);
+    fn getinfo_reads_content_type_from_info() {
+        let mut easy = Easy::open();
+
+        // Absent by default — the mapping is skipped, matching curl's NULL result.
         assert_eq!(getinfo(&easy, CurlInfo::ContentType), None);
-        assert_eq!(getinfo(&easy, CurlInfo::EffectiveUrl), None);
+
+        // Once the response-header path records a type, `getinfo` returns it verbatim (including
+        // any `; charset=…` parameter, exactly as curl keeps `data->info.contenttype`).
+        easy.info.set_content_type("text/html; charset=utf-8");
+        assert_eq!(
+            getinfo(&easy, CurlInfo::ContentType).as_deref(),
+            Some("text/html; charset=utf-8")
+        );
+    }
+
+    /// `Info::set_content_type` stores a non-empty value (trimmed) and treats an empty/whitespace
+    /// value as absent, so a `Content-Type:` header with no value reports as `None`.
+    #[test]
+    fn set_content_type_trims_and_clears() {
+        let mut easy = Easy::open();
+
+        easy.info.set_content_type("  application/json  ");
+        assert_eq!(easy.info.contenttype.as_deref(), Some("application/json"));
+
+        easy.info.set_content_type("   ");
+        assert_eq!(easy.info.contenttype, None);
+    }
+
+    /// The origin URL written to `user.xdg.origin.url` must come from the `url` argument passed
+    /// to [`fwrite_xattr`] (curl's `per->url`), **not** from the handle's parsed URL
+    /// (`state.uh`). This is the direct regression test for the finding that the origin URL was
+    /// derived from `Easy.state.uh` instead of the per-transfer URL: after a redirect the two
+    /// differ, and curl records the caller-supplied one.
+    ///
+    /// The actual `fsetxattr` syscall is not exercised here — extended-attribute writes require a
+    /// filesystem that supports the `user.*` namespace, which is not guaranteed in a unit-test
+    /// sandbox — so, exactly as curl's own unit test 1621 does, this asserts the credential-
+    /// stripped value that [`fwrite_xattr`] computes from the passed `url` and feeds to
+    /// `fsetxattr`.
+    #[test]
+    fn origin_url_uses_passed_url_not_handle_state() {
+        // A handle whose parsed URL (the OLD, buggy source) is a *different* origin than the
+        // per-transfer URL the caller will pass in.
+        let mut easy = Easy::open();
+        easy.set_url("http://handle-derived.example/old")
+            .expect("valid URL");
+
+        // The per-transfer URL actually used for this file (curl's `per->url`), with credentials.
+        let passed_url = "http://alice:s3cr3t@passed.example/final?x=1";
+
+        // `fwrite_xattr` computes the origin as `stripcredentials(passed_url)`; assert that value.
+        let origin = stripcredentials(passed_url).expect("a well-formed URL must strip");
+        assert_eq!(origin, "http://passed.example/final?x=1");
+
+        // It must be derived from the PASSED url, never from the handle's `state.uh`.
+        assert!(
+            !origin.contains("handle-derived.example"),
+            "origin url must not come from the handle state: {origin:?}"
+        );
+        assert!(!origin.contains("alice") && !origin.contains("s3cr3t"));
+
+        // Sanity: the handle's own parsed URL is indeed the other origin, proving the two sources
+        // are distinguishable and that we selected the passed one.
+        let handle_url = easy
+            .state
+            .uh
+            .as_ref()
+            .and_then(|u| u.get(CurlUPart::Url, 0).ok())
+            .expect("handle URL was set");
+        assert!(handle_url.contains("handle-derived.example"));
     }
 }

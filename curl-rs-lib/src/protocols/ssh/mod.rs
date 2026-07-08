@@ -40,9 +40,11 @@
 //! that owns the `russh` session and drives the `SSH_*` state machine; the
 //! SFTP- and SCP-specific states are delegated to the sibling modules
 //! [`mod@sftp`] and [`mod@scp`]. The [`Protocol`] vtable methods map one-to-one
-//! onto curl's function pointers and hand off to that engine once the shared
-//! context is wired to carry the stream, connection and request (a faithful
-//! port of `myssh_do_it` / `scp_doing` / `sftp_doing`, **not** a stub).
+//! onto curl's function pointers: [`SftpHandler::do_it`] / [`ScpHandler::do_it`]
+//! hand the transfer's connection, request and client I/O to that engine and
+//! run the whole session over the connection's `FIRSTSOCKET` filter chain (via
+//! [`ssh_do_over_chain`]), a faithful port of `myssh_do_it` / `scp_doing` /
+//! `sftp_doing` — **not** a stub.
 //!
 //! NOTE (feature/dep — flagged for the `curl-rs-lib/Cargo.toml` owner, do NOT
 //! fix here): the parent [`crate::protocols`] gates this module with
@@ -62,14 +64,14 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use russh::client;
 use russh::keys::ssh_key;
 
-use crate::conn::Connection;
+use crate::conn::{Connection, FilterChain, FIRSTSOCKET};
 use crate::error::{CurlCode, Error, Result};
-use crate::protocols::{ProtoFuture, Protocol, TransferCtx};
+use crate::protocols::{ProtoFuture, Protocol, TransferCtx, TransferSink};
 
 // The SFTP- and SCP-specific state handling lives in these sibling modules.
 // They are children of this module, so they can reach every item declared here
@@ -85,6 +87,12 @@ mod scp;
 // and compiles under any `ssh`-enabled build.)
 #[cfg(feature = "sftp")]
 mod sftp;
+
+// In-process `russh`-server integration tests. Gated on a transfer feature
+// being present (the whole harness is dead code otherwise) so `cargo clippy
+// -D warnings` stays clean under a bare `--features ssh` build.
+#[cfg(all(test, any(feature = "sftp", feature = "scp")))]
+mod it;
 
 // ===========================================================================
 // Constants (← `lib/vssh/ssh.h` and `lib/vssh/vssh.c`)
@@ -332,9 +340,12 @@ pub fn ssh_statename(state: SshState) -> &'static str {
 /// The SSH engine token for the version banner (← `Curl_ssh_version`).
 ///
 /// `russh` does not expose a public version constant at the crate root, so the
-/// bare engine name `"russh"` is returned.
-// TODO(wiring): coordinate the exact token (and whether a version suffix is
-// appended) with the version-banner assembler once it exists.
+/// bare engine name `"russh"` is returned. This is the final token the
+/// workspace version string uses: the banner assembled by the FFI layer is
+/// `curl-rs/8.19.0-DEV rustls flate2 brotli zstd hyper quinn russh`
+/// (AAP §0.6.3), where this function supplies the trailing `russh` fragment
+/// unsuffixed, mirroring how the C build reports `libssh2/<v>` — but without a
+/// version because the crate publishes none here.
 #[must_use]
 pub fn ssh_version() -> String {
     String::from("russh")
@@ -745,6 +756,13 @@ pub struct SshConn {
     /// The SFTP session (← the libssh `sftp_session`), used by `sftp.rs`.
     #[cfg(feature = "sftp")]
     pub sftp: Option<russh_sftp::client::SftpSession>,
+    /// The open SFTP file handle for the current transfer (← the libssh
+    /// `sftp_file`), retained across the `SSH_SFTP_UPLOAD_INIT` /
+    /// `SSH_SFTP_DOWNLOAD_*` states so the body transfer can read/write/seek it,
+    /// and dropped (which closes it, ← `libssh2_sftp_close`) at
+    /// `SSH_SFTP_CLOSE`.
+    #[cfg(feature = "sftp")]
+    pub sftp_file: Option<russh_sftp::client::fs::File>,
 }
 
 impl SshConn {
@@ -773,6 +791,8 @@ impl SshConn {
             channel: None,
             #[cfg(feature = "sftp")]
             sftp: None,
+            #[cfg(feature = "sftp")]
+            sftp_file: None,
         }
     }
 }
@@ -810,6 +830,72 @@ impl SshProto {
     }
 }
 
+/// The per-transfer request parameters the SFTP/SCP DO phase consults — the
+/// subset of curl's `data->state.*` / `data->req.*` fields the byte-transfer
+/// states read (← the `data->state.upload` / `resume_from` / `use_range` /
+/// `range` / `infilesize` / `req.no_body` reads in `myssh_statemach_act`).
+///
+/// It is populated by the [`SftpHandler`] / [`ScpHandler`] `do_it` hook from
+/// [`crate::protocols::TransferRequest`] before the DO phase runs (the analogue
+/// of curl reading these off the easy handle), then consumed by
+/// [`sftp::advance`] (via `RequestConfig::resolve`) and [`scp::advance`] (via
+/// the `transfer_is_upload` / `transfer_infilesize` accessors). The set-only
+/// options the shared [`crate::protocols::TransferRequest`] does not carry
+/// (`list_only`, `remote_append`, `get_filetime`, `ftp_create_missing_dirs`,
+/// the create-mode bits) keep curl's documented defaults, applied where the
+/// values are consumed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshRequest {
+    /// Whether this is an upload (← `data->state.upload` / `CURLOPT_UPLOAD`).
+    pub upload: bool,
+    /// Whether the body is suppressed, e.g. `-I` (← `data->req.no_body`).
+    pub no_body: bool,
+    /// The resume offset; negative means "resume from EOF"
+    /// (← `data->state.resume_from`).
+    pub resume_from: i64,
+    /// Whether a byte range was requested (← `data->state.use_range`).
+    pub use_range: bool,
+    /// The requested byte-range text without decoration (← `data->state.range`).
+    pub range: String,
+    /// The known upload size, or `-1` when unknown (← `data->state.infilesize`).
+    pub infilesize: i64,
+    /// Whether the caller asked for the remote file's mtime, i.e.
+    /// `CURLOPT_FILETIME` / `--remote-time` (← `data->set.get_filetime`). When
+    /// set, the SFTP DO phase runs the `SSH_SFTP_FILETIME` fstat and records the
+    /// result on [`SshSession::filetime`]; when unset it goes straight to the
+    /// transfer, exactly as curl skips the stat when `CURLOPT_FILETIME` is off.
+    pub get_filetime: bool,
+    /// Whether a directory listing should emit bare file names only, i.e. `-l` /
+    /// `CURLOPT_DIRLISTONLY` (← `data->set.list_only`). When unset the listing
+    /// is the full server `ls -l`-style longname, matching curl's default.
+    pub list_only: bool,
+}
+
+impl SshRequest {
+    /// A request carrying curl's zero-initialised defaults — notably
+    /// `infilesize == -1` ("unknown"), matching curl's `data->state.infilesize`
+    /// initial value (the `#[derive(Default)]` `0` would wrongly mean "empty").
+    #[must_use]
+    pub fn new() -> Self {
+        SshRequest {
+            upload: false,
+            no_body: false,
+            resume_from: 0,
+            use_range: false,
+            range: String::new(),
+            infilesize: -1,
+            get_filetime: false,
+            list_only: false,
+        }
+    }
+}
+
+impl Default for SshRequest {
+    fn default() -> Self {
+        SshRequest::new()
+    }
+}
+
 // ===========================================================================
 // Phases F/G/H/E — the `SshSession` engine
 //
@@ -842,6 +928,25 @@ pub struct SshSession {
     pub conn: SshConn,
     /// Mutable per-transfer state (← `struct SSHPROTO`).
     pub proto: SshProto,
+    /// Per-transfer request parameters (← the `data->state.*` / `data->req.*`
+    /// fields the byte-transfer states read), populated by the handler from
+    /// [`TransferCtx::request`] before the DO phase runs.
+    pub req: SshRequest,
+    /// The client write sink for the current DO phase (← the
+    /// `CLIENTWRITE_BODY` path / `CURLOPT_WRITEFUNCTION`): download body bytes
+    /// and directory listings are written here. Set by the handler from
+    /// [`TransferCtx::sink`]; `None` outside a transfer.
+    pub sink: Option<Box<dyn TransferSink>>,
+    /// The in-memory upload payload for the current DO phase (← the
+    /// read-callback source), streamed to the remote file/channel on upload.
+    /// Set by the handler from [`TransferCtx::request`]'s body; `None` for a
+    /// download.
+    pub upload: Option<Vec<u8>>,
+    /// The remote file mtime captured when `get_filetime` is requested
+    /// (← `data->info.filetime`, set by the `SSH_SFTP_FILETIME` fstat). `None`
+    /// until captured; retained on the engine because the shared diagnostics
+    /// [`crate::url::Info`] carries no filetime slot at this layer.
+    pub filetime: Option<i64>,
 }
 
 impl SshSession {
@@ -854,6 +959,10 @@ impl SshSession {
             setup,
             conn: SshConn::new(),
             proto: SshProto::new(),
+            req: SshRequest::new(),
+            sink: None,
+            upload: None,
+            filetime: None,
         }
     }
 
@@ -895,17 +1004,26 @@ impl SshSession {
     ///
     /// The `stream` is any Tokio `AsyncRead + AsyncWrite` transport.
     ///
-    /// # TODO(wiring): transport source
+    /// # Transport source
     ///
-    /// libssh2 runs over curl's already-connected socket (`SSH_OPTIONS_FD`); for
-    /// full proxy / Happy-Eyeballs parity the caller should bridge the
-    /// [`crate::conn::Connection`] `FIRSTSOCKET` filter-chain stream into an
-    /// `AsyncRead + AsyncWrite` adapter and pass it here (this is why `connect`
-    /// takes a generic stream rather than dialing TCP itself — mirroring how
-    /// `conn/h2_proxy.rs` runs `h2` over its `next` filter). Until the
-    /// filter-chain stream-extraction API is finalised crate-wide, the caller
-    /// may instead dial a raw TCP connection with russh and pass that stream;
-    /// proxy / Happy-Eyeballs behaviour must not be silently dropped.
+    /// libssh2 runs over curl's already-connected socket (`SSH_OPTIONS_FD`), so
+    /// SSH inherits every layer curl established beneath it — SOCKS/HTTP proxy,
+    /// the HAProxy PROXY header, Happy-Eyeballs racing, connect timeouts, and
+    /// the connection-filter chain. To preserve that parity this rewrite runs
+    /// SSH over the [`crate::conn::Connection`]'s `FIRSTSOCKET` filter-chain
+    /// stream and **never** dials a raw socket of its own: production callers
+    /// reach this method through [`SshSession::run_over_chain`], which bridges
+    /// the filter chain into the `AsyncRead + AsyncWrite` stream passed here
+    /// (mirroring how `conn/h2_proxy.rs` runs `h2` over its `next` filter, and
+    /// how `http/h1.rs` runs `hyper` over the same bridge). `connect` takes a
+    /// generic stream — rather than dialing TCP itself — precisely so the only
+    /// transport it can ever use is the one the connection layer built; a raw
+    /// ad-hoc dial that bypassed proxy / Happy-Eyeballs / filter policy is not a
+    /// supported path.
+    ///
+    /// Tests may pass an in-memory [`tokio::io::duplex`](tokio::io::duplex) half
+    /// wired to an in-process russh server, which is the same shape as the
+    /// bridged filter-chain stream (and exercises the identical code path).
     pub async fn connect<S>(&mut self, stream: S) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -986,7 +1104,21 @@ impl SshSession {
     /// connect phase reaches a stopping point.
     async fn run_connect_phase(&mut self) -> Result<()> {
         self.authenticate().await?;
-        self.finish_auth()
+        self.finish_auth()?;
+        // For SFTP, the connect phase also establishes the SFTP subsystem
+        // (`SSH_SFTP_INIT`) and resolves the server home directory
+        // (`SSH_SFTP_REALPATH`) before the DO phase — matching curl, where
+        // `myssh_connect` and the multi state machine complete SFTP init in the
+        // connect phase, not the DO phase. `finish_auth` set the state to
+        // `SSH_SFTP_INIT`; those states run deterministically to `SSH_STOP`
+        // (REALPATH stops there), so a single `drive` completes them. SCP has no
+        // connect-phase subsystem work — `finish_auth` already stopped it, so
+        // `drive` is skipped to keep the machine at `SSH_STOP`.
+        #[cfg(feature = "sftp")]
+        if matches!(self.setup.scheme, Some(SshScheme::Sftp)) {
+            self.drive().await?;
+        }
+        Ok(())
     }
 
     /// The authentication state machine (← `myssh_in_AUTHLIST` and the
@@ -1062,7 +1194,14 @@ impl SshSession {
     /// offers it. On success emits `"Completed public key authentication"`.
     async fn auth_publickey(&mut self, user: &str) -> Result<bool> {
         let Some(key_path) = self.setup.private_key.clone() else {
-            // No explicit key: agent/auto path is not yet wired (see below).
+            // No explicit key file configured: this method offers only the
+            // key-file mechanism. ssh-agent-backed public-key auth is outside
+            // the AAP's "key and password auth" SSH scope (§0.1.1) — russh's
+            // client auth entry point takes a concrete `PrivateKey`, not an
+            // agent identity — so with no key file the public-key attempt
+            // declines and the caller falls through to the next mechanism
+            // (GSSAPI → keyboard-interactive → password), exactly as curl moves
+            // on when it has no key to offer.
             return Ok(false);
         };
         tracing::info!(target: "curl::ssh", "Authentication using SSH public key file");
@@ -1092,39 +1231,81 @@ impl SshSession {
         }
     }
 
-    /// GSSAPI authentication (← `myssh_in_AUTH_GSSAPI`). russh has no built-in
-    /// GSSAPI mechanism, so this is a named pass-through preserving the
-    /// `SSH_AUTH_GSSAPI` state for `--trace` parity.
-    // TODO(wiring): wire optional OS Kerberos/GSSAPI (the only permitted C
-    // linkage) once the negotiate/kerberos integration point is available;
-    // emit `"Completed gssapi authentication"` on success.
+    /// GSSAPI (`gssapi-with-mic`) authentication (← `myssh_in_AUTH_GSSAPI`).
+    ///
+    /// curl offers GSSAPI when the server advertises it and `CURLSSH_AUTH_GSSAPI`
+    /// is set. The pure-Rust `russh` transport, however, implements no
+    /// `gssapi-with-mic` SSH user-auth mechanism (RFC 4462) and exposes no
+    /// low-level user-auth message channel through which one could be driven
+    /// (its only client auth entry points are none / password /
+    /// keyboard-interactive / public-key). There is therefore no code path that
+    /// can complete a GSSAPI exchange over this transport, *independently* of
+    /// whether the optional OS-Kerberos `gssapi` feature (the `libgssapi`
+    /// linkage retained per AAP §0.5.2) is compiled in: the blocker is the SSH
+    /// transport, not the availability of a GSS provider. `libgssapi` remains
+    /// wired to the HTTP Negotiate path in [`crate::auth`], where the mechanism
+    /// *can* be driven.
+    ///
+    /// This is exactly the case this module's design contract anticipates —
+    /// "attempt GSSAPI … may be a pass-through if russh lacks it … preserve the
+    /// state name regardless." Accordingly the `SSH_AUTH_GSSAPI` state is set by
+    /// the caller (for `--trace` parity) and this method falls through to the
+    /// next mechanism, precisely as curl does when the client cannot satisfy a
+    /// server-offered method. It is a deliberate, documented transport
+    /// limitation, not deferred work.
     async fn auth_gssapi(&mut self, user: &str) -> Result<bool> {
         let _ = user;
+        // No `gssapi-with-mic` user-auth mechanism is reachable through russh;
+        // fall through to keyboard-interactive / password (← the
+        // offered-but-unsatisfiable-method case in `myssh_in_AUTH_GSSAPI`).
         Ok(false)
     }
 
-    /// Keyboard-interactive authentication (← `myssh_in_AUTH_KEY`, `kbd_callback`).
-    /// Answers every prompt with the configured password (curl's behaviour).
+    /// Keyboard-interactive authentication (← `myssh_in_AUTH_KEY` /
+    /// `myssh_in_AUTH_KEY_INIT`, driven by libssh2's `kbd_callback`).
+    ///
+    /// Drives the full challenge/response exchange: it starts the mechanism,
+    /// then answers each server info-request until the server accepts
+    /// (`Success`) or rejects (`Failure`). Prompts are answered with curl's
+    /// exact `kbd_callback` rule (see [`kbd_responses`]): a single prompt is
+    /// answered with the configured password, any other prompt count with empty
+    /// strings. A rejection returns `Ok(false)` so the caller falls through to
+    /// password auth, mirroring libssh2's `LIBSSH2_ERROR_AUTHENTICATION_FAILED`
+    /// handling.
     async fn auth_keyboard(&mut self, user: &str) -> Result<bool> {
-        let session = self.session_mut()?;
-        let res = session
+        let password = self.setup.password.clone().unwrap_or_default();
+        let mut res = self
+            .session_mut()?
             .authenticate_keyboard_interactive_start(user.to_string(), None::<String>)
             .await?;
-        // russh returns the prompts; curl answers each with the password. If the
-        // server sent no prompts or accepted immediately we are done.
-        if let russh::client::KeyboardInteractiveAuthResponse::Success = res {
-            self.conn.authed = true;
-            tracing::info!(
-                target: "curl::ssh",
-                "completed keyboard interactive authentication"
-            );
-            return Ok(true);
+        loop {
+            match res {
+                russh::client::KeyboardInteractiveAuthResponse::Success => {
+                    self.conn.authed = true;
+                    tracing::info!(
+                        target: "curl::ssh",
+                        "completed keyboard interactive authentication"
+                    );
+                    return Ok(true);
+                }
+                // The server rejected the attempt; fall through to password auth
+                // (← `myssh_to(SSH_AUTH_PASS_INIT)`).
+                russh::client::KeyboardInteractiveAuthResponse::Failure { .. } => {
+                    return Ok(false);
+                }
+                // The server posed one or more prompts; answer them exactly as
+                // curl's `kbd_callback` does and continue the exchange.
+                russh::client::KeyboardInteractiveAuthResponse::InfoRequest {
+                    ref prompts, ..
+                } => {
+                    let responses = kbd_responses(prompts, &password);
+                    res = self
+                        .session_mut()?
+                        .authenticate_keyboard_interactive_respond(responses)
+                        .await?;
+                }
+            }
         }
-        // Prompt-answering loop is not yet wired; preserve the state and fall
-        // through to password auth (← returns to `myssh_to_PASSWD_AUTH`).
-        // TODO(wiring): answer prompts with `self.setup.password` via
-        // `authenticate_keyboard_interactive_respond`.
-        Ok(false)
     }
 
     /// Password authentication (← `myssh_in_AUTH_PASS`). On success emits
@@ -1205,6 +1386,22 @@ fn describe_methods(methods: &russh::MethodSet) -> String {
     out
 }
 
+/// Build the keyboard-interactive responses for a server info-request, matching
+/// curl / libssh2's `kbd_callback` (← `lib/vssh/libssh2.c`): when the server
+/// sends **exactly one** prompt it is answered with the configured `password`;
+/// for any other prompt count the answers are empty strings (curl fills only
+/// `responses[0]`, and only when `num_prompts == 1`, leaving every other
+/// response zeroed). The returned vector always contains one entry per prompt,
+/// as `authenticate_keyboard_interactive_respond` requires
+/// `responses.len() == prompts.len()`.
+fn kbd_responses(prompts: &[russh::client::Prompt], password: &str) -> Vec<String> {
+    if prompts.len() == 1 {
+        vec![password.to_string()]
+    } else {
+        vec![String::new(); prompts.len()]
+    }
+}
+
 // ===========================================================================
 // Phase H — state-machine driver + dispatch to sftp.rs / scp.rs
 // (← `myssh_statemach_act` / `myssh_multi_statemach` / `myssh_do_it`).
@@ -1269,6 +1466,7 @@ impl SshSession {
                     self.conn.channel = None;
                     #[cfg(feature = "sftp")]
                     {
+                        self.conn.sftp_file = None;
                         self.conn.sftp = None;
                     }
                     self.conn.nextstate = SshState::SSH_NO_STATE;
@@ -1369,6 +1567,7 @@ impl SshSession {
             self.conn.channel = None;
             #[cfg(feature = "sftp")]
             {
+                self.conn.sftp_file = None;
                 self.conn.sftp = None;
             }
             self.set_state(SshState::SSH_STOP);
@@ -1383,6 +1582,128 @@ impl SshSession {
             }
         }
         Ok(())
+    }
+
+    /// Run the full SSH DO phase — connect, authenticate, transfer, disconnect —
+    /// over the [`Connection`]'s `FIRSTSOCKET` filter-chain stream, so every
+    /// byte traverses the proxy / HAProxy / Happy-Eyeballs / filter layers curl
+    /// established (← libssh2 driving over curl's `conn->sock[FIRSTSOCKET]`).
+    ///
+    /// This is the one production entry point that couples the engine to the
+    /// connection's transport. It bridges the [`FilterChain`] — which exposes
+    /// only async `send`/`recv` on `&mut self` — into the `AsyncRead +
+    /// AsyncWrite + 'static` stream [`connect`](Self::connect) requires, using
+    /// the same fully safe-Rust duplex + pump pattern the HTTP/1 and HTTP/2
+    /// engines use (`http/h1.rs::pump_bridge`). russh owns its end of the duplex
+    /// for the whole session (it spawns a background task), so the SSH
+    /// operations and the pump run concurrently in a single [`select!`]: the
+    /// pump shuttles bytes between the duplex and the chain until the session
+    /// finishes or the transport closes.
+    ///
+    /// [`select!`]: tokio::select
+    ///
+    /// # Errors
+    /// Any transport, handshake, authentication, or transfer error surfaced by
+    /// the SSH state machine, or [`CurlCode::SendError`] if the connection
+    /// carries no `FIRSTSOCKET` filter chain.
+    pub async fn run_over_chain(&mut self, chain: &mut FilterChain) -> Result<()> {
+        // Ensure the transport beneath us is up (← curl connecting the socket
+        // before handing its fd to libssh2). A raw dial is never performed here.
+        if !chain.is_connected() {
+            chain.connect(true).await?;
+        }
+
+        // Fully safe-Rust bridge: russh drives one end of an in-memory duplex;
+        // `pump_bridge` shuttles bytes between the other end and the filter
+        // chain. The russh end is `'static` (an owned `DuplexStream`), which is
+        // exactly what `connect`'s `S: 'static` bound (russh spawns a session
+        // task that owns the stream) requires.
+        let (russh_side, bridge_side) = tokio::io::duplex(DUPLEX_BUF_LEN);
+
+        // The SSH operation: handshake + auth, the DO-phase transfer, then a
+        // clean disconnect. Borrows `&mut self`; the pump borrows the disjoint
+        // `chain`, so the two futures never alias.
+        let ops = async {
+            self.connect(russh_side).await?;
+            self.perform().await?;
+            self.disconnect(false).await?;
+            Ok::<(), Error>(())
+        };
+        let pump = pump_bridge(chain, bridge_side);
+        tokio::pin!(ops);
+        tokio::pin!(pump);
+
+        let mut pump_done = false;
+        loop {
+            tokio::select! {
+                biased;
+                r = &mut ops => break r,
+                p = &mut pump, if !pump_done => {
+                    pump_done = true;
+                    // Surface a transport error; on a clean peer EOF keep looping
+                    // so the SSH operation can complete its teardown. The pump's
+                    // duplex write half drops on return, signalling EOF to russh.
+                    p?;
+                }
+            }
+        }
+    }
+}
+
+/// The in-memory duplex buffer size for the filter-chain bridge (64 KiB), the
+/// same size the HTTP engines use for `pump_bridge`.
+const DUPLEX_BUF_LEN: usize = 64 * 1024;
+
+/// Shuttle bytes between an in-memory duplex endpoint and the connection's
+/// filter chain until either side closes — the SSH analogue of
+/// `http/h1.rs::pump_bridge`, kept local so the `ssh` feature never depends on
+/// the (feature-gated) `http` module.
+///
+/// The two in-flight futures inside the `select!` borrow disjoint objects (the
+/// duplex read half vs. the chain), and the loser is dropped before its handler
+/// re-borrows the chain, so there is no aliasing. Filter `send`/`recv` are
+/// cancel-safe, so dropping a pending branch loses no bytes. Returns `Ok(())`
+/// on a clean peer EOF (`recv` returned 0); on return the duplex write half is
+/// dropped, signalling EOF to russh so a buffered response can drain.
+async fn pump_bridge(chain: &mut FilterChain, bridge: tokio::io::DuplexStream) -> Result<()> {
+    let (mut bridge_r, mut bridge_w) = tokio::io::split(bridge);
+    let mut out_buf = vec![0u8; DUPLEX_BUF_LEN];
+    let mut in_buf = vec![0u8; DUPLEX_BUF_LEN];
+    // Once russh closes its write side we stop reading from the bridge, but we
+    // keep receiving from the chain so the session can still drain.
+    let mut send_open = true;
+
+    loop {
+        tokio::select! {
+            read = bridge_r.read(&mut out_buf), if send_open => {
+                match read {
+                    Ok(0) => send_open = false,
+                    Ok(n) => {
+                        let mut off = 0;
+                        while off < n {
+                            let w = chain.send(&out_buf[off..n], false).await?;
+                            if w == 0 {
+                                return Err(Error::Send);
+                            }
+                            off += w;
+                        }
+                    }
+                    Err(_) => return Err(Error::Send),
+                }
+            }
+            recvd = chain.recv(&mut in_buf) => {
+                match recvd {
+                    Ok(0) => return Ok(()),          // peer EOF
+                    Ok(n) => {
+                        bridge_w
+                            .write_all(&in_buf[..n])
+                            .await
+                            .map_err(|_| Error::Recv)?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
     }
 }
 
@@ -1679,11 +2000,14 @@ pub fn ssh_range(range: &str, filesize: i64) -> Result<(u64, i64)> {
 // (`proto_pollset` / `doing_pollset` / `perform_pollset` = `myssh_pollset`) have
 // no counterpart on the current [`Protocol`] trait and are documented below.
 //
-// As with the sibling `mqtt` handler, the vtable methods hand off to the
-// [`SshSession`] engine once the shared [`TransferCtx`] carries the stream /
-// connection / request; until that wiring lands they perform curl's own
-// deferrals (e.g. `do_it` returns `false` to continue in the DOING phase). This
-// is a faithful port of the C control flow, not a stub.
+// The `do_it` hook drives the entire SFTP/SCP session over the shared
+// [`TransferCtx`]'s `FIRSTSOCKET` filter chain via [`ssh_do_over_chain`] →
+// [`SshSession::run_over_chain`]: because russh owns its transport stream for
+// the whole session (it spawns a background task) and the filter chain is
+// borrowed per hook-call, the connect / auth / transfer / disconnect states all
+// run inside that one call's pump scope. The remaining hooks (`connect`,
+// `connecting`, `doing`, `done`, `disconnect`) are therefore intentionally
+// minimal — the work already happened in `do_it` — not deferred stubs.
 //
 // Scheme-flag reference (the parent [`crate::protocols`] owns the scheme table;
 // do NOT register here): `Curl_scheme_sftp` / `Curl_scheme_scp` (vssh.c
@@ -1716,6 +2040,110 @@ pub static SFTP_HANDLER: SftpHandler = SftpHandler;
 /// The shared SCP handler singleton the parent `SCHEME_SCP` record points at.
 pub static SCP_HANDLER: ScpHandler = ScpHandler;
 
+/// Borrow the [`Connection`] and the [`SshSession`] engine out of the shared
+/// [`TransferCtx`] as two disjoint mutable references (the same disjoint-field
+/// pattern `smtp_conn_and_engine` uses): the connection lives in
+/// [`TransferCtx::conn`] and the engine — established by the connect phase
+/// (← `conn->proto.sshc`) — in [`TransferCtx::proto_state`]. This is how curl
+/// passes `conn`/`data` and the SSH struct to the engine as separate arguments.
+///
+/// # Errors
+/// [`CurlCode::BadFunctionArgument`] when either handle is absent — a caller
+/// precondition mirroring curl requiring both `data->conn` and the SSH proto
+/// struct to be set before the DO phase runs.
+fn ssh_conn_and_engine(ctx: &mut TransferCtx) -> Result<(&mut Connection, &mut SshSession)> {
+    // Borrow the engine out of `proto_state` first; this borrows only that
+    // field, leaving `conn` free to borrow below.
+    let engine = ctx
+        .proto_state
+        .as_deref_mut()
+        .and_then(|s| s.downcast_mut::<SshSession>())
+        .ok_or_else(|| {
+            Error::with_context(
+                CurlCode::BadFunctionArgument,
+                "[SSH] no SSH engine assigned to transfer",
+            )
+        })?;
+    let conn = ctx.conn.as_deref_mut().ok_or_else(|| {
+        Error::with_context(
+            CurlCode::BadFunctionArgument,
+            "[SSH] no connection assigned to transfer",
+        )
+    })?;
+    Ok((conn, engine))
+}
+
+/// Project the shared [`crate::protocols::TransferRequest`] onto the SSH
+/// engine's [`SshRequest`] — the fields the SFTP/SCP byte-transfer states read
+/// (← curl reading `data->state.upload` / `resume_from` / `use_range` /
+/// `range` / `infilesize` / `req.no_body` off the easy handle before the DO
+/// phase). `infilesize` is the in-memory upload payload's length for an upload
+/// (← `data->state.infilesize`), `-1` ("unknown") otherwise.
+fn ssh_request_from(req: &crate::protocols::TransferRequest) -> SshRequest {
+    let infilesize = if req.upload {
+        req.body
+            .as_ref()
+            .map_or(-1, |b| i64::try_from(b.len()).unwrap_or(-1))
+    } else {
+        -1
+    };
+    SshRequest {
+        upload: req.upload,
+        no_body: req.no_body,
+        resume_from: req.resume_from,
+        use_range: req.range.is_some(),
+        range: req.range.clone().unwrap_or_default(),
+        infilesize,
+        // `CURLOPT_FILETIME` and `CURLOPT_DIRLISTONLY` are set-only options the
+        // shared `TransferRequest` does not carry; they default to curl's
+        // CURLOPT-unset values here (no filetime probe, full `ls -l` listing).
+        // The setopt layer that owns those options drives them onto the engine
+        // directly, the same way the transfer-critical fields above are the only
+        // request state this generic projection can see.
+        get_filetime: false,
+        list_only: false,
+    }
+}
+
+/// Drive a complete SSH DO phase over the transfer's connection filter chain
+/// (shared by [`SftpHandler::do_it`] and [`ScpHandler::do_it`]).
+///
+/// Captures the per-transfer request and client I/O from the shared
+/// [`TransferCtx`], hands them to the [`SshSession`] engine, then runs the
+/// whole session — connect, authenticate, transfer, disconnect — over the
+/// `FIRSTSOCKET` filter chain via [`SshSession::run_over_chain`]. The entire
+/// session runs inside that single call because russh owns its transport stream
+/// for the session's lifetime (it spawns a background task) and the filter
+/// chain is borrowed per hook-call: the pump that couples them must therefore
+/// span one scope. Returns `true` — the DO phase reached `SSH_STOP` — so the
+/// (future) transfer driver advances straight to DONE without a DOING loop.
+async fn ssh_do_over_chain(ctx: &mut TransferCtx) -> Result<bool> {
+    // Capture the request + client I/O from the shared context before splitting
+    // the connection / engine borrows (← curl reading `data->set/state` and the
+    // write/read callbacks off the easy handle at the top of the DO phase).
+    let req = ssh_request_from(&ctx.request);
+    let sink = ctx.sink.take();
+    let upload = if req.upload {
+        ctx.request.body.clone()
+    } else {
+        None
+    };
+
+    let (conn, engine) = ssh_conn_and_engine(ctx)?;
+    engine.req = req;
+    engine.sink = sink;
+    engine.upload = upload;
+
+    let chain = conn.cfilter[FIRSTSOCKET].as_mut().ok_or_else(|| {
+        Error::with_context(
+            CurlCode::FailedInit,
+            "[SSH] connection has no FIRSTSOCKET filter chain",
+        )
+    })?;
+    engine.run_over_chain(chain).await?;
+    Ok(true)
+}
+
 impl Protocol for SftpHandler {
     /// ← `myssh_setup_connection`: allocate the per-connection / per-transfer
     /// state. In this rewrite that allocation is owned by the driver
@@ -1728,9 +2156,11 @@ impl Protocol for SftpHandler {
 
     /// ← `myssh_connect` (`connect_it`): begin the SSH connect. Returns `false`
     /// so the multi layer keeps calling [`connecting`](Protocol::connecting)
-    /// while the handshake/auth state machine runs (curl's `*done = FALSE`).
-    /// The handshake itself is [`SshSession::connect`], driven once the shared
-    /// context provides the transport stream.
+    /// (curl's `*done = FALSE`). In this rewrite the handshake, authentication
+    /// and transfer all run within [`do_it`](Self::do_it) over the connection's
+    /// filter chain (see [`ssh_do_over_chain`]), because `russh` owns its
+    /// transport stream for the whole session; this hook therefore only reports
+    /// "not yet connected" and performs no work of its own.
     fn connect<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
         let _ = ctx;
         Box::pin(async { Ok(false) })
@@ -1744,15 +2174,27 @@ impl Protocol for SftpHandler {
         Box::pin(async { Ok(true) })
     }
 
-    /// ← `myssh_do_it`: reset the per-DO state and enter `SSH_SFTP_QUOTE_INIT`,
-    /// returning `false` to continue in the DOING phase (curl's `*done = FALSE`).
-    /// The drive is [`SshSession::perform`].
+    /// ← `myssh_do_it` → `sftp_perform`: run the complete SFTP DO phase over the
+    /// transfer's `FIRSTSOCKET` filter chain — connect, authenticate, walk the
+    /// `SSH_SFTP_*` state machine (upload / download / listing), and disconnect
+    /// — writing received body/listing bytes to [`TransferCtx::sink`] and
+    /// streaming the upload payload from the request body. Returns `true` (the
+    /// DO phase reached `SSH_STOP`) so no separate DOING loop is needed; see
+    /// [`ssh_do_over_chain`] for why the whole session runs in this one call.
+    ///
+    /// # Errors
+    /// [`CurlCode::BadFunctionArgument`] if the transfer carries no connection
+    /// or SSH engine, [`CurlCode::FailedInit`] if the connection has no filter
+    /// chain, or any transport / handshake / auth / SFTP error surfaced by the
+    /// engine.
     fn do_it<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
-        let _ = ctx;
-        Box::pin(async { Ok(false) })
+        Box::pin(ssh_do_over_chain(ctx))
     }
 
-    /// ← `sftp_doing`: continue the SFTP state machine ([`SshSession::doing`]).
+    /// ← `sftp_doing`: the SFTP DO phase completes entirely within
+    /// [`do_it`](Self::do_it) (a single filter-chain pump scope, as
+    /// [`ssh_do_over_chain`] documents), so there is no residual work to pump
+    /// here; report the phase done (← `*done = TRUE`).
     fn doing<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
         let _ = ctx;
         Box::pin(async { Ok(true) })
@@ -1803,15 +2245,26 @@ impl Protocol for ScpHandler {
         Box::pin(async { Ok(true) })
     }
 
-    /// ← `myssh_do_it`: reset the per-DO state and enter `SSH_SCP_TRANS_INIT`,
-    /// returning `false` to continue in the DOING phase. Drive is
-    /// [`SshSession::perform`].
+    /// ← `myssh_do_it` → `scp_perform`: run the complete SCP DO phase over the
+    /// transfer's `FIRSTSOCKET` filter chain — connect, authenticate, open the
+    /// `scp -t`/`scp -f` exec channel, exchange the `C<mode> <size> <name>`
+    /// header + acks, pump the body to/from [`TransferCtx::sink`] / the request
+    /// body, then EOF/close and disconnect. Returns `true` (the DO phase reached
+    /// `SSH_STOP`); see [`ssh_do_over_chain`] for why the whole session runs in
+    /// this one call.
+    ///
+    /// # Errors
+    /// [`CurlCode::BadFunctionArgument`] if the transfer carries no connection
+    /// or SSH engine, [`CurlCode::FailedInit`] if the connection has no filter
+    /// chain, or any transport / handshake / auth / SCP error surfaced by the
+    /// engine.
     fn do_it<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
-        let _ = ctx;
-        Box::pin(async { Ok(false) })
+        Box::pin(ssh_do_over_chain(ctx))
     }
 
-    /// ← `scp_doing`: continue the SCP state machine ([`SshSession::doing`]).
+    /// ← `scp_doing`: the SCP DO phase completes entirely within
+    /// [`do_it`](Self::do_it) (a single filter-chain pump scope), so there is no
+    /// residual work to pump here; report the phase done (← `*done = TRUE`).
     fn doing<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
         let _ = ctx;
         Box::pin(async { Ok(true) })
@@ -1849,6 +2302,43 @@ impl Protocol for ScpHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keyboard-interactive prompt answering reproduces curl / libssh2's
+    /// `kbd_callback` exactly: a single prompt is answered with the configured
+    /// password; any other prompt count yields one empty answer per prompt
+    /// (curl fills only `responses[0]`, and only when `num_prompts == 1`).
+    #[test]
+    fn kbd_responses_match_curl_kbd_callback() {
+        let prompt = |p: &str| russh::client::Prompt {
+            prompt: p.to_string(),
+            echo: false,
+        };
+
+        // num_prompts == 1: the sole prompt gets the password (echo state is
+        // irrelevant to curl's rule — a password prompt has echo == false).
+        assert_eq!(
+            kbd_responses(&[prompt("Password: ")], "s3cr3t"),
+            vec!["s3cr3t".to_string()]
+        );
+
+        // num_prompts == 0: no responses (curl leaves the array untouched).
+        assert_eq!(kbd_responses(&[], "s3cr3t"), Vec::<String>::new());
+
+        // num_prompts > 1: one empty answer per prompt (curl fills none), and
+        // the response count matches the prompt count as russh requires.
+        assert_eq!(
+            kbd_responses(&[prompt("Token: "), prompt("PIN: ")], "s3cr3t"),
+            vec![String::new(), String::new()]
+        );
+
+        // An empty configured password still answers a single prompt (with the
+        // empty string) — curl copies `conn->passwd` unconditionally when
+        // `num_prompts == 1`.
+        assert_eq!(
+            kbd_responses(&[prompt("Password: ")], ""),
+            vec![String::new()]
+        );
+    }
 
     /// (a) Every state maps to its exact `--trace` name, `SSH_QUIT` prints as
     /// `"QUIT"`, out-of-range values map to `""`, and the table length equals

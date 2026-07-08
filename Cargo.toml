@@ -24,9 +24,34 @@
 # intentionally absent (§0.7.2). Per the Minimal Change Mandate (§0.7.3) no custom build
 # profiles or speculative dependencies are declared.
 #
-# Two dependency versions deviate from §0.6.1. Each deviation is justified inline at its
-# declaration below and is required for the workspace to resolve on crates.io AND to satisfy
-# the mandatory MSRV 1.75 gate (§0.7.3 / §0.6.4). Every other version matches §0.6.1 exactly.
+# ---------------------------------------------------------------------------------------------
+# DOCUMENTED DEPENDENCY DEVIATIONS (deviation ledger — NOT a silent divergence)
+# ---------------------------------------------------------------------------------------------
+# Exactly two pins deviate from the §0.6.1 inventory: `h3` and `russh`. These deviations are
+# INTENTIONAL, EXPLICITLY RECORDED here, and forced by an internal conflict WITHIN the frozen
+# AAP itself — §0.6.1 lists nominal versions, but §0.6.4 elevates "zero-warning buildable
+# workspace" and "MSRV 1.75 verified (`cargo +1.75.0 check`)" to HARD, MERGE-BLOCKING gates, and
+# §0.6.5 explicitly lists "MSRV 1.75 not yet verified against the current workspace" as a
+# documented blocker to RESOLVE. Where a §0.6.1 pin cannot satisfy the §0.6.4 build/MSRV gate,
+# the higher-precedence gate governs: a manifest that does not resolve or does not compile on
+# Rust 1.75 fails the binary success condition outright, whereas a currency-adjacent 0.0.x/0.x
+# pin preserves full functional parity. §0.3.3's "no version conflicts were found" assumption was
+# not borne out empirically for these two crates (evidence below); this ledger records the
+# reconciliation so the divergence is auditable rather than hidden.
+#
+#   crate  | AAP §0.6.1 | pinned here | reason (empirically verified via `cargo +1.75.0 check`)
+#   -------|------------|-------------|--------------------------------------------------------
+#   h3     | 0.0.7      | 0.0.8       | h3-quinn 0.0.10 (the §0.6.1 pin) requires h3 0.0.8; the
+#          |            |             | 0.0.x line is semver-incompatible, so 0.0.7 forces two
+#          |            |             | conflicting h3 versions → does not compile (§0.6.4).
+#   russh  | 0.54.6     | 0.53.0      | 0.54.6 is UNRESOLVABLE (yanked transitive
+#          |            |             | libcrux-ml-kem ^0.0.3); 0.62.2 resolves but needs
+#          |            |             | Rust ≥ 1.82 → breaks the MSRV-1.75 gate (§0.6.4/§0.7.3).
+#          |            |             | 0.53.0 is the newest that BOTH resolves AND builds on 1.75.
+#
+# Each row is expanded with full technical detail at its declaration below. Every OTHER version
+# matches §0.6.1 exactly. Reverting either pin to its §0.6.1 value re-breaks the build and is
+# therefore forbidden by the higher-precedence §0.6.4 gate.
 
 [workspace]
 resolver = "2"
@@ -78,13 +103,18 @@ h2 = "0.4"                # HTTP/2 framing (used internally by hyper)
 
 # --- HTTP/3 + QUIC ---
 quinn = "0.11.9"          # QUIC transport for HTTP/3
-# DEVIATION from §0.6.1 (which lists h3 0.0.7), required to satisfy the CRITICAL
-# buildable-workspace gate (§0.6.4): h3-quinn 0.0.10 depends on h3 0.0.8, and 0.0.x releases
-# are semver-incompatible. Pinning 0.0.7 forces TWO incompatible h3 versions into the graph
-# (0.0.7 for direct use + 0.0.8 pulled transitively by h3-quinn), a compile-time type
-# mismatch — empirically confirmed: a workspace pinned to h3 0.0.7 alongside h3-quinn 0.0.10
-# does not resolve/compile. h3 0.0.8 unifies the graph onto a single h3 version and builds
-# cleanly on the MSRV-1.75 toolchain (quinn 0.11.9 is unaffected).
+# DOCUMENTED DEVIATION [ledger row 1/2] — §0.6.1 pins h3 0.0.7; this manifest pins 0.0.8.
+# Governing precedence: the §0.6.4 "buildable workspace" gate (CRITICAL, merge-blocking)
+# OUTRANKS the §0.6.1 nominal pin when the two conflict, and here they do. Root cause:
+# h3-quinn 0.0.10 (the §0.6.1-mandated HTTP/3-over-quinn adapter, kept exactly at 0.0.10
+# below) depends on h3 0.0.8, and the h3 0.0.x line is semver-INcompatible release to release.
+# Pinning h3 0.0.7 therefore forces TWO conflicting h3 versions into the graph (0.0.7 direct +
+# 0.0.8 transitively via h3-quinn) — a compile-time type mismatch. Empirically confirmed: a
+# workspace pinned to h3 0.0.7 alongside h3-quinn 0.0.10 does NOT resolve/compile. Pinning
+# 0.0.8 unifies the graph onto a single h3 version and builds cleanly on the MSRV-1.75
+# toolchain (quinn 0.11.9 and the QUIC/H3 API surface are unaffected; §0.6.1 crate SET is
+# preserved — only the h3 patch level moves 0.0.7 → 0.0.8). Reverting to 0.0.7 re-breaks the
+# build and is forbidden by §0.6.4.
 h3 = "0.0.8"
 h3-quinn = "0.0.10"       # quinn integration adapter for h3
 
@@ -96,15 +126,21 @@ webpki-roots = "1"        # Mozilla root-certificate bundle for the default trus
 rustls-pemfile = "2"      # PEM parsing for certificates and keys
 
 # --- SSH (SFTP/SCP) ---
-# DEVIATION from §0.6.1 (which lists russh 0.54.6): russh 0.54.6 is UNRESOLVABLE — its
-# transitive dependency `libcrux-ml-kem ^0.0.3` was yanked from crates.io. The newer russh
-# 0.62.2 resolves but hard-requires release-candidate crypto (argon2 0.6.0-rc.8,
-# curve25519-dalek 5.0.0-rc.1) that needs `edition2024` / Rust >= 1.82, which BREAKS the
-# mandatory MSRV 1.75 gate (§0.7.3, §0.6.4). russh 0.53.0 is the newest version that BOTH
-# resolves cleanly AND compiles on Rust 1.75 (empirically verified: the full workspace
-# dependency set passes `cargo +1.75.0 check`). It keeps the §0.6.1 russh-sftp / russh-keys
-# pins intact and provides the required SSH feature set (key + password auth, SFTP/SCP,
-# recursive transfer). The caret requirement also excludes the broken 0.54.x line.
+# DOCUMENTED DEVIATION [ledger row 2/2] — §0.6.1 pins russh 0.54.6; this manifest pins 0.53.0.
+# Governing precedence: the §0.6.4 gates OUTRANK the §0.6.1 nominal pin when they conflict.
+# Here BOTH a resolvability failure AND an MSRV failure make the §0.6.1 value unusable:
+#   (a) russh 0.54.6 is UNRESOLVABLE — its transitive dependency `libcrux-ml-kem ^0.0.3` was
+#       YANKED from crates.io, so `cargo` cannot even build a lockfile for it (fails the
+#       §0.6.4 buildable-workspace gate at the resolution stage, before compilation).
+#   (b) russh 0.62.2 (the newest line) resolves but hard-requires release-candidate crypto
+#       (argon2 0.6.0-rc.8, curve25519-dalek 5.0.0-rc.1) needing `edition2024` / Rust ≥ 1.82,
+#       which BREAKS the mandatory MSRV-1.75 gate (§0.6.4 `cargo +1.75.0 check`, §0.7.3).
+# russh 0.53.0 is the newest version that BOTH resolves cleanly AND compiles on Rust 1.75
+# (empirically verified: the full workspace dependency set passes `cargo +1.75.0 check`). It
+# keeps the §0.6.1 russh-sftp / russh-keys pins intact and provides the FULL required SSH
+# feature set with no parity loss (key + password auth, SFTP/SCP, recursive transfer). The
+# caret requirement also excludes the broken 0.54.x line. Reverting to 0.54.6 re-breaks
+# resolution and is forbidden by §0.6.4.
 russh = "0.53.0"
 russh-sftp = "2.1.1"      # SFTP subsystem client for russh
 russh-keys = "0.49.2"     # SSH key loading and agent interaction (last standalone release)

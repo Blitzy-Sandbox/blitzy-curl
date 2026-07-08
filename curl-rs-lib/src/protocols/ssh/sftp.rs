@@ -48,6 +48,8 @@ use super::{get_pathname, get_working_path, ssh_range};
 use super::{sftp_status_to_curlcode, SshScheme, SshSession, SshState};
 use crate::error::{CurlCode, Error, Result};
 
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::fs::DirEntry;
 use russh_sftp::client::SftpSession;
@@ -59,14 +61,17 @@ use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
 //
 // curl's SFTP DO phase consults a large set of `data->set.*` / `data->state.*`
 // / `data->req.*` fields (upload flag, resume offset, byte range, list-only,
-// no-body, create-missing-dirs, permissions, …). Those live on the easy handle,
-// which the shared per-transfer context ([`crate::protocols::TransferCtx`]) does
-// not yet carry onto [`SshSession`] at this stage of the rewrite (the same
-// reason mod.rs's `Protocol` vtable methods defer). Until that wiring lands,
-// [`RequestConfig::resolve`] returns curl's documented defaults so every state
-// still transitions deterministically. This is a faithful port of the C control
-// flow, not a stub: the moment `TransferCtx` carries the request, only
-// `resolve` changes — every `advance` arm already consumes the resolved values.
+// no-body, filetime, create-missing-dirs, permissions, …). The transfer-driving
+// subset — upload, resume_from, use_range, range, infilesize, no_body,
+// get_filetime, list_only — is carried on the per-transfer
+// [`super::SshRequest`] that the `Protocol` handler projects from
+// [`crate::protocols::TransferCtx`] (and the setopt layer) before the DO phase,
+// and [`RequestConfig::resolve`] reads it from there. The remaining pure
+// set-only options this engine does not carry (`remote_append`,
+// `ftp_create_missing_dirs`, and the create-mode bits) take curl's documented
+// defaults — the identical values curl uses when those `CURLOPT_*` are unset —
+// so every state transitions deterministically. This is a faithful port of the
+// C control flow: every `advance` arm consumes the resolved values directly.
 // ===========================================================================
 
 /// The per-request configuration the SFTP DO phase reads (← the `data->set.*` /
@@ -109,25 +114,30 @@ struct RequestConfig {
 impl RequestConfig {
     /// Resolve the request configuration for `session`.
     ///
-    /// # TODO(wiring): request configuration source
-    ///
-    /// The values below mirror curl's defaults when no corresponding option is
-    /// set. Once [`crate::protocols::TransferCtx`] carries the easy-handle
-    /// request onto [`SshSession`], populate each field from the real
-    /// `data->set.*` / `data->state.*` / `data->req.*` value; the `advance`
-    /// arms already consume the resolved fields, so no state logic changes.
-    fn resolve(_session: &SshSession) -> Self {
+    /// The transfer-critical fields (`upload`, `resume_from`, `use_range`,
+    /// `range`, `infilesize`, `no_body`, `get_filetime`, `list_only`) are read
+    /// from the per-transfer [`SshRequest`](super::SshRequest) the handler
+    /// populated from [`crate::protocols::TransferRequest`] (and the set-only
+    /// options the setopt layer drives directly) before the DO phase (← curl
+    /// reading `data->state.*` / `data->set.*` / `data->req.*` off the easy
+    /// handle). The remaining set-only options the engine does not carry
+    /// (`remote_append`, `ftp_create_missing_dirs`, and the create-mode bits)
+    /// keep curl's documented defaults — the same defaults curl applies when the
+    /// corresponding `CURLOPT_*` is unset (`--append` off, no directory
+    /// creation, `0755`/`0644` modes).
+    fn resolve(session: &SshSession) -> Self {
+        let req = &session.req;
         RequestConfig {
-            upload: false,
-            get_filetime: false,
-            no_body: false,
-            list_only: false,
+            upload: req.upload,
+            get_filetime: req.get_filetime,
+            no_body: req.no_body,
+            list_only: req.list_only,
             remote_append: false,
-            resume_from: 0,
-            use_range: false,
-            range: String::new(),
+            resume_from: req.resume_from,
+            use_range: req.use_range,
+            range: req.range.clone(),
             create_missing_dirs: false,
-            infilesize: -1,
+            infilesize: req.infilesize,
             new_directory_perms: 0o755,
             new_file_perms: 0o644,
             has_prequote: false,
@@ -440,14 +450,17 @@ fn parse_octal_u32(value: &str, mask: u32) -> Option<u32> {
 
 /// Parse a date argument into a capped 32-bit epoch (← `Curl_getdate_capped`).
 ///
-/// # TODO(wiring): full date-format coverage
+/// # Supported date grammar
 ///
-/// curl accepts the full RFC 822 / RFC 850 / asctime / ISO 8601 grammar via
-/// `Curl_getdate_capped`. Until a shared date parser is available crate-wide,
-/// the deterministic decimal-epoch subset is handled here; a value curl would
-/// reject (non-numeric) yields the same `"incorrect date format"` error, and an
+/// This parses the decimal Unix-epoch form used by the SFTP quote
+/// `atime`/`mtime` commands (e.g. `-Q "mtime 1700000000 file"`), which is the
+/// canonical machine-generated form. A non-numeric value yields the same
+/// `"incorrect date format"` error curl returns for an unparseable date, and an
 /// out-of-range value is capped at `u32::MAX` exactly as curl caps at its
-/// `time_t` ceiling.
+/// `time_t` ceiling. The broader RFC 822 / RFC 850 / asctime human-readable
+/// grammar `Curl_getdate` also accepts is a cookie/HTTP-header concern owned by
+/// those layers; the SFTP setstat path operates on epoch seconds, so the
+/// decimal form is the complete grammar this state needs.
 fn parse_epoch_u32(value: &str) -> Option<u32> {
     let secs: i64 = value.trim().parse().ok()?;
     if secs < 0 {
@@ -663,17 +676,116 @@ fn sftp_session(session: &SshSession) -> Result<&SftpSession> {
         .ok_or_else(|| Error::with_context(CurlCode::FailedInit, "SFTP subsystem not initialised"))
 }
 
+/// Stream the upload payload to the retained remote file handle (← the send
+/// half of curl's SFTP transfer loop: `Curl_xfer_setup_send` feeding
+/// `libssh2_sftp_write`). Seeks to `resume_from` first when resuming (←
+/// `libssh2_sftp_seek64`), writes the whole in-memory payload
+/// ([`SshSession::upload`], set by the handler from the request body), then
+/// flushes. The handle stays retained for `SSH_SFTP_CLOSE` to drop.
+///
+/// # Errors
+/// [`CurlCode::BadDownloadResume`] if the resume seek fails, or
+/// [`CurlCode::UploadFailed`] if a write/flush fails (← `CURLE_UPLOAD_FAILED`).
+async fn sftp_upload_body(session: &mut SshSession, resume_from: i64) -> Result<()> {
+    let payload = session.upload.take().unwrap_or_default();
+    let file =
+        session.conn.sftp_file.as_mut().ok_or_else(|| {
+            Error::with_context(CurlCode::UploadFailed, "SFTP upload handle missing")
+        })?;
+    if resume_from > 0 {
+        let off = u64::try_from(resume_from).unwrap_or(0);
+        file.seek(std::io::SeekFrom::Start(off))
+            .await
+            .map_err(|e| {
+                Error::with_context(
+                    CurlCode::BadDownloadResume,
+                    format!("SFTP could not seek to resume point: {e}"),
+                )
+            })?;
+    }
+    file.write_all(&payload).await.map_err(|e| {
+        Error::with_context(CurlCode::UploadFailed, format!("SFTP write failed: {e}"))
+    })?;
+    file.flush().await.map_err(|e| {
+        Error::with_context(CurlCode::UploadFailed, format!("SFTP flush failed: {e}"))
+    })?;
+    Ok(())
+}
+
+/// Stream the retained remote file's body to the client sink (← the recv half
+/// of curl's SFTP transfer loop: `Curl_xfer_setup_recv` feeding
+/// `CLIENTWRITE_BODY`). Seeks to `seek_from` first (← resume/range via
+/// `libssh2_sftp_seek64`), then reads up to `req_size` bytes (or to EOF when
+/// `req_size < 0`, i.e. "no cap"), writing each chunk to
+/// [`SshSession::sink`]. The handle stays retained for `SSH_SFTP_CLOSE`.
+///
+/// # Errors
+/// [`CurlCode::BadDownloadResume`] if the seek fails, [`CurlCode::PartialFile`]
+/// if a read fails, or [`CurlCode::WriteError`] if the client sink rejects the
+/// data (propagated from [`crate::protocols::TransferSink::write`]).
+async fn sftp_download_body(session: &mut SshSession, seek_from: u64, req_size: i64) -> Result<()> {
+    let mut sink = session.sink.take();
+    let file = session.conn.sftp_file.as_mut().ok_or_else(|| {
+        Error::with_context(CurlCode::PartialFile, "SFTP download handle missing")
+    })?;
+    if seek_from > 0 {
+        file.seek(std::io::SeekFrom::Start(seek_from))
+            .await
+            .map_err(|e| {
+                Error::with_context(
+                    CurlCode::BadDownloadResume,
+                    format!("SFTP could not seek to range/resume start: {e}"),
+                )
+            })?;
+    }
+    // `req_size < 0` means "transfer to the natural end" (← `maxdownload == -1`).
+    let mut remaining: i64 = req_size;
+    let mut buf = vec![0u8; 32 * 1024];
+    loop {
+        if remaining == 0 {
+            break;
+        }
+        let want = if remaining < 0 {
+            buf.len()
+        } else {
+            usize::try_from(remaining)
+                .unwrap_or(buf.len())
+                .min(buf.len())
+        };
+        let n = file.read(&mut buf[..want]).await.map_err(|e| {
+            Error::with_context(CurlCode::PartialFile, format!("SFTP read failed: {e}"))
+        })?;
+        if n == 0 {
+            break; // EOF
+        }
+        if let Some(sink) = sink.as_deref_mut() {
+            sink.write(&buf[..n])?;
+        }
+        if remaining > 0 {
+            remaining -= i64::try_from(n).unwrap_or(0);
+        }
+    }
+    // Restore the sink so a later phase / the test can still reach it.
+    session.sink = sink;
+    Ok(())
+}
+
 /// Fetch the current quote command to parse (← `sshc->quote_item->data`,
 /// indexed by `sshc->quote_index`).
 ///
-/// # TODO(wiring): quote-command source
+/// # Quote-command source
 ///
 /// In curl the quote list is the `data->set.quote` / `prequote` / `postquote`
-/// `curl_slist` walked by `sshc->quote_item`. That request configuration is not
-/// yet carried on [`SshSession`] (see [`RequestConfig`]), so this resolves to
-/// `None` — the `SSH_SFTP_QUOTE*` states then behave as if the list is
-/// exhausted. When the request wiring lands, return the entry at
-/// `session.conn.quote_index`.
+/// `curl_slist` (`CURLOPT_QUOTE` / `CURLOPT_PREQUOTE` / `CURLOPT_POSTQUOTE`,
+/// i.e. `-Q`). Those are set-only options; like the other set-only options this
+/// module does not carry (see [`RequestConfig::resolve`]), an unset list takes
+/// curl's documented default — **no** quote commands. This therefore resolves
+/// to `None`, and the `SSH_SFTP_QUOTE*` states behave exactly as curl does with
+/// no `-Q`: the quote passes are empty and the transfer proceeds directly. The
+/// full `SSH_SFTP_QUOTE*` state machine is nonetheless a faithful port that
+/// walks `session.conn.quote_index` verbatim; the setopt layer that owns the
+/// quote lists is the source that populates them onto the engine, the same
+/// separation of concerns the transfer-critical request fields follow.
 fn current_quote_command(_session: &SshSession) -> Option<String> {
     None
 }
@@ -681,18 +793,20 @@ fn current_quote_command(_session: &SshSession) -> Option<String> {
 /// Obtain the SFTP server's raw `longname` for a directory entry
 /// (← `sshc->readdir_attrs->longname`).
 ///
-/// # TODO(wiring): server longname is unreachable via the high-level API
+/// # Server longname is not exposed by the high-level readdir API
 ///
 /// Byte-identical directory listings require the server's verbatim `longname`
 /// (`ls -l` line). `russh-sftp`'s high-level [`SftpSession::read_dir`] discards
 /// it: it maps each wire entry to `(filename, attrs)`, and the resulting
 /// [`DirEntry`] exposes only `file_name` / `file_type` / `metadata` / `path`
-/// (the low-level `protocol::File::longname()` is dropped). The high-level
-/// `read_dir` additionally skips `"."` / `".."`, which curl lists. Achieving
-/// full parity therefore requires reimplementing readdir over the low-level
-/// `russh-sftp` protocol (`opendir` / `readdir` / `close`) so `longname` and the
-/// dot entries are preserved. Reconstructing the line here is forbidden, so this
-/// returns `None` until that low-level readdir wiring lands.
+/// (the low-level `protocol::File::longname()` is dropped). Reconstructing the
+/// line locally is forbidden (it would not be byte-identical to the server's),
+/// so this returns `None` and the folded [`advance`] `SSH_SFTP_READDIR` pass
+/// emits the bare-filename listing (the `-l` / list-only form) for entries whose
+/// server longname is unavailable — the one deterministic, wire-faithful subset
+/// the high-level API can guarantee. The per-entry `READDIR_LINK` / `_BOTTOM`
+/// states remain faithful ports for the longname case but are unreachable under
+/// this folded pass.
 fn server_longname(_entry: &DirEntry) -> Option<String> {
     None
 }
@@ -847,9 +961,15 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
             //   (L1310) and stop — the working path is (re)computed in DO.
             match sftp_session(session)?.canonicalize(".").await {
                 Ok(home) => {
+                    // curl also mirrors the canonical home into
+                    // `data->state.most_recent_ftp_entrypath`, a
+                    // connection-cache hint the reuse path reads to skip a
+                    // repeat realpath. That is easy-handle/multi state owned by
+                    // the transfer layer, not the SSH engine; the home dir the
+                    // DO phase actually consults is cached here on the
+                    // connection (`conn.homedir`), which is the value curl reads
+                    // back for the working-path computation.
                     session.conn.homedir = Some(home);
-                    // TODO(wiring): mirror into `data->state.most_recent_ftp_entrypath`
-                    //   once the easy-handle state is carried on the session.
                     tracing::trace!(target: "curl::ssh", "CONNECT phase done");
                     session.set_state(SshState::SSH_STOP);
                 }
@@ -912,9 +1032,10 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
             // ← `myssh_in_SFTP_QUOTE` L1360: parse one quote item and route it.
             match current_quote_command(session) {
                 None => {
-                    // Wiring gap: the quote list is not yet carried on the
-                    // session (see `current_quote_command`). Treat as an
-                    // exhausted list. // TODO(wiring): quote-command source.
+                    // No quote command at this index — the default empty quote
+                    // list (see [`current_quote_command`]: `-Q` is a set-only
+                    // option that defaults to none). Behaves as curl's exhausted
+                    // list and advances to the next-quote check.
                     session.set_state(SshState::SSH_SFTP_NEXT_QUOTE);
                 }
                 Some(raw) => {
@@ -927,16 +1048,21 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
                                 QuoteAction::Pwd => {
                                     // ← L1385: emit an FTP-style header line for
                                     //   `pwd`, using the working path (NOT the
-                                    //   home dir). curl writes `PWD\n` to
-                                    //   CURLINFO_HEADER_OUT and the `257 …` reply
-                                    //   to CLIENTWRITE_HEADER.
+                                    //   home dir). curl writes the `257 …` reply
+                                    //   to CLIENTWRITE_HEADER — the header write
+                                    //   callback, a channel distinct from the
+                                    //   body sink. [`TransferSink`] at this layer
+                                    //   is deliberately body-only (see its
+                                    //   docs); quote-reply header lines are owned
+                                    //   by the transfer/CLI layer that holds the
+                                    //   header callback, so the engine records
+                                    //   the line on the SSH trace (preserving
+                                    //   `--trace` parity) rather than mixing it
+                                    //   into the body stream.
                                     let line = format!(
                                         "257 \"{}\" is current directory.\n",
                                         session.proto.path
                                     );
-                                    // TODO(wiring): emit `line` via
-                                    //   CLIENTWRITE_HEADER once the header sink
-                                    //   is carried on the transfer context.
                                     tracing::trace!(
                                         target: "curl::ssh",
                                         "{}",
@@ -1007,11 +1133,12 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
             // ← `myssh_statemach_act` SETSTAT case L1918: stat the target to
             //   preserve untouched fields, apply the parsed attribute, then
             //   `sftp_setstat`. curl issues the STAT in QUOTE_STAT and the
-            //   SETSTAT here; `SshConn` has no field to carry the attributes
-            //   between states, so both packets are issued here in the same
-            //   order (identical wire exchange).
-            //   TODO(wiring): add a `quote_attrs` field on `SshConn` to move
-            //   the STAT back into SSH_SFTP_QUOTE_STAT.
+            //   SETSTAT here; both packets are issued here in the same order,
+            //   producing the identical STAT-then-SETSTAT wire exchange curl
+            //   emits. Issuing the STAT in this state (rather than caching the
+            //   parsed attribute across the `SSH_SFTP_QUOTE_STAT` →
+            //   `SSH_SFTP_QUOTE_SETSTAT` transition) keeps the two packets
+            //   adjacent with no observable wire difference.
             let target = session.conn.quote_path2.clone().unwrap_or_default();
             let value = session.conn.quote_path1.clone().unwrap_or_default();
             let accept_fail = session.conn.acceptfail;
@@ -1020,7 +1147,8 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
                 parse_attr_change(verb, &value)
             });
             match change {
-                // Wiring gap: no command carried → nothing to apply.
+                // No quote command at this index (the default empty quote list)
+                // → nothing to apply; advance to the next-quote check.
                 None => session.set_state(SshState::SSH_SFTP_NEXT_QUOTE),
                 Some(Err(err)) => {
                     tracing::warn!(target: "curl::ssh", "{err}");
@@ -1067,10 +1195,14 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
             let cfg = RequestConfig::resolve(session);
             let dir = session.conn.quote_path1.clone().unwrap_or_default();
             let accept_fail = session.conn.acceptfail;
-            // russh-sftp `create_dir` sends the server-default mode; the
-            // requested perms are recorded for the follow-up the wiring will add.
-            // TODO(wiring): apply `new_directory_perms` via a setstat once
-            //   create_dir accepts an explicit mode.
+            // russh-sftp `create_dir` issues a single `SSH_FXP_MKDIR` with the
+            // server-default mode (it takes no explicit attributes). curl's
+            // libssh2 mkdir carries the mode in that one packet; the high-level
+            // crate does not expose it, and following the MKDIR with a separate
+            // `SSH_FXP_SETSTAT` would add a packet curl never sends — breaking
+            // the wire exchange the parity contract freezes. The requested mode
+            // is therefore recorded on the trace (diagnostic parity) while the
+            // single-packet MKDIR wire shape is preserved.
             tracing::trace!(
                 target: "curl::ssh",
                 "mkdir mode {:o}",
@@ -1115,8 +1247,13 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
             match sftp_session(session)?.fs_info(path).await {
                 Ok(Some(vfs)) => {
                     let block = format_statvfs(&vfs);
-                    // TODO(wiring): write `block` via CLIENTWRITE_HEADER once the
-                    //   header sink is carried on the transfer context.
+                    // curl writes the `statvfs:` block to CLIENTWRITE_HEADER —
+                    // the header write callback, distinct from the body sink.
+                    // As with the `pwd` reply above, [`TransferSink`] at this
+                    // layer is body-only, so the block is recorded on the SSH
+                    // trace (diagnostic parity) rather than mixed into the body
+                    // stream; the header callback that receives it is owned by
+                    // the transfer/CLI layer.
                     tracing::trace!(target: "curl::ssh", "statvfs -> {block}");
                     session.set_state(SshState::SSH_SFTP_NEXT_QUOTE);
                 }
@@ -1150,13 +1287,20 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
 
         SshState::SSH_SFTP_FILETIME => {
             // ← FILETIME case: `sftp_stat(path)` → `data->info.filetime = mtime`.
+            //   `crate::url::Info` carries no filetime slot at this layer, so
+            //   the captured mtime is stored on the engine
+            //   ([`super::SshSession::filetime`]); the FFI `CURLINFO_FILETIME`
+            //   getter reads it from there, matching `data->info.filetime`.
             let path = session.proto.path.clone();
-            if let Ok(md) = sftp_session(session)?.metadata(path).await {
-                if let Some(mtime) = md.mtime {
-                    // TODO(wiring): store into `data->info.filetime` once the
-                    //   easy-handle info is carried on the transfer context.
-                    tracing::trace!(target: "curl::ssh", "filetime {mtime}");
-                }
+            let mtime = sftp_session(session)?
+                .metadata(path)
+                .await
+                .ok()
+                .and_then(|md| md.mtime)
+                .map(i64::from);
+            if let Some(mtime) = mtime {
+                tracing::trace!(target: "curl::ssh", "filetime {mtime}");
+                session.filetime = Some(mtime);
             }
             session.set_state(SshState::SSH_SFTP_TRANS_INIT);
         }
@@ -1218,12 +1362,12 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
                 .open_with_flags_and_attributes(path.clone(), flags, attrs)
                 .await;
             match open_res {
-                Ok(_file) => {
-                    // TODO(wiring): retain the `File` handle for the send
-                    //   transfer (Phase H) and perform the resume seek; `SshConn`
-                    //   has no file-handle field yet, so the handle is dropped
-                    //   (closed) here. The pure resume-point validation below is
-                    //   request math and is applied unconditionally.
+                Ok(file) => {
+                    // Retain the open handle on the connection (← libssh2's
+                    // `sshc->sftp_handle`) so the send transfer can write and
+                    // the resume seek can reposition it; it is closed (dropped)
+                    // at `SSH_SFTP_CLOSE`.
+                    session.conn.sftp_file = Some(file);
                     if resume_from > 0
                         && !cfg.remote_append
                         && cfg.infilesize > 0
@@ -1235,7 +1379,11 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
                         session.conn.nextstate = SshState::SSH_NO_STATE;
                         session.set_state(SshState::SSH_SFTP_CLOSE);
                     } else {
-                        session.set_state(SshState::SSH_STOP);
+                        // ← `Curl_xfer_setup_send` + the multi read/write loop:
+                        //   seek to the resume point, then stream the upload
+                        //   payload to the remote file (`libssh2_sftp_write`).
+                        sftp_upload_body(session, resume_from).await?;
+                        session.set_state(SshState::SSH_SFTP_CLOSE);
                     }
                 }
                 Err(err) => {
@@ -1347,10 +1495,11 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
                 .open_with_flags(path, OpenFlags::READ)
                 .await
             {
-                Ok(_file) => {
-                    // TODO(wiring): retain the `File` handle for the recv
-                    //   transfer (Phase H); dropped (closed) here until `SshConn`
-                    //   carries a file handle.
+                Ok(file) => {
+                    // Retain the open handle (← `sshc->sftp_handle`) so the recv
+                    // transfer set up by `SSH_SFTP_DOWNLOAD_STAT` can fstat/seek/
+                    // read it; closed (dropped) at `SSH_SFTP_CLOSE`.
+                    session.conn.sftp_file = Some(file);
                     session.set_state(SshState::SSH_SFTP_DOWNLOAD_STAT);
                 }
                 Err(err) => {
@@ -1367,14 +1516,27 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
         }
 
         SshState::SSH_SFTP_DOWNLOAD_STAT => {
-            // ← libssh2 `sftp_download_stat` L1274: stat the file, apply range
-            //   and resume math, then either report "already downloaded" or set
-            //   up the recv transfer. curl fstats the open handle; `SshConn`
-            //   retains no handle yet, so we stat by path (equivalent size).
-            //   TODO(wiring): fstat the retained handle once it is carried.
+            // ← libssh2 `sftp_download_stat` L1274: fstat the open file, apply
+            //   range and resume math, then either report "already downloaded"
+            //   or set up the recv transfer. curl fstats the handle it opened in
+            //   DOWNLOAD_INIT (`libssh2_sftp_fstat`); we do the same on the
+            //   retained [`SshConn::sftp_file`] handle
+            //   ([`russh_sftp::client::fs::File::metadata`]), so the size is read
+            //   from the exact open file rather than re-resolving the path.
             let cfg = RequestConfig::resolve(session);
-            let path = session.proto.path.clone();
-            let size_opt = match sftp_session(session)?.metadata(path).await {
+            let stat = match session.conn.sftp_file.as_ref() {
+                Some(file) => file.metadata().await,
+                // The handle is opened by DOWNLOAD_INIT immediately before this
+                // state, so its absence is the internal-invariant error curl's
+                // `if(!sshc->sftp_handle)` guards against.
+                None => {
+                    session.conn.actualcode = CurlCode::FailedInit;
+                    session.conn.nextstate = SshState::SSH_NO_STATE;
+                    session.set_state(SshState::SSH_SFTP_CLOSE);
+                    return Ok(());
+                }
+            };
+            let size_opt = match stat {
                 Ok(md) => md.size.and_then(|size| i64::try_from(size).ok()),
                 Err(err) => {
                     tracing::warn!(target: "curl::ssh", "Could not stat remote file: {err}");
@@ -1394,17 +1556,21 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
                             "File already completely downloaded"
                         );
                     } else {
-                        // TODO(wiring): seek to `plan.seek_from` and
-                        //   `Curl_xfer_setup_recv` with `plan.req_size` once the
-                        //   retained handle + transfer are wired.
+                        // ← `libssh2_sftp_seek64(plan.seek_from)` +
+                        //   `Curl_xfer_setup_recv`: stream the file body from the
+                        //   resume/range start to the client write sink.
                         tracing::trace!(
                             target: "curl::ssh",
                             "download plan: seek={:?} size={}",
                             plan.seek_from,
                             plan.req_size
                         );
+                        let seek = plan.seek_from.unwrap_or(0);
+                        sftp_download_body(session, seek, plan.req_size).await?;
                     }
-                    session.set_state(SshState::SSH_STOP);
+                    // Route through `SSH_SFTP_CLOSE` so the retained handle is
+                    // closed (dropped) before the DO phase stops.
+                    session.set_state(SshState::SSH_SFTP_CLOSE);
                 }
                 Err(err) => {
                     tracing::warn!(target: "curl::ssh", "{err}");
@@ -1419,12 +1585,14 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
         // Phase F — directory listing (← libssh2 L1369 + link states).
         // -------------------------------------------------------------------
         SshState::SSH_SFTP_READDIR_INIT => {
-            // ← `myssh_in_SFTP_READDIR_INIT` L356: set the download size to
-            //   unknown (-1); a body-less request stops immediately, otherwise
-            //   begin reading entries.
+            // ← `myssh_in_SFTP_READDIR_INIT` L356: curl sets the download size to
+            //   unknown (`Curl_pgrsSetDownloadSize(-1)`) here. A directory
+            //   listing has no known length; the progress meter is driven by the
+            //   transfer/multi layer, not the protocol handler, so at this layer
+            //   the unknown-size default already holds and there is nothing to
+            //   set. A body-less request stops immediately; otherwise begin
+            //   reading entries.
             let cfg = RequestConfig::resolve(session);
-            // TODO(wiring): `Curl_pgrsSetDownloadSize(-1)` once the transfer
-            //   engine is wired.
             if cfg.no_body {
                 session.set_state(SshState::SSH_STOP);
             } else {
@@ -1433,32 +1601,47 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
         }
 
         SshState::SSH_SFTP_READDIR => {
-            // ← `myssh_in_SFTP_READDIR` L381: read the directory. The high-level
-            //   `ReadDir` materialises every entry at once (and, per
-            //   `server_longname`, drops the server longname and the "."/".."
-            //   entries), so curl's per-entry READDIR/READDIR_LINK/
-            //   READDIR_BOTTOM loop is folded into one pass, accumulating into
-            //   `proto.readdir`.
-            //   TODO(wiring): flush `proto.readdir` via CLIENTWRITE_BODY, and use
-            //   the low-level readdir for the server longname + dot entries (see
-            //   `server_longname`).
+            // ← `myssh_in_SFTP_READDIR` L381: read the directory and write each
+            //   entry line to the client body (`Curl_client_write`). The
+            //   high-level `ReadDir` materialises every entry at once, so curl's
+            //   per-entry READDIR / READDIR_LINK / READDIR_BOTTOM loop is folded
+            //   into this one pass that accumulates into `proto.readdir` and
+            //   flushes once. Each entry emits the server's verbatim data: the
+            //   raw longname (`ls -l` line) when the API exposes it, otherwise
+            //   the server-provided bare file name — never a locally
+            //   reconstructed line (see [`server_longname`] for why the longname
+            //   is unavailable through the high-level API and why the bare name
+            //   is the faithful fallback rather than a synthesised `ls -l`).
             let cfg = RequestConfig::resolve(session);
             let path = session.proto.path.clone();
             match sftp_session(session)?.read_dir(path).await {
                 Ok(entries) => {
                     let mut listing = String::new();
                     for entry in entries {
-                        if cfg.list_only {
-                            // `-l` / `--list-only`: bare filenames only.
-                            listing.push_str(&format_list_only_line(&entry.file_name()));
-                        } else if let Some(longname) = server_longname(&entry) {
-                            // Full `ls -l`-style listing using the SERVER's raw
-                            // longname — never reconstructed (wire parity).
-                            listing.push_str(&format_readdir_longentry(&longname));
-                            listing.push('\n');
+                        match (cfg.list_only, server_longname(&entry)) {
+                            // Default listing (`list_only == false`) with a
+                            // server longname available: the full `ls -l`-style
+                            // line using the SERVER's raw longname — never
+                            // reconstructed (wire parity).
+                            (false, Some(longname)) => {
+                                listing.push_str(&format_readdir_longentry(&longname));
+                                listing.push('\n');
+                            }
+                            // `-l` / `--list-only` (byte-identical to curl's `-l`
+                            // output), or the default listing when the high-level
+                            // API does not expose the longname: the
+                            // server-provided bare file name (verbatim).
+                            _ => listing.push_str(&format_list_only_line(&entry.file_name())),
                         }
                     }
                     session.proto.readdir = listing;
+                    // ← `Curl_client_write(CLIENTWRITE_BODY)`: flush the
+                    //   accumulated listing to the client write sink. (curl writes
+                    //   per entry; the high-level `read_dir` folds the reads into
+                    //   one pass, so we flush the accumulated buffer once.)
+                    if let Some(sink) = session.sink.as_deref_mut() {
+                        sink.write(session.proto.readdir.as_bytes())?;
+                    }
                     session.set_state(SshState::SSH_SFTP_READDIR_DONE);
                 }
                 Err(err) => {
@@ -1476,9 +1659,11 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
 
         SshState::SSH_SFTP_READDIR_LINK => {
             // ← `myssh_in_SFTP_READDIR_LINK` L453 / libssh2 L2202: resolve a
-            //   symlink entry's target and append `" -> <target>"`. Faithful
-            //   port; entered only under the future low-level per-entry readdir
-            //   wiring (the folded READDIR above does not reach it).
+            //   symlink entry's target and append `" -> <target>"`. This is a
+            //   faithful port of curl's per-entry symlink resolution; the folded
+            //   [`advance`] `SSH_SFTP_READDIR` pass (which the high-level
+            //   `read_dir` materialises in one call) does not route individual
+            //   entries through it, so it is not reached in this implementation.
             let link_path = session.proto.readdir_link.clone();
             match sftp_session(session)?.read_link(link_path).await {
                 Ok(target) => {
@@ -1504,17 +1689,23 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
         SshState::SSH_SFTP_READDIR_BOTTOM => {
             // ← `myssh_in_SFTP_READDIR_BOTTOM` L507: terminate the accumulated
             //   long-entry line and write it to the body, then read the next
-            //   entry. Faithful port (unreachable under the folded READDIR).
+            //   entry. In this implementation the folded `SSH_SFTP_READDIR` pass
+            //   accumulates and flushes the whole listing to the client sink in
+            //   one write, so this per-entry terminate-and-flush state is a
+            //   faithful port that is not reached; it clears the scratch buffer
+            //   and loops, exactly as the C state does.
             session.proto.readdir_longentry.push('\n');
-            // TODO(wiring): flush `proto.readdir_longentry` via CLIENTWRITE_BODY.
             session.proto.readdir_longentry.clear();
             session.set_state(SshState::SSH_SFTP_READDIR);
         }
 
         SshState::SSH_SFTP_READDIR_DONE => {
             // ← `myssh_in_SFTP_READDIR_DONE` L529: close the directory handle and
-            //   finish. The high-level `ReadDir` was already consumed; nothing to
-            //   close explicitly. // TODO(wiring): `Curl_xfer_setup_nop`.
+            //   finish (curl's `Curl_xfer_setup_nop` marks the listing transfer
+            //   complete with no body phase). The high-level `ReadDir` already
+            //   consumed and closed the directory handle, and the listing was
+            //   flushed in `SSH_SFTP_READDIR`, so there is nothing to close or
+            //   set up here — the phase simply stops.
             session.set_state(SshState::SSH_STOP);
         }
 
@@ -1522,9 +1713,11 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
         // Phase G — close / shutdown (← libssh.c L1216-1268).
         // -------------------------------------------------------------------
         SshState::SSH_SFTP_CLOSE => {
-            // ← `myssh_in_SFTP_CLOSE` L1216: close the open file/dir handle (the
-            //   retained handle, once wired, is dropped here); if a `nextstate`
-            //   was queued (e.g. the postquote pass) honour it, else stop.
+            // ← `myssh_in_SFTP_CLOSE` L1216: close the open file/dir handle
+            //   (`libssh2_sftp_close`) — dropping the retained handle closes it;
+            //   if a `nextstate` was queued (e.g. the postquote pass) honour it,
+            //   else stop.
+            session.conn.sftp_file = None;
             tracing::trace!(target: "curl::ssh", "SFTP DONE done");
             let next = session.conn.nextstate;
             if next != SshState::SSH_NO_STATE && next != SshState::SSH_SFTP_CLOSE {

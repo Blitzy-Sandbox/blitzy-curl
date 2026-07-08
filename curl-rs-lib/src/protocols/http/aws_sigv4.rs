@@ -27,6 +27,26 @@
 //! All cryptography is pure-Rust (`sha2` + `hmac`); there is no OpenSSL / C
 //! crypto linkage.
 //!
+//! # Logging of signing material
+//!
+//! SigV4 signing produces several values that constitute request-authorization
+//! material: the **canonical request** (embeds the signed headers and payload
+//! hash), the **string-to-sign** (embeds the credential scope and the
+//! canonical-request hash), and — most sensitive of all — the final request
+//! **signature**. curl's C implementation emits all three verbatim via `infof`
+//! under `-v` (`lib/http_aws_sigv4.c`), i.e. at its default informational
+//! verbosity. This module deliberately deviates for security:
+//!
+//! * The canonical request and string-to-sign are recorded at
+//!   [`tracing::trace!`] rather than `info!`, so they surface only under an
+//!   explicit deepest-verbosity (`--trace`-level) subscriber and never at the
+//!   default level.
+//! * The signature is **never** written to any log at any verbosity; only a
+//!   fixed, value-free completion marker is emitted (also at `trace!`).
+//!
+//! This is the single intentional observability divergence from curl in this
+//! module; every wire byte and header value the peer receives is unchanged.
+//!
 //! # Structural mapping (C → Rust)
 //!
 //! | C (`lib/http_aws_sigv4.c`)        | Rust (this module)                    |
@@ -986,7 +1006,14 @@ fn compute_signature(input: &SigV4Input<'_>, clock: i64) -> Result<Option<String
         made.signed_headers,
         payload_hash
     );
-    tracing::info!(
+    // The canonical request is authorization-derived material: it embeds the
+    // signed headers and the payload hash used to compute the request
+    // signature. curl emits it via `infof` under `-v`, but signing material must
+    // never surface by default. It is therefore recorded at `trace!` (the
+    // deepest verbosity — only reachable under an explicit `--trace`-level
+    // subscriber, never at the default level), not `info!`. See the module note
+    // and the `string_to_sign` / signature sites below.
+    tracing::trace!(
         "aws_sigv4: Canonical request (enclosed in []) - [{}]",
         canonical_request
     );
@@ -1000,7 +1027,11 @@ fn compute_signature(input: &SigV4Input<'_>, clock: i64) -> Result<Option<String
     let algo = format!("{provider0_upper}4-HMAC-SHA256");
     let cr_hash = sha256_to_hex(Sha256::digest(canonical_request.as_bytes()).as_slice());
     let string_to_sign = format!("{algo}\n{timestamp}\n{credential_scope}\n{cr_hash}");
-    tracing::info!(
+    // The string-to-sign is likewise signing material (it carries the credential
+    // scope and the canonical-request hash). Recorded at `trace!` for the same
+    // reason as the canonical request above: available for deep `--trace`
+    // debugging, but never emitted at the default verbosity.
+    tracing::trace!(
         "aws_sigv4: String to sign (enclosed in []) - [{}]",
         string_to_sign
     );
@@ -1013,7 +1044,12 @@ fn compute_signature(input: &SigV4Input<'_>, clock: i64) -> Result<Option<String
     let k_service = hmac_sha256(&k_region, service.as_bytes());
     let k_signing = hmac_sha256(&k_service, request_type.as_bytes());
     let signature = sha256_to_hex(&hmac_sha256(&k_signing, string_to_sign.as_bytes()));
-    tracing::info!("aws_sigv4: Signature - {}", signature);
+    // The final request signature is the single most sensitive value produced
+    // here: an attacker who observes it can replay the signed request until it
+    // expires. curl logs it verbatim under `-v`, but we deliberately deviate —
+    // the value is REDACTED and never written to any log at any verbosity. Only
+    // a fixed, value-free completion marker is emitted, and only at `trace!`.
+    tracing::trace!("aws_sigv4: request signed (signature redacted)");
 
     // (15/16) Build the output header block: Authorization, then (S3)
     // content-sha256, then (if we generated it) the date header.

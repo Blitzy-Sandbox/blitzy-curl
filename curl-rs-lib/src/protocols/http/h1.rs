@@ -500,8 +500,10 @@ pub fn req_dprint(req: &HttpReqData) -> Result<String> {
 // Phase 2 — HTTP/1.1 transfer engine over `hyper`
 // ===========================================================================
 
-/// Size of the in-memory duplex pipe bridging `hyper` and the filter chain.
-const DUPLEX_BUF_LEN: usize = 64 * 1024;
+/// Size of the in-memory duplex pipe bridging `hyper`/`h2` and the filter
+/// chain. `pub(crate)` so the sibling [`crate::protocols::http::h2`] engine
+/// bridges its connection to the filter chain with the identical geometry.
+pub(crate) const DUPLEX_BUF_LEN: usize = 64 * 1024;
 
 /// Size of the scratch buffers used by the byte pump.
 const PUMP_BUF_LEN: usize = 64 * 1024;
@@ -761,7 +763,7 @@ fn response_keep_alive(http_minor: i32, headers: &http::HeaderMap, req_keepalive
 /// Shuttle bytes between an in-memory duplex endpoint and the connection's
 /// filter chain until either side closes.
 ///
-/// This is the fully safe-Rust bridge that lets `hyper` (which needs an
+/// This is the fully safe-Rust bridge that lets `hyper`/`h2` (which need an
 /// `AsyncRead + AsyncWrite`) drive a [`FilterChain`] (which only exposes async
 /// `send`/`recv` on `&mut self`). The two in-flight futures inside the
 /// `select!` borrow disjoint objects — the duplex read half vs. the chain — and
@@ -770,9 +772,16 @@ fn response_keep_alive(http_minor: i32, headers: &http::HeaderMap, req_keepalive
 /// pending branch loses no bytes.
 ///
 /// Returns `Ok(())` on a clean peer EOF (`recv` returned 0); on return the
-/// duplex write half is dropped, signalling EOF to `hyper` so a buffered
+/// duplex write half is dropped, signalling EOF to `hyper`/`h2` so a buffered
 /// response can drain.
-async fn pump_bridge(chain: &mut FilterChain, bridge: tokio::io::DuplexStream) -> Result<()> {
+///
+/// `pub(crate)` so the sibling [`crate::protocols::http::h2`] engine reuses the
+/// identical, audited bridge rather than duplicating it (a single point of
+/// cancel-safety review for both HTTP/1 and HTTP/2 over a filter chain).
+pub(crate) async fn pump_bridge(
+    chain: &mut FilterChain,
+    bridge: tokio::io::DuplexStream,
+) -> Result<()> {
     let (mut bridge_r, mut bridge_w) = tokio::io::split(bridge);
     let mut out_buf = vec![0u8; PUMP_BUF_LEN];
     let mut in_buf = vec![0u8; PUMP_BUF_LEN];

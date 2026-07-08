@@ -247,11 +247,13 @@ fn client_bind_addr(peer: SocketAddr) -> SocketAddr {
 ///
 /// Mirrors curl's `"QUIC connect to %s port %u failed: %s"` diagnostic
 /// (`vquic.c` / `curl_ngtcp2.c`), preserving the `--trace` vocabulary.
-fn quic_connect_failed(conn: &Connection, detail: impl std::fmt::Display) -> Error {
-    let msg = format!(
-        "QUIC connect to {} port {} failed: {detail}",
-        conn.host.name, conn.remote_port
-    );
+///
+/// Takes the host/port by value rather than borrowing the whole
+/// [`Connection`]: this lets [`perform`] format transfer-time errors without
+/// holding a shared `&Connection` (which is not `Send`) across its `await`
+/// points, keeping the returned future `Send` for the multi-threaded runtime.
+fn quic_connect_failed(host: &str, port: u16, detail: impl std::fmt::Display) -> Error {
+    let msg = format!("QUIC connect to {host} port {port} failed: {detail}");
     tracing::error!("{msg}");
     Error::quic_connect(msg)
 }
@@ -274,7 +276,7 @@ fn quic_connect_failed(conn: &Connection, detail: impl std::fmt::Display) -> Err
 ///   ([`conn_may_http3`]), if the UDP endpoint cannot be bound, or if the QUIC
 ///   handshake fails (bad certificate, ALPN mismatch, timeout, refusal).
 pub async fn connect_quic(
-    conn: &Connection,
+    conn: &mut Connection,
     addr: SocketAddr,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
     // Enforce curl's HTTP/3 eligibility rules first (exact codes / text).
@@ -282,23 +284,30 @@ pub async fn connect_quic(
 
     let client_config = build_quic_client_config(conn)?;
 
+    // Own the host/port for error text so no shared `&Connection` is held across
+    // the handshake `await` below (keeps this future `Send`; `&Connection` is
+    // not, because a connection filter is not `Sync`).
+    let host = conn.host.name.clone();
+    let port = conn.remote_port;
+
     // Bind a client UDP endpoint. quinn spawns its endpoint driver on the
     // ambient Tokio runtime (Tokio is the sole async runtime, per the AAP).
     let endpoint = quinn::Endpoint::client(client_bind_addr(addr))
-        .map_err(|e| quic_connect_failed(conn, e))?;
+        .map_err(|e| quic_connect_failed(&host, port, e))?;
 
     // The SNI / certificate name is curl's connection host name.
-    let server_name = conn.host.name.as_str();
     let connecting = endpoint
-        .connect_with(client_config, addr, server_name)
-        .map_err(|e| quic_connect_failed(conn, e))?;
+        .connect_with(client_config, addr, &host)
+        .map_err(|e| quic_connect_failed(&host, port, e))?;
 
-    let connection = connecting.await.map_err(|e| quic_connect_failed(conn, e))?;
+    let connection = connecting
+        .await
+        .map_err(|e| quic_connect_failed(&host, port, e))?;
 
     tracing::debug!(
         "QUIC connected to {} port {} (remote {})",
-        server_name,
-        conn.remote_port,
+        host,
+        port,
         connection.remote_address()
     );
 
@@ -454,16 +463,20 @@ pub async fn perform<F>(
 where
     F: FnMut(&[u8]) -> Result<()>,
 {
-    // No connection mutation is required here (all QUIC/h3 state is local), so
-    // reborrow as a shared reference. This lets both the request future and the
-    // driver arm of the `select!` below reference `conn` without aliasing.
-    let conn: &Connection = conn;
-
+    // Read the request-shaping inputs and own the connection's identity for
+    // error text up front. After the QUIC handshake below, `conn` is no longer
+    // referenced, so nothing borrows it across the request/driver `await`s —
+    // which is what keeps this future `Send` (a shared `&Connection` is not
+    // `Send`, because a connection filter is not `Sync`). The `AtomicU64`
+    // byte counter is likewise shared by value, not by borrowing `conn`.
     let is_ssl = conn.scheme.is_ssl;
     let default_auth = default_authority(conn);
+    let host = conn.host.name.clone();
+    let port = conn.remote_port;
 
     // Phase 2: establish QUIC. `_endpoint` MUST stay alive for the whole
     // transfer (dropping the last Endpoint clone stops quinn's driver task).
+    // This is the last use of `conn`.
     let (_endpoint, quic_conn) = connect_quic(conn, addr).await?;
 
     // Wrap the quinn connection for `h3` and split it into the connection
@@ -472,7 +485,7 @@ where
     let h3_conn = h3_quinn::Connection::new(quic_conn);
     let (mut driver, mut send_request) = h3::client::new(h3_conn)
         .await
-        .map_err(|e| quic_connect_failed(conn, e))?;
+        .map_err(|e| quic_connect_failed(&host, port, e))?;
 
     let http_req = build_http_request(&req, is_ssl, &default_auth)?;
 
@@ -483,11 +496,12 @@ where
     let received = AtomicU64::new(0);
 
     // The request future performs the full send/recv exchange on one stream.
+    // It borrows only the owned `host`/`port` (not `conn`) for error text.
     let request_fut = async {
         let mut stream = send_request
             .send_request(http_req)
             .await
-            .map_err(|e| map_h3_stream_error(conn, &e, false))?;
+            .map_err(|e| map_h3_stream_error(&host, port, &e, false))?;
 
         // Stream the request body, if any, then half-close the send side.
         if let Some(body) = body {
@@ -495,19 +509,19 @@ where
                 stream
                     .send_data(body)
                     .await
-                    .map_err(|e| map_h3_stream_error(conn, &e, false))?;
+                    .map_err(|e| map_h3_stream_error(&host, port, &e, false))?;
             }
         }
         stream
             .finish()
             .await
-            .map_err(|e| map_h3_stream_error(conn, &e, false))?;
+            .map_err(|e| map_h3_stream_error(&host, port, &e, false))?;
 
         // Response head.
         let response = stream
             .recv_response()
             .await
-            .map_err(|e| map_h3_stream_error(conn, &e, false))?;
+            .map_err(|e| map_h3_stream_error(&host, port, &e, false))?;
         let mut resp = response_head_to_httpresp(&response);
 
         // Response body: stream each chunk to the write-out path as it arrives.
@@ -530,7 +544,7 @@ where
                 Err(ref e) if e.is_h3_no_error() => break,
                 Err(e) => {
                     let bytes = received.load(Ordering::Relaxed) > 0;
-                    return Err(map_h3_stream_error(conn, &e, bytes));
+                    return Err(map_h3_stream_error(&host, port, &e, bytes));
                 }
             }
         }
@@ -551,7 +565,7 @@ where
             Err(ref e) if e.is_h3_no_error() => {}
             Err(e) => {
                 let bytes = received.load(Ordering::Relaxed) > 0;
-                return Err(map_h3_stream_error(conn, &e, bytes));
+                return Err(map_h3_stream_error(&host, port, &e, bytes));
             }
         }
 
@@ -575,7 +589,7 @@ where
         result = &mut request_fut => result,
         conn_err = &mut driver_fut => {
             let bytes = received.load(Ordering::Relaxed) > 0;
-            Err(map_h3_connection_error(conn, &conn_err, bytes))
+            Err(map_h3_connection_error(&host, port, &conn_err, bytes))
         }
     }
 }
@@ -592,11 +606,8 @@ where
 /// * `bytes_received` true (curl's `data->req.bytecount != 0`) →
 ///   [`Error::PartialFile`] (`CURLE_PARTIAL_FILE`, 18).
 /// * otherwise → [`Error::http3`] (`CURLE_HTTP3`, 95).
-fn partial_or_http3(conn: &Connection, detail: &str, bytes_received: bool) -> Error {
-    let msg = format!(
-        "HTTP/3 error on {} port {}: {detail}",
-        conn.host.name, conn.remote_port
-    );
+fn partial_or_http3(host: &str, port: u16, detail: &str, bytes_received: bool) -> Error {
+    let msg = format!("HTTP/3 error on {host} port {port}: {detail}");
     tracing::error!("{msg}");
     if bytes_received {
         // Bytes already reached the write-out path: partial transfer.
@@ -611,11 +622,12 @@ fn partial_or_http3(conn: &Connection, detail: &str, bytes_received: bool) -> Er
 /// become [`Error::http3`] (95), or [`Error::PartialFile`] (18) when body bytes
 /// were already delivered.
 fn map_h3_stream_error(
-    conn: &Connection,
+    host: &str,
+    port: u16,
     err: &h3::error::StreamError,
     bytes_received: bool,
 ) -> Error {
-    partial_or_http3(conn, &format!("stream error: {err}"), bytes_received)
+    partial_or_http3(host, port, &format!("stream error: {err}"), bytes_received)
 }
 
 /// Map an `h3` [`ConnectionError`](h3::error::ConnectionError) observed *during*
@@ -623,11 +635,17 @@ fn map_h3_stream_error(
 /// an in-flight request is an HTTP/3 error (95), or a partial file (18) when
 /// body bytes were already delivered.
 fn map_h3_connection_error(
-    conn: &Connection,
+    host: &str,
+    port: u16,
     err: &h3::error::ConnectionError,
     bytes_received: bool,
 ) -> Error {
-    partial_or_http3(conn, &format!("connection error: {err}"), bytes_received)
+    partial_or_http3(
+        host,
+        port,
+        &format!("connection error: {err}"),
+        bytes_received,
+    )
 }
 
 /// The HTTP/3 connection filter (← curl's `Curl_cft_http3`, `curl_ngtcp2.c`).
@@ -959,27 +977,24 @@ mod tests {
 
     #[test]
     fn quic_connect_failure_maps_to_96() {
-        let conn = https_conn("example.com", 443, TlsConfig::new());
         assert_eq!(
-            quic_connect_failed(&conn, "boom").code(),
+            quic_connect_failed("example.com", 443, "boom").code(),
             CurlCode::QuicConnectError
         );
     }
 
     #[test]
     fn transfer_error_without_bytes_is_http3_95() {
-        let conn = https_conn("example.com", 443, TlsConfig::new());
         assert_eq!(
-            partial_or_http3(&conn, "stream reset", false).code(),
+            partial_or_http3("example.com", 443, "stream reset", false).code(),
             CurlCode::Http3
         );
     }
 
     #[test]
     fn transfer_error_with_bytes_is_partial_file_18() {
-        let conn = https_conn("example.com", 443, TlsConfig::new());
         assert_eq!(
-            partial_or_http3(&conn, "stream reset", true).code(),
+            partial_or_http3("example.com", 443, "stream reset", true).code(),
             CurlCode::PartialFile
         );
     }

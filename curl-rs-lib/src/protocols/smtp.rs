@@ -1782,35 +1782,117 @@ pub struct SmtpHandler;
 /// (← `Curl_handler_smtp` / `Curl_handler_smtps`).
 pub static HANDLER: SmtpHandler = SmtpHandler;
 
+/// The remaining whole-transfer time budget in milliseconds for the SMTP
+/// engine (← curl's `Curl_timeleft_ms(data)`): the configured
+/// `CURLOPT_TIMEOUT[_MS]` when set, or `0` — the sentinel the ping-pong pump
+/// reads as "no transfer timeout applies", falling back to its per-response
+/// default (see [`PingPong::state_timeout`]). Threading the configured budget
+/// here mirrors curl reading the live remaining time from the easy handle on
+/// each engine step.
+fn smtp_do_timeleft(ctx: &TransferCtx) -> i64 {
+    ctx.request
+        .timeout
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Borrow the transfer's [`Connection`] and its [`SmtpConn`] engine disjointly
+/// from the [`TransferCtx`]: the connection lives in [`TransferCtx::conn`] and
+/// the engine — established by the connect phase (← `conn->proto.smtpc`) — in
+/// [`TransferCtx::proto_state`]. Because `conn` and `proto_state` are distinct
+/// fields, the two mutable borrows coexist (the disjoint-field-borrow pattern
+/// documented on [`TransferCtx`]), which is exactly how curl passes
+/// `conn`/`data` and the SMTP struct to the engine as separate arguments.
+///
+/// # Errors
+/// [`CurlCode::BadFunctionArgument`] when either handle is absent — a caller
+/// precondition mirroring curl requiring both `data->conn` and
+/// `conn->proto.smtpc` to be set before the DO phase runs.
+fn smtp_conn_and_engine(ctx: &mut TransferCtx) -> Result<(&mut Connection, &mut SmtpConn)> {
+    // Borrow the engine out of `proto_state` first; this borrows only that
+    // field, leaving `conn` free to borrow below.
+    let engine = ctx
+        .proto_state
+        .as_deref_mut()
+        .and_then(|s| s.downcast_mut::<SmtpConn>())
+        .ok_or_else(|| {
+            Error::with_context(
+                CurlCode::BadFunctionArgument,
+                "[SMTP] no SMTP engine assigned to transfer",
+            )
+        })?;
+    let conn = ctx.conn.as_deref_mut().ok_or_else(|| {
+        Error::with_context(
+            CurlCode::BadFunctionArgument,
+            "[SMTP] no connection assigned to transfer",
+        )
+    })?;
+    Ok((conn, engine))
+}
+
 impl Protocol for SmtpHandler {
     /// The SMTP "DO" phase entry point (← `smtp_do`).
     ///
-    /// The full DO-phase logic — `MAIL`/`RCPT`/`DATA` or a custom command,
-    /// driven through the ping-pong state machine — lives in
-    /// [`SmtpConn::perform`]/[`SmtpConn::doing`], which the transfer layer
-    /// invokes against the owning [`SmtpConn`] and [`crate::conn::Connection`].
-    /// That wiring binds once [`TransferCtx`] carries the connection handle (a
-    /// documented placeholder in [`crate::protocols`] today, finalized by
-    /// [`crate::multi`]); until then this hook is the faithful placeholder,
-    /// reporting the DO phase as complete in one step.
-    fn do_it<'a>(&'a self, _ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
-        Box::pin(async { Ok(true) })
+    /// Drives the first step of the DO-phase state machine over the transfer's
+    /// [`SmtpConn`] engine (held in [`TransferCtx::proto_state`], set up by the
+    /// connect phase) and its [`Connection`] (in [`TransferCtx::conn`]),
+    /// issuing `MAIL`/`RCPT`/`DATA` for an upload or a custom command
+    /// (`VRFY`/`EXPN`/`NOOP`/`RSET`/`HELP`) otherwise. Returns `true` when the
+    /// DO phase reaches `SMTP_STOP` in this single non-blocking step; otherwise
+    /// the transfer layer continues it via [`doing`](Self::doing) (← the
+    /// `*done` out-parameter of `smtp_do`).
+    ///
+    /// # Errors
+    /// [`CurlCode::BadFunctionArgument`] if the transfer carries no connection
+    /// or no SMTP engine (a caller precondition, ← curl's `data->conn` /
+    /// `conn->proto.smtpc` always being established by the connect phase), or
+    /// any protocol/I/O error surfaced while issuing the DO-phase commands.
+    fn do_it<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
+        Box::pin(async move {
+            let timeleft = smtp_do_timeleft(ctx);
+            let (conn, engine) = smtp_conn_and_engine(ctx)?;
+            engine.perform(conn, timeleft).await
+        })
+    }
+
+    /// Continue a non-blocking SMTP DO phase (← `smtp_doing`).
+    ///
+    /// Pumps the engine's ping-pong state machine one non-blocking step and
+    /// reports whether the DO phase has reached `SMTP_STOP`
+    /// (← `*done = (smtpc->state == SMTP_STOP)`).
+    ///
+    /// # Errors
+    /// As [`do_it`](Self::do_it): a missing connection/engine, or an engine
+    /// error surfaced while pumping the state machine.
+    fn doing<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
+        Box::pin(async move {
+            let timeleft = smtp_do_timeleft(ctx);
+            let (conn, engine) = smtp_conn_and_engine(ctx)?;
+            engine.doing(conn, timeleft).await
+        })
     }
 
     /// The SMTP "DONE" phase entry point (← `smtp_done`).
     ///
-    /// The real teardown — sending the dot-terminated body's trailing `250` via
-    /// [`SmtpState::Postdata`] and marking the connection for closure on error
-    /// — lives in [`SmtpConn::done`], driven by the transfer layer with the
-    /// owning [`SmtpConn`]/[`crate::conn::Connection`]. This hook is the
-    /// faithful placeholder pending [`TransferCtx`] enrichment.
+    /// Completes the transfer over the engine: on a good `status` for a body
+    /// upload it drives [`SmtpState::Postdata`] to collect the dot-terminated
+    /// message's trailing `250`; on a bad `status` it marks the connection for
+    /// closure and propagates the error (← `smtp_done`).
+    ///
+    /// # Errors
+    /// The propagated bad `status`, [`CurlCode::BadFunctionArgument`] for a
+    /// missing connection/engine, or any error from the POSTDATA exchange.
     fn done<'a>(
         &'a self,
-        _ctx: &'a mut TransferCtx,
-        _status: Result<()>,
-        _premature: bool,
+        ctx: &'a mut TransferCtx,
+        status: Result<()>,
+        premature: bool,
     ) -> ProtoFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            let timeleft = smtp_do_timeleft(ctx);
+            let (conn, engine) = smtp_conn_and_engine(ctx)?;
+            engine.done(conn, status, premature, timeleft).await
+        })
     }
 }
 
@@ -2862,5 +2944,70 @@ mod tests {
             io.lock().unwrap().captured.as_slice(),
             b"MAIL FROM:<from@example.com>\r\nRCPT TO:<rcpt@example.com>\r\nDATA\r\n"
         );
+    }
+
+    /// The [`SmtpHandler`] trait hooks (← `smtp_do`/`smtp_doing`/`smtp_done`)
+    /// drive the DO and DONE phases over the [`SmtpConn`] engine held in
+    /// [`TransferCtx::proto_state`] and the [`Connection`] in
+    /// [`TransferCtx::conn`], with a missing engine/connection reported as a
+    /// caller-precondition error. This exercises the handler wiring the review
+    /// flagged (the previous `do_it`/`done` were no-op placeholders).
+    #[tokio::test]
+    async fn handler_drives_do_doing_done_over_transfer_ctx() {
+        // Greeting-completed session; server returns 250 (MAIL), 250 (RCPT),
+        // 354 (DATA), then the final 250 collected by the DONE/POSTDATA step.
+        let io = Arc::new(Mutex::new(MockIo {
+            to_deliver: b"250 2.1.0 Ok\r\n250 2.1.5 Ok\r\n354 End data\r\n250 2.0.0 Ok\r\n"
+                .to_vec(),
+            ..MockIo::default()
+        }));
+        let mut conn = conn_with(Arc::clone(&io));
+        conn.connect(FIRSTSOCKET, false).await.unwrap();
+
+        // The engine the connect phase would have installed, primed for upload.
+        let mut engine = smtpc("localhost");
+        engine.pp.init(Instant::now());
+        engine.options.mail_from = Some("from@example.com".to_string());
+        engine.options.mail_rcpt = vec!["rcpt@example.com".to_string()];
+        engine.options.upload = true;
+
+        // Assemble the transfer context exactly as the driver would: the
+        // connection in `conn`, the SMTP engine in `proto_state`.
+        let mut ctx = TransferCtx::new();
+        ctx.conn = Some(Box::new(conn));
+        ctx.proto_state = Some(Box::new(engine));
+
+        // Drive the DO phase through the handler vtable (do_it, then doing).
+        let mut done = HANDLER.do_it(&mut ctx).await.unwrap();
+        let mut guard = 0;
+        while !done && guard < 40 {
+            done = HANDLER.doing(&mut ctx).await.unwrap();
+            guard += 1;
+        }
+        assert!(done, "handler DO phase did not reach completion");
+
+        // The three DO-phase commands were issued in order with exact framing.
+        assert_eq!(
+            io.lock().unwrap().captured.as_slice(),
+            b"MAIL FROM:<from@example.com>\r\nRCPT TO:<rcpt@example.com>\r\nDATA\r\n"
+        );
+
+        // DONE completes cleanly, collecting the trailing 250 via POSTDATA and
+        // resetting the engine to the idle Body transfer mode for reuse.
+        HANDLER.done(&mut ctx, Ok(()), false).await.unwrap();
+        let engine = ctx
+            .proto_state
+            .as_deref()
+            .unwrap()
+            .downcast_ref::<SmtpConn>()
+            .unwrap();
+        assert_eq!(engine.state(), SmtpState::Stop);
+        assert_eq!(engine.transfer(), PpTransfer::Body);
+
+        // A transfer with no connection/engine is a caller-precondition error
+        // (← curl requiring `data->conn` / `conn->proto.smtpc`).
+        let mut empty = TransferCtx::new();
+        let err = HANDLER.do_it(&mut empty).await.unwrap_err();
+        assert_eq!(err.code(), CurlCode::BadFunctionArgument);
     }
 }

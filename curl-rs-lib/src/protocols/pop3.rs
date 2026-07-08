@@ -54,6 +54,7 @@
 //! in safe Rust with **zero `unsafe`** while driving both engines coherently.
 
 use std::fmt::Write as _;
+use std::mem;
 use std::time::Instant;
 
 use md5::{Digest as _, Md5};
@@ -463,7 +464,10 @@ impl Default for Pop3Request<'_> {
 /// [`use_ssl`](Self::use_ssl), …) are co-located here — curl keeps them on the
 /// easy handle — so the fixed-signature [`PingPongProtocol::statemachine`] can
 /// reach them without extra out-of-band arguments.
-#[derive(Debug)]
+///
+/// Does not derive [`Debug`]: it owns a [`PingPong`] (whose I/O buffers are not
+/// `Debug`), exactly like its sibling engine
+/// [`crate::protocols::smtp::SmtpConn`].
 pub struct Pop3Conn {
     /// The shared SASL engine (← `pop3_conn.sasl`). [`Pop3Conn`] drives it via
     /// [`Sasl::sasl_start`] / [`Sasl::sasl_continue`], supplying the POP3
@@ -504,6 +508,16 @@ pub struct Pop3Conn {
     pub no_body: bool,
     /// Whether an initial SASL response is permitted (← `data->set.sasl_ir`).
     pub sasl_ir: bool,
+
+    /// The owned ping-pong command/response buffer for this connection
+    /// (← the pingpong embedded in curl's `struct pop3_conn`). Mirrors
+    /// [`crate::protocols::smtp::SmtpConn`]'s owned `pp`: the lifecycle wrappers
+    /// ([`perform`](Self::perform) / [`doing`](Self::doing)) swap it out via
+    /// [`mem::replace`] so the state machine can borrow the engine and the
+    /// buffer disjointly, then swap it back. The lower-level
+    /// [`perform_command`](Self::perform_command) / [`run_statemachine`] still
+    /// accept an external `pp` for unit tests that drive a single step.
+    pub pp: PingPong,
 }
 
 impl Pop3Conn {
@@ -532,6 +546,7 @@ impl Pop3Conn {
             list_only: req.list_only,
             no_body: false,
             sasl_ir: req.sasl_ir,
+            pp: PingPong::new(),
         }
     }
 
@@ -810,6 +825,81 @@ impl Pop3Conn {
                     return Ok(());
                 }
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Public DO/DONE lifecycle wrappers driven by [`Pop3Handler`] over the
+    // owned [`pp`](Self::pp) — the borrow-safe equivalent of curl passing `pp`
+    // and `conn`/`data` as separate arguments. Each wrapper swaps `pp` out of
+    // `self` (via `mem::replace`) so the state machine can borrow the engine
+    // and the buffer disjointly, then swaps it back (mirrors
+    // [`crate::protocols::smtp::SmtpConn`]).
+    // -----------------------------------------------------------------------
+
+    /// Begin the DO phase (← `pop3_perform` inside `pop3_do`): issue the first
+    /// command ([`perform_command`](Self::perform_command) — `RETR`/`LIST`/`TOP`
+    /// or a custom command) and pump the ping-pong state machine once. Returns
+    /// `true` once the DO phase has reached [`Pop3State::Stop`] (the `+OK`
+    /// status line has been consumed and the body, if any, is left for the
+    /// [`write_resp`](Protocol::write_resp)→[`write_body`](Self::write_body)
+    /// path); otherwise the transfer layer continues via [`doing`](Self::doing).
+    ///
+    /// # Errors
+    /// Any protocol or I/O error surfaced while issuing the command or pumping
+    /// the state machine.
+    pub async fn perform(&mut self, conn: &mut Connection) -> Result<bool> {
+        // Swap the buffer out so `perform_command`/`run_statemachine` can borrow
+        // `self` and `pp` disjointly (← curl's separate `pp`/`conn` arguments).
+        let mut pp = mem::replace(&mut self.pp, PingPong::new());
+        let result = match self.perform_command(&mut pp) {
+            Ok(()) => self.run_statemachine(&mut pp, conn).await,
+            Err(e) => Err(e),
+        };
+        self.pp = pp;
+        result?;
+        Ok(self.state == Pop3State::Stop)
+    }
+
+    /// Continue a non-blocking DO phase (← `pop3_doing` → `pop3_multi_statemach`):
+    /// pump the state machine one step and report whether it reached
+    /// [`Pop3State::Stop`].
+    ///
+    /// # Errors
+    /// Any error surfaced while pumping the state machine.
+    pub async fn doing(&mut self, conn: &mut Connection) -> Result<bool> {
+        let mut pp = mem::replace(&mut self.pp, PingPong::new());
+        let result = self.run_statemachine(&mut pp, conn).await;
+        self.pp = pp;
+        result?;
+        Ok(self.state == Pop3State::Stop)
+    }
+
+    /// Complete a single DO (← `pop3_done`): reset the transfer mode to
+    /// [`PpTransfer::Body`] for the next request, and on a bad `status` mark the
+    /// connection for closure and propagate the error. `premature` is accepted
+    /// for signature parity (`(void)premature` in curl).
+    ///
+    /// # Errors
+    /// The propagated bad `status`.
+    pub async fn done(
+        &mut self,
+        conn: &mut Connection,
+        status: Result<()>,
+        premature: bool,
+    ) -> Result<()> {
+        // `(void)premature` in curl — accepted for signature parity.
+        let _ = premature;
+        // Reset the transfer mode for the next request (← `pop3->transfer =
+        // PPTRANSFER_BODY`).
+        self.pop3.transfer = PpTransfer::Body;
+        match status {
+            Err(e) => {
+                // Marked for closure on failure (← `connclose(conn, ...)`).
+                conn.bits.close = true;
+                Err(e)
+            }
+            Ok(()) => Ok(()),
         }
     }
 }
@@ -1623,30 +1713,30 @@ impl Pop3Conn {
 /// The complete POP3 logic lives in [`Pop3Conn`] (the port of `struct
 /// pop3_conn` and the `pop3_*` machine) and its per-transfer [`Pop3`] (the port
 /// of `struct POP3`); the vtable methods below map one-to-one onto curl's
-/// `Curl_protocol_pop3` function pointers and hand off to that engine once the
-/// shared [`TransferCtx`] carries the connection, ping-pong buffer, and request
-/// handles (pending the upstream transfer/multi wiring; see
-/// [`crate::protocols::TransferCtx`], which is intentionally minimal at this
-/// stage). curl's `Curl_protocol_pop3` sets these pointers:
+/// `Curl_protocol_pop3` function pointers and drive that engine over the
+/// connection, ping-pong buffer, and request state carried by the shared
+/// [`TransferCtx`] (the engine lives in [`TransferCtx::proto_state`], the
+/// connection in [`TransferCtx::conn`], ← `conn->proto.pop3c`). curl's
+/// `Curl_protocol_pop3` sets these pointers:
 ///
 /// | curl pointer         | value                 | mapped to                                   |
 /// |----------------------|-----------------------|---------------------------------------------|
 /// | `setup_connection`   | `pop3_setup_connection` | [`Pop3Conn::new`] + URL-option parse (default hook) |
-/// | `do_it`              | `pop3_do`             | [`Pop3Handler::do_it`] → [`Pop3Conn::perform_command`] |
-/// | `done`               | `pop3_done`           | [`Pop3Handler::done`] (ownership-based cleanup) |
+/// | `do_it`              | `pop3_do`             | [`Pop3Handler::do_it`] → [`Pop3Conn::perform`] |
+/// | `doing`              | `pop3_doing`          | [`Pop3Handler::doing`] → [`Pop3Conn::doing`] |
+/// | `done`               | `pop3_done`           | [`Pop3Handler::done`] → [`Pop3Conn::done`]  |
+/// | `write_resp`         | `pop3_write`          | [`Pop3Handler::write_resp`] → [`Pop3Conn::write_body`] |
 /// | `connect_it`         | `pop3_connect`        | [`Pop3Conn::run_statemachine`] from `ServerGreet` (default hook) |
 /// | `connecting`         | `pop3_multi_statemach`| [`Pop3Conn::run_statemachine`] (default hook) |
-/// | `doing`              | `pop3_doing`          | [`Pop3Conn::run_statemachine`] (default hook) |
 /// | `proto_pollset` / `doing_pollset` | `pop3_pollset` | the ping-pong socket set (default hook) |
 /// | `disconnect`         | `pop3_disconnect`     | [`Pop3Conn::perform_quit`] (default hook)   |
-/// | `write_resp`         | `pop3_write`          | [`Pop3Conn::write_body`] (default hook)     |
 /// | `do_more` / `perform_pollset` / `write_resp_hd` / `connection_check` / `attach` / `follow` | `ZERO_NULL` | faithful no-op defaults |
 ///
-/// Only the two pointers curl marks mandatory (`do_it`, `done`) are overridden
-/// here; every other hook keeps the [`Protocol`] trait's faithful default,
-/// mirroring both curl's `ZERO_NULL` entries and the pointers whose real work
-/// is already implemented on [`Pop3Conn`] and bound once the transfer context
-/// is threaded through. This matches the sibling ping-pong handlers.
+/// The DO-phase pointers (`do_it`, `doing`), the mandatory `done`, and the body
+/// writer (`write_resp`) are overridden here to drive [`Pop3Conn`] over the
+/// [`TransferCtx`]; every other hook keeps the [`Protocol`] trait's faithful
+/// default, mirroring curl's `ZERO_NULL` entries and the generic connect/
+/// disconnect machinery. This matches the sibling ping-pong handlers.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Pop3Handler;
 
@@ -1655,43 +1745,135 @@ pub struct Pop3Handler;
 /// `Curl_scheme_pop3s`).
 pub static HANDLER: Pop3Handler = Pop3Handler;
 
+/// Borrow the transfer's [`Connection`] and its [`Pop3Conn`] engine disjointly
+/// from the [`TransferCtx`]: the connection lives in [`TransferCtx::conn`] and
+/// the engine — established by the connect phase (← `conn->proto.pop3c`) — in
+/// [`TransferCtx::proto_state`]. Because `conn` and `proto_state` are distinct
+/// fields, the two mutable borrows coexist (the disjoint-field-borrow pattern
+/// documented on [`TransferCtx`]).
+///
+/// # Errors
+/// [`CurlCode::BadFunctionArgument`] when either handle is absent — a caller
+/// precondition mirroring curl requiring both `data->conn` and
+/// `conn->proto.pop3c` to be established before the DO phase runs.
+fn pop3_conn_and_engine(ctx: &mut TransferCtx) -> Result<(&mut Connection, &mut Pop3Conn)> {
+    let engine = ctx
+        .proto_state
+        .as_deref_mut()
+        .and_then(|s| s.downcast_mut::<Pop3Conn>())
+        .ok_or_else(|| {
+            Error::with_context(
+                CurlCode::BadFunctionArgument,
+                "[POP3] no POP3 engine assigned to transfer",
+            )
+        })?;
+    let conn = ctx.conn.as_deref_mut().ok_or_else(|| {
+        Error::with_context(
+            CurlCode::BadFunctionArgument,
+            "[POP3] no connection assigned to transfer",
+        )
+    })?;
+    Ok((conn, engine))
+}
+
 impl Protocol for Pop3Handler {
-    /// The required "DO" phase (← `pop3_do`).
+    /// The required "DO" phase (← `pop3_do` → `pop3_perform`).
     ///
-    /// `pop3_do` decodes the URL path ([`Pop3Conn::parse_url_path`]) and the
-    /// custom request ([`Pop3Conn::parse_custom_request`]), then calls
-    /// `pop3_regular_transfer` → `pop3_perform`, which issues the first command
-    /// ([`Pop3Conn::perform_command`]) and sets `*dophase_done = FALSE` before
-    /// running the ping-pong state machine. The command response (and any
-    /// multi-line body) is therefore completed in the DOING phase, so the DO
-    /// phase is *not* complete on return — hence `Ok(false)`, deferring to
-    /// [`doing`](Protocol::doing) exactly as curl defers to `pop3_multi_statemach`.
+    /// Drives the transfer's [`Pop3Conn`] engine (held in
+    /// [`TransferCtx::proto_state`], its URL path / custom request already
+    /// decoded into the engine by the connect phase, ← `conn->proto.pop3c`) and
+    /// its [`Connection`] (in [`TransferCtx::conn`]): issues the first command
+    /// (`RETR`/`LIST`/`TOP` or a custom command) and pumps the ping-pong state
+    /// machine. Returns `true` if the DO phase has already reached
+    /// [`Pop3State::Stop`] in this step; otherwise the transfer layer continues
+    /// it via [`doing`](Protocol::doing) (← `pop3_multi_statemach`). The
+    /// multi-line response body is delivered separately through
+    /// [`write_resp`](Protocol::write_resp).
     ///
-    /// The concrete request work lives in [`Pop3Conn`]; it binds here once
-    /// [`TransferCtx`] carries the easy-handle's URL path/custom request, the
-    /// owning [`crate::conn::Connection`], and the ping-pong buffer.
+    /// # Errors
+    /// [`CurlCode::BadFunctionArgument`] if the transfer carries no connection
+    /// or no POP3 engine, or any protocol/I/O error surfaced while issuing the
+    /// command.
     fn do_it<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
-        let _ = ctx;
-        Box::pin(async { Ok(false) })
+        Box::pin(async move {
+            let (conn, engine) = pop3_conn_and_engine(ctx)?;
+            engine.perform(conn).await
+        })
+    }
+
+    /// Continue a non-blocking POP3 DO phase (← `pop3_doing`).
+    ///
+    /// Pumps the engine's ping-pong state machine one step and reports whether
+    /// the DO phase reached [`Pop3State::Stop`].
+    ///
+    /// # Errors
+    /// As [`do_it`](Self::do_it): a missing connection/engine, or an engine
+    /// error surfaced while pumping the state machine.
+    fn doing<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
+        Box::pin(async move {
+            let (conn, engine) = pop3_conn_and_engine(ctx)?;
+            engine.doing(conn).await
+        })
     }
 
     /// The required teardown (← `pop3_done`).
     ///
-    /// `pop3_done` frees `POP3.id` / `POP3.custom` and resets `POP3.transfer` to
-    /// `PPTRANSFER_BODY` (marking the connection for close if the transfer
-    /// failed). In this rewrite `id`/`custom` are owned `String`s on [`Pop3`] and
-    /// are released deterministically by ownership/`Drop` when the transfer
-    /// ends, and the `transfer` reset plus the failure-driven connection-close
-    /// are applied through the connection handle once [`TransferCtx`] carries it.
-    /// This is a complete port of `pop3_done`, not a stub.
+    /// Resets `POP3.transfer` to [`PpTransfer::Body`] for the next request and,
+    /// on a bad `status`, marks the connection for closure and propagates the
+    /// error. (`POP3.id`/`POP3.custom` are owned `String`s released
+    /// deterministically by ownership when the transfer ends.)
+    ///
+    /// # Errors
+    /// The propagated bad `status`, or [`CurlCode::BadFunctionArgument`] for a
+    /// missing connection/engine.
     fn done<'a>(
         &'a self,
         ctx: &'a mut TransferCtx,
         status: Result<()>,
         premature: bool,
     ) -> ProtoFuture<'a, ()> {
-        let _ = (ctx, status, premature);
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            let (conn, engine) = pop3_conn_and_engine(ctx)?;
+            engine.done(conn, status, premature).await
+        })
+    }
+
+    /// Post-process and deliver a chunk of response *body* bytes (← `pop3_write`).
+    ///
+    /// The multi-line message body is dot-unstuffed and scanned for the
+    /// `\r\n.\r\n` end-of-body marker by [`Pop3Conn::write_body`]; the resulting
+    /// client bytes (the marker and stuffing removed) are written to the
+    /// transfer's [`sink`](TransferCtx::sink), exactly as curl's `pop3_write`
+    /// funnels body bytes into `Curl_client_write`. `is_eos` needs no
+    /// POP3-specific finalisation (the EOB marker already delimits the body).
+    fn write_resp<'a>(
+        &'a self,
+        ctx: &'a mut TransferCtx,
+        buf: &'a [u8],
+        is_eos: bool,
+    ) -> ProtoFuture<'a, ()> {
+        Box::pin(async move {
+            let _ = is_eos;
+            // De-stuff via the engine's EOB scanner (disjoint `proto_state`
+            // borrow ends when `out` is produced), then deliver to the sink.
+            let out = match ctx
+                .proto_state
+                .as_deref_mut()
+                .and_then(|s| s.downcast_mut::<Pop3Conn>())
+            {
+                Some(engine) => engine.write_body(buf).0,
+                // No engine assigned (a caller precondition normally satisfied
+                // by the connect phase): pass the chunk through unchanged rather
+                // than aborting the write.
+                None => buf.to_vec(),
+            };
+            if !out.is_empty() {
+                if let Some(sink) = ctx.sink.as_deref_mut() {
+                    sink.write(&out)?;
+                }
+            }
+            Ok(())
+        })
     }
 }
 
@@ -1707,6 +1889,12 @@ mod tests {
     use super::*;
     use crate::conn::Scheme;
 
+    use std::sync::{Arc, Mutex};
+
+    use crate::conn::filters::{CfFuture, FilterCtx, QueryCtx, QueryOut};
+    use crate::conn::{CfQuery, CfType, ConnectionFilter, FilterChain, Transport};
+    use crate::protocols::TransferSink;
+
     /// A fresh connection state with default options.
     fn mk_pop3() -> Pop3Conn {
         Pop3Conn::new(&Pop3Request::default())
@@ -1715,6 +1903,103 @@ mod tests {
     /// A minimal POP3 [`Connection`] for handlers that read connection fields.
     fn mk_conn() -> Connection {
         Connection::new(Scheme::new("pop3", 110), "mail.example.com", 110)
+    }
+
+    // ----- In-memory mock connection filter (leaf; overrides send/recv) -----
+    //
+    // Mirrors the harness in `smtp.rs`/`pingpong.rs`: it delivers canned bytes
+    // on `recv` and captures written bytes on `send`, so command framing and
+    // response handling can be exercised without a live socket.
+
+    /// Shared, inspectable I/O state for [`MockFilter`].
+    #[derive(Default)]
+    struct MockIo {
+        /// Bytes handed to `recv`, consumed from the front.
+        to_deliver: Vec<u8>,
+        /// Bytes accepted by `send`, for assertion.
+        captured: Vec<u8>,
+    }
+
+    /// A leaf filter terminating the chain: it never delegates.
+    struct MockFilter {
+        io: Arc<Mutex<MockIo>>,
+        fd: i32,
+    }
+
+    impl ConnectionFilter for MockFilter {
+        fn name(&self) -> &'static str {
+            "MOCK"
+        }
+
+        fn cf_type(&self) -> CfType {
+            CfType::IP_CONNECT
+        }
+
+        fn send<'a>(
+            &'a mut self,
+            _cx: &'a mut FilterCtx<'_>,
+            buf: &'a [u8],
+            _eos: bool,
+        ) -> CfFuture<'a, Result<usize>> {
+            let io = Arc::clone(&self.io);
+            let data = buf.to_vec();
+            Box::pin(async move {
+                let mut g = io.lock().unwrap();
+                g.captured.extend_from_slice(&data);
+                Ok(data.len())
+            })
+        }
+
+        fn recv<'a>(
+            &'a mut self,
+            _cx: &'a mut FilterCtx<'_>,
+            buf: &'a mut [u8],
+        ) -> CfFuture<'a, Result<usize>> {
+            let io = Arc::clone(&self.io);
+            Box::pin(async move {
+                let mut g = io.lock().unwrap();
+                let n = g.to_deliver.len().min(buf.len());
+                buf[..n].copy_from_slice(&g.to_deliver[..n]);
+                g.to_deliver.drain(..n);
+                Ok(n)
+            })
+        }
+
+        fn data_pending(&self, _cx: &QueryCtx<'_>) -> bool {
+            !self.io.lock().unwrap().to_deliver.is_empty()
+        }
+
+        fn query(&self, _cx: &QueryCtx<'_>, query: CfQuery, out: &mut QueryOut) -> Result<()> {
+            match query {
+                CfQuery::Socket => {
+                    *out = QueryOut::Socket(self.fd);
+                    Ok(())
+                }
+                CfQuery::Transport => {
+                    *out = QueryOut::Transport(Transport::Tcp);
+                    Ok(())
+                }
+                _ => Err(Error::Code(CurlCode::UnknownOption)),
+            }
+        }
+    }
+
+    /// A network connection whose primary chain is the given mock filter.
+    fn conn_with(io: Arc<Mutex<MockIo>>) -> Connection {
+        let mut conn = Connection::new(Scheme::new("pop3", 110), "mail.example.com", 110);
+        let mut chain = FilterChain::new(FIRSTSOCKET);
+        chain.add(Box::new(MockFilter { io, fd: 7 }));
+        conn.cfilter[FIRSTSOCKET] = Some(chain);
+        conn
+    }
+
+    /// A [`TransferSink`] that records every delivered body chunk for assertion.
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+    impl TransferSink for RecordingSink {
+        fn write(&mut self, data: &[u8]) -> Result<()> {
+            self.0.lock().expect("sink lock").extend_from_slice(data);
+            Ok(())
+        }
     }
 
     // ----- Pop3State diagnostic vocabulary (← the `names[]` in `pop3_state`) --
@@ -2128,5 +2413,86 @@ mod tests {
         conn.perform_authentication(&mut pp, &c)
             .expect("connect ends");
         assert_eq!(conn.state, Pop3State::Stop);
+    }
+
+    // ----- Pop3Handler end-to-end (← pop3_do/pop3_doing/pop3_done/pop3_write) -
+
+    /// The [`Pop3Handler`] trait hooks drive the DO phase over the [`Pop3Conn`]
+    /// engine held in [`TransferCtx::proto_state`] and the [`Connection`] in
+    /// [`TransferCtx::conn`]: `do_it` flushes the `RETR` command and `doing`
+    /// consumes the `+OK` status line, completing the DO phase. `done` resets
+    /// the transfer mode, and a transfer with no connection/engine is a
+    /// caller-precondition error. This exercises the handler wiring the review
+    /// flagged (the previous `do_it` discarded `TransferCtx` and returned
+    /// `Ok(false)`).
+    #[tokio::test]
+    async fn handler_drives_retr_command_over_transfer_ctx() {
+        // The server returns just the RETR status line; the message body is
+        // delivered separately by the transfer layer via `write_resp`.
+        let io = Arc::new(Mutex::new(MockIo {
+            to_deliver: b"+OK 11 octets\r\n".to_vec(),
+            ..MockIo::default()
+        }));
+        let mut conn = conn_with(Arc::clone(&io));
+        conn.connect(FIRSTSOCKET, false).await.unwrap();
+
+        // The engine the connect phase would have installed, primed to RETR #1.
+        let mut engine = mk_pop3();
+        engine.pop3.id = String::from("1");
+        engine.pp.init(Instant::now());
+
+        let mut ctx = TransferCtx::new();
+        ctx.conn = Some(Box::new(conn));
+        ctx.proto_state = Some(Box::new(engine));
+
+        // Drive the DO phase through the handler: do_it flushes RETR, then doing
+        // reads the +OK status line and completes the DO phase.
+        let mut done = HANDLER.do_it(&mut ctx).await.unwrap();
+        let mut guard = 0;
+        while !done && guard < 40 {
+            done = HANDLER.doing(&mut ctx).await.unwrap();
+            guard += 1;
+        }
+        assert!(done, "handler DO phase did not reach completion");
+        assert_eq!(io.lock().unwrap().captured.as_slice(), b"RETR 1\r\n");
+
+        // DONE resets the transfer mode to Body for the next request.
+        HANDLER.done(&mut ctx, Ok(()), false).await.unwrap();
+        let engine = ctx
+            .proto_state
+            .as_deref()
+            .unwrap()
+            .downcast_ref::<Pop3Conn>()
+            .unwrap();
+        assert_eq!(engine.pop3.transfer, PpTransfer::Body);
+
+        // A transfer with no connection/engine is a caller-precondition error.
+        let mut empty = TransferCtx::new();
+        let err = HANDLER.do_it(&mut empty).await.unwrap_err();
+        assert_eq!(err.code(), CurlCode::BadFunctionArgument);
+    }
+
+    /// [`Pop3Handler::write_resp`] (← `pop3_write`) dot-unstuffs the multi-line
+    /// body via [`Pop3Conn::write_body`] and delivers the client bytes to the
+    /// transfer's [`sink`](TransferCtx::sink); the terminating `.\r\n` marker is
+    /// consumed, not delivered. This covers the "body bytes reach client
+    /// callbacks" wiring the review flagged as deferred.
+    #[tokio::test]
+    async fn handler_write_resp_destuffs_body_to_sink() {
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = TransferCtx::new();
+        ctx.proto_state = Some(Box::new(mk_pop3()));
+        ctx.sink = Some(Box::new(RecordingSink(Arc::clone(&sink))));
+
+        // A complete message body followed by the end-of-body marker in one
+        // chunk (the known-good pair from `write_body_delivers_body_then_detects_eob`).
+        HANDLER
+            .write_resp(&mut ctx, b"hello world\r\n.\r\n", true)
+            .await
+            .unwrap();
+
+        // The message content plus the marker's leading CRLF reached the sink;
+        // the terminating `.\r\n` did not.
+        assert_eq!(sink.lock().unwrap().as_slice(), b"hello world\r\n");
     }
 }

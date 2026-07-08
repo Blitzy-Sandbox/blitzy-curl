@@ -98,6 +98,7 @@
 //! (`#![forbid(unsafe_code)]`): there is no `unsafe`, no raw pointer, and no FFI
 //! anywhere in this module.
 
+use std::mem;
 use std::time::Instant;
 
 use crate::auth::sasl::{
@@ -597,6 +598,18 @@ impl ImapConn {
     #[must_use]
     pub fn client_body(&self) -> &[u8] {
         &self.client_body
+    }
+
+    /// Take (drain) the body bytes accumulated for the client so far, clearing
+    /// the internal buffer. Used by [`ImapHandler`] — acting as the transfer
+    /// driver — to deliver each newly-buffered chunk (the untagged response
+    /// lines and any header/literal bytes the DO-phase response handlers
+    /// captured into [`client_body`](Self::client_body)) to the client sink,
+    /// then continue accumulating from empty. The engine only ever appends to
+    /// this buffer, so draining it is side-effect free.
+    #[must_use]
+    pub fn take_client_body(&mut self) -> Vec<u8> {
+        mem::take(&mut self.client_body)
     }
 
     /// The deferred transfer setup recorded by the last DO-phase response.
@@ -2561,39 +2574,182 @@ pub struct ImapHandler;
 /// (TLS is layered by the connection filter chain, not by a distinct handler).
 pub static HANDLER: ImapHandler = ImapHandler;
 
+/// The remaining whole-transfer time budget in milliseconds for the IMAP engine
+/// (← curl's `Curl_timeleft_ms(data)`): the configured `CURLOPT_TIMEOUT[_MS]`
+/// when set, or `0` — the sentinel the ping-pong pump reads as "no transfer
+/// timeout applies". Mirrors the SMTP/POP3 handlers.
+fn imap_do_timeleft(ctx: &TransferCtx) -> i64 {
+    ctx.request
+        .timeout
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Borrow the transfer's [`Connection`] and its [`ImapConn`] engine disjointly
+/// from the [`TransferCtx`]: the connection lives in [`TransferCtx::conn`] and
+/// the engine — established by the connect phase (← `conn->proto.imapc`) — in
+/// [`TransferCtx::proto_state`]. Because `conn` and `proto_state` are distinct
+/// fields, the two mutable borrows coexist (the disjoint-field-borrow pattern
+/// documented on [`TransferCtx`]).
+///
+/// # Errors
+/// [`CurlCode::BadFunctionArgument`] when either handle is absent — a caller
+/// precondition mirroring curl requiring both `data->conn` and
+/// `conn->proto.imapc` to be established before the DO phase runs.
+fn imap_conn_and_engine(ctx: &mut TransferCtx) -> Result<(&mut Connection, &mut ImapConn)> {
+    let engine = ctx
+        .proto_state
+        .as_deref_mut()
+        .and_then(|s| s.downcast_mut::<ImapConn>())
+        .ok_or_else(|| {
+            Error::with_context(
+                CurlCode::BadFunctionArgument,
+                "[IMAP] no IMAP engine assigned to transfer",
+            )
+        })?;
+    let conn = ctx.conn.as_deref_mut().ok_or_else(|| {
+        Error::with_context(
+            CurlCode::BadFunctionArgument,
+            "[IMAP] no connection assigned to transfer",
+        )
+    })?;
+    Ok((conn, engine))
+}
+
+/// Drain the engine's accumulated client body (the untagged response lines and
+/// literal-header bytes the DO-phase response handlers captured, ← curl's
+/// buffered-literal reinjection) and deliver it to the transfer's
+/// [`sink`](TransferCtx::sink). The engine `proto_state` borrow ends when the
+/// owned bytes are taken, before the disjoint `sink` borrow.
+fn imap_flush_body(ctx: &mut TransferCtx) -> Result<()> {
+    let body = match ctx
+        .proto_state
+        .as_deref_mut()
+        .and_then(|s| s.downcast_mut::<ImapConn>())
+    {
+        Some(engine) => engine.take_client_body(),
+        None => Vec::new(),
+    };
+    if !body.is_empty() {
+        if let Some(sink) = ctx.sink.as_deref_mut() {
+            sink.write(&body)?;
+        }
+    }
+    Ok(())
+}
+
 impl Protocol for ImapHandler {
-    /// The IMAP "DO" phase (← `Curl_protocol_imap.do_it`, i.e. `imap_do`).
+    /// The IMAP "DO" phase (← `imap_do`).
     ///
-    /// curl's `imap_do` parses the URL path and any custom request, then hands
-    /// off to the generic transfer machinery, which pumps the tagged-command
-    /// state machine (`SELECT`/`FETCH`/`APPEND`/`SEARCH`/`LIST`, …) to
-    /// completion. That concrete drive — including the URL parsing and the
-    /// `PingPong` pump — is implemented by [`ImapConn::run_do`], which owns the
-    /// live `(ImapConn, Connection)` pair. This vtable entry is the faithful
-    /// shim: it reports "the DO phase is complete" (`Ok(true)`) so the generic
-    /// lifecycle can advance to `DOING`/`DONE`, exactly as the driver arranges,
-    /// once the transfer layer binds a context to its IMAP connection state.
-    fn do_it<'a>(&'a self, _ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
-        Box::pin(async { Ok(true) })
+    /// Drives the transfer's [`ImapConn`] engine (held in
+    /// [`TransferCtx::proto_state`], ← `conn->proto.imapc`) and its
+    /// [`Connection`] (in [`TransferCtx::conn`]) through
+    /// [`ImapConn::run_do`], which issues the tagged command sequence
+    /// (`SELECT`/`FETCH`/`APPEND`/`SEARCH`/`LIST`, …) derived from the request's
+    /// URL path/query. Any body bytes buffered by the DO-phase response handlers
+    /// (untagged lines and literal headers) are then delivered to the client
+    /// [`sink`](TransferCtx::sink) via [`imap_flush_body`]. Returns `true` once
+    /// the DO phase reaches [`ImapState::Stop`]; otherwise the transfer layer
+    /// continues via [`doing`](Protocol::doing).
+    ///
+    /// # Errors
+    /// [`CurlCode::BadFunctionArgument`] if the transfer carries no connection
+    /// or no IMAP engine, or any protocol/I/O error surfaced while driving the
+    /// command sequence.
+    fn do_it<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
+        Box::pin(async move {
+            let now = Instant::now();
+            let timeleft = imap_do_timeleft(ctx);
+            // Own the URL path/query so the request borrow ends before the
+            // connection/engine borrows below (← `imap_do` parsing the URL).
+            let path = ctx.request.path.clone();
+            let query = ctx.request.query.clone();
+            let done = {
+                let (conn, engine) = imap_conn_and_engine(ctx)?;
+                engine
+                    .run_do(conn, &path, query.as_deref(), now, timeleft)
+                    .await?
+            };
+            // Deliver the buffered untagged/literal-header bytes to the sink.
+            imap_flush_body(ctx)?;
+            Ok(done)
+        })
     }
 
-    /// The IMAP "DONE" phase (← `Curl_protocol_imap.done`, i.e. `imap_done`).
+    /// Continue a non-blocking IMAP DO phase (← `imap_doing`).
     ///
-    /// curl's `imap_done` finalizes the transfer: on error it flags the
-    /// connection for closure, otherwise it issues the trailing
-    /// `FETCH`/`APPEND` completion (`IMAP_FETCH_FINAL` / `IMAP_APPEND_FINAL`)
-    /// and resets the per-request `IMAP` state. That teardown is implemented by
-    /// [`ImapConn::run_done`], which owns the live `(ImapConn, Connection)`
-    /// pair and honors the incoming `status`/`premature` flags. This vtable
-    /// entry is the faithful no-op shim the [`Protocol`] trait requires; the
-    /// driver performs the real finalization once a context is bound.
+    /// Pumps the engine's state machine one step via [`ImapConn::run_doing`],
+    /// then delivers any newly buffered body bytes to the sink. Returns `true`
+    /// once the DO phase reaches [`ImapState::Stop`].
+    ///
+    /// # Errors
+    /// As [`do_it`](Self::do_it): a missing connection/engine, or an engine
+    /// error surfaced while pumping the state machine.
+    fn doing<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
+        Box::pin(async move {
+            let now = Instant::now();
+            let timeleft = imap_do_timeleft(ctx);
+            let done = {
+                let (conn, engine) = imap_conn_and_engine(ctx)?;
+                engine.run_doing(conn, now, timeleft).await?
+            };
+            imap_flush_body(ctx)?;
+            Ok(done)
+        })
+    }
+
+    /// The IMAP "DONE" phase (← `imap_done`).
+    ///
+    /// Finalizes the transfer over the engine via [`ImapConn::run_done`]: on
+    /// error it flags the connection for closure and propagates the status,
+    /// otherwise it issues the trailing `FETCH`/`APPEND` completion
+    /// (`IMAP_FETCH_FINAL` / `IMAP_APPEND_FINAL`) and resets the per-request
+    /// state, honoring the incoming `status`/`premature`. Any residual buffered
+    /// body is delivered to the sink.
+    ///
+    /// # Errors
+    /// The propagated bad `status`, [`CurlCode::BadFunctionArgument`] for a
+    /// missing connection/engine, or any error from the completion exchange.
     fn done<'a>(
         &'a self,
-        _ctx: &'a mut TransferCtx,
-        _status: Result<()>,
-        _premature: bool,
+        ctx: &'a mut TransferCtx,
+        status: Result<()>,
+        premature: bool,
     ) -> ProtoFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            let timeleft = imap_do_timeleft(ctx);
+            {
+                let (conn, engine) = imap_conn_and_engine(ctx)?;
+                engine.run_done(conn, status, premature, timeleft).await?;
+            }
+            imap_flush_body(ctx)?;
+            Ok(())
+        })
+    }
+
+    /// Deliver a chunk of response *body* bytes (← `imap_write`).
+    ///
+    /// IMAP literal bodies are raw, byte-counted content (no dot-stuffing), so
+    /// the transfer layer's received body bytes pass straight through to the
+    /// transfer's [`sink`](TransferCtx::sink) — the "subsequent body bytes"
+    /// following the buffered literal header, funneled exactly as curl's
+    /// `imap_write` calls `Curl_client_write`. `is_eos` needs no IMAP-specific
+    /// finalisation (the recorded literal size delimits the body).
+    fn write_resp<'a>(
+        &'a self,
+        ctx: &'a mut TransferCtx,
+        buf: &'a [u8],
+        is_eos: bool,
+    ) -> ProtoFuture<'a, ()> {
+        Box::pin(async move {
+            let _ = is_eos;
+            if !buf.is_empty() {
+                if let Some(sink) = ctx.sink.as_deref_mut() {
+                    sink.write(buf)?;
+                }
+            }
+            Ok(())
+        })
     }
 }
 
@@ -2630,6 +2786,108 @@ mod tests {
             c.options = Some(opts.to_string());
         }
         c
+    }
+
+    // ----- In-memory mock connection filter (leaf; overrides send/recv) -----
+    //
+    // Mirrors the harness in `smtp.rs`/`pop3.rs`: it delivers canned bytes on
+    // `recv` and captures written bytes on `send`, so command framing and
+    // response handling can be exercised without a live socket.
+    use std::sync::{Arc, Mutex};
+
+    use crate::conn::filters::{CfFuture, FilterCtx, QueryCtx, QueryOut};
+    use crate::conn::{CfQuery, CfType, ConnectionFilter, FilterChain, Transport};
+    use crate::protocols::TransferSink;
+
+    /// Shared, inspectable I/O state for [`MockFilter`].
+    #[derive(Default)]
+    struct MockIo {
+        /// Bytes handed to `recv`, consumed from the front.
+        to_deliver: Vec<u8>,
+        /// Bytes accepted by `send`, for assertion.
+        captured: Vec<u8>,
+    }
+
+    /// A leaf filter terminating the chain: it never delegates.
+    struct MockFilter {
+        io: Arc<Mutex<MockIo>>,
+        fd: i32,
+    }
+
+    impl ConnectionFilter for MockFilter {
+        fn name(&self) -> &'static str {
+            "MOCK"
+        }
+
+        fn cf_type(&self) -> CfType {
+            CfType::IP_CONNECT
+        }
+
+        fn send<'a>(
+            &'a mut self,
+            _cx: &'a mut FilterCtx<'_>,
+            buf: &'a [u8],
+            _eos: bool,
+        ) -> CfFuture<'a, Result<usize>> {
+            let io = Arc::clone(&self.io);
+            let data = buf.to_vec();
+            Box::pin(async move {
+                let mut g = io.lock().unwrap();
+                g.captured.extend_from_slice(&data);
+                Ok(data.len())
+            })
+        }
+
+        fn recv<'a>(
+            &'a mut self,
+            _cx: &'a mut FilterCtx<'_>,
+            buf: &'a mut [u8],
+        ) -> CfFuture<'a, Result<usize>> {
+            let io = Arc::clone(&self.io);
+            Box::pin(async move {
+                let mut g = io.lock().unwrap();
+                let n = g.to_deliver.len().min(buf.len());
+                buf[..n].copy_from_slice(&g.to_deliver[..n]);
+                g.to_deliver.drain(..n);
+                Ok(n)
+            })
+        }
+
+        fn data_pending(&self, _cx: &QueryCtx<'_>) -> bool {
+            !self.io.lock().unwrap().to_deliver.is_empty()
+        }
+
+        fn query(&self, _cx: &QueryCtx<'_>, query: CfQuery, out: &mut QueryOut) -> Result<()> {
+            match query {
+                CfQuery::Socket => {
+                    *out = QueryOut::Socket(self.fd);
+                    Ok(())
+                }
+                CfQuery::Transport => {
+                    *out = QueryOut::Transport(Transport::Tcp);
+                    Ok(())
+                }
+                _ => Err(Error::Code(CurlCode::UnknownOption)),
+            }
+        }
+    }
+
+    /// A network connection whose primary chain is the given mock filter.
+    fn conn_with(io: Arc<Mutex<MockIo>>) -> Connection {
+        let mut conn = Connection::new(Scheme::new("imap", 143), "example.com", 143);
+        let mut chain = FilterChain::new(FIRSTSOCKET);
+        chain.add(Box::new(MockFilter { io, fd: 7 }));
+        conn.cfilter[FIRSTSOCKET] = Some(chain);
+        conn
+    }
+
+    /// A [`TransferSink`] that records every delivered body chunk for assertion.
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+    impl TransferSink for RecordingSink {
+        fn write(&mut self, data: &[u8]) -> Result<()> {
+            self.0.lock().expect("sink lock").extend_from_slice(data);
+            Ok(())
+        }
     }
 
     // ----- State-name trace table (← `names[]`) -------------------------------
@@ -3123,18 +3381,88 @@ mod tests {
     // ----- Protocol vtable shim (← Curl_protocol_imap) ------------------------
 
     #[tokio::test]
-    async fn handler_do_it_reports_phase_complete() {
-        // do_it (← imap_do) reports the DO phase complete so the lifecycle can
-        // advance; the concrete drive lives in ImapConn::run_do.
+    async fn handler_drives_list_body_to_sink() {
+        // A directory listing (LIST) is the DO command chosen for a bare `/`
+        // path with no mailbox/custom/upload. The server returns one untagged
+        // listing line followed by the tagged completion; the handler must issue
+        // the command over the connection and deliver the untagged line's bytes
+        // to the client sink (the "buffered literals/body bytes reach client
+        // callbacks" wiring the review flagged as deferred).
+        let io = Arc::new(Mutex::new(MockIo {
+            to_deliver: b"* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\nA001 OK LIST completed\r\n"
+                .to_vec(),
+            ..MockIo::default()
+        }));
+        let mut conn = conn_with(Arc::clone(&io));
+        conn.connect(FIRSTSOCKET, false).await.unwrap();
+
+        // The engine the connect phase would have installed (connection id 0 =>
+        // tag letter 'A'), matching curl's `conn->proto.imapc`.
+        let engine = ImapConn::new(0);
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
         let mut ctx = TransferCtx::new();
-        assert!(HANDLER.do_it(&mut ctx).await.unwrap());
+        ctx.request.path = String::from("/");
+        ctx.conn = Some(Box::new(conn));
+        ctx.proto_state = Some(Box::new(engine));
+        ctx.sink = Some(Box::new(RecordingSink(Arc::clone(&sink))));
+
+        // do_it issues `A001 LIST "" *` and flushes it; doing reads the
+        // untagged listing line and the tagged completion, ending the DO phase.
+        let mut done = HANDLER.do_it(&mut ctx).await.unwrap();
+        let mut guard = 0;
+        while !done && guard < 40 {
+            done = HANDLER.doing(&mut ctx).await.unwrap();
+            guard += 1;
+        }
+        assert!(done, "handler DO phase did not reach completion");
+
+        // The tagged LIST command reached the wire.
+        assert!(
+            io.lock().unwrap().captured.windows(4).any(|w| w == b"LIST"),
+            "LIST command was not sent"
+        );
+        // The untagged listing line reached the client sink.
+        let body = sink.lock().unwrap().clone();
+        assert!(
+            body.windows(5).any(|w| w == b"INBOX"),
+            "listing body did not reach the sink: {body:?}"
+        );
+
+        // A transfer with no connection/engine is a caller-precondition error.
+        let mut empty = TransferCtx::new();
+        let err = HANDLER.do_it(&mut empty).await.unwrap_err();
+        assert_eq!(err.code(), CurlCode::BadFunctionArgument);
     }
 
     #[tokio::test]
-    async fn handler_done_is_ok() {
-        // done (← imap_done) is the mandatory teardown hook.
+    async fn handler_done_reports_missing_precondition() {
+        // done (← imap_done) requires the connection and engine established by
+        // the connect phase; an empty transfer is a caller-precondition error
+        // (mirrors the SMTP/POP3 handlers).
         let mut ctx = TransferCtx::new();
-        HANDLER.done(&mut ctx, Ok(()), false).await.unwrap();
+        let err = HANDLER.done(&mut ctx, Ok(()), false).await.unwrap_err();
+        assert_eq!(err.code(), CurlCode::BadFunctionArgument);
+    }
+
+    #[tokio::test]
+    async fn handler_write_resp_passes_literal_body_to_sink() {
+        // IMAP literal bodies are raw, byte-counted content (no dot-stuffing):
+        // write_resp (← imap_write) funnels the "subsequent body bytes" that
+        // follow a buffered literal header straight to the client sink.
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = TransferCtx::new();
+        ctx.sink = Some(Box::new(RecordingSink(Arc::clone(&sink))));
+
+        HANDLER
+            .write_resp(&mut ctx, b"Subject: hi\r\n\r\nbody bytes", true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sink.lock().unwrap().as_slice(),
+            b"Subject: hi\r\n\r\nbody bytes"
+        );
     }
 
     #[test]

@@ -1282,6 +1282,33 @@ pub struct Info {
     /// `req.httpcode`). Consulted by [`Easy::follow`] to decide `POST`→`GET`
     /// method switching and whether a redirect is auth-related (`401`/`407`).
     pub httpcode: i32,
+    /// The `Content-Type` of the most recently retrieved document, as read back
+    /// by `CURLINFO_CONTENT_TYPE` (curl's `data->info.contenttype`). It is set
+    /// by the HTTP response-header processing path when a `Content-Type:` header
+    /// is seen (see [`set_content_type`](Info::set_content_type)) and is `None`
+    /// when the response carried no such header — exactly as curl leaves
+    /// `data->info.contenttype` `NULL`. The CLI consults it for `--xattr`
+    /// (`user.mime_type`) and `--write-out %{content_type}`.
+    pub contenttype: Option<String>,
+}
+
+impl Info {
+    /// Record the response `Content-Type` header value (← the `data->info.contenttype`
+    /// assignment in curl's `Curl_http_readwrite_headers`, `lib/http.c`).
+    ///
+    /// The value is stored verbatim (the full header value after the `Content-Type:`
+    /// name and its optional whitespace), matching curl, which keeps the entire value
+    /// including any `; charset=…` parameter. Passing an empty string clears the field
+    /// so that a `Content-Type:` header with no value is reported as absent, mirroring
+    /// curl's behavior of only recording a non-empty type.
+    pub fn set_content_type(&mut self, value: &str) {
+        let trimmed = value.trim();
+        self.contenttype = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
 }
 
 /// The mutable, per-transfer operational state of an easy handle — the parts of

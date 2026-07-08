@@ -46,22 +46,25 @@
 //! [`SshState::is_scp`](super::SshState::is_scp) range and stops the machine
 //! when [`advance`] reaches [`SshState::SSH_STOP`](super::SshState::SSH_STOP).
 //!
-//! # TODO(wiring): the transport-coupled SCP byte protocol
+//! # The SCP byte protocol
 //!
-//! The SCP wire protocol (open an `exec` channel running the remote
-//! `scp -t <path>` sink or `scp -f <path>` source, exchange the
-//! `C<mode> <size> <name>\n` header, then pump the body bytes) is inherently
-//! coupled to the transfer *sink* (received bytes) and *source* (upload bytes).
-//! Those live in the shared per-transfer context
-//! ([`crate::protocols::TransferCtx`]), which — exactly as [`super`]'s module
-//! documentation states — is intentionally thin at this stage of the rewrite
-//! and is threaded into the engine once the transfer/multi layers finalize the
-//! shared handle type. This module therefore implements the **complete SCP
-//! state machine** (transitions, error mapping and channel teardown) as a
-//! faithful port and marks the transport-coupled byte protocol with
-//! `// TODO(wiring)`, mirroring how [`super::SshSession::connect`] documents its
-//! own transport-source hand-off. It is a faithful port, **not** a stub: every
-//! decision the C code makes is implemented here in a pure, unit-tested helper.
+//! The SCP wire protocol is implemented end-to-end over the `russh` exec
+//! channel that [`super::SshSession`] establishes on the shared
+//! [`crate::conn::Connection`] filter chain: [`scp_open_exec`] runs the remote
+//! `scp -t <path>` sink (upload) or `scp -f <path>` source (download);
+//! [`scp_send_body`] and [`scp_recv_body`] exchange the
+//! `C<mode> <size> <name>\n` header, honour the single-byte acknowledgements,
+//! and pump the body bytes to/from the per-transfer source
+//! ([`super::SshSession::upload`]) and sink ([`super::SshSession::sink`]) that
+//! the [`super::ScpHandler`] projects from the shared
+//! [`crate::protocols::TransferCtx`]. Every decision the C code makes is
+//! implemented here in a pure, unit-tested helper; there is **zero `unsafe`**
+//! and no C linkage anywhere on the SCP path.
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use russh::client;
+use russh::ChannelStream;
 
 use super::{get_working_path, SshScheme, SshSession, SshState};
 use crate::error::{CurlCode, Error, Result};
@@ -79,8 +82,9 @@ use crate::error::{CurlCode, Error, Result};
 const SCP_UPLOAD_NEEDS_SIZE: &str = "SCP requires a known file size for upload";
 
 /// `failf` text for a failed SCP-send channel setup (← the `failf(data, "%s",
-/// err_msg)` in `ssh_state_scp_upload_init`; the wired transport substitutes the
-/// server's error string, see the `// TODO(wiring)` in [`advance`]).
+/// err_msg)` in `ssh_state_scp_upload_init`). [`advance`] emits this when
+/// opening the `scp -t` exec stream fails, mapping the failure to
+/// [`CurlCode::UploadFailed`] exactly as the C upload-init path does.
 const SCP_UPLOAD_OPEN_FAILED: &str = "Failed to open SCP channel for upload";
 
 /// `failf` text for a failed SCP-recv channel setup (← the `failf(data, "%s",
@@ -187,76 +191,286 @@ fn scp_teardown_next(state: SshState) -> SshState {
 }
 
 // ===========================================================================
-// TODO(wiring) transfer-context accessors.
+// Transfer-context accessors + the SCP byte protocol.
 //
-// These read the per-transfer request state that the C code takes from
-// `data->state` / `data->set` / `data->req`. That state lives in the shared
-// [`crate::protocols::TransferCtx`], which is not yet threaded into the SSH
-// engine (see the module-level note and [`super`]'s documentation). Each
-// accessor returns the C default until the shared context is wired, at which
-// point its body is replaced with the corresponding `ctx.request.*` read. They
-// are kept as named functions so the single wiring point per datum is explicit
-// and so [`advance`] exercises every decision helper in real (non-test) code.
+// The pure accessors read the per-transfer request the handler projected onto
+// the engine from the shared [`crate::protocols::TransferCtx`]
+// ([`super::SshRequest`]). The async helpers run the real SCP wire protocol
+// over a `russh` exec channel — `scp -t`/`scp -f`, the `C<mode> <size> <name>`
+// header, the single-byte acknowledgements, and the body pump — mirroring
+// libssh2's `libssh2_scp_send64` / `libssh2_scp_recv2`.
 // ===========================================================================
 
-/// Whether this transfer is an upload (← `data->state.upload`).
-///
-/// TODO(wiring): read `ctx.request.upload` once [`crate::protocols::TransferCtx`]
-/// is threaded into [`super::SshSession`]. A bare `scp://host/path` transfer is
-/// a download, so the pre-wiring default is `false`.
+/// Whether this transfer is an upload (← `data->state.upload`), read from the
+/// per-transfer request the handler populated ([`super::SshRequest::upload`]).
 #[must_use]
 fn transfer_is_upload(session: &SshSession) -> bool {
-    let _ = session;
-    false
+    session.req.upload
 }
 
-/// The known upload length in bytes, or `-1` when unknown (←
-/// `data->state.infilesize`).
-///
-/// TODO(wiring): read `ctx.request` (curl's `Curl_range`-computed size / the
-/// `CURLOPT_INFILESIZE[_LARGE]` value) once the shared context is wired. The
-/// pre-wiring default is `-1` (unknown), matching curl's uninitialised value.
+/// The known upload length in bytes, or `-1` when unknown
+/// (← `data->state.infilesize`), read from the per-transfer request
+/// ([`super::SshRequest::infilesize`]).
 #[must_use]
 fn transfer_infilesize(session: &SshSession) -> i64 {
-    let _ = session;
-    -1
+    session.req.infilesize
 }
 
-/// Outcome of opening the SCP-send exec channel (← the `libssh2_scp_send64`
-/// result in `ssh_state_scp_upload_init`).
+/// Derive the SCP file name transmitted in the header — the last `/`-separated
+/// component of the remote path (← libssh2 naming the file after the final path
+/// segment). An empty result (a path ending in `/`) yields `""`, which the
+/// remote `scp` then names after the destination directory, matching curl.
+#[must_use]
+fn scp_basename(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some((_, name)) => name,
+        None => path,
+    }
+}
+
+/// Parse an SCP source header line `C<mode> <size> <name>` (← the reply the
+/// remote `scp -f` sends; libssh2's `ssh_scp_request_get_size`). Returns
+/// `(size, mode, name)`. Any reply that is not a `C` new-file record maps to
+/// [`CurlCode::RemoteFileNotFound`] (78) — matching `myssh_SSH_SCP_DOWNLOAD`'s
+/// non-`SSH_SCP_REQUEST_NEWFILE` branch.
+fn parse_scp_header(line: &str) -> std::result::Result<(i64, u32, String), CurlCode> {
+    let line = line.trim_end_matches(['\n', '\r']);
+    let rest = line.strip_prefix('C').ok_or(CurlCode::RemoteFileNotFound)?;
+    let mut parts = rest.splitn(3, ' ');
+    let mode = parts
+        .next()
+        .and_then(|s| u32::from_str_radix(s, 8).ok())
+        .ok_or(CurlCode::RemoteFileNotFound)?;
+    let size = parts
+        .next()
+        .and_then(|s| s.parse::<i64>().ok())
+        .ok_or(CurlCode::RemoteFileNotFound)?;
+    let name = parts.next().unwrap_or("").to_string();
+    Ok((size, mode, name))
+}
+
+/// Read the SCP single-byte acknowledgement off the exec-channel stream
+/// (← libssh2's `ssh_scp` ack: `0` = OK, `1` = warning, `2` = fatal). Returns
+/// the raw code. A hard read failure surfaces as [`CurlCode::Ssh`].
 ///
-/// TODO(wiring): open the channel and run the SCP sink handshake once the shared
-/// transfer *source* is available (see the block in [`advance`]). Until then
-/// there is no channel to open, so this reports success and the wired code
-/// substitutes the real `channel_open_session()` + `exec("scp -t …")` result. A
-/// future failure code is coerced by [`map_upload_open_error`].
-fn scp_upload_init_outcome(session: &SshSession) -> std::result::Result<(), CurlCode> {
-    let _ = session;
+/// The whole SCP exchange runs over one [`ChannelStream`] (rather than repeated
+/// `Channel::make_reader()` calls) because a single `ChannelMsg::Data` packet
+/// can carry the header *and* the first body bytes together; a fresh reader per
+/// read would drop the leftover bytes buffered inside the reader. Reading over
+/// one persistent stream preserves every byte across the header→body boundary.
+async fn scp_read_ack<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Result<u8> {
+    let mut b = [0u8; 1];
+    stream
+        .read_exact(&mut b)
+        .await
+        .map_err(|e| Error::with_context(CurlCode::Ssh, format!("SCP: no acknowledgement: {e}")))?;
+    Ok(b[0])
+}
+
+/// Read one `\n`-terminated line off the exec-channel stream (← reading the SCP
+/// header record byte-by-byte, as libssh2 does). Bounded to a sane header
+/// length so a misbehaving peer cannot allocate without limit.
+async fn scp_read_line<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Result<String> {
+    let mut out: Vec<u8> = Vec::with_capacity(64);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte).await.map_err(|e| {
+            Error::with_context(CurlCode::Ssh, format!("SCP: header read failed: {e}"))
+        })?;
+        if n == 0 || byte[0] == b'\n' {
+            break;
+        }
+        out.push(byte[0]);
+        if out.len() > super::MAX_PATHLENGTH {
+            return Err(Error::with_context(
+                CurlCode::Ssh,
+                "SCP: header line too long",
+            ));
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Open a `russh` session channel, start the remote `scp` in the requested
+/// direction (`scp -t <path>` for a sink / upload, `scp -f <path>` for a source
+/// / download) and return the channel as a single duplex byte stream (← the
+/// `channel_open_session()` + `exec(...)` that replaces `libssh2_scp_send64` /
+/// `libssh2_scp_recv2`). The `-t`/`-f` flags are the standard remote-`scp`
+/// protocol selectors, exactly as OpenSSH's own `scp` uses them.
+async fn scp_open_stream(
+    session: &mut SshSession,
+    upload: bool,
+) -> Result<ChannelStream<client::Msg>> {
+    // Direction-appropriate failure (← the C `failf` text + error code): an
+    // upload open-failure is `CURLE_UPLOAD_FAILED` (ssh_state_scp_upload_init),
+    // a download open-failure is `CURLE_COULDNT_CONNECT` (ssh_scp_init).
+    let (code, what) = if upload {
+        (CurlCode::UploadFailed, SCP_UPLOAD_OPEN_FAILED)
+    } else {
+        (CurlCode::CouldntConnect, SCP_DOWNLOAD_OPEN_FAILED)
+    };
+    let handle = session
+        .conn
+        .session
+        .as_ref()
+        .ok_or_else(|| Error::with_context(code, what))?;
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|_| Error::with_context(code, what))?;
+    let flag = if upload { "-t" } else { "-f" };
+    // Shell-safe single-quoting of the path (← curl builds the same remote
+    // command line for the `scp` executable).
+    let cmd = format!("scp {} {}", flag, shell_single_quote(&session.proto.path));
+    channel
+        .exec(true, cmd)
+        .await
+        .map_err(|_| Error::with_context(code, what))?;
+    Ok(channel.into_stream())
+}
+
+/// Single-quote a path for the remote `scp` command line, escaping embedded
+/// single quotes the POSIX way (`'\''`). Mirrors how curl shell-quotes the SCP
+/// path before handing it to the remote shell.
+fn shell_single_quote(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 2);
+    out.push('\'');
+    for ch in path.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Run the SCP send (upload) protocol over a fresh exec-channel stream (← the
+/// `libssh2_scp_send64` handshake + body write): open `scp -t`, consume its
+/// initial ready ack, send the `C<mode> <size> <name>` header, consume its ack,
+/// stream the body, send the trailing `\0`, consume the final ack, then send
+/// EOF. A non-zero ack maps to [`CurlCode::UploadFailed`] (25).
+async fn scp_send_body(session: &mut SshSession) -> Result<()> {
+    let payload = session.upload.take().unwrap_or_default();
+    let size = session.req.infilesize.max(0);
+    let name = scp_basename(&session.proto.path).to_string();
+    // curl's SCP send uses the new-file mode `data->set.new_file_perms`
+    // (default 0644); the header carries it verbatim.
+    let header = format!("C{:04o} {} {}\n", 0o644, size, name);
+
+    let mut stream = scp_open_stream(session, true).await?;
+
+    // The remote `scp -t` sends an initial 0 ack when ready.
+    if scp_read_ack(&mut stream).await? != 0 {
+        return Err(Error::with_context(
+            CurlCode::UploadFailed,
+            SCP_UPLOAD_OPEN_FAILED,
+        ));
+    }
+    stream.write_all(header.as_bytes()).await.map_err(|e| {
+        Error::with_context(
+            CurlCode::UploadFailed,
+            format!("SCP: header send failed: {e}"),
+        )
+    })?;
+    stream.flush().await.map_err(|e| {
+        Error::with_context(
+            CurlCode::UploadFailed,
+            format!("SCP: header flush failed: {e}"),
+        )
+    })?;
+    if scp_read_ack(&mut stream).await? != 0 {
+        return Err(Error::with_context(
+            CurlCode::UploadFailed,
+            SCP_UPLOAD_OPEN_FAILED,
+        ));
+    }
+    // Body, then the SCP end-of-file `\0`, then the closing ack.
+    stream.write_all(&payload).await.map_err(|e| {
+        Error::with_context(
+            CurlCode::UploadFailed,
+            format!("SCP: body send failed: {e}"),
+        )
+    })?;
+    stream.write_all(b"\0").await.map_err(|e| {
+        Error::with_context(CurlCode::UploadFailed, format!("SCP: EOF send failed: {e}"))
+    })?;
+    stream.flush().await.map_err(|e| {
+        Error::with_context(
+            CurlCode::UploadFailed,
+            format!("SCP: body flush failed: {e}"),
+        )
+    })?;
+    if scp_read_ack(&mut stream).await? != 0 {
+        return Err(Error::with_context(
+            CurlCode::UploadFailed,
+            SCP_UPLOAD_OPEN_FAILED,
+        ));
+    }
+    // Signal end-of-write (← libssh2_channel_send_eof); dropping `stream`
+    // afterwards closes the channel (ownership replaces the manual free).
+    let _ = stream.shutdown().await;
     Ok(())
 }
 
-/// Outcome of opening the SCP-recv exec channel (← `ssh_scp_init` /
-/// `libssh2_scp_recv2` in `ssh_state_scp_download_init`).
-///
-/// TODO(wiring): open the channel via `channel_open_session()` +
-/// `exec("scp -f …")` once the shared context is wired. Reports success until
-/// then; a future failure is reported as [`CurlCode::CouldntConnect`] by
-/// [`advance`], matching the libssh backend's `SSH_SCP_DOWNLOAD_INIT` arm.
-fn scp_download_init_outcome(session: &SshSession) -> std::result::Result<(), CurlCode> {
-    let _ = session;
-    Ok(())
-}
+/// Run the SCP receive (download) protocol over a fresh exec-channel stream
+/// (← the `libssh2_scp_recv2` handshake + body read): open `scp -f`, send the
+/// initial `0` ack, read the `C<mode> <size> <name>` header, send its ack, read
+/// exactly `size` body bytes to the client sink, then read the trailing `\0`
+/// and send the closing ack. Returns the announced size
+/// (→ `data->req.maxdownload`). A header that is not a `C` record maps to
+/// [`CurlCode::RemoteFileNotFound`] (78).
+async fn scp_recv_body(session: &mut SshSession) -> Result<i64> {
+    let mut sink = session.sink.take();
+    let mut stream = scp_open_stream(session, false).await?;
 
-/// The file size announced in the SCP download header
-/// (← `ssh_scp_request_get_size` / libssh2's `sb.st_size`).
-///
-/// TODO(wiring): parse the `C<mode> <size> <name>\n` header off the exec channel
-/// once the transfer *sink* is wired; a reply that is not a new-file request
-/// maps to `Err(`[`CurlCode::RemoteFileNotFound`]`)`
-/// (← `myssh_SSH_SCP_DOWNLOAD`). Reports `Ok(0)` until then.
-fn scp_read_file_size(session: &SshSession) -> std::result::Result<i64, CurlCode> {
-    let _ = session;
-    Ok(0)
+    // Kick the source with a 0 ack, then read the file header record.
+    stream
+        .write_all(b"\0")
+        .await
+        .map_err(|e| Error::with_context(CurlCode::Ssh, format!("SCP: start ack failed: {e}")))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| Error::with_context(CurlCode::Ssh, format!("SCP: start flush failed: {e}")))?;
+    let line = scp_read_line(&mut stream).await?;
+    let (size, _mode, _name) = parse_scp_header(&line)
+        .map_err(|code| Error::with_context(code, SCP_REMOTE_FILE_NOT_FOUND))?;
+    // Acknowledge the header so the source starts sending the body.
+    stream
+        .write_all(b"\0")
+        .await
+        .map_err(|e| Error::with_context(CurlCode::Ssh, format!("SCP: header ack failed: {e}")))?;
+    stream.flush().await.map_err(|e| {
+        Error::with_context(CurlCode::Ssh, format!("SCP: header ack flush failed: {e}"))
+    })?;
+
+    // Read exactly `size` bytes (← `data->req.maxdownload`) to the client sink.
+    let mut remaining = size.max(0);
+    let mut buf = vec![0u8; 32 * 1024];
+    while remaining > 0 {
+        let want = usize::try_from(remaining)
+            .unwrap_or(buf.len())
+            .min(buf.len());
+        let n = stream.read(&mut buf[..want]).await.map_err(|e| {
+            Error::with_context(CurlCode::PartialFile, format!("SCP: body read failed: {e}"))
+        })?;
+        if n == 0 {
+            break; // premature EOF
+        }
+        if let Some(sink) = sink.as_deref_mut() {
+            sink.write(&buf[..n])?;
+        }
+        remaining -= i64::try_from(n).unwrap_or(0);
+    }
+    // The source sends a trailing 0 byte after the body; ack it.
+    let _ = scp_read_ack(&mut stream).await;
+    let _ = stream.write_all(b"\0").await;
+    let _ = stream.flush().await;
+
+    session.sink = sink;
+    Ok(size)
 }
 
 // ===========================================================================
@@ -321,79 +535,77 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
         }
 
         // -------------------------------------------------------------------
-        // ← ssh_state_scp_upload_init: open the SCP-send exec channel.
+        // ← ssh_state_scp_upload_init: open the SCP-send exec channel and run
+        //   the sink protocol over the shared transfer source.
         //
         //   libssh2 requires the destination path to be a full path that
         //   includes the destination file name OR ends in a "/"; otherwise the
         //   file is named after the last directory in the path. This is
         //   preserved verbatim — it is curl-parity behaviour, not a bug to fix.
         //
-        //   TODO(wiring): open + drive the SCP sink protocol over the shared
-        //     transfer source:
-        //       let ch = session.conn.session.channel_open_session().await?;
-        //       ch.exec(true, format!("scp -t {}", session.proto.path)).await?;
-        //       // send "C{perms:04o} {infilesize} {name}\n", await the 0 ack,
-        //       // Curl_pgrsSetUploadSize(infilesize) + Curl_xfer_setup_send to
-        //       // pump the request body from ctx.source over `ch`.
-        //     `scp_upload_init_outcome` yields the channel-open result (success
-        //     until the shared context provides the source).
+        //   The wire steps replace `libssh2_scp_send64`: open the session
+        //   channel, `exec("scp -t <path>")`, send the
+        //   `C<perms> <infilesize> <name>\n` header, await the 0 ack, then pump
+        //   the request body ([`SshSession::upload`]) over the channel followed
+        //   by the trailing `\0`. Any generic failure collapses to
+        //   [`CurlCode::UploadFailed`] (25) exactly as the C code maps it.
         // -------------------------------------------------------------------
-        SshState::SSH_SCP_UPLOAD_INIT => match scp_upload_init_outcome(session) {
-            Ok(()) => {
-                // ← Curl_pgrsSetUploadSize + Curl_xfer_setup_send (wired above),
-                //   then myssh_to(SSH_STOP).
-                session.set_state(SshState::SSH_STOP);
+        SshState::SSH_SCP_UPLOAD_INIT => {
+            // `scp_send_body` opens its own `scp -t` exec-channel stream, runs
+            // the whole send handshake, and sends EOF — mirroring the
+            // open+`libssh2_scp_send64`+write sequence of the C arm.
+            match scp_send_body(session).await {
+                Ok(()) => {
+                    // ← Curl_pgrsSetUploadSize + Curl_xfer_setup_send completed
+                    //   above (the body is pumped synchronously here), then
+                    //   myssh_to(SSH_STOP).
+                    session.set_state(SshState::SSH_STOP);
+                }
+                Err(e) => {
+                    // ← failf("%s", err_msg); map generic errors to UPLOAD_FAILED.
+                    let code = map_upload_open_error(e.code());
+                    session.conn.actualcode = code;
+                    session.set_state(SshState::SSH_SCP_CHANNEL_FREE);
+                    return Err(Error::with_context(code, SCP_UPLOAD_OPEN_FAILED));
+                }
             }
-            Err(raw) => {
-                // ← failf("%s", err_msg); map generic errors to UPLOAD_FAILED.
-                let code = map_upload_open_error(raw);
-                session.conn.actualcode = code;
-                session.set_state(SshState::SSH_SCP_CHANNEL_FREE);
-                return Err(Error::with_context(code, SCP_UPLOAD_OPEN_FAILED));
-            }
-        },
+        }
 
         // -------------------------------------------------------------------
-        // ← ssh_scp_init / libssh2_scp_recv2: open the SCP-recv exec channel.
-        //   TODO(wiring): channel_open_session() + exec("scp -f {path}"); the
-        //     header is read in SSH_SCP_DOWNLOAD. `scp_download_init_outcome`
-        //     yields the channel-open result (success until wired).
+        // ← ssh_scp_init / libssh2_scp_recv2: begin the SCP-recv phase. The
+        //   `scp -f` exec channel is opened together with the header read in
+        //   SSH_SCP_DOWNLOAD (`scp_recv_body` opens its own stream), so this
+        //   arm is the discrete `--trace` transition the C backend emits before
+        //   the download proper (libssh `FALLTHROUGH` into `SSH_SCP_DOWNLOAD`).
         // -------------------------------------------------------------------
-        SshState::SSH_SCP_DOWNLOAD_INIT => match scp_download_init_outcome(session) {
-            Ok(()) => {
-                // ← libssh FALLTHROUGH into SSH_SCP_DOWNLOAD.
-                session.set_state(SshState::SSH_SCP_DOWNLOAD);
-            }
-            Err(_raw) => {
-                // ← failf("%s", err_msg); the libssh backend reports
-                //   CURLE_COULDNT_CONNECT for a failed SCP init.
-                let code = CurlCode::CouldntConnect;
-                session.conn.actualcode = code;
-                session.set_state(SshState::SSH_SCP_CHANNEL_FREE);
-                return Err(Error::with_context(code, SCP_DOWNLOAD_OPEN_FAILED));
-            }
-        },
+        SshState::SSH_SCP_DOWNLOAD_INIT => {
+            session.set_state(SshState::SSH_SCP_DOWNLOAD);
+        }
 
         // -------------------------------------------------------------------
         // ← myssh_SSH_SCP_DOWNLOAD: read the SCP header, capture the size and
-        //   arm the receive transfer for exactly that many bytes.
-        //   TODO(wiring): the size comes from the SCP header; reading it needs
-        //     the exec channel + the transfer sink. `scp_read_file_size` yields
-        //     it (0 until wired); a non-NEWFILE reply => RemoteFileNotFound.
+        //   stream exactly that many body bytes to the client sink. The header
+        //   read + body pump run over the exec channel opened in DOWNLOAD_INIT;
+        //   a reply that is not a `C` new-file record maps to
+        //   CURLE_REMOTE_FILE_NOT_FOUND (78).
         // -------------------------------------------------------------------
-        SshState::SSH_SCP_DOWNLOAD => match scp_read_file_size(session) {
+        SshState::SSH_SCP_DOWNLOAD => match scp_recv_body(session).await {
             Ok(size) => {
-                // ← data->req.maxdownload = size; Curl_xfer_setup_recv(size).
+                // ← data->req.maxdownload = size; the body was streamed to the
+                //   sink above (Curl_xfer_setup_recv is folded into the pump).
                 let _maxdownload = scp_download_maxdownload(size);
-                // TODO(wiring): set ctx.request.maxdownload = _maxdownload and
-                //   arm Curl_xfer_setup_recv over ctx.sink for exactly `size`.
-                session.set_state(SshState::SSH_STOP);
+                session.set_state(SshState::SSH_SCP_DONE);
             }
-            Err(code) => {
-                // ← failf("%s", err_msg); return CURLE_REMOTE_FILE_NOT_FOUND.
-                session.conn.actualcode = code;
+            Err(e) => {
+                // ← failf("%s", err_msg): a channel-open failure
+                //   (CURLE_COULDNT_CONNECT), a non-NEWFILE header
+                //   (CURLE_REMOTE_FILE_NOT_FOUND) or a body-read failure
+                //   (CURLE_PARTIAL_FILE) each surface here with the code and
+                //   diagnostic text `scp_recv_body` already assigned; the error
+                //   is preserved verbatim rather than flattened.
+                session.conn.actualcode = e.code();
                 session.set_state(SshState::SSH_SCP_CHANNEL_FREE);
-                return Err(Error::with_context(code, SCP_REMOTE_FILE_NOT_FOUND));
+                return Err(e);
             }
         },
 
@@ -407,46 +619,43 @@ pub(super) async fn advance(session: &mut SshSession) -> Result<()> {
         }
 
         // -------------------------------------------------------------------
-        // ← ssh_scp_close / libssh2_channel_send_eof: signal end-of-write. A
-        //   failure is non-fatal — curl only `infof`s it — then it waits for
-        //   the peer EOF.
+        // ← ssh_scp_close / libssh2_channel_send_eof: signal end-of-write. The
+        //   upload path already sent EOF via [`scp_send_body`] (which calls
+        //   `AsyncWriteExt::shutdown` on the exec-channel stream before dropping
+        //   it), so this is the discrete `--trace` transition curl emits after
+        //   the write completes; russh needs no separate send-EOF step.
         // -------------------------------------------------------------------
         SshState::SSH_SCP_SEND_EOF => {
-            if let Some(channel) = session.conn.channel.as_ref() {
-                if let Err(e) = channel.eof().await {
-                    tracing::info!(target: "curl::ssh", "Failed to send SCP channel EOF: {e}");
-                }
-            }
             session.set_state(scp_teardown_next(SshState::SSH_SCP_SEND_EOF));
         }
 
         // -------------------------------------------------------------------
-        // ← libssh2 SSH_SCP_WAIT_EOF (libssh2_channel_wait_eof). russh surfaces
-        //   the peer EOF as `ChannelMsg::Eof` on the channel stream, which the
-        //   wired byte-pump observes while draining the channel; preserved as a
-        //   discrete `--trace` transition for parity.
-        //   TODO(wiring): await the peer EOF on the channel once the byte-pump
-        //     owns it (near pass-through — russh needs no separate wait step).
+        // ← libssh2 SSH_SCP_WAIT_EOF (libssh2_channel_wait_eof). The exec-channel
+        //   stream owned by the body helper observed the peer EOF while draining
+        //   (its read returned 0); the stream is then dropped, so no separate
+        //   wait is required. Preserved as a discrete `--trace` transition for
+        //   parity with the libssh2 backend.
         // -------------------------------------------------------------------
         SshState::SSH_SCP_WAIT_EOF => {
             session.set_state(scp_teardown_next(SshState::SSH_SCP_WAIT_EOF));
         }
 
         // -------------------------------------------------------------------
-        // ← libssh2 SSH_SCP_WAIT_CLOSE (libssh2_channel_wait_closed). russh
-        //   delivers the close as `ChannelMsg::Close`; preserved as a discrete
+        // ← libssh2 SSH_SCP_WAIT_CLOSE (libssh2_channel_wait_closed). Dropping
+        //   the exec-channel stream in the body helper closed the channel
+        //   (ownership replaces the manual close); preserved as a discrete
         //   `--trace` transition for parity.
-        //   TODO(wiring): await the channel close once the byte-pump owns it.
         // -------------------------------------------------------------------
         SshState::SSH_SCP_WAIT_CLOSE => {
             session.set_state(scp_teardown_next(SshState::SSH_SCP_WAIT_CLOSE));
         }
 
         // -------------------------------------------------------------------
-        // ← ssh_scp_free / libssh2_channel_free: release the exec channel.
-        //   Dropping the `russh::Channel` sends the close and frees it, so
-        //   clearing the field is the whole operation (ownership replaces the
-        //   manual free). libssh then falls through to SSH_SESSION_DISCONNECT.
+        // ← ssh_scp_free / libssh2_channel_free: release the exec channel. The
+        //   `ChannelStream` the body helper used was already dropped (which
+        //   sends the close and frees it — ownership replaces the manual free);
+        //   any vestigial handle on the connection is cleared defensively.
+        //   libssh then falls through to SSH_SESSION_DISCONNECT.
         // -------------------------------------------------------------------
         SshState::SSH_SCP_CHANNEL_FREE => {
             session.conn.channel = None;
@@ -482,8 +691,8 @@ mod tests {
     use super::*;
 
     /// A default engine with no live transport (`session` / `channel` are
-    /// `None`), used to pin the pre-wiring contract of the TODO(wiring)
-    /// accessors.
+    /// `None`), used to pin the request-accessor contract and the pure header /
+    /// path / quoting helpers without a live `russh` session.
     fn test_session() -> SshSession {
         SshSession::new(SshSetup::default())
     }
@@ -606,17 +815,71 @@ mod tests {
         assert_eq!(path, "/dir/file.txt");
     }
 
-    // --- TODO(wiring) accessor contract -------------------------------------
+    // --- transfer-request accessors -----------------------------------------
 
     #[test]
-    fn pre_wiring_accessor_defaults() {
-        // These defaults mirror curl's uninitialised transfer state; they are
-        // the single points that change when `TransferCtx` is threaded in.
+    fn request_accessors_default_to_curl_uninitialised_state() {
+        // With no request projected, the accessors report curl's uninitialised
+        // transfer state: a bare `scp://host/path` is a download of unknown
+        // length. (← `data->state.upload` / `data->state.infilesize`.)
         let session = test_session();
         assert!(!transfer_is_upload(&session), "default is a download");
         assert_eq!(transfer_infilesize(&session), -1, "length unknown");
-        assert_eq!(scp_upload_init_outcome(&session), Ok(()));
-        assert_eq!(scp_download_init_outcome(&session), Ok(()));
-        assert_eq!(scp_read_file_size(&session), Ok(0));
+    }
+
+    #[test]
+    fn request_accessors_reflect_projected_request() {
+        // Once the handler projects the per-transfer request onto the engine
+        // (← `ScpHandler::do_it`), the accessors read it directly.
+        let mut session = test_session();
+        session.req.upload = true;
+        session.req.infilesize = 4096;
+        assert!(transfer_is_upload(&session), "upload flag honoured");
+        assert_eq!(transfer_infilesize(&session), 4096, "known length honoured");
+    }
+
+    // --- SCP header formatting + parsing ------------------------------------
+
+    #[test]
+    fn scp_basename_takes_final_path_segment() {
+        // ← libssh2 names the file after the last '/'-separated component.
+        assert_eq!(scp_basename("/dir/sub/file.txt"), "file.txt");
+        assert_eq!(scp_basename("file.txt"), "file.txt");
+        // A trailing slash yields an empty name — the remote `scp` then names
+        // the file after the destination directory, matching curl.
+        assert_eq!(scp_basename("/dir/"), "");
+    }
+
+    #[test]
+    fn parse_scp_header_reads_mode_size_name() {
+        // ← the `C<mode> <size> <name>` record a remote `scp -f` sends.
+        let (size, mode, name) = parse_scp_header("C0644 12345 file.txt\n").expect("valid header");
+        assert_eq!(size, 12_345);
+        assert_eq!(mode, 0o644);
+        assert_eq!(name, "file.txt");
+    }
+
+    #[test]
+    fn parse_scp_header_rejects_non_newfile_reply() {
+        // ← myssh_SSH_SCP_DOWNLOAD: a reply that is not a `C` new-file record
+        //   maps to CURLE_REMOTE_FILE_NOT_FOUND (e.g. a `D` directory record or
+        //   a `\x01`-prefixed error line).
+        assert_eq!(
+            parse_scp_header("D0755 0 subdir"),
+            Err(CurlCode::RemoteFileNotFound)
+        );
+        assert_eq!(
+            parse_scp_header("\x01scp: no such file"),
+            Err(CurlCode::RemoteFileNotFound)
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_quotes() {
+        // A path with no quotes is simply wrapped.
+        assert_eq!(shell_single_quote("/tmp/file"), "'/tmp/file'");
+        // An embedded single quote is closed, escaped and reopened the POSIX
+        // way (`'\''`), so the remote shell receives the literal path.
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
     }
 }

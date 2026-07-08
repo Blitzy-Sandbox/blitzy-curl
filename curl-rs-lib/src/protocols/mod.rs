@@ -221,8 +221,9 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::conn::Transport;
+use crate::conn::{Connection, Transport};
 use crate::error::Result;
+use crate::url::Info;
 
 // ===========================================================================
 // PROTOPT_* — per-protocol characteristic flags (`lib/urldata.h`).
@@ -677,31 +678,56 @@ pub struct TransferRequest {
 /// function, from which a handler reaches its connection, its active socket,
 /// the request options, and the client write sink.
 ///
-/// The connection is referenced by [`conn_id`](Self::conn_id) rather than
-/// borrowed, which keeps [`Protocol`] object-safe (`&dyn Protocol`, as
-/// [`SchemeHandler`] requires) and free of a lifetime parameter; the mutable
-/// borrow of the context is expressed on each method's receiver instead. The
-/// owning connection lives in the driver ([`crate::transfer`] /
-/// [`crate::multi`]) and is referenced here by id, never owned or borrowed, so
-/// `protocols` takes no dependency on those driver modules (which depend on
-/// `protocols`, not the other way round).
+/// The context keeps [`Protocol`] object-safe (`&dyn Protocol`, as
+/// [`SchemeHandler`] requires) and free of a lifetime parameter: the mutable
+/// borrow of the whole context is expressed on each method's receiver, and the
+/// per-transfer state a handler needs is reached through the context's own
+/// fields rather than through borrowed method arguments. `protocols` still
+/// takes no dependency on the driver modules ([`crate::transfer`] /
+/// [`crate::multi`]) — the dependency arrow points the other way — because the
+/// [`Connection`] the context can carry is a `crate::conn` type, and `conn` is
+/// a sibling layer that `protocols` already builds upon (see
+/// [`crate::conn::Transport`]).
 ///
-/// Beyond that identity, the context carries the state a handler needs to
-/// actually run its exchange: the live transport ([`io`](Self::io)), the body
-/// sink ([`sink`](Self::sink)), the request parameters
-/// ([`request`](Self::request)), the concrete socket handle
-/// ([`socket_fd`](Self::socket_fd)) for pollset registration, and a
-/// type-erased per-protocol scratch slot ([`proto_state`](Self::proto_state))
-/// in which a handler keeps its live engine across the transfer's phases. These
-/// are distinct public fields so a handler can borrow the stream, the sink, the
-/// (immutable) request, and its own `proto_state` simultaneously under the
-/// borrow checker.
+/// The context carries the state a handler needs to actually run its exchange:
+///
+/// * a lightweight connection identity ([`conn_id`](Self::conn_id)) for
+///   diagnostics and connection-cache bookkeeping;
+/// * the live [`Connection`] itself ([`conn`](Self::conn)) — present once the
+///   driver has assigned one — over whose filter chain a stream-oriented
+///   handler (HTTP, SSH, the mail protocols) drives its heavy engine;
+/// * the live datagram/local transport ([`io`](Self::io)) for the handlers
+///   (TFTP, FILE) that do not run over a [`Connection`] filter chain;
+/// * the body sink ([`sink`](Self::sink)) and the request parameters
+///   ([`request`](Self::request));
+/// * the concrete socket handle ([`socket_fd`](Self::socket_fd)) for pollset
+///   registration;
+/// * a type-erased per-protocol scratch slot ([`proto_state`](Self::proto_state))
+///   in which a handler keeps its live engine across the transfer's phases; and
+/// * the diagnostics accumulator ([`info`](Self::info)) a handler writes its
+///   negotiated outcome (status code, content type, …) into.
+///
+/// These are distinct public fields so a handler can borrow the connection, the
+/// sink, the (immutable) request, its own `proto_state`, and `info`
+/// simultaneously as disjoint fields under the borrow checker.
 #[derive(Default)]
 #[non_exhaustive]
 pub struct TransferCtx {
     /// The connection this transfer is bound to, identified the way curl reaches
     /// it through `data->conn`; `None` before a connection has been assigned.
     pub conn_id: Option<i64>,
+    /// The live [`Connection`] this transfer runs its protocol exchange over
+    /// (← curl's `data->conn`). A stream-oriented handler drives its heavy
+    /// engine — `http::h1::perform`, `http::h2::perform`, `http::h3::perform`,
+    /// the `russh` SSH session, or a mail [`pingpong`](crate::protocols::pingpong)
+    /// loop — directly over this connection's filter chain
+    /// (`conn.cfilter[FIRSTSOCKET]`), exactly as curl passes `conn` into
+    /// `Curl_http`, `Curl_smtp_*`, `ssh_*`, etc. Boxed so [`TransferCtx`] stays
+    /// small and `Send`. `None` before the driver (or a test) has assigned a
+    /// connection; a handler that needs one returns
+    /// [`CurlCode::BadFunctionArgument`](crate::error::CurlCode::BadFunctionArgument)
+    /// when it is absent rather than panicking.
+    pub conn: Option<Box<Connection>>,
     /// The connection-socket index this transfer operates on (← curl's
     /// `conn->sockindex`): `0` is the primary socket (curl's `FIRSTSOCKET`) and
     /// `1` the secondary socket (e.g. the FTP data connection).
@@ -741,6 +767,19 @@ pub struct TransferCtx {
     /// protocol-agnostic. `Send` is required so [`TransferCtx`] can still cross
     /// the multi handle's worker threads.
     pub proto_state: Option<Box<dyn Any + Send>>,
+    /// The per-transfer diagnostics/result accumulator a handler populates as it
+    /// runs (← curl's `data->info`, `struct PureInfo`). During DO/PERFORM a
+    /// stream handler records the negotiated outcome here — the response status
+    /// (`info.httpcode`), the reported body content type
+    /// ([`Info::set_content_type`](crate::url::Info::set_content_type)), and the
+    /// like — precisely as curl writes `data->info.httpcode`/
+    /// `data->info.contenttype` from inside `Curl_http` and the mail handlers.
+    /// The driver later reconciles this into the owning easy handle's
+    /// [`Info`](crate::url::Info) so `curl_easy_getinfo`
+    /// (`CURLINFO_RESPONSE_CODE`, `CURLINFO_CONTENT_TYPE`, …) and the CLI's
+    /// `--write-out`/xattr paths observe it. Defaults to an all-empty
+    /// [`Info`](crate::url::Info).
+    pub info: Info,
 }
 
 impl TransferCtx {
@@ -760,12 +799,17 @@ impl fmt::Debug for TransferCtx {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TransferCtx")
             .field("conn_id", &self.conn_id)
+            .field("conn", &self.conn.as_ref().map(|_| "<connection>"))
             .field("sockindex", &self.sockindex)
             .field("io", &self.io.as_ref().map(|_| "<stream>"))
             .field("sink", &self.sink.as_ref().map(|_| "<sink>"))
             .field("request", &self.request)
             .field("socket_fd", &self.socket_fd)
-            .field("proto_state", &self.proto_state.as_ref().map(|_| "<proto_state>"))
+            .field(
+                "proto_state",
+                &self.proto_state.as_ref().map(|_| "<proto_state>"),
+            )
+            .field("info", &self.info)
             .finish()
     }
 }
@@ -1031,11 +1075,16 @@ impl SchemeHandler {
 // Each record carries the scheme's identity/ABI metadata (name, protocol and
 // family bits, characteristic flags, default port). The `handler` slot binds
 // the scheme to its `&'static dyn Protocol` behavior vtable where that behavior
-// exists in this build: the auxiliary application protocols (TFTP, TELNET,
+// exists in this build: the HTTP family (HTTP/HTTPS) points at
+// [`http::HANDLER`], and the auxiliary application protocols (TFTP, TELNET,
 // DICT, LDAP/LDAPS, FILE, GOPHER/GOPHERS, SMB/SMBS, RTSP, MQTT/MQTTS, WS/WSS)
 // point at their module's `HANDLER`, each TLS variant sharing its base scheme's
-// handler (see the module-level *Handler binding*). The HTTP and FTP/mail
-// families keep `handler: None` here until their own handlers are wired.
+// handler (see the module-level *Handler binding*). The FTP family points at
+// [`ftp::HANDLER`], the SSH family (SFTP/SCP) at [`ssh::SFTP_HANDLER`] /
+// [`ssh::SCP_HANDLER`], and the mail families at their module handlers:
+// IMAP/IMAPS → [`imap::HANDLER`], POP3/POP3S → [`pop3::HANDLER`], and
+// SMTP/SMTPS → [`smtp::HANDLER`]. Every registered scheme in this build binds a
+// handler; a scheme whose feature is disabled is simply not registered.
 // ===========================================================================
 
 // --- HTTP family -----------------------------------------------------------
@@ -1048,7 +1097,7 @@ pub static SCHEME_HTTP: SchemeHandler = SchemeHandler {
     family: CURLPROTO_HTTP,
     flags: PROTOPT_CREDSPERREQUEST | PROTOPT_USERPWDCTRL | PROTOPT_CONN_REUSE,
     defport: 80,
-    handler: None,
+    handler: Some(&http::HANDLER),
 };
 
 /// `https` (← `Curl_scheme_https`).
@@ -1063,7 +1112,7 @@ pub static SCHEME_HTTPS: SchemeHandler = SchemeHandler {
         | PROTOPT_USERPWDCTRL
         | PROTOPT_CONN_REUSE,
     defport: 443,
-    handler: None,
+    handler: Some(&http::HANDLER),
 };
 
 /// `ws` — WebSocket (← `Curl_scheme_ws`).
@@ -1160,7 +1209,7 @@ pub static SCHEME_IMAP: SchemeHandler = SchemeHandler {
     family: CURLPROTO_IMAP,
     flags: PROTOPT_CLOSEACTION | PROTOPT_URLOPTIONS | PROTOPT_SSL_REUSE | PROTOPT_CONN_REUSE,
     defport: 143,
-    handler: None,
+    handler: Some(&imap::HANDLER),
 };
 
 /// `imaps` (← `Curl_scheme_imaps`).
@@ -1171,7 +1220,7 @@ pub static SCHEME_IMAPS: SchemeHandler = SchemeHandler {
     family: CURLPROTO_IMAP,
     flags: PROTOPT_CLOSEACTION | PROTOPT_SSL | PROTOPT_URLOPTIONS | PROTOPT_CONN_REUSE,
     defport: 993,
-    handler: None,
+    handler: Some(&imap::HANDLER),
 };
 
 /// `pop3` (← `Curl_scheme_pop3`).
@@ -1186,7 +1235,7 @@ pub static SCHEME_POP3: SchemeHandler = SchemeHandler {
         | PROTOPT_SSL_REUSE
         | PROTOPT_CONN_REUSE,
     defport: 110,
-    handler: None,
+    handler: Some(&pop3::HANDLER),
 };
 
 /// `pop3s` (← `Curl_scheme_pop3s`).
@@ -1201,7 +1250,7 @@ pub static SCHEME_POP3S: SchemeHandler = SchemeHandler {
         | PROTOPT_URLOPTIONS
         | PROTOPT_CONN_REUSE,
     defport: 995,
-    handler: None,
+    handler: Some(&pop3::HANDLER),
 };
 
 /// `smtp` (← `Curl_scheme_smtp`).
@@ -1849,6 +1898,42 @@ mod tests {
         assert_eq!(hs.defport, 443);
         assert!(hs.is_secure());
         assert_ne!(hs.flags & PROTOPT_ALPN, 0);
+
+        // Finding: SCHEME_HTTP/HTTPS were `handler: None`, so the registered
+        // schemes could not dispatch. Both now point at the HTTP `HANDLER`.
+        assert!(
+            scheme_handler("http").unwrap().handler.is_some(),
+            "http scheme must dispatch to the HTTP handler"
+        );
+        assert!(
+            hs.handler.is_some(),
+            "https scheme must dispatch to the HTTP handler"
+        );
+    }
+
+    #[test]
+    fn mail_scheme_handlers_are_bound() {
+        // Finding: SCHEME_IMAP/IMAPS/POP3/POP3S were `handler: None`, so the
+        // default-enabled IMAP/POP3 schemes could not dispatch to their newly
+        // created handlers. Each now points at its module `HANDLER` (the TLS
+        // variant sharing its base scheme's handler), mirroring the SMTP/SMTPS
+        // entries that were already bound. Assertions are feature-gated to the
+        // compiled scheme set.
+        #[cfg(feature = "imap")]
+        {
+            assert!(scheme_handler("imap").unwrap().handler.is_some());
+            assert!(scheme_handler("imaps").unwrap().handler.is_some());
+        }
+        #[cfg(feature = "pop3")]
+        {
+            assert!(scheme_handler("pop3").unwrap().handler.is_some());
+            assert!(scheme_handler("pop3s").unwrap().handler.is_some());
+        }
+        #[cfg(feature = "smtp")]
+        {
+            assert!(scheme_handler("smtp").unwrap().handler.is_some());
+            assert!(scheme_handler("smtps").unwrap().handler.is_some());
+        }
     }
 
     #[cfg(feature = "ftp")]

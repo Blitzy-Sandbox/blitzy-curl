@@ -65,8 +65,9 @@ use tokio::task::JoinHandle;
 use crate::conn::filters::{
     CfFuture, ConnectionFilter, FilterChain, FilterCtx, QueryCtx, QueryOut,
 };
-use crate::conn::{CfQuery, CfType};
-use crate::error::{Error, Result};
+use crate::conn::{CfQuery, CfType, Connection, FIRSTSOCKET};
+use crate::error::{CurlCode, Error, Result};
+use crate::protocols::http::h1::{pump_bridge, DUPLEX_BUF_LEN};
 use crate::protocols::http::{
     http_req_to_h2, HttpMajors, HttpReqData, HttpResp, CURL_HTTP_V2X, HTTP_PSEUDO_AUTHORITY,
     HTTP_PSEUDO_METHOD, HTTP_PSEUDO_PATH, HTTP_PSEUDO_SCHEME,
@@ -1038,6 +1039,152 @@ impl H2Stream {
 }
 
 // ===========================================================================
+// perform — one HTTP/2 request/response exchange over a connection, mirroring
+// the sibling `h1::perform` entry point used by the HTTP handler dispatch.
+// ===========================================================================
+
+/// Size of the scratch buffer used to drain response-body `DATA` frames.
+const H2_RECV_BUF_LEN: usize = 64 * 1024;
+
+/// Drive a single HTTP/2 request/response exchange over the byte stream `io`.
+///
+/// `io` is one half of the in-memory duplex pipe whose other half
+/// [`pump_bridge`] shuttles to the connection's [`FilterChain`] (in tests, a
+/// duplex half wired straight to a mock server). The request is built before
+/// any I/O so malformed input fails fast; the response head and body are then
+/// read from the single stream. The [`H2Connection`] handshake spawns the
+/// connection driver internally, so the SETTINGS exchange and DATA framing make
+/// progress concurrently while this future awaits the stream.
+async fn h2_exchange<S, W>(
+    io: S,
+    req: &HttpReqData,
+    is_ssl: bool,
+    body: Option<Vec<u8>>,
+    mut write_body: W,
+) -> Result<HttpResp>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    W: FnMut(&[u8]) -> Result<()>,
+{
+    // Build the request first so malformed input fails before any I/O.
+    let request = build_h2_request(req, is_ssl)?;
+
+    // Handshake advertises curl's client SETTINGS and spawns the driver task.
+    let mut conn = H2Connection::handshake(io, H2Settings::new()).await?;
+
+    // A request with no (or an empty) body closes the send half with the
+    // HEADERS frame — matching curl's `end_of_stream` on a bodyless request.
+    let has_body = body.as_ref().is_some_and(|b| !b.is_empty());
+    let mut stream = conn.open_stream(request, !has_body).await?;
+
+    if let Some(payload) = body {
+        if !payload.is_empty() {
+            stream.send(&payload, true).await?;
+        }
+    }
+
+    let resp = stream.recv_response().await?;
+
+    // Drain the response body to the sink until end of stream.
+    let mut buf = vec![0u8; H2_RECV_BUF_LEN];
+    loop {
+        let n = stream.recv(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        write_body(&buf[..n])?;
+    }
+
+    Ok(resp)
+}
+
+/// Perform one HTTP/2 request/response exchange over a connection.
+///
+/// This is the HTTP/2 counterpart of [`h1::perform`](crate::protocols::http::h1::perform),
+/// invoked by the HTTP version dispatch in [`crate::protocols::http`] when the
+/// transfer negotiates (or is pinned to, via prior knowledge) HTTP/2. The
+/// exchange is driven over the connection's primary [`FilterChain`] (raw TCP or
+/// TLS) using the same fully safe-Rust duplex+[`pump_bridge`] bridge the
+/// HTTP/1 engine uses, with the `h2` crate owning framing, multiplexing and
+/// flow control.
+///
+/// * `req` — the fully-populated request description (method, target, headers).
+/// * `body` — the complete request body, or `None`/empty for a bodyless
+///   request (`GET`/`HEAD`); sent as `DATA` frames with `END_STREAM` on the
+///   final frame.
+/// * `write_body` — sink invoked with each chunk of decoded response body; its
+///   error is mapped to `CURLE_WRITE_ERROR` (23) by the stream layer.
+///
+/// On completion the connection's `lastused` timestamp is refreshed: an HTTP/2
+/// connection is multiplexed and kept alive for reuse, mirroring curl keeping
+/// the `nghttp2` connection in the connection cache.
+///
+/// # Errors
+///
+/// Returns a [`crate::error::Error`] whose code follows curl's conventions: a
+/// stream-level failure maps to `CURLE_HTTP2_STREAM` (92), a connection-level
+/// failure to `CURLE_HTTP2` (16), a send failure to `CURLE_SEND_ERROR` (55),
+/// and a body write-out failure to `CURLE_WRITE_ERROR` (23).
+pub(crate) async fn perform<W>(
+    conn: &mut Connection,
+    req: HttpReqData,
+    body: Option<Vec<u8>>,
+    write_body: W,
+) -> Result<HttpResp>
+where
+    W: FnMut(&[u8]) -> Result<()>,
+{
+    let is_ssl = conn.is_ssl(FIRSTSOCKET);
+
+    // Ensure the primary filter chain exists and is connected.
+    {
+        let chain = conn.cfilter[FIRSTSOCKET].as_mut().ok_or_else(|| {
+            Error::with_context(CurlCode::SendError, "h2: connection has no filter chain")
+        })?;
+        if !chain.is_connected() {
+            chain.connect(true).await?;
+        }
+    }
+
+    let resp = {
+        let chain = conn.cfilter[FIRSTSOCKET].as_mut().ok_or_else(|| {
+            Error::with_context(CurlCode::SendError, "h2: connection has no filter chain")
+        })?;
+
+        // Fully safe-Rust bridge: the `h2` connection driver drives one end of
+        // an in-memory duplex pipe; `pump_bridge` shuttles bytes between the
+        // other end and the filter chain — the identical mechanism the HTTP/1
+        // engine uses.
+        let (h2_side, bridge_side) = tokio::io::duplex(DUPLEX_BUF_LEN);
+
+        let exchange = h2_exchange(h2_side, &req, is_ssl, body, write_body);
+        let pump = pump_bridge(chain, bridge_side);
+        tokio::pin!(exchange);
+        tokio::pin!(pump);
+
+        let mut pump_done = false;
+        loop {
+            tokio::select! {
+                biased;
+                r = &mut exchange => break r?,
+                p = &mut pump, if !pump_done => {
+                    pump_done = true;
+                    // Surface socket errors; on a clean EOF keep looping so the
+                    // exchange can drain any buffered response frames.
+                    p?;
+                }
+            }
+        }
+    };
+
+    // An HTTP/2 connection is multiplexed and reusable; refresh `lastused` so a
+    // future `ConnCache` can reclaim it (mirroring curl's `Curl_conncache`).
+    conn.lastused = std::time::Instant::now();
+
+    Ok(resp)
+}
+
+// ===========================================================================
 // H2Filter — the connection filter (← `Curl_cft_nghttp2`, `lib/http2.c`).
 // ===========================================================================
 
@@ -1360,7 +1507,8 @@ impl ConnectionFilter for H2Filter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conn::FIRSTSOCKET;
+    use crate::conn::filters::{CfFuture, FilterCtx};
+    use crate::conn::{CfType, ConnectionFilter, Scheme, FIRSTSOCKET};
     use crate::error::CurlCode;
     use http::{Response, StatusCode};
     use std::collections::BTreeSet;
@@ -1845,5 +1993,97 @@ mod tests {
         let mut got = Vec::new();
         reader.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"PREPOST");
+    }
+
+    // ---- perform() end-to-end over a real FilterChain ---------------------
+
+    /// A leaf [`ConnectionFilter`] wrapping one half of an in-memory duplex, so
+    /// [`perform`] can drive a *real* [`FilterChain`] against the duplex-based
+    /// mock HTTP/2 server. This mirrors h1's `MockTcpFilter`, but over a
+    /// [`DuplexStream`] because the h2 mock server speaks over a duplex; the
+    /// stream is connected before construction, so `connect` merely reports
+    /// success.
+    struct DuplexLeaf {
+        io: Option<DuplexStream>,
+    }
+
+    impl ConnectionFilter for DuplexLeaf {
+        fn name(&self) -> &'static str {
+            "MOCK-DUPLEX"
+        }
+
+        fn cf_type(&self) -> CfType {
+            CfType::IP_CONNECT
+        }
+
+        fn connect<'a>(
+            &'a mut self,
+            _cx: &'a mut FilterCtx<'_>,
+            _blocking: bool,
+        ) -> CfFuture<'a, Result<bool>> {
+            Box::pin(async move { Ok(self.io.is_some()) })
+        }
+
+        fn send<'a>(
+            &'a mut self,
+            _cx: &'a mut FilterCtx<'_>,
+            buf: &'a [u8],
+            _eos: bool,
+        ) -> CfFuture<'a, Result<usize>> {
+            Box::pin(async move {
+                let s = self.io.as_mut().ok_or(Error::Send)?;
+                s.write_all(buf).await.map_err(|_| Error::Send)?;
+                Ok(buf.len())
+            })
+        }
+
+        fn recv<'a>(
+            &'a mut self,
+            _cx: &'a mut FilterCtx<'_>,
+            buf: &'a mut [u8],
+        ) -> CfFuture<'a, Result<usize>> {
+            Box::pin(async move {
+                let s = self.io.as_mut().ok_or(Error::Recv)?;
+                s.read(buf).await.map_err(|_| Error::Recv)
+            })
+        }
+    }
+
+    /// `perform` drives a full HTTP/2 GET over a real `FilterChain`: it builds
+    /// the internal duplex + pump bridge (mirroring `h1::perform`), performs the
+    /// h2 handshake and stream exchange against the mock server through the
+    /// chain, and streams the response body out through its write closure. This
+    /// is the HTTP/2 counterpart of h1's `perform_end_to_end_get_over_filter_chain`
+    /// and the direct coverage for the handler's `version == 20` dispatch arm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_drives_h2_get_over_filter_chain() {
+        let (client_io, server_io) = duplex(64 * 1024);
+        let server = tokio::spawn(run_mock_server(
+            server_io,
+            ServerBehavior::OkBody(b"perform-h2".to_vec()),
+        ));
+
+        let mut chain = FilterChain::new(FIRSTSOCKET);
+        chain.add(Box::new(DuplexLeaf {
+            io: Some(client_io),
+        }));
+        let mut conn = Connection::new(Scheme::new("http", 80), "example.com", 80);
+        conn.cfilter[FIRSTSOCKET] = Some(chain);
+
+        let req = HttpReqData::make("GET", Some("http"), Some("example.com"), Some("/"));
+        let mut body: Vec<u8> = Vec::new();
+        let resp = perform(&mut conn, req, None, |d: &[u8]| -> Result<()> {
+            body.extend_from_slice(d);
+            Ok(())
+        })
+        .await
+        .expect("perform drives the HTTP/2 exchange");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("x-served-by"), Some("mock-h2"));
+        assert_eq!(body, b"perform-h2");
+
+        drop(conn);
+        let _ = server.await;
     }
 }
