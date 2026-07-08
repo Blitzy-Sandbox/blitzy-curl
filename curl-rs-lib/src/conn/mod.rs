@@ -70,6 +70,7 @@ pub mod h1_proxy;
 pub mod h2_proxy;
 pub mod happy_eyeballs;
 pub mod haproxy;
+pub mod https_connect;
 pub mod shutdown;
 pub mod socket;
 
