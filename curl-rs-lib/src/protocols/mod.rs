@@ -112,6 +112,66 @@
 #[cfg(feature = "ftp")]
 pub mod ftp_list;
 
+// ---------------------------------------------------------------------------
+// Concrete per-protocol handler modules (declared here "as they are
+// implemented", per the note above). Each module is gated by the same Cargo
+// feature as its `SCHEME_*` registry entry below (AAP §0.5.3): when a
+// protocol's feature is disabled, neither its module nor its scheme entry is
+// compiled — exactly like a stock curl built with the matching
+// `CURL_DISABLE_*` guard.
+// ---------------------------------------------------------------------------
+
+// Generic line-based command/response ("ping-pong") engine shared by the text
+// protocols FTP/IMAP/POP3/SMTP (`lib/pingpong.c`, guarded in C by
+// `USE_PINGPONG`, i.e. whenever any of those four protocols is enabled).
+#[cfg(any(
+    feature = "ftp",
+    feature = "imap",
+    feature = "pop3",
+    feature = "smtp"
+))]
+pub mod pingpong;
+
+// TFTP over UDP (`lib/tftp.c`).
+#[cfg(feature = "tftp")]
+pub mod tftp;
+
+// TELNET (`lib/telnet.c`).
+#[cfg(feature = "telnet")]
+pub mod telnet;
+
+// DICT (`lib/dict.c`).
+#[cfg(feature = "dict")]
+pub mod dict;
+
+// MQTT (`lib/mqtt.c`).
+#[cfg(feature = "mqtt")]
+pub mod mqtt;
+
+// RTSP (`lib/rtsp.c`).
+#[cfg(feature = "rtsp")]
+pub mod rtsp;
+
+// FILE (`lib/file.c`).
+#[cfg(feature = "file")]
+pub mod file;
+
+// GOPHER (`lib/gopher.c`).
+#[cfg(feature = "gopher")]
+pub mod gopher;
+
+// LDAP (`lib/openldap.c`).
+#[cfg(feature = "ldap")]
+pub mod ldap;
+
+// SMB (`lib/smb.c`).
+#[cfg(feature = "smb")]
+pub mod smb;
+
+// WebSocket (`lib/ws.c`), gated by `websockets` (curl `CURL_DISABLE_WEBSOCKETS`).
+#[cfg(feature = "websockets")]
+pub mod ws;
+
 use std::future::Future;
 use std::os::fd::RawFd;
 use std::pin::Pin;
