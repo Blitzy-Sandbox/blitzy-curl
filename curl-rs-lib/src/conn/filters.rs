@@ -634,6 +634,31 @@ impl<'c> FilterCtx<'c> {
             None => Ok(()),
         }
     }
+
+    /// Delegates a **read-only** [`query`](ConnectionFilter::query) to the next
+    /// filter *without relinquishing the mutable borrow of the chain tail*.
+    ///
+    /// The mutating lifecycle methods — `connect` in particular — occasionally
+    /// need to read a property of the layer directly below them. curl does
+    /// exactly this in `cf_haproxy_date_out_set`, which calls
+    /// `Curl_conn_cf_get_ip_info(cf->next, …)` from *inside* the HAProxy
+    /// filter's connect handshake to learn the local/remote address it must
+    /// stamp into the PROXY-protocol header. Those methods receive a
+    /// [`FilterCtx`] (holding `&mut [FilterNode]`) rather than a [`QueryCtx`],
+    /// so this helper reborrows the tail **immutably** and dispatches the query,
+    /// mirroring [`QueryCtx::query_next`] byte-for-byte.
+    ///
+    /// At the end of the chain curl's `Curl_cf_def_query` returns
+    /// `CURLE_UNKNOWN_OPTION` — reproduced verbatim.
+    pub fn query_next(&self, query: CfQuery, out: &mut QueryOut) -> Result<()> {
+        match self.tail.split_first() {
+            Some((next, rest)) => {
+                let inner = QueryCtx::new(rest, self.sockindex);
+                next.filter.query(&inner, query, out)
+            }
+            None => Err(Error::Code(CurlCode::UnknownOption)),
+        }
+    }
 }
 
 // ===========================================================================

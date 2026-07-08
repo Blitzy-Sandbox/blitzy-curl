@@ -86,8 +86,12 @@ curl-rs-ffi = { path = "../curl-rs-ffi", version = "8.19.0-dev" }
 # --- CLI framework ---
 # `derive` powers the `#[derive(Parser)]` arg structs in `args.rs` (1:1 with
 # `docs/cmdline-opts/*.md`); `cargo` sources the version from the manifest; `wrap_help` wraps
-# help text to the terminal width for `--help` output parity.
-clap = { workspace = true, features = ["derive", "cargo", "wrap_help"] }
+# help text to the terminal width for `--help` output parity; `string` allows runtime-built
+# option identifiers/value-names (`clap::builder::Str`/`Id` from `String`), required by
+# `args.rs::build_cli_command`, which constructs the clap surface from the `OPTIONS` table
+# (curl's `aliases[]` analog) — including the synthetic hidden `--no-<name>` negations and the
+# value-names stripped from each option's `Arg:` placeholder.
+clap = { workspace = true, features = ["derive", "cargo", "wrap_help", "string"] }
 # Shell-completion generation (parity with curl's completion support); used by `args.rs`.
 clap_complete = { workspace = true }
 # CLI-level contextual error chaining in `main.rs`/`operate.rs` (§0.5.1 assigns `anyhow` to
@@ -129,6 +133,30 @@ chrono = { workspace = true }
 # primitives, and every `unsafe` block MUST carry a `// SAFETY:` comment (a fully-safe
 # implementation is preferred wherever feasible).
 libc = { workspace = true }
+
+[features]
+# ---------------------------------------------------------------------------
+# IPFS gateway support (`--ipfs-gateway`, plus the `IPFS_GATEWAY` environment
+# handling and IPFS/IPNS URL rewriting reimplemented in `ipfs.rs`).
+#
+# This is the SOLE feature declared for the CLI crate, and it exists exclusively
+# to mirror curl 8.x's `#ifndef CURL_DISABLE_IPFS` compile guard. `args.rs`
+# gates the `OperationConfig::ipfs_gateway` field and its `--ipfs-gateway`
+# option handler behind `#[cfg(feature = "ipfs")]`, exactly as the C tool wraps
+# `config->ipfs_gateway` (and `case C_IPFS_GATEWAY`) in `#ifndef CURL_DISABLE_IPFS`.
+#
+# It is a DEFAULT feature so the shipped `curl-rs` behaves identically to
+# curl 8.x, where IPFS support is compiled in by default — the Minimal Change
+# Mandate (§0.7.3) forbids altering defaults or removing flags. Declaring the
+# feature also makes the `#[cfg(feature = "ipfs")]` predicate a KNOWN cfg, so
+# the `unexpected_cfgs` lint (warn-by-default from Rust 1.80 onward, and a
+# merge-blocking error under `cargo clippy -- -D warnings`, AAP §0.6.4) stays
+# silent on the stable CI leg.
+#
+# This is a CLI-local compile guard ONLY; the protocol/TLS/auth/DNS feature
+# matrix remains OWNED by `curl-rs-lib` and is NOT duplicated here.
+default = ["ipfs"]
+ipfs = []
 
 [dev-dependencies]
 # CLI integration testing (§0.5.1 assigns these to the CLI; curl-rs-lib excludes them).

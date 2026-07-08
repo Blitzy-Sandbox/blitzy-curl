@@ -68,6 +68,8 @@ use crate::tls::config::TlsConfig;
 pub mod filters;
 pub mod h1_proxy;
 pub mod h2_proxy;
+pub mod happy_eyeballs;
+pub mod haproxy;
 pub mod shutdown;
 pub mod socket;
 

@@ -133,13 +133,37 @@ pub mod ftp_list;
 // Generic line-based command/response ("ping-pong") engine shared by the text
 // protocols FTP/IMAP/POP3/SMTP (`lib/pingpong.c`, guarded in C by
 // `USE_PINGPONG`, i.e. whenever any of those four protocols is enabled).
-#[cfg(any(
-    feature = "ftp",
-    feature = "imap",
-    feature = "pop3",
-    feature = "smtp"
-))]
+#[cfg(any(feature = "ftp", feature = "imap", feature = "pop3", feature = "smtp"))]
 pub mod pingpong;
+
+// HTTP family root (`lib/http.c` / `lib/http.h`), gated by `http`
+// (curl `CURL_DISABLE_HTTP`). Owns the shared request/response header
+// machinery, version negotiation across HTTP/1.1, HTTP/2 and HTTP/3, redirect
+// handling, `Expect: 100-continue`, and the auth glue; the `http` submodule
+// tree (`h1`, `h2`, `h3`, `chunks`, `proxy`, `aws_sigv4`) hangs off it. The
+// sibling `rtsp` and `ws` handlers reuse this module's header machinery via
+// `use crate::protocols::http`.
+#[cfg(feature = "http")]
+pub mod http;
+
+// FTP / FTPS (`lib/ftp.c`, `lib/ftp.h`). The dual-connection ping-pong
+// protocol; rides `pingpong` for the control channel and `ftp_list` for
+// wildcard listings.
+#[cfg(feature = "ftp")]
+pub mod ftp;
+
+// SMTP/SMTPS (`lib/smtp.c`), a ping-pong mail-submission protocol.
+#[cfg(feature = "smtp")]
+pub mod smtp;
+
+// IMAP/IMAPS (`lib/imap.c`): a ping-pong mail-access protocol driving SASL
+// authentication, STARTTLS upgrade, and mailbox SELECT/FETCH/APPEND/SEARCH.
+#[cfg(feature = "imap")]
+pub mod imap;
+
+// POP3 and POP3S (`lib/pop3.c`), a ping-pong mail-retrieval protocol.
+#[cfg(feature = "pop3")]
+pub mod pop3;
 
 // TFTP over UDP (`lib/tftp.c`).
 #[cfg(feature = "tftp")]
@@ -180,6 +204,13 @@ pub mod smb;
 // WebSocket (`lib/ws.c`), gated by `websockets` (curl `CURL_DISABLE_WEBSOCKETS`).
 #[cfg(feature = "websockets")]
 pub mod ws;
+
+// SFTP + SCP over SSH (`lib/vssh/*`), gated by `ssh` (curl `USE_SSH`). This is
+// the SSH family root; it declares its own `sftp`/`scp` submodules and exposes
+// the [`ssh::SFTP_HANDLER`] / [`ssh::SCP_HANDLER`] singletons the `SCHEME_SFTP`
+// / `SCHEME_SCP` records below point at.
+#[cfg(feature = "ssh")]
+pub mod ssh;
 
 use std::any::Any;
 use std::fmt;
@@ -1074,7 +1105,7 @@ pub static SCHEME_FTP: SchemeHandler = SchemeHandler {
         | PROTOPT_SSL_REUSE
         | PROTOPT_CONN_REUSE,
     defport: 21,
-    handler: None,
+    handler: Some(&ftp::HANDLER),
 };
 
 /// `ftps` (← `Curl_scheme_ftps`). Note: unlike `ftp`, curl grants `ftps`
@@ -1092,7 +1123,7 @@ pub static SCHEME_FTPS: SchemeHandler = SchemeHandler {
         | PROTOPT_WILDCARD
         | PROTOPT_CONN_REUSE,
     defport: 990,
-    handler: None,
+    handler: Some(&ftp::HANDLER),
 };
 
 // --- SSH family (subfolder handlers) ---------------------------------------
@@ -1105,7 +1136,7 @@ pub static SCHEME_SFTP: SchemeHandler = SchemeHandler {
     family: CURLPROTO_SFTP,
     flags: PROTOPT_DIRLOCK | PROTOPT_CLOSEACTION | PROTOPT_NOURLQUERY | PROTOPT_CONN_REUSE,
     defport: 22,
-    handler: None,
+    handler: Some(&ssh::SFTP_HANDLER),
 };
 
 /// `scp` (← `Curl_scheme_scp`).
@@ -1116,7 +1147,7 @@ pub static SCHEME_SCP: SchemeHandler = SchemeHandler {
     family: CURLPROTO_SCP,
     flags: PROTOPT_DIRLOCK | PROTOPT_CLOSEACTION | PROTOPT_NOURLQUERY | PROTOPT_CONN_REUSE,
     defport: 22,
-    handler: None,
+    handler: Some(&ssh::SCP_HANDLER),
 };
 
 // --- Mail protocols --------------------------------------------------------
@@ -1185,7 +1216,7 @@ pub static SCHEME_SMTP: SchemeHandler = SchemeHandler {
         | PROTOPT_SSL_REUSE
         | PROTOPT_CONN_REUSE,
     defport: 25,
-    handler: None,
+    handler: Some(&smtp::HANDLER),
 };
 
 /// `smtps` (← `Curl_scheme_smtps`).
@@ -1200,7 +1231,7 @@ pub static SCHEME_SMTPS: SchemeHandler = SchemeHandler {
         | PROTOPT_URLOPTIONS
         | PROTOPT_CONN_REUSE,
     defport: 465,
-    handler: None,
+    handler: Some(&smtp::HANDLER),
 };
 
 // --- Auxiliary protocols ---------------------------------------------------

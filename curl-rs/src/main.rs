@@ -18,10 +18,27 @@
 // CLI sub-modules — language rewrites of curl's `src/*.c`, wired in as they are added.
 mod terminal;
 
+// Command-line configuration model + argument parser (Rust rewrite of curl's
+// `src/tool_getparam.c`, `src/tool_paramhlp.c`, and `src/tool_cfgable.c`). This is the
+// foundational CLI module: it defines the `OperationConfig` / `GlobalConfig` / `State`
+// configuration vocabulary, the `ParameterError` code set, and the full curl 8.x flag
+// surface (parsed 1:1 from `docs/cmdline-opts/`). Every other CLI sub-module
+// (`setopt`, `operate`, `parsecfg`, `var`, `writeout`, `urlglob`, `formparse`, `ipfs`,
+// `filetime`, `xattr`, and the `callbacks/*` group) consumes the types it exports, so it
+// is declared here at the crate root even though `main` does not yet drive it directly —
+// the operation-dispatch wiring is layered on in a later checkpoint (AAP §0.7.3).
+mod args;
+
 // Interactive no-echo password prompt (Rust rewrite of `src/tool_getpass.c`). Consumed by the
 // argument- and operation-handling layer when a required password is not supplied on the command
 // line (for example `-u user:` with an empty password, `--proxy-user`, or an SSH key passphrase).
 mod getpass;
+
+// Extended-attribute metadata writer (Rust rewrite of `src/tool_xattr.c`). Consumed by the
+// post-transfer path in the operation-handling layer (`operate.rs` / `callbacks/write.rs`) when
+// the `--xattr` option is set, to record the origin URL, referrer, and MIME type on the
+// downloaded output file.
+mod xattr;
 
 use clap::Parser;
 
