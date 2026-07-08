@@ -40,6 +40,61 @@ mod getpass;
 // downloaded output file.
 mod xattr;
 
+// URL globbing engine (Rust rewrite of `src/tool_urlglob.c`). Implements curl's own
+// `{a,b}` / `[1-10]` URL-expansion mini-language (distinct from filesystem globbing). Consumed
+// by the operation-dispatch layer (`operate.rs`) to expand a single command-line URL into the
+// sequence of concrete transfers, and referenced from `args.rs`'s `State` (`urlglob`/`inglob`).
+mod urlglob;
+// `--parallel` aggregate progress meter and five-column byte formatter (Rust rewrite of
+// `src/tool_progress.c`). Consumed by the parallel-transfer dispatch loop in `operate.rs`,
+// which installs `progress_display::xferinfo_cb` on each easy handle and calls
+// `ProgressMeter::progress_meter` between `curl_multi_poll` iterations to render the single
+// aggregate status line. The single-transfer progress bar lives in `callbacks/progress.rs`
+// (rewrite of `src/tool_cb_prg.c`), not here. Wired into dispatch in a later checkpoint
+// (AAP §0.7.3).
+mod progress_display;
+// IPFS/IPNS gateway URL rewriting (Rust rewrite of `src/tool_ipfs.c`). Consumed by the
+// option-application layer (`setopt.rs` / `operate.rs`, added in a later checkpoint) to rewrite
+// an `ipfs://` / `ipns://` target URL into the gateway HTTP(S) URL before the transfer starts.
+// Gated behind the default-on `ipfs` feature, mirroring curl's `#ifndef CURL_DISABLE_IPFS`
+// (and the matching `#[cfg(feature = "ipfs")]` guard on `OperationConfig::ipfs_gateway`).
+#[cfg(feature = "ipfs")]
+mod ipfs;
+// The `--write-out` / `-w` format engine (Rust rewrite of `src/tool_writeout.c`). Defines the
+// shared variable catalogue (`WriteoutId` / `WriteoutVar` / `VARIABLES`) and the format-string
+// interpreter (`our_writeout`). Consumed by the operation-handling layer after each transfer,
+// and mutually referenced with `writeout_json` (which renders the `%{json}` / `%{header_json}`
+// output over the same variable table).
+mod writeout;
+
+// The `%{json}` / `%{header_json}` emitters plus shared JSON string quoting (Rust rewrite of
+// `src/tool_writeout_json.c`). Iterates `writeout::VARIABLES` in JSON mode; also exports
+// `json_quoted` for the `--write-out` `:json` value function in `var.rs`.
+mod writeout_json;
+// File-time get/set plus portable local-time conversion (Rust rewrite of `src/tool_filetime.c`
+// and `src/toolx/tool_time.c`). `getfiletime` feeds `-z` / `--time-cond` (translated by
+// `setopt.rs` into `CURLOPT_TIMECONDITION` + `CURLOPT_TIMEVALUE`) and `setfiletime` is called
+// by the post-transfer path (`operate.rs` / `callbacks/write.rs`) for `-R` / `--remote-time`,
+// stamping the output file with the server-reported `CURLINFO_FILETIME`. Implemented entirely
+// with safe `std::fs` (Rust 1.75) + `chrono`; contains no `unsafe`.
+mod filetime;
+// `-F` / `--form` multipart parser (Rust rewrite of `src/tool_formparse.c`). Parses one
+// `-F`/`--form-string` argument into the CLI-side MIME tree (`args::ToolMime`) and later
+// converts that tree into a `curl-rs-lib` mime object. Consumed by the argument layer (which
+// installs `formparse::form_parser_hook` as the `args::FormParserHook`) and by the operation
+// layer (`operate.rs` / `setopt.rs`), which calls `formparse::tool2curlmime` to build the body.
+// Declared here at the crate root even though `main` does not yet drive it directly — the
+// operation-dispatch wiring is layered on in a later checkpoint (AAP §0.7.3).
+mod formparse;
+// Config-file parser and default-config discovery (Rust rewrite of `src/tool_parsecfg.c` +
+// `src/tool_findfile.c`). Reads `.curlrc` / `-K` files, tokenizes each directive with curl's
+// exact grammar (comment/quoting/separator rules), and dispatches it to `args::getparameter`
+// through the `args::ConfigParserHook` function pointer. The argument layer installs
+// `parsecfg::config_parser_hook` (for `--config`/`-K`) and the operation layer drives the
+// implicit default-`.curlrc` load via `parsecfg::find_config_file`; both are wired in the
+// operation-dispatch checkpoint (AAP §0.7.3).
+mod parsecfg;
+
 use clap::Parser;
 
 /// First line of `--version` output, in curl's parity form

@@ -65,6 +65,7 @@ use crate::tls::config::TlsConfig;
 // declaration.
 // ===========================================================================
 
+pub mod connect;
 pub mod filters;
 pub mod h1_proxy;
 pub mod h2_proxy;
@@ -843,6 +844,15 @@ pub struct Connection {
     /// The per-connection diagnostic state flags (`conn->bits`).
     pub bits: ConnectBits,
 
+    /// Whether the HAProxy PROXY-protocol v1 header must be emitted on connect
+    /// (curl's `data->set.haproxyprotocol`).
+    ///
+    /// curl carries this on the easy handle; because this connection-layer
+    /// rewrite has no `Curl_easy`, the resolved setting is snapshotted here so
+    /// the connection-setup filter can consult it during its
+    /// `CF_SETUP_CNNCT_HAPROXY` stage (`cf_setup_connect` in `lib/connect.c`).
+    pub haproxy_protocol: bool,
+
     // --- Notification model for multiplexing --------------------------------
     // Set by `set_multiplex` when an attached multi must be told the
     // connection became multiplexed (curl calls `Curl_multi_connchanged`).
@@ -918,6 +928,7 @@ impl Connection {
             gssapi_delegation: 0,
             transport_wanted,
             bits: ConnectBits::default(),
+            haproxy_protocol: false,
             multi_connchanged_pending: false,
         };
         conn.build_destination();

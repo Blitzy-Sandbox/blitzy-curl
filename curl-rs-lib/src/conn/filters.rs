@@ -800,6 +800,27 @@ impl FilterChain {
         self.filters.last().map(|n| n.filter.as_ref())
     }
 
+    /// Returns the filter names top-to-bottom (head first).
+    ///
+    /// This exposes the assembled chain order for `--trace` order-parity
+    /// assertions (the connection-setup layer must build the chain in curl's
+    /// exact `cf_setup_connect` insertion order). It is the public counterpart
+    /// of the internal `filters[i].name()` inspection.
+    #[must_use]
+    pub fn names(&self) -> Vec<&'static str> {
+        self.filters.iter().map(FilterNode::name).collect()
+    }
+
+    /// Returns each filter's capability bits top-to-bottom (head first),
+    /// paired with its name, for order/-type parity assertions.
+    #[must_use]
+    pub fn layout(&self) -> Vec<(&'static str, CfType)> {
+        self.filters
+            .iter()
+            .map(|n| (n.name(), n.filter.cf_type()))
+            .collect()
+    }
+
     /// Adds a filter at the **top** of the chain (index `0`).
     ///
     /// This mirrors curl's `Curl_conn_cf_add`, which prepends: `cf->next =
