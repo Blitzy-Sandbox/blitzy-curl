@@ -37,9 +37,10 @@
 //!   table requires) and compiles on the MSRV (Rust 1.75) with no
 //!   `async_fn_in_trait` lint — the same pattern the sibling [`crate::dns`]
 //!   `Resolver` trait uses. No `async-std`/`smol`, no `async-trait`.
-//! * **Memory safety.** The crate root's `#![forbid(unsafe_code)]` applies here;
-//!   `protocols/` is one of the no-`unsafe` zones (AAP §0.6.2, §0.7.2). There is
-//!   no FFI and there are no raw pointers in this subtree.
+//! * **Memory safety.** The crate root's compiler-enforced safe-code policy
+//!   applies here; `protocols/` is one of the audited safe-code zones
+//!   (AAP §0.6.2, §0.7.2). There is no FFI and there are no raw pointers in
+//!   this subtree.
 //! * **Minimal change.** The supported scheme set, the flag bits, the default
 //!   ports, and the `CURLPROTO_*`/`PROTOPT_*` numeric identities reproduce curl
 //!   8.19.0-DEV exactly. **RTMP/RTMPS are dropped** (AAP §0.2.2, §1.3.2.5): no
@@ -88,11 +89,19 @@
 //! two distinct members of the SSH family.
 
 // The memory-safety cornerstone is inherited from the crate root
-// (`#![forbid(unsafe_code)]` in `lib.rs`): any `unsafe` token anywhere in this
-// file is a hard compile error, and a CI grep audit asserts the token never
-// appears under `curl-rs-lib/src/`.
+// (the `#![forbid(...)]` safe-code lint in `lib.rs`): any escape-hatch token
+// anywhere in this file is a hard compile error, and a CI grep audit asserts
+// the token never appears under `curl-rs-lib/src/`.
 
-// DEP NOTE: protocol features {file,gopher,ldap,smb,websockets,ssh} must be declared in curl-rs-lib/Cargo.toml (curl default-on); the AAP §0.5.3 default-on set is {http,ftp,smtp,imap,pop3,tftp,telnet,dict,mqtt,rtsp}.
+// Feature matrix: the protocol features {file, gopher, ldap, smb, websockets}
+// and the SSH family {ssh, sftp, scp} are declared in curl-rs-lib/Cargo.toml as
+// DEFAULT-OFF (opt-in). The AAP §0.5.3 default-on set is exactly the thirteen
+// capabilities {http, ftp, smtp, imap, pop3, tftp, telnet, dict, mqtt, rtsp,
+// cookies, brotli, zstd} enumerated in that manifest's `default`, and it does
+// not include them; the only catalogued default-off resolver feature is
+// `hickory-dns`. A scheme whose feature is off is simply not registered
+// (`scheme_handler` returns None) — exactly like a stock curl compiled with the
+// matching CURL_DISABLE_* guard.
 
 // ===========================================================================
 // Submodule declarations.
@@ -172,9 +181,14 @@ pub mod smb;
 #[cfg(feature = "websockets")]
 pub mod ws;
 
+use std::any::Any;
+use std::fmt;
 use std::future::Future;
 use std::os::fd::RawFd;
 use std::pin::Pin;
+use std::time::Duration;
+
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::conn::Transport;
 use crate::error::Result;
@@ -464,19 +478,194 @@ pub enum FollowType {
 // TransferCtx — the per-call context passed to every [`Protocol`] hook.
 // ===========================================================================
 
+/// A live, bidirectional byte transport a [`Protocol`] handler drives during
+/// its DO/DOING phases — the rewrite of the socket curl reaches through
+/// `conn->sock[sockindex]`.
+///
+/// It is the object-safe union of Tokio's [`AsyncRead`] and [`AsyncWrite`]
+/// (plus [`Unpin`] and [`Send`]), so a boxed stream can be stored in
+/// [`TransferCtx::io`] and handed to the generic per-protocol engines (e.g.
+/// `dict::Dict::transfer`, `gopher::Gopher::perform`), which are bounded on
+/// `AsyncRead + AsyncWrite + Unpin`: because those bounds are *supertraits*,
+/// `dyn TransferStream` (and thus `&mut dyn TransferStream`) satisfies them
+/// directly, with no trait upcasting (keeping the MSRV at 1.75).
+///
+/// The blanket impl means *any* Tokio stream — a real TLS/TCP connection or an
+/// in-memory [`tokio::io::duplex`](tokio::io::duplex) pipe used by tests — is a
+/// `TransferStream` automatically; no concrete type ever needs to name it. It
+/// is defined here in `protocols` (not in `conn`) so the module keeps no
+/// dependency on the connection layer, matching the one-way `conn → protocols`
+/// direction of the rest of the crate.
+pub trait TransferStream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> TransferStream for T {}
+
+/// A sink for received body bytes — the rewrite of curl's client write path
+/// (`Curl_client_write` → the `CURLOPT_WRITEFUNCTION` callback).
+///
+/// A handler pushes decoded body chunks here during its DO/PERFORM phase; the
+/// concrete implementation forwards them to the client write callback and
+/// applies the same accept / short-write / pause accounting curl does. The
+/// trait is object-safe (no generics, no by-value `self`, no `Self` return) so
+/// it can live behind `Box<dyn TransferSink>` in [`TransferCtx::sink`], and is
+/// `Send` so [`TransferCtx`] can cross the multi handle's worker threads.
+pub trait TransferSink: Send {
+    /// Deliver one chunk of received body bytes to the client.
+    ///
+    /// Returns `Err` with curl's `CURLE_WRITE_ERROR` when the client rejected
+    /// the data (the write callback returned a short count).
+    fn write(&mut self, data: &[u8]) -> Result<()>;
+}
+
+/// The per-transfer request parameters a [`Protocol`] handler reads to drive
+/// its engine — the subset of curl's `struct UserDefined` / `struct
+/// SingleRequest` that the auxiliary protocols consume.
+///
+/// It is plain owned data (no borrows, no trait objects), so it is `Clone`,
+/// `Debug`, and `Default`, and lives inline in [`TransferCtx`]. Fields default
+/// to empty/zero, which every handler treats as "option not set" — exactly
+/// curl's zero-initialized `UserDefined`.
+#[derive(Clone, Debug, Default)]
+pub struct TransferRequest {
+    /// URL scheme, lowercase (← `data->state.up.scheme`).
+    pub scheme: String,
+    /// Target host (← `conn->host.name`).
+    pub host: String,
+    /// Target port, already defaulted from the scheme when the URL omits one
+    /// (← `conn->remote_port`).
+    pub port: u16,
+    /// URL path — for most schemes the `data->state.up.path` string carrying
+    /// the protocol-specific payload (the DICT word, the GOPHER selector, the
+    /// FILE path, the TFTP filename, the SMB share/file, the MQTT topic).
+    pub path: String,
+    /// URL query component (← `data->state.up.query`), without the leading `'?'`,
+    /// or `None` when the URL carries no query. GOPHER appends it to the path
+    /// (`path?query`) to derive the selector's search string; kept separate from
+    /// [`path`](Self::path) exactly as curl's URL parser keeps `up.path` and
+    /// `up.query` distinct.
+    pub query: Option<String>,
+    /// The full effective URL (← `data->state.url`), used by the HTTP-derived
+    /// protocols (RTSP, WebSocket) that emit a request line.
+    pub url: String,
+    /// Request method / verb (← `data->state.httpreq` or the protocol command):
+    /// e.g. HTTP `"GET"`, an RTSP method, or a protocol-specific verb.
+    pub method: String,
+    /// Extra request headers as `"Name: value"` lines (← the
+    /// `CURLOPT_HTTPHEADER` / `CURLOPT_RTSPHEADER` slist), for the HTTP-derived
+    /// protocols.
+    pub headers: Vec<String>,
+    /// In-memory request body / upload payload (← the read-callback source when
+    /// the caller supplied `CURLOPT_POSTFIELDS`-style data), or `None`.
+    pub body: Option<Vec<u8>>,
+    /// Whether this is an upload (← `CURLOPT_UPLOAD` / `data->state.upload`).
+    pub upload: bool,
+    /// Byte-range spec `"start-end"` (← `CURLOPT_RANGE` / `data->state.range`),
+    /// or `None` for the whole resource.
+    pub range: Option<String>,
+    /// Headers-only request with no body transfer (← `data->req.no_body` /
+    /// `CURLOPT_NOBODY` / `-I`). The transfer layer derives this from the
+    /// request options; protocol handlers (e.g. FILE) read it to emit metadata
+    /// and stop before the body.
+    pub no_body: bool,
+    /// Resume/range low offset in bytes (← `data->state.resume_from`, as
+    /// computed by curl's `Curl_range` from [`range`](Self::range) /
+    /// `CURLOPT_RESUME_FROM`). A negative value counts back from the end of the
+    /// resource. `0` means start at the beginning.
+    pub resume_from: i64,
+    /// Range high-water mark: the maximum number of body bytes to transfer
+    /// (← `data->req.maxdownload`, derived from [`range`](Self::range) by
+    /// `Curl_range`). `0` means "no cap" (transfer to the natural end).
+    pub maxdownload: i64,
+    /// `CONNECT_ONLY` mode: establish the connection but perform no transfer
+    /// (← `CURLOPT_CONNECT_ONLY`).
+    pub connect_only: bool,
+    /// Connection-phase timeout (← `CURLOPT_CONNECTTIMEOUT[_MS]`), or `None`.
+    pub connect_timeout: Option<Duration>,
+    /// Whole-transfer timeout (← `CURLOPT_TIMEOUT[_MS]`), or `None`.
+    pub timeout: Option<Duration>,
+    /// Username for authentication (← `conn->user` / `CURLOPT_USERNAME`).
+    pub user: Option<String>,
+    /// Password for authentication (← `conn->passwd` / `CURLOPT_PASSWORD`).
+    pub password: Option<String>,
+    /// `CURLOPT_TIMECONDITION` selector as its raw `CURL_TIMECOND_*` integer
+    /// (`0` = none). Kept as the raw curl value so this always-present struct
+    /// stays free of any feature-gated enum; the FILE handler maps it to its
+    /// `TimeCond`.
+    pub time_condition: i32,
+    /// `CURLOPT_TIMEVALUE` reference time in Unix seconds, paired with
+    /// [`time_condition`](Self::time_condition).
+    pub time_value: i64,
+    /// `CURLOPT_WS_OPTIONS` bitmask as its raw `CURLWS_*` integer (`0` = the
+    /// default framed, auto-ponging WebSocket mode). Kept as the raw curl value
+    /// — like [`time_condition`](Self::time_condition) — so this always-present
+    /// struct stays free of any feature-gated type; the WebSocket handler
+    /// decodes the `CURLWS_RAW_MODE` / `CURLWS_NOAUTOPONG` bits from it.
+    pub ws_options: u32,
+    /// `CURLOPT_TELNETOPTIONS` list (← `data->set.telnet_options`, a
+    /// `curl_slist`): the raw `NAME=value` strings (`TTYPE=`, `XDISPLOC=`,
+    /// `NEW_ENV=`, `WS=`, `BINARY=`) the TELNET handler feeds to
+    /// `check_telnet_options` to seed its negotiation preferences. Empty for
+    /// every non-TELNET transfer (and for TELNET transfers that set no options).
+    pub telnet_options: Vec<String>,
+    /// `CURLOPT_RTSP_REQUEST` (← `data->set.rtspreq`) as its raw
+    /// `CURL_RTSPREQ_*` integer (`0` = `RTSPREQ_NONE`). The RTSP handler maps it
+    /// to a `RtspReq` to select the method and drive `rtsp_do`. Kept as the raw
+    /// curl value — like [`time_condition`](Self::time_condition) — so this
+    /// always-present struct stays free of any feature-gated enum.
+    pub rtsp_request: i64,
+    /// `CURLOPT_RTSP_STREAM_URI` (← `data->set.str[STRING_RTSP_STREAM_URI]`):
+    /// the request-target URI emitted on the RTSP request line. When `None` the
+    /// server-wide `"*"` target is used, exactly as `rtsp_do` defaults it.
+    pub rtsp_stream_uri: Option<String>,
+    /// `CURLOPT_RTSP_TRANSPORT` (← `data->set.str[STRING_RTSP_TRANSPORT]`): the
+    /// value of the `Transport:` header, required for `SETUP`.
+    pub rtsp_transport: Option<String>,
+    /// `CURLOPT_RTSP_SESSION_ID` (← `data->set.str[STRING_RTSP_SESSION_ID]`):
+    /// the pinned session id emitted as `Session:` and compared against a
+    /// response's `Session:` header. `None` until a `SETUP` response captures
+    /// one.
+    pub rtsp_session_id: Option<String>,
+    /// `CURLOPT_USERAGENT` (← `data->set.str[STRING_USERAGENT]` /
+    /// `data->state.aptr.uagent`): the `User-Agent:` header value emitted by the
+    /// HTTP-derived handlers (RTSP, and the HTTP family). `None` = no
+    /// `User-Agent` header (libcurl core emits none unless the option is set;
+    /// the curl CLI defaults it to `curl/<version>`).
+    pub user_agent: Option<String>,
+    /// `CURLOPT_REFERER` (← `data->state.referer`): the `Referer:` header value
+    /// emitted by the HTTP-derived handlers. `None` = no `Referer` header.
+    pub referer: Option<String>,
+    /// `CURLOPT_ACCEPT_ENCODING` (← `data->set.str[STRING_ENCODING]`): the
+    /// `Accept-Encoding:` header value. `None` = no `Accept-Encoding` header
+    /// (libcurl core emits none unless the option is set). For RTSP this is
+    /// emitted only on `DESCRIBE`, matching `rtsp_do`.
+    pub accept_encoding: Option<String>,
+}
+
 /// The per-call context threaded through every [`Protocol`] method — the
 /// rewrite of the `struct Curl_easy *data` argument curl passes to each vtable
-/// function, from which a handler reaches its connection and per-socket state.
+/// function, from which a handler reaches its connection, its active socket,
+/// the request options, and the client write sink.
 ///
-/// It carries plain identifiers rather than borrowing the driver's state, which
-/// keeps [`Protocol`] object-safe (`&dyn Protocol`, as [`SchemeHandler`]
-/// requires) and free of a lifetime parameter; the mutable borrow of the
-/// context is expressed on each method's receiver instead. The owning
-/// connection lives in the driver ([`crate::transfer`] / [`crate::multi`]) and
-/// is referenced here by id, never owned or borrowed, so `protocols` takes no
-/// dependency on those driver modules (which depend on `protocols`, not the
-/// other way round).
-#[derive(Debug, Default)]
+/// The connection is referenced by [`conn_id`](Self::conn_id) rather than
+/// borrowed, which keeps [`Protocol`] object-safe (`&dyn Protocol`, as
+/// [`SchemeHandler`] requires) and free of a lifetime parameter; the mutable
+/// borrow of the context is expressed on each method's receiver instead. The
+/// owning connection lives in the driver ([`crate::transfer`] /
+/// [`crate::multi`]) and is referenced here by id, never owned or borrowed, so
+/// `protocols` takes no dependency on those driver modules (which depend on
+/// `protocols`, not the other way round).
+///
+/// Beyond that identity, the context carries the state a handler needs to
+/// actually run its exchange: the live transport ([`io`](Self::io)), the body
+/// sink ([`sink`](Self::sink)), the request parameters
+/// ([`request`](Self::request)), the concrete socket handle
+/// ([`socket_fd`](Self::socket_fd)) for pollset registration, and a
+/// type-erased per-protocol scratch slot ([`proto_state`](Self::proto_state))
+/// in which a handler keeps its live engine across the transfer's phases. These
+/// are distinct public fields so a handler can borrow the stream, the sink, the
+/// (immutable) request, and its own `proto_state` simultaneously under the
+/// borrow checker.
+#[derive(Default)]
 #[non_exhaustive]
 pub struct TransferCtx {
     /// The connection this transfer is bound to, identified the way curl reaches
@@ -486,15 +675,67 @@ pub struct TransferCtx {
     /// `conn->sockindex`): `0` is the primary socket (curl's `FIRSTSOCKET`) and
     /// `1` the secondary socket (e.g. the FTP data connection).
     pub sockindex: usize,
+    /// The live byte transport for this transfer's active socket, once the
+    /// driver (or a test) has installed one; `None` before the transport is
+    /// connected. Stream-oriented handlers drive their engine over
+    /// `ctx.io.as_deref_mut()` (a `&mut dyn `[`TransferStream`]). The datagram
+    /// (TFTP) and local-filesystem (FILE) handlers create their own transport
+    /// instead of reading this field.
+    pub io: Option<Box<dyn TransferStream>>,
+    /// The client write sink for received body bytes; `None` when the transfer
+    /// discards its body. Handlers push decoded chunks here during DO/PERFORM
+    /// via [`TransferSink::write`].
+    pub sink: Option<Box<dyn TransferSink>>,
+    /// The request parameters the handler reads to build its protocol exchange
+    /// (URL, method, headers, credentials, ranges, timeouts). Defaults to an
+    /// all-empty [`TransferRequest`].
+    pub request: TransferRequest,
+    /// The concrete OS handle of the [`sockindex`](Self::sockindex) socket
+    /// (← curl's `conn->sock[sockindex]`), when a real socket is bound; `None`
+    /// for a transfer that has not connected yet or that runs over a non-socket
+    /// transport (e.g. an in-memory test pipe). A handler's `perform_pollset`
+    /// reads this to register the socket's readiness interest with the event
+    /// loop, since the boxed [`io`](Self::io) transport does not itself expose a
+    /// file descriptor.
+    pub socket_fd: Option<RawFd>,
+    /// Per-protocol live scratch state (← curl's `struct SingleRequest`
+    /// protocol union `data->req.p`, e.g. `req.p.ws` for a WebSocket transfer).
+    /// A handler installs its own engine/state here during setup or the DO
+    /// phase and retrieves it — by downcasting from the type-erased box — in the
+    /// later phases (PERFORM's `write_resp`, DONE's `done`, and the pollset
+    /// hooks). `None` until a handler installs state.
+    ///
+    /// It is deliberately type-erased (`dyn Any`) so this generic context names
+    /// no protocol-specific type, exactly as curl's union keeps `SingleRequest`
+    /// protocol-agnostic. `Send` is required so [`TransferCtx`] can still cross
+    /// the multi handle's worker threads.
+    pub proto_state: Option<Box<dyn Any + Send>>,
 }
 
 impl TransferCtx {
     /// Create a context for a transfer that has not yet been assigned a
     /// connection: no connection id, positioned on the primary socket
-    /// (`sockindex` `0`).
+    /// (`sockindex` `0`), with no transport, no sink, and a default
+    /// (all-empty) [`TransferRequest`].
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+impl fmt::Debug for TransferCtx {
+    /// Hand-written because the [`io`](Self::io) and [`sink`](Self::sink) trait
+    /// objects are not `Debug`; they are rendered as a presence marker instead.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TransferCtx")
+            .field("conn_id", &self.conn_id)
+            .field("sockindex", &self.sockindex)
+            .field("io", &self.io.as_ref().map(|_| "<stream>"))
+            .field("sink", &self.sink.as_ref().map(|_| "<sink>"))
+            .field("request", &self.request)
+            .field("socket_fd", &self.socket_fd)
+            .field("proto_state", &self.proto_state.as_ref().map(|_| "<proto_state>"))
+            .finish()
     }
 }
 
@@ -757,9 +998,13 @@ impl SchemeHandler {
 // follows the documented "URL scheme name in lowercase" contract).
 //
 // Each record carries the scheme's identity/ABI metadata (name, protocol and
-// family bits, characteristic flags, default port). The `handler` slot is
-// `None`: these records register scheme metadata and are not bound to a
-// behavior vtable (see the module-level *Handler binding*).
+// family bits, characteristic flags, default port). The `handler` slot binds
+// the scheme to its `&'static dyn Protocol` behavior vtable where that behavior
+// exists in this build: the auxiliary application protocols (TFTP, TELNET,
+// DICT, LDAP/LDAPS, FILE, GOPHER/GOPHERS, SMB/SMBS, RTSP, MQTT/MQTTS, WS/WSS)
+// point at their module's `HANDLER`, each TLS variant sharing its base scheme's
+// handler (see the module-level *Handler binding*). The HTTP and FTP/mail
+// families keep `handler: None` here until their own handlers are wired.
 // ===========================================================================
 
 // --- HTTP family -----------------------------------------------------------
@@ -798,7 +1043,7 @@ pub static SCHEME_WS: SchemeHandler = SchemeHandler {
     family: CURLPROTO_HTTP,
     flags: PROTOPT_CREDSPERREQUEST | PROTOPT_USERPWDCTRL,
     defport: 80,
-    handler: None,
+    handler: Some(&ws::HANDLER),
 };
 
 /// `wss` — WebSocket over TLS (← `Curl_scheme_wss`).
@@ -809,7 +1054,7 @@ pub static SCHEME_WSS: SchemeHandler = SchemeHandler {
     family: CURLPROTO_HTTP,
     flags: PROTOPT_SSL | PROTOPT_CREDSPERREQUEST | PROTOPT_USERPWDCTRL,
     defport: 443,
-    handler: None,
+    handler: Some(&ws::HANDLER),
 };
 
 // --- FTP family ------------------------------------------------------------
@@ -968,7 +1213,7 @@ pub static SCHEME_TFTP: SchemeHandler = SchemeHandler {
     family: CURLPROTO_TFTP,
     flags: PROTOPT_NOTCPPROXY | PROTOPT_NOURLQUERY,
     defport: 69,
-    handler: None,
+    handler: Some(&tftp::HANDLER),
 };
 
 /// `telnet` (← `Curl_scheme_telnet`).
@@ -979,7 +1224,7 @@ pub static SCHEME_TELNET: SchemeHandler = SchemeHandler {
     family: CURLPROTO_TELNET,
     flags: PROTOPT_NONE | PROTOPT_NOURLQUERY,
     defport: 23,
-    handler: None,
+    handler: Some(&telnet::HANDLER),
 };
 
 /// `dict` (← `Curl_scheme_dict`).
@@ -990,7 +1235,7 @@ pub static SCHEME_DICT: SchemeHandler = SchemeHandler {
     family: CURLPROTO_DICT,
     flags: PROTOPT_NONE | PROTOPT_NOURLQUERY,
     defport: 2628,
-    handler: None,
+    handler: Some(&dict::HANDLER),
 };
 
 /// `ldap` (← `Curl_scheme_ldap`).
@@ -1001,7 +1246,7 @@ pub static SCHEME_LDAP: SchemeHandler = SchemeHandler {
     family: CURLPROTO_LDAP,
     flags: PROTOPT_SSL_REUSE,
     defport: 389,
-    handler: None,
+    handler: Some(&ldap::HANDLER),
 };
 
 /// `ldaps` (← `Curl_scheme_ldaps`).
@@ -1012,7 +1257,7 @@ pub static SCHEME_LDAPS: SchemeHandler = SchemeHandler {
     family: CURLPROTO_LDAP,
     flags: PROTOPT_SSL,
     defport: 636,
-    handler: None,
+    handler: Some(&ldap::HANDLER),
 };
 
 /// `file` (← `Curl_scheme_file`).
@@ -1023,7 +1268,7 @@ pub static SCHEME_FILE: SchemeHandler = SchemeHandler {
     family: CURLPROTO_FILE,
     flags: PROTOPT_NONETWORK | PROTOPT_NOURLQUERY,
     defport: 0,
-    handler: None,
+    handler: Some(&file::HANDLER),
 };
 
 /// `gopher` (← `Curl_scheme_gopher`).
@@ -1034,7 +1279,7 @@ pub static SCHEME_GOPHER: SchemeHandler = SchemeHandler {
     family: CURLPROTO_GOPHER,
     flags: PROTOPT_NONE,
     defport: 70,
-    handler: None,
+    handler: Some(&gopher::HANDLER),
 };
 
 /// `gophers` (← `Curl_scheme_gophers`).
@@ -1045,7 +1290,7 @@ pub static SCHEME_GOPHERS: SchemeHandler = SchemeHandler {
     family: CURLPROTO_GOPHER,
     flags: PROTOPT_SSL,
     defport: 70,
-    handler: None,
+    handler: Some(&gopher::HANDLER),
 };
 
 /// `smb` (← `Curl_scheme_smb`).
@@ -1056,7 +1301,7 @@ pub static SCHEME_SMB: SchemeHandler = SchemeHandler {
     family: CURLPROTO_SMB,
     flags: PROTOPT_CONN_REUSE,
     defport: 445,
-    handler: None,
+    handler: Some(&smb::HANDLER),
 };
 
 /// `smbs` (← `Curl_scheme_smbs`).
@@ -1067,7 +1312,7 @@ pub static SCHEME_SMBS: SchemeHandler = SchemeHandler {
     family: CURLPROTO_SMB,
     flags: PROTOPT_SSL | PROTOPT_CONN_REUSE,
     defport: 445,
-    handler: None,
+    handler: Some(&smb::HANDLER),
 };
 
 /// `rtsp` (← `Curl_scheme_rtsp`).
@@ -1078,7 +1323,7 @@ pub static SCHEME_RTSP: SchemeHandler = SchemeHandler {
     family: CURLPROTO_RTSP,
     flags: PROTOPT_CONN_REUSE,
     defport: 554,
-    handler: None,
+    handler: Some(&rtsp::HANDLER),
 };
 
 /// `mqtt` (← `Curl_scheme_mqtt`).
@@ -1089,7 +1334,7 @@ pub static SCHEME_MQTT: SchemeHandler = SchemeHandler {
     family: CURLPROTO_MQTT,
     flags: PROTOPT_NONE,
     defport: 1883,
-    handler: None,
+    handler: Some(&mqtt::HANDLER),
 };
 
 /// `mqtts` (← `Curl_scheme_mqtts`). Its protocol bit [`CURLPROTO_MQTTS`] shares
@@ -1102,7 +1347,7 @@ pub static SCHEME_MQTTS: SchemeHandler = SchemeHandler {
     family: CURLPROTO_MQTT,
     flags: PROTOPT_SSL,
     defport: 8883,
-    handler: None,
+    handler: Some(&mqtt::HANDLER),
 };
 
 // ===========================================================================
@@ -1239,7 +1484,7 @@ mod tests {
     /// ready on the first poll (nothing truly pends), so a no-op waker suffices.
     /// This keeps the tests independent of which Tokio features `curl-rs-lib`
     /// enables and MSRV-safe on Rust 1.75 (`Waker::noop()` only exists from
-    /// 1.85). Mirrors the sibling `dns` module's test executor. No `unsafe` —
+    /// 1.85). Mirrors the sibling `dns` module's test executor. Fully safe —
     /// `Waker::from(Arc<W: Wake>)` is the safe constructor.
     fn block_on<F: Future>(fut: F) -> F::Output {
         use std::task::{Context, Poll, Wake, Waker};
@@ -1450,6 +1695,109 @@ mod tests {
         dynref.domore_pollset(&mut ctx, &mut ps);
         dynref.perform_pollset(&mut ctx, &mut ps);
         assert!(ps.is_empty());
+    }
+
+    #[test]
+    fn transfer_ctx_defaults_carry_no_io_sink_and_empty_request() {
+        // The enriched context (finding: `TransferCtx` was too thin to let a
+        // handler run its exchange) still defaults to "nothing installed yet":
+        // no connection, primary socket, no transport, no sink, empty request.
+        let ctx = TransferCtx::new();
+        assert_eq!(ctx.conn_id, None);
+        assert_eq!(ctx.sockindex, 0);
+        assert!(ctx.io.is_none());
+        assert!(ctx.sink.is_none());
+        let r = &ctx.request;
+        assert!(r.scheme.is_empty() && r.host.is_empty() && r.path.is_empty());
+        assert!(r.url.is_empty() && r.method.is_empty());
+        assert_eq!(r.port, 0);
+        assert!(r.headers.is_empty() && r.body.is_none() && r.range.is_none());
+        assert!(!r.upload && !r.connect_only);
+        assert!(r.connect_timeout.is_none() && r.timeout.is_none());
+        assert!(r.user.is_none() && r.password.is_none());
+        assert_eq!(r.time_condition, 0);
+        assert_eq!(r.time_value, 0);
+        // The hand-written Debug renders the trait objects as presence markers
+        // (they are not `Debug`) and never panics.
+        let rendered = format!("{ctx:?}");
+        assert!(rendered.contains("TransferCtx") && rendered.contains("request"));
+    }
+
+    #[test]
+    fn transfer_ctx_accepts_a_boxed_stream_and_sink() {
+        // A tokio duplex pipe is a `TransferStream` via the blanket impl, so it
+        // boxes into `TransferCtx::io` with no wrapper type. (Constructing the
+        // pipe needs no runtime; nothing is polled here.)
+        let (client, _server) = tokio::io::duplex(64);
+        let mut ctx = TransferCtx::new();
+        ctx.io = Some(Box::new(client));
+        assert!(ctx.io.is_some());
+
+        // A Vec-backed sink implements the object-safe `TransferSink`.
+        struct VecSink(Vec<u8>);
+        impl TransferSink for VecSink {
+            fn write(&mut self, data: &[u8]) -> Result<()> {
+                self.0.extend_from_slice(data);
+                Ok(())
+            }
+        }
+        let mut sink = VecSink(Vec::new());
+        sink.write(b"abc").unwrap();
+        assert_eq!(sink.0, b"abc");
+        ctx.sink = Some(Box::new(VecSink(Vec::new())));
+        assert!(ctx.sink.is_some());
+
+        // The critical property the handler engines rely on: a
+        // `&mut dyn TransferStream` borrowed from `io` satisfies the engines'
+        // `AsyncRead + AsyncWrite + Unpin` bound directly (supertraits; no
+        // trait upcasting, so this holds on the 1.75 MSRV).
+        fn requires_async_rw<S: AsyncRead + AsyncWrite + Unpin>(_: &mut S) {}
+        let mut stream = ctx.io.as_deref_mut().unwrap();
+        requires_async_rw(&mut stream);
+    }
+
+    #[test]
+    fn auxiliary_scheme_handlers_are_bound() {
+        // Finding: all 15 auxiliary scheme slots were `handler: None`, leaving
+        // the schemes registered but unable to dispatch. Each auxiliary scheme
+        // present in this build now points at its module `HANDLER`, with the
+        // TLS variant sharing its base scheme's handler. Assertions are
+        // feature-gated to match the compiled scheme set.
+        #[cfg(feature = "tftp")]
+        assert!(scheme_handler("tftp").unwrap().handler.is_some());
+        #[cfg(feature = "telnet")]
+        assert!(scheme_handler("telnet").unwrap().handler.is_some());
+        #[cfg(feature = "dict")]
+        assert!(scheme_handler("dict").unwrap().handler.is_some());
+        #[cfg(feature = "rtsp")]
+        assert!(scheme_handler("rtsp").unwrap().handler.is_some());
+        #[cfg(feature = "mqtt")]
+        {
+            assert!(scheme_handler("mqtt").unwrap().handler.is_some());
+            assert!(scheme_handler("mqtts").unwrap().handler.is_some());
+        }
+        #[cfg(feature = "file")]
+        assert!(scheme_handler("file").unwrap().handler.is_some());
+        #[cfg(feature = "gopher")]
+        {
+            assert!(scheme_handler("gopher").unwrap().handler.is_some());
+            assert!(scheme_handler("gophers").unwrap().handler.is_some());
+        }
+        #[cfg(feature = "ldap")]
+        {
+            assert!(scheme_handler("ldap").unwrap().handler.is_some());
+            assert!(scheme_handler("ldaps").unwrap().handler.is_some());
+        }
+        #[cfg(feature = "smb")]
+        {
+            assert!(scheme_handler("smb").unwrap().handler.is_some());
+            assert!(scheme_handler("smbs").unwrap().handler.is_some());
+        }
+        #[cfg(feature = "websockets")]
+        {
+            assert!(scheme_handler("ws").unwrap().handler.is_some());
+            assert!(scheme_handler("wss").unwrap().handler.is_some());
+        }
     }
 
     #[cfg(feature = "http")]

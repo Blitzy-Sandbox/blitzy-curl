@@ -1182,6 +1182,12 @@ impl ConnCache {
 #[derive(Debug, Clone, Default)]
 pub struct Shared {
     /// The shared cookie jar, independently locked (`CURL_LOCK_DATA_COOKIE`).
+    ///
+    /// Compiled only when the `cookies` feature is enabled, mirroring curl's
+    /// `#ifndef CURL_DISABLE_COOKIES` guard around `struct CookieInfo *cookies`
+    /// in `lib/urldata.h`; a cookie-less build omits the field entirely (the
+    /// derived `Default`/`Clone`/`Debug` impls follow automatically).
+    #[cfg(feature = "cookies")]
     pub cookies: Arc<Mutex<crate::cookie::CookieJar>>,
     /// The shared DNS cache, independently locked (`CURL_LOCK_DATA_DNS`).
     pub dns: Arc<Mutex<DnsCache>>,
@@ -1206,6 +1212,7 @@ impl Shared {
     #[must_use]
     pub fn new(max_conns: usize) -> Self {
         Shared {
+            #[cfg(feature = "cookies")]
             cookies: Arc::new(Mutex::new(crate::cookie::CookieJar::default())),
             dns: Arc::new(Mutex::new(DnsCache::default())),
             conns: Arc::new(Mutex::new(ConnCache::new(max_conns))),

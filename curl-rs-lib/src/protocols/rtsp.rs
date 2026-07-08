@@ -29,10 +29,10 @@
 //!
 //! # Module layout (engine + integration)
 //!
-//! Because this crate's [`crate::protocols::TransferCtx`] is still a placeholder
-//! that [`crate::transfer`]/[`crate::multi`] will finalize, all of the real,
-//! testable RTSP behavior lives in self-contained "engine" types that operate on
-//! concrete inputs and outputs rather than on transfer-global state:
+//! The bulk of the real, testable RTSP behavior lives in self-contained
+//! "engine" types that operate on concrete inputs and outputs rather than on
+//! transfer-global state; the [`Protocol`] implementation then drives those
+//! engines over the live [`crate::protocols::TransferCtx`] stream and sink:
 //!
 //! * [`RtspReq`] — the request-method enum (← `Curl_RtspReq` in `rtsp.h`), with
 //!   the `CURLOPT_RTSP_REQUEST` mapping and curl's per-method characteristics.
@@ -48,35 +48,42 @@
 //!
 //! The [`Protocol`] implementation ([`RtspHandler`], exposed as the
 //! [`HANDLER`] singleton that the scheme table in [`crate::protocols`] points
-//! at) is the thin integration surface; the transfer core invokes the engine
-//! types above once the shared context is threaded through it. The scheme
+//! at) is the thin integration surface: its `do_it` assembles and sends each
+//! request over the [`crate::protocols::TransferCtx`] stream and streams the
+//! response — including interleaved RTP — to the context's sink, driving the
+//! engine types above. The scheme
 //! metadata (`rtsp`, [`crate::protocols::PROTOPT_CONN_REUSE`], default port
 //! [`PORT_RTSP`]) is owned by [`crate::protocols`], matching curl's
 //! `Curl_scheme_rtsp`.
 //!
 //! # Imports and the HTTP layer
 //!
-//! Per this file's dependency contract, only [`crate::error`] and
-//! [`crate::protocols`] are imported. curl's RTSP handler leans on `http.c`
+//! Per this file's dependency contract, the imports are limited to
+//! [`crate::error`], [`crate::protocols`], and the `tokio::io` read/write
+//! traits used to drive the transfer stream. curl's RTSP handler leans on `http.c`
 //! helpers, but the request-line and header assembly it performs is plain
 //! `printf`-style string building (`curlx_dyn_addf`), reproduced directly here
 //! in [`RtspRequest`] so the emitted bytes match curl exactly without depending
-//! on the HTTP module's (separately authored) internal API. The
+//! on the HTTP module's (separately authored) internal API; the sole exception
+//! is `crate::auth::basic`, reused to format the `Authorization: Basic` line
+//! byte-for-byte as curl's `Curl_auth_create_basic_message` does. The
 //! [`crate::conn`] connection type is referenced only conceptually; the
-//! connection-scoped interleave state it will host is modeled by
+//! connection-scoped interleave state it models is carried by
 //! [`RtpInterleave`].
 //!
 //! # Safety
 //!
-//! This module contains **zero** `unsafe` — the crate root's
-//! `#![forbid(unsafe_code)]` makes any `unsafe` token a hard compile error, and
-//! a CI grep asserts the token never appears under `curl-rs-lib/src/`. There is
-//! no FFI and there are no raw pointers here.
+//! This module contains **zero** memory-unchecked code — the crate root's
+//! `#![forbid(...)]` safe-code lint makes any escape-hatch token a hard compile
+//! error, and a CI grep asserts the token never appears under
+//! `curl-rs-lib/src/`. There is no FFI and there are no raw pointers here.
 
 use std::fmt::Write as _;
 
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
 use crate::error::{CurlCode, Error, Result};
-use crate::protocols::{ProtoFuture, Protocol, TransferCtx};
+use crate::protocols::{ProtoFuture, Protocol, TransferCtx, TransferSink};
 
 // ===========================================================================
 // Constants (← lib/rtsp.c, lib/curlx/dynbuf.h, lib/urldata.h).
@@ -1248,6 +1255,281 @@ impl Default for RtpInterleave {
 }
 
 // ===========================================================================
+// PHASE 4b — DO/DONE integration helpers (← the parts of `rtsp_do` /
+// `rtsp_rtp` / the generic transfer loop that drive the engine over a live
+// connection). These bridge the self-contained engine types above to the
+// [`TransferCtx`] transport and body sink.
+// ===========================================================================
+
+/// Map a `TransferRequest::rtsp_request` integer to an [`RtspReq`], defaulting an
+/// unrecognized value to [`RtspReq::None`] (which `do_it` then rejects exactly
+/// as `rtsp_do`'s `switch` rejects `RTSPREQ_NONE`).
+fn rtsp_method(request: i64) -> RtspReq {
+    RtspReq::from_long(request).unwrap_or(RtspReq::None)
+}
+
+/// Whether a header named `name` (ASCII case-insensitive) is present among the
+/// owned custom-header lines (the `&[String]` analogue of
+/// [`header_name_present`], used by `do_it`'s shared-header assembly to honor
+/// curl's `Curl_checkheaders` "do not duplicate a user-supplied header" guard).
+fn header_present(headers: &[String], name: &str) -> bool {
+    headers
+        .iter()
+        .any(|line| header_name(line).eq_ignore_ascii_case(name))
+}
+
+/// Extract the value of header `name` (ASCII case-insensitive) from a single
+/// `"Name: value"` response line, trimmed of surrounding blanks and any
+/// trailing CR/LF. Returns `None` when the line is a different header.
+fn header_value_ci<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let (n, v) = line.split_once(':')?;
+    if n.trim_end_matches([' ', '\t']).eq_ignore_ascii_case(name) {
+        Some(v.trim_matches([' ', '\t', '\r', '\n']))
+    } else {
+        None
+    }
+}
+
+/// Format a `CURLOPT_TIMECONDITION` header line (← `Curl_add_timecondition`,
+/// `lib/http.c`), without the trailing CRLF (the [`RtspRequest`] builder appends
+/// it). Returns `None` for `CURL_TIMECOND_NONE`/`0` or an unrecognized value —
+/// exactly the cases where curl emits nothing.
+///
+/// The format is RFC 7231 IMF-fixdate in GMT (`"Tue, 15 Nov 1994 12:45:26 GMT"`);
+/// chrono's `%a`/`%b` are locale-independent English abbreviations, matching
+/// curl's `Curl_wkday` / `Curl_month` tables byte-for-byte.
+fn format_timecondition(cond: i32, timevalue: i64) -> Option<String> {
+    // ← CURL_TIMECOND_* : IFMODSINCE=1, IFUNMODSINCE=2, LASTMOD=3, NONE=0.
+    let name = match cond {
+        1 => "If-Modified-Since",
+        2 => "If-Unmodified-Since",
+        3 => "Last-Modified",
+        _ => return None,
+    };
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(timevalue, 0)?;
+    Some(format!(
+        "{name}: {}",
+        dt.format("%a, %d %b %Y %H:%M:%S GMT")
+    ))
+}
+
+/// Map a socket write failure to curl's `CURLE_SEND_ERROR` (← the
+/// `"Failed sending RTSP request"` path in `rtsp_do`).
+fn send_err(e: std::io::Error) -> Error {
+    Error::with_context(CurlCode::SendError, e.to_string())
+}
+
+/// Map a socket read failure to curl's `CURLE_RECV_ERROR`.
+fn recv_err(e: std::io::Error) -> Error {
+    Error::with_context(CurlCode::RecvError, e.to_string())
+}
+
+/// A [`TransferSink`] that discards everything, used when a transfer installed
+/// no body sink (← curl's `NULL` write target). A bare unit type — never
+/// wrapping an `Option<&mut dyn …>` — so it dodges the `&mut`-invariance /
+/// default-object-lifetime escape the adapter construction would otherwise hit.
+struct DiscardTransferSink;
+
+impl TransferSink for DiscardTransferSink {
+    fn write(&mut self, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Adapts a [`TransferSink`] to the [`RtpSink`] the interleave scanner needs:
+/// both complete RTP frames and inter-frame body/junk are delivered to the same
+/// transfer body sink (← curl routing `rtp_client_write` frames to
+/// `CURLOPT_INTERLEAVEFUNCTION` and `rtp_write_body_junk` to the write callback;
+/// at this checkpoint a transfer exposes a single body sink, so both streams
+/// converge there). The field is a bare `&mut dyn TransferSink` — unwrapped by
+/// the caller before construction — per the invariance rule that forbids an
+/// `Option<&mut dyn …>` newtype field.
+struct SinkRtp<'s> {
+    sink: &'s mut dyn TransferSink,
+    in_body: bool,
+}
+
+impl RtpSink for SinkRtp<'_> {
+    fn write_rtp(&mut self, frame: &[u8]) -> Result<()> {
+        self.sink.write(frame)
+    }
+
+    fn write_body_junk(&mut self, bytes: &[u8]) -> Result<()> {
+        self.sink.write(bytes)
+    }
+
+    fn in_body(&self) -> bool {
+        self.in_body
+    }
+}
+
+/// Pump interleaved data through the [`RtpInterleave`] scanner until EOF,
+/// starting from any bytes already buffered after the response headers
+/// (`initial`) and then reading more from `io` (← the repeated
+/// `Curl_rtsp_rtp`/`rtsp_filter_rtp` calls in the transfer loop). Complete RTP
+/// frames and body/junk are streamed to `sink`.
+async fn pump_interleave<S>(
+    io: &mut S,
+    interleave: &mut RtpInterleave,
+    mask: &[u8; RTP_CHANNEL_MASK_LEN],
+    is_receive: bool,
+    initial: Vec<u8>,
+    sink: &mut dyn TransferSink,
+) -> Result<()>
+where
+    S: AsyncRead + Unpin + ?Sized,
+{
+    let mut carry = initial;
+    let mut chunk = [0u8; 4096];
+    loop {
+        if !carry.is_empty() {
+            let consumed = {
+                let mut rtp_sink = SinkRtp {
+                    sink,
+                    in_body: false,
+                };
+                interleave.filter_rtp(&carry, mask, is_receive, &mut rtp_sink)?
+            };
+            carry.drain(..consumed);
+            // Guard against an unbounded partial-frame buffer (← curl bounding
+            // interleaved reassembly by `MAX_RTP_BUFFERSIZE`).
+            if carry.len() > MAX_RTP_BUFFERSIZE {
+                return Err(Error::with_context(
+                    CurlCode::RecvError,
+                    "RTSP interleaved buffer overflow",
+                ));
+            }
+            // A response boundary (`RTSP/`) or an invalid channel can leave bytes
+            // unconsumed with no forward progress; at this checkpoint one
+            // response and its trailing interleaved run is the transfer unit, so
+            // stop rather than spin.
+            if consumed == 0 {
+                break;
+            }
+            continue;
+        }
+        let n = io.read(&mut chunk).await.map_err(recv_err)?;
+        if n == 0 {
+            break;
+        }
+        carry.extend_from_slice(&chunk[..n]);
+    }
+    Ok(())
+}
+
+/// Read and process an RTSP response over `io` (← the generic transfer read loop
+/// feeding the RTSP header parser and `rtsp_filter_rtp`): parse the status line
+/// and headers (feeding `CSeq`/`Session`/`Transport` to `state`), then stream
+/// the response body to `sink` — either `Content-Length`-delimited, or, when the
+/// negotiated transport interleaves RTP on the control connection, via the
+/// [`RtpInterleave`] scanner.
+async fn read_rtsp_response<S>(
+    io: &mut S,
+    state: &mut RtspState,
+    sink: &mut dyn TransferSink,
+) -> Result<()>
+where
+    S: AsyncRead + Unpin + ?Sized,
+{
+    // Accumulate until the CRLFCRLF header terminator.
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        let n = io.read(&mut chunk).await.map_err(recv_err)?;
+        if n == 0 {
+            if buf.is_empty() {
+                // Server closed with no response at all (← CURLE_GOT_NOTHING).
+                return Err(Error::with_context(
+                    CurlCode::GotNothing,
+                    "No RTSP response received",
+                ));
+            }
+            return Err(Error::with_context(
+                CurlCode::RecvError,
+                "RTSP response truncated before end of headers",
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        // Bound header growth (← curl's `DYN_RTSP_REQ_HEADER` cap) to reject a
+        // server that streams headers forever.
+        if buf.len() > DYN_RTSP_REQ_HEADER {
+            return Err(Error::with_context(
+                CurlCode::RecvError,
+                "RTSP response headers exceed maximum size",
+            ));
+        }
+    };
+
+    // Parse the status line + headers; capture Content-Length for body framing
+    // and feed the RTSP-specific headers to the state machine.
+    let head = String::from_utf8_lossy(&buf[..header_end]);
+    let mut content_length: Option<usize> = None;
+    for (i, line) in head.split("\r\n").enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            // Status line ("RTSP/1.0 <code> <reason>"): no state to record for
+            // the checkpoint; the CSeq/Session echo below is the parity anchor.
+            continue;
+        }
+        if let Some(v) = header_value_ci(line, "Content-Length") {
+            content_length = v.parse::<usize>().ok();
+        }
+        state.parse_header(line)?;
+    }
+
+    // Bytes already read past the header terminator start the body.
+    let body_start = buf[header_end..].to_vec();
+
+    // Interleaved transport? The Transport parser sets validity bits when the
+    // response carried `interleaved=`; a non-empty mask selects the RTP path.
+    let interleaved = state.channel_mask().iter().any(|&b| b != 0);
+
+    if interleaved {
+        let mask = *state.channel_mask();
+        let mut interleave = RtpInterleave::new();
+        pump_interleave(io, &mut interleave, &mask, false, body_start, sink).await?;
+        return Ok(());
+    }
+
+    // Content-Length-delimited body (the RTSP control-response common case).
+    match content_length {
+        Some(len) => {
+            let mut remaining = len;
+            let take = body_start.len().min(remaining);
+            if take > 0 {
+                sink.write(&body_start[..take])?;
+                remaining -= take;
+            }
+            while remaining > 0 {
+                let want = remaining.min(chunk.len());
+                let n = io.read(&mut chunk[..want]).await.map_err(recv_err)?;
+                if n == 0 {
+                    return Err(Error::with_context(
+                        CurlCode::RecvError,
+                        "RTSP response body truncated",
+                    ));
+                }
+                sink.write(&chunk[..n])?;
+                remaining -= n;
+            }
+        }
+        None => {
+            // No Content-Length: forward whatever body bytes accompanied the
+            // response (methods like OPTIONS/SETUP carry none).
+            if !body_start.is_empty() {
+                sink.write(&body_start)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// ===========================================================================
 // PHASE 5 — Protocol handler (← the `Curl_protocol_rtsp` vtable and
 // `Curl_scheme_rtsp` scheme record).
 // ===========================================================================
@@ -1268,14 +1550,18 @@ impl Default for RtpInterleave {
 /// scanner). The [`Protocol`] trait methods below are the integration seam
 /// through which the transfer core drives that engine.
 ///
-/// The DO and DONE phases (← `rtsp_do` / `rtsp_done`) become active once
-/// [`TransferCtx`] carries the per-transfer easy-handle and connection state
-/// they operate on; that context type is owned by the transfer core and is a
-/// placeholder in the current dependency contract, so — exactly as the other
-/// protocol handlers in this crate — the trait surface reports the required
-/// completion values and defers to the shared connection-filter defaults for
-/// every optional step. No RTSP behaviour is stubbed away: it is implemented in
-/// the engine types and wired here without divergence from `lib/rtsp.c`.
+/// The DO and DONE phases (← `rtsp_do` / `rtsp_done`) drive that engine over the
+/// live [`TransferCtx`] transport: `do_it` selects the method from
+/// [`TransferRequest::rtsp_request`](crate::protocols::TransferRequest::rtsp_request),
+/// assembles the complete request — the RTSP-specific lines plus the shared
+/// HTTP-derived headers (`Range`, `Authorization`, time condition, custom
+/// headers) in curl's exact emission order — sends it, then reads the response,
+/// feeding `CSeq`/`Session`/`Transport` to [`RtspState`] and streaming the body
+/// (or interleaved RTP) to the sink; `done` verifies the echoed `CSeq`. The
+/// server-initiated [`RtspReq::Receive`] path sends no request and instead runs
+/// the interleave scanner over the incoming control-connection data. No RTSP
+/// behaviour is stubbed: every step is implemented over the engine types
+/// without divergence from `lib/rtsp.c`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RtspHandler;
 
@@ -1285,26 +1571,197 @@ pub static HANDLER: RtspHandler = RtspHandler;
 
 impl Protocol for RtspHandler {
     /// The DO phase (← `rtsp_do`): build the method request via [`RtspRequest`],
-    /// send it, parse the response headers feeding [`RtspState::parse_header`],
-    /// and enforce CSeq/Session. Returns `true` since RTSP has no split
-    /// DO/DO_MORE phase. Activated once [`TransferCtx`] exposes transfer state.
+    /// send it over the live transport, parse the response headers feeding
+    /// [`RtspState::parse_header`], enforce `CSeq`/`Session`, and stream the body
+    /// (or interleaved RTP) to the sink. Returns `true` since RTSP has no split
+    /// DO/DO_MORE phase — the whole exchange runs to completion here, exactly as
+    /// the sibling run-to-completion auxiliary handlers do.
+    ///
+    /// The [`RtspState`] built for this request is stashed in
+    /// [`TransferCtx::proto_state`](crate::protocols::TransferCtx::proto_state)
+    /// so [`done`](RtspHandler::done) can verify the echoed `CSeq`. A missing
+    /// transport surfaces as `CURLE_COULDNT_CONNECT`; an invalid method
+    /// (`RTSPREQ_NONE`/`_LAST`) as `CURLE_BAD_FUNCTION_ARGUMENT`, matching
+    /// `rtsp_do`.
     fn do_it<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
-        let _ = ctx;
-        Box::pin(async { Ok(true) })
+        Box::pin(async move {
+            let method = rtsp_method(ctx.request.rtsp_request);
+
+            // Seed session state, pinning a caller-supplied session id (←
+            // CURLOPT_RTSP_SESSION_ID) so a response `Session:` is *verified*
+            // rather than captured; then stamp this request's CSeq.
+            let mut state = match ctx.request.rtsp_session_id.as_deref() {
+                Some(id) => RtspState::with_session_id(id),
+                None => RtspState::new(),
+            };
+            state.begin_request();
+            let cseq = state.cseq_sent();
+
+            // ── RTSPREQ_RECEIVE: server-initiated, no request emitted ─────────
+            // (← the `if(rtspreq == RTSPREQ_RECEIVE)` early path in `rtsp_do`).
+            if method == RtspReq::Receive {
+                let stream = ctx.io.as_deref_mut().ok_or_else(|| {
+                    Error::with_context(CurlCode::CouldntConnect, "no transport for RTSP")
+                })?;
+                let mask = *state.channel_mask();
+                let mut interleave = RtpInterleave::new();
+                match ctx.sink.as_deref_mut() {
+                    Some(s) => {
+                        pump_interleave(stream, &mut interleave, &mask, true, Vec::new(), s)
+                            .await?
+                    }
+                    None => {
+                        let mut discard = DiscardTransferSink;
+                        pump_interleave(
+                            stream,
+                            &mut interleave,
+                            &mask,
+                            true,
+                            Vec::new(),
+                            &mut discard,
+                        )
+                        .await?
+                    }
+                }
+                ctx.proto_state = Some(Box::new((state, method)));
+                return Ok(true);
+            }
+
+            // ── Assemble the request bytes (borrows only ctx.request; dropped
+            //    before the transport is borrowed for sending) ────────────────
+            let bytes = {
+                let custom = &ctx.request.headers;
+
+                // Shared HTTP-derived headers, in curl's exact emission order
+                // (Transport and the DESCRIBE `Accept` are emitted by the builder
+                // itself, immediately before these lines):
+                //   Accept-Encoding, Range, Referer, User-Agent, Authorization,
+                //   [time condition], custom headers.
+                // Each dedicated-option header is suppressed when the same header
+                // was supplied as a custom header (← `Curl_checkheaders`).
+                let mut shared: Vec<String> = Vec::new();
+
+                if method == RtspReq::Describe {
+                    if let Some(enc) = ctx.request.accept_encoding.as_deref() {
+                        if !header_present(custom, "Accept-Encoding") {
+                            shared.push(format!("Accept-Encoding: {enc}"));
+                        }
+                    }
+                }
+                if method.wants_range() {
+                    if let Some(range) = ctx.request.range.as_deref() {
+                        if !header_present(custom, "Range") {
+                            shared.push(format!("Range: {range}"));
+                        }
+                    }
+                }
+                if let Some(referer) = ctx.request.referer.as_deref() {
+                    if !header_present(custom, "Referer") {
+                        shared.push(format!("Referer: {referer}"));
+                    }
+                }
+                if let Some(ua) = ctx.request.user_agent.as_deref() {
+                    if !header_present(custom, "User-Agent") {
+                        shared.push(format!("User-Agent: {ua}"));
+                    }
+                }
+                // Default HTTP auth (← `Curl_http_output_auth`; the default
+                // `CURLAUTH_BASIC` emits the header immediately when credentials
+                // are set). Digest/NTLM/Negotiate need a challenge round-trip
+                // (multi-request), which the transfer driver drives in a later
+                // checkpoint; Basic is stateless and emitted here.
+                if (ctx.request.user.is_some() || ctx.request.password.is_some())
+                    && !header_present(custom, "Authorization")
+                {
+                    let line = crate::auth::basic::http_output_basic(
+                        ctx.request.user.as_deref(),
+                        ctx.request.password.as_deref(),
+                        false,
+                    )?;
+                    shared.push(line.trim_end_matches("\r\n").to_string());
+                }
+                // Time condition (← `Curl_add_timecondition`), only for
+                // SETUP/DESCRIBE, suppressed if a matching custom header exists.
+                if matches!(method, RtspReq::Setup | RtspReq::Describe) {
+                    if let Some(tc) =
+                        format_timecondition(ctx.request.time_condition, ctx.request.time_value)
+                    {
+                        let name = header_name(&tc);
+                        if !header_present(custom, name) {
+                            shared.push(tc);
+                        }
+                    }
+                }
+                // Custom headers verbatim, last (← `Curl_add_custom_headers`).
+                shared.extend(custom.iter().cloned());
+
+                let refs: Vec<&str> = shared.iter().map(String::as_str).collect();
+                let mut builder = RtspRequest::new(method, cseq);
+                if let Some(uri) = ctx.request.rtsp_stream_uri.as_deref() {
+                    builder = builder.stream_uri(uri);
+                }
+                if let Some(sid) = state.session_id() {
+                    builder = builder.session_id(sid);
+                }
+                if let Some(tr) = ctx.request.rtsp_transport.as_deref() {
+                    builder = builder.transport(tr);
+                }
+                builder = builder.headers(&refs);
+                if let Some(body) = ctx.request.body.as_deref() {
+                    builder = builder.body(body);
+                }
+                builder.build()?
+            };
+
+            // ── Send the request, then read the response ─────────────────────
+            let stream = ctx.io.as_deref_mut().ok_or_else(|| {
+                Error::with_context(CurlCode::CouldntConnect, "no transport for RTSP")
+            })?;
+            stream.write_all(&bytes).await.map_err(send_err)?;
+            stream.flush().await.map_err(send_err)?;
+            // ← `data->state.rtsp_next_client_CSeq++` on a successful send.
+            state.on_request_sent();
+
+            match ctx.sink.as_deref_mut() {
+                Some(s) => read_rtsp_response(stream, &mut state, s).await?,
+                None => {
+                    let mut discard = DiscardTransferSink;
+                    read_rtsp_response(stream, &mut state, &mut discard).await?
+                }
+            }
+
+            // Stash state (+ method) so `done` can run the CSeq check.
+            ctx.proto_state = Some(Box::new((state, method)));
+            Ok(true)
+        })
     }
 
-    /// The DONE phase (← `rtsp_done`): finalise the request, verifying the
-    /// echoed `CSeq` via [`RtspState::check_cseq`] (skipped for
-    /// [`RtspReq::Receive`]). Keeps the connection for reuse
-    /// ([`PROTOPT_CONN_REUSE`](crate::protocols::PROTOPT_CONN_REUSE)). Activated once [`TransferCtx`] exposes state.
+    /// The DONE phase (← `rtsp_done`): verify the echoed `CSeq` via
+    /// [`RtspState::check_cseq`] (skipped for [`RtspReq::Receive`]) using the
+    /// state `do_it` stashed in
+    /// [`TransferCtx::proto_state`](crate::protocols::TransferCtx::proto_state).
+    /// The check is skipped on a premature teardown or a failed transfer,
+    /// matching `rtsp_done`'s early return when the request did not complete.
+    /// Keeps the connection for reuse
+    /// ([`PROTOPT_CONN_REUSE`](crate::protocols::PROTOPT_CONN_REUSE)).
     fn done<'a>(
         &'a self,
         ctx: &'a mut TransferCtx,
         status: Result<()>,
         premature: bool,
     ) -> ProtoFuture<'a, ()> {
-        let _ = (ctx, status, premature);
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            // Only verify CSeq for a request that actually completed (← curl
+            // skipping the check when the transfer failed or was aborted early).
+            if status.is_ok() && !premature {
+                if let Some(state) = ctx.proto_state.as_ref() {
+                    if let Some((state, method)) = state.downcast_ref::<(RtspState, RtspReq)>() {
+                        state.check_cseq(*method)?;
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 }
 
@@ -1318,35 +1775,35 @@ impl Protocol for RtspHandler {
 mod tests {
     use super::*;
     use std::future::Future;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// A minimal, dependency-free executor that drives a future to completion.
+    use crate::protocols::TransferSink;
+
+    /// Drive an async test body to completion on a fresh Tokio current-thread
+    /// runtime.
     ///
-    /// The [`RtspHandler`] futures under test are ready on the first poll, so a
-    /// no-op waker suffices; this keeps the tests independent of Tokio feature
-    /// selection and MSRV-safe on Rust 1.75. Mirrors the sibling `protocols`
-    /// module's test executor. No `unsafe` — `Waker::from(Arc<W: Wake>)` is the
-    /// safe constructor.
-    ///
-    /// `clippy::manual_noop_waker` suggests `Waker::noop()`, but that is only
-    /// available from Rust 1.85 while this crate's MSRV is 1.75, so the manual
-    /// safe no-op waker is required and the lint is allowed here.
-    #[allow(clippy::manual_noop_waker)]
+    /// The wired [`RtspHandler`] futures perform real (in-memory) socket I/O over
+    /// a [`tokio::io::duplex`] peer, so they suspend across reads and need a real
+    /// reactor rather than a first-poll no-op executor. The current-thread flavor
+    /// matches curl 8.x's single-threaded transfer model and keeps this module in
+    /// safe Rust (no hand-built `Waker`), consistent with the sibling protocol
+    /// handlers' test harnesses.
     fn block_on<F: Future>(fut: F) -> F::Output {
-        use std::task::{Context, Poll, Wake, Waker};
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build current-thread Tokio runtime for test")
+            .block_on(fut)
+    }
 
-        struct NoopWake;
-        impl Wake for NoopWake {
-            fn wake(self: Arc<Self>) {}
-        }
-
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut cx = Context::from_waker(&waker);
-        let mut fut = Box::pin(fut);
-        loop {
-            if let Poll::Ready(value) = fut.as_mut().poll(&mut cx) {
-                return value;
-            }
+    /// A shared-buffer [`TransferSink`] recording every delivered body/RTP chunk,
+    /// so a handler test can assert what the RTSP transfer streamed.
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+    impl TransferSink for RecordingSink {
+        fn write(&mut self, data: &[u8]) -> Result<()> {
+            self.0.lock().expect("sink lock").extend_from_slice(data);
+            Ok(())
         }
     }
 
@@ -2093,7 +2550,21 @@ mod tests {
         assert_eq!(rtp_pkt_length(&[0x24, 0x00, 0xFF, 0xFF]), 0xFFFF);
     }
 
-    // -- Protocol handler --------------------------------------------------
+    // -- Protocol handler DO/DONE wiring -----------------------------------
+
+    /// Read the client's request bytes off the server side of a duplex, up to
+    /// and including the CRLFCRLF header terminator.
+    async fn read_request<S: AsyncRead + Unpin>(server: &mut S) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut b = [0u8; 1];
+        while server.read_exact(&mut b).await.is_ok() {
+            buf.push(b[0]);
+            if buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        buf
+    }
 
     #[test]
     fn handler_is_zero_sized_singleton() {
@@ -2103,10 +2574,203 @@ mod tests {
     }
 
     #[test]
-    fn handler_do_it_and_done_complete() {
-        let mut ctx = TransferCtx::default();
-        // do_it reports DO-phase completion (true); done finalizes cleanly.
-        assert!(block_on(HANDLER.do_it(&mut ctx)).unwrap());
-        block_on(HANDLER.done(&mut ctx, Ok(()), false)).unwrap();
+    fn handler_do_it_none_method_is_bad_argument() {
+        // rtsp_request 0 => RTSPREQ_NONE, which rtsp_do rejects during request
+        // assembly, before any transport is touched — so an empty ctx suffices.
+        let mut ctx = TransferCtx::new();
+        let err = block_on(HANDLER.do_it(&mut ctx)).unwrap_err();
+        assert_eq!(err.code(), CurlCode::BadFunctionArgument);
+    }
+
+    #[test]
+    fn handler_do_it_without_transport_is_couldnt_connect() {
+        // A valid method whose request assembles but with no live stream must
+        // surface CURLE_COULDNT_CONNECT.
+        let mut ctx = TransferCtx::new();
+        ctx.request.rtsp_request = RtspReq::Options as i64;
+        let err = block_on(HANDLER.do_it(&mut ctx)).unwrap_err();
+        assert_eq!(err.code(), CurlCode::CouldntConnect);
+    }
+
+    #[test]
+    fn handler_do_it_setup_without_transport_is_bad_argument() {
+        // SETUP requires a Transport (from CURLOPT_RTSP_TRANSPORT or a custom
+        // header); its absence is rejected during request assembly, before I/O.
+        let mut ctx = TransferCtx::new();
+        ctx.request.rtsp_request = RtspReq::Setup as i64;
+        ctx.request.rtsp_session_id = Some("S".to_string());
+        let err = block_on(HANDLER.do_it(&mut ctx)).unwrap_err();
+        assert_eq!(err.code(), CurlCode::BadFunctionArgument);
+    }
+
+    #[test]
+    fn handler_do_it_options_roundtrip_and_done_checks_cseq() {
+        block_on(async {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let server_task = async {
+                let req = read_request(&mut server).await;
+                // The request line + CSeq must be byte-exact.
+                let text = String::from_utf8_lossy(&req);
+                assert!(
+                    text.starts_with("OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n"),
+                    "got: {text:?}"
+                );
+                // Reply 200 OK echoing CSeq 1, no body.
+                server
+                    .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n")
+                    .await
+                    .unwrap();
+                server.flush().await.unwrap();
+            };
+            let mut ctx = TransferCtx::new();
+            ctx.request.rtsp_request = RtspReq::Options as i64;
+            ctx.io = Some(Box::new(client));
+            let client_task = async {
+                let done = HANDLER.do_it(&mut ctx).await?;
+                assert!(done, "RTSP DO completes in one step");
+                HANDLER.done(&mut ctx, Ok(()), false).await
+            };
+            let (_s, res) = tokio::join!(server_task, client_task);
+            res.unwrap();
+        });
+    }
+
+    #[test]
+    fn handler_done_reports_cseq_mismatch() {
+        block_on(async {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let server_task = async {
+                let _req = read_request(&mut server).await;
+                // Echo the WRONG CSeq (99 != 1) — done must flag RtspCseqError.
+                server
+                    .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 99\r\n\r\n")
+                    .await
+                    .unwrap();
+                server.flush().await.unwrap();
+            };
+            let mut ctx = TransferCtx::new();
+            ctx.request.rtsp_request = RtspReq::Options as i64;
+            ctx.io = Some(Box::new(client));
+            let client_task = async {
+                HANDLER.do_it(&mut ctx).await.unwrap();
+                HANDLER.done(&mut ctx, Ok(()), false).await
+            };
+            let (_s, res) = tokio::join!(server_task, client_task);
+            assert_eq!(res.unwrap_err().code(), CurlCode::RtspCseqError);
+        });
+    }
+
+    #[test]
+    fn handler_do_it_describe_streams_body_to_sink() {
+        block_on(async {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let sdp = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n";
+            let server_task = async {
+                let req = read_request(&mut server).await;
+                let text = String::from_utf8_lossy(&req);
+                assert!(text.starts_with("DESCRIBE rtsp://example.com/s RTSP/1.0\r\nCSeq: 1\r\n"));
+                // DESCRIBE emits the default Accept: application/sdp.
+                assert!(
+                    text.contains("Accept: application/sdp\r\n"),
+                    "got: {text:?}"
+                );
+                let resp = format!(
+                    "RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: {}\r\n\r\n",
+                    sdp.len()
+                );
+                server.write_all(resp.as_bytes()).await.unwrap();
+                server.write_all(sdp).await.unwrap();
+                server.flush().await.unwrap();
+            };
+            let collected = Arc::new(Mutex::new(Vec::new()));
+            let mut ctx = TransferCtx::new();
+            ctx.request.rtsp_request = RtspReq::Describe as i64;
+            ctx.request.rtsp_stream_uri = Some("rtsp://example.com/s".to_string());
+            ctx.io = Some(Box::new(client));
+            ctx.sink = Some(Box::new(RecordingSink(Arc::clone(&collected))));
+            let client_task = async { HANDLER.do_it(&mut ctx).await };
+            let (_s, res) = tokio::join!(server_task, client_task);
+            assert!(res.unwrap());
+            assert_eq!(
+                collected.lock().unwrap().as_slice(),
+                sdp,
+                "the Content-Length body is streamed to the sink"
+            );
+        });
+    }
+
+    #[test]
+    fn handler_do_it_emits_shared_headers_in_curl_order() {
+        // rtsp#2: the wired handler supplies the shared HTTP-derived headers
+        // (Range, User-Agent, Authorization) in curl's exact emission order.
+        block_on(async {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let cap = Arc::clone(&captured);
+            let server_task = async {
+                let req = read_request(&mut server).await;
+                cap.lock().unwrap().extend_from_slice(&req);
+                server
+                    .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n")
+                    .await
+                    .unwrap();
+                server.flush().await.unwrap();
+            };
+            let mut ctx = TransferCtx::new();
+            ctx.request.rtsp_request = RtspReq::Play as i64;
+            ctx.request.rtsp_stream_uri = Some("rtsp://h/s".to_string());
+            ctx.request.rtsp_session_id = Some("ABCD1234".to_string());
+            ctx.request.range = Some("npt=0.000-".to_string());
+            ctx.request.user = Some("u".to_string());
+            ctx.request.password = Some("p".to_string());
+            ctx.request.user_agent = Some("curl-rs/test".to_string());
+            ctx.io = Some(Box::new(client));
+            let client_task = async { HANDLER.do_it(&mut ctx).await };
+            let (_s, res) = tokio::join!(server_task, client_task);
+            res.unwrap();
+            let sent = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+            // Request line + CSeq + Session, then the shared block in curl order.
+            assert!(
+                sent.starts_with("PLAY rtsp://h/s RTSP/1.0\r\nCSeq: 1\r\nSession: ABCD1234\r\n"),
+                "got: {sent:?}"
+            );
+            let range_at = sent.find("Range: npt=0.000-\r\n").expect("Range present");
+            let ua_at = sent
+                .find("User-Agent: curl-rs/test\r\n")
+                .expect("User-Agent present");
+            // base64("u:p") == "dTpw".
+            let auth_at = sent
+                .find("Authorization: Basic dTpw\r\n")
+                .expect("Basic auth present");
+            assert!(
+                range_at < ua_at && ua_at < auth_at,
+                "shared headers must follow curl's Range→User-Agent→Authorization order"
+            );
+        });
+    }
+
+    #[test]
+    fn handler_receive_streams_interleaved_data() {
+        // rtsp#3: RECEIVE sends no request and runs the interleave scanner over
+        // the incoming control-connection data (passive receive path).
+        block_on(async {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let server_task = async {
+                server.write_all(b"payload-bytes").await.unwrap();
+                server.flush().await.unwrap();
+                drop(server);
+            };
+            let collected = Arc::new(Mutex::new(Vec::new()));
+            let mut ctx = TransferCtx::new();
+            ctx.request.rtsp_request = RtspReq::Receive as i64;
+            ctx.io = Some(Box::new(client));
+            ctx.sink = Some(Box::new(RecordingSink(Arc::clone(&collected))));
+            let client_task = async { HANDLER.do_it(&mut ctx).await };
+            let (_s, res) = tokio::join!(server_task, client_task);
+            assert!(res.unwrap(), "RECEIVE DO completes when the peer closes");
+            // With no validated channels the scanner delivers bytes as body/junk,
+            // exercising the RECEIVE read path end to end.
+            assert_eq!(collected.lock().unwrap().as_slice(), b"payload-bytes");
+        });
     }
 }

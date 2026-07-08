@@ -141,10 +141,21 @@ jobs:
         run: rustup toolchain install stable --profile minimal
       - name: 'Install cargo-audit and cargo-deny'
         run: cargo +stable install --locked cargo-audit cargo-deny
+      # These security-audit tools resolve the FULL dependency graph via `cargo metadata`,
+      # which must parse EVERY locked manifest for EVERY target — including deps that are never
+      # built on the four supported targets (e.g. the wasm-only `wit-bindgen`) yet declare
+      # `edition = "2024"`. The pinned MSRV toolchain (Cargo 1.75, root rust-toolchain.toml)
+      # cannot parse an edition-2024 manifest, so the metadata step aborts BEFORE any policy is
+      # evaluated. Per tech-spec §0.6.4/§0.6.5 the MSRV gate is a *build/check* gate (owned by
+      # the dedicated `msrv` job below, `cargo +1.75 check --workspace`); the security-audit
+      # gate is toolchain-agnostic policy enforcement. Running it under `+stable` (whose Cargo
+      # parses edition-2024 manifests) lets the gate execute while the declared MSRV gate stays
+      # fully intact and independent. `+stable` propagates to cargo-deny's own `cargo metadata`
+      # subprocess via RUSTUP_TOOLCHAIN, overriding the directory-local 1.75 override.
       - name: 'Gate: cargo audit (zero critical CVEs, tech-spec 0.6.4)'
-        run: cargo audit
+        run: cargo +stable audit
       - name: 'Gate: cargo deny check (advisories/licenses/sources/bans)'
-        run: cargo deny check
+        run: cargo +stable deny check
 
   # Gate 9 (tech-spec 0.6.2): the safe core curl-rs-lib MUST contain zero `unsafe`
   # USAGE. Enforcement is two-layered: (1) the crate root declares

@@ -51,18 +51,19 @@
 //!   table in [`crate::protocols`] (the `tftp` scheme, default port 69, flags
 //!   `PROTOPT_NOTCPPROXY | PROTOPT_NOURLQUERY`, transport [`Transport::Udp`]).
 //!
-//! There is **no `unsafe`** anywhere in this file (the crate root applies
-//! `#![forbid(unsafe_code)]`); TFTP needs no TLS and no authentication.
+//! There is **no memory-unchecked code** anywhere in this file (the crate root
+//! applies the `#![forbid(...)]` safe-code lint); TFTP needs no TLS and no
+//! authentication.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use tokio::net::UdpSocket;
+use tokio::net::{lookup_host, UdpSocket};
 use tokio::time::sleep;
 
 use crate::conn::Transport;
 use crate::error::{CurlCode, Error, Result};
-use crate::protocols::{ProtoFuture, Protocol, TransferCtx};
+use crate::protocols::{ProtoFuture, Protocol, TransferCtx, TransferSink};
 
 // ===========================================================================
 // Wire and negotiation constants (← lib/tftp.c, lib/tftp.h).
@@ -386,7 +387,14 @@ fn parse_option_number(value: &[u8], max: u64) -> Option<u64> {
 /// Implementors fill `buf` with up to `buf.len()` bytes and report how many
 /// were produced plus whether the source is now exhausted (`eof`). A return of
 /// `Ok((0, true))` marks a clean end of input.
-pub trait TftpSource {
+///
+/// The `Send` bound mirrors [`crate::protocols::TransferSink`]: TFTP's
+/// [`run`](TftpConn::run) is driven from an async protocol future that is
+/// `Send` (the multi handle uses a multi-threaded runtime), so the source it
+/// borrows across `await` points must be `Send` too. Every impl in the
+/// workspace (`&[u8]`, and the handler's body-slice source) already satisfies
+/// this.
+pub trait TftpSource: Send {
     /// Read up to `buf.len()` bytes into `buf`.
     ///
     /// Returns `(n, eof)` where `n` is the number of bytes written to the start
@@ -399,7 +407,10 @@ pub trait TftpSource {
 }
 
 /// The download byte sink (← `Curl_client_write` with `CLIENTWRITE_BODY`).
-pub trait TftpSink {
+///
+/// The `Send` bound matches [`TftpSource`] (and [`crate::protocols::TransferSink`]):
+/// the sink is borrowed across the `await` points of the `Send` transfer future.
+pub trait TftpSink: Send {
     /// Write the whole of `buf` to the sink.
     ///
     /// # Errors
@@ -432,9 +443,10 @@ impl TftpSink for Vec<u8> {
 // ===========================================================================
 // TftpParams — the transfer inputs (← the fields curl reads from `Curl_easy`).
 //
-// The engine takes these explicitly rather than reaching through the (still
-// placeholder) `TransferCtx`, mirroring how the sibling `dns` backends receive
-// `host`/`port`/`ip_version` as parameters.
+// The engine takes these explicitly as parameters rather than reaching through
+// the per-transfer `TransferCtx`, mirroring how the sibling `dns` backends
+// receive `host`/`port`/`ip_version` as parameters — this keeps the codec unit
+// testable in isolation while `do_it` reads the inputs from `TransferCtx`.
 // ===========================================================================
 
 /// The inputs that configure a single TFTP transfer.
@@ -1368,6 +1380,114 @@ pub fn parse_mode_suffix(path: &str, default_mode: TftpMode) -> (String, TftpMod
 }
 
 // ===========================================================================
+// URL decoding for the filename (← Curl_urldecode(..., REJECT_ZERO), lib/escape.c,
+// as called by tftp_connect_for_rx / tftp_connect_for_tx).
+// ===========================================================================
+
+/// Map one ASCII hex digit to its value, or `None` if it is not a hex digit
+/// (← the `ISXDIGIT` test in `Curl_urldecode`, `lib/escape.c`).
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// URL-decode a TFTP filename with curl's `REJECT_ZERO` policy
+/// (← `Curl_urldecode(&up.path[1], 0, &filename, NULL, REJECT_ZERO)`, `lib/escape.c`,
+/// invoked by `tftp_connect_for_rx` / `tftp_connect_for_tx`).
+///
+/// Each `%XX` escape (a `%` followed by two hex digits) is decoded to its byte;
+/// a `%` not followed by two hex digits is a literal `%`, exactly as
+/// `Curl_urldecode` treats it. `REJECT_ZERO` rejects **only** a decoded NUL —
+/// unlike DICT's `REJECT_CTRL`, control bytes and `0x7F` pass through. This is
+/// the byte-for-byte equivalent of the C decode loop; `crate::escape::unescape`
+/// offers only `REJECT_CTRL`/`REJECT_NADA`, so — as GOPHER does for the same
+/// `REJECT_ZERO` need — the loop is reimplemented here (TFTP is a default-on
+/// feature and cannot depend on the default-off GOPHER module).
+///
+/// # Errors
+/// Returns [`CurlCode::UrlMalformat`] (via [`Error::url`]) when the decoded data
+/// contains a NUL byte, exactly as `Curl_urldecode` returns `CURLE_URL_MALFORMAT`.
+fn urldecode_reject_zero(input: &[u8]) -> Result<Vec<u8>> {
+    // `length == 0` in Curl_urldecode means "use strlen(string)": decoding runs
+    // only up to the first literal NUL, so truncate there to match curl's `alloc`.
+    let end = input.iter().position(|&b| b == 0).unwrap_or(input.len());
+    let s = &input[..end];
+
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < s.len() {
+        // Decode `%XX` iff a full two-hex-digit escape follows the `%`
+        // (curl: `alloc > 2 && ISXDIGIT(s[1]) && ISXDIGIT(s[2])`). `s.len() - i`
+        // is curl's remaining `alloc` including the current `%`.
+        let decoded = if s[i] == b'%' && (s.len() - i) > 2 {
+            match (hex_val(s[i + 1]), hex_val(s[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    let byte = (hi << 4) | lo;
+                    i += 3;
+                    byte
+                }
+                // A `%` not followed by two hex digits is a literal `%`.
+                _ => {
+                    i += 1;
+                    b'%'
+                }
+            }
+        } else {
+            let byte = s[i];
+            i += 1;
+            byte
+        };
+
+        // REJECT_ZERO: reject only a decoded NUL. (A literal NUL can never reach
+        // here — it was truncated by the `strlen` step above — so in practice
+        // this fires solely on a `%00` escape, matching curl.)
+        if decoded == 0 {
+            return Err(Error::url(
+                "TFTP filename contains a rejected NUL byte (%00)",
+            ));
+        }
+        out.push(decoded);
+    }
+
+    Ok(out)
+}
+
+// ===========================================================================
+// Sink adapters bridging the transfer's client-write sink to the engine's
+// `TftpSink` (← Curl_client_write with CLIENTWRITE_BODY).
+// ===========================================================================
+
+/// Forwards downloaded bytes from [`TftpConn::run`] to the transfer's client
+/// body sink (← `Curl_client_write(data, CLIENTWRITE_BODY, ...)`).
+///
+/// The field is a bare `&mut dyn TransferSink` (not `Option<&mut dyn …>`): the
+/// caller unwraps the `Option<Box<dyn TransferSink>>` *before* constructing the
+/// adapter, so no `&mut`-invariance object-lifetime coercion arises when the
+/// borrow is carried across the `run` await points.
+struct SinkTftpSink<'s>(&'s mut dyn TransferSink);
+
+impl TftpSink for SinkTftpSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> Result<()> {
+        self.0.write(buf)
+    }
+}
+
+/// A [`TftpSink`] that discards every byte, used when the transfer installed no
+/// download sink (← curl writing to a `NULL`/ignored body when no write
+/// destination is configured).
+struct DiscardTftpSink;
+
+impl TftpSink for DiscardTftpSink {
+    fn write(&mut self, _buf: &[u8]) -> Result<()> {
+        Ok(())
+    }
+}
+
+// ===========================================================================
 // TftpHandler — the scheme-dispatch entry point (← the TFTP `Curl_protocol`
 // vtable reached through `Curl_scheme_tftp`).
 // ===========================================================================
@@ -1384,15 +1504,19 @@ pub fn parse_mode_suffix(path: &str, default_mode: TftpMode) -> (String, TftpMod
 /// The protocol logic — the RX/TX state machine, `OACK` option negotiation, the
 /// short-block EOF rule, block-number wraparound, transfer-id pinning, and the
 /// timeout/retransmit clock — lives in [`TftpConn`], which is fully implemented
-/// and unit-tested in this module. The trait methods below are intentionally
-/// thin because the shared [`TransferCtx`] is still the crate-wide placeholder
-/// (opaque and `#[non_exhaustive]`, with no fields populated yet): until it
-/// carries the owning [`crate::conn::Connection`] and the in-flight request
-/// state, a vtable method
-/// has nothing to pull a socket or transfer parameters from. When that wiring
-/// lands, `connect` will open the [`UdpSocket`] and the DO phase will drive
-/// [`TftpConn::run`] to completion — no protocol behavior is deferred here, only
-/// the handle plumbing that every protocol in the crate shares.
+/// and unit-tested in this module. [`do_it`](TftpHandler::do_it) is the wiring
+/// that drives it: it reads the [`TransferCtx`] (the URL path, upload flag,
+/// in-memory body, host/port, and timeout), derives the remote filename exactly
+/// as curl (`;mode=` suffix strip → skip leading `/` → `Curl_urldecode` with
+/// `REJECT_ZERO`), builds a [`TftpParams`], **opens its own** [`UdpSocket`]
+/// (TFTP is the sole datagram protocol, so — like the FILE handler — it creates
+/// its own transport rather than reading [`TransferCtx::io`], which is the
+/// stream transport for the TCP protocols), and drives [`TftpConn::run`] to
+/// completion, streaming download bytes to the transfer's client sink. This
+/// mirrors curl's split where `tftp_connect` opens/binds the UDP socket and
+/// `tftp_do`/`tftp_perform` run the exchange; our generic connection phase does
+/// not create a UDP socket, so `do_it` owns the whole datagram lifecycle. No
+/// protocol behavior is deferred.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TftpHandler;
 
@@ -1408,15 +1532,106 @@ impl TftpHandler {
 }
 
 impl Protocol for TftpHandler {
-    /// The required DO phase (← `tftp_do` / `tftp_perform`).
+    /// The required DO phase (← `tftp_do` / `tftp_perform`, plus the socket
+    /// creation of `tftp_connect`).
     ///
     /// TFTP performs the whole transfer within DO/DOING; the concrete work is
-    /// [`TftpConn::run`]. Returns `true` (DO complete) — the faithful result for
-    /// a run-to-completion transfer. The socket and parameters are threaded in
-    /// once [`TransferCtx`] is finalized (see the type-level note).
+    /// [`TftpConn::run`]. This method wires the engine to the transfer:
+    ///
+    /// 1. **Filename + mode** are derived exactly as curl. `tftp_setup_connection`
+    ///    strips a trailing `;mode=netascii`/`;mode=octet` suffix (selecting the
+    ///    [`TftpMode`]); then `tftp_connect_for_rx`/`_for_tx` reads `&up.path[1]`
+    ///    (the leading `/` is *not* part of the filename) and URL-decodes it with
+    ///    `REJECT_ZERO` ([`urldecode_reject_zero`]). The decoded bytes are carried
+    ///    as text (curl parity holds for every ASCII/UTF-8 filename — the whole
+    ///    TFTP test corpus and all realistic usage). An empty remainder is
+    ///    rejected downstream in `build_first_request` as `CURLE_TFTP_ILLEGAL`,
+    ///    matching curl's "Missing filename".
+    /// 2. **Parameters** map from the request: `upload` from `data->state.upload`,
+    ///    `infilesize` from the in-memory body length when uploading
+    ///    (← `data->state.infilesize`), and `timeout` from the effective transfer
+    ///    timeout. `blksize`/`no_options` take their curl defaults (`0` ⇒ 512, and
+    ///    options enabled) since no CLI override is threaded at this checkpoint.
+    /// 3. **The UDP socket** is created here — TFTP is the only datagram protocol,
+    ///    so, exactly as `tftp_connect` does, the handler resolves the remote
+    ///    address and binds a fresh local socket ("any interface, random UDP
+    ///    port", in the resolved address family) rather than using the stream
+    ///    transport in [`TransferCtx::io`].
+    /// 4. **The engine runs to completion** over that socket, streaming any
+    ///    download bytes to the transfer's client body sink (or discarding them
+    ///    when the transfer installed none).
+    ///
+    /// Returns `true` (DO complete) for a run-to-completion transfer, exactly as
+    /// `tftp_do` reports the DO phase finished.
     fn do_it<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
-        let _ = ctx;
-        Box::pin(async { Ok(true) })
+        Box::pin(async move {
+            // (1) Filename + mode (← tftp_setup_connection then
+            // tftp_connect_for_rx/_for_tx). Default mode is Octet (curl's
+            // prefer_ascii defaults false); the URL `;mode=` suffix overrides it.
+            let (path_no_suffix, mode) = parse_mode_suffix(&ctx.request.path, TftpMode::Octet);
+            // curl reads `&up.path[1]`: the leading slash is not part of the name.
+            let raw = path_no_suffix.strip_prefix('/').unwrap_or(&path_no_suffix);
+            let filename_bytes = urldecode_reject_zero(raw.as_bytes())?;
+            let filename = String::from_utf8_lossy(&filename_bytes).into_owned();
+
+            // (2) Transfer parameters (← the fields curl reads from Curl_easy).
+            let upload = ctx.request.upload;
+            let infilesize = if upload {
+                ctx.request.body.as_ref().map(|b| b.len() as u64)
+            } else {
+                None
+            };
+            let params = TftpParams {
+                filename,
+                upload,
+                mode,
+                // CURLOPT_TFTP_BLKSIZE default: 0 ⇒ the engine uses 512.
+                blksize: 0,
+                infilesize,
+                // CURLOPT_TFTP_NO_OPTIONS default: options enabled.
+                no_options: false,
+                timeout: ctx.request.timeout,
+            };
+
+            // (3) Resolve the remote address and bind a local UDP socket
+            // (← tftp_connect: bind "any interface, random UDP port" in the
+            // resolved address family). TFTP owns its socket; it does not use the
+            // stream transport in ctx.io.
+            let host = ctx.request.host.clone();
+            let port = ctx.request.port;
+            let server = lookup_host((host.as_str(), port))
+                .await
+                .map_err(|e| Error::with_context(CurlCode::CouldntResolveHost, e.to_string()))?
+                .next()
+                .ok_or_else(|| {
+                    Error::with_context(
+                        CurlCode::CouldntResolveHost,
+                        format!("no address for {host}:{port}"),
+                    )
+                })?;
+            let bind_addr = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+            let socket = UdpSocket::bind(bind_addr)
+                .await
+                .map_err(|e| Error::with_context(CurlCode::CouldntConnect, e.to_string()))?;
+
+            // (4) Drive the engine to completion (← tftp_perform /
+            // tftp_multi_statemach). The upload source is the in-memory body
+            // (empty and never read for a download); the download sink is the
+            // transfer's client sink, or a discarding sink when none is installed.
+            let mut engine = TftpConn::new(params);
+            let mut source: &[u8] = ctx.request.body.as_deref().unwrap_or(&[]);
+            match ctx.sink.as_deref_mut() {
+                Some(s) => {
+                    let mut sink = SinkTftpSink(s);
+                    engine.run(&socket, server, &mut source, &mut sink).await?;
+                }
+                None => {
+                    let mut sink = DiscardTftpSink;
+                    engine.run(&socket, server, &mut source, &mut sink).await?;
+                }
+            }
+            Ok(true)
+        })
     }
 
     /// The required teardown (← `tftp_done`).
@@ -1452,6 +1667,7 @@ mod tests {
     use crate::error::{CurlCode, Error};
     use crate::protocols::{Protocol, TransferCtx};
     use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::net::UdpSocket;
 
@@ -2074,20 +2290,227 @@ mod tests {
         assert_eq!(HANDLER.transport(), Transport::Udp);
     }
 
+    #[test]
+    fn handler_is_object_safe() {
+        // The scheme table stores the handler as `&dyn Protocol`; this coercion
+        // proves `Protocol` stays object-safe with the wired `do_it`.
+        let _h: &dyn Protocol = &HANDLER;
+    }
+
     #[tokio::test]
-    async fn handler_is_object_safe_and_do_it_done_behave() {
-        // Exercised through &dyn Protocol, exactly as SCHEME_TFTP stores it.
+    async fn handler_done_propagates_status() {
+        // `tftp_done` keeps no connection alive and propagates `status`
+        // unchanged: `Ok` stays `Ok`, and an error surfaces with its exact code.
         let handler: &dyn Protocol = &HANDLER;
         let mut ctx = TransferCtx::new();
-        assert!(handler.do_it(&mut ctx).await.unwrap());
-        // A successful status passes through.
         handler.done(&mut ctx, Ok(()), false).await.unwrap();
-        // A failing status is propagated unchanged.
         let err = handler
             .done(&mut ctx, Err(Error::Code(CurlCode::TftpNotfound)), true)
             .await
             .unwrap_err();
         assert_eq!(err.code(), CurlCode::TftpNotfound);
+    }
+
+    /// A shared-buffer download sink (← the transfer's `CLIENTWRITE_BODY`), so a
+    /// handler test can assert which downloaded bytes the wired DO phase
+    /// delivered to the client body write.
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+    impl TransferSink for RecordingSink {
+        fn write(&mut self, data: &[u8]) -> Result<()> {
+            self.0.lock().expect("sink lock").extend_from_slice(data);
+            Ok(())
+        }
+    }
+
+    /// Build a [`TransferCtx`] addressed at `server` for `path`, optionally with
+    /// an upload `body` and a recording download `sink` — the minimal request
+    /// state the wired [`TftpHandler::do_it`] reads.
+    fn handler_ctx(
+        server: SocketAddr,
+        path: &str,
+        upload: bool,
+        body: Option<Vec<u8>>,
+        sink: Option<Arc<Mutex<Vec<u8>>>>,
+    ) -> TransferCtx {
+        let mut ctx = TransferCtx::new();
+        ctx.request.host = server.ip().to_string();
+        ctx.request.port = server.port();
+        ctx.request.path = path.to_string();
+        ctx.request.upload = upload;
+        ctx.request.body = body;
+        if let Some(buf) = sink {
+            ctx.sink = Some(Box::new(RecordingSink(buf)));
+        }
+        ctx
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_downloads_to_sink() {
+        // End-to-end through the handler: `do_it` resolves host/port, binds its
+        // own UDP socket, drives `TftpConn::run`, and streams the downloaded file
+        // to the client sink — none of which the former no-op stub did.
+        let file: Vec<u8> = b"hello world".to_vec();
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let server = serve_download(server_sock, file.clone(), false, 512);
+
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = handler_ctx(server_addr, "/h.txt", false, None, Some(Arc::clone(&collected)));
+
+        let client = HANDLER.do_it(&mut ctx);
+        let (_srv, cres) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(server, client)
+        })
+        .await
+        .expect("test timed out");
+        assert!(cres.expect("handler download failed"), "DO phase complete");
+        assert_eq!(collected.lock().unwrap().as_slice(), file.as_slice());
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_download_without_sink_still_succeeds() {
+        // With no sink installed the download still runs to completion; the bytes
+        // are discarded (← a body write with no client destination).
+        let file: Vec<u8> = b"discard me".to_vec();
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let server = serve_download(server_sock, file.clone(), false, 512);
+
+        let mut ctx = handler_ctx(server_addr, "/d.bin", false, None, None);
+
+        let client = HANDLER.do_it(&mut ctx);
+        let (_srv, cres) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(server, client)
+        })
+        .await
+        .expect("test timed out");
+        assert!(cres.expect("handler download failed"));
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_uploads_body() {
+        // Upload path: the in-memory request body is the WRQ source; the handler
+        // sends it block-by-block and the server reassembles the exact bytes.
+        let payload: Vec<u8> = (0u8..200).collect(); // > 1 block at blksize 512? no — 1 short block
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let server = serve_upload(server_sock, 512);
+
+        let mut ctx = handler_ctx(
+            server_addr,
+            "/up.bin",
+            true,
+            Some(payload.clone()),
+            None,
+        );
+
+        let client = HANDLER.do_it(&mut ctx);
+        let (received, cres) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(server, client)
+        })
+        .await
+        .expect("test timed out");
+        assert!(cres.expect("handler upload failed"));
+        assert_eq!(received, payload);
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_server_error_maps_curl_code() {
+        // A server `ERROR` packet surfaces through the handler as the frozen
+        // `CURLE_TFTP_*` code (code 1 = "file not found" ⇒ CURLE_TFTP_NOTFOUND).
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let server = serve_error(server_sock, 1, "not found");
+
+        let mut ctx = handler_ctx(server_addr, "/missing", false, None, None);
+
+        let client = HANDLER.do_it(&mut ctx);
+        let (_srv, cres) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(server, client)
+        })
+        .await
+        .expect("test timed out");
+        let err = cres.expect_err("server error must surface");
+        assert_eq!(err.code(), CurlCode::TftpNotfound);
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_missing_filename_is_illegal() {
+        // A path of just "/" leaves an empty filename after the leading-slash
+        // skip; `build_first_request` rejects it as CURLE_TFTP_ILLEGAL before any
+        // datagram is sent (so no server is needed).
+        let mut ctx = handler_ctx("127.0.0.1:9".parse().unwrap(), "/", false, None, None);
+        let err = HANDLER.do_it(&mut ctx).await.unwrap_err();
+        assert_eq!(err.code(), CurlCode::TftpIllegal);
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_builds_curl_faithful_filename() {
+        // Wire-parity proof: a URL path of "/hello%20world.txt;mode=octet" must
+        // reach the RRQ as filename "hello world.txt" (leading '/' skipped, %20
+        // decoded) and mode "octet" (suffix stripped + selected) — exactly what
+        // curl's tftp_setup_connection + tftp_connect_for_rx produce.
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let checked = Arc::new(Mutex::new(None::<(Vec<u8>, Vec<u8>)>));
+        let checked_srv = Arc::clone(&checked);
+
+        // Bespoke server: parse the RRQ's filename\0mode\0, record them, then
+        // serve a one-block download so the client completes cleanly.
+        let server = async move {
+            let mut buf = vec![0u8; 4096];
+            let (n, client) = server_sock.recv_from(&mut buf).await.unwrap();
+            let rrq = &buf[..n];
+            // opcode (2) + filename \0 + mode \0 + options…
+            let fname_start = 2;
+            let fname_end = fname_start
+                + rrq[fname_start..].iter().position(|&b| b == 0).unwrap();
+            let mode_start = fname_end + 1;
+            let mode_end = mode_start
+                + rrq[mode_start..].iter().position(|&b| b == 0).unwrap();
+            *checked_srv.lock().unwrap() = Some((
+                rrq[fname_start..fname_end].to_vec(),
+                rrq[mode_start..mode_end].to_vec(),
+            ));
+            // Serve a single DATA block (no OACK) then read the ACK.
+            let data_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut data = Vec::new();
+            data.extend_from_slice(&3u16.to_be_bytes());
+            data.extend_from_slice(&1u16.to_be_bytes());
+            data.extend_from_slice(b"ok");
+            data_sock.send_to(&data, client).await.unwrap();
+            let _ = data_sock.recv_from(&mut buf).await.unwrap();
+        };
+
+        let mut ctx = handler_ctx(
+            server_addr,
+            "/hello%20world.txt;mode=octet",
+            false,
+            None,
+            None,
+        );
+
+        let client = HANDLER.do_it(&mut ctx);
+        let (_srv, cres) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(server, client)
+        })
+        .await
+        .expect("test timed out");
+        assert!(cres.expect("handler download failed"));
+        let (fname, mode) = checked.lock().unwrap().take().expect("RRQ observed");
+        assert_eq!(fname, b"hello world.txt", "filename decoded, slash skipped");
+        assert_eq!(mode, b"octet", "mode selected from ;mode= suffix");
+    }
+
+    #[test]
+    fn urldecode_reject_zero_matches_curl() {
+        // %XX escapes decode; a lone/short % is literal; REJECT_ZERO rejects a
+        // decoded NUL (← Curl_urldecode, lib/escape.c).
+        assert_eq!(urldecode_reject_zero(b"foo%20bar").unwrap(), b"foo bar");
+        assert_eq!(urldecode_reject_zero(b"100%").unwrap(), b"100%"); // trailing % literal
+        assert_eq!(urldecode_reject_zero(b"a%zzb").unwrap(), b"a%zzb"); // non-hex literal
+        assert_eq!(urldecode_reject_zero(b"caf%C3%A9").unwrap(), "café".as_bytes());
+        assert!(urldecode_reject_zero(b"x%00y").is_err()); // decoded NUL rejected
     }
 
     // --- End-to-end transfers over a real UDP loopback socket ----------------

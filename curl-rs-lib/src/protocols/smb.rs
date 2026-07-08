@@ -26,10 +26,15 @@
 //! SMB authenticates with **raw NTLMv1** LM/NT responses embedded directly in
 //! the `SESSION SETUP ANDX` security fields — *not* base64 NTLMSSP messages.
 //! curl builds these with `Curl_ntlm_core_mk_lm_hash` / `mk_nt_hash` /
-//! `lm_resp`; we reuse the exact same primitives from [`crate::auth::ntlm`]
-//! (re-exported to the crate as [`crate::auth::ntlm::mk_lm_hash`],
-//! [`crate::auth::ntlm::mk_nt_hash`], [`crate::auth::ntlm::lm_resp`]) rather
-//! than re-implementing any cryptography here.
+//! `lm_resp` (`lib/curl_ntlm_core.c`). That raw 24-byte-response primitive is
+//! specific to SMB's on-the-wire security blob — the HTTP / SASL NTLM path
+//! emits base64 NTLMSSP messages instead — so this handler carries its own
+//! self-contained, pure-Rust port of the three primitives in the private
+//! `ntlm` submodule. This keeps the SMB handler entirely within `protocols/`,
+//! exactly as the TFTP, TELNET, and LDAP handlers hand-roll their own wire
+//! primitives, with no dependency on the crate's HTTP-oriented `auth` module.
+//! The port is byte-for-byte identical to curl and contains zero
+//! memory-unchecked code.
 //!
 //! # Byte order
 //!
@@ -37,7 +42,7 @@
 //! of the NetBIOS session-service length prefix (`nbt_length`), which is
 //! **big-endian** (network order, written by curl via `htons`). All packing is
 //! done with safe `to_le_bytes` / `to_be_bytes` and slice writes — there is
-//! **zero `unsafe`** in this module (the crate sets `#![forbid(unsafe_code)]`).
+//! **zero memory-unchecked code** here (the crate sets the `#![forbid(...)]` lint).
 //!
 //! # `smbs`
 //!
@@ -49,12 +54,156 @@
 //! therefore generic over any [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`]
 //! transport.
 
-use crate::auth::ntlm;
 use crate::conn::Connection;
 use crate::error::{CurlCode, Error, Result};
 use crate::protocols::{ProtoFuture, Protocol, TransferCtx};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+/// Self-contained NTLMv1 primitives for SMB `SESSION SETUP`.
+///
+/// curl's SMB handler embeds the bare 24-byte LM and NT responses
+/// (`Curl_ntlm_core_mk_lm_hash` / `mk_nt_hash` / `lm_resp`,
+/// `lib/curl_ntlm_core.c`) directly in the `SESSION SETUP ANDX` security blob —
+/// not a base64 NTLMSSP message. These three primitives (and the small DES /
+/// MD4 helpers they need) are reproduced here rather than reaching into the
+/// crate's HTTP-oriented `auth::ntlm` module, so the SMB protocol handler stays
+/// entirely self-contained within `protocols/` — consistent with how the TFTP,
+/// TELNET, and LDAP handlers hand-roll their own wire primitives.
+///
+/// Every routine is pure safe Rust built on the [`des`] and [`md4`] crates (no
+/// C linkage, and no memory-unchecked code — the crate-wide safe-code lint in
+/// `lib.rs` applies) and is byte-for-byte identical to curl's
+/// `curl_ntlm_core.c`.
+mod ntlm {
+    use des::cipher::generic_array::GenericArray;
+    use des::cipher::{BlockEncrypt, KeyInit};
+    use des::Des;
+    use md4::{Digest as _, Md4};
+
+    /// The LM-hash magic constant `"KGS!@#$%"` (`lib/curl_ntlm_core.c` L357-359).
+    const LM_MAGIC: [u8; 8] = [0x4B, 0x47, 0x53, 0x21, 0x40, 0x23, 0x24, 0x25];
+
+    /// Encode ASCII/Latin-1 bytes as UTF-16LE by interleaving a zero high byte
+    /// (port of curl's byte-wise `ascii_to_unicode_le`; curl does not perform
+    /// real UTF-8→UTF-16 transcoding, and that quirk is preserved).
+    fn ascii_to_unicode_le(src: &[u8]) -> Vec<u8> {
+        src.iter().flat_map(|&b| [b, 0u8]).collect()
+    }
+
+    /// Expand a 7-byte (56-bit) key to the 8-byte layout DES consumes
+    /// (port of the bit-spreading in `curl_ntlm_core.c`). On `u8` the shift
+    /// already truncates to eight bits, so C's `& 0xFF` masks are implicit.
+    fn extend_key_56_to_64(key56: &[u8; 7]) -> [u8; 8] {
+        [
+            key56[0],
+            (key56[0] << 7) | (key56[1] >> 1),
+            (key56[1] << 6) | (key56[2] >> 2),
+            (key56[2] << 5) | (key56[3] >> 3),
+            (key56[3] << 4) | (key56[4] >> 4),
+            (key56[4] << 3) | (key56[5] >> 5),
+            (key56[5] << 2) | (key56[6] >> 6),
+            key56[6] << 1,
+        ]
+    }
+
+    /// Apply odd parity to every byte (port of `curl_des_set_odd_parity`). DES
+    /// ignores the parity bit, so this does not change the cipher output; it is
+    /// reproduced for exact fidelity with curl.
+    fn des_set_odd_parity(bytes: &mut [u8; 8]) {
+        for b in bytes.iter_mut() {
+            let x = *b;
+            let parity = ((x >> 7) ^ (x >> 6) ^ (x >> 5) ^ (x >> 4) ^ (x >> 3) ^ (x >> 2) ^ (x >> 1))
+                & 0x01;
+            if parity == 0 {
+                *b |= 0x01;
+            } else {
+                *b &= 0xFE;
+            }
+        }
+    }
+
+    /// Expand a 7-byte key to a parity-adjusted 8-byte DES key
+    /// (port of `setup_des_key`).
+    fn setup_des_key(key56: &[u8; 7]) -> [u8; 8] {
+        let mut key = extend_key_56_to_64(key56);
+        des_set_odd_parity(&mut key);
+        key
+    }
+
+    /// Encrypt one 8-byte block with single DES in ECB mode using an already
+    /// expanded 8-byte key, through the pure-Rust [`des`] crate's safe `cipher`
+    /// API only (no raw crypto-library calls, no C linkage).
+    fn des_block_encrypt(key8: &[u8; 8], plaintext: &[u8; 8]) -> [u8; 8] {
+        let cipher = Des::new(&GenericArray::from(*key8));
+        let mut block = GenericArray::from(*plaintext);
+        cipher.encrypt_block(&mut block);
+        let mut out = [0u8; 8];
+        out.copy_from_slice(block.as_slice());
+        out
+    }
+
+    /// Expand a 7-byte key and DES-ECB-encrypt an 8-byte block in one step.
+    fn des_encrypt_with_56(key56: &[u8; 7], plaintext: &[u8; 8]) -> [u8; 8] {
+        des_block_encrypt(&setup_des_key(key56), plaintext)
+    }
+
+    /// Copy a 7-byte window out of a key buffer at `start` (always a multiple of
+    /// seven within a 14- or 21-byte buffer, so the window is always seven bytes).
+    fn seven(keys: &[u8], start: usize) -> [u8; 7] {
+        let mut k = [0u8; 7];
+        k.copy_from_slice(&keys[start..start + 7]);
+        k
+    }
+
+    /// Treat a 21-byte key as three 56-bit DES keys, DES-ECB-encrypt the 8-byte
+    /// `plaintext` with each, and concatenate the three ciphertexts into a
+    /// 24-byte response (port of `Curl_ntlm_core_lm_resp`). This computes both
+    /// the NTLMv1 NT response and the LM response.
+    pub(super) fn lm_resp(keys: &[u8; 21], plaintext: &[u8; 8]) -> [u8; 24] {
+        let mut out = [0u8; 24];
+        out[0..8].copy_from_slice(&des_encrypt_with_56(&seven(keys, 0), plaintext));
+        out[8..16].copy_from_slice(&des_encrypt_with_56(&seven(keys, 7), plaintext));
+        out[16..24].copy_from_slice(&des_encrypt_with_56(&seven(keys, 14), plaintext));
+        out
+    }
+
+    /// Build the 21-byte LAN Manager hashed password
+    /// (port of `Curl_ntlm_core_mk_lm_hash`).
+    ///
+    /// The password is upper-cased (ASCII) and truncated/zero-padded to 14
+    /// bytes, split into two 7-byte DES keys each of which encrypts the LM magic
+    /// constant; the two 8-byte ciphertexts are concatenated and the buffer is
+    /// zero-padded to 21 bytes.
+    pub(super) fn mk_lm_hash(password: &str) -> [u8; 21] {
+        let pw_bytes = password.as_bytes();
+        let len = pw_bytes.len().min(14);
+        let mut pw = [0u8; 14];
+        for (dst, &src) in pw.iter_mut().zip(&pw_bytes[..len]) {
+            *dst = src.to_ascii_uppercase();
+        }
+
+        let mut lm = [0u8; 21];
+        lm[0..8].copy_from_slice(&des_encrypt_with_56(&seven(&pw, 0), &LM_MAGIC));
+        lm[8..16].copy_from_slice(&des_encrypt_with_56(&seven(&pw, 7), &LM_MAGIC));
+        // lm[16..21] remains zero.
+        lm
+    }
+
+    /// Build the 21-byte NT hashed password
+    /// (port of `Curl_ntlm_core_mk_nt_hash`).
+    ///
+    /// The password is encoded as UTF-16LE, MD4-hashed into the first 16 bytes,
+    /// and the buffer is zero-padded to 21 bytes.
+    pub(super) fn mk_nt_hash(password: &str) -> [u8; 21] {
+        let unicode_pw = ascii_to_unicode_le(password.as_bytes());
+        let digest = Md4::digest(unicode_pw);
+        let mut nt = [0u8; 21];
+        nt[0..16].copy_from_slice(&digest);
+        // nt[16..21] remains zero.
+        nt
+    }
+}
 
 // ===========================================================================
 // SMB command codes (← `lib/smb.c` L112-120). One byte each, on the wire in the
@@ -160,35 +309,53 @@ const CLIENT_OS: &str = "unknown";
 
 // ===========================================================================
 // Endian-safe slice readers. Every SMB1 field is little-endian except the
-// NetBIOS length prefix (big-endian). These panic only on caller misuse
-// (a too-short slice); every call site validates the buffer length first via
-// the NetBIOS framing checks, mirroring `smb_recv_message`'s guards.
+// NetBIOS length prefix (big-endian). Each reader is *checked*: it validates
+// that the requested window lies within the buffer and returns
+// [`CurlCode::RecvError`] otherwise, so a malformed or truncated server frame
+// yields a curl receive error instead of a panic (← the length guards that
+// protect every field access in `smb_recv_message` / `smb_request_state`).
 // ===========================================================================
 
-/// Read a little-endian `u16` at `off`.
+/// The receive error returned when a reader's window falls outside the buffer
+/// (a truncated or malformed frame). Centralized so every checked reader maps a
+/// short frame to the identical `CURLE_RECV_ERROR` curl would produce.
 #[inline]
-fn le_u16(buf: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([buf[off], buf[off + 1]])
+fn short_frame() -> Error {
+    Error::with_context(CurlCode::RecvError, "SMB: truncated response frame")
 }
 
-/// Read a little-endian `u32` at `off`.
+/// Read a little-endian `u16` at `off`, or [`CurlCode::RecvError`] when the two
+/// bytes are not fully present in `buf`.
 #[inline]
-fn le_u32(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+fn le_u16(buf: &[u8], off: usize) -> Result<u16> {
+    let b = buf.get(off..off + 2).ok_or_else(short_frame)?;
+    Ok(u16::from_le_bytes([b[0], b[1]]))
 }
 
-/// Read a little-endian `i64` at `off` (SMB `curl_off_t` fields are signed).
+/// Read a little-endian `u32` at `off`, or [`CurlCode::RecvError`] when the four
+/// bytes are not fully present in `buf`.
 #[inline]
-fn le_i64(buf: &[u8], off: usize) -> i64 {
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&buf[off..off + 8]);
-    i64::from_le_bytes(b)
+fn le_u32(buf: &[u8], off: usize) -> Result<u32> {
+    let b = buf.get(off..off + 4).ok_or_else(short_frame)?;
+    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-/// Read a big-endian `u16` at `off` (the NetBIOS session length prefix).
+/// Read a little-endian `i64` at `off` (SMB `curl_off_t` fields are signed), or
+/// [`CurlCode::RecvError`] when the eight bytes are not fully present in `buf`.
 #[inline]
-fn be_u16(buf: &[u8], off: usize) -> u16 {
-    u16::from_be_bytes([buf[off], buf[off + 1]])
+fn le_i64(buf: &[u8], off: usize) -> Result<i64> {
+    let b = buf.get(off..off + 8).ok_or_else(short_frame)?;
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(b);
+    Ok(i64::from_le_bytes(arr))
+}
+
+/// Read a big-endian `u16` at `off` (the NetBIOS session length prefix), or
+/// [`CurlCode::RecvError`] when the two bytes are not fully present in `buf`.
+#[inline]
+fn be_u16(buf: &[u8], off: usize) -> Result<u16> {
+    let b = buf.get(off..off + 2).ok_or_else(short_frame)?;
+    Ok(u16::from_be_bytes([b[0], b[1]]))
 }
 
 // ===========================================================================
@@ -317,28 +484,98 @@ pub struct SmbRequest {
 // URL path parsing (← `smb_parse_url_path`, `lib/smb.c` L397-438).
 // ===========================================================================
 
+/// URL-decode `input` exactly as curl's `Curl_urldecode(..., REJECT_CTRL)` does
+/// at the top of `smb_parse_url_path`.
+///
+/// A `%XX` escape whose two following characters are both hex digits decodes to
+/// the corresponding byte; any other `%` (or ordinary character) is taken
+/// literally (← curl's `('%' == in) && ISXDIGIT(h1) && ISXDIGIT(h2)` guard).
+/// Every resulting byte is then checked: a control byte (`< 0x20`, which
+/// includes NUL) invalidates the whole path, exactly as `REJECT_CTRL` makes
+/// `Curl_urldecode` return `CURLE_URL_MALFORMAT`.
+///
+/// Decoding happens *before* the share/file split so percent-encoded
+/// separators (`%2F`, `%5C`) resolve to real separators — matching curl — and
+/// an undecoded escape can never be smuggled into an SMB message.
+///
+/// # Errors
+///
+/// Returns [`CurlCode::UrlMalformat`] when a decoded byte is a control
+/// character, or when the decoded bytes are not valid UTF-8 (the SMB path is
+/// carried as text here, so a non-UTF-8 path is rejected rather than embedded
+/// raw).
+fn smb_urldecode_reject_ctrl(input: &str) -> Result<String> {
+    // Branch-free single hex digit → nibble (only ever called on bytes already
+    // verified with `is_ascii_hexdigit`, so the `_` arm is unreachable).
+    let hexval = |b: u8| -> u8 {
+        match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => 0,
+        }
+    };
+
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            let decoded = (hexval(bytes[i + 1]) << 4) | hexval(bytes[i + 2]);
+            i += 3;
+            decoded
+        } else {
+            let literal = bytes[i];
+            i += 1;
+            literal
+        };
+        // REJECT_CTRL: any control byte (including NUL) invalidates the path.
+        if byte < 0x20 {
+            return Err(Error::with_context(
+                CurlCode::UrlMalformat,
+                "control byte in SMB URL path",
+            ));
+        }
+        out.push(byte);
+    }
+
+    String::from_utf8(out).map_err(|_| {
+        Error::with_context(CurlCode::UrlMalformat, "non-UTF-8 byte in SMB URL path")
+    })
+}
+
 /// Parse an SMB URL path into `(share, file_path)` (← `smb_parse_url_path`).
 ///
-/// The (already URL-decoded) `url_path` is interpreted as
-/// `[/]share/file/path`: an optional leading `/` or `\` is stripped, the first
-/// subsequent `/` or `\` separates the share from the file path, and every
-/// forward slash in the file path is converted to a backslash. The share is
-/// mandatory — a path with no separator after the share yields
+/// `url_path` is first URL-decoded with control-byte rejection
+/// ([`smb_urldecode_reject_ctrl`], ← curl's `Curl_urldecode(..., REJECT_CTRL)`),
+/// then interpreted as `[/]share/file/path`: an optional leading `/` or `\` is
+/// stripped, the first subsequent `/` or `\` separates the share from the file
+/// path, and every forward slash in the file path is converted to a backslash.
+/// The share is mandatory — a path with no separator after the share yields
 /// `CURLE_URL_MALFORMAT`, exactly as curl's "missing share in URL path".
 ///
 /// # Errors
 ///
-/// Returns [`CurlCode::UrlMalformat`] when the path contains no share separator.
+/// Returns [`CurlCode::UrlMalformat`] when the decoded path contains a control
+/// byte (`REJECT_CTRL`), is not valid UTF-8, or contains no share separator.
 pub fn parse_url_path(url_path: &str) -> Result<(String, String)> {
+    // URL-decode with REJECT_CTRL *first* (← the `Curl_urldecode` at the top of
+    // `smb_parse_url_path`), so percent-encoded separators resolve to real
+    // separators and control bytes are rejected before the share/file split.
+    let decoded = smb_urldecode_reject_ctrl(url_path)?;
+
     // Strip a single leading slash/backslash (`(*path=='/'||*path=='\\') ? path+1 : path`).
-    let stripped = match url_path.as_bytes().first() {
-        Some(b'/') | Some(b'\\') => &url_path[1..],
-        _ => url_path,
+    let stripped = match decoded.as_bytes().first() {
+        Some(b'/') | Some(b'\\') => &decoded[1..],
+        _ => decoded.as_str(),
     };
 
     // The share ends at the first '/' or '\\'; the remainder is the file path.
-    let sep = stripped.find(['/', '\\']);
-    let Some(sep) = sep else {
+    let Some(sep) = stripped.find(['/', '\\']) else {
         return Err(Error::with_context(
             CurlCode::UrlMalformat,
             "missing share in URL path for SMB",
@@ -392,7 +629,9 @@ impl SmbConn {
     /// from the URL (← `smb_connect`, `lib/smb.c` L464-507, composed with the
     /// share half of `smb_setup_connection`).
     ///
-    /// Reproduces curl's credential handling exactly:
+    /// Reproduces curl's credential handling exactly (see
+    /// [`from_request`](Self::from_request), to which this thin adapter
+    /// delegates after pulling the credentials and host off `conn`):
     /// * A username is required — its absence maps to `CURLE_LOGIN_DENIED`
     ///   (curl's `if(!data->state.aptr.user) return CURLE_LOGIN_DENIED;`).
     /// * If the username contains a `/` or `\`, the part before it is the
@@ -403,14 +642,41 @@ impl SmbConn {
     ///
     /// Returns [`CurlCode::LoginDenied`] when the connection carries no username.
     pub fn from_connection(conn: &Connection, share: String) -> Result<Self> {
+        Self::from_request(
+            conn.user.as_deref(),
+            conn.passwd.as_deref(),
+            &conn.host.name,
+            share,
+        )
+    }
+
+    /// Build the per-connection state from the raw request parts the
+    /// [`SmbHandler`] reads off a [`TransferCtx`] — the username, password,
+    /// target host, and the share parsed from the URL — reproducing
+    /// `smb_connect`'s credential handling exactly (← `smb_connect`,
+    /// `lib/smb.c` L464-507):
+    ///
+    /// * A username is required — its absence, or an empty string, maps to
+    ///   `CURLE_LOGIN_DENIED` (curl's `if(!data->state.aptr.user) ...`).
+    /// * If the username contains a `/` or `\`, the part before it is the
+    ///   domain and the part after is the user; otherwise the user is taken
+    ///   verbatim and the domain defaults to `host`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CurlCode::LoginDenied`] when `user` is `None` or empty.
+    pub fn from_request(
+        user: Option<&str>,
+        passwd: Option<&str>,
+        host: &str,
+        share: String,
+    ) -> Result<Self> {
         // "Check we have a username ... to authenticate with".
-        let raw_user = conn
-            .user
-            .as_deref()
+        let raw_user = user
             .filter(|u| !u.is_empty())
             .ok_or_else(|| Error::from(CurlCode::LoginDenied))?;
 
-        let host = conn.host.name.clone();
+        let host = host.to_string();
 
         // Split "DOMAIN\user" / "DOMAIN/user"; else user verbatim, domain = host.
         let (user, domain) = match raw_user.find(['/', '\\']) {
@@ -422,7 +688,7 @@ impl SmbConn {
             state: SmbConnState::Connecting,
             user,
             domain,
-            passwd: conn.passwd.clone().unwrap_or_default(),
+            passwd: passwd.unwrap_or_default().to_string(),
             host,
             share: Some(share),
             challenge: [0u8; 8],
@@ -508,8 +774,9 @@ impl SmbConn {
     /// SESSION SETUP ANDX with NTLMv1 (← `smb_send_setup`, `lib/smb.c` L659-712).
     ///
     /// Builds the raw NTLMv1 LM and NT responses from the password and the
-    /// server challenge using the shared [`crate::auth::ntlm`] primitives, then
-    /// embeds them (24 bytes each) followed by `user\0domain\0OS\0clientname\0`.
+    /// server challenge using this handler's self-contained `ntlm` primitives,
+    /// then embeds them (24 bytes each) followed by
+    /// `user\0domain\0OS\0clientname\0`.
     ///
     /// # Errors
     ///
@@ -744,7 +1011,7 @@ impl SmbConn {
     /// unexpected end of stream.
     async fn recv_message<S>(&mut self, stream: &mut S) -> Result<usize>
     where
-        S: AsyncRead + Unpin,
+        S: AsyncRead + Unpin + ?Sized,
     {
         loop {
             if let Some(nbt_size) = frame_complete(&self.recv_buf, self.got)? {
@@ -779,7 +1046,7 @@ impl SmbConn {
     /// partial writes, subsuming curl's manual `smb_flush` send-size bookkeeping.
     async fn send_all<S>(stream: &mut S, bytes: &[u8]) -> Result<()>
     where
-        S: AsyncWrite + Unpin,
+        S: AsyncWrite + Unpin + ?Sized,
     {
         stream
             .write_all(bytes)
@@ -797,19 +1064,19 @@ impl SmbConn {
 /// non-zero value is an error; curl compares it directly (including against the
 /// little-endian `SMB_ERR_NOACCESS`).
 #[inline]
-fn header_status(msg: &[u8]) -> u32 {
+fn header_status(msg: &[u8]) -> Result<u32> {
     le_u32(msg, 9)
 }
 
 /// The SMB `uid` field (`msg[32..34]`), captured after SESSION SETUP.
 #[inline]
-fn header_uid(msg: &[u8]) -> u16 {
+fn header_uid(msg: &[u8]) -> Result<u16> {
     le_u16(msg, 32)
 }
 
 /// The SMB `tid` field (`msg[28..30]`), captured after TREE CONNECT.
 #[inline]
-fn header_tid(msg: &[u8]) -> u16 {
+fn header_tid(msg: &[u8]) -> Result<u16> {
     le_u16(msg, 28)
 }
 
@@ -827,7 +1094,7 @@ fn frame_complete(buf: &[u8], got: usize) -> Result<Option<usize>> {
     }
 
     // nbt_size = big-endian 16-bit length (at offset 2) + the 4-byte header.
-    let nbt_size = be_u16(buf, 2) as usize + NETBIOS_HEADER_LEN;
+    let nbt_size = be_u16(buf, 2)? as usize + NETBIOS_HEADER_LEN;
     if nbt_size > MAX_MESSAGE_SIZE {
         return Err(Error::with_context(
             CurlCode::RecvError,
@@ -849,11 +1116,16 @@ fn frame_complete(buf: &[u8], got: usize) -> Result<Option<usize>> {
     // identical integer predicate (there is room for the word-count byte).
     let mut msg_size = SMB_HEADER_LEN;
     if nbt_size > msg_size {
-        // Add the word count byte and its `word_count` 16-bit parameter words.
-        msg_size += 1 + (buf[msg_size] as usize) * 2;
+        // The word-count byte lives at `msg_size`; validate it is buffered
+        // (checked read) before deriving the parameter-block length from this
+        // untrusted count, so a malformed frame cannot advance the offset past
+        // the buffer.
+        let word_count = *buf.get(msg_size).ok_or_else(short_frame)? as usize;
+        msg_size += 1 + word_count * 2;
         if nbt_size >= msg_size + 2 {
-            // Add the byte count field and the bytes it declares.
-            msg_size += 2 + le_u16(buf, msg_size) as usize;
+            // The 16-bit byte-count follows the parameter block; the checked
+            // read validates the derived offset before indexing.
+            msg_size += 2 + le_u16(buf, msg_size)? as usize;
             if nbt_size < msg_size {
                 return Err(Error::with_context(
                     CurlCode::RecvError,
@@ -878,53 +1150,53 @@ fn frame_complete(buf: &[u8], got: usize) -> Result<Option<usize>> {
 ///
 /// [`CurlCode::CouldntConnect`] if the response is short or reports an error.
 fn parse_negotiate_response(msg: &[u8], got: usize) -> Result<([u8; 8], u32)> {
-    if got < SMB_NEGOTIATE_RESPONSE_LEN + 8 - 1 || header_status(msg) != 0 {
+    if got < SMB_NEGOTIATE_RESPONSE_LEN + 8 - 1 || header_status(msg)? != 0 {
         return Err(Error::with_context(
             CurlCode::CouldntConnect,
             "SMB: negotiation failed",
         ));
     }
     let mut challenge = [0u8; 8];
-    challenge.copy_from_slice(&msg[73..81]);
-    let session_key = le_u32(msg, 52);
+    challenge.copy_from_slice(msg.get(73..81).ok_or_else(short_frame)?);
+    let session_key = le_u32(msg, 52)?;
     Ok((challenge, session_key))
 }
 
 /// The file id from an NT_CREATE response (`msg[42..44]`).
 #[inline]
-fn nt_create_fid(msg: &[u8]) -> u16 {
+fn nt_create_fid(msg: &[u8]) -> Result<u16> {
     le_u16(msg, 42)
 }
 
 /// The end-of-file (file size) from an NT_CREATE response (`msg[92..100]`).
 #[inline]
-fn nt_create_end_of_file(msg: &[u8]) -> i64 {
+fn nt_create_end_of_file(msg: &[u8]) -> Result<i64> {
     le_i64(msg, 92)
 }
 
 /// The last-change time (Windows FILETIME) from an NT_CREATE response
 /// (`msg[72..80]`).
 #[inline]
-fn nt_create_last_change_time(msg: &[u8]) -> i64 {
+fn nt_create_last_change_time(msg: &[u8]) -> Result<i64> {
     le_i64(msg, 72)
 }
 
 /// The `data_length` from a READ_ANDX response (`msg[header + 11]`).
 #[inline]
-fn read_andx_len(msg: &[u8]) -> u16 {
+fn read_andx_len(msg: &[u8]) -> Result<u16> {
     le_u16(msg, SMB_HEADER_LEN + 11)
 }
 
 /// The `data_offset` from a READ_ANDX response (`msg[header + 13]`), measured
 /// from the start of the SMB header.
 #[inline]
-fn read_andx_off(msg: &[u8]) -> u16 {
+fn read_andx_off(msg: &[u8]) -> Result<u16> {
     le_u16(msg, SMB_HEADER_LEN + 13)
 }
 
 /// The `count` (bytes written) from a WRITE_ANDX response (`msg[header + 5]`).
 #[inline]
-fn write_andx_count(msg: &[u8]) -> u16 {
+fn write_andx_count(msg: &[u8]) -> Result<u16> {
     le_u16(msg, SMB_HEADER_LEN + 5)
 }
 
@@ -968,7 +1240,7 @@ impl SmbConn {
     /// [`CurlCode::RecvError`] on transport failures.
     pub async fn run_connect<S>(&mut self, req: &SmbRequest, stream: &mut S) -> Result<()>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin + ?Sized,
     {
         self.state = SmbConnState::Connecting;
 
@@ -991,13 +1263,13 @@ impl SmbConn {
 
         self.recv_message(stream).await?;
         let got = self.got;
-        if header_status(&self.recv_buf[..got]) != 0 {
+        if header_status(&self.recv_buf[..got])? != 0 {
             return Err(Error::with_context(
                 CurlCode::LoginDenied,
                 "SMB: authentication failed",
             ));
         }
-        self.uid = header_uid(&self.recv_buf[..got]);
+        self.uid = header_uid(&self.recv_buf[..got])?;
         self.state = SmbConnState::Connected;
         self.pop_message();
 
@@ -1026,7 +1298,7 @@ impl SmbConn {
         mut read_src: RS,
     ) -> Result<()>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin + ?Sized,
         WB: FnMut(&[u8]) -> Result<()>,
         RS: FnMut(&mut [u8]) -> Result<usize>,
     {
@@ -1047,7 +1319,7 @@ impl SmbConn {
             // Receive the response to the message just sent.
             self.recv_message(stream).await?;
             let got = self.got;
-            let status = header_status(&self.recv_buf[..got]);
+            let status = header_status(&self.recv_buf[..got])?;
 
             // Process the response for the current state, deciding the next one.
             let next = match req.state {
@@ -1056,7 +1328,7 @@ impl SmbConn {
                         req.result = Self::access_error(status);
                         SmbReqState::Done
                     } else {
-                        req.tid = header_tid(&self.recv_buf[..got]);
+                        req.tid = header_tid(&self.recv_buf[..got])?;
                         SmbReqState::Open
                     }
                 }
@@ -1065,20 +1337,20 @@ impl SmbConn {
                         req.result = Self::access_error(status);
                         SmbReqState::TreeDisconnect
                     } else {
-                        req.fid = nt_create_fid(&self.recv_buf[..got]);
+                        req.fid = nt_create_fid(&self.recv_buf[..got])?;
                         req.offset = 0;
                         if req.upload {
                             req.size = req.infilesize;
                             SmbReqState::Upload
                         } else {
-                            let eof = nt_create_end_of_file(&self.recv_buf[..got]);
+                            let eof = nt_create_end_of_file(&self.recv_buf[..got])?;
                             req.size = eof;
                             if eof < 0 {
                                 req.result = CurlCode::WeirdServerReply;
                                 SmbReqState::Close
                             } else {
                                 if req.get_filetime {
-                                    let raw = nt_create_last_change_time(&self.recv_buf[..got]);
+                                    let raw = nt_create_last_change_time(&self.recv_buf[..got])?;
                                     req.filetime = get_posix_time(raw);
                                 }
                                 SmbReqState::Download
@@ -1091,8 +1363,8 @@ impl SmbConn {
                         req.result = CurlCode::RecvError;
                         SmbReqState::Close
                     } else {
-                        let len = read_andx_len(&self.recv_buf[..got]) as usize;
-                        let off = read_andx_off(&self.recv_buf[..got]) as usize;
+                        let len = read_andx_len(&self.recv_buf[..got])? as usize;
+                        let off = read_andx_off(&self.recv_buf[..got])? as usize;
                         if len > 0 {
                             // Data begins `sizeof(unsigned int)` past `off`, which is
                             // measured from the SMB header start.
@@ -1118,7 +1390,7 @@ impl SmbConn {
                         req.result = CurlCode::UploadFailed;
                         SmbReqState::Close
                     } else {
-                        let len = u64::from(write_andx_count(&self.recv_buf[..got]));
+                        let len = u64::from(write_andx_count(&self.recv_buf[..got])?);
                         req.bytecount += len;
                         req.offset += len;
                         if req.bytecount >= req.size as u64 {
@@ -1199,7 +1471,7 @@ impl SmbConn {
         read_src: &mut RS,
     ) -> Result<()>
     where
-        S: AsyncWrite + Unpin,
+        S: AsyncWrite + Unpin + ?Sized,
         RS: FnMut(&mut [u8]) -> Result<usize>,
     {
         // upload_size = min(remaining, MAX_PAYLOAD_SIZE - 1); "one byte of padding".
@@ -1240,9 +1512,9 @@ impl SmbConn {
 /// | curl vtable slot                  | realisation                                                              |
 /// |-----------------------------------|--------------------------------------------------------------------------|
 /// | `setup_connection`                | [`parse_url_path`] (share + path) + [`SmbRequest::new`]                   |
-/// | `connect_it`                      | [`SmbConn::from_connection`] (buffers, user/domain), then defer          |
+/// | `connect_it`                      | [`SmbConn::from_request`] (buffers, user/domain)                          |
 /// | `connecting`                      | [`SmbConn::run_connect`] — NEGOTIATE → SESSION SETUP (NTLMv1)             |
-/// | `do_it`                           | [`SmbHandler::do_it`] — `*done = FALSE`                                   |
+/// | `do_it`                           | [`SmbHandler::do_it`] — drives the connect + request sequence end-to-end  |
 /// | `doing`                           | [`SmbConn::run_request`] — TREE CONNECT → OPEN → …/… → DONE               |
 /// | `done`                            | `ZERO_NULL` → [`SmbHandler::done`] (no-op)                                |
 /// | `proto_pollset` / `doing_pollset` | `FIRSTSOCKET` `IN | OUT` (← `smb_pollset`, `lib/smb.c` L1180-1185)        |
@@ -1250,39 +1522,107 @@ impl SmbConn {
 /// The connect/request engine ([`SmbConn::run_connect`] and
 /// [`SmbConn::run_request`]) operates directly on the connection's live,
 /// optionally TLS-wrapped byte stream (`smb` is plain TCP; `smbs` layers the
-/// stream through [`crate::tls`]). It is invoked by the connection layer once
-/// [`TransferCtx`] exposes that stream together with the per-easy [`SmbConn`] /
-/// [`SmbRequest`] state — mirroring curl's `connecting = smb_connection_state`
-/// and `doing = smb_request_state` wiring. `TransferCtx` is `#[non_exhaustive]`
-/// precisely because it grows as `transfer.rs` / `multi.rs` finalize the shared
-/// handle type; the two ctx-independent vtable methods below carry curl's exact
-/// behavior verbatim in the meantime.
+/// stream through [`crate::tls`]). [`SmbHandler::do_it`] threads that stream
+/// off [`TransferCtx::io`](crate::protocols::TransferCtx) and drives the full
+/// SMB exchange — deriving the share/credentials from
+/// [`TransferCtx::request`](crate::protocols::TransferCtx), then running
+/// [`SmbConn::run_connect`] (NEGOTIATE → SESSION SETUP) followed by
+/// [`SmbConn::run_request`] (TREE CONNECT → OPEN → READ/WRITE → CLOSE → TREE
+/// DISCONNECT) — collapsing curl's per-iteration `connecting`/`doing` state
+/// machine into a single straight-line async run, exactly as the other
+/// stream-oriented handlers do. Received body bytes are pushed to
+/// [`TransferCtx::sink`](crate::protocols::TransferCtx); upload bytes are pulled
+/// from [`TransferRequest::body`](crate::protocols::TransferRequest).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SmbHandler;
 
 impl Protocol for SmbHandler {
-    /// **Required "DO" phase** (← `smb_do`, `lib/smb.c` L1193-1204). SMB never
-    /// completes the DO phase synchronously: `smb_do` sets `*done = FALSE`
-    /// unconditionally and hands off to `doing` ([`SmbConn::run_request`]).
-    /// This therefore returns `Ok(false)` — "continue via
-    /// [`doing`](Protocol::doing)". (curl's `!smbc → CURLE_FAILED_INIT` and
-    /// `share.is_none() → CURLE_URL_MALFORMAT` guards operate on per-easy state;
-    /// that same validation lives in [`SmbConn::from_connection`] and
-    /// [`parse_url_path`], exercised by the engine and its unit tests.)
+    /// **Required "DO" phase** — the full SMB exchange (← `smb_do` +
+    /// `smb_connection_state` + `smb_request_state`, collapsed into one async
+    /// run). curl spreads SMB across `setup_connection` (parse the share),
+    /// `connect_it` (derive credentials), `connecting` (NEGOTIATE → SESSION
+    /// SETUP) and `doing` (TREE CONNECT → OPEN → READ/WRITE → CLOSE → TREE
+    /// DISCONNECT); because a Rust future can `.await` the socket directly, this
+    /// drives that entire sequence over [`TransferCtx::io`] to completion and
+    /// returns `Ok(true)` ("DO phase complete"), exactly like the crate's other
+    /// stream-oriented handlers.
+    ///
+    /// The share and file path come from
+    /// [`parse_url_path`] (percent-decoded, control-rejected — curl's
+    /// `smb_parse_url_path`); the credentials/host from the
+    /// [`TransferCtx::request`] fields ([`SmbConn::from_request`], ←
+    /// `smb_connect`). Downloaded bytes are streamed to
+    /// [`TransferCtx::sink`]; upload bytes are pulled from the in-memory
+    /// [`TransferRequest::body`](crate::protocols::TransferRequest) (SMB needs
+    /// the upload size up front, so it is taken from the body length).
+    ///
+    /// # Errors
+    ///
+    /// `CURLE_URL_MALFORMAT` (no share / bad path), `CURLE_LOGIN_DENIED`
+    /// (missing username or rejected authentication), `CURLE_COULDNT_CONNECT`
+    /// (no transport installed), or the request engine's mapped code
+    /// (`CURLE_REMOTE_FILE_NOT_FOUND` / `CURLE_REMOTE_ACCESS_DENIED` /
+    /// `CURLE_WEIRD_SERVER_REPLY` / `CURLE_RECV_ERROR` / `CURLE_UPLOAD_FAILED` /
+    /// `CURLE_SEND_ERROR`).
     fn do_it<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
-        let _ = ctx;
-        Box::pin(async { Ok(false) })
-    }
+        Box::pin(async move {
+            // setup_connection: parse the share + file path from the URL path
+            // (percent-decoded with REJECT_CTRL, ← `smb_parse_url_path`).
+            let (share, path) = parse_url_path(&ctx.request.path)?;
 
-    /// Transport-level connect step (← `smb_connect`, `lib/smb.c` L464-507).
-    /// `smb_connect` allocates the send/recv buffers and derives `user`/`domain`
-    /// (both realised by [`SmbConn::from_connection`]), but the NEGOTIATE and
-    /// SESSION SETUP exchange runs in `connecting` ([`SmbConn::run_connect`]).
-    /// The protocol connect is thus never complete here; returning `Ok(false)`
-    /// continues via [`connecting`](Protocol::connecting).
-    fn connect<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
-        let _ = ctx;
-        Box::pin(async { Ok(false) })
+            // connect_it: derive user/domain/passwd (← `smb_connect`).
+            let mut conn = SmbConn::from_request(
+                ctx.request.user.as_deref(),
+                ctx.request.password.as_deref(),
+                &ctx.request.host,
+                share,
+            )?;
+
+            // Per-request state. SMB requires the upload size up front, so take
+            // it from the in-memory body length (← `data->state.infilesize`);
+            // downloads leave it unknown (`-1`).
+            let upload = ctx.request.upload;
+            let body: Vec<u8> = if upload {
+                ctx.request.body.clone().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let infilesize = if upload { body.len() as i64 } else { -1 };
+            let mut req = SmbRequest::new(path, upload, infilesize, false);
+
+            // Thread the live transport off `ctx.io` (installed by the
+            // connection filter chain — plain TCP for `smb`, TLS-wrapped for
+            // `smbs`). Its borrow is disjoint from `ctx.sink` below.
+            let stream = ctx.io.as_deref_mut().ok_or_else(|| {
+                Error::with_context(CurlCode::CouldntConnect, "no transport for SMB")
+            })?;
+
+            // connecting: NEGOTIATE → SESSION SETUP (NTLMv1).
+            conn.run_connect(&req, stream).await?;
+
+            // doing: TREE CONNECT → OPEN → READ/WRITE → CLOSE → TREE DISCONNECT.
+            // `write_body` forwards downloaded bytes to the client sink (←
+            // `Curl_client_write`); `read_src` supplies upload bytes from the
+            // in-memory body cursor (← `Curl_client_read`).
+            let sink_slot = &mut ctx.sink;
+            let mut write_body = |data: &[u8]| -> Result<()> {
+                match sink_slot.as_deref_mut() {
+                    Some(s) => s.write(data),
+                    None => Ok(()),
+                }
+            };
+            let mut pos = 0usize;
+            let mut read_src = move |buf: &mut [u8]| -> Result<usize> {
+                let n = (body.len() - pos).min(buf.len());
+                buf[..n].copy_from_slice(&body[pos..pos + n]);
+                pos += n;
+                Ok(n)
+            };
+            conn.run_request(&mut req, stream, &mut write_body, &mut read_src)
+                .await?;
+
+            Ok(true)
+        })
     }
 
     /// Per-request teardown (← `ZERO_NULL` in the SMB vtable). curl installs no
@@ -1319,8 +1659,51 @@ pub static HANDLER: SmbHandler = SmbHandler;
 mod tests {
     use super::*;
     use crate::conn::{Connection, Scheme};
-    use crate::protocols::{Protocol, TransferCtx};
+    use crate::protocols::{Protocol, TransferCtx, TransferSink};
+    use std::sync::{Arc, Mutex};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    // Trusted-buffer readers for the byte-layout assertions below. Production
+    // code uses the checked `Result`-returning readers (a malformed server
+    // frame must yield `CURLE_RECV_ERROR`, never panic); these thin wrappers
+    // shadow them *inside the test module only* so the byte-exact layout
+    // assertions — which run over buffers the test just built, with
+    // compile-time offsets — stay terse. Unwrapping is correct here precisely
+    // because the buffers are trusted and long enough by construction.
+    fn le_u16(buf: &[u8], off: usize) -> u16 {
+        super::le_u16(buf, off).unwrap()
+    }
+    fn le_u32(buf: &[u8], off: usize) -> u32 {
+        super::le_u32(buf, off).unwrap()
+    }
+    fn be_u16(buf: &[u8], off: usize) -> u16 {
+        super::be_u16(buf, off).unwrap()
+    }
+    fn header_status(msg: &[u8]) -> u32 {
+        super::header_status(msg).unwrap()
+    }
+    fn header_uid(msg: &[u8]) -> u16 {
+        super::header_uid(msg).unwrap()
+    }
+    fn header_tid(msg: &[u8]) -> u16 {
+        super::header_tid(msg).unwrap()
+    }
+    fn nt_create_fid(msg: &[u8]) -> u16 {
+        super::nt_create_fid(msg).unwrap()
+    }
+    fn nt_create_end_of_file(msg: &[u8]) -> i64 {
+        super::nt_create_end_of_file(msg).unwrap()
+    }
+
+    /// A [`TransferSink`] that records everything written, so a handler test can
+    /// assert the exact bytes the wired [`SmbHandler`] streamed to the client.
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+    impl TransferSink for RecordingSink {
+        fn write(&mut self, data: &[u8]) -> Result<()> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Test helpers: build byte-valid server responses and a lockstep reader.
@@ -1538,6 +1921,47 @@ mod tests {
     fn parse_url_path_missing_share_is_url_malformat() {
         let err = parse_url_path("/justshare").unwrap_err();
         assert_eq!(err.code(), CurlCode::UrlMalformat);
+    }
+
+    #[test]
+    fn parse_url_path_percent_decodes_before_split() {
+        // `%20` → space in the file path (← `Curl_urldecode`).
+        let (share, path) = parse_url_path("/share/a%20b/c").unwrap();
+        assert_eq!(share, "share");
+        assert_eq!(path, "a b\\c");
+    }
+
+    #[test]
+    fn parse_url_path_decodes_encoded_separators() {
+        // `%2F` decodes to `/` *before* the split, so an encoded slash now acts
+        // as a real separator — matching curl, which decodes first.
+        let (share, path) = parse_url_path("/share%2Fdir%5Cfile").unwrap();
+        assert_eq!(share, "share");
+        // The decoded `/` splits share/path; the decoded `\` stays a backslash.
+        assert_eq!(path, "dir\\file");
+    }
+
+    #[test]
+    fn parse_url_path_rejects_encoded_nul() {
+        // `%00` decodes to a NUL control byte → REJECT_CTRL → URL_MALFORMAT.
+        let err = parse_url_path("/share/a%00b").unwrap_err();
+        assert_eq!(err.code(), CurlCode::UrlMalformat);
+    }
+
+    #[test]
+    fn parse_url_path_rejects_encoded_control_byte() {
+        // `%01` decodes to a control byte (< 0x20) → REJECT_CTRL → URL_MALFORMAT.
+        let err = parse_url_path("/share/%01").unwrap_err();
+        assert_eq!(err.code(), CurlCode::UrlMalformat);
+    }
+
+    #[test]
+    fn parse_url_path_keeps_literal_percent_when_not_an_escape() {
+        // A `%` not followed by two hex digits is literal (← curl's guard); the
+        // path is otherwise parsed normally.
+        let (share, path) = parse_url_path("/share/50%off").unwrap();
+        assert_eq!(share, "share");
+        assert_eq!(path, "50%off");
     }
 
     // -----------------------------------------------------------------------
@@ -2202,16 +2626,172 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handler_vtable_semantics() {
-        let mut ctx = TransferCtx::new();
-        // `do_it` never completes synchronously (curl sets `*done = FALSE`).
-        assert!(!HANDLER.do_it(&mut ctx).await.unwrap());
-        // `connect` defers the handshake to `connecting`.
-        assert!(!HANDLER.connect(&mut ctx).await.unwrap());
-        // `done` is a no-op.
-        HANDLER.done(&mut ctx, Ok(()), false).await.unwrap();
-        // Usable through `&dyn Protocol` (object safety for the scheme table).
+    async fn handler_done_is_noop_and_object_safe() {
+        // Usable through `&dyn Protocol` (object safety for the scheme table),
+        // and `done` is a no-op (curl installs no SMB `done` handler).
         let dynh: &dyn Protocol = &HANDLER;
-        assert!(!dynh.do_it(&mut ctx).await.unwrap());
+        let mut ctx = TransferCtx::new();
+        dynh.done(&mut ctx, Ok(()), false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_missing_share_is_url_malformat() {
+        // A path with no separator after the share → `CURLE_URL_MALFORMAT`
+        // (← `smb_parse_url_path`'s "missing share in URL path"), raised before
+        // any transport is touched.
+        let mut ctx = TransferCtx::new();
+        ctx.request.path = "/justshare".into();
+        ctx.request.host = "server".into();
+        ctx.request.user = Some("user".into());
+        let err = HANDLER.do_it(&mut ctx).await.unwrap_err();
+        assert_eq!(err.code(), CurlCode::UrlMalformat);
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_missing_user_is_login_denied() {
+        // A valid share/path but no username → `CURLE_LOGIN_DENIED`
+        // (← `smb_connect`'s username requirement), before the transport check.
+        let mut ctx = TransferCtx::new();
+        ctx.request.path = "/share/file.txt".into();
+        ctx.request.host = "server".into();
+        let err = HANDLER.do_it(&mut ctx).await.unwrap_err();
+        assert_eq!(err.code(), CurlCode::LoginDenied);
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_without_transport_is_couldnt_connect() {
+        // Valid share + credentials but no `ctx.io` installed → the transport
+        // guard fires with `CURLE_COULDNT_CONNECT`.
+        let mut ctx = TransferCtx::new();
+        ctx.request.path = "/share/file.txt".into();
+        ctx.request.host = "server".into();
+        ctx.request.user = Some("user".into());
+        ctx.request.password = Some("pass".into());
+        let err = HANDLER.do_it(&mut ctx).await.unwrap_err();
+        assert_eq!(err.code(), CurlCode::CouldntConnect);
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_downloads_over_duplex() {
+        // Drive the *whole* SMB exchange through `do_it` over one in-memory
+        // stream: NEGOTIATE → SESSION SETUP → TREE CONNECT → OPEN → READ →
+        // CLOSE → TREE DISCONNECT, and assert the sink received the file bytes.
+        let (client, mut server) = duplex(64 * 1024);
+        let challenge = [0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18];
+        let session_key = 0x1234_5678u32;
+        let (uid, tid, fid) = (0x0055u16, 0x00abu16, 0x00cdu16);
+        let file = b"hello, smb world!".to_vec();
+        let file_len = file.len() as i64;
+        let file_srv = file.clone();
+
+        let server_task = tokio::spawn(async move {
+            let neg = recv_one(&mut server).await;
+            assert_eq!(neg[8], SMB_COM_NEGOTIATE);
+            server
+                .write_all(&negotiate_response(session_key, challenge))
+                .await
+                .unwrap();
+            let setup = recv_one(&mut server).await;
+            assert_eq!(setup[8], SMB_COM_SETUP_ANDX);
+            server.write_all(&setup_response(uid, 0)).await.unwrap();
+
+            let tc = recv_one(&mut server).await;
+            assert_eq!(tc[8], SMB_COM_TREE_CONNECT_ANDX);
+            server
+                .write_all(&tree_connect_response(uid, tid, 0))
+                .await
+                .unwrap();
+            let op = recv_one(&mut server).await;
+            assert_eq!(op[8], SMB_COM_NT_CREATE_ANDX);
+            server
+                .write_all(&nt_create_response(uid, tid, fid, file_len, 0, 0))
+                .await
+                .unwrap();
+            let rd = recv_one(&mut server).await;
+            assert_eq!(rd[8], SMB_COM_READ_ANDX);
+            server
+                .write_all(&read_andx_response(uid, tid, &file_srv))
+                .await
+                .unwrap();
+            let cl = recv_one(&mut server).await;
+            assert_eq!(cl[8], SMB_COM_CLOSE);
+            server.write_all(&ok_response(uid, tid)).await.unwrap();
+            let td = recv_one(&mut server).await;
+            assert_eq!(td[8], SMB_COM_TREE_DISCONNECT);
+            server.write_all(&ok_response(uid, tid)).await.unwrap();
+        });
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = TransferCtx::new();
+        ctx.request.path = "/share/dir/file.txt".into();
+        ctx.request.host = "server".into();
+        ctx.request.user = Some("user".into());
+        ctx.request.password = Some("pass".into());
+        ctx.io = Some(Box::new(client));
+        ctx.sink = Some(Box::new(RecordingSink(received.clone())));
+
+        let done = HANDLER.do_it(&mut ctx).await.unwrap();
+        assert!(done, "do_it drives the exchange to completion");
+        assert_eq!(*received.lock().unwrap(), file);
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_uploads_body_over_duplex() {
+        // Upload path: the in-memory body is the read source and its length is
+        // the up-front size. Assert the server received the payload verbatim.
+        let (client, mut server) = duplex(64 * 1024);
+        let (uid, tid, fid) = (0x0007u16, 0x0008u16, 0x0009u16);
+        let payload = b"upload me over the handler".to_vec();
+        let dlen = payload.len();
+
+        let server_task = tokio::spawn(async move {
+            recv_one(&mut server).await; // NEGOTIATE
+            server
+                .write_all(&negotiate_response(0, [0u8; 8]))
+                .await
+                .unwrap();
+            recv_one(&mut server).await; // SESSION SETUP
+            server.write_all(&setup_response(uid, 0)).await.unwrap();
+            recv_one(&mut server).await; // TREE CONNECT
+            server
+                .write_all(&tree_connect_response(uid, tid, 0))
+                .await
+                .unwrap();
+            recv_one(&mut server).await; // OPEN
+            server
+                .write_all(&nt_create_response(uid, tid, fid, 0, 0, 0))
+                .await
+                .unwrap();
+            // WRITE_ANDX: 68-byte header then payload; data begins at offset 68.
+            let wr = recv_one(&mut server).await;
+            assert_eq!(wr[8], SMB_COM_WRITE_ANDX);
+            let got = u16::from_le_bytes([wr[57], wr[58]]) as usize;
+            let received = wr[68..68 + got].to_vec();
+            server
+                .write_all(&write_andx_response(uid, tid, got as u16))
+                .await
+                .unwrap();
+            recv_one(&mut server).await; // CLOSE
+            server.write_all(&ok_response(uid, tid)).await.unwrap();
+            recv_one(&mut server).await; // TREE DISCONNECT
+            server.write_all(&ok_response(uid, tid)).await.unwrap();
+            received
+        });
+
+        let mut ctx = TransferCtx::new();
+        ctx.request.path = "/share/out.bin".into();
+        ctx.request.host = "server".into();
+        ctx.request.user = Some("user".into());
+        ctx.request.password = Some("pass".into());
+        ctx.request.upload = true;
+        ctx.request.body = Some(payload.clone());
+        ctx.io = Some(Box::new(client));
+
+        let done = HANDLER.do_it(&mut ctx).await.unwrap();
+        assert!(done);
+        let received = server_task.await.unwrap();
+        assert_eq!(received.len(), dlen);
+        assert_eq!(received, payload);
     }
 }

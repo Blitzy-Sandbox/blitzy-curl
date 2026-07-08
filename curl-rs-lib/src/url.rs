@@ -494,7 +494,9 @@ impl SchemeHandler {
 // Precomputed flag combinations matching the curl handler definitions, kept as
 // module-private aliases so the registry reads cleanly and stays in sync with
 // `lib/*.c`.
+#[cfg(feature = "http")]
 const F_HTTP: u32 = protopt::CREDSPERREQUEST | protopt::USERPWDCTRL | protopt::CONN_REUSE;
+#[cfg(feature = "http")]
 const F_HTTPS: u32 = protopt::SSL
     | protopt::CREDSPERREQUEST
     | protopt::ALPN
@@ -502,6 +504,7 @@ const F_HTTPS: u32 = protopt::SSL
     | protopt::CONN_REUSE;
 const F_WS: u32 = protopt::CREDSPERREQUEST | protopt::USERPWDCTRL;
 const F_WSS: u32 = protopt::SSL | protopt::CREDSPERREQUEST | protopt::USERPWDCTRL;
+#[cfg(feature = "ftp")]
 const F_FTP: u32 = protopt::DUAL
     | protopt::CLOSEACTION
     | protopt::NEEDSPWD
@@ -509,6 +512,7 @@ const F_FTP: u32 = protopt::DUAL
     | protopt::WILDCARD
     | protopt::SSL_REUSE
     | protopt::CONN_REUSE;
+#[cfg(feature = "ftp")]
 const F_FTPS: u32 = protopt::SSL
     | protopt::DUAL
     | protopt::CLOSEACTION
@@ -520,44 +524,56 @@ const F_FTPS: u32 = protopt::SSL
 const F_SFTP: u32 = protopt::NEEDSPWD;
 #[cfg(feature = "scp")]
 const F_SCP: u32 = protopt::DIRLOCK | protopt::CLOSEACTION | protopt::NEEDSPWD;
+#[cfg(feature = "imap")]
 const F_IMAP: u32 = protopt::CLOSEACTION
     | protopt::NEEDSPWD
     | protopt::URLOPTIONS
     | protopt::SSL_REUSE
     | protopt::CONN_REUSE;
+#[cfg(feature = "imap")]
 const F_IMAPS: u32 = protopt::CLOSEACTION
     | protopt::SSL
     | protopt::NEEDSPWD
     | protopt::URLOPTIONS
     | protopt::CONN_REUSE;
+#[cfg(feature = "pop3")]
 const F_POP3: u32 = protopt::CLOSEACTION
     | protopt::NEEDSPWD
     | protopt::URLOPTIONS
     | protopt::SSL_REUSE
     | protopt::CONN_REUSE;
+#[cfg(feature = "pop3")]
 const F_POP3S: u32 = protopt::CLOSEACTION
     | protopt::SSL
     | protopt::NEEDSPWD
     | protopt::NOURLQUERY
     | protopt::URLOPTIONS
     | protopt::CONN_REUSE;
+#[cfg(feature = "smtp")]
 const F_SMTP: u32 = protopt::URLOPTIONS | protopt::SSL_REUSE | protopt::CONN_REUSE;
+#[cfg(feature = "smtp")]
 const F_SMTPS: u32 = protopt::CLOSEACTION
     | protopt::SSL
     | protopt::NOURLQUERY
     | protopt::URLOPTIONS
     | protopt::CONN_REUSE;
+#[cfg(feature = "telnet")]
 const F_TELNET: u32 = protopt::NONE | protopt::NOURLQUERY;
+#[cfg(feature = "dict")]
 const F_DICT: u32 = protopt::NONE | protopt::NOURLQUERY;
+#[cfg(feature = "tftp")]
 const F_TFTP: u32 = protopt::NOTCPPROXY | protopt::NOURLQUERY;
 const F_LDAP: u32 = protopt::NONE | protopt::NOURLQUERY;
 const F_LDAPS: u32 = protopt::SSL | protopt::NOURLQUERY;
 const F_SMB: u32 = protopt::CONN_REUSE;
 const F_SMBS: u32 = protopt::SSL | protopt::CONN_REUSE;
+#[cfg(feature = "rtsp")]
 const F_RTSP: u32 = protopt::CONN_REUSE;
 const F_GOPHER: u32 = protopt::NONE;
 const F_GOPHERS: u32 = protopt::SSL;
+#[cfg(feature = "mqtt")]
 const F_MQTT: u32 = protopt::NONE;
+#[cfg(feature = "mqtt")]
 const F_MQTTS: u32 = protopt::SSL;
 const F_FILE: u32 = protopt::NONETWORK | protopt::NOURLQUERY;
 

@@ -82,8 +82,9 @@
 //!
 //! # Memory safety
 //!
-//! The crate root's `#![forbid(unsafe_code)]` applies here: this module — like
-//! all of `curl-rs-lib/src/` — contains **zero** `unsafe`. All manual
+//! The crate root's compiler-enforced safe-code policy (declared in `lib.rs`)
+//! applies here: this module — like all of `curl-rs-lib/src/` — contains
+//! **zero** memory-unchecked code. All manual
 //! `malloc`/`free`/`realloc` bookkeeping from `lib/gopher.c` (the `gopherpath`
 //! allocation, the `buf_alloc` decode buffer, and their `curlx_free` calls)
 //! is subsumed by Rust ownership: [`String`]/[`Vec<u8>`] free themselves.
@@ -453,16 +454,81 @@ impl Protocol for GopherHandler {
     /// response in one call and sets `*done = TRUE` unconditionally, so the DO
     /// phase always completes in a single step: this returns `Ok(true)`.
     ///
-    /// The concrete transfer — selector construction, the partial-write send
-    /// loop, and the EOF-framed receive — is implemented and exercised by
-    /// [`perform`] and its helpers. Those run once the [`TransferCtx`] carries a
-    /// live connection and the client read/write callbacks; the context is the
-    /// crate-wide, deliberately-empty placeholder today (the [`Protocol`]
-    /// subsystem is not yet wired to `transfer`/`multi`), so this adapter
-    /// contributes only curl's `*done = TRUE` signal.
+    /// Drives the concrete transfer over the connection byte stream
+    /// ([`TransferCtx::io`]): the selector is built from the URL path and
+    /// optional query ([`build_selector`]), sent with its `"\r\n"` terminator
+    /// (partial-write tolerant, exactly as [`send_request`]), and the
+    /// EOF-framed response body is streamed to the download sink
+    /// ([`TransferCtx::sink`]) in bounded [`RECV_CHUNK`] pieces (as
+    /// [`receive_response`]). Gopher is strict half-duplex, so the send
+    /// completes fully before the receive begins. `gophers` reaches this same
+    /// code with a [`TlsStream`] behind [`TransferCtx::io`] (see [`connect_tls`]),
+    /// mirroring `gopher.c` running one `gopher_do` for both schemes.
+    ///
+    /// The selector echo that curl routes to `CLIENTWRITE_HEADER` is not
+    /// duplicated into the body here: [`TransferCtx`] exposes only a body sink,
+    /// matching a plain `gopher://` fetch where the selector is not part of the
+    /// output.
+    ///
+    /// # Errors
+    ///
+    /// [`CURLE_URL_MALFORMAT`](crate::error::CurlCode::UrlMalformat) if the
+    /// selector fails `REJECT_ZERO` decoding, [`CURLE_COULDNT_CONNECT`](crate::error::CurlCode::CouldntConnect)
+    /// if no connection stream is present, and the send/receive I/O errors
+    /// ([`CurlCode::SendError`] / [`CurlCode::RecvError`]) surfaced by the stream.
     fn do_it<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
-        let _ = ctx;
-        Box::pin(async { Ok(true) })
+        Box::pin(async move {
+            // Build the selector first: an owned `Vec`, so the immutable borrow
+            // of `ctx.request` is released before the transport/sink borrows.
+            let selector = build_selector(&ctx.request.path, ctx.request.query.as_deref())?;
+
+            // Disjoint field borrows: the connection byte stream and the sink.
+            let stream = ctx.io.as_deref_mut().ok_or_else(|| {
+                Error::with_context(
+                    CurlCode::CouldntConnect,
+                    "[GOPHER] no connection stream for the request",
+                )
+            })?;
+            let mut sink = ctx.sink.as_deref_mut();
+
+            // --- Send: the selector (tolerating partial writes), then the
+            // "\r\n" terminator, then flush (← the transmit half of gopher_do,
+            // identical to `send_request`).
+            let mut remaining: &[u8] = &selector;
+            while !remaining.is_empty() {
+                let n = stream.write(remaining).await.map_err(|_| send_error())?;
+                if n == 0 {
+                    // The peer accepts no more data: curl's send loop would spin
+                    // on SOCKET_WRITABLE and ultimately fail. Report it now.
+                    return Err(send_error());
+                }
+                // The AsyncWrite contract guarantees `n <= remaining.len()`;
+                // clamp defensively (curl's `DEBUGASSERT`) against a slice panic.
+                let n = n.min(remaining.len());
+                remaining = &remaining[n..];
+            }
+            stream
+                .write_all(GOPHER_EOL.as_slice())
+                .await
+                .map_err(|_| send_error())?;
+            stream.flush().await.map_err(|_| send_error())?;
+
+            // --- Receive: stream the EOF-framed response body to the sink in
+            // bounded chunks (← `Curl_xfer_setup_recv(data, FIRSTSOCKET, -1)`);
+            // Gopher has no length framing, so EOF (a zero-length read) is the
+            // only end-of-body signal.
+            let mut buf = [0u8; RECV_CHUNK];
+            loop {
+                let n = stream.read(&mut buf).await.map_err(|_| Error::Recv)?;
+                if n == 0 {
+                    break;
+                }
+                if let Some(sink) = sink.as_deref_mut() {
+                    sink.write(&buf[..n])?;
+                }
+            }
+            Ok(true)
+        })
     }
 
     /// DONE phase (← the `done` slot of `struct Curl_handler`). `gopher.c`
@@ -489,8 +555,10 @@ impl Protocol for GopherHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::TransferSink;
     use std::io;
     use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -916,11 +984,75 @@ mod tests {
     // PHASE 3 — the `Protocol` handler adapter.
     // ---------------------------------------------------------------------
 
+    /// A shared-buffer [`TransferSink`] recording delivered body chunks, so a
+    /// test can assert what the handler streamed to the download.
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+    impl TransferSink for RecordingSink {
+        fn write(&mut self, data: &[u8]) -> Result<()> {
+            self.0.lock().expect("sink lock").extend_from_slice(data);
+            Ok(())
+        }
+    }
+
     #[tokio::test]
-    async fn handler_do_it_completes_in_one_step() {
+    async fn handler_do_it_drives_selector_and_streams_body_to_sink() {
+        // The DO phase must build the selector from the ctx path, send it with
+        // its terminator, and stream the EOF-framed reply to the sink (←
+        // `gopher_do` performing the whole exchange and setting `*done = TRUE`).
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut req = Vec::new();
+            let mut buf = [0u8; 256];
+            loop {
+                let n = server_io.read(&mut buf).await.expect("server read");
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+                if req.ends_with(b"\r\n") {
+                    break;
+                }
+            }
+            server_io
+                .write_all(b"gopher-body-bytes")
+                .await
+                .expect("server write");
+            server_io.flush().await.expect("server flush");
+            // Drop the server half so the client's EOF-framed receive completes.
+            drop(server_io);
+            req
+        });
+
+        let collected = Arc::new(Mutex::new(Vec::new()));
         let mut ctx = TransferCtx::new();
-        let done = HANDLER.do_it(&mut ctx).await.expect("do_it ok");
+        ctx.request.path = "/1caption".to_string();
+        ctx.io = Some(Box::new(client_io));
+        ctx.sink = Some(Box::new(RecordingSink(Arc::clone(&collected))));
+
+        let done = HANDLER
+            .do_it(&mut ctx)
+            .await
+            .expect("do_it drives the gopher exchange");
         assert!(done, "gopher_do sets *done = TRUE unconditionally");
+
+        let req = server.await.expect("server task joins");
+        // "/1caption" drops the leading '/' + item-type '1' -> selector "caption".
+        assert_eq!(req.as_slice(), &b"caption\r\n"[..]);
+        assert_eq!(
+            collected.lock().expect("sink").as_slice(),
+            &b"gopher-body-bytes"[..],
+            "the EOF-framed body is streamed to the sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_without_a_stream_reports_couldnt_connect() {
+        // A request with no connection stream must surface CURLE_COULDNT_CONNECT
+        // rather than silently succeeding (gopher always needs a connection).
+        let mut ctx = TransferCtx::new();
+        ctx.request.path = "/1x".to_string();
+        let err = HANDLER.do_it(&mut ctx).await.unwrap_err();
+        assert_eq!(err.code(), CurlCode::CouldntConnect);
     }
 
     #[tokio::test]

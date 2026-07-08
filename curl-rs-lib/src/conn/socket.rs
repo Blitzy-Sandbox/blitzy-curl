@@ -1038,7 +1038,7 @@ impl SocketFilter {
         let remote = self
             .remote
             .as_inet()
-            .ok_or_else(|| Error::Code(CurlCode::FailedInit))?;
+            .ok_or(Error::Code(CurlCode::FailedInit))?;
         let opts = self.opts.clone();
         let bind = self.local_bind.clone();
         let deadline = self.connect_timeout;
@@ -1056,7 +1056,7 @@ impl SocketFilter {
         let remote = self
             .remote
             .as_inet()
-            .ok_or_else(|| Error::Code(CurlCode::FailedInit))?;
+            .ok_or(Error::Code(CurlCode::FailedInit))?;
         let deadline = self.connect_timeout;
 
         let (socket, ip) = udp_connect_inner(remote, deadline).await?;
@@ -1072,7 +1072,7 @@ impl SocketFilter {
             .remote
             .as_unix()
             .map(|(p, a)| (p.to_string(), a))
-            .ok_or_else(|| Error::Code(CurlCode::FailedInit))?;
+            .ok_or(Error::Code(CurlCode::FailedInit))?;
         let deadline = self.connect_timeout;
 
         let (stream, ip) = unix_connect_inner(&path, abstract_ns, deadline).await?;
@@ -1094,7 +1094,7 @@ impl SocketFilter {
         let listener = self
             .listener
             .take()
-            .ok_or_else(|| Error::Code(CurlCode::FailedInit))?;
+            .ok_or(Error::Code(CurlCode::FailedInit))?;
 
         let result = match deadline {
             Some(dur) => match timeout(dur, listener.accept()).await {

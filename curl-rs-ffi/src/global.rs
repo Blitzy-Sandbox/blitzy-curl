@@ -1007,10 +1007,9 @@ fn parsedate(bytes: &[u8]) -> Option<i64> {
             }
 
             // Otherwise a plain number, bounded to 8 digits (max 99_999_999).
-            let (num, p) = match str_number(bytes, tok_start, 99_999_999) {
-                Some(v) => v,
-                None => return None, // failed to convert
-            };
+            // `?` propagates the `None` (failed conversion) identically to the
+            // former explicit `match ... { None => return None }`.
+            let (num, p) = str_number(bytes, tok_start, 99_999_999)?;
             let num_digits = p - tok_start;
             let val = num as u32;
 

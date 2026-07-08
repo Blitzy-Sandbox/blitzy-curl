@@ -60,14 +60,14 @@
 //! (curl's `Curl_debug`/`CURLINFO_HEADER_IN`/`CURLINFO_HEADER_OUT`). Forwarding
 //! response lines to the application as `CLIENTWRITE_INFO` "headers" is a
 //! transfer-layer concern that operates on the easy handle; it is applied by the
-//! transfer layer once the shared per-transfer context (currently the
-//! placeholder [`crate::protocols::TransferCtx`]) carries that handle, exactly as
-//! curl routes `Curl_client_write` through `data` rather than through the
-//! protocol vtable.
+//! transfer layer once the ping-pong based protocols are wired into transfer
+//! dispatch. The per-transfer [`crate::protocols::TransferCtx`] already carries
+//! the response sink (curl's `Curl_client_write` path), exactly as curl routes
+//! `Curl_client_write` through `data` rather than through the protocol vtable.
 //!
 //! # Safety
 //!
-//! This module honours the crate-wide `#![forbid(unsafe_code)]` lint: it uses
+//! This module honours the crate-wide `#![forbid(...)]` safe-code lint: it uses
 //! only safe `std`/`bytes` operations — no raw pointers, no manual allocation,
 //! and no FFI — so it introduces no memory-safety obligations of its own.
 
@@ -694,7 +694,7 @@ impl PingPong {
                 direction = "in",
                 "{}",
                 String::from_utf8_lossy(&self.recvbuf[..length])
-                    .trim_end_matches(|c| c == '\r' || c == '\n')
+                    .trim_end_matches(['\r', '\n'])
             );
 
             // Ask the protocol whether this line ends the (multi-line) response.
@@ -705,7 +705,7 @@ impl PingPong {
                 // next `readresp`. Any bytes past it become `overflow`.
                 let len = self.recvbuf.len();
                 self.nfinal = length;
-                self.overflow = if len > length { len - length } else { 0 };
+                self.overflow = len.saturating_sub(length);
                 *size = self.nread_resp; // size of the response
                 self.nread_resp = 0; // restart for the next response
                 return Ok(true);

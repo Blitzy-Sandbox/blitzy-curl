@@ -59,19 +59,21 @@
 //!
 //! [`HANDLER`] is the `&'static dyn Protocol` singleton the scheme table in
 //! [`crate::protocols`] points `file` at. Its trait methods reproduce FILE's
-//! phase results — connect and DO both complete in a single shot
-//! (curl sets `*done = TRUE`), and teardown is a no-op close — which is all the
-//! current, intentionally empty [`TransferCtx`] placeholder can carry. As
-//! `TransferCtx` grows (see its `TODO(wiring)` note) the handler dispatches to
-//! the engine functions above; the engine is complete today so that wiring is
-//! pure plumbing.
+//! phase results: connect completes in a single shot (curl sets `*done = TRUE`),
+//! the DO phase resolves the URL path from the [`TransferCtx`] request and
+//! drives the engine — [`download`] for a fetch or [`upload`] for a
+//! `--upload-file`, streaming the body to the transfer's download sink — and
+//! teardown is a no-op close (local I/O owns nothing beyond the open file,
+//! which the transfer state drops). Because file descriptors cannot be
+//! `select()`-ed, the DO phase performs the whole transfer in one call and
+//! reports completion, exactly as `file_do` sets `*done = TRUE`.
 //!
 //! # Safety
 //!
-//! Written entirely in safe Rust: no `unsafe`, no raw file descriptors, no
-//! `libc` — only [`std::fs`]-style paths via [`tokio::fs`]. The crate root's
-//! `#![forbid(unsafe_code)]` is enforced here, and this module is one of the
-//! audited no-`unsafe` zones. It depends only on [`crate::protocols`] and
+//! Written entirely in safe Rust: no escape-hatch blocks, no raw file
+//! descriptors, no `libc` — only [`std::fs`]-style paths via [`tokio::fs`]. The
+//! crate root's `#![forbid(...)]` safe-code lint is enforced here, and this
+//! module is one of the audited safe-code zones. It depends only on [`crate::protocols`] and
 //! [`crate::error`].
 
 use std::borrow::Cow;
@@ -84,7 +86,7 @@ use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::error::{CurlCode, Error, Result};
-use crate::protocols::{ProtoFuture, Protocol, TransferCtx};
+use crate::protocols::{ProtoFuture, Protocol, TransferCtx, TransferSink};
 
 // ===========================================================================
 // Buffer sizes and permissions — curl defaults reproduced verbatim.
@@ -137,6 +139,22 @@ pub enum TimeCond {
     /// `CURL_TIMECOND_LASTMOD` — behaves like [`TimeCond::IfModifiedSince`] for
     /// the comparison (curl's `switch` folds `LASTMOD` into the default arm).
     LastModified = 3,
+}
+
+impl TimeCond {
+    /// Map a raw `CURL_TIMECOND_*` integer (as carried by
+    /// [`TransferRequest::time_condition`](crate::protocols::TransferRequest::time_condition))
+    /// to a [`TimeCond`]. Any unrecognized value folds to [`TimeCond::None`],
+    /// matching curl's `switch` default (no condition ⇒ always transfer).
+    #[must_use]
+    pub fn from_raw(value: i32) -> Self {
+        match value {
+            1 => TimeCond::IfModifiedSince,
+            2 => TimeCond::IfUnmodifiedSince,
+            3 => TimeCond::LastModified,
+            _ => TimeCond::None,
+        }
+    }
 }
 
 /// Evaluate a `CURLOPT_TIMECONDITION` against a document's modification time
@@ -315,7 +333,7 @@ fn urldecode_reject_zero(input: &str) -> Result<Vec<u8>> {
 
 /// Build a [`PathBuf`] from raw decoded bytes. On Unix the bytes are used
 /// verbatim (paths are arbitrary NUL-free byte strings there); on other targets
-/// they are interpreted lossily as UTF-8. No `unsafe` is involved — the Unix
+/// they are interpreted lossily as UTF-8. No escape-hatch code is involved — the Unix
 /// path is built through the safe [`std::os::unix::ffi::OsStrExt`] adapter.
 #[cfg(unix)]
 fn bytes_to_path(bytes: &[u8]) -> PathBuf {
@@ -509,7 +527,7 @@ pub struct DownloadOutcome {
 ///   the target is a directory, or the seek did not land on the requested
 ///   offset.
 /// * [`CurlCode::WriteError`] — the sink rejected header or body bytes.
-pub async fn download<W: ClientWrite + ?Sized>(
+pub async fn download<W: ClientWrite>(
     path: &Path,
     sink: &mut W,
     req: &DownloadRequest,
@@ -652,7 +670,7 @@ pub async fn download<W: ClientWrite + ?Sized>(
 /// and `remaining` is decremented, so the loop stops after exactly
 /// `expected_size` bytes (reproducing curl's high-water behavior); otherwise it
 /// reads until EOF. Returns the number of body bytes written.
-async fn stream_file_body<W: ClientWrite + ?Sized>(
+async fn stream_file_body<W: ClientWrite>(
     file: &mut fs::File,
     sink: &mut W,
     size_known: bool,
@@ -687,7 +705,7 @@ async fn stream_file_body<W: ClientWrite + ?Sized>(
 /// Render a directory as a newline-separated listing (← curl's
 /// `opendir`/`readdir` branch), skipping entries whose name begins with `.`.
 /// Returns the number of body bytes written.
-async fn write_directory_listing<W: ClientWrite + ?Sized>(
+async fn write_directory_listing<W: ClientWrite>(
     path: &Path,
     sink: &mut W,
 ) -> Result<u64> {
@@ -776,7 +794,7 @@ pub struct UploadOutcome {
 ///   writing, or its size could not be determined for a negative resume.
 /// * [`CurlCode::ReadError`] — reading from `source` failed.
 /// * [`CurlCode::SendError`] — writing to the destination failed or was short.
-pub async fn upload<R: AsyncRead + Unpin + ?Sized>(
+pub async fn upload<R: AsyncRead + Unpin>(
     path: &Path,
     source: &mut R,
     req: &UploadRequest,
@@ -879,6 +897,45 @@ pub async fn upload<R: AsyncRead + Unpin + ?Sized>(
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FileProtocol;
 
+/// Adapts the transfer's body [`TransferSink`] to the engine's [`ClientWrite`]
+/// contract for the DO phase: **body** bytes are forwarded to the download sink
+/// while the synthesized **header** bytes curl routes to `CLIENTWRITE_HEADER`
+/// are dropped (a plain `file://` fetch surfaces only the body; there is no
+/// header sink in [`TransferCtx`]). Holds `None` when the transfer installed no
+/// download sink, in which case the body is discarded and the transfer still
+/// completes — the engine's byte accounting is unaffected.
+struct SinkClientWrite<'s>(&'s mut dyn TransferSink);
+
+impl ClientWrite for SinkClientWrite<'_> {
+    fn write_header(&mut self, _data: &[u8]) -> Result<()> {
+        // No header sink in this context (← a header callback that writes
+        // nowhere visible for a plain FILE fetch).
+        Ok(())
+    }
+
+    fn write_body(&mut self, data: &[u8]) -> Result<()> {
+        self.0.write(data)
+    }
+}
+
+/// A [`ClientWrite`] that discards every byte, used when the transfer installed
+/// no download sink (← curl still runs the do-phase and its byte accounting even
+/// when the write callback has nowhere to go — e.g. `-o /dev/null`-style sinks).
+/// Keeping the download path uniform (always driven through a `ClientWrite`)
+/// mirrors `file_do`, which always calls `Curl_client_write` regardless of the
+/// user's output configuration.
+struct DiscardClientWrite;
+
+impl ClientWrite for DiscardClientWrite {
+    fn write_header(&mut self, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    fn write_body(&mut self, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+}
+
 impl Protocol for FileProtocol {
     /// Prepare FILE state before the transfer (← `file_setup_connection`, which
     /// merely allocates the `FILEPROTO` scratch struct). Nothing to do here
@@ -901,12 +958,83 @@ impl Protocol for FileProtocol {
     /// The DO phase (← `file_do`): read for a download or write for an upload.
     /// curl performs the entire FILE do-phase in one call (`*done = TRUE`,
     /// unconditionally), because file descriptors cannot be `select()`-ed like
-    /// sockets; this reports the DO phase as complete. The actual transfer is
-    /// carried out by [`download`] / [`upload`] once the context supplies the
-    /// resolved path, the direction, and the request options.
+    /// sockets; this reports the DO phase as complete once the transfer is done.
+    ///
+    /// The URL path ([`TransferCtx::request`]'s `path`) is resolved to a local
+    /// filesystem path by [`resolve_url_path`], then the direction is chosen
+    /// from [`TransferRequest::upload`](crate::protocols::TransferRequest::upload):
+    ///
+    /// * **Upload** — the request body ([`TransferRequest::body`](crate::protocols::TransferRequest::body))
+    ///   is written to the destination by [`upload`], honoring
+    ///   [`resume_from`](crate::protocols::TransferRequest::resume_from) for the
+    ///   append-vs-truncate decision (← `file_upload`).
+    /// * **Download** — the file is streamed to the download sink
+    ///   ([`TransferCtx::sink`]) by [`download`], honoring `no_body`, the
+    ///   resume/range offsets, and the time condition (← `file_do`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the errors of [`resolve_url_path`], [`download`], and
+    /// [`upload`] (e.g. [`CurlCode::UrlMalformat`], [`CurlCode::FileCouldntReadFile`],
+    /// [`CurlCode::WriteError`]) with the frozen curl codes intact.
     fn do_it<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
-        let _ = ctx;
-        Box::pin(async { Ok(true) })
+        Box::pin(async move {
+            // Resolve the URL path to a local filesystem path (← file_connect's
+            // curlx_open target derivation). Owned `PathBuf`, so the immutable
+            // borrow of `ctx.request` ends before the sink borrow below.
+            let path = resolve_url_path(&ctx.request.path)?;
+
+            if ctx.request.upload {
+                // ── Upload branch (← file_upload). The payload is the in-memory
+                // request body; its length is the known upload size.
+                let up_req = UploadRequest {
+                    resume_from: ctx.request.resume_from,
+                    infilesize: ctx
+                        .request
+                        .body
+                        .as_ref()
+                        .map_or(-1, |b| b.len() as i64),
+                    new_file_perms: DEFAULT_NEW_FILE_PERMS,
+                };
+                // `&[u8]` implements `AsyncRead`; an absent body is an empty
+                // source (a zero-byte upload, exactly as curl would send).
+                let mut source: &[u8] = ctx.request.body.as_deref().unwrap_or(&[]);
+                upload(&path, &mut source, &up_req).await?;
+            } else {
+                // ── Download branch (← file_do). Map the request options to the
+                // engine's inputs; `resume_from`/`maxdownload` are the values
+                // curl's `Curl_range` computes at the transfer layer.
+                let dl_req = DownloadRequest {
+                    no_body: ctx.request.no_body,
+                    range_requested: ctx.request.range.is_some(),
+                    resume_from: ctx.request.resume_from,
+                    maxdownload: ctx.request.maxdownload,
+                    timecondition: TimeCond::from_raw(ctx.request.time_condition),
+                    timevalue: ctx.request.time_value,
+                };
+                // Adapt the transfer's body sink to the engine's `ClientWrite`:
+                // body bytes go to the sink; the synthesized headers curl routes
+                // to `CLIENTWRITE_HEADER` have no header sink here and are
+                // dropped (a plain `file://` fetch shows only the body). The
+                // `Option` is unwrapped to a bare `&mut dyn TransferSink` *before*
+                // the adapter is built so the trait-object lifetime shortens to
+                // the borrow (an `Option<&mut dyn …>` field would force the
+                // pointee `'static` under `&mut`'s invariance). A missing sink
+                // still runs the full do-phase through a discarding writer,
+                // exactly as `file_do` always calls the client-write path.
+                match ctx.sink.as_deref_mut() {
+                    Some(s) => {
+                        let mut sink = SinkClientWrite(s);
+                        download(&path, &mut sink, &dl_req).await?;
+                    }
+                    None => {
+                        let mut sink = DiscardClientWrite;
+                        download(&path, &mut sink, &dl_req).await?;
+                    }
+                }
+            }
+            Ok(true)
+        })
     }
 
     /// Tear down a completed (or, if `premature`, aborted) FILE transfer
@@ -954,6 +1082,7 @@ pub static HANDLER: FileProtocol = FileProtocol;
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     // ---- test scaffolding -------------------------------------------------
@@ -1022,6 +1151,28 @@ mod tests {
         fn write_body(&mut self, _: &[u8]) -> Result<()> {
             Err(Error::from(CurlCode::WriteError))
         }
+    }
+
+    /// A shared-buffer [`TransferSink`] (the transfer-layer download sink, as
+    /// opposed to the engine-facing [`ClientWrite`]) that records every chunk
+    /// the handler streams, so a test can assert what reached the download (←
+    /// the bytes curl would hand to `CURLOPT_WRITEFUNCTION`). Installed into
+    /// [`TransferCtx::sink`] to drive the handler end-to-end.
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+
+    impl TransferSink for RecordingSink {
+        fn write(&mut self, data: &[u8]) -> Result<()> {
+            self.0.lock().expect("sink lock").extend_from_slice(data);
+            Ok(())
+        }
+    }
+
+    /// Build a [`TransferCtx`] whose request path points at `path`, matching how
+    /// curl's URL parser hands `file_do` the (percent-decoded) local path.
+    fn ctx_for(path: &Path) -> TransferCtx {
+        let mut ctx = TransferCtx::new();
+        ctx.request.path = path.to_str().expect("utf-8 temp path").to_string();
+        ctx
     }
 
     // ---- constants & TimeCond --------------------------------------------
@@ -1547,13 +1698,109 @@ mod tests {
 
     #[tokio::test]
     async fn handler_phase_methods_complete() {
+        // Every lifecycle phase runs against a real file so the wired DO phase
+        // (← `file_do`) performs an actual transfer, not the former no-op. FILE
+        // completes connect and DO in a single shot (curl's `*done = TRUE`).
+        let dir = TmpDir::new("handler_phases");
+        let path = dir.join("data.txt");
+        std::fs::write(&path, b"body bytes").unwrap();
+
         let h: &dyn Protocol = &HANDLER;
-        let mut ctx = TransferCtx::new();
-        // FILE completes connect and DO in a single shot (curl's `*done = TRUE`).
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = ctx_for(&path);
+        ctx.sink = Some(Box::new(RecordingSink(Arc::clone(&collected))));
+
         h.setup_connection(&mut ctx).await.unwrap();
         assert!(h.connect(&mut ctx).await.unwrap());
         assert!(h.do_it(&mut ctx).await.unwrap());
         h.done(&mut ctx, Ok(()), false).await.unwrap();
         h.disconnect(&mut ctx, false).await.unwrap();
+
+        assert_eq!(
+            collected.lock().unwrap().as_slice(),
+            b"body bytes",
+            "the wired DO phase streams the file body to the download sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_downloads_file_to_sink() {
+        // The DO phase resolves the request path, opens the file, and streams
+        // its bytes to the transfer's download sink (← `file_do` read loop).
+        let dir = TmpDir::new("handler_dl");
+        let path = dir.join("payload.bin");
+        std::fs::write(&path, b"the quick brown fox").unwrap();
+
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = ctx_for(&path);
+        ctx.sink = Some(Box::new(RecordingSink(Arc::clone(&collected))));
+
+        let done = HANDLER.do_it(&mut ctx).await.expect("do_it downloads");
+        assert!(done, "FILE do_it reports the DO phase complete in one step");
+        assert_eq!(collected.lock().unwrap().as_slice(), b"the quick brown fox");
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_download_without_sink_still_succeeds() {
+        // curl's `file_do` always drives the client-write path; with no download
+        // sink installed the body is discarded but the DO phase still completes
+        // successfully (the discarding-writer branch, not an early error).
+        let dir = TmpDir::new("handler_dl_nosink");
+        let path = dir.join("payload.bin");
+        std::fs::write(&path, b"discarded").unwrap();
+
+        let mut ctx = ctx_for(&path);
+        // No sink installed.
+        let done = HANDLER
+            .do_it(&mut ctx)
+            .await
+            .expect("do_it completes with no sink");
+        assert!(done);
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_no_body_streams_nothing() {
+        // `-I`/`CURLOPT_NOBODY` (← `data->req.no_body`) emits headers only; the
+        // body sink must receive zero bytes while the DO phase still completes.
+        let dir = TmpDir::new("handler_nobody");
+        let path = dir.join("data.txt");
+        std::fs::write(&path, b"unseen body").unwrap();
+
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = ctx_for(&path);
+        ctx.request.no_body = true;
+        ctx.sink = Some(Box::new(RecordingSink(Arc::clone(&collected))));
+
+        assert!(HANDLER.do_it(&mut ctx).await.expect("do_it ok"));
+        assert!(
+            collected.lock().unwrap().is_empty(),
+            "no_body suppresses body delivery to the sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_uploads_body_to_file() {
+        // The upload direction (← `file_upload`) writes the request body to the
+        // destination path; a truncating (non-resume) write replaces contents.
+        let dir = TmpDir::new("handler_up");
+        let path = dir.join("dest.bin");
+
+        let mut ctx = ctx_for(&path);
+        ctx.request.upload = true;
+        ctx.request.body = Some(b"uploaded payload".to_vec());
+
+        assert!(HANDLER.do_it(&mut ctx).await.expect("do_it uploads"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"uploaded payload");
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_missing_file_surfaces_curl_code() {
+        // A download of a nonexistent path surfaces curl's frozen
+        // `CURLE_FILE_COULDNT_READ_FILE` rather than succeeding silently.
+        let dir = TmpDir::new("handler_missing");
+        let path = dir.join("nope");
+        let mut ctx = ctx_for(&path);
+        let err = HANDLER.do_it(&mut ctx).await.unwrap_err();
+        assert_eq!(err.code(), CurlCode::FileCouldntReadFile);
     }
 }

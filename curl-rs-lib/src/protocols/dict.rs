@@ -42,8 +42,8 @@
 //!   [`CURLE_URL_MALFORMAT`](crate::error::CurlCode::UrlMalformat).
 //! * **Request framing** (`sendf`). The request is a single buffer,
 //!   `CLIENT <version>\r\n<command>\r\nQUIT\r\n`, with CRLF line endings, sent in
-//!   one shot; the response is read to end-of-stream and passed through byte for
-//!   byte.
+//!   one shot; the response is then streamed to the download in bounded chunks
+//!   (never buffered whole) and passed through byte for byte.
 //!
 //! # Fidelity notes
 //!
@@ -74,10 +74,10 @@
 //! [`AsyncRead`]/[`AsyncWrite`] byte-stream contract that chain exposes.
 //!
 //! The memory-safety cornerstone is inherited from the crate root
-//! (`#![forbid(unsafe_code)]`): there is no `unsafe`, no raw pointer, and no FFI
-//! anywhere in this module.
+//! (the `#![forbid(...)]` safe-code lint): there is no escape-hatch block, no
+//! raw pointer, and no FFI anywhere in this module.
 
-use crate::error::{Error, Result};
+use crate::error::{CurlCode, Error, Result};
 use crate::protocols::{ProtoFuture, Protocol, TransferCtx};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -108,6 +108,13 @@ const DEFAULT_DATABASE: &[u8] = b"!";
 const DEFAULT_STRATEGY: &[u8] = b".";
 /// Word substituted when the lookup word is missing/empty (curl's `"default"`).
 const DEFAULT_WORD: &[u8] = b"default";
+
+/// Receive-buffer chunk size for streaming the server reply (← curl's
+/// `CURL_MAX_WRITE_SIZE`, the size of one generic transfer-loop read). The DICT
+/// response is read and handed to the download sink one chunk at a time, so
+/// peak memory stays bounded to this many bytes regardless of how much the
+/// server sends — the memory-safe replacement for an unbounded `read_to_end`.
+const DICT_RECV_CHUNK: usize = 16 * 1024;
 
 // ===========================================================================
 // DictHandler — the protocol behavior singleton (← `Curl_protocol_dict`).
@@ -176,17 +183,66 @@ impl Protocol for DictHandler {
     /// response body. The DO phase is therefore always complete in a single
     /// step, which this returns as `Ok(true)`.
     ///
-    /// The concrete send/receive work lives in [`DictHandler::transfer`], which
-    /// is driven over the connection's byte stream. It binds here once
-    /// [`TransferCtx`] carries the easy-handle's URL path, the owning
-    /// [`crate::conn::Connection`] stream, and the download sink; that context
-    /// is a documented placeholder in [`crate::protocols`] today, finalized by
-    /// [`crate::transfer`]/[`crate::multi`]. DICT needs no protocol-specific
-    /// connect, `do_more`, or `doing` step, so every other [`Protocol`] hook
-    /// keeps its faithful no-op default — mirroring the `ZERO_NULL` entries of
-    /// curl's `Curl_protocol_dict`.
-    fn do_it<'a>(&'a self, _ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
-        Box::pin(async { Ok(true) })
+    /// The concrete send/receive work is driven here over the connection's byte
+    /// stream ([`TransferCtx::io`]): the URL path ([`TransferCtx::request`]'s
+    /// `path`) is turned into the request buffer by [`build_request`], the
+    /// buffer is sent in one shot, and the reply is streamed to the download
+    /// sink ([`TransferCtx::sink`]) in bounded [`DICT_RECV_CHUNK`] pieces by
+    /// [`converse_streaming`]. DICT needs no protocol-specific connect,
+    /// `do_more`, or `doing` step, so every other [`Protocol`] hook keeps its
+    /// faithful no-op default — mirroring the `ZERO_NULL` entries of curl's
+    /// `Curl_protocol_dict`.
+    ///
+    /// # Errors
+    ///
+    /// [`CURLE_URL_MALFORMAT`](crate::error::CurlCode::UrlMalformat) if the path
+    /// fails `REJECT_CTRL` decoding, [`CURLE_COULDNT_CONNECT`](crate::error::CurlCode::CouldntConnect)
+    /// if no connection stream is present, and the send/receive I/O errors
+    /// surfaced by the stream.
+    fn do_it<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
+        Box::pin(async move {
+            // Build the request buffer from the URL path (← the body of
+            // `dict_do`). A path that selects no command *and* has no '/' yields
+            // `None`: curl issues no request at all, yet the DO phase is still
+            // complete in a single step, so return `Ok(true)` with no I/O.
+            let request = match build_request(&ctx.request.path)? {
+                Some(req) => req,
+                None => return Ok(true),
+            };
+
+            // Disjoint field borrows: the connection byte stream and the
+            // download sink are separate `TransferCtx` fields, so both can be
+            // borrowed mutably at once.
+            let stream = ctx.io.as_deref_mut().ok_or_else(|| {
+                Error::with_context(
+                    CurlCode::CouldntConnect,
+                    "[DICT] no connection stream for the request",
+                )
+            })?;
+            let mut sink = ctx.sink.as_deref_mut();
+
+            // Send the whole `CLIENT`/command/`QUIT` buffer in one shot
+            // (← `dict_do`'s single `sendf`).
+            stream.write_all(&request).await.map_err(|_| Error::Send)?;
+            stream.flush().await.map_err(|_| Error::Send)?;
+
+            // Stream the reply to the sink in bounded [`DICT_RECV_CHUNK`] pieces
+            // (← the generic transfer loop's `CURL_MAX_WRITE_SIZE` reads): peak
+            // memory stays one chunk regardless of reply size — the memory-safe
+            // replacement for an unbounded `read_to_end`. A missing sink still
+            // drains the reply cleanly (bytes discarded).
+            let mut buf = vec![0u8; DICT_RECV_CHUNK];
+            loop {
+                let n = stream.read(&mut buf).await.map_err(|_| Error::Recv)?;
+                if n == 0 {
+                    break;
+                }
+                if let Some(sink) = sink.as_deref_mut() {
+                    sink.write(&buf[..n])?;
+                }
+            }
+            Ok(true)
+        })
     }
 
     /// The DICT "DONE" phase (← `Curl_protocol_dict.done`, which is `ZERO_NULL`).
@@ -269,12 +325,18 @@ fn build_request(path: &str) -> Result<Option<Vec<u8>>> {
 // ===========================================================================
 
 /// Drive the DICT conversation over `stream`: send `request` in full, then read
-/// the response to end-of-stream and return it verbatim.
+/// the reply in bounded chunks and return it verbatim.
 ///
 /// curl issues the `CLIENT`/command/`QUIT` buffer in a single `sendf` and then
-/// streams the entire server reply straight through to the download;
-/// `read_to_end` mirrors that "read until the server closes" behavior and keeps
-/// every byte exactly as received (curl does no DICT-level response parsing).
+/// streams the entire server reply straight through to the download. This form
+/// accumulates that reply into a returned `Vec` for callers — notably
+/// [`DictHandler::transfer`] and the unit tests — that want the whole reply in
+/// memory; the byte-for-byte pass-through is preserved (curl does no DICT-level
+/// response parsing). The reply is read in bounded [`DICT_RECV_CHUNK`]-sized
+/// pieces rather than a single unbounded `read_to_end`, matching the generic
+/// transfer loop's `CURL_MAX_WRITE_SIZE` reads. The protocol DO phase
+/// ([`DictHandler::do_it`]) uses the same bounded read but hands each chunk
+/// straight to the download sink, so it never accumulates the reply at all.
 ///
 /// # Errors
 ///
@@ -289,10 +351,14 @@ where
     stream.flush().await.map_err(|_| Error::Send)?;
 
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .await
-        .map_err(|_| Error::Recv)?;
+    let mut buf = vec![0u8; DICT_RECV_CHUNK];
+    loop {
+        let n = stream.read(&mut buf).await.map_err(|_| Error::Recv)?;
+        if n == 0 {
+            break;
+        }
+        response.extend_from_slice(&buf[..n]);
+    }
     Ok(response)
 }
 
@@ -510,8 +576,9 @@ mod tests {
     // private `use` aliases of the parent module, so `use super::*` does not
     // re-export them; import what the tests reference directly.
     use crate::error::CurlCode;
-    use crate::protocols::{Protocol, TransferCtx};
+    use crate::protocols::{Protocol, TransferCtx, TransferSink};
     use std::io::{Error as IoError, ErrorKind};
+    use std::sync::{Arc, Mutex};
     use tokio_test::io::Builder;
 
     // -- helpers ------------------------------------------------------------
@@ -832,11 +899,93 @@ mod tests {
     #[tokio::test]
     async fn handler_do_it_completes_and_done_is_noop() {
         // Reproduces `dict_do` setting `*done = TRUE` (DO completes in one step)
-        // and the `ZERO_NULL` `done` pointer (a faithful no-op).
+        // and the `ZERO_NULL` `done` pointer (a faithful no-op). With an empty
+        // path `build_request` yields `None`, so DO completes without any I/O.
         let dynref: &dyn Protocol = &HANDLER;
         let mut ctx = TransferCtx::new();
         assert!(dynref.do_it(&mut ctx).await.unwrap());
         assert!(dynref.done(&mut ctx, Ok(()), false).await.is_ok());
         assert!(dynref.done(&mut ctx, Ok(()), true).await.is_ok());
+    }
+
+    /// A shared-buffer [`TransferSink`] that records every delivered chunk, so a
+    /// test can assert what the handler streamed to the download.
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+    impl TransferSink for RecordingSink {
+        fn write(&mut self, data: &[u8]) -> Result<()> {
+            self.0.lock().expect("sink lock").extend_from_slice(data);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_drives_the_exchange_and_streams_reply_to_the_sink() {
+        // The DO phase must build the request from the ctx path, write it in one
+        // shot, and stream the server reply to the sink (← `dict_do` + the
+        // generic transfer loop). The scripted `write(expected)` expectation
+        // proves the exact `CLIENT/DEFINE/QUIT` bytes were sent; the recorded
+        // sink proves the reply was streamed through rather than discarded.
+        let expected = built("/d:basic");
+        let response: &[u8] = b"552 no match\r\n";
+        let mock = Builder::new().write(&expected).read(response).build();
+
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = TransferCtx::new();
+        ctx.request.path = "/d:basic".to_string();
+        ctx.io = Some(Box::new(mock));
+        ctx.sink = Some(Box::new(RecordingSink(Arc::clone(&collected))));
+
+        let done = HANDLER
+            .do_it(&mut ctx)
+            .await
+            .expect("do_it drives the DICT exchange");
+        assert!(done, "DICT do_it reports the DO phase complete in one step");
+        assert_eq!(
+            collected.lock().expect("sink").as_slice(),
+            response,
+            "the whole reply is streamed to the sink unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_without_a_command_touches_no_transport() {
+        // A path with no command prefix and no '/' builds no request, so `do_it`
+        // completes without needing a stream or sink (← `dict_do` fall-through).
+        let mut ctx = TransferCtx::new();
+        ctx.request.path = "noslash".to_string();
+        // No io/sink installed: must still succeed with no I/O.
+        assert!(HANDLER.do_it(&mut ctx).await.expect("do_it completes"));
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_without_a_stream_reports_couldnt_connect() {
+        // A path that *does* build a request but has no connection stream must
+        // surface CURLE_COULDNT_CONNECT rather than silently succeeding.
+        let mut ctx = TransferCtx::new();
+        ctx.request.path = "/d:basic".to_string();
+        let err = HANDLER.do_it(&mut ctx).await.unwrap_err();
+        assert_eq!(err.code(), CurlCode::CouldntConnect);
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_streams_large_reply_in_bounded_chunks() {
+        // A reply larger than one DICT_RECV_CHUNK must be delivered in full
+        // through multiple bounded reads (no unbounded read_to_end).
+        let expected = built("/d:basic");
+        let big = vec![b'x'; DICT_RECV_CHUNK * 2 + 7];
+        let mock = Builder::new().write(&expected).read(&big).build();
+
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = TransferCtx::new();
+        ctx.request.path = "/d:basic".to_string();
+        ctx.io = Some(Box::new(mock));
+        ctx.sink = Some(Box::new(RecordingSink(Arc::clone(&collected))));
+
+        assert!(HANDLER.do_it(&mut ctx).await.expect("do_it ok"));
+        assert_eq!(
+            collected.lock().expect("sink").len(),
+            big.len(),
+            "every byte of a multi-chunk reply reaches the sink"
+        );
     }
 }

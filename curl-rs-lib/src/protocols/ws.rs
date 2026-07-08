@@ -43,8 +43,8 @@
 //!
 //! # Safety
 //!
-//! This module is written entirely in **safe Rust** — it contains no `unsafe`
-//! blocks, no raw pointers, and no FFI. Manual `malloc`/`free` of curl's
+//! This module is written entirely in **safe Rust** — it contains no
+//! escape-hatch blocks, no raw pointers, and no FFI. Manual `malloc`/`free` of curl's
 //! `struct websocket` and its `bufq`s is replaced by ownership; masking, length
 //! decoding, and buffering are all bounds-checked by construction. Every
 //! fallible step returns an [`Error`] carrying the exact curl [`CurlCode`].
@@ -54,12 +54,15 @@ use base64::Engine as _;
 use bytes::{Buf, BytesMut};
 use rand::RngCore as _;
 use sha1::{Digest, Sha1};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use std::os::fd::RawFd;
 
 use crate::conn::FilterChain;
 use crate::error::{CurlCode, Error, Result};
-use crate::protocols::{Pollset, ProtoFuture, Protocol, TransferCtx};
+use crate::protocols::{
+    Pollset, ProtoFuture, Protocol, TransferCtx, TransferRequest, TransferStream,
+};
 use crate::tls;
 
 // ===========================================================================
@@ -946,23 +949,36 @@ impl WsEncoder {
         Ok(())
     }
 
-    /// Mask and buffer up to `payload_remain` bytes of `buf` into `out`,
-    /// advancing the rolling XOR index (← curl `ws_enc_write_payload`).
+    /// Mask and buffer up to one [`WS_CHUNK_SIZE`] chunk of `buf`'s payload into
+    /// `out`, advancing the rolling XOR index (← curl `ws_enc_write_payload`).
     ///
-    /// Returns the number of payload bytes consumed. Unlike curl — which may
-    /// return `CURLE_AGAIN` when its bounded `bufq` fills — `out` here is a
-    /// growable buffer (curl runs this path with a `SOFT_LIMIT` bufq whose write
-    /// "always succeeds"), so this always buffers `min(buf.len, payload_remain)`.
+    /// Returns the number of payload bytes consumed. curl streams a frame's
+    /// payload through a **bounded** `bufq` (`WS_CHUNK_SIZE` bytes per chunk),
+    /// so a single call never materialises more than one chunk;
+    /// [`Websocket::enc_send`] flushes `out` to the transport between calls and
+    /// re-enters here for the next chunk. Bounding each call this way keeps the
+    /// send buffer size independent of the (possibly huge) frame size — the
+    /// growable `out` never balloons to hold the whole payload — while the
+    /// flush-between-chunks loop supplies the `CURLE_AGAIN` backpressure that
+    /// curl's bufq soft-limit provides once the transport stops draining. The
+    /// bytes are masked straight into `out` (a single reserve, with no throwaway
+    /// intermediate buffer doubling the copy and the allocation).
     fn write_payload(&mut self, buf: &[u8], out: &mut BytesMut) -> Result<usize> {
         let remain = clamp_off_to_usize(self.payload_remain);
-        let len = buf.len().min(remain);
+        // Bound the amount encoded per call to one transmit chunk so a large
+        // frame is streamed in `WS_CHUNK_SIZE` pieces rather than buffered whole.
+        let len = buf.len().min(remain).min(WS_CHUNK_SIZE);
 
         let start = self.xori as usize;
-        let mut masked = Vec::with_capacity(len);
-        for (i, &b) in buf[..len].iter().enumerate() {
-            masked.push(b ^ self.mask[(start + i) & 3]);
-        }
-        out.extend_from_slice(&masked);
+        // Mask directly into `out`: reserve once, then append the XOR-masked
+        // bytes via the byte iterator (no temporary `Vec`).
+        out.reserve(len);
+        out.extend(
+            buf[..len]
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| b ^ self.mask[(start + i) & 3]),
+        );
 
         self.xori = ((start + len) & 3) as u32;
         self.payload_remain -= usize_to_off(len);
@@ -1702,72 +1718,340 @@ pub struct WsHandler;
 /// records (`handler: &ws::HANDLER`).
 pub static HANDLER: WsHandler = WsHandler;
 
+/// Adapts the transfer's boxed byte transport ([`TransferCtx::io`], a
+/// `&mut dyn `[`TransferStream`]) to the [`WsIo`] seam the [`Websocket`] engine
+/// drives, so the exact same framing code runs over the production
+/// [`FilterChain`] and over an in-memory test pipe alike.
+///
+/// This mirrors curl, where the WebSocket engine's `nw_in_recv` / `ws_flush`
+/// bottom out in `Curl_conn_recv` / `Curl_xfer_send` regardless of whether the
+/// underlying connection filter is plaintext TCP or a TLS filter (for `wss`).
+struct AsyncIoWs<'a> {
+    stream: &'a mut dyn TransferStream,
+}
+
+impl WsIo for AsyncIoWs<'_> {
+    async fn ws_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
+        // `&mut dyn TransferStream` is `AsyncRead + Unpin`, so `read` applies.
+        self.stream.read(buf).await.map_err(|e| io_err_to_curl(&e, false))
+    }
+
+    async fn ws_send(&mut self, buf: &[u8]) -> Result<usize> {
+        // A single `write` may accept fewer bytes than offered; the engine's
+        // flush / partial-send accounting already tolerates a short count.
+        self.stream.write(buf).await.map_err(|e| io_err_to_curl(&e, true))
+    }
+}
+
+/// Map a transport [`std::io::Error`] to the curl error the WebSocket engine
+/// expects, preserving the `WouldBlock`/`Interrupted` → `CURLE_AGAIN` mapping
+/// the non-blocking send/receive loops rely on (← curl's `Curl_xfer_send` /
+/// `nw_in_recv` error sites). `dir_send` selects the directional fallback:
+/// `CURLE_SEND_ERROR` for the write path, `CURLE_RECV_ERROR` for the read path.
+fn io_err_to_curl(e: &std::io::Error, dir_send: bool) -> Error {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::WouldBlock | ErrorKind::Interrupted => again_err(),
+        _ if dir_send => send_err(format!("[WS] transport send failed: {e}")),
+        _ => recv_err(format!("[WS] transport recv failed: {e}")),
+    }
+}
+
+/// Ensure the transfer's [`TransferCtx::proto_state`] holds a [`Websocket`]
+/// engine, creating and configuring one from the request options if absent
+/// (← curl allocating the `struct websocket` in `ws_setup_conn` /
+/// `Curl_ws_accept`). Idempotent: a handshake already in progress keeps its
+/// existing engine and buffers untouched.
+fn ensure_ws_installed(ctx: &mut TransferCtx) {
+    let present = matches!(&ctx.proto_state, Some(b) if b.is::<Websocket>());
+    if !present {
+        let mut ws = Websocket::new();
+        let opts = ctx.request.ws_options;
+        ws.configure(
+            opts & CURLWS_RAW_MODE != 0,
+            opts & CURLWS_NOAUTOPONG != 0,
+            ctx.request.connect_only,
+        );
+        ctx.proto_state = Some(Box::new(ws));
+    }
+}
+
+/// Build the `Host` request-header value: bare `host` when the port is the
+/// scheme default (`80` for `ws`, `443` for `wss`) or unset, else `host:port`
+/// (← the Host emission of curl's HTTP request builder that WebSocket reuses).
+fn ws_host_header(req: &TransferRequest) -> String {
+    let default_port: u16 = if req.scheme.eq_ignore_ascii_case("wss") {
+        443
+    } else {
+        80
+    };
+    if req.port == 0 || req.port == default_port {
+        req.host.clone()
+    } else {
+        format!("{}:{}", req.host, req.port)
+    }
+}
+
+/// The upper bound on the accumulated handshake-response header block do_it will
+/// buffer before giving up (← the bounded read curl performs while parsing the
+/// `101` response). Prevents an unbounded read from a hostile or broken server.
+const WS_MAX_HANDSHAKE: usize = 128 * 1024;
+
 impl Protocol for WsHandler {
     /// Prepare the connection for a WebSocket transfer (← curl `ws_setup_conn`).
     ///
-    /// curl pins the negotiation to HTTP/1.1 here (WebSocket runs over an
-    /// HTTP/1.1 Upgrade) before deferring to the HTTP connection setup. The
-    /// version-pinning is applied once the transfer state lands in
-    /// [`TransferCtx`]; the handshake bytes themselves are produced by
-    /// [`Websocket::ws_request_headers`] / [`Websocket::build_upgrade_request`].
+    /// curl pins the negotiation to HTTP/1.1 (WebSocket runs over an HTTP/1.1
+    /// Upgrade) and allocates the per-transfer WebSocket state. The HTTP/1.1 pin
+    /// is expressed by [`wss_alpn`] — the `wss` TLS filter offers only
+    /// HTTP/1.1 — because this port layers HTTP/TLS through the connection
+    /// filter chain rather than carrying a mutable http-version enum in
+    /// [`TransferCtx`]; here we perform the state allocation, configuring the
+    /// [`Websocket`] engine from the request's `CURLOPT_WS_OPTIONS` bits so it is
+    /// ready to mint the handshake in [`do_it`](WsHandler::do_it).
     fn setup_connection<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, ()> {
-        let _ = ctx;
+        ensure_ws_installed(ctx);
         Box::pin(async { Ok(()) })
     }
 
     /// The DO phase (← curl's `do_it = Curl_http`): drive the HTTP/1.1 Upgrade
     /// request, then hand the connection over to WebSocket framing.
     ///
-    /// Once [`TransferCtx`] carries the live connection and easy handle, this
-    /// issues the upgrade request, validates the `101` response via
-    /// [`Websocket::accept`], and — for `CURLOPT_CONNECT_ONLY == 2` — yields
-    /// control to the application's `curl_ws_send`/`curl_ws_recv` calls, or else
-    /// pumps received frames to the write callback. Returns `true` to signal the
-    /// DO phase is complete (as curl's HTTP `do_it` does for a WS upgrade).
+    /// Issues the upgrade request built by [`Websocket::build_upgrade_request`],
+    /// then reads and validates the `101` response via [`Websocket::accept`]
+    /// (status `101` + `Sec-WebSocket-Accept`). For `CURLOPT_CONNECT_ONLY == 2`
+    /// the application drives `curl_ws_send`/`curl_ws_recv` afterwards; otherwise
+    /// the transfer's PERFORM phase feeds received body bytes to
+    /// [`write_resp`](WsHandler::write_resp), which decodes frames into the
+    /// client sink. Either way the DO phase itself is finished, so this returns
+    /// `true` (as curl's HTTP `do_it` does once the upgrade response is in).
     fn do_it<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
-        let _ = ctx;
-        Box::pin(async { Ok(true) })
+        Box::pin(async move {
+            // The engine is normally installed by setup_connection; create it
+            // here too so do_it is self-sufficient (e.g. when tested directly).
+            ensure_ws_installed(ctx);
+
+            // Build the Upgrade request. `path`/`host`/`extra` immutably borrow
+            // `ctx.request` while the engine mutably borrows `ctx.proto_state`
+            // (disjoint fields), and the engine mints a fresh `Sec-WebSocket-Key`.
+            let request_bytes = {
+                let path = if ctx.request.path.is_empty() {
+                    "/"
+                } else {
+                    ctx.request.path.as_str()
+                };
+                let host_hdr = ws_host_header(&ctx.request);
+                let extra: Vec<&str> =
+                    ctx.request.headers.iter().map(String::as_str).collect();
+                let engine = match ctx
+                    .proto_state
+                    .as_mut()
+                    .and_then(|b| b.downcast_mut::<Websocket>())
+                {
+                    Some(ws) => ws,
+                    None => {
+                        return Err(Error::with_context(
+                            CurlCode::FailedInit,
+                            "[WS] WebSocket engine state missing",
+                        ))
+                    }
+                };
+                engine.build_upgrade_request(path, &host_hdr, &extra)
+            };
+
+            // Send the whole handshake request (tolerating short writes). Scoped
+            // so the transport borrow ends before the accept loop reborrows it.
+            {
+                let stream = ctx.io.as_deref_mut().ok_or_else(|| {
+                    Error::with_context(
+                        CurlCode::CouldntConnect,
+                        "[WS] no transport for handshake",
+                    )
+                })?;
+                let mut io = AsyncIoWs { stream };
+                let mut off = 0usize;
+                while off < request_bytes.len() {
+                    let n = io.ws_send(&request_bytes[off..]).await?;
+                    if n == 0 {
+                        return Err(send_err(
+                            "[WS] connection closed during handshake send",
+                        ));
+                    }
+                    off += n;
+                }
+            }
+
+            // Read the server handshake until complete, then validate `101` +
+            // `Sec-WebSocket-Accept`. `accept` does not touch engine state until
+            // the header block parses, so repeated calls on a growing buffer are
+            // safe; on success it buffers any trailing body bytes for `recv`.
+            let mut resp = BytesMut::new();
+            let mut tmp = vec![0u8; WS_CHUNK_SIZE];
+            loop {
+                let accept_res = match ctx
+                    .proto_state
+                    .as_mut()
+                    .and_then(|b| b.downcast_mut::<Websocket>())
+                {
+                    Some(ws) => ws.accept(&resp),
+                    None => {
+                        return Err(Error::with_context(
+                            CurlCode::FailedInit,
+                            "[WS] WebSocket engine state missing",
+                        ))
+                    }
+                };
+                match accept_res {
+                    Ok(_leftover) => break,
+                    Err(e) if e.code() == CurlCode::Again => {
+                        if resp.len() >= WS_MAX_HANDSHAKE {
+                            return Err(recv_err_weird(
+                                "[WS] server handshake response exceeded the size limit",
+                            ));
+                        }
+                        let n = {
+                            let stream = ctx.io.as_deref_mut().ok_or_else(|| {
+                                Error::with_context(
+                                    CurlCode::CouldntConnect,
+                                    "[WS] no transport for handshake",
+                                )
+                            })?;
+                            let mut io = AsyncIoWs { stream };
+                            io.ws_recv(&mut tmp).await?
+                        };
+                        if n == 0 {
+                            return Err(Error::with_context(
+                                CurlCode::GotNothing,
+                                "[WS] connection closed during handshake",
+                            ));
+                        }
+                        resp.extend_from_slice(&tmp[..n]);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            Ok(true)
+        })
     }
 
     /// Feed a chunk of response *body* bytes into the WebSocket decoder
     /// (← the `ws_cw_decode` client writer curl installs in `Curl_ws_accept`).
     ///
-    /// In the integrated transfer the per-connection [`Websocket`] engine held
-    /// in [`TransferCtx`] receives `buf` via its decoder; until [`TransferCtx`]
-    /// exposes that engine handle, this passes through.
+    /// Appends `buf` to the per-connection [`Websocket`] engine's receive buffer
+    /// and decodes every complete frame out of it, delivering each frame's
+    /// payload to the client [`sink`](TransferCtx::sink) and flushing any
+    /// auto-PONG queued in response to a PING. A partial frame is left buffered
+    /// for the next call. `_is_eos` is unused: the WebSocket frame protocol is
+    /// self-delimiting, so end-of-stream needs no extra decode step here.
     fn write_resp<'a>(
         &'a self,
         ctx: &'a mut TransferCtx,
         buf: &'a [u8],
-        is_eos: bool,
+        _is_eos: bool,
     ) -> ProtoFuture<'a, ()> {
-        let _ = (ctx, buf, is_eos);
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            // Disjoint field borrows: the engine (`proto_state`), the transport
+            // (`io`, for flushing auto-PONGs), and the client sink.
+            let engine = match ctx
+                .proto_state
+                .as_mut()
+                .and_then(|b| b.downcast_mut::<Websocket>())
+            {
+                Some(ws) => ws,
+                None => {
+                    return Err(Error::with_context(
+                        CurlCode::FailedInit,
+                        "[WS] response bytes arrived before the WebSocket handshake",
+                    ))
+                }
+            };
+            let mut io = ctx.io.as_deref_mut().map(|stream| AsyncIoWs { stream });
+            let mut sink = ctx.sink.as_deref_mut();
+
+            engine.recvbuf.extend_from_slice(buf);
+            let mut out = vec![0u8; WS_CHUNK_SIZE];
+            loop {
+                match engine.recv_one(&mut out)? {
+                    RecvStep::Delivered(n) => {
+                        if let Some(io) = io.as_mut() {
+                            engine.send_pending_control(io).await?;
+                        }
+                        if let Some(sink) = sink.as_deref_mut() {
+                            sink.write(&out[..n])?;
+                        }
+                    }
+                    RecvStep::NeedMore => {
+                        if let Some(io) = io.as_mut() {
+                            engine.send_pending_control(io).await?;
+                        }
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Tear down a WebSocket transfer (← curl `Curl_http_done` path).
     ///
-    /// When the connection is still open and a [`Websocket`] engine is present,
-    /// a CLOSE control frame is sent before the transport is released; a dead
-    /// connection skips the graceful close. The engine-driven close lands with
-    /// the transfer state in [`TransferCtx`].
+    /// A cleanly-finished (`status` ok, not `premature`), non-raw, non-`CONNECT_
+    /// ONLY` transfer that still has a live transport is closed gracefully with
+    /// a CLOSE control frame before its state is released; an aborted or dead
+    /// connection skips the close chatter, and a `CONNECT_ONLY` WebSocket is
+    /// left for the application to close. The CLOSE is best-effort — a failed
+    /// close never overrides the transfer's outcome — after which the per-
+    /// transfer engine state is dropped (← freeing `req.p.ws`).
     fn done<'a>(
         &'a self,
         ctx: &'a mut TransferCtx,
         status: Result<()>,
         premature: bool,
     ) -> ProtoFuture<'a, ()> {
-        let _ = (ctx, status, premature);
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            let graceful = !premature && status.is_ok();
+            if graceful {
+                let want_close = matches!(
+                    ctx.proto_state
+                        .as_ref()
+                        .and_then(|b| b.downcast_ref::<Websocket>()),
+                    Some(ws) if !ws.is_raw_mode() && !ws.connect_only
+                );
+                if want_close {
+                    if let Some(engine) = ctx
+                        .proto_state
+                        .as_mut()
+                        .and_then(|b| b.downcast_mut::<Websocket>())
+                    {
+                        if let Some(stream) = ctx.io.as_deref_mut() {
+                            let mut io = AsyncIoWs { stream };
+                            // Empty-payload CLOSE frame; ignore any send error.
+                            let _ = engine.send(&mut io, &[], 0, CURLWS_CLOSE).await;
+                        }
+                    }
+                }
+            }
+            // Release the per-transfer WebSocket state.
+            ctx.proto_state = None;
+            Ok(())
+        })
     }
 
     /// Contribute desired sockets during the transfer (← curl's WS
     /// `perform_pollset`, which delegates to `Curl_http_perform_pollset`).
     ///
-    /// The concrete want-read/want-write decision is [`Websocket::adjust_pollset`];
-    /// it is invoked once [`TransferCtx`] exposes the socket and engine.
+    /// Delegates the concrete want-read/want-write decision to
+    /// [`Websocket::adjust_pollset`] (always readable; writable while outbound
+    /// bytes remain buffered), given the installed engine and the transfer's
+    /// concrete socket handle [`socket_fd`](TransferCtx::socket_fd).
     fn perform_pollset(&self, ctx: &mut TransferCtx, ps: &mut Pollset) {
-        let _ = (ctx, ps);
+        if let (Some(engine), Some(fd)) = (
+            ctx.proto_state
+                .as_ref()
+                .and_then(|b| b.downcast_ref::<Websocket>()),
+            ctx.socket_fd,
+        ) {
+            engine.adjust_pollset(fd, ps);
+        }
     }
 }
 
@@ -1779,16 +2063,19 @@ impl Protocol for WsHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::TransferSink;
     use std::future::Future;
-    use std::sync::Arc;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Wake, Waker};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-    // -- A minimal, safe (no-`unsafe`) executor --------------------------
+    // -- A minimal, fully safe executor ----------------------------------
     //
     // The engine's async methods only ever await the in-memory `MockTransport`
     // below, whose futures are always immediately ready, so a single poll with a
     // no-op waker suffices. `std::task::Wake` gives us a `Waker` without any
-    // `unsafe`, respecting the crate-wide `#![forbid(unsafe_code)]`.
+    // escape-hatch code, respecting the crate-wide `#![forbid(...)]` safe-code lint.
 
     struct NoopWake;
     impl Wake for NoopWake {
@@ -2324,5 +2611,305 @@ mod tests {
     #[test]
     fn wss_alpn_is_http_1_1_only() {
         assert_eq!(wss_alpn(), [b"http/1.1".as_slice()]);
+    }
+
+    // -- Handler lifecycle over an in-memory transport ------------------
+    //
+    // These exercise the `WsHandler` `Protocol` vtable — the DO-phase
+    // handshake, the PERFORM-phase frame decode, and the DONE-phase graceful
+    // CLOSE — end to end, with no external daemons.
+
+    /// A client body sink that captures every delivered chunk for assertion.
+    struct VecSink(Arc<Mutex<Vec<u8>>>);
+    impl TransferSink for VecSink {
+        fn write(&mut self, data: &[u8]) -> Result<()> {
+            self.0.lock().expect("sink lock").extend_from_slice(data);
+            Ok(())
+        }
+    }
+
+    /// An in-memory [`TransferStream`]: `poll_read` hands back preloaded server
+    /// bytes (0 bytes = EOF) and `poll_write` captures everything the handler
+    /// sends into a shared buffer. Every op is immediately ready, so it drives
+    /// under the crate's tiny [`block_on`] executor without a Tokio runtime.
+    struct MockStream {
+        to_recv: Vec<u8>,
+        pos: usize,
+        sent: Arc<Mutex<Vec<u8>>>,
+    }
+    impl MockStream {
+        fn new(to_recv: Vec<u8>) -> (Self, Arc<Mutex<Vec<u8>>>) {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            (
+                MockStream {
+                    to_recv,
+                    pos: 0,
+                    sent: Arc::clone(&sent),
+                },
+                sent,
+            )
+        }
+    }
+    impl AsyncRead for MockStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let n = (this.to_recv.len() - this.pos).min(buf.remaining());
+            if n > 0 {
+                buf.put_slice(&this.to_recv[this.pos..this.pos + n]);
+                this.pos += n;
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncWrite for MockStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.get_mut()
+                .sent
+                .lock()
+                .expect("sent lock")
+                .extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Build a [`Websocket`] already in the post-handshake ("accepted") state for
+    /// a known key, so `write_resp`/`done` can be exercised without running the
+    /// (random-key) DO handshake first.
+    fn accepted_engine(sec_key: &str) -> Websocket {
+        let mut ws = Websocket::new();
+        ws.sec_key = sec_key.to_string();
+        let accept = Websocket::sec_websocket_accept(sec_key);
+        let resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        );
+        ws.accept(resp.as_bytes()).expect("engine reaches accepted state");
+        ws
+    }
+
+    /// Full happy path over a live `tokio::io::duplex` pipe with a concurrent
+    /// server that computes the correct `Sec-WebSocket-Accept` from the client's
+    /// *random* key: DO handshake, PERFORM decode into the sink, DONE CLOSE.
+    #[tokio::test]
+    async fn handler_performs_handshake_decodes_and_closes_over_a_live_pipe() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+
+        let server = tokio::spawn(async move {
+            // Read the client's Upgrade request up to the header terminator.
+            let mut req = Vec::new();
+            let mut buf = [0u8; 512];
+            loop {
+                let n = server_io.read(&mut buf).await.expect("server read req");
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+                if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // Echo back the RFC 6455 accept token for the offered key.
+            let text = String::from_utf8_lossy(&req);
+            let key = text
+                .lines()
+                .find_map(|l| {
+                    l.split_once(':').and_then(|(n, v)| {
+                        n.trim()
+                            .eq_ignore_ascii_case("Sec-WebSocket-Key")
+                            .then(|| v.trim().to_string())
+                    })
+                })
+                .expect("client offered a Sec-WebSocket-Key");
+            let accept = Websocket::sec_websocket_accept(&key);
+            // 101 response immediately followed by an unmasked server TEXT frame
+            // ("hi"), written together so the client buffers the frame while
+            // completing the handshake.
+            let mut resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            .into_bytes();
+            resp.extend_from_slice(&[0x81, 0x02, b'h', b'i']);
+            server_io.write_all(&resp).await.expect("server write 101+frame");
+            server_io.flush().await.expect("server flush");
+            // Observe the client's CLOSE frame from DONE.
+            let mut close = Vec::new();
+            if let Ok(n) = server_io.read(&mut buf).await {
+                close.extend_from_slice(&buf[..n]);
+            }
+            close
+        });
+
+        let mut ctx = TransferCtx::new();
+        ctx.io = Some(Box::new(client_io));
+        ctx.request.scheme = "ws".to_string();
+        ctx.request.host = "example.test".to_string();
+        ctx.request.port = 80;
+        ctx.request.path = "/chat".to_string();
+        let sink_data = Arc::new(Mutex::new(Vec::new()));
+        ctx.sink = Some(Box::new(VecSink(Arc::clone(&sink_data))));
+
+        HANDLER.setup_connection(&mut ctx).await.expect("setup_connection ok");
+        let done = HANDLER.do_it(&mut ctx).await.expect("do_it handshake ok");
+        assert!(done, "WS do_it reports the DO phase complete after the 101");
+
+        // The transfer driver feeds received body bytes to write_resp; the
+        // server frame was buffered by `accept`, so an empty feed decodes it.
+        HANDLER
+            .write_resp(&mut ctx, &[], false)
+            .await
+            .expect("write_resp decodes the buffered frame");
+        assert_eq!(
+            sink_data.lock().expect("sink").as_slice(),
+            b"hi",
+            "the server TEXT frame is decoded into the client sink"
+        );
+
+        HANDLER.done(&mut ctx, Ok(()), false).await.expect("done ok");
+        assert!(
+            ctx.proto_state.is_none(),
+            "done releases the per-transfer WebSocket engine state"
+        );
+
+        let close = server.await.expect("server task joins");
+        assert!(!close.is_empty(), "server observed a client CLOSE frame");
+        assert_eq!(
+            close[0], 0x88,
+            "the CLOSE frame carries the FIN + CLOSE opcode (0x88)"
+        );
+        assert_ne!(close[1] & 0x80, 0, "the client CLOSE frame is masked");
+    }
+
+    /// do_it maps a non-`101` handshake response to `CURLE_HTTP_RETURNED_ERROR`.
+    #[test]
+    fn handler_do_it_rejects_non_101() {
+        let (io, _sent) = MockStream::new(
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        );
+        let mut ctx = TransferCtx::new();
+        ctx.io = Some(Box::new(io));
+        ctx.request.host = "h".to_string();
+        let err = block_on(HANDLER.do_it(&mut ctx)).expect_err("non-101 must fail");
+        assert_eq!(err.code(), CurlCode::HttpReturnedError);
+    }
+
+    /// do_it rejects a `101` whose `Sec-WebSocket-Accept` does not match the key.
+    #[test]
+    fn handler_do_it_rejects_bad_accept_key() {
+        let (io, _sent) = MockStream::new(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+              Sec-WebSocket-Accept: wrong-value\r\n\r\n"
+                .to_vec(),
+        );
+        let mut ctx = TransferCtx::new();
+        ctx.io = Some(Box::new(io));
+        ctx.request.host = "h".to_string();
+        let err = block_on(HANDLER.do_it(&mut ctx)).expect_err("bad accept must fail");
+        assert_eq!(err.code(), CurlCode::WeirdServerReply);
+    }
+
+    /// write_resp before the handshake (no engine installed) is a hard error,
+    /// never a silent no-op.
+    #[test]
+    fn handler_write_resp_without_handshake_errors() {
+        let mut ctx = TransferCtx::new();
+        let err = block_on(HANDLER.write_resp(&mut ctx, b"\x81\x01A", false))
+            .expect_err("body before handshake must fail");
+        assert_eq!(err.code(), CurlCode::FailedInit);
+    }
+
+    /// write_resp feeds body bytes into the decoder and delivers the decoded
+    /// frame payload to the client sink.
+    #[test]
+    fn handler_write_resp_decodes_frame_into_sink() {
+        let mut ctx = TransferCtx::new();
+        ctx.proto_state = Some(Box::new(accepted_engine("dGhlIHNhbXBsZSBub25jZQ==")));
+        let (io, _sent) = MockStream::new(Vec::new());
+        ctx.io = Some(Box::new(io));
+        let sink_data = Arc::new(Mutex::new(Vec::new()));
+        ctx.sink = Some(Box::new(VecSink(Arc::clone(&sink_data))));
+
+        // An unmasked server TEXT frame carrying "ok".
+        block_on(HANDLER.write_resp(&mut ctx, &[0x81, 0x02, b'o', b'k'], false))
+            .expect("decode ok");
+        assert_eq!(sink_data.lock().expect("sink").as_slice(), b"ok");
+    }
+
+    /// done gracefully sends a masked, empty CLOSE frame and releases the engine
+    /// state for a cleanly-finished transfer.
+    #[test]
+    fn handler_done_sends_close_and_releases_state() {
+        let mut ctx = TransferCtx::new();
+        ctx.proto_state = Some(Box::new(accepted_engine("dGhlIHNhbXBsZSBub25jZQ==")));
+        let (io, sent) = MockStream::new(Vec::new());
+        ctx.io = Some(Box::new(io));
+
+        block_on(HANDLER.done(&mut ctx, Ok(()), false)).expect("done ok");
+        let sent = sent.lock().expect("sent");
+        assert_eq!(sent.len(), 6, "empty CLOSE = 2 header + 4 mask bytes");
+        assert_eq!(sent[0], 0x88, "FIN + CLOSE opcode");
+        assert_eq!(sent[1], 0x80, "MASK bit set, zero payload length");
+        assert!(ctx.proto_state.is_none(), "engine state released");
+    }
+
+    /// done on an aborted (`premature`) transfer skips the CLOSE chatter but
+    /// still releases the engine state.
+    #[test]
+    fn handler_done_skips_close_when_premature() {
+        let mut ctx = TransferCtx::new();
+        ctx.proto_state = Some(Box::new(accepted_engine("dGhlIHNhbXBsZSBub25jZQ==")));
+        let (io, sent) = MockStream::new(Vec::new());
+        ctx.io = Some(Box::new(io));
+
+        block_on(HANDLER.done(&mut ctx, Ok(()), true)).expect("done ok");
+        assert!(
+            sent.lock().expect("sent").is_empty(),
+            "no CLOSE frame is sent on a premature teardown"
+        );
+        assert!(ctx.proto_state.is_none(), "engine state still released");
+    }
+
+    /// The bounded encoder never materialises more than one `WS_CHUNK_SIZE`
+    /// chunk of payload per `write_payload` call, masking straight into `out`
+    /// (← finding: the old path buffered the whole frame via a throwaway `Vec`).
+    #[test]
+    fn encode_write_payload_is_bounded_to_one_chunk() {
+        let mut enc = WsEncoder::new();
+        let big = vec![0xAAu8; WS_CHUNK_SIZE + 100];
+        let mut out = BytesMut::new();
+        enc.add_frame(CURLWS_BINARY, (WS_CHUNK_SIZE + 100) as i64, &mut out)
+            .expect("add_frame ok");
+        let head_len = out.len();
+        let mask0 = enc.mask[0];
+
+        let n1 = enc.write_payload(&big, &mut out).expect("chunk 1");
+        assert_eq!(n1, WS_CHUNK_SIZE, "a single call is capped at one chunk");
+        assert_eq!(
+            out.len(),
+            head_len + WS_CHUNK_SIZE,
+            "out grows by exactly one chunk, not the whole payload"
+        );
+        assert_eq!(out[head_len], 0xAA ^ mask0, "payload is masked into out");
+
+        let n2 = enc.write_payload(&big[n1..], &mut out).expect("chunk 2");
+        assert_eq!(n2, 100, "the remainder is consumed on the next call");
+        assert_eq!(out.len(), head_len + WS_CHUNK_SIZE + 100);
     }
 }

@@ -99,7 +99,21 @@ scp = ["ssh"]                            # SCP rides raw SSH `exec`; no extra de
 # optional OS GSSAPI linkage is the ONLY C dependency retained anywhere in the workspace
 # (AAP §0.5.2); it is inert unless `gssapi`/`spnego` is explicitly enabled, so default builds
 # and the default-feature MSRV 1.75 gate link no C library.
-gssapi = ["dep:libgssapi"]               # HAVE_GSSAPI (Kerberos V5)
+#
+# MSRV NOTE (gssapi is intentionally OUTSIDE the MSRV / `--all-features` gate): the only
+# maintained OS-GSSAPI wrapper on crates.io, `libgssapi`, has moved wholesale to Rust
+# edition 2024 (every release from 0.10.0 up, including the 0.11.0 the auth code's by-value
+# `ClientCtx::new` API targets), and its `libgssapi-sys` bindgen output emits edition-2024
+# `unsafe extern` blocks. Cargo 1.75 cannot even PARSE an edition-2024 manifest, and rustc
+# 1.75 rejects `unsafe extern`, so NO `libgssapi` release both builds on MSRV 1.75 and
+# matches the existing `auth::kerberos` API — this is an upstream ecosystem constraint, not a
+# workspace defect. Per tech-spec §0.6.4 the MSRV merge gate is `cargo +1.75 check --workspace`
+# with DEFAULT features (gssapi OFF, links no C), and `--all-features` is NOT one of the eight
+# §0.6.4 gates; per §0.6.5 the stable toolchain is where optional/native legs are exercised,
+# and `--features gssapi` / `--all-features` build cleanly there (verified). Enabling `gssapi`
+# therefore requires a stable (edition-2024-capable) toolchain; it is deliberately gated out
+# of the MSRV/all-features build until an MSRV-1.75-compatible GSSAPI crate exists upstream.
+gssapi = ["dep:libgssapi"]               # HAVE_GSSAPI (Kerberos V5); requires edition-2024 toolchain
 spnego = ["gssapi"]                      # USE_SPNEGO  (Negotiate; builds on GSSAPI)
 
 # --- Optional-dependency gates ---

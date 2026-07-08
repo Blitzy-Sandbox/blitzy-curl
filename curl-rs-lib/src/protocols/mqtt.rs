@@ -52,6 +52,7 @@
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::timeout;
 
 use crate::conn::Connection;
 use crate::error::{CurlCode, Error, Result};
@@ -614,6 +615,16 @@ pub struct MqttRequest<'a> {
     /// Keepalive interval in milliseconds, or `0` to disable pings
     /// (← `data->set.upkeep_interval_ms`).
     pub upkeep_interval_ms: u64,
+    /// The effective whole-transfer deadline (← `CURLOPT_TIMEOUT[_MS]` as
+    /// surfaced by `Curl_timeleft`), or `None` when no timeout is configured.
+    ///
+    /// [`MqttTransfer::perform`] enforces this around the entire CONNECT →
+    /// CONNACK → SUBSCRIBE/PUBLISH exchange (including every blocking read), so a
+    /// broker cannot hold the transfer open indefinitely — matching curl's
+    /// multi-timeout behavior, where a transfer whose `Curl_timeleft` goes
+    /// negative is failed with `CURLE_OPERATION_TIMEDOUT`. `None` preserves
+    /// curl's behavior when no timeout is set (bounded only by keepalive/peer).
+    pub timeout: Option<Duration>,
 }
 
 // ===========================================================================
@@ -754,21 +765,62 @@ impl MqttTransfer {
     }
 
     /// Run the whole MQTT transfer to completion over `io` (← `mqtt_do` followed
-    /// by the multi loop's repeated `mqtt_doing` calls).
+    /// by the multi loop's repeated `mqtt_doing` calls), bounded by the effective
+    /// transfer deadline in [`req.timeout`](MqttRequest::timeout).
     ///
     /// Sends the `CONNECT`, then repeatedly advances the state machine until it
     /// signals completion. Received `PUBLISH` payload bytes are handed to `sink`,
-    /// the analog of curl's `Curl_client_write(CLIENTWRITE_BODY, …)`.
+    /// the analog of curl's `Curl_client_write(CLIENTWRITE_BODY, …)`. When a
+    /// timeout is configured the whole exchange — CONNECT, every read, and every
+    /// `doing` step — is cancelled once the deadline elapses (← curl's
+    /// multi-timeout), so a stalling broker cannot hold the transfer open.
     ///
     /// # Errors
     ///
     /// Propagates any framing/verification error with the same [`CurlCode`] curl
-    /// would return, or an I/O error from the underlying stream.
+    /// would return, an I/O error from the underlying stream, or
+    /// [`CurlCode::OperationTimedout`] when the transfer deadline elapses.
     pub async fn perform<S>(
         &mut self,
         io: &mut S,
         req: &MqttRequest<'_>,
-        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+        sink: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
+    ) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        // Enforce the effective transfer deadline around the *entire* exchange
+        // (← curl's multi loop failing a transfer once `Curl_timeleft` goes
+        // negative, `CURLE_OPERATION_TIMEDOUT`). `tokio::time::timeout` cancels
+        // the in-flight read/write when the deadline elapses, so a broker that
+        // stalls — e.g. accepts the CONNECT then sends nothing — cannot hold the
+        // transfer open indefinitely. With no configured timeout the transfer is
+        // unbounded, exactly as curl leaves it (bounded only by keepalive pings /
+        // peer behavior).
+        match req.timeout {
+            Some(deadline) => match timeout(deadline, self.perform_inner(io, req, sink)).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(Error::with_context(
+                    CurlCode::OperationTimedout,
+                    "MQTT transfer timeout",
+                )),
+            },
+            None => self.perform_inner(io, req, sink).await,
+        }
+    }
+
+    /// The unbounded transfer body (← `mqtt_do` plus the multi loop's repeated
+    /// `mqtt_doing` calls), wrapped by [`perform`](MqttTransfer::perform) with
+    /// the effective transfer deadline.
+    ///
+    /// Sends the `CONNECT`, then repeatedly advances the state machine until it
+    /// signals completion. Received `PUBLISH` payload bytes are handed to `sink`,
+    /// the analog of curl's `Curl_client_write(CLIENTWRITE_BODY, …)`.
+    async fn perform_inner<S>(
+        &mut self,
+        io: &mut S,
+        req: &MqttRequest<'_>,
+        sink: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -797,7 +849,7 @@ impl MqttTransfer {
         &mut self,
         io: &mut S,
         req: &MqttRequest<'_>,
-        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+        sink: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
     ) -> Result<bool>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -899,7 +951,7 @@ impl MqttTransfer {
         &mut self,
         io: &mut S,
         req: &MqttRequest<'_>,
-        _sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+        _sink: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
     ) -> Result<bool>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -954,7 +1006,7 @@ impl MqttTransfer {
         &mut self,
         io: &mut S,
         req: &MqttRequest<'_>,
-        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+        sink: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
     ) -> Result<bool>
     where
         S: AsyncRead + Unpin,
@@ -999,7 +1051,7 @@ impl MqttTransfer {
     async fn pub_remain<S>(
         &mut self,
         io: &mut S,
-        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+        sink: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
     ) -> Result<bool>
     where
         S: AsyncRead + Unpin,
@@ -1118,11 +1170,15 @@ where
 ///
 /// This type is the [`Protocol`] vtable adapter that the transfer layer drives.
 /// The complete MQTT logic lives in [`MqttTransfer`] (the port of `struct MQTT`
-/// and the `mqtt_do` / `mqtt_doing` / `mqtt_read_publish` machine); the vtable
-/// methods below map one-to-one onto curl's function pointers and hand off to that
-/// engine once the shared [`TransferCtx`] carries the connection/request handles
-/// (pending the upstream transfer/multi wiring; see
-/// [`crate::protocols::TransferCtx`], which is intentionally empty at this stage).
+/// and the `mqtt_do` / `mqtt_doing` / `mqtt_read_publish` machine);
+/// [`do_it`](MqttHandler::do_it) reads the [`TransferCtx`] (the live transport,
+/// the URL path/credentials, the POST body that selects publish-vs-subscribe,
+/// the body sink, and the transfer timeout), builds a [`MqttRequest`], and drives
+/// [`MqttTransfer::perform`] to completion over the connected stream — the whole
+/// CONNECT → CONNACK → SUBSCRIBE/PUBLISH exchange. Because `perform` runs the
+/// full `mqtt_doing` loop internally, the DO phase completes the transfer in one
+/// step (no separate `doing` override is needed, exactly as the sibling
+/// run-to-completion auxiliary handlers work).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MqttHandler;
 
@@ -1132,16 +1188,68 @@ pub struct MqttHandler;
 pub static HANDLER: MqttHandler = MqttHandler;
 
 impl Protocol for MqttHandler {
-    /// The required "DO" phase (← `mqtt_do`).
+    /// The required "DO" phase (← `mqtt_do` + the `mqtt_doing` multi loop).
     ///
-    /// `mqtt_do` sends the `CONNECT` and returns with `*done = FALSE`, deferring
-    /// the CONNACK/SUBSCRIBE/PUBLISH exchange to the DOING phase; accordingly this
-    /// returns `Ok(false)`. The `CONNECT` dispatch and full state machine are
-    /// [`MqttTransfer::perform`], driven once [`TransferCtx`] is wired to carry the
-    /// stream, connection, and request.
+    /// curl's `mqtt_do` sends the `CONNECT` and returns `*done = FALSE`, then the
+    /// multi loop calls `mqtt_doing` until the CONNACK/SUBSCRIBE/PUBLISH exchange
+    /// finishes. Here that whole exchange is driven to completion by
+    /// [`MqttTransfer::perform`] (its `perform_inner` runs the identical
+    /// `mqtt_doing` state loop), so the DO phase returns `Ok(true)` — the DO phase
+    /// itself completed the transfer, exactly as the sibling run-to-completion
+    /// auxiliary handlers (DICT, GOPHER, TELNET, TFTP, FILE) do.
+    ///
+    /// The request is assembled from [`TransferCtx`]: `is_publish` mirrors curl's
+    /// `httpreq == HTTPREQ_POST` (a POST body ⇒ publish, otherwise subscribe), the
+    /// body is the publish payload, the URL path yields the topic, and
+    /// [`request.timeout`](crate::protocols::TransferRequest::timeout) bounds the
+    /// exchange. A missing transport surfaces as `CURLE_COULDNT_CONNECT`.
     fn do_it<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
-        let _ = ctx;
-        Box::pin(async { Ok(false) })
+        Box::pin(async move {
+            // A fresh 12-byte client id per transfer (← mqtt_setup_conn generating
+            // `curl` + 8 random alphanumerics).
+            let client_id = generate_client_id();
+
+            // Build the request view over the transfer fields. `is_publish`
+            // mirrors curl's `httpreq == HTTPREQ_POST`: a POST body (postfields)
+            // means publish, its absence means subscribe. `max_filesize` /
+            // `upkeep_interval_ms` take their curl defaults (no CLI override is
+            // threaded at this checkpoint).
+            let req = MqttRequest {
+                path: ctx.request.path.as_str(),
+                user: ctx.request.user.as_deref(),
+                passwd: ctx.request.password.as_deref(),
+                is_publish: ctx.request.body.is_some(),
+                payload: ctx.request.body.as_deref(),
+                client_id: &client_id,
+                max_filesize: 0,
+                upkeep_interval_ms: 0,
+                timeout: ctx.request.timeout,
+            };
+
+            // The live transport (← the connected socket curl reaches through
+            // Curl_xfer_send/recv). MQTT runs over the stream filter chain:
+            // plaintext for `mqtt`, a TLS stream for `mqtts` (layered upstream).
+            let mut stream = ctx.io.as_deref_mut().ok_or_else(|| {
+                Error::with_context(CurlCode::CouldntConnect, "no transport for MQTT")
+            })?;
+
+            // Deliver received PUBLISH payload bytes to the client body sink
+            // (← Curl_client_write with CLIENTWRITE_BODY); discard them when the
+            // transfer installed no sink. Borrowing `ctx.sink` here is disjoint
+            // from the `ctx.io` borrow above and the immutable `ctx.request`
+            // borrow in `req`.
+            let sink_slot = &mut ctx.sink;
+            let mut sink = move |data: &[u8]| -> Result<()> {
+                match sink_slot.as_deref_mut() {
+                    Some(s) => s.write(data),
+                    None => Ok(()),
+                }
+            };
+
+            let mut engine = MqttTransfer::new();
+            engine.perform(&mut stream, &req, &mut sink).await?;
+            Ok(true)
+        })
     }
 
     /// The required teardown (← `mqtt_done`).
@@ -1164,7 +1272,9 @@ impl Protocol for MqttHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::TransferSink;
     use std::future::Future;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // ---- helpers -----------------------------------------------------------
@@ -1197,6 +1307,7 @@ mod tests {
             client_id,
             max_filesize: 0,
             upkeep_interval_ms: 0,
+            timeout: None,
         }
     }
 
@@ -1520,6 +1631,7 @@ mod tests {
                     client_id: "curl01234567",
                     max_filesize: 0,
                     upkeep_interval_ms: 0,
+                    timeout: None,
                 };
                 let mut sink = |_: &[u8]| Ok(());
                 engine.perform(&mut client, &req, &mut sink).await
@@ -1576,16 +1688,233 @@ mod tests {
 
     // ---- Protocol vtable adapter ------------------------------------------
 
+    /// A shared-buffer [`TransferSink`] that records every delivered PUBLISH
+    /// payload chunk, so a handler test can assert what was streamed to the
+    /// download (← `Curl_client_write(CLIENTWRITE_BODY, …)`).
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+    impl TransferSink for RecordingSink {
+        fn write(&mut self, data: &[u8]) -> Result<()> {
+            self.0.lock().expect("sink lock").extend_from_slice(data);
+            Ok(())
+        }
+    }
+
     #[test]
-    fn handler_do_it_defers_and_done_is_ok() {
-        // The HANDLER is a shared, zero-sized singleton usable as &dyn Protocol.
+    fn handler_is_object_safe() {
+        // The HANDLER is a shared, zero-sized singleton usable as `&dyn Protocol`
+        // (← the `&Curl_protocol_mqtt` pointer stored in the scheme table), and
+        // `MqttHandler` is Copy/Default/Debug like the sibling handlers.
+        let handler: &dyn Protocol = &HANDLER;
+        let _copy = HANDLER;
+        // Exercising a defaulted synchronous no-op trait method proves the
+        // handler is usable through the vtable without any concrete-type
+        // knowledge (`connection_check` returns curl's "no checks" `0`).
+        let mut ctx = TransferCtx::new();
+        assert_eq!(handler.connection_check(&mut ctx, 0), 0);
+    }
+
+    #[test]
+    fn handler_done_is_noop_ok() {
+        // `mqtt_done` frees buffers owned elsewhere in this rewrite, so `done` is
+        // a faithful no-op on both the success and the premature-teardown paths.
+        let handler: &dyn Protocol = &HANDLER;
+        block_on(async {
+            let mut ctx = TransferCtx::new();
+            handler.done(&mut ctx, Ok(()), false).await.unwrap();
+            handler
+                .done(
+                    &mut ctx,
+                    Err(Error::with_context(CurlCode::RecvError, "recv")),
+                    true,
+                )
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn handler_do_it_without_transport_is_couldnt_connect() {
+        // With no live stream installed (← a connection that never came up),
+        // `do_it` must surface `CURLE_COULDNT_CONNECT` rather than panic or
+        // silently succeed. This replaces the earlier stale expectation that the
+        // stub returned `Ok(false)`; the wired handler now drives the exchange
+        // and therefore requires a transport (AAP §0.7.1 — behavior aligned to
+        // the corrected implementation).
         let handler: &dyn Protocol = &HANDLER;
         let mut ctx = TransferCtx::new();
-        // do_it mirrors mqtt_do: DO not complete (false), work continues in DOING.
-        let done = block_on(handler.do_it(&mut ctx)).unwrap();
-        assert!(!done);
-        // done mirrors mqtt_done: nothing to free (ownership handles it).
-        let mut ctx2 = TransferCtx::new();
-        block_on(handler.done(&mut ctx2, Ok(()), false)).unwrap();
+        ctx.request.path = "/topic".to_string();
+        let err = block_on(handler.do_it(&mut ctx)).unwrap_err();
+        assert_eq!(err.code(), CurlCode::CouldntConnect);
+    }
+
+    #[test]
+    fn handler_do_it_subscribe_streams_publish_to_sink() {
+        // End-to-end DO phase over a live duplex transport installed in
+        // `ctx.io`: an empty body means subscribe (← `httpreq != HTTPREQ_POST`),
+        // so the broker plays CONNACK → SUBACK → PUBLISH → DISCONNECT and the
+        // handler must stream the PUBLISH payload to `ctx.sink` and report the DO
+        // phase complete (`Ok(true)`, the run-to-completion pattern).
+        block_on(async {
+            let (client, mut server) = tokio::io::duplex(4096);
+
+            let server_task = async {
+                // CONNECT (client id is random, so read it generically).
+                let mut fb = [0u8; 1];
+                server.read_exact(&mut fb).await.unwrap();
+                assert_eq!(fb[0], MQTT_MSG_CONNECT);
+                let rl = read_remaining_len(&mut server).await;
+                let mut rest = vec![0u8; rl];
+                server.read_exact(&mut rest).await.unwrap();
+
+                // CONNACK (accepted).
+                server
+                    .write_all(&[MQTT_MSG_CONNACK, 0x02, 0x00, 0x00])
+                    .await
+                    .unwrap();
+
+                // SUBSCRIBE — echo its packet id back in the SUBACK.
+                server.read_exact(&mut fb).await.unwrap();
+                assert_eq!(fb[0], MQTT_MSG_SUBSCRIBE);
+                let rl = read_remaining_len(&mut server).await;
+                let mut sub = vec![0u8; rl];
+                server.read_exact(&mut sub).await.unwrap();
+                let (pid_hi, pid_lo) = (sub[0], sub[1]);
+
+                // SUBACK, then a single PUBLISH, then DISCONNECT.
+                server
+                    .write_all(&[MQTT_MSG_SUBACK, 0x03, pid_hi, pid_lo, 0x00])
+                    .await
+                    .unwrap();
+                let payload = b"hello-mqtt";
+                let mut pkt = vec![MQTT_MSG_PUBLISH];
+                pkt.extend_from_slice(&enc_len(payload.len()));
+                pkt.extend_from_slice(payload);
+                server.write_all(&pkt).await.unwrap();
+                server.write_all(&DISCONNECT_PACKET).await.unwrap();
+                server.flush().await.unwrap();
+            };
+
+            let collected = Arc::new(Mutex::new(Vec::new()));
+            let mut ctx = TransferCtx::new();
+            ctx.request.path = "/topic".to_string();
+            ctx.io = Some(Box::new(client));
+            ctx.sink = Some(Box::new(RecordingSink(Arc::clone(&collected))));
+
+            let client_task = async {
+                let handler: &dyn Protocol = &HANDLER;
+                handler.do_it(&mut ctx).await
+            };
+
+            let (_s, res) = tokio::join!(server_task, client_task);
+            assert!(res.unwrap(), "MQTT subscribe DO phase completes in one step");
+            assert_eq!(
+                collected.lock().expect("sink").as_slice(),
+                b"hello-mqtt",
+                "the PUBLISH payload is streamed to the transfer sink"
+            );
+        });
+    }
+
+    #[test]
+    fn handler_do_it_publish_sends_payload_then_disconnect() {
+        // A request body means publish (← `httpreq == HTTPREQ_POST`): the handler
+        // must CONNECT, PUBLISH the body to the topic, then DISCONNECT, and
+        // report the DO phase complete.
+        block_on(async {
+            let (client, mut server) = tokio::io::duplex(4096);
+
+            let server_task = async {
+                let mut fb = [0u8; 1];
+                server.read_exact(&mut fb).await.unwrap();
+                assert_eq!(fb[0], MQTT_MSG_CONNECT);
+                let rl = read_remaining_len(&mut server).await;
+                let mut rest = vec![0u8; rl];
+                server.read_exact(&mut rest).await.unwrap();
+
+                server
+                    .write_all(&[MQTT_MSG_CONNACK, 0x02, 0x00, 0x00])
+                    .await
+                    .unwrap();
+                server.flush().await.unwrap();
+
+                // PUBLISH: topic "t" (len 1) then the payload "hi".
+                server.read_exact(&mut fb).await.unwrap();
+                assert_eq!(fb[0], MQTT_MSG_PUBLISH);
+                let rl = read_remaining_len(&mut server).await;
+                let mut body = vec![0u8; rl];
+                server.read_exact(&mut body).await.unwrap();
+                assert_eq!(body[0], 0x00);
+                assert_eq!(body[1], 0x01);
+                assert_eq!(body[2], b't');
+                assert_eq!(&body[3..], b"hi");
+
+                // DISCONNECT.
+                let mut disc = [0u8; 2];
+                server.read_exact(&mut disc).await.unwrap();
+                assert_eq!(disc, DISCONNECT_PACKET);
+            };
+
+            let mut ctx = TransferCtx::new();
+            ctx.request.path = "/t".to_string();
+            ctx.request.body = Some(b"hi".to_vec());
+            ctx.io = Some(Box::new(client));
+
+            let client_task = async {
+                let handler: &dyn Protocol = &HANDLER;
+                handler.do_it(&mut ctx).await
+            };
+
+            let (_s, res) = tokio::join!(server_task, client_task);
+            assert!(res.unwrap(), "MQTT publish DO phase completes in one step");
+        });
+    }
+
+    #[test]
+    fn handler_do_it_times_out_when_broker_stalls() {
+        // mqtt#2 at the handler level: a broker that accepts the CONNECT then
+        // sends nothing must not hold the transfer open. With
+        // `ctx.request.timeout` set, `do_it` threads it into `MqttRequest.timeout`
+        // and the deadline cancels the stalled read, surfacing
+        // `CURLE_OPERATION_TIMEDOUT` (← curl's multi-timeout).
+        block_on(async {
+            let (client, mut server) = tokio::io::duplex(4096);
+
+            let server_task = async {
+                // Consume the CONNECT, send CONNACK, then stall (hold the
+                // connection open without ever answering the SUBSCRIBE) longer
+                // than the client's deadline.
+                let mut fb = [0u8; 1];
+                server.read_exact(&mut fb).await.unwrap();
+                let rl = read_remaining_len(&mut server).await;
+                let mut rest = vec![0u8; rl];
+                server.read_exact(&mut rest).await.unwrap();
+                server
+                    .write_all(&[MQTT_MSG_CONNACK, 0x02, 0x00, 0x00])
+                    .await
+                    .unwrap();
+                server.flush().await.unwrap();
+                // Keep `server` alive (no EOF) while the client's deadline fires.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                drop(server);
+            };
+
+            let mut ctx = TransferCtx::new();
+            ctx.request.path = "/topic".to_string();
+            ctx.request.timeout = Some(Duration::from_millis(50));
+            ctx.io = Some(Box::new(client));
+
+            let client_task = async {
+                let handler: &dyn Protocol = &HANDLER;
+                handler.do_it(&mut ctx).await
+            };
+
+            let (_s, res) = tokio::join!(server_task, client_task);
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.code(),
+                CurlCode::OperationTimedout,
+                "a stalling broker trips the transfer deadline"
+            );
+        });
     }
 }

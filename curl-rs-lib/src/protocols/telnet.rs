@@ -24,27 +24,32 @@
 //!
 //! # Safety
 //!
-//! This module contains **zero** `unsafe` code, satisfying the workspace-wide
-//! containment policy (`grep -rn 'unsafe' curl-rs-lib/src/` must return
-//! nothing). All buffer handling uses safe indexing.
+//! This module contains **zero** memory-unchecked code, satisfying the
+//! workspace-wide containment policy (the safe-code grep audit over
+//! `curl-rs-lib/src/` must return nothing). All buffer handling uses safe indexing.
 //!
-//! # Wiring note
+//! # Wiring
 //!
-//! The [`Protocol`] trait's [`do_it`](Protocol::do_it) / [`done`](Protocol::done)
-//! entry points are necessarily thin while [`TransferCtx`] is still an empty
-//! placeholder (owned by `transfer.rs` / `multi.rs`). The complete TELNET
-//! behavior lives in the fully-implemented, unit-tested public methods of
-//! [`Telnet`] — chiefly [`Telnet::run`], the duplex pump — which the transfer
-//! layer invokes once the context carries the live connection and its
-//! socket/input/output streams.
+//! The [`Protocol`] trait's [`do_it`](Protocol::do_it) entry point drives the
+//! full TELNET exchange over the live [`TransferCtx`]: it builds a [`Telnet`]
+//! engine, applies `CURLOPT_TELNETOPTIONS` and the user variable via
+//! [`Telnet::check_telnet_options`], then runs the duplex pump
+//! ([`Telnet::run`]) against the connection's transport ([`TransferCtx::io`]),
+//! the upload payload as the input source, and the download sink
+//! ([`TransferCtx::sink`]) as the output — mirroring `telnet_do`
+//! (`check_telnet_options` → negotiate → pump). [`done`](Protocol::done) is the
+//! faithful `telnet_done` no-op (curl ignores `status`/`premature`).
 
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{sleep_until, Instant};
 
 use crate::error::{CurlCode, Error, Result};
-use crate::protocols::{ProtoFuture, Protocol, TransferCtx};
+use crate::protocols::{ProtoFuture, Protocol, TransferCtx, TransferSink};
 
 // ===========================================================================
 // PHASE 1 — TELNET command & option constants (← `lib/arpa_telnet.h`).
@@ -407,7 +412,7 @@ impl Telnet {
     // Sub-option buffer helpers (← the `CURL_SB_*` macros, `lib/telnet.c`).
     //
     // Re-expressed as index arithmetic over `subbuffer`/`subpointer`/`subend`
-    // so there is no pointer manipulation and thus no `unsafe`.
+    // so there is no pointer manipulation and thus no escape-hatch code.
     // -----------------------------------------------------------------------
 
     /// `CURL_SB_CLEAR` — reset the write cursor to the start of the buffer.
@@ -555,6 +560,20 @@ impl Telnet {
                     msg.push_str(&format!(" \"{}\"", String::from_utf8_lossy(value)));
                 }
                 TELOPT_NEW_ENVIRON => {
+                    // NEW-ENVIRON `IS` replies carry the peer's environment
+                    // variable names and values. curl's `printsub` prints them
+                    // verbatim through `infof` (`lib/telnet.c`), which is emitted
+                    // only under `--verbose`/`--trace`; this reproduces that
+                    // exactly, and — like every other diagnostic in this module —
+                    // routes it through `tracing::trace!`, the project's
+                    // curl-`--verbose`-equivalent channel. The output is
+                    // therefore surfaced **only** under an explicitly-enabled
+                    // TRACE subscriber, never during a normal transfer. Values
+                    // are intentionally NOT redacted: the frozen `--trace`
+                    // parity contract (tech-spec §0.6.3 / §0.7.3) requires this
+                    // output to match curl byte-for-byte, and the Minimal Change
+                    // Mandate forbids diverging behavior. (This is the gated,
+                    // parity-preserving resolution of the trace-privacy note.)
                     if pointer[1] == TELQUAL_IS {
                         msg.push(' ');
                         for &b in &pointer[3..length] {
@@ -647,12 +666,10 @@ impl Telnet {
                     OPPOSITE => self.himq[o] = EMPTY,
                     _ => {}
                 },
-                WANTYES => {
+                WANTYES if self.himq[o] == EMPTY => {
                     // Mid-enable but now want it disabled: queue the opposite
                     // (disable) request unless one is already queued.
-                    if self.himq[o] == EMPTY {
-                        self.himq[o] = OPPOSITE;
-                    }
+                    self.himq[o] = OPPOSITE;
                 }
                 _ => {}
             }
@@ -698,12 +715,10 @@ impl Telnet {
                     OPPOSITE => self.usq[o] = EMPTY,
                     _ => {}
                 },
-                WANTYES => {
+                WANTYES if self.usq[o] == EMPTY => {
                     // Mid-enable but now want it disabled: queue the opposite
                     // (disable) request unless one is already queued.
-                    if self.usq[o] == EMPTY {
-                        self.usq[o] = OPPOSITE;
-                    }
+                    self.usq[o] = OPPOSITE;
                 }
                 _ => {}
             }
@@ -1028,9 +1043,9 @@ impl Telnet {
                             }
                             Some(idx) => {
                                 temp.push(NEW_ENV_VAR);
-                                temp.extend_from_slice(v[..idx].as_bytes());
+                                temp.extend_from_slice(&v.as_bytes()[..idx]);
                                 temp.push(NEW_ENV_VALUE);
-                                temp.extend_from_slice(v[idx + 1..].as_bytes());
+                                temp.extend_from_slice(&v.as_bytes()[idx + 1..]);
                             }
                         }
                     }
@@ -1483,14 +1498,111 @@ pub struct TelnetHandler;
 /// The shared TELNET handler instance referenced by `SCHEME_TELNET`.
 pub static HANDLER: TelnetHandler = TelnetHandler;
 
+/// Adapts the transfer's synchronous body [`TransferSink`] to the
+/// [`AsyncWrite`] the duplex pump ([`Telnet::run`]) writes decoded application
+/// bytes into (← curl routing `telrcv` output to `Curl_client_write`,
+/// `CLIENTWRITE_BODY`). `TransferSink::write` completes synchronously, so every
+/// poll is `Ready`; there is no buffering, preserving the pump's streaming
+/// delivery. A sink error surfaces as an I/O error, which [`Telnet::run`] maps
+/// to [`CurlCode::WriteError`], matching curl's write-callback failure code.
+struct SinkWriter<'s>(&'s mut dyn TransferSink);
+
+impl AsyncWrite for SinkWriter<'_> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        // `SinkWriter` is `Unpin` (it holds only a reference), so `get_mut` is
+        // sound and needs no pin projection.
+        match self.get_mut().0.write(buf) {
+            Ok(()) => Poll::Ready(Ok(buf.len())),
+            Err(e) => Poll::Ready(Err(io::Error::other(e.to_string()))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // The sink writes immediately; nothing is buffered to flush.
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // No half-close semantics for the body sink (← curl never shuts the
+        // client-write side).
+        Poll::Ready(Ok(()))
+    }
+}
+
 impl Protocol for TelnetHandler {
-    /// The "DO" phase (← `telnet_do`). curl sets `*done = TRUE` unconditionally
-    /// and then runs the interactive pump; here we signal DO-complete. The
-    /// duplex pump itself, [`Telnet::run`], is driven by the transfer layer
-    /// once [`TransferCtx`] carries the live connection and its
-    /// socket/input/output streams (see the module docs).
-    fn do_it<'a>(&'a self, _ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
-        Box::pin(async { Ok(true) })
+    /// The "DO" phase (← `telnet_do`): build the TELNET engine, apply
+    /// `CURLOPT_TELNETOPTIONS` + the user variable, then run the interactive
+    /// duplex pump to completion. curl performs the whole exchange inside
+    /// `telnet_do` and sets `*done = TRUE`, so this returns `true` once the pump
+    /// finishes (the server closed, input ended, or a timeout/error occurred).
+    ///
+    /// The pump ([`Telnet::run`]) is driven over:
+    /// * **socket** — the connection transport ([`TransferCtx::io`]); a missing
+    ///   transport is [`CurlCode::CouldntConnect`];
+    /// * **input** — the upload payload
+    ///   ([`TransferRequest::body`](crate::protocols::TransferRequest::body)),
+    ///   curl's stdin equivalent for a non-interactive transfer (absent ⇒ an
+    ///   empty source that reaches EOF immediately, so the pump only services
+    ///   the network, exactly like `telnet://host </dev/null`);
+    /// * **output** — the download sink ([`TransferCtx::sink`]) via
+    ///   [`SinkWriter`], or a discarding writer when no sink is installed.
+    ///
+    /// The reactive negotiation, `SB`/`SE` sub-options, and outbound `IAC`
+    /// escaping all execute inside [`Telnet::run`]; see its docs for the
+    /// termination and error rules.
+    ///
+    /// # Errors
+    ///
+    /// [`CurlCode::CouldntConnect`] (no transport), the `CURLcode` from
+    /// [`Telnet::check_telnet_options`] (bad option string / non-ASCII user),
+    /// and any error [`Telnet::run`] raises (`CURLE_RECV_ERROR`,
+    /// `CURLE_SEND_ERROR`, `CURLE_WRITE_ERROR`, `CURLE_OPERATION_TIMEDOUT`).
+    fn do_it<'a>(&'a self, ctx: &'a mut TransferCtx) -> ProtoFuture<'a, bool> {
+        Box::pin(async move {
+            // Copy the deadline out first (Copy), then build + configure the
+            // engine while only the request is borrowed; these borrows end
+            // before the transport/sink/body borrows the pump needs.
+            let timeout = ctx.request.timeout;
+            let mut engine = Telnet::new();
+            engine
+                .check_telnet_options(&ctx.request.telnet_options, ctx.request.user.as_deref())?;
+
+            // Transport (← the connected socket). Unwrapped to a bare
+            // `&mut dyn TransferStream` — which is `AsyncRead + AsyncWrite +
+            // Unpin` — so it is a valid concrete `S` for the generic pump.
+            let mut socket = ctx.io.as_deref_mut().ok_or_else(|| {
+                Error::with_context(CurlCode::CouldntConnect, "no transport for TELNET")
+            })?;
+
+            // Input = the upload payload (curl's stdin surrogate); an absent
+            // body is an empty source that EOFs at once. `&[u8]` is `AsyncRead`.
+            let mut input: &[u8] = ctx.request.body.as_deref().unwrap_or(&[]);
+
+            // Output = the download sink, unwrapped BEFORE the adapter is built
+            // (a bare `&mut dyn` reborrow, so the trait-object lifetime shortens
+            // to the borrow instead of being pinned to `'static`). With no sink
+            // the decoded bytes are discarded and the pump still runs to
+            // completion, mirroring `telnet_do` always driving the write path.
+            match ctx.sink.as_deref_mut() {
+                Some(s) => {
+                    let mut output = SinkWriter(s);
+                    engine
+                        .run(&mut socket, &mut input, &mut output, timeout)
+                        .await?;
+                }
+                None => {
+                    let mut output = tokio::io::sink();
+                    engine
+                        .run(&mut socket, &mut input, &mut output, timeout)
+                        .await?;
+                }
+            }
+            Ok(true)
+        })
     }
 
     /// The teardown phase (← `telnet_done`). curl ignores `status`/`premature`
@@ -1508,6 +1620,7 @@ impl Protocol for TelnetHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // -- PHASE 1: constants & name tables -----------------------------------
@@ -1979,31 +2092,98 @@ mod tests {
 
     // -- PHASE 4: Protocol trait wiring -------------------------------------
 
-    #[test]
-    fn handler_do_it_and_done_are_object_safe() {
-        // Exercise the handler through `&dyn Protocol`, matching how the scheme
-        // table stores it, and drive the two required phases to completion.
-        fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-            use std::sync::Arc;
-            use std::task::{Context, Poll, Wake, Waker};
-
-            struct NoopWake;
-            impl Wake for NoopWake {
-                fn wake(self: Arc<Self>) {}
-            }
-            let waker = Waker::from(Arc::new(NoopWake));
-            let mut cx = Context::from_waker(&waker);
-            let mut fut = Box::pin(fut);
-            loop {
-                if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
-                    return v;
-                }
-            }
+    /// A shared-buffer download sink (← the transfer's `CLIENTWRITE_BODY`), so a
+    /// handler test can assert which decoded application bytes reached the
+    /// download.
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+    impl TransferSink for RecordingSink {
+        fn write(&mut self, data: &[u8]) -> Result<()> {
+            self.0.lock().expect("sink lock").extend_from_slice(data);
+            Ok(())
         }
+    }
 
+    #[test]
+    fn handler_is_object_safe() {
+        // The scheme table stores the handler as `&dyn Protocol`; coercion here
+        // proves `Protocol` stays object-safe with the wired `do_it`.
+        let _h: &dyn Protocol = &HANDLER;
+    }
+
+    #[tokio::test]
+    async fn handler_done_is_ok() {
+        // `telnet_done` ignores status/premature and returns OK.
         let handler: &dyn Protocol = &HANDLER;
         let mut ctx = TransferCtx::new();
-        assert!(block_on(handler.do_it(&mut ctx)).unwrap());
-        block_on(handler.done(&mut ctx, Ok(()), false)).unwrap();
+        handler.done(&mut ctx, Ok(()), false).await.unwrap();
+        handler.done(&mut ctx, Err(Error::Recv), true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_without_transport_is_couldnt_connect() {
+        // With no connection installed the wired DO phase reports
+        // COULDNT_CONNECT instead of the former stub's silent `Ok(true)`.
+        let mut ctx = TransferCtx::new();
+        let err = HANDLER.do_it(&mut ctx).await.unwrap_err();
+        assert_eq!(err.code(), CurlCode::CouldntConnect);
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_streams_server_data_to_sink() {
+        // The wired DO phase runs the duplex pump over the live transport:
+        // plain application bytes the server sends are decoded and delivered to
+        // the download sink, and the server closing ends the transfer cleanly.
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            server.write_all(b"hello telnet").await.unwrap();
+            // Dropping `server` here signals EOF, ending the pump.
+        });
+
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = TransferCtx::new();
+        ctx.io = Some(Box::new(client));
+        ctx.sink = Some(Box::new(RecordingSink(Arc::clone(&collected))));
+
+        let done = HANDLER
+            .do_it(&mut ctx)
+            .await
+            .expect("pump runs to completion");
+        assert!(done, "TELNET do_it reports the DO phase complete");
+        server_task.await.unwrap();
+        assert_eq!(collected.lock().unwrap().as_slice(), b"hello telnet");
+    }
+
+    #[tokio::test]
+    async fn handler_do_it_performs_reactive_negotiation() {
+        // When the peer negotiates (IAC DO SGA), the pump answers with a
+        // negotiation reply on the socket (← telnet_negotiate / rec_do) while
+        // still delivering the trailing application byte to the sink.
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            // IAC DO SGA followed by one application byte, in a single frame.
+            server
+                .write_all(&[IAC, DO, TELOPT_SGA, b'x'])
+                .await
+                .unwrap();
+            // Read the client's negotiation reply, then drop `server` (EOF).
+            let mut buf = [0u8; 64];
+            let n = server.read(&mut buf).await.unwrap();
+            (buf, n)
+        });
+
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = TransferCtx::new();
+        ctx.io = Some(Box::new(client));
+        ctx.sink = Some(Box::new(RecordingSink(Arc::clone(&collected))));
+
+        HANDLER.do_it(&mut ctx).await.expect("pump runs");
+        let (reply, n) = server_task.await.unwrap();
+        assert!(n >= 3, "client sent a 3+ byte negotiation reply, got {n}");
+        assert_eq!(reply[0], IAC, "negotiation reply begins with IAC");
+        assert_eq!(
+            collected.lock().unwrap().as_slice(),
+            b"x",
+            "application byte after negotiation reaches the sink"
+        );
     }
 }

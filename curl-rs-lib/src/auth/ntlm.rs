@@ -327,13 +327,7 @@ fn seven(keys: &[u8], start: usize) -> [u8; 7] {
 /// `plaintext` with each, and concatenate the three ciphertexts into a 24-byte
 /// response (port of `Curl_ntlm_core_lm_resp`, `lib/curl_ntlm_core.c`
 /// L312-348). This computes both the NTLMv1 NT response and the LM response.
-///
-/// `pub(crate)` because the SMB protocol handler
-/// (`crate::protocols::smb`) reuses this raw NTLMv1 DESL primitive directly —
-/// curl's SMB `SESSION SETUP` embeds the bare 24-byte LM/NT responses
-/// (`Curl_ntlm_core_lm_resp`) in the security blob rather than a base64
-/// NTLMSSP message, so it must call this the same way `smb_send_setup` does.
-pub(crate) fn lm_resp(keys: &[u8; 21], plaintext: &[u8; 8]) -> [u8; 24] {
+fn lm_resp(keys: &[u8; 21], plaintext: &[u8; 8]) -> [u8; 24] {
     let mut out = [0u8; 24];
     out[0..8].copy_from_slice(&des_encrypt_with_56(&seven(keys, 0), plaintext));
     out[8..16].copy_from_slice(&des_encrypt_with_56(&seven(keys, 7), plaintext));
@@ -351,10 +345,7 @@ const LM_MAGIC: [u8; 8] = [0x4B, 0x47, 0x53, 0x21, 0x40, 0x23, 0x24, 0x25];
 /// split into two 7-byte DES keys, each of which encrypts the LM magic constant;
 /// the two 8-byte ciphertexts are concatenated and the buffer is zero-padded to
 /// 21 bytes.
-///
-/// `pub(crate)` so the SMB handler (`crate::protocols::smb`) can build the LM
-/// key exactly as curl's `smb_send_setup` does (`Curl_ntlm_core_mk_lm_hash`).
-pub(crate) fn mk_lm_hash(password: &str) -> [u8; 21] {
+fn mk_lm_hash(password: &str) -> [u8; 21] {
     let pw_bytes = password.as_bytes();
     let len = pw_bytes.len().min(14);
     let mut pw = [0u8; 14];
@@ -376,10 +367,7 @@ pub(crate) fn mk_lm_hash(password: &str) -> [u8; 21] {
 /// curl's byte-wise `ascii_to_unicode_le` — curl does not perform real
 /// UTF-8→UTF-16 transcoding, and that quirk is preserved), MD4-hashed into the
 /// first 16 bytes, and the buffer is zero-padded to 21 bytes.
-///
-/// `pub(crate)` so the SMB handler (`crate::protocols::smb`) can build the NT
-/// key exactly as curl's `smb_send_setup` does (`Curl_ntlm_core_mk_nt_hash`).
-pub(crate) fn mk_nt_hash(password: &str) -> [u8; 21] {
+fn mk_nt_hash(password: &str) -> [u8; 21] {
     let unicode_pw = ascii_to_unicode_le(password.as_bytes());
     let digest = Md4::digest(unicode_pw);
     let mut nt = [0u8; 21];
