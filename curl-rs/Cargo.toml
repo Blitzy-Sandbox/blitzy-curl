@@ -139,7 +139,7 @@ libc = { workspace = true }
 # IPFS gateway support (`--ipfs-gateway`, plus the `IPFS_GATEWAY` environment
 # handling and IPFS/IPNS URL rewriting reimplemented in `ipfs.rs`).
 #
-# This is the SOLE feature declared for the CLI crate, and it exists exclusively
+# The `ipfs` feature exists exclusively
 # to mirror curl 8.x's `#ifndef CURL_DISABLE_IPFS` compile guard. `args.rs`
 # gates the `OperationConfig::ipfs_gateway` field and its `--ipfs-gateway`
 # option handler behind `#[cfg(feature = "ipfs")]`, exactly as the C tool wraps
@@ -155,8 +155,29 @@ libc = { workspace = true }
 #
 # This is a CLI-local compile guard ONLY; the protocol/TLS/auth/DNS feature
 # matrix remains OWNED by `curl-rs-lib` and is NOT duplicated here.
-default = ["ipfs"]
+#
+# ---------------------------------------------------------------------------
+# `--libcurl <file>` C-source generation (Rust rewrite of `src/tool_setopt.c`
+# + `src/tool_easysrc.c`, driven by `setopt.rs`).
+#
+# This compile guard mirrors curl 8.x's `#ifndef CURL_DISABLE_LIBCURL_OPTION`.
+# When enabled (the default), `setopt.rs` accumulates — for every option it
+# applies to the easy handle — an equivalent line of C source, so `--libcurl`
+# can write a standalone, compilable libcurl program (curl's `dumpeasysrc`).
+# When disabled (`--no-default-features`), the entire `easysrc` machinery
+# (the `NameValue` symbol tables, `c_escape`, and the source buffers) compiles
+# out to a zero-cost no-op — exactly as defining `CURL_DISABLE_LIBCURL_OPTION`
+# elides that code from the C tool.
+#
+# It is a DEFAULT feature so the shipped `curl-rs` behaves identically to
+# curl 8.x, where `--libcurl` is compiled in by default — the Minimal Change
+# Mandate (§0.7.3) forbids altering defaults or removing flags. Declaring the
+# feature also makes the `#[cfg(feature = "libcurl-option")]` predicate a KNOWN
+# cfg, so the `unexpected_cfgs` lint (a merge-blocking error under
+# `cargo clippy -- -D warnings`, AAP §0.6.4) stays silent.
+default = ["ipfs", "libcurl-option"]
 ipfs = []
+libcurl-option = []
 
 [dev-dependencies]
 # CLI integration testing (§0.5.1 assigns these to the CLI; curl-rs-lib excludes them).

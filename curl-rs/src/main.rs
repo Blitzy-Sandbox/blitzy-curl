@@ -94,6 +94,14 @@ mod formparse;
 // implicit default-`.curlrc` load via `parsecfg::find_config_file`; both are wired in the
 // operation-dispatch checkpoint (AAP §0.7.3).
 mod parsecfg;
+// Easy-handle configuration and `--libcurl` C-source emission (Rust rewrite of
+// `src/config2setopts.c` + `src/tool_setopt.c` + `src/tool_easysrc.c`). Translates a fully
+// parsed `args::OperationConfig`/`GlobalConfig` into a `curl-rs-lib` easy handle via
+// `setopt::config2setopts`, and — when `--libcurl` was given and the `libcurl-option` feature
+// is enabled — records an equivalent standalone libcurl C program. Declared here at the crate
+// root even though `main` does not yet drive it directly; the operation-dispatch layer
+// (`operate.rs`) calls `config2setopts` in a later checkpoint (AAP §0.7.3).
+mod setopt;
 
 use clap::Parser;
 

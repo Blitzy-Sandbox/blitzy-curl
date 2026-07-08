@@ -849,7 +849,7 @@ fn write_string(
         Some(s) => {
             if use_json {
                 let _ = write!(w, "\"{}\":", var.name);
-                json_write_string(w, &s, false);
+                json_write_string(w, s.as_bytes(), false);
             } else {
                 let _ = w.write_all(s.as_bytes());
             }

@@ -65,6 +65,7 @@ use crate::tls::config::TlsConfig;
 // declaration.
 // ===========================================================================
 
+pub mod cache;
 pub mod connect;
 pub mod filters;
 pub mod h1_proxy;
@@ -82,6 +83,11 @@ pub mod socket;
 /// The connection-filter trait and the chain container that composes filters
 /// into a tower-style middleware stack. Defined in [`filters`].
 pub use filters::{ConnectionFilter, FilterChain};
+
+/// The connection pool (`cpool`): the shareable, mutex-guarded cache of idle
+/// connections keyed by destination, the reuse-matching needle, and the
+/// per-destination connection-limit result codes. Defined in [`cache`].
+pub use cache::{ConnCache, LimitResult, ReuseKey};
 
 // ===========================================================================
 // Socket index constants (`lib/urldata.h`).
