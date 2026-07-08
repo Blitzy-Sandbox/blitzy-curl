@@ -1,16 +1,12 @@
 // SPDX-License-Identifier: curl
 // Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
 
-//! libcurl-parity CLI callback handlers registered on curl-rs easy/multi handles. Rust
-//! rewrite of curl 8.19.0-DEV `src/tool_cb_*.c`.
+//! libcurl-parity CLI callback support for curl-rs easy/multi handles. Rust rewrite of
+//! curl 8.19.0-DEV `src/tool_cb_*.c`.
 //!
-//! This module is the aggregator for the `callbacks` family. It declares the seven callback
-//! submodules and owns the shared per-transfer output context [`OutStruct`] — a port of
-//! curl's `struct OutStruct` from `src/tool_sdecls.h` — together with the two safe boundary
-//! primitives (`userdata_mut` and `callback_slice`) that every callback uses to cross the C
-//! ABI. The header- and progress-callback context types are re-exported here so that
-//! dependents (notably `operate.rs`) reach the entire callback-data surface through this one
-//! module.
+//! This module owns the shared per-transfer output context [`OutStruct`] — a port of curl's
+//! `struct OutStruct` from `src/tool_sdecls.h` — together with the two safe boundary
+//! primitives (`userdata_mut` and `callback_slice`) that a callback uses to cross the C ABI.
 //!
 //! The `OutStruct` model mirrors curl's data structure field-for-field, minus the
 //! Windows-only console `utf8seq` staging buffer (the supported targets are the Linux and
@@ -18,23 +14,6 @@
 //! pair — hand-managed in curl — is expressed here through Rust ownership: an
 //! `Option<String>` filename and an [`OutSink`] enum that unifies a buffered regular file
 //! with the standard streams and the discard ("/dev/null") sink.
-
-// Callback submodules — language rewrites of curl's `src/tool_cb_*.c`. Authored as siblings;
-// declared here so the whole `callbacks` subtree is part of the `curl-rs` binary crate.
-pub mod debug;
-pub mod header;
-pub mod progress;
-pub mod read;
-pub mod seek;
-pub mod socket;
-pub mod write;
-
-// Re-export the callback context types owned by the submodules so dependents can satisfy the
-// full per-transfer callback surface (`OutStruct` + `HdrCbData` + `ProgressData`) through the
-// single `crate::callbacks` path. `CURL_PROGRESS_STATS` / `CURL_PROGRESS_BAR` are curl's
-// progress-meter style selectors (`src/tool_cb_prg.h`).
-pub use header::HdrCbData;
-pub use progress::{ProgressData, CURL_PROGRESS_BAR, CURL_PROGRESS_STATS};
 
 use core::ffi::c_void;
 use std::fs::File;

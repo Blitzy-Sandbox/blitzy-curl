@@ -57,21 +57,17 @@ use crate::tls::config::TlsConfig;
 // Sibling submodules of the connection subsystem.
 //
 // `mod.rs` owns the cross-cutting identity (constants, `Connection`,
-// `ConnectBits`, `Transport`); the ten sibling modules below own the concrete
-// filter implementations and the connection lifecycle. They are declared here
-// so the whole `conn/` folder forms a single module tree, and are intentionally
-// left ungated: the per-protocol / per-transport feature gating lives inside
-// the individual modules, not on the module declaration.
+// `ConnectBits`, `Transport`); the sibling modules below own the concrete
+// connection-filter implementations (the socket, proxy-tunnel, and shutdown
+// filters). They are declared here so the `conn/` folder forms a single module
+// tree, and are intentionally left ungated: the per-protocol / per-transport
+// feature gating lives inside the individual modules, not on the module
+// declaration.
 // ===========================================================================
 
-pub mod cache;
-pub mod connect;
 pub mod filters;
 pub mod h1_proxy;
 pub mod h2_proxy;
-pub mod happy_eyeballs;
-pub mod haproxy;
-pub mod https_connect;
 pub mod shutdown;
 pub mod socket;
 
@@ -82,11 +78,6 @@ pub mod socket;
 /// The connection-filter trait and the chain container that composes filters
 /// into a tower-style middleware stack. Defined in [`filters`].
 pub use filters::{ConnectionFilter, FilterChain};
-
-/// The connection pool (`struct cpool` / conncache). Consumed by the URL layer
-/// (`crate::url`) and the multi handle (`crate::multi`) as
-/// `crate::conn::ConnCache`. Defined in [`cache`].
-pub use cache::ConnCache;
 
 // ===========================================================================
 // Socket index constants (`lib/urldata.h`).
@@ -112,7 +103,7 @@ pub const CONN_SOCKET_COUNT: usize = 2;
 // ===========================================================================
 // SSL mode selectors for the connection-setup filter (`lib/cfilters.h`).
 //
-// Used by `connect.rs` / `https_connect.rs` to decide whether a TLS filter is
+// Consumed by the connection-setup logic to decide whether a TLS filter is
 // installed when the connection filter chain is being assembled.
 // ===========================================================================
 
@@ -699,7 +690,7 @@ pub struct ShutdownState {
 #[derive(Debug)]
 pub struct Connection {
     // --- Identity assigned by the connection pool ---------------------------
-    /// A unique, monotonically-increasing id assigned by the [`ConnCache`]
+    /// A unique, monotonically-increasing id assigned by the connection pool
     /// (`conn->connection_id`).
     pub connection_id: i64,
     /// The normalized reuse key — `hostname+port+scope`, plus proxy/`--connect-to`

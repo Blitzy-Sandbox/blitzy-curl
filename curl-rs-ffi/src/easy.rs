@@ -1056,6 +1056,7 @@ fn setopt_dispatch(easy: &mut Easy, option: c_int, arg: usize) -> c_int {
     const OPT_BUFFERSIZE: c_int = CURLoption::CURLOPT_BUFFERSIZE as c_int;
     const OPT_PATH_AS_IS: c_int = CURLoption::CURLOPT_PATH_AS_IS as c_int;
     const OPT_HTTP_VERSION: c_int = CURLoption::CURLOPT_HTTP_VERSION as c_int;
+    const OPT_SHARE: c_int = CURLoption::CURLOPT_SHARE as c_int;
 
     match option {
         OPT_URL => {
@@ -1109,6 +1110,31 @@ fn setopt_dispatch(easy: &mut Easy, option: c_int, arg: usize) -> c_int {
         OPT_HTTP_VERSION => {
             easy.set.httpwant = arg as i64;
             CURLcode::CURLE_OK as c_int
+        }
+        OPT_SHARE => {
+            // OBJECTPOINT: the vararg is a `CURLSH *` (or NULL to stop sharing). Mirror curl's
+            // `CURLOPT_SHARE` handler in `lib/setopt.c`: detach any currently attached share
+            // first (`data->share->dirty--; data->share = NULL`), then, when a valid new share is
+            // supplied, attach it (`data->share = set; data->share->dirty++`). Holding the core
+            // `Arc<Share>` wires the enabled data classes — the share carries its own `specifier`,
+            // so a later consumer reads only the caches the user actually shared.
+            easy.detach_share();
+            if arg == 0 {
+                // NULL share: detach only — curl treats `CURLOPT_SHARE, NULL` as "share nothing".
+                CURLcode::CURLE_OK as c_int
+            } else {
+                // SAFETY: per the setopt contract the argument is a `CURLSH *` previously returned
+                // by `curl_share_init` and not yet cleaned up, so it outlives this call;
+                // `share_core` null-checks the handle and clones out the core `Arc<Share>` without
+                // taking ownership of the boxed FFI state.
+                match unsafe { crate::share::share_core(arg as *mut c_void) } {
+                    Some(core) => {
+                        easy.attach_share(core);
+                        CURLcode::CURLE_OK as c_int
+                    }
+                    None => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT as c_int,
+                }
+            }
         }
         // Any other option: accepted (no-op) if it is a real curl option, else unknown.
         _ => {

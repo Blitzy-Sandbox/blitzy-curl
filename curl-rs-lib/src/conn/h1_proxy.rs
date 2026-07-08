@@ -931,6 +931,20 @@ impl H1ProxyFilter {
             req.push_str("Proxy-Connection: Keep-Alive\r\n");
         }
         for (name, value) in &self.config.extra_headers {
+            // Security (header-injection / request-smuggling defense): a proxy header whose name or
+            // value carries a bare CR or LF would terminate the header line early and let a caller
+            // inject arbitrary additional CONNECT headers — or split the request entirely — once it
+            // is serialized verbatim onto the wire. Reject any such header here, immediately before
+            // serialization (the last gate before the bytes reach the socket, so every ingestion
+            // path is covered). This mirrors curl, which never emits a custom header containing an
+            // embedded newline.
+            if name.bytes().any(|b| b == b'\r' || b == b'\n')
+                || value.bytes().any(|b| b == b'\r' || b == b'\n')
+            {
+                return Err(Error::proxy(
+                    "CONNECT header name or value contains CR or LF (possible header injection)",
+                ));
+            }
             req.push_str(name);
             req.push_str(": ");
             req.push_str(value);
@@ -1319,6 +1333,48 @@ mod tests {
         // HTTP/2.x is not an HTTP/1 status line.
         assert_eq!(parse_status_line("HTTP/2.0 200 x\r\n"), None);
         assert_eq!(parse_status_line("garbage\r\n"), None);
+    }
+
+    #[test]
+    fn connect_extra_header_with_crlf_is_rejected() {
+        // M6 (header-injection / request-smuggling defense): an extra CONNECT header carrying a
+        // bare CR/LF in its value must be refused before serialization so it cannot smuggle an
+        // additional header or split the request. The same holds for a CRLF hidden in the header
+        // name, while a clean header still serializes verbatim (no false positive).
+        let mut cfg_val = H1ProxyConfig::new("example.com", 443);
+        cfg_val
+            .extra_headers
+            .push(("X-Inject".to_string(), "ok\r\nEvil: 1".to_string()));
+        let mut f_val = H1ProxyFilter::new(cfg_val);
+        assert!(
+            f_val.build_request().is_err(),
+            "CRLF in a header value must be rejected"
+        );
+        assert!(
+            f_val.tunnel.request_data.is_empty(),
+            "a rejected header must not queue any bytes to send"
+        );
+
+        let mut cfg_name = H1ProxyConfig::new("example.com", 443);
+        cfg_name
+            .extra_headers
+            .push(("X-Bad\r\nEvil".to_string(), "v".to_string()));
+        assert!(
+            H1ProxyFilter::new(cfg_name).build_request().is_err(),
+            "CRLF in a header name must be rejected"
+        );
+
+        let mut cfg_ok = H1ProxyConfig::new("example.com", 443);
+        cfg_ok
+            .extra_headers
+            .push(("X-Fine".to_string(), "value".to_string()));
+        let mut f_ok = H1ProxyFilter::new(cfg_ok);
+        f_ok.build_request().expect("a clean header must serialize");
+        let req = String::from_utf8(f_ok.tunnel.request_data.to_vec()).unwrap();
+        assert!(
+            req.contains("X-Fine: value\r\n"),
+            "a clean header must be serialized verbatim, got: {req:?}"
+        );
     }
 
     #[test]

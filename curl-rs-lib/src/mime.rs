@@ -1714,7 +1714,7 @@ fn push_part(
         }
         MimeKind::File => {
             let path = part.filepath.ok_or(Error::Read)?;
-            let f = File::open(&path).map_err(|_| Error::Read)?;
+            let f = File::open(path).map_err(|_| Error::Read)?;
             match part.encoder {
                 // Encoded file part: stream the file through the encoder a
                 // bounded chunk at a time instead of reading the whole file into

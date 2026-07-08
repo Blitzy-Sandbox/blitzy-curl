@@ -24,8 +24,13 @@
 //! Following the crate's opaque-handle discipline (see `lib.rs`), C handles are heap-boxed Rust
 //! state exposed as raw pointers:
 //!
-//! * `CURLSH *` ↔ `Box<Arc<Mutex<ShareState>>>` — the `Arc<Mutex<…>>` cross-handle sharing model
-//!   (AAP §0.3.2). The `Arc` is the clone-handle easy handles will hold; boxing it gives the
+//! * `CURLSH *` ↔ `Box<Arc<Mutex<ShareState>>>`. The boxed [`ShareState`] holds the FFI-only
+//!   lock/unlock callbacks plus a clone of the core cross-handle sharing object,
+//!   [`curl_rs_lib::multi::Share`] — the `Arc<Mutex<…>>` fine-grained sharing model (AAP §0.3.2).
+//!   That inner `Arc<Share>` is the real clone-handle attached easy handles hold (via
+//!   `CURLOPT_SHARE`), and it owns the per-data-class shared caches (cookies / DNS / connection
+//!   pool / PSL / HSTS / SSL sessions, each independently locked) together with the `specifier`
+//!   bitmask and the `dirty` attach count. Boxing the outer `Arc<Mutex<ShareState>>` gives the
 //!   share a stable raw address that survives being handed across the FFI boundary.
 //! * `curl_mime *` ↔ `Box<MimeHandle>` and `curl_mimepart *` ↔ a `Box<PartHandle>` owned by that
 //!   `MimeHandle`. The part handles buffer each part's configuration (see [`PartHandle`] for why
@@ -50,11 +55,15 @@
 //! unavailable on the pinned stable MSRV (1.75). Consistent with `easy.rs` and `mprintf.rs`, both
 //! functions therefore take fixed parameters and omit the `…`: [`curl_share_setopt`] captures its
 //! single promoted argument as `arg: usize` (ABI-correct on the System V AMD64 target — the third
-//! integer/pointer argument is passed in `rdx` whether or not the callee is declared variadic),
-//! and [`curl_formadd`] takes only its two fixed double-pointers (its `CURLFORM_*` option list
-//! cannot be walked without `va_list` machinery on stable, so it is a documented, memory-safe
-//! no-op — the same limitation the printf family carries). `cbindgen` header generation is
-//! best-effort and never clobbers the committed `include/curl/curl.h`, which keeps the real
+//! integer/pointer argument is passed in `rdx` whether or not the callee is declared variadic).
+//! [`curl_formadd`] is the harder case: it does not merely *receive* one promoted argument, it must
+//! *read* an open-ended `CURLFORM_*` option list to build the form chain, and that list cannot be
+//! walked without `va_list` machinery on stable. A C trampoline that walked the varargs is ruled
+//! out by AAP §0.5.2 (no new C linkage). It therefore matches curl's own form-API-disabled build
+//! exactly — returning `CURL_FORMADD_DISABLED` and appending nothing, identical to the
+//! `#else /* if disabled */` stub in `lib/formdata.c` — which is the honest, ABI-compatible signal
+//! (never a false `CURL_FORMADD_OK`). Modern callers use the mime API. `cbindgen` header generation
+//! is best-effort and never clobbers the committed `include/curl/curl.h`, which keeps the real
 //! `…, …)` declarations and remains the authoritative ABI surface.
 
 // Require every unsafe operation to sit inside an explicit `unsafe { … }` block, even inside an
@@ -72,6 +81,7 @@ use crate::slist::{curl_slist, curl_slist_free_all, slist_to_vec};
 use crate::{as_mut, as_ref, box_from_raw, box_into_raw, ffi_guard, CURLcode};
 use curl_rs_lib::error::{share_strerror, CurlShCode, Error};
 use curl_rs_lib::mime::{Encoding, HttpPost, Mime, MimeReadCallback, ReadOutcome};
+use curl_rs_lib::multi::Share;
 use libc::{c_char, c_int, c_long, c_void, size_t};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -326,19 +336,20 @@ const CURL_ZERO_TERMINATED: size_t = size_t::MAX;
 
 /// The mutable state behind a `CURLSH *` handle.
 ///
-/// A `CURLSH *` is a `Box<Arc<Mutex<ShareState>>>` erased to `*mut c_void`; the boxed `Arc` is the
-/// clone-handle that easy handles will hold (AAP §0.3.2, fine-grained per-data-type locking). All
-/// fields are `Send + Sync` (the user pointer is stored as its integer address rather than a raw
-/// pointer, and C function pointers are `Send + Sync`), so `Arc<Mutex<ShareState>>` is soundly
-/// shareable across the multi-thread runtime without tripping `clippy::arc_with_non_send_sync`.
+/// A `CURLSH *` is a `Box<Arc<Mutex<ShareState>>>` erased to `*mut c_void`. The [`ShareState`]
+/// holds the FFI-only lock/unlock callbacks plus a clone of the core cross-handle sharing object,
+/// [`Share`] — the actual `Arc` clone-handle attached easy handles hold (AAP §0.3.2, fine-grained
+/// per-data-type locking). The specifier bitmask and the `dirty` attach count live on that core
+/// `Share` (as atomics) so they stay consistent across the FFI handle and every attached easy
+/// handle. All fields are `Send + Sync` (`Share` is `Send + Sync`, the user pointer is stored as
+/// its integer address rather than a raw pointer, and C function pointers are `Send + Sync`), so
+/// `Arc<Mutex<ShareState>>` is soundly shareable across the multi-thread runtime without tripping
+/// `clippy::arc_with_non_send_sync`.
 struct ShareState {
-    /// Bitmask of enabled data classes: bit `1 << (curl_lock_data as u32)` is set when that class
-    /// is shared. `curl_share_init` seeds it with `CURL_LOCK_DATA_SHARE`, mirroring
-    /// `lib/curl_share.c`.
-    specifier: u32,
-    /// Reference count of easy handles currently attached to this share (curl's `share->dirty`).
-    /// A non-zero value forbids `setopt`/`cleanup`, which then yield `CURLSHE_IN_USE`.
-    dirty: u32,
+    /// The core cross-handle sharing object: the per-data-class shared caches (each independently
+    /// locked), the `specifier` bitmask, and the `dirty` attach count. Cloned into each attached
+    /// easy handle by `CURLOPT_SHARE` (see [`share_core`]); this is the FFI handle's own reference.
+    core: Arc<Share>,
     /// User lock callback registered via `CURLSHOPT_LOCKFUNC`.
     lockfunc: curl_lock_function,
     /// User unlock callback registered via `CURLSHOPT_UNLOCKFUNC`.
@@ -353,8 +364,8 @@ impl ShareState {
     /// matching `curl_share_init` in `lib/curl_share.c`.
     fn new() -> Self {
         ShareState {
-            specifier: 1u32 << (curl_lock_data::CURL_LOCK_DATA_SHARE as u32),
-            dirty: 0,
+            // `Share::new` seeds the specifier with `CURL_LOCK_DATA_SHARE` and a zero attach count.
+            core: Arc::new(Share::new()),
             lockfunc: None,
             unlockfunc: None,
             clientdata: 0,
@@ -362,12 +373,26 @@ impl ShareState {
     }
 
     /// Returns whether the given data class is currently shared (used by the easy layer and by
-    /// tests to observe `CURLSHOPT_SHARE`/`CURLSHOPT_UNSHARE`).
+    /// tests to observe `CURLSHOPT_SHARE`/`CURLSHOPT_UNSHARE`). Delegates to the core [`Share`],
+    /// which stores the specifier as a `1 << curl_lock_data` bitmask.
     #[allow(dead_code)]
     pub(crate) fn shares(&self, data: curl_lock_data) -> bool {
-        let bit = 1u32 << (data as u32);
-        self.specifier & bit != 0
+        self.core.shares(1u32 << (data as u32))
     }
+}
+
+/// Interpret a raw `CURLSH *` and clone out its core [`Share`] — the `Arc` an easy handle holds
+/// while attached (`CURLOPT_SHARE`). Returns `None` for a null/invalid handle.
+///
+/// # Safety
+/// `share` must be null or a pointer previously returned by [`curl_share_init`] and not yet
+/// reclaimed by [`curl_share_cleanup`].
+pub(crate) unsafe fn share_core(share: *mut c_void) -> Option<Arc<Share>> {
+    // SAFETY: delegated to this function's contract; `share_arc` null-checks and borrows the boxed
+    // `Arc<Mutex<ShareState>>` without taking ownership, and `Arc::clone` of the inner `core` is a
+    // cheap refcount bump that hands the caller an independent handle onto the same share.
+    let arc = unsafe { share_arc(share) }?;
+    Some(Arc::clone(&lock_state(arc).core))
 }
 
 /// Interpret a raw `CURLSH *` as its boxed `Arc<Mutex<ShareState>>`.
@@ -440,8 +465,9 @@ pub unsafe extern "C" fn curl_share_setopt(share: *mut c_void, option: c_int, ar
 /// For `CURLSHOPT_LOCKFUNC`/`CURLSHOPT_UNLOCKFUNC`, `arg` must be a valid `curl_lock_function` /
 /// `curl_unlock_function` pointer value (or 0 for `None`). Other options treat `arg` as data.
 unsafe fn share_setopt_dispatch(state: &mut ShareState, option: c_int, arg: usize) -> CURLSHcode {
-    // curl forbids modifying a share while it is attached to a live handle.
-    if state.dirty > 0 {
+    // curl forbids modifying a share while it is attached to a live handle. The attach count
+    // lives on the core `Share` so it stays correct across the FFI handle and every easy handle.
+    if state.core.in_use() {
         return CURLSHcode::CURLSHE_IN_USE;
     }
 
@@ -491,12 +517,9 @@ fn share_set_data_class(state: &mut ShareState, arg: usize, enable: bool) -> CUR
     if !(COOKIE..=HSTS).contains(&raw) {
         return CURLSHcode::CURLSHE_BAD_OPTION;
     }
-    let bit = 1u32 << (raw as u32);
-    if enable {
-        state.specifier |= bit;
-    } else {
-        state.specifier &= !bit;
-    }
+    // Toggle the class on the core `Share`, whose specifier is a `1 << curl_lock_data` bitmask
+    // (matching curl's `share->specifier`); this is the same bit the attaching easy handle reads.
+    state.core.set_class(1u32 << (raw as u32), enable);
     CURLSHcode::CURLSHE_OK
 }
 
@@ -528,7 +551,9 @@ pub unsafe extern "C" fn curl_share_cleanup(share: *mut c_void) -> c_int {
                 state.lockfunc,
                 state.unlockfunc,
                 state.clientdata,
-                state.dirty,
+                // The attach count lives on the core `Share`; a non-zero value means easy handles
+                // are still attached, so teardown must be refused with `CURLSHE_IN_USE`.
+                state.core.attached(),
             )
         };
 
@@ -681,12 +706,18 @@ impl Drop for PartSource {
         {
             let free = *free;
             let arg = *arg as *mut c_void;
-            // SAFETY: `free` is the `curl_free_callback` the caller registered via
-            // `curl_mime_data_cb`, and `arg` is its matching user token; invoking it once here
-            // is exactly the documented free contract.
-            unsafe {
-                free(arg);
-            }
+            // Guard the C free callback with `catch_unwind` so a panic cannot unwind out of
+            // `Drop` and across the FFI boundary (AAP §0.6.2/§0.7.2). `Drop` has no way to report
+            // an error and a double panic would abort the process, so a panicking free callback is
+            // swallowed here — the token is considered released regardless.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // SAFETY: `free` is the `curl_free_callback` the caller registered via
+                // `curl_mime_data_cb`, and `arg` is its matching user token; invoking it once here
+                // is exactly the documented free contract.
+                unsafe {
+                    free(arg);
+                }
+            }));
         }
     }
 }
@@ -842,16 +873,25 @@ impl MimeReadCallback for CMimeCallbackReader {
         if buf.is_empty() {
             return ReadOutcome::Bytes(0);
         }
-        // SAFETY: `readfunc` is the C read callback registered via `curl_mime_data_cb`. We pass a
-        // pointer to our buffer, element size 1, count `buf.len()`, and the user token — exactly
-        // the `curl_read_callback` contract. The callback writes at most `buf.len()` bytes.
-        let n = unsafe {
-            readfunc(
-                buf.as_mut_ptr() as *mut c_char,
-                1,
-                buf.len(),
-                self.arg as *mut c_void,
-            )
+        // The call is wrapped in `catch_unwind` so a panicking callback aborts the read rather
+        // than unwinding across the FFI boundary (AAP §0.6.2).
+        let n = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: `readfunc` is the C read callback registered via `curl_mime_data_cb`. We
+            // pass a pointer to our buffer, element size 1, count `buf.len()`, and the user token
+            // — exactly the `curl_read_callback` contract. The callback writes at most `buf.len()`
+            // bytes.
+            unsafe {
+                readfunc(
+                    buf.as_mut_ptr() as *mut c_char,
+                    1,
+                    buf.len(),
+                    self.arg as *mut c_void,
+                )
+            }
+        })) {
+            Ok(n) => n,
+            // A panicking read callback is treated as an abort of the transfer.
+            Err(_) => return ReadOutcome::Abort,
         };
         if n == CURL_READFUNC_ABORT {
             ReadOutcome::Abort
@@ -868,14 +908,23 @@ impl MimeReadCallback for CMimeCallbackReader {
             Some(f) => f,
             None => return false,
         };
-        // SAFETY: `seekfunc` is the C seek callback registered via `curl_mime_data_cb`; invoked
-        // with the user token, offset, and origin per the `curl_seek_callback` contract.
-        let r = unsafe {
-            seekfunc(
-                self.arg as *mut c_void,
-                offset as curl_off_t,
-                whence as c_int,
-            )
+        // The call is wrapped in `catch_unwind` so a panicking callback fails the seek rather than
+        // unwinding across the FFI boundary (AAP §0.6.2).
+        let r = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: `seekfunc` is the C seek callback registered via `curl_mime_data_cb`;
+            // invoked with the user token, offset, and origin per the `curl_seek_callback`
+            // contract.
+            unsafe {
+                seekfunc(
+                    self.arg as *mut c_void,
+                    offset as curl_off_t,
+                    whence as c_int,
+                )
+            }
+        })) {
+            Ok(r) => r,
+            // A panicking seek callback is treated as a failed seek.
+            Err(_) => return false,
         };
         r == CURL_SEEKFUNC_OK
     }
@@ -1360,27 +1409,33 @@ unsafe fn free_owned_cstring(ptr: *mut c_char) {
 /// `CURLFORMcode curl_formadd(struct curl_httppost **httppost, struct curl_httppost **last_post,
 /// ...);`
 ///
-/// Deprecated (curl 7.56.0). This builder is variadic over `CURLFORM_*` options, but on the
-/// pinned stable MSRV a C `va_list` cannot be walked (no `c_variadic`; see the module-level
-/// variadic note). It therefore validates its output double-pointers and returns without
-/// appending a node — a memory-safe no-op that leaves the caller's list unchanged (the same
-/// documented-limitation stance the printf family takes). Modern callers must use the mime API;
-/// the symbol remains exported for ABI parity. Returns `CURL_FORMADD_NULL` when a required output
-/// pointer is NULL (matching `FormAdd` in `lib/formdata.c`), otherwise `CURL_FORMADD_OK`.
+/// Deprecated (curl 7.56.0). This builder is variadic over `CURLFORM_*` options. Constructing the
+/// form chain requires *reading* those variadic arguments, which is impossible on the pinned
+/// stable MSRV: a C `va_list` cannot be walked without the nightly-only `c_variadic` feature (see
+/// the module-level variadic note), and the alternative — a C trampoline that walks the varargs —
+/// would introduce new C linkage that AAP §0.5.2 prohibits (no C dependency beyond optional OS
+/// GSSAPI). Because neither the variadic option list nor an ABI shim can be provided under those
+/// constraints, this entry point behaves exactly like curl's own form-API-disabled build: it
+/// returns `CURL_FORMADD_DISABLED` and appends nothing, byte-for-byte identical to the
+/// `#else /* if disabled */` stub in `lib/formdata.c` that a `CURL_DISABLE_FORM_API` curl ships.
+/// This is the honest, ABI-compatible signal the finding requires — a caller sees a documented
+/// non-success code rather than a false `CURL_FORMADD_OK` that would imply a field was added.
+/// Modern callers must use the mime API (`curl_mime_*`); the symbol remains exported for ABI
+/// parity.
 ///
 /// # Safety
-/// `httppost` and `last_post` must be null or valid `struct curl_httppost **` for the call.
+/// `httppost` and `last_post` must be null or valid `struct curl_httppost **` for the call. This
+/// implementation never dereferences them (it matches curl's disabled-build stub, which likewise
+/// ignores both pointers), so any pointer value — including NULL — is accepted.
 #[no_mangle]
 pub unsafe extern "C" fn curl_formadd(
     httppost: *mut *mut curl_httppost,
     last_post: *mut *mut curl_httppost,
 ) -> c_int {
-    ffi_guard(CURLFORMcode::CURL_FORMADD_NULL as c_int, move || {
-        if httppost.is_null() || last_post.is_null() {
-            return CURLFORMcode::CURL_FORMADD_NULL as c_int;
-        }
-        CURLFORMcode::CURL_FORMADD_OK as c_int
-    })
+    // Mirror curl's `CURL_DISABLE_FORM_API` stub verbatim: ignore both output pointers and report
+    // that the deprecated variadic builder is unavailable in this build.
+    let _ = (httppost, last_post);
+    CURLFORMcode::CURL_FORMADD_DISABLED as c_int
 }
 
 /// `int curl_formget(struct curl_httppost *form, void *arg, curl_formget_callback append);`
@@ -1411,15 +1466,26 @@ pub unsafe extern "C" fn curl_formget(
             if failed {
                 return Err(Error::bad_argument("curl_formget: append callback aborted"));
             }
-            // SAFETY: `append_fn` is the C callback; invoked with the user token, the chunk
-            // pointer, and its length per the `curl_formget_callback` contract. A well-behaved
-            // callback returns `chunk.len()`; anything else is treated as an abort.
-            let n = unsafe {
-                append_fn(
-                    arg_addr as *mut c_void,
-                    chunk.as_ptr() as *const c_char,
-                    chunk.len(),
-                )
+            // The call is wrapped in `catch_unwind` so a panicking callback aborts the form walk
+            // rather than unwinding across the FFI boundary (AAP §0.6.2).
+            let n = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // SAFETY: `append_fn` is the C callback; invoked with the user token, the chunk
+                // pointer, and its length per the `curl_formget_callback` contract. A well-behaved
+                // callback returns `chunk.len()`; anything else is treated as an abort.
+                unsafe {
+                    append_fn(
+                        arg_addr as *mut c_void,
+                        chunk.as_ptr() as *const c_char,
+                        chunk.len(),
+                    )
+                }
+            })) {
+                Ok(n) => n,
+                Err(_) => {
+                    // A panicking append callback is treated as an abort of the form walk.
+                    failed = true;
+                    return Err(Error::bad_argument("curl_formget: append callback panicked"));
+                }
             };
             if n != chunk.len() {
                 failed = true;
@@ -1440,10 +1506,11 @@ pub unsafe extern "C" fn curl_formget(
 ///
 /// Free a form chain previously built with [`curl_formadd`]. NULL-safe and symmetric with the
 /// crate's form-allocation model (`Box<curl_httppost>` nodes, `CString` string fields, and slist
-/// headers), walking both the `next` and `more` links. Because this build's [`curl_formadd`] is a
-/// documented no-op that allocates no chain, in practice this receives NULL; the traversal is the
-/// correct complement for any chain this crate's form builder produces and is only ever validly
-/// invoked on such chains (the C contract restricts `curl_formfree` to `curl_formadd` output).
+/// headers), walking both the `next` and `more` links. Because this build's [`curl_formadd`] is
+/// disabled (it returns `CURL_FORMADD_DISABLED` and allocates no chain), in practice this receives
+/// NULL; the traversal is nonetheless the correct complement for any `curl_httppost` chain valid
+/// under this crate's allocation model and is only ever validly invoked on such chains (the C
+/// contract restricts `curl_formfree` to `curl_formadd` output).
 ///
 /// # Safety
 /// `form` must be null or a `curl_httppost` chain produced by [`curl_formadd`] and not already
@@ -1490,9 +1557,9 @@ pub unsafe extern "C" fn curl_formfree(form: *mut curl_httppost) {
         unsafe { free_owned_cstring(contenttype) };
         // SAFETY: owned `CString` under the crate's allocation model.
         unsafe { free_owned_cstring(showfilename) };
-        // NOTE: `buffer` is intentionally not reclaimed here — this build's `curl_formadd` never
-        // allocates one, so it is always null in practice; a future variadic-capable `curl_formadd`
-        // that allocates `buffer` must extend this to free it with the matching allocator.
+        // NOTE: `buffer` is intentionally not reclaimed here — no `curl_httppost` node produced
+        // under this crate's allocation model sets it (the disabled `curl_formadd` allocates no
+        // chain), so it is always null and there is nothing to free.
         if !contentheader.is_null() {
             // Free the attached header list (safe `extern "C"` wrapper; reclaims the chain once).
             curl_slist_free_all(contentheader);
@@ -1765,11 +1832,12 @@ mod tests {
     #[test]
     fn share_in_use_blocks_setopt_and_cleanup() {
         let sh = curl_share_init();
-        // Simulate an attached transfer by bumping the private `dirty` counter.
+        // Simulate an attached transfer by bumping the core share's attach count (curl's
+        // `share->dirty++`), the same call `Easy::attach_share` makes via `CURLOPT_SHARE`.
         {
-            // SAFETY: `sh` is a live handle; borrowing to mutate the guarded state is sound.
+            // SAFETY: `sh` is a live handle; borrowing to read the guarded state is sound.
             let arc = unsafe { share_arc(sh) }.unwrap();
-            lock_state(arc).dirty = 1;
+            lock_state(arc).core.attach();
         }
         // SAFETY: `sh` live.
         unsafe {
@@ -1783,16 +1851,121 @@ mod tests {
             );
             assert_eq!(curl_share_cleanup(sh), CURLSHcode::CURLSHE_IN_USE as c_int);
         }
-        // Clear it and cleanup for real.
+        // Detach and cleanup for real (curl's `share->dirty--`).
         {
             // SAFETY: `sh` is still live — the preceding IN_USE `curl_share_cleanup` did not free
-            // it — so reconstructing the boxed `Arc` handle to clear `dirty` is sound.
+            // it — so borrowing the boxed `Arc` handle to drop the attach count is sound.
             let arc = unsafe { share_arc(sh) }.unwrap();
-            lock_state(arc).dirty = 0;
+            lock_state(arc).core.detach();
         }
         // SAFETY: `sh` still live (the IN_USE cleanup did not free it).
         let rc = unsafe { curl_share_cleanup(sh) };
         assert_eq!(rc, CURLSHcode::CURLSHE_OK as c_int);
+    }
+
+    #[test]
+    fn curlopt_share_attaches_wires_dirty_and_blocks_cleanup() {
+        // Frozen ABI integers: the option id and the success code.
+        const CURLOPT_SHARE: c_int = crate::easy::CURLoption::CURLOPT_SHARE as c_int;
+        let ok = CURLcode::CURLE_OK as c_int;
+
+        // A share configured to share the cookie jar.
+        let sh = curl_share_init();
+        // SAFETY: `sh` is a live handle from `curl_share_init`.
+        unsafe {
+            assert_eq!(
+                curl_share_setopt(
+                    sh,
+                    CURLSHoption::CURLSHOPT_SHARE as c_int,
+                    curl_lock_data::CURL_LOCK_DATA_COOKIE as usize,
+                ),
+                CURLSHcode::CURLSHE_OK as c_int
+            );
+        }
+        // The class is recorded on the core share (fine-grained specifier bit — M4).
+        {
+            // SAFETY: `sh` still live.
+            let arc = unsafe { share_arc(sh) }.unwrap();
+            assert!(lock_state(arc).shares(curl_lock_data::CURL_LOCK_DATA_COOKIE));
+        }
+
+        // Attach it to an easy handle through the real `CURLOPT_SHARE` FFI path (M1).
+        let h = crate::easy::curl_easy_init();
+        assert!(!h.is_null());
+        // SAFETY: `h` is a live easy handle and `sh` a live share; the promoted argument is the
+        // `CURLSH *` the option expects.
+        let rc = unsafe { crate::easy::curl_easy_setopt(h, CURLOPT_SHARE, sh as usize) };
+        assert_eq!(rc, ok, "CURLOPT_SHARE must accept a valid share handle");
+
+        // The share now reports one attached handle, so setopt/cleanup are refused.
+        {
+            // SAFETY: `sh` still live.
+            let arc = unsafe { share_arc(sh) }.unwrap();
+            assert_eq!(
+                lock_state(arc).core.attached(),
+                1,
+                "attaching an easy handle must bump the share's dirty count"
+            );
+        }
+        // SAFETY: `sh` live and in use.
+        assert_eq!(
+            unsafe { curl_share_cleanup(sh) },
+            CURLSHcode::CURLSHE_IN_USE as c_int,
+            "cleanup must refuse while an easy handle is attached"
+        );
+
+        // Cleaning up the easy handle detaches it (its `Drop` calls `detach_share`).
+        // SAFETY: `h` is a live handle; cleanup reclaims and drops it.
+        unsafe { crate::easy::curl_easy_cleanup(h) };
+        {
+            // SAFETY: `sh` still live (the IN_USE cleanup did not free it).
+            let arc = unsafe { share_arc(sh) }.unwrap();
+            assert_eq!(
+                lock_state(arc).core.attached(),
+                0,
+                "cleaning up the easy handle must drop the share's dirty count"
+            );
+        }
+
+        // With no handle attached, cleanup now succeeds.
+        // SAFETY: `sh` live and no longer in use.
+        assert_eq!(
+            unsafe { curl_share_cleanup(sh) },
+            CURLSHcode::CURLSHE_OK as c_int
+        );
+    }
+
+    #[test]
+    fn curlopt_share_null_detaches() {
+        const CURLOPT_SHARE: c_int = crate::easy::CURLoption::CURLOPT_SHARE as c_int;
+        let ok = CURLcode::CURLE_OK as c_int;
+        let sh = curl_share_init();
+        let h = crate::easy::curl_easy_init();
+        // SAFETY: both are live handles produced by their `*_init` constructors.
+        unsafe {
+            assert_eq!(
+                crate::easy::curl_easy_setopt(h, CURLOPT_SHARE, sh as usize),
+                ok
+            );
+            // Re-issuing `CURLOPT_SHARE` with NULL detaches ("share nothing"), dropping dirty.
+            assert_eq!(crate::easy::curl_easy_setopt(h, CURLOPT_SHARE, 0), ok);
+        }
+        {
+            // SAFETY: `sh` still live.
+            let arc = unsafe { share_arc(sh) }.unwrap();
+            assert_eq!(
+                lock_state(arc).core.attached(),
+                0,
+                "CURLOPT_SHARE with NULL must detach"
+            );
+        }
+        // SAFETY: not in use → OK.
+        assert_eq!(
+            unsafe { curl_share_cleanup(sh) },
+            CURLSHcode::CURLSHE_OK as c_int
+        );
+        // SAFETY: live handle.
+        unsafe { crate::easy::curl_easy_cleanup(h) };
     }
 
     #[test]
@@ -2220,24 +2393,30 @@ mod tests {
     // ----- Phase 4: deprecated form API --------------------------------------------------------
 
     #[test]
-    fn formadd_validates_output_pointers() {
-        // SAFETY: null output pointers are explicitly handled.
+    fn formadd_reports_disabled_and_appends_nothing() {
+        // The deprecated variadic builder cannot walk its `CURLFORM_*` option list on stable MSRV
+        // 1.75 (no `c_variadic`) and a C trampoline is barred by AAP §0.5.2, so this build matches
+        // curl's own `CURL_DISABLE_FORM_API` stub: `curl_formadd` returns `CURL_FORMADD_DISABLED`
+        // for every input — including NULL — and never appends a node (`lib/formdata.c`). This is
+        // the honest ABI signal that replaced the former false `CURL_FORMADD_OK` no-op.
+        // SAFETY: the disabled stub never dereferences its pointer arguments.
         unsafe {
             assert_eq!(
                 curl_formadd(ptr::null_mut(), ptr::null_mut()),
-                CURLFORMcode::CURL_FORMADD_NULL as c_int
+                CURLFORMcode::CURL_FORMADD_DISABLED as c_int
             );
         }
         let mut post: *mut curl_httppost = ptr::null_mut();
         let mut last: *mut curl_httppost = ptr::null_mut();
-        // SAFETY: valid double-pointers; the no-op builder leaves them unchanged.
+        // SAFETY: valid double-pointers; the disabled builder ignores them and appends nothing.
         unsafe {
             assert_eq!(
                 curl_formadd(&mut post, &mut last),
-                CURLFORMcode::CURL_FORMADD_OK as c_int
+                CURLFORMcode::CURL_FORMADD_DISABLED as c_int
             );
         }
-        assert!(post.is_null(), "no-op builder appends nothing");
+        assert!(post.is_null(), "disabled builder appends nothing");
+        assert!(last.is_null(), "disabled builder appends nothing");
     }
 
     #[test]

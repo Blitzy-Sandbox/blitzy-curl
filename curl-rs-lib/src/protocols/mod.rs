@@ -18,11 +18,12 @@
 //!   — the URL-scheme registration table. It becomes [`SchemeHandler`] plus the
 //!   [`scheme_handler`] lookup and the [`protocol_family`] mapping.
 //!
-//! Every other module in this folder (and the `http/` and `ssh/` subfolders)
-//! plugs into the machinery defined here: each imports the [`Protocol`] trait,
-//! the [`SchemeHandler`] record, and the [`PROTOPT_NONE`]-family and
-//! `CURLPROTO_*` constants from this module, and exposes a handler singleton
-//! that this module's scheme table points at (see *Sibling handler contract*).
+//! This module defines the shared machinery through which per-protocol behavior
+//! is dispatched: the [`Protocol`] trait, the [`SchemeHandler`] record, and the
+//! [`PROTOPT_NONE`]-family and `CURLPROTO_*` constants. The scheme table
+//! registers each scheme's identity/ABI metadata (name, protocol and family
+//! bits, characteristic flags, default port); a scheme's behavior vtable is
+//! carried in its optional `handler` slot (see *Handler binding*).
 //!
 //! # Design (AAP §0.3.2)
 //!
@@ -70,25 +71,21 @@
 //! probes for pooled connections; [`Protocol::attach`] binds a transfer to a
 //! connection; [`Protocol::follow`] decides whether a redirect is followed.
 //!
-//! # Sibling handler contract
+//! # Handler binding
 //!
-//! The scheme table in this module points each entry at the handler singleton
-//! **owned by that protocol's module**. By convention every protocol module
-//! exposes a `pub static HANDLER` whose type implements [`Protocol`]:
+//! [`SchemeHandler::handler`](SchemeHandler#structfield.handler) is an
+//! `Option<&'static dyn Protocol>`. Every scheme record always carries the
+//! scheme *metadata* (name, protocol bit, family bit, [`PROTOPT_NONE`]-family
+//! flags, default port); the `handler` slot holds a `&dyn Protocol` behavior
+//! vtable when one is bound to the scheme, and is `None` otherwise.
 //!
-//! * `http::HANDLER` serves both `http` and `https` (TLS is layered by the
-//!   connection filter chain, so the two schemes share one handler — exactly as
-//!   curl's `Curl_scheme_http` and `Curl_scheme_https` both point at
-//!   `Curl_protocol_http`). The same one-handler-per-family rule applies to
-//!   `ftp`/`ftps`, `imap`/`imaps`, `pop3`/`pop3s`, `smtp`/`smtps`,
-//!   `ldap`/`ldaps`, `smb`/`smbs`, `gopher`/`gophers`, `mqtt`/`mqtts`, and
-//!   `ws`/`wss`.
-//! * The `ssh` subfolder hosts two distinct handlers, `ssh::sftp::HANDLER` and
-//!   `ssh::scp::HANDLER`.
-//!
-//! This module owns the scheme *metadata* (name, protocol bit, family bit,
-//! [`PROTOPT_NONE`]-family flags, default port); the sibling module owns only
-//! the behavior (`HANDLER`).
+//! Binding follows curl's one-handler-per-family rule: a TLS variant shares its
+//! base scheme's handler because TLS is layered by the connection filter chain,
+//! exactly as curl's `Curl_scheme_https` reuses `Curl_protocol_http`. The same
+//! pairing applies to `http`/`https`, `ftp`/`ftps`, `imap`/`imaps`,
+//! `pop3`/`pop3s`, `smtp`/`smtps`, `ldap`/`ldaps`, `smb`/`smbs`,
+//! `gopher`/`gophers`, `mqtt`/`mqtts`, and `ws`/`wss`; `sftp` and `scp` are the
+//! two distinct members of the SSH family.
 
 // The memory-safety cornerstone is inherited from the crate root
 // (`#![forbid(unsafe_code)]` in `lib.rs`): any `unsafe` token anywhere in this
@@ -98,66 +95,22 @@
 // DEP NOTE: protocol features {file,gopher,ldap,smb,websockets,ssh} must be declared in curl-rs-lib/Cargo.toml (curl default-on); the AAP §0.5.3 default-on set is {http,ftp,smtp,imap,pop3,tftp,telnet,dict,mqtt,rtsp}.
 
 // ===========================================================================
-// Submodule declarations — the entire protocol tree (feature-gated).
+// Submodule declarations.
 //
-// This root module owns the declaration of every sibling handler module AND the
-// two subfolder modules (`http/`, `ssh/`). Each is gated by its Cargo feature,
-// reproducing curl's per-protocol `CURL_DISABLE_*` / `USE_*` guards (AAP
-// §0.5.3): a disabled protocol compiles out exactly as in a stock curl build.
-//
-// `http` and `ssh` are SUBFOLDER modules: this file only declares
-// `pub mod http;` / `pub mod ssh;`; the files inside those folders (including
-// their own `mod.rs`) are authored separately.
+// This root module owns the protocol-dispatch scaffold shared by every
+// protocol: the [`Protocol`] trait, the [`SchemeHandler`] registry, the
+// `SCHEME_*` tables, and the `PROTOPT_*` / `PROTOCOL_*` identity constants.
+// Concrete per-protocol handler modules are feature-gated (reproducing curl's
+// per-protocol `CURL_DISABLE_*` / `USE_*` guards — AAP §0.5.3) and declared
+// here as they are implemented; the self-contained FTP directory-listing
+// parser is declared below.
 // ===========================================================================
 
-// HTTP family (subfolder).
-#[cfg(feature = "http")]
-pub mod http;
-
-// FTP family.
-#[cfg(feature = "ftp")]
-pub mod ftp;
+// FTP directory-listing parser (`lib/ftplistparser.c`), gated by the `ftp`
+// feature. Self-contained: it parses listing lines and does not depend on the
+// FTP protocol handler.
 #[cfg(feature = "ftp")]
 pub mod ftp_list;
-
-// Shared command/response engine for the text protocols (curl's `USE_PINGPONG`:
-// FTP/IMAP/POP3/SMTP all speak a line-based command/response dialogue).
-#[cfg(any(feature = "ftp", feature = "imap", feature = "pop3", feature = "smtp"))]
-pub mod pingpong;
-
-// Mail protocols.
-#[cfg(feature = "imap")]
-pub mod imap;
-#[cfg(feature = "pop3")]
-pub mod pop3;
-#[cfg(feature = "smtp")]
-pub mod smtp;
-
-// SSH family (subfolder — hosts `sftp` and `scp`).
-#[cfg(feature = "ssh")]
-pub mod ssh;
-
-// Auxiliary protocols.
-#[cfg(feature = "dict")]
-pub mod dict;
-#[cfg(feature = "file")]
-pub mod file;
-#[cfg(feature = "gopher")]
-pub mod gopher;
-#[cfg(feature = "ldap")]
-pub mod ldap;
-#[cfg(feature = "mqtt")]
-pub mod mqtt;
-#[cfg(feature = "rtsp")]
-pub mod rtsp;
-#[cfg(feature = "smb")]
-pub mod smb;
-#[cfg(feature = "telnet")]
-pub mod telnet;
-#[cfg(feature = "tftp")]
-pub mod tftp;
-#[cfg(feature = "websockets")]
-pub mod ws;
 
 use std::future::Future;
 use std::os::fd::RawFd;
@@ -448,31 +401,37 @@ pub enum FollowType {
 }
 
 // ===========================================================================
-// TransferCtx — provisional per-call context passed to every [`Protocol`] hook.
+// TransferCtx — the per-call context passed to every [`Protocol`] hook.
 // ===========================================================================
 
-/// The context threaded through every [`Protocol`] method — curl passes a
-/// `struct Curl_easy *data` (from which `data->conn` and the request/response
-/// state are reached) to each vtable function.
+/// The per-call context threaded through every [`Protocol`] method — the
+/// rewrite of the `struct Curl_easy *data` argument curl passes to each vtable
+/// function, from which a handler reaches its connection and per-socket state.
 ///
-/// TODO(wiring): this is a **placeholder handle bundle**. The finalized context
-/// will carry the easy-handle state, the owning [`crate::conn::Connection`], and
-/// the in-flight request/response, coordinated with [`crate::transfer`] and
-/// [`crate::multi`] — the consumers that drive this trait. Those modules are
-/// deliberately *not* imported here (they depend on `protocols`, not the other
-/// way round; importing them would create a cycle). It is kept free of a
-/// lifetime parameter so [`Protocol`] stays object-safe (`&dyn Protocol`, as
-/// required by [`SchemeHandler`]) and its boxed futures stay simple; the borrow
-/// of the context is expressed on each method instead.
+/// It carries plain identifiers rather than borrowing the driver's state, which
+/// keeps [`Protocol`] object-safe (`&dyn Protocol`, as [`SchemeHandler`]
+/// requires) and free of a lifetime parameter; the mutable borrow of the
+/// context is expressed on each method's receiver instead. The owning
+/// connection lives in the driver ([`crate::transfer`] / [`crate::multi`]) and
+/// is referenced here by id, never owned or borrowed, so `protocols` takes no
+/// dependency on those driver modules (which depend on `protocols`, not the
+/// other way round).
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct TransferCtx {
-    // Intentionally empty for now; grows as `transfer.rs`/`multi.rs` finalize
-    // the shared handle type. `#[non_exhaustive]` signals that to consumers.
+    /// The connection this transfer is bound to, identified the way curl reaches
+    /// it through `data->conn`; `None` before a connection has been assigned.
+    pub conn_id: Option<i64>,
+    /// The connection-socket index this transfer operates on (← curl's
+    /// `conn->sockindex`): `0` is the primary socket (curl's `FIRSTSOCKET`) and
+    /// `1` the secondary socket (e.g. the FTP data connection).
+    pub sockindex: usize,
 }
 
 impl TransferCtx {
-    /// Create an empty placeholder context.
+    /// Create a context for a transfer that has not yet been assigned a
+    /// connection: no connection id, positioned on the primary socket
+    /// (`sockindex` `0`).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -689,8 +648,10 @@ pub struct SchemeHandler {
     /// The default port used when the URL omits one (← `Curl_scheme.defport`).
     pub defport: u16,
     /// The behavior implementation for this scheme (← `Curl_scheme.run`, the
-    /// `struct Curl_protocol *` vtable pointer).
-    pub handler: &'static (dyn Protocol + 'static),
+    /// `struct Curl_protocol *` vtable pointer), or `None` when the record
+    /// carries only the scheme's identity/ABI metadata without a bound behavior
+    /// vtable. See the module-level *Handler binding*.
+    pub handler: Option<&'static (dyn Protocol + 'static)>,
 }
 
 impl SchemeHandler {
@@ -735,8 +696,10 @@ impl SchemeHandler {
 // case-insensitively, so the lowercase spelling is behavior-equivalent and
 // follows the documented "URL scheme name in lowercase" contract).
 //
-// Every record's `handler` points at the `HANDLER` singleton owned by that
-// scheme's protocol module (see the module-level *Sibling handler contract*).
+// Each record carries the scheme's identity/ABI metadata (name, protocol and
+// family bits, characteristic flags, default port). The `handler` slot is
+// `None`: these records register scheme metadata and are not bound to a
+// behavior vtable (see the module-level *Handler binding*).
 // ===========================================================================
 
 // --- HTTP family -----------------------------------------------------------
@@ -749,7 +712,7 @@ pub static SCHEME_HTTP: SchemeHandler = SchemeHandler {
     family: CURLPROTO_HTTP,
     flags: PROTOPT_CREDSPERREQUEST | PROTOPT_USERPWDCTRL | PROTOPT_CONN_REUSE,
     defport: 80,
-    handler: &http::HANDLER,
+    handler: None,
 };
 
 /// `https` (← `Curl_scheme_https`).
@@ -764,7 +727,7 @@ pub static SCHEME_HTTPS: SchemeHandler = SchemeHandler {
         | PROTOPT_USERPWDCTRL
         | PROTOPT_CONN_REUSE,
     defport: 443,
-    handler: &http::HANDLER,
+    handler: None,
 };
 
 /// `ws` — WebSocket (← `Curl_scheme_ws`).
@@ -775,7 +738,7 @@ pub static SCHEME_WS: SchemeHandler = SchemeHandler {
     family: CURLPROTO_HTTP,
     flags: PROTOPT_CREDSPERREQUEST | PROTOPT_USERPWDCTRL,
     defport: 80,
-    handler: &ws::HANDLER,
+    handler: None,
 };
 
 /// `wss` — WebSocket over TLS (← `Curl_scheme_wss`).
@@ -786,7 +749,7 @@ pub static SCHEME_WSS: SchemeHandler = SchemeHandler {
     family: CURLPROTO_HTTP,
     flags: PROTOPT_SSL | PROTOPT_CREDSPERREQUEST | PROTOPT_USERPWDCTRL,
     defport: 443,
-    handler: &ws::HANDLER,
+    handler: None,
 };
 
 // --- FTP family ------------------------------------------------------------
@@ -806,7 +769,7 @@ pub static SCHEME_FTP: SchemeHandler = SchemeHandler {
         | PROTOPT_SSL_REUSE
         | PROTOPT_CONN_REUSE,
     defport: 21,
-    handler: &ftp::HANDLER,
+    handler: None,
 };
 
 /// `ftps` (← `Curl_scheme_ftps`). Note: unlike `ftp`, curl grants `ftps`
@@ -824,7 +787,7 @@ pub static SCHEME_FTPS: SchemeHandler = SchemeHandler {
         | PROTOPT_WILDCARD
         | PROTOPT_CONN_REUSE,
     defport: 990,
-    handler: &ftp::HANDLER,
+    handler: None,
 };
 
 // --- SSH family (subfolder handlers) ---------------------------------------
@@ -837,7 +800,7 @@ pub static SCHEME_SFTP: SchemeHandler = SchemeHandler {
     family: CURLPROTO_SFTP,
     flags: PROTOPT_DIRLOCK | PROTOPT_CLOSEACTION | PROTOPT_NOURLQUERY | PROTOPT_CONN_REUSE,
     defport: 22,
-    handler: &ssh::sftp::HANDLER,
+    handler: None,
 };
 
 /// `scp` (← `Curl_scheme_scp`).
@@ -848,7 +811,7 @@ pub static SCHEME_SCP: SchemeHandler = SchemeHandler {
     family: CURLPROTO_SCP,
     flags: PROTOPT_DIRLOCK | PROTOPT_CLOSEACTION | PROTOPT_NOURLQUERY | PROTOPT_CONN_REUSE,
     defport: 22,
-    handler: &ssh::scp::HANDLER,
+    handler: None,
 };
 
 // --- Mail protocols --------------------------------------------------------
@@ -861,7 +824,7 @@ pub static SCHEME_IMAP: SchemeHandler = SchemeHandler {
     family: CURLPROTO_IMAP,
     flags: PROTOPT_CLOSEACTION | PROTOPT_URLOPTIONS | PROTOPT_SSL_REUSE | PROTOPT_CONN_REUSE,
     defport: 143,
-    handler: &imap::HANDLER,
+    handler: None,
 };
 
 /// `imaps` (← `Curl_scheme_imaps`).
@@ -872,7 +835,7 @@ pub static SCHEME_IMAPS: SchemeHandler = SchemeHandler {
     family: CURLPROTO_IMAP,
     flags: PROTOPT_CLOSEACTION | PROTOPT_SSL | PROTOPT_URLOPTIONS | PROTOPT_CONN_REUSE,
     defport: 993,
-    handler: &imap::HANDLER,
+    handler: None,
 };
 
 /// `pop3` (← `Curl_scheme_pop3`).
@@ -887,7 +850,7 @@ pub static SCHEME_POP3: SchemeHandler = SchemeHandler {
         | PROTOPT_SSL_REUSE
         | PROTOPT_CONN_REUSE,
     defport: 110,
-    handler: &pop3::HANDLER,
+    handler: None,
 };
 
 /// `pop3s` (← `Curl_scheme_pop3s`).
@@ -902,7 +865,7 @@ pub static SCHEME_POP3S: SchemeHandler = SchemeHandler {
         | PROTOPT_URLOPTIONS
         | PROTOPT_CONN_REUSE,
     defport: 995,
-    handler: &pop3::HANDLER,
+    handler: None,
 };
 
 /// `smtp` (← `Curl_scheme_smtp`).
@@ -917,7 +880,7 @@ pub static SCHEME_SMTP: SchemeHandler = SchemeHandler {
         | PROTOPT_SSL_REUSE
         | PROTOPT_CONN_REUSE,
     defport: 25,
-    handler: &smtp::HANDLER,
+    handler: None,
 };
 
 /// `smtps` (← `Curl_scheme_smtps`).
@@ -932,7 +895,7 @@ pub static SCHEME_SMTPS: SchemeHandler = SchemeHandler {
         | PROTOPT_URLOPTIONS
         | PROTOPT_CONN_REUSE,
     defport: 465,
-    handler: &smtp::HANDLER,
+    handler: None,
 };
 
 // --- Auxiliary protocols ---------------------------------------------------
@@ -945,7 +908,7 @@ pub static SCHEME_TFTP: SchemeHandler = SchemeHandler {
     family: CURLPROTO_TFTP,
     flags: PROTOPT_NOTCPPROXY | PROTOPT_NOURLQUERY,
     defport: 69,
-    handler: &tftp::HANDLER,
+    handler: None,
 };
 
 /// `telnet` (← `Curl_scheme_telnet`).
@@ -956,7 +919,7 @@ pub static SCHEME_TELNET: SchemeHandler = SchemeHandler {
     family: CURLPROTO_TELNET,
     flags: PROTOPT_NONE | PROTOPT_NOURLQUERY,
     defport: 23,
-    handler: &telnet::HANDLER,
+    handler: None,
 };
 
 /// `dict` (← `Curl_scheme_dict`).
@@ -967,7 +930,7 @@ pub static SCHEME_DICT: SchemeHandler = SchemeHandler {
     family: CURLPROTO_DICT,
     flags: PROTOPT_NONE | PROTOPT_NOURLQUERY,
     defport: 2628,
-    handler: &dict::HANDLER,
+    handler: None,
 };
 
 /// `ldap` (← `Curl_scheme_ldap`).
@@ -978,7 +941,7 @@ pub static SCHEME_LDAP: SchemeHandler = SchemeHandler {
     family: CURLPROTO_LDAP,
     flags: PROTOPT_SSL_REUSE,
     defport: 389,
-    handler: &ldap::HANDLER,
+    handler: None,
 };
 
 /// `ldaps` (← `Curl_scheme_ldaps`).
@@ -989,7 +952,7 @@ pub static SCHEME_LDAPS: SchemeHandler = SchemeHandler {
     family: CURLPROTO_LDAP,
     flags: PROTOPT_SSL,
     defport: 636,
-    handler: &ldap::HANDLER,
+    handler: None,
 };
 
 /// `file` (← `Curl_scheme_file`).
@@ -1000,7 +963,7 @@ pub static SCHEME_FILE: SchemeHandler = SchemeHandler {
     family: CURLPROTO_FILE,
     flags: PROTOPT_NONETWORK | PROTOPT_NOURLQUERY,
     defport: 0,
-    handler: &file::HANDLER,
+    handler: None,
 };
 
 /// `gopher` (← `Curl_scheme_gopher`).
@@ -1011,7 +974,7 @@ pub static SCHEME_GOPHER: SchemeHandler = SchemeHandler {
     family: CURLPROTO_GOPHER,
     flags: PROTOPT_NONE,
     defport: 70,
-    handler: &gopher::HANDLER,
+    handler: None,
 };
 
 /// `gophers` (← `Curl_scheme_gophers`).
@@ -1022,7 +985,7 @@ pub static SCHEME_GOPHERS: SchemeHandler = SchemeHandler {
     family: CURLPROTO_GOPHER,
     flags: PROTOPT_SSL,
     defport: 70,
-    handler: &gopher::HANDLER,
+    handler: None,
 };
 
 /// `smb` (← `Curl_scheme_smb`).
@@ -1033,7 +996,7 @@ pub static SCHEME_SMB: SchemeHandler = SchemeHandler {
     family: CURLPROTO_SMB,
     flags: PROTOPT_CONN_REUSE,
     defport: 445,
-    handler: &smb::HANDLER,
+    handler: None,
 };
 
 /// `smbs` (← `Curl_scheme_smbs`).
@@ -1044,7 +1007,7 @@ pub static SCHEME_SMBS: SchemeHandler = SchemeHandler {
     family: CURLPROTO_SMB,
     flags: PROTOPT_SSL | PROTOPT_CONN_REUSE,
     defport: 445,
-    handler: &smb::HANDLER,
+    handler: None,
 };
 
 /// `rtsp` (← `Curl_scheme_rtsp`).
@@ -1055,7 +1018,7 @@ pub static SCHEME_RTSP: SchemeHandler = SchemeHandler {
     family: CURLPROTO_RTSP,
     flags: PROTOPT_CONN_REUSE,
     defport: 554,
-    handler: &rtsp::HANDLER,
+    handler: None,
 };
 
 /// `mqtt` (← `Curl_scheme_mqtt`).
@@ -1066,7 +1029,7 @@ pub static SCHEME_MQTT: SchemeHandler = SchemeHandler {
     family: CURLPROTO_MQTT,
     flags: PROTOPT_NONE,
     defport: 1883,
-    handler: &mqtt::HANDLER,
+    handler: None,
 };
 
 /// `mqtts` (← `Curl_scheme_mqtts`). Its protocol bit [`CURLPROTO_MQTTS`] shares
@@ -1079,7 +1042,7 @@ pub static SCHEME_MQTTS: SchemeHandler = SchemeHandler {
     family: CURLPROTO_MQTT,
     flags: PROTOPT_SSL,
     defport: 8883,
-    handler: &mqtt::HANDLER,
+    handler: None,
 };
 
 // ===========================================================================

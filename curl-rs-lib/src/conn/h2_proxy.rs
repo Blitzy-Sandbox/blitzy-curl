@@ -395,11 +395,17 @@ impl H2Tunnel {
                 send_closed: false,
             }),
             Err(e) => {
+                // Observability (m2): trace only the stable curl error *code* (its `strerror`
+                // text), never the raw underlying error's `Display`. Lower-level `Io` / HTTP-2
+                // strings can carry endpoint or configuration specifics that curl never emits into
+                // `--trace` at this level; `CurlCode`'s message is the sanitized, curl-compatible
+                // text (`lib/strerror.c`). The full error is still returned unchanged to the caller.
+                let code = e.code();
                 tracing::trace!(
                     target: "curl::cf",
                     filter = CF_NAME,
                     state = ?H2TunnelState::Failed,
-                    error = %e,
+                    error = %code,
                     "HTTP/2 proxy tunnel failed"
                 );
                 // Abort the connection driver so a failed handshake leaks no task.

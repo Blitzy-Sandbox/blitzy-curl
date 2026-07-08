@@ -52,6 +52,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1171,27 +1172,164 @@ impl ConnCache {
 }
 
 /// The bundle of resources a multi handle shares across its transfers, and that
-/// can be shared across multiple multi handles (curl's `CURLSH` sharing). Each
-/// resource sits behind its **own** [`Mutex`] so, per AAP §0.3.2, cookie/DNS and
-/// connection-cache contention remain independent (fine-grained locking). The
-/// [`Clone`] impl shares the underlying [`Arc`]s rather than copying state.
+/// can be shared across multiple easy/multi handles (curl's `CURLSH` sharing).
+/// Each resource sits behind its **own** [`Mutex`] so, per AAP §0.3.2,
+/// cookie / DNS / connection-cache / PSL / HSTS / SSL-session contention remain
+/// independent (fine-grained locking, one lock per data class). The [`Clone`]
+/// impl shares the underlying [`Arc`]s rather than copying state, which is
+/// exactly how an attaching easy handle acquires a second handle onto the
+/// *same* caches (curl's `data->cookies = data->share->cookies`, etc.).
 #[derive(Debug, Clone, Default)]
 pub struct Shared {
-    /// The shared DNS cache, independently locked.
+    /// The shared cookie jar, independently locked (`CURL_LOCK_DATA_COOKIE`).
+    pub cookies: Arc<Mutex<crate::cookie::CookieJar>>,
+    /// The shared DNS cache, independently locked (`CURL_LOCK_DATA_DNS`).
     pub dns: Arc<Mutex<DnsCache>>,
-    /// The shared connection accounting, independently locked.
+    /// The shared connection accounting, independently locked
+    /// (`CURL_LOCK_DATA_CONNECT`).
     pub conns: Arc<Mutex<ConnCache>>,
+    /// The shared Public Suffix List, independently locked
+    /// (`CURL_LOCK_DATA_PSL`).
+    pub psl: Arc<Mutex<crate::psl::Psl>>,
+    /// The shared HSTS store, independently locked (`CURL_LOCK_DATA_HSTS`).
+    pub hsts: Arc<Mutex<crate::hsts::Hsts>>,
+    /// The shared TLS session-resumption cache (`CURL_LOCK_DATA_SSL_SESSION`).
+    /// [`SessionCache`](crate::tls::session_cache::SessionCache) is itself an
+    /// `Arc`-backed clone-to-share handle, so it is stored directly rather than
+    /// double-wrapped in another [`Arc`]/[`Mutex`].
+    pub ssl_session: crate::tls::session_cache::SessionCache,
 }
 
 impl Shared {
     /// Creates a fresh shared bundle whose connection cache caps at
-    /// `max_conns` (`0` = unlimited).
+    /// `max_conns` (`0` = unlimited); every other resource starts empty.
     #[must_use]
     pub fn new(max_conns: usize) -> Self {
         Shared {
+            cookies: Arc::new(Mutex::new(crate::cookie::CookieJar::default())),
             dns: Arc::new(Mutex::new(DnsCache::default())),
             conns: Arc::new(Mutex::new(ConnCache::new(max_conns))),
+            psl: Arc::new(Mutex::new(crate::psl::Psl::default())),
+            hsts: Arc::new(Mutex::new(crate::hsts::Hsts::default())),
+            ssl_session: crate::tls::session_cache::SessionCache::new(),
         }
+    }
+}
+
+/// The cross-handle sharing object behind a `CURLSH` handle — the rewrite of
+/// curl's `struct Curl_share` (`lib/curl_share.c`). It bundles the fine-grained,
+/// independently-locked [`Shared`] resources with the two pieces of bookkeeping
+/// curl keeps on a share:
+///
+/// * `specifier` — the bitmask of enabled data classes toggled by
+///   `curl_share_setopt(CURLSHOPT_SHARE / CURLSHOPT_UNSHARE)`. Each bit is
+///   `1 << curl_lock_data`, matching curl's `share->specifier` exactly, so the
+///   FFI layer maps a `curl_lock_data` value straight onto [`Share::set_class`]
+///   / [`Share::shares`].
+/// * `dirty` — the count of easy handles currently attached, which gates
+///   `CURLSHE_IN_USE` on `curl_share_setopt` / `curl_share_cleanup`.
+///
+/// Both are atomics so the object can be held behind a plain [`Arc`] and
+/// observed consistently from every handle that shares it: the FFI `CURLSH`
+/// handle and each attached easy handle ([`crate::url::Easy`]) hold the same
+/// `Arc<Share>`, so `dirty` stays correct even when a handle detaches on
+/// [`Drop`] on another thread.
+#[derive(Debug)]
+pub struct Share {
+    /// The fine-grained shared resources (each independently locked).
+    resources: Shared,
+    /// Bitmask of enabled data classes (`1 << curl_lock_data`).
+    specifier: AtomicU32,
+    /// Number of easy handles currently attached (curl's `share->dirty`).
+    dirty: AtomicU32,
+}
+
+impl Share {
+    /// The specifier bit for the internal `CURL_LOCK_DATA_SHARE` class
+    /// (`curl_lock_data` value `1`), which `curl_share_init` seeds — matching
+    /// `lib/curl_share.c`.
+    pub const BIT_SHARE: u32 = 1 << 1;
+
+    /// Creates a fresh share with only the internal `CURL_LOCK_DATA_SHARE`
+    /// class enabled and no handles attached, mirroring `curl_share_init`.
+    #[must_use]
+    pub fn new() -> Self {
+        Share {
+            resources: Shared::default(),
+            specifier: AtomicU32::new(Self::BIT_SHARE),
+            dirty: AtomicU32::new(0),
+        }
+    }
+
+    /// The fine-grained shared resources (each independently locked). An
+    /// attaching easy handle reads the caches for the classes enabled in
+    /// [`specifier`](Self::specifier) through this accessor.
+    #[must_use]
+    pub fn resources(&self) -> &Shared {
+        &self.resources
+    }
+
+    /// Records that an easy handle has attached to this share (curl's
+    /// `share->dirty++`).
+    pub fn attach(&self) {
+        self.dirty.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records that an easy handle has detached (curl's `share->dirty--`),
+    /// saturating at zero so an unbalanced detach can never underflow.
+    pub fn detach(&self) {
+        let _ = self
+            .dirty
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |d| {
+                Some(d.saturating_sub(1))
+            });
+    }
+
+    /// The number of easy handles currently attached.
+    #[must_use]
+    pub fn attached(&self) -> u32 {
+        self.dirty.load(Ordering::Acquire)
+    }
+
+    /// Whether any easy handle is currently attached — the condition under
+    /// which `curl_share_setopt` / `curl_share_cleanup` must return
+    /// `CURLSHE_IN_USE`.
+    #[must_use]
+    pub fn in_use(&self) -> bool {
+        self.attached() != 0
+    }
+
+    /// Enables (`on = true`) or disables (`on = false`) sharing of the data
+    /// class whose specifier bit is `bit` (`1 << curl_lock_data`), matching
+    /// `curl_share_setopt(CURLSHOPT_SHARE / CURLSHOPT_UNSHARE)`.
+    pub fn set_class(&self, bit: u32, on: bool) {
+        if on {
+            self.specifier.fetch_or(bit, Ordering::AcqRel);
+        } else {
+            self.specifier.fetch_and(!bit, Ordering::AcqRel);
+        }
+    }
+
+    /// Whether the data class whose specifier bit is `bit` (`1 << curl_lock_data`)
+    /// is currently shared.
+    #[must_use]
+    pub fn shares(&self, bit: u32) -> bool {
+        self.specifier.load(Ordering::Acquire) & bit != 0
+    }
+
+    /// The raw specifier bitmask (`1 << curl_lock_data` per enabled class),
+    /// matching curl's `share->specifier`.
+    #[must_use]
+    pub fn specifier(&self) -> u32 {
+        self.specifier.load(Ordering::Acquire)
+    }
+}
+
+impl Default for Share {
+    /// Same as [`Share::new`] — a share with only `CURL_LOCK_DATA_SHARE`
+    /// enabled — so `Default` never yields the (curl-invalid) empty specifier.
+    fn default() -> Self {
+        Share::new()
     }
 }
 

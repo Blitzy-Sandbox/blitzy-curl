@@ -232,12 +232,13 @@ pub fn getpass_r(prompt: &str, buflen: usize) -> Option<String> {
         .as_ref()
         .map_or(libc::STDIN_FILENO, |file| file.as_raw_fd());
 
-    // Disable echo for the duration of the prompt. The guard restores the original terminal
-    // attributes when it drops at the end of this function — after the trailing newline is
-    // written below — reproducing curl's ordering: disable echo, prompt, read, newline, re-enable
-    // echo. If `fd` is not a terminal the guard is `None` and no attributes are changed or
-    // restored.
-    let _echo_guard = EchoGuard::disable(fd);
+    // Disable echo for the duration of the prompt. `EchoGuard::disable` returns `Some` only when
+    // echo was actually disabled (curl's `disabled = ttyecho(FALSE, fd)`); it is `None` when `fd`
+    // is not a terminal (e.g. piped stdin) or the attribute change failed. The guard restores the
+    // original terminal attributes when it drops at the end of this function — after the trailing
+    // newline is written below — reproducing curl's ordering: disable echo, prompt, read, newline,
+    // re-enable echo. A `None` guard changes and restores nothing.
+    let echo_guard = EchoGuard::disable(fd);
 
     // The prompt goes to standard error, matching curl's `fputs(prompt, tool_stderr)`. Write
     // errors are ignored just as curl ignores the `fputs` return value.
@@ -248,16 +249,21 @@ pub fn getpass_r(prompt: &str, buflen: usize) -> Option<String> {
     // Read the secret from the terminal (or standard input) with echo suppressed.
     let secret = read_secret(tty.as_mut(), buflen);
 
-    // Emit a trailing newline: on `termios` platforms curl always does this because the user's
-    // <kbd>Enter</kbd> was not echoed. Written before the guard drops so the observable sequence
-    // matches curl (newline, then echo restored).
-    let _ = stderr.write_all(b"\n");
-    let _ = stderr.flush();
+    // Emit a trailing newline **only when echo was actually disabled**, matching curl's
+    // `if(disabled) { fputs("\n", tool_stderr); ... }` in `src/tool_getpass.c`: because the user's
+    // <kbd>Enter</kbd> was not echoed in that case, curl supplies the missing newline itself. When
+    // echo suppression did not happen (non-terminal / fallback path) the terminal already echoed
+    // the newline, so writing another would add spurious stderr output. Written before the guard
+    // drops so the observable sequence matches curl (newline, then echo restored).
+    if echo_guard.is_some() {
+        let _ = stderr.write_all(b"\n");
+        let _ = stderr.flush();
+    }
 
     secret
-    // Drop order (reverse of declaration): `stderr`, then `_echo_guard` (restores the terminal
-    // while `fd` is still open), then `tty` (closes `/dev/tty`). The standard-input descriptor is
-    // never owned and thus never closed.
+    // Drop order (reverse of declaration): `stderr`, then `echo_guard` (restores the terminal
+    // while `fd` is still open, and only if echo was actually disabled), then `tty` (closes
+    // `/dev/tty`). The standard-input descriptor is never owned and thus never closed.
 }
 
 #[cfg(test)]
@@ -365,5 +371,24 @@ mod tests {
         let devnull = File::open("/dev/null").expect("open /dev/null");
         let guard = EchoGuard::disable(devnull.as_raw_fd());
         drop(guard); // must not panic or touch the terminal
+    }
+
+    #[test]
+    fn no_trailing_newline_when_echo_was_not_disabled() {
+        // M8 (CLI parity): `getpass_r` writes its trailing newline only when echo was actually
+        // disabled (`if echo_guard.is_some()`), mirroring curl's `if(disabled)` guard in
+        // `src/tool_getpass.c`. On a non-terminal fd (the fallback path) `EchoGuard::disable`
+        // returns `None`, so `is_some()` is false and no newline is emitted — the terminal, not
+        // curl, already echoed the user's Enter. This asserts that exact gate condition, which is
+        // the seam that drives the newline decision, without needing a real controlling terminal.
+        let devnull = File::open("/dev/null").expect("open /dev/null");
+        let echo_guard = EchoGuard::disable(devnull.as_raw_fd());
+        // `getpass_r` writes the trailing newline iff `echo_guard.is_some()`. On this non-terminal
+        // fd `disable` returns `None`, so the guard is absent, the `is_some()` gate is false, and
+        // the fallback path adds no spurious stderr newline (curl parity).
+        assert!(
+            echo_guard.is_none(),
+            "non-terminal fd must not report echo as disabled, so no trailing newline is emitted"
+        );
     }
 }

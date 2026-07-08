@@ -47,10 +47,12 @@
 use std::cmp::Ordering;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::error::{CurlCode, Error, Result};
 use crate::escape;
 use crate::idn;
+use crate::multi::Share;
 use crate::netrc::{Netrc, NetrcCode};
 use crate::urlapi::{self, CurlUPart, Url};
 
@@ -1319,6 +1321,16 @@ pub struct Easy {
     pub state: EasyState,
     /// Read-back connection info (`data->info`).
     pub info: Info,
+    /// The cross-handle sharing object attached via `CURLOPT_SHARE`
+    /// (curl's `data->share`), or `None` when this handle shares nothing.
+    ///
+    /// Holding the [`Arc<Share>`](Share) both keeps the fine-grained shared
+    /// caches (cookies / DNS / connection pool / PSL / HSTS / SSL sessions)
+    /// reachable — gated by the share's `specifier` — and keeps the share's
+    /// attach count (`dirty`) correct: [`Easy::attach_share`] bumps it and both
+    /// [`Easy::detach_share`] and [`Drop`] release it, so `curl_share_cleanup`
+    /// observes `CURLSHE_IN_USE` for exactly as long as a handle is attached.
+    pub share: Option<Arc<Share>>,
 }
 
 impl Easy {
@@ -1345,6 +1357,10 @@ impl Easy {
             set: self.set.clone(),
             state: EasyState::default(),
             info: Info::default(),
+            // curl's `dupset` does not copy `data->share`: a duplicated handle
+            // starts attached to no share (the caller must re-issue
+            // `CURLOPT_SHARE` to share), so `dirty` is not inadvertently bumped.
+            share: None,
         }
     }
 
@@ -1373,6 +1389,46 @@ impl Easy {
         // TRUE for the initial URL; only absolute redirect targets clear it).
         self.state.allow_port = true;
         Ok(())
+    }
+
+    /// Attaches a cross-handle [`Share`] to this easy handle — the core of
+    /// `curl_easy_setopt(CURLOPT_SHARE, sh)` (curl's `data->share = set;
+    /// data->share->dirty++`).
+    ///
+    /// Any share previously attached is released first (via
+    /// [`detach_share`](Easy::detach_share)), so the share's attach count stays
+    /// balanced when `CURLOPT_SHARE` is issued more than once. The handle then
+    /// records the new share and bumps its attach count so that a concurrent
+    /// `curl_share_cleanup` correctly reports `CURLSHE_IN_USE`.
+    pub fn attach_share(&mut self, share: Arc<Share>) {
+        self.detach_share();
+        share.attach();
+        self.share = Some(share);
+    }
+
+    /// Detaches any currently attached [`Share`], decrementing its attach count
+    /// (curl's `data->share->dirty--; data->share = NULL`). A no-op when no
+    /// share is attached; idempotent, so [`Drop`] can call it unconditionally.
+    pub fn detach_share(&mut self) {
+        if let Some(share) = self.share.take() {
+            share.detach();
+        }
+    }
+
+    /// The cross-handle [`Share`] currently attached (`data->share`), if any.
+    #[must_use]
+    pub fn share(&self) -> Option<&Arc<Share>> {
+        self.share.as_ref()
+    }
+}
+
+impl Drop for Easy {
+    /// Releases any attached [`Share`] so its `dirty` attach count drops when
+    /// the handle is cleaned up — the effect of `curl_easy_cleanup` on a handle
+    /// that still references a share (`Curl_share ... dirty--`). Without this,
+    /// `curl_share_cleanup` would forever see the share as `CURLSHE_IN_USE`.
+    fn drop(&mut self) {
+        self.detach_share();
     }
 }
 

@@ -955,7 +955,7 @@ async fn unix_connect_inner(
     deadline: Option<Duration>,
 ) -> Result<(UnixStream, IpQuadruple)> {
     let stream = if abstract_ns {
-        connect_abstract_unix(path)?
+        connect_abstract_unix(path).await?
     } else {
         let connect = UnixStream::connect(path);
         match deadline {
@@ -983,26 +983,41 @@ async fn unix_connect_inner(
 ///
 /// The abstract namespace has no filesystem entry (curl represents it with a
 /// leading NUL byte); Rust's std exposes it through
-/// [`std::os::linux::net::SocketAddrExt::from_abstract_name`]. The connect is
-/// performed on a blocking std socket (an abstract connect completes locally and
-/// immediately) which is then switched to non-blocking and adopted by Tokio via
-/// [`UnixStream::from_std`] — all without `unsafe`.
+/// [`std::os::linux::net::SocketAddrExt::from_abstract_name`]. `std` only offers
+/// a *blocking* connect for an abstract address ([`StdUnixStream::connect_addr`]),
+/// so — although an abstract connect resolves locally and effectively immediately
+/// — that syscall is run on Tokio's blocking thread pool via
+/// [`tokio::task::spawn_blocking`] rather than on the async reactor, so it can
+/// never stall the runtime (m1). Only the blocking construction happens
+/// off-reactor; the resulting std stream (already switched to non-blocking) is
+/// then adopted back on the reactor via [`UnixStream::from_std`] — all without
+/// `unsafe`.
 #[cfg(target_os = "linux")]
-fn connect_abstract_unix(name: &str) -> Result<UnixStream> {
+async fn connect_abstract_unix(name: &str) -> Result<UnixStream> {
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::{SocketAddr as StdUnixSocketAddr, UnixStream as StdUnixStream};
 
-    let addr = StdUnixSocketAddr::from_abstract_name(name.as_bytes())
-        .map_err(|e| Error::connect(format!("invalid abstract unix name: {e}")))?;
-    let std_stream = StdUnixStream::connect_addr(&addr).map_err(map_connect_err)?;
-    std_stream.set_nonblocking(true).map_err(map_connect_err)?;
+    // Perform the blocking address construction + connect off the async reactor.
+    let name = name.to_owned();
+    let std_stream = tokio::task::spawn_blocking(move || -> Result<StdUnixStream> {
+        let addr = StdUnixSocketAddr::from_abstract_name(name.as_bytes())
+            .map_err(|e| Error::connect(format!("invalid abstract unix name: {e}")))?;
+        let std_stream = StdUnixStream::connect_addr(&addr).map_err(map_connect_err)?;
+        std_stream.set_nonblocking(true).map_err(map_connect_err)?;
+        Ok(std_stream)
+    })
+    .await
+    .map_err(|e| Error::connect(format!("abstract unix connect task panicked: {e}")))??;
+
+    // Back on the reactor: register the non-blocking std stream with Tokio.
     UnixStream::from_std(std_stream).map_err(map_connect_err)
 }
 
 /// Abstract UNIX sockets are a Linux-only feature; on other platforms a request
 /// for one is a connect error rather than a silent fallback.
 #[cfg(not(target_os = "linux"))]
-fn connect_abstract_unix(_name: &str) -> Result<UnixStream> {
+#[allow(clippy::unused_async)] // async to match the Linux signature used by the caller.
+async fn connect_abstract_unix(_name: &str) -> Result<UnixStream> {
     Err(Error::connect(
         "abstract unix sockets are only supported on Linux",
     ))
