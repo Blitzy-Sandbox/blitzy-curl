@@ -66,7 +66,7 @@ use crate::args::{
     ParameterError, CONFIG_MAX_LEVELS,
 };
 use crate::callbacks::write::{create_dir_hierarchy, tool_create_output_file};
-use crate::callbacks::{OutSink, OutStruct};
+use crate::callbacks::{HdrCbData, OutSink, OutStruct};
 use crate::progress_display::{ProgressMeter, TransferProgress};
 use crate::urlglob::URLGlob;
 use crate::{filetime, parsecfg, setopt, urlglob, writeout, xattr};
@@ -744,11 +744,46 @@ pub(crate) struct PerTransfer {
     /// (curl's `per->startat`).
     startat: Option<Instant>,
     /// Primary output sink (curl's `per->outs`).
-    outs: OutStruct,
+    ///
+    /// `pub(crate)` so the header callback (`callbacks/header.rs`, curl's `src/tool_cb_hdr.c`)
+    /// can derive/redirect the output file from a `Content-Disposition`/`Location` header and
+    /// stream bold/OSC 8 header display, exactly as curl's `tool_header_cb` manipulates
+    /// `per->outs`.
+    pub(crate) outs: OutStruct,
     /// Header output sink for `-D`/`--dump-header` (curl's `per->heads`).
-    heads: OutStruct,
+    ///
+    /// `pub(crate)` so the header callback can write received headers to the dump file.
+    pub(crate) heads: OutStruct,
     /// Etag save sink for `--etag-save` (curl's `per->etag_save`).
-    etag_save: OutStruct,
+    ///
+    /// `pub(crate)` so the header callback can capture the `ETag` value.
+    pub(crate) etag_save: OutStruct,
+    /// Header-callback per-transfer state (curl's `per->hdrcbdata`): the pending-headers
+    /// buffer, the `Content-Disposition` honour flag, and the `OperationConfig` pointer the
+    /// callback reads. Populated when the header callback is wired to the transfer engine
+    /// (deferred) and consumed by `callbacks/header.rs` (curl's `src/tool_cb_hdr.c`); not yet
+    /// read by the engine, hence `allow(dead_code)`.
+    #[allow(dead_code)]
+    pub(crate) hdrcbdata: HdrCbData,
+    /// Count of response headers seen, feeding `--write-out` `%{num_headers}` (curl's
+    /// `per->num_headers`). Maintained by the header callback (`callbacks/header.rs`).
+    #[allow(dead_code)]
+    pub(crate) num_headers: i64,
+    /// Whether the previous header line was empty, used to reset `num_headers` at a
+    /// header-block boundary (curl's `per->was_last_header_empty`). Maintained by the header
+    /// callback.
+    #[allow(dead_code)]
+    pub(crate) was_last_header_empty: bool,
+    /// Whether standard output is a TTY, denormalized from [`GlobalConfig::isatty`] (which the
+    /// callback cannot reach, receiving only this `PerTransfer`). Gates bold/OSC 8 header
+    /// display in `callbacks/header.rs` (curl reads `global->isatty`).
+    #[allow(dead_code)]
+    pub(crate) isatty: bool,
+    /// Whether styled output is enabled, denormalized from [`GlobalConfig::styled_output`].
+    /// Gates bold/OSC 8 header display in `callbacks/header.rs` (curl reads
+    /// `global->styled_output`).
+    #[allow(dead_code)]
+    pub(crate) styled_output: bool,
     /// Raw descriptor of a resumable output file, captured for `--xattr`
     /// (curl reads `fileno(per->outs.stream)`); `None` unless resuming to a real file.
     outfd: Option<RawFd>,
@@ -818,6 +853,15 @@ impl PerTransfer {
             outs: OutStruct::default(),
             heads: OutStruct::default(),
             etag_save: OutStruct::default(),
+            // Header-callback state: curl zero-inits `per->hdrcbdata`, `per->num_headers`, and
+            // `per->was_last_header_empty`. The config pointer inside `hdrcbdata` and the
+            // isatty/styled_output snapshots are populated when the header callback is wired
+            // to the transfer engine (deferred, see below).
+            hdrcbdata: HdrCbData::default(),
+            num_headers: 0,
+            was_last_header_empty: false,
+            isatty: false,
+            styled_output: false,
             outfd: None,
             progress: TransferProgress::new(),
             noprogress: false,

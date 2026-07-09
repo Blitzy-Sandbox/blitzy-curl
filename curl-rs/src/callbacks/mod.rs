@@ -52,10 +52,21 @@ pub use progress::{ProgressData, CURL_PROGRESS_BAR, CURL_PROGRESS_STATS};
 // the `CURLOPT_OPENSOCKETFUNCTION` (Linux MPTCP) and `CURLOPT_SOCKOPTFUNCTION`
 // (`--ip-tos` / `--vlan-priority`) callbacks and is the only submodule that reaches OS socket
 // primitives directly (its `unsafe` is the narrow OS-integration exception of AAP §0.6.2).
-pub mod socket;
 /// `CURLOPT_READFUNCTION` upload-source read + `CURLOPT_XFERINFOFUNCTION` busy-read unpauser
 /// (Rust rewrite of curl's `src/tool_cb_rea.c`).
 pub mod read;
+pub mod socket;
+
+/// `CURLOPT_HEADERFUNCTION` — `-D`/`--dump-header`, `--etag-save`, `-O` from
+/// `Content-Disposition`, `--write-out` header counting, and bold/OSC 8 header display
+/// (Rust rewrite of curl's `src/tool_cb_hdr.c`).
+pub mod header;
+
+// Re-export the header-callback per-transfer state at the `callbacks` root, mirroring how
+// curl's `tool_cb_hdr.h` publishes `struct HdrCbData`. It is embedded in `PerTransfer`
+// (`operate.rs`); the header callback is not yet wired into the transfer engine, but the type
+// is consumed by `operate.rs` so no `unused_imports` relaxation is required here.
+pub use header::HdrCbData;
 
 /// Output destination for a transfer.
 ///
