@@ -405,7 +405,7 @@ fn parse_stream<R: BufRead>(
                 Ok(usedarg) => {
                     // C: `if(!res && param && *param && !usedarg) res = PARAM_GOT_EXTRA_PARAMETER;`
                     // A non-empty value that the option did not consume is trailing garbage.
-                    let value_nonempty = param.as_deref().map_or(false, |p| !p.is_empty());
+                    let value_nonempty = param.as_deref().is_some_and(|p| !p.is_empty());
                     if value_nonempty && !usedarg {
                         ParameterError::GotExtraParameter
                     } else {
@@ -423,7 +423,7 @@ fn parse_stream<R: BufRead>(
                 .op_ref()
                 .url_list
                 .first()
-                .map_or(false, |g| g.url.is_some());
+                .is_some_and(|g| g.url.is_some());
             if has_url {
                 global.push_operation();
             }

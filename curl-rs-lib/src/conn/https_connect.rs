@@ -1802,6 +1802,7 @@ mod tests {
     // server and wins the (single-baller) race; the winner answers queries.
     // =======================================================================
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(miri, ignore = "exercises aws-lc-rs/ring C-FFI (rustls handshake + rcgen); Miri cannot interpret foreign functions")]
     async fn h21_baller_wins_over_real_tls_server() {
         ensure_provider();
         let (server_cfg, ca_pem) = make_h2_server();
@@ -1994,6 +1995,7 @@ mod tests {
     // Test 7 — http_connect_add input validation.
     // =======================================================================
     #[test]
+    #[cfg_attr(miri, ignore = "installs the aws-lc-rs rustls crypto provider; Miri cannot interpret the aws-lc-rs C-FFI crypto")]
     fn http_connect_add_out_of_range_index_is_bad_argument() {
         ensure_provider();
         let conn = Connection::new(Scheme::new("https", 443), "example.com", 443);

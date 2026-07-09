@@ -79,7 +79,13 @@ pub mod system;
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+// `UdpSocket` backs the one-time IPv6-stack probe below. Under Miri, creating a
+// UDP (SOCK_DGRAM) socket is an unsupported operation, so the probe uses a
+// `cfg(miri)` shim (see `ipv6_works`) and the import is elided there to avoid an
+// unused-import warning. Native and release builds are unaffected.
+#[cfg(not(miri))]
+use std::net::UdpSocket;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -859,7 +865,24 @@ static IPV6_WORKS: OnceLock<bool> = OnceLock::new();
 /// `PF_INET6` socket to test for support.
 #[must_use]
 pub fn ipv6_works() -> bool {
-    *IPV6_WORKS.get_or_init(|| UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).is_ok())
+    *IPV6_WORKS.get_or_init(|| {
+        // Under Miri, creating/binding a UDP (SOCK_DGRAM) socket is an
+        // unsupported operation. The probe is incidental infrastructure — the
+        // resolve() orchestration tests exercise pure logic with a mock
+        // resolver — so under Miri we assume the loopback IPv6 stack is usable
+        // (as it is on the CI runners) and skip the real bind. This keeps the
+        // pure-logic tests interpretable under Miri for UB checking. Native and
+        // release builds are byte-for-byte unaffected — `cfg(miri)` is never
+        // set outside `cargo miri`.
+        #[cfg(miri)]
+        {
+            true
+        }
+        #[cfg(not(miri))]
+        {
+            UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).is_ok()
+        }
+    })
 }
 
 /// Whether the requested `ip_version` can be satisfied — curl's

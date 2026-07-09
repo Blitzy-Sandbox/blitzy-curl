@@ -851,7 +851,7 @@ impl Pop3Conn {
     pub async fn perform(&mut self, conn: &mut Connection) -> Result<bool> {
         // Swap the buffer out so `perform_command`/`run_statemachine` can borrow
         // `self` and `pp` disjointly (← curl's separate `pp`/`conn` arguments).
-        let mut pp = mem::replace(&mut self.pp, PingPong::new());
+        let mut pp = mem::take(&mut self.pp);
         let result = match self.perform_command(&mut pp) {
             Ok(()) => self.run_statemachine(&mut pp, conn).await,
             Err(e) => Err(e),
@@ -868,7 +868,7 @@ impl Pop3Conn {
     /// # Errors
     /// Any error surfaced while pumping the state machine.
     pub async fn doing(&mut self, conn: &mut Connection) -> Result<bool> {
-        let mut pp = mem::replace(&mut self.pp, PingPong::new());
+        let mut pp = mem::take(&mut self.pp);
         let result = self.run_statemachine(&mut pp, conn).await;
         self.pp = pp;
         result?;

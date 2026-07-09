@@ -651,6 +651,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
     fn invalid_server_name_is_ssl_connect_error() {
         // An empty server name is not a valid DNS name or IP literal.
         let cfg = TlsConfig::default();
@@ -675,6 +676,7 @@ mod tests {
     /// Round-trip handshake against a server whose certificate the client trusts (via a
     /// private CA blob), followed by a ping/pong through the encrypted [`TlsStream`].
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
     async fn round_trip_handshake_and_io() {
         let (server_cfg, ca_pem) = make_server(&[]);
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -714,6 +716,7 @@ mod tests {
     /// ALPN negotiation: the server offers only `h2`, the client offers
     /// `[h2, http/1.1]`, so the negotiated protocol must be [`AlpnProtocol::H2`].
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
     async fn alpn_negotiates_h2() {
         let (server_cfg, ca_pem) = make_server(&[b"h2"]);
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -745,6 +748,7 @@ mod tests {
     /// [`CurlCode::PeerFailedVerification`](crate::error::CurlCode::PeerFailedVerification)
     /// — the frozen integer `60`.
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
     async fn untrusted_cert_is_peer_failed_verification() {
         let (server_cfg, _ca_pem) = make_server(&[]);
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -773,6 +777,7 @@ mod tests {
     /// `--insecure` ([`TlsConfig::insecure`](config::TlsConfig::insecure)) installs an
     /// accept-all verifier, so the same untrusted certificate now completes the handshake.
     #[tokio::test]
+    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
     async fn insecure_accepts_untrusted_cert() {
         let (server_cfg, _ca_pem) = make_server(&[]);
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);

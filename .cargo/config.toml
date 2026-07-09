@@ -18,3 +18,18 @@
 # changes selection preference, keeping the Minimal Change Mandate intact.
 [resolver]
 incompatible-rust-versions = "fallback"
+
+# Miri configuration for the memory-safety gate (AAP §0.6.4, Gate 5:
+# `cargo +nightly miri test -p curl-rs-lib`).
+# ==================================================================
+# `-Zmiri-disable-isolation` lets the safe-Rust unit tests that exercise the
+# byte-compatible on-disk state formats (cookie jar, HSTS, Alt-Svc, netrc — AAP
+# §0.6.3) and the TLS cert/key loaders perform real filesystem reads/writes
+# through `tempfile`, instead of aborting on Miri's default host-isolation of
+# `open`/`stat`. Isolation only gates access to the outside world; disabling it
+# does NOT relax Miri's undefined-behaviour / Stacked-Borrows checking, so the
+# gate's memory-safety guarantee is fully preserved. Cargo applies this to the
+# environment of the processes it spawns (including the Miri runner), and the
+# variable is ignored by every non-Miri toolchain/command.
+[env]
+MIRIFLAGS = "-Zmiri-disable-isolation"

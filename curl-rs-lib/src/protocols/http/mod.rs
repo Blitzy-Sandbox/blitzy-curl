@@ -2378,11 +2378,9 @@ pub fn http_follow(
                 http_switch_to_get(cfg, st, 302);
             }
         }
-        303 => {
-            // 'See Other': switch to GET/HEAD unless POST is explicitly kept.
-            if st.httpreq != HttpReq::Get && (!is_post_like(st.httpreq) || !cfg.post303) {
-                http_switch_to_get(cfg, st, 303);
-            }
+        // 'See Other': switch to GET/HEAD unless POST is explicitly kept.
+        303 if st.httpreq != HttpReq::Get && (!is_post_like(st.httpreq) || !cfg.post303) => {
+            http_switch_to_get(cfg, st, 303);
         }
         // 300/304/305/306/307 and unknowns: no method change.
         _ => {}
@@ -3432,10 +3430,8 @@ pub fn classify_response_header(hd: &str) -> ResponseHeader {
                 return ResponseHeader::Trailer(copy_header_value(hd).unwrap_or_default());
             }
         }
-        Some(b'w') => {
-            if hd_is(hd, "WWW-Authenticate:") {
-                return ResponseHeader::WwwAuthenticate(copy_header_value(hd).unwrap_or_default());
-            }
+        Some(b'w') if hd_is(hd, "WWW-Authenticate:") => {
+            return ResponseHeader::WwwAuthenticate(copy_header_value(hd).unwrap_or_default());
         }
         _ => {}
     }

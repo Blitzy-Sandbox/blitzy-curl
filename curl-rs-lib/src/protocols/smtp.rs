@@ -1548,7 +1548,7 @@ impl SmtpConn {
         let now = Instant::now();
         // Swap the engine out so `statemach` can borrow `pp` and `self`
         // (as the `PingPongProtocol`) without aliasing.
-        let mut pp = mem::replace(&mut self.pp, PingPong::new());
+        let mut pp = mem::take(&mut self.pp);
         let result = pp
             .statemach(self, conn, block, disconnecting, now, xfer_timeleft_ms)
             .await;
@@ -1644,7 +1644,7 @@ impl SmtpConn {
 
         // Issue the first DO-phase command. Swap `pp` out so the builder can
         // borrow it disjointly from `self`.
-        let mut pp = mem::replace(&mut self.pp, PingPong::new());
+        let mut pp = mem::take(&mut self.pp);
         let queued = if (self.options.upload || self.options.mime_post)
             && !self.options.mail_rcpt.is_empty()
         {
@@ -1737,7 +1737,7 @@ impl SmtpConn {
     ) -> Result<()> {
         if !dead_connection && conn.bits.protoconnstart && !self.pp.needs_flush() {
             // Queue QUIT (swap `pp` out for the disjoint builder borrow).
-            let mut pp = mem::replace(&mut self.pp, PingPong::new());
+            let mut pp = mem::take(&mut self.pp);
             let queued = self.perform_quit(&mut pp);
             self.pp = pp;
             if queued.is_ok() {

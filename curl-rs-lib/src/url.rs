@@ -2866,6 +2866,7 @@ mod tests {
     use super::*;
 
     /// Builds a bare connection needle for a known scheme.
+    #[cfg(feature = "http")]
     fn mk_conn(scheme: &str, host: &str, port: u16) -> Connection {
         let handler = get_scheme_handler(scheme).expect("known scheme");
         Connection::new(handler, host, port)
@@ -2873,6 +2874,7 @@ mod tests {
 
     // --- scheme → handler selection -----------------------------------------
 
+    #[cfg(all(feature = "http", feature = "ftp"))]
     #[test]
     fn scheme_handler_core_schemes() {
         let http = get_scheme_handler("http").expect("http");
@@ -2896,6 +2898,7 @@ mod tests {
         assert!(file.is_nonetwork());
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn scheme_handler_is_case_insensitive() {
         // curl's Curl_get_scheme lowercases before matching.
@@ -2917,6 +2920,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn findprotocol_honors_allowed_and_redir_protocols() {
         // Allowed on a normal request.
@@ -3112,6 +3116,7 @@ mod tests {
 
     // --- connection reuse matching (url_match_conn) -------------------------
 
+    #[cfg(feature = "http")]
     #[test]
     fn reuse_exact_match() {
         let a = mk_conn("http", "example.com", 80);
@@ -3122,6 +3127,7 @@ mod tests {
         assert!(a.can_reuse_for(&c));
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn reuse_rejects_host_or_port_mismatch() {
         let a = mk_conn("http", "example.com", 80);
@@ -3129,6 +3135,7 @@ mod tests {
         assert!(!a.can_reuse_for(&mk_conn("http", "example.com", 8080)));
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn reuse_rejects_scheme_mismatch() {
         // An http candidate cannot serve an https needle (needs TLS)...
@@ -3139,6 +3146,7 @@ mod tests {
         assert!(!https.can_reuse_for(&mk_conn("http", "example.com", 80)));
     }
 
+    #[cfg(all(feature = "http", feature = "ftp"))]
     #[test]
     fn reuse_credentials_matter_only_when_not_creds_per_request() {
         // HTTP carries credentials per request: differing creds still match.
@@ -3158,6 +3166,7 @@ mod tests {
         assert!(!fa.can_reuse_for(&fb));
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn reuse_rejects_tls_config_mismatch() {
         let a = mk_conn("https", "example.com", 443);
@@ -3168,6 +3177,7 @@ mod tests {
         assert!(!a.can_reuse_for(&b));
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn reuse_rejects_proxy_mismatch_and_unusable_conn() {
         let a = mk_conn("http", "example.com", 80);
@@ -3194,6 +3204,7 @@ mod tests {
 
     // --- connection cache (find_or_create / disconnect) ---------------------
 
+    #[cfg(feature = "http")]
     #[test]
     fn conn_cache_reuses_and_creates() {
         let mut cache = ConnCache::new(DEFAULT_CONNCACHE_SIZE);
@@ -3216,6 +3227,7 @@ mod tests {
         assert_ne!(r3.connection_id, r1.connection_id);
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn conn_cache_disconnect_closes_or_retains() {
         let mut cache = ConnCache::new(DEFAULT_CONNCACHE_SIZE);
@@ -3236,6 +3248,7 @@ mod tests {
 
     // --- create_conn (connect flow) -----------------------------------------
 
+    #[cfg(feature = "http")]
     #[test]
     fn create_conn_selects_handler_and_resolves_endpoint() {
         let mut e = Easy::open();
@@ -3253,6 +3266,7 @@ mod tests {
         assert_eq!(c.passwd.as_deref(), Some("pass"));
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn create_conn_reuses_second_time() {
         let mut e = Easy::open();
@@ -3278,6 +3292,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "http", feature = "ftp"))]
     #[test]
     fn create_conn_applies_default_credentials() {
         // FTP (needs a password) with no credentials → anonymous defaults.

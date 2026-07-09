@@ -1127,6 +1127,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "builds a rustls SslFilter connector (aws-lc-rs); Miri cannot interpret the aws-lc-rs C-FFI crypto")]
     fn ssl_filter_identity() {
         let cfg = TlsConfig::default();
         let ssl = SslFilter::new(&cfg, "example.com".to_string()).expect("connector builds");
@@ -1138,6 +1139,7 @@ mod tests {
     // -- Phase 2/3: filter INSERTION ORDER (the critical parity test) -------
 
     #[test]
+    #[cfg_attr(miri, ignore = "builds a rustls SslFilter connector (aws-lc-rs); Miri cannot interpret the aws-lc-rs C-FFI crypto")]
     fn ordering_httpproxy_tunnel_ssl() {
         let mut conn = http_conn("example.com", 80);
         conn.bits.httpproxy = true;
@@ -1152,6 +1154,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "builds a rustls SslFilter connector (aws-lc-rs); Miri cannot interpret the aws-lc-rs C-FFI crypto")]
     fn ordering_httpproxy_tunnel_haproxy_ssl() {
         let mut conn = http_conn("example.com", 80);
         conn.bits.httpproxy = true;
@@ -1167,6 +1170,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "builds a rustls SslFilter connector (aws-lc-rs); Miri cannot interpret the aws-lc-rs C-FFI crypto")]
     fn ssl_filter_sits_at_the_ssl_stage() {
         // Confirm the "SSL" node carries the SSL capability bit at its position.
         let conn = http_conn("example.com", 80);
