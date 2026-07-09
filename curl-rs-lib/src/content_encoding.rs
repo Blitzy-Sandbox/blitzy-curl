@@ -282,9 +282,9 @@ trait Decoder: Send {
     fn finish(&mut self, out: &mut BytesMut, limit: usize) -> Result<()>;
 }
 
-/// A bounded `Write` sink for the write-adapter decoders (`gzip`, `br`, `zstd`).
+/// A bounded `Write` sink for the write-adapter decoders (`br`, `zstd`).
 ///
-/// The `flate2`/`brotli`/`zstd` write adapters decode by *writing* their
+/// The `brotli`/`zstd` write adapters decode by *writing* their
 /// decompressed output into an inner writer. Using a plain `Vec<u8>` there lets
 /// a single `write_all` of a small compressed chunk balloon the vector without
 /// limit — the decompression-bomb vector called out in the review. `BoundedSink`
@@ -295,6 +295,12 @@ trait Decoder: Send {
 /// drained into the transfer's output buffer after each call via
 /// [`drain_sink`], and `limit` is refreshed from the owning [`Unencoder`] before
 /// every call so a runtime change to the ceiling always takes effect.
+///
+/// Gated to the `brotli`/`zstd` write-adapter decoders: the `gzip` decoder
+/// drives [`run_inflate`] directly and enforces the ceiling there, so it does
+/// not use this sink. When neither feature is enabled there are no write-adapter
+/// decoders and this type is compiled out.
+#[cfg(any(feature = "brotli", feature = "zstd"))]
 struct BoundedSink {
     /// Bytes decoded so far in the current call, awaiting drain.
     buf: Vec<u8>,
@@ -306,6 +312,7 @@ struct BoundedSink {
     overflowed: bool,
 }
 
+#[cfg(any(feature = "brotli", feature = "zstd"))]
 impl BoundedSink {
     /// Creates an empty sink. `limit` is set to the permissive `usize::MAX`
     /// until the owning [`Unencoder`] supplies the real ceiling before the
@@ -319,6 +326,7 @@ impl BoundedSink {
     }
 }
 
+#[cfg(any(feature = "brotli", feature = "zstd"))]
 impl std::io::Write for BoundedSink {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         // Reject *before* extending the buffer so the allocation never exceeds
@@ -341,9 +349,10 @@ impl std::io::Write for BoundedSink {
 /// Moves everything accumulated in a decoder's [`BoundedSink`] into the output
 /// buffer and clears the sink for reuse.
 ///
-/// Used by the write-adapter–based decoders (`gzip`, `br`, `zstd`), which emit
+/// Used by the write-adapter–based decoders (`br`, `zstd`), which emit
 /// their decoded output into the sink that is drained after each write so
 /// intermediate memory stays bounded.
+#[cfg(any(feature = "brotli", feature = "zstd"))]
 #[inline]
 fn drain_sink(sink: &mut BoundedSink, out: &mut BytesMut) {
     if !sink.buf.is_empty() {
@@ -354,12 +363,13 @@ fn drain_sink(sink: &mut BoundedSink, out: &mut BytesMut) {
 
 /// Maps a write-adapter failure to the appropriate [`Error`].
 ///
-/// The `gzip`, `br`, and `zstd` decoders wrap a [`BoundedSink`]. When the
+/// The `br` and `zstd` decoders wrap a [`BoundedSink`]. When the
 /// underlying `write_all` fails there are two distinct causes to tell apart:
 /// the sink tripped the decompression-bomb ceiling (`overflowed == true`),
 /// which is a resource-limit condition reported as [`Error::TooLarge`]
 /// (`CURLE_TOO_LARGE`); or the compressed stream was malformed, reported as a
 /// content-encoding error just like curl's `*_do_close` diagnostics.
+#[cfg(any(feature = "brotli", feature = "zstd"))]
 #[inline]
 fn sink_write_error(overflowed: bool, _err: std::io::Error, what: &str) -> Error {
     if overflowed {
@@ -619,27 +629,171 @@ impl Decoder for DeflateDecoder {
 // gzip — transparent gzip (curl's zlib_writer/gzip, inflateInit2(+32))
 // -------------------------------------------------------------------------
 
+/// Upper bound on the bytes buffered while parsing a single gzip member header.
+///
+/// A gzip header is normally 10 bytes, but the optional `FEXTRA` field carries
+/// a 16-bit length (so up to 65 535 bytes) and `FNAME`/`FCOMMENT` are
+/// NUL-terminated strings of unbounded length in principle. curl/zlib read and
+/// discard these fields; because this decoder buffers the header to locate the
+/// DEFLATE body, an unbounded `FNAME`/`FCOMMENT`/`FEXTRA` would let a hostile
+/// server balloon the header buffer. This ceiling (comfortably above a maximal
+/// `FEXTRA` plus realistic name/comment fields) caps that transient allocation;
+/// no real-world gzip stream approaches it, so parity is unaffected. A header
+/// that exceeds it is treated as malformed (`CURLE_BAD_CONTENT_ENCODING`).
+const MAX_GZIP_HEADER_BYTES: usize = 128 * 1024;
+
+/// Outcome of attempting to parse an RFC 1952 gzip member header from a prefix
+/// of the coded stream.
+enum GzipHeaderParse {
+    /// Not enough bytes buffered yet to decide; feed more input.
+    NeedMore,
+    /// The bytes are not a valid gzip header (bad magic or compression method).
+    Invalid,
+    /// A complete header occupying this many leading bytes; the DEFLATE body
+    /// begins immediately after.
+    Complete(usize),
+}
+
+/// Parses an RFC 1952 gzip member header from the front of `buf`.
+///
+/// Mirrors what zlib's `inflate` (with `MAX_WBITS + 32`) does internally: verify
+/// the `1f 8b` magic and the `CM == 8` (DEFLATE) method byte, then skip the
+/// fixed 10-byte header and whichever optional fields the `FLG` byte enables —
+/// `FEXTRA` (0x04, 2-byte length + payload), `FNAME` (0x08, NUL-terminated),
+/// `FCOMMENT` (0x10, NUL-terminated) and `FHCRC` (0x02, 2-byte CRC). Returns the
+/// total header length so the caller knows where the compressed body starts.
+fn parse_gzip_header(buf: &[u8]) -> GzipHeaderParse {
+    // Fixed portion: ID1 ID2 CM FLG MTIME(4) XFL OS.
+    if buf.len() < 10 {
+        return GzipHeaderParse::NeedMore;
+    }
+    if buf[0] != 0x1f || buf[1] != 0x8b {
+        return GzipHeaderParse::Invalid;
+    }
+    if buf[2] != 8 {
+        // Only DEFLATE (CM == 8) is defined; anything else is malformed.
+        return GzipHeaderParse::Invalid;
+    }
+    let flg = buf[3];
+    let mut pos = 10usize;
+    // FEXTRA: 2-byte little-endian length followed by that many bytes.
+    if flg & 0x04 != 0 {
+        if buf.len() < pos + 2 {
+            return GzipHeaderParse::NeedMore;
+        }
+        let xlen = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
+        pos += 2;
+        if buf.len() < pos + xlen {
+            return GzipHeaderParse::NeedMore;
+        }
+        pos += xlen;
+    }
+    // FNAME: original file name, NUL-terminated.
+    if flg & 0x08 != 0 {
+        loop {
+            if pos >= buf.len() {
+                return GzipHeaderParse::NeedMore;
+            }
+            let byte = buf[pos];
+            pos += 1;
+            if byte == 0 {
+                break;
+            }
+        }
+    }
+    // FCOMMENT: file comment, NUL-terminated.
+    if flg & 0x10 != 0 {
+        loop {
+            if pos >= buf.len() {
+                return GzipHeaderParse::NeedMore;
+            }
+            let byte = buf[pos];
+            pos += 1;
+            if byte == 0 {
+                break;
+            }
+        }
+    }
+    // FHCRC: 2-byte header CRC16 (contents not validated, matching zlib, which
+    // only checks it when present but whose result curl does not surface).
+    if flg & 0x02 != 0 {
+        if buf.len() < pos + 2 {
+            return GzipHeaderParse::NeedMore;
+        }
+        pos += 2;
+    }
+    GzipHeaderParse::Complete(pos)
+}
+
+/// Where the gzip member decoder is within the RFC 1952 framing.
+enum GzipState {
+    /// Buffering and parsing the member header.
+    Header,
+    /// Inflating the DEFLATE body of the current member.
+    Body,
+    /// Buffering the 8-byte trailer (CRC32 + ISIZE) of the current member.
+    Trailer,
+}
+
 /// The `gzip` decoder.
 ///
 /// curl decodes gzip "transparently" via `inflateInit2(z, MAX_WBITS + 32)`,
-/// letting zlib parse the gzip header, member, and trailer. The low-level
-/// [`flate2::Decompress`] API does not expose gzip window bits, so this decoder
-/// uses [`flate2::write::MultiGzDecoder`] — a `Write` adapter that decodes gzip
-/// (tolerating concatenated members) into a [`BoundedSink`], which is drained
-/// into the output buffer after every write to keep memory bounded and which
-/// enforces the per-call decompression-bomb ceiling before bytes are buffered.
+/// letting zlib parse the gzip header, inflate the body, and — crucially —
+/// **verify the 8-byte trailer**, reporting `CURLE_BAD_CONTENT_ENCODING` on a
+/// CRC32 or ISIZE mismatch. The low-level [`flate2::Decompress`] API does not
+/// expose gzip window bits, so this decoder reproduces zlib's gzip framing
+/// itself: a small state machine parses each member's header, drives the raw
+/// DEFLATE body through the shared [`run_inflate`] loop (which enforces the
+/// decompression-bomb ceiling exactly as for `deflate`), and validates the
+/// trailer inline against a running [`flate2::Crc`] over the decoded output.
+///
+/// Concatenated members are supported (like zlib's transparent multi-member
+/// handling): after a validated trailer the machine resets and parses the next
+/// member. A stream that ends mid-member or mid-trailer is tolerated as a
+/// truncated transfer — matching curl's lenient `gzip_do_close`, which does not
+/// turn a short read into an error — so only a *present but wrong* trailer is
+/// rejected.
 struct GzipDecoder {
-    inner: flate2::write::MultiGzDecoder<BoundedSink>,
+    /// Current position within the gzip framing.
+    state: GzipState,
+    /// Header bytes accumulated so far for the member being parsed (bounded by
+    /// [`MAX_GZIP_HEADER_BYTES`]).
+    header_buf: Vec<u8>,
+    /// Raw-DEFLATE inflater for the current member's body (`false` = no zlib
+    /// header, i.e. a bare DEFLATE stream, which is what a gzip body is).
+    decomp: flate2::Decompress,
+    /// Running CRC32 and byte count over the current member's decoded output,
+    /// compared against the trailer. [`flate2::Crc::sum`] yields the CRC32 and
+    /// [`flate2::Crc::amount`] the ISIZE (mod 2^32), matching the trailer's two
+    /// little-endian 32-bit fields.
+    crc: flate2::Crc,
+    /// Trailer bytes accumulated so far (need 8: CRC32 then ISIZE).
+    trailer_buf: Vec<u8>,
+    /// Set once [`finish`](Decoder::finish) has run so a later call is a no-op.
     finished: bool,
 }
 
 impl GzipDecoder {
-    /// Creates a `gzip` decoder writing into a fresh, empty bounded sink.
+    /// Creates a `gzip` decoder positioned at the start of the first member.
     fn new() -> Self {
         GzipDecoder {
-            inner: flate2::write::MultiGzDecoder::new(BoundedSink::new()),
+            state: GzipState::Header,
+            header_buf: Vec::new(),
+            decomp: flate2::Decompress::new(false),
+            crc: flate2::Crc::new(),
+            trailer_buf: Vec::new(),
             finished: false,
         }
+    }
+
+    /// The diagnostic curl surfaces (via `process_zlib_error`) for a malformed
+    /// gzip stream. The `detail` mirrors zlib's `z->msg` for the deterministic
+    /// framing failures (`incorrect header check` / `incorrect data check` /
+    /// `incorrect length check`), so `--verbose` output matches curl 8.x.
+    fn framing_error(detail: &str) -> Error {
+        Error::bad_content_encoding(format!(
+            "Error while processing content unencoding: {detail}"
+        ))
     }
 }
 
@@ -648,36 +802,109 @@ impl Decoder for GzipDecoder {
         "gzip"
     }
 
-    fn decode(&mut self, input: &[u8], out: &mut BytesMut, limit: usize) -> Result<()> {
-        if input.is_empty() || self.finished {
-            return Ok(());
-        }
-        use std::io::Write as _;
-        self.inner.get_mut().limit = limit;
-        if let Err(e) = self.inner.write_all(input) {
-            let overflowed = self.inner.get_ref().overflowed;
-            return Err(sink_write_error(overflowed, e, "gzip"));
-        }
-        drain_sink(self.inner.get_mut(), out);
-        Ok(())
-    }
-
-    fn finish(&mut self, out: &mut BytesMut, limit: usize) -> Result<()> {
+    fn decode(&mut self, mut input: &[u8], out: &mut BytesMut, limit: usize) -> Result<()> {
         if self.finished {
             return Ok(());
         }
-        self.finished = true;
-        use std::io::Write as _;
-        // Flush any bytes the adapter still holds, then drain the sink. Flush
-        // failures on a truncated stream are ignored to match curl's lenient
-        // `gzip_do_close`, but a ceiling breach latched during the flush is
-        // still surfaced as a resource-limit error.
-        self.inner.get_mut().limit = limit;
-        let _ = self.inner.flush();
-        if self.inner.get_ref().overflowed {
-            return Err(Error::TooLarge);
+        // Drive the framing state machine, consuming `input` as it advances
+        // across headers, bodies and trailers (a single call may span several
+        // members, or only a fraction of one).
+        loop {
+            if input.is_empty() {
+                return Ok(());
+            }
+            match self.state {
+                GzipState::Header => {
+                    // Buffer just enough of `input` to complete the header,
+                    // capped so a pathological header cannot exhaust memory.
+                    let room = MAX_GZIP_HEADER_BYTES.saturating_sub(self.header_buf.len());
+                    let take = room.min(input.len());
+                    let prev_len = self.header_buf.len();
+                    self.header_buf.extend_from_slice(&input[..take]);
+                    match parse_gzip_header(&self.header_buf) {
+                        GzipHeaderParse::Invalid => {
+                            return Err(Self::framing_error("incorrect header check"));
+                        }
+                        GzipHeaderParse::Complete(header_len) => {
+                            // Only the header bytes belong to the header; the
+                            // remainder of `input` is the body (and beyond).
+                            let used_from_input = header_len - prev_len;
+                            input = &input[used_from_input..];
+                            self.header_buf.clear();
+                            // Fresh inflater and CRC for this member's body.
+                            self.decomp = flate2::Decompress::new(false);
+                            self.crc = flate2::Crc::new();
+                            self.state = GzipState::Body;
+                        }
+                        GzipHeaderParse::NeedMore => {
+                            input = &input[take..];
+                            if self.header_buf.len() >= MAX_GZIP_HEADER_BYTES {
+                                return Err(Self::framing_error("incorrect header check"));
+                            }
+                            // Either `input` is now empty (wait for more) or the
+                            // cap was hit above; the outer check returns Ok.
+                        }
+                    }
+                }
+                GzipState::Body => {
+                    let base = out.len();
+                    let in_before = self.decomp.total_in();
+                    let status = match run_inflate(&mut self.decomp, input, out, limit) {
+                        Ok(status) => status,
+                        Err(RunInflateError::TooLarge) => return Err(Error::TooLarge),
+                        Err(RunInflateError::Decompress) => {
+                            return Err(Self::framing_error(
+                                "Unknown failure within decompression software.",
+                            ));
+                        }
+                    };
+                    // Fold exactly this member's freshly decoded bytes into the
+                    // running CRC/length, then advance past the consumed input.
+                    self.crc.update(&out[base..]);
+                    let consumed = (self.decomp.total_in() - in_before) as usize;
+                    input = &input[consumed..];
+                    if status == flate2::Status::StreamEnd {
+                        self.trailer_buf.clear();
+                        self.state = GzipState::Trailer;
+                    } else {
+                        // Needs more body input; resume on the next call.
+                        return Ok(());
+                    }
+                }
+                GzipState::Trailer => {
+                    let need = 8 - self.trailer_buf.len();
+                    let take = need.min(input.len());
+                    self.trailer_buf.extend_from_slice(&input[..take]);
+                    input = &input[take..];
+                    if self.trailer_buf.len() < 8 {
+                        // Trailer split across calls; wait for the rest.
+                        return Ok(());
+                    }
+                    let crc_expected =
+                        u32::from_le_bytes(self.trailer_buf[0..4].try_into().unwrap());
+                    let isize_expected =
+                        u32::from_le_bytes(self.trailer_buf[4..8].try_into().unwrap());
+                    if crc_expected != self.crc.sum() {
+                        return Err(Self::framing_error("incorrect data check"));
+                    }
+                    if isize_expected != self.crc.amount() {
+                        return Err(Self::framing_error("incorrect length check"));
+                    }
+                    // Member fully validated; any remaining input starts the
+                    // next concatenated member.
+                    self.state = GzipState::Header;
+                }
+            }
         }
-        drain_sink(self.inner.get_mut(), out);
+    }
+
+    fn finish(&mut self, _out: &mut BytesMut, _limit: usize) -> Result<()> {
+        // The body is inflated eagerly during `decode` (via `run_inflate`, which
+        // emits output as it goes), so there is never buffered residual to flush
+        // here. A stream that stops mid-header, mid-body or mid-trailer is a
+        // truncated transfer, which curl's `gzip_do_close` tolerates rather than
+        // reporting as a content error — so end-of-body is a lenient no-op.
+        self.finished = true;
         Ok(())
     }
 }
@@ -1389,6 +1616,79 @@ mod tests {
         let result = unencoder.write(&garbage).and_then(|_| unencoder.finish());
         let err = result.expect_err("corrupt gzip must fail");
         assert_eq!(err.code() as i32, 61);
+    }
+
+    #[test]
+    fn gzip_bad_crc_is_rejected() {
+        // A gzip member whose stored CRC32 does not match the decoded body must
+        // be rejected as CURLE_BAD_CONTENT_ENCODING — zlib's "incorrect data
+        // check" as surfaced by curl. (Before the fix this was silently
+        // accepted, the defect reported in F5-CE-001.)
+        let data = sample();
+        let mut encoded = gzip_compress(&data);
+        let n = encoded.len();
+        encoded[n - 8] ^= 0x01; // flip a bit in the little-endian CRC32 field
+        let err = decode_all("gzip", &encoded).expect_err("bad gzip CRC must fail");
+        assert_eq!(err.code(), CurlCode::BadContentEncoding);
+        assert_eq!(err.code() as i32, 61);
+    }
+
+    #[test]
+    fn gzip_bad_isize_is_rejected() {
+        // A corrupted ISIZE (uncompressed-length) trailer field must likewise be
+        // rejected — zlib's "incorrect length check".
+        let data = sample();
+        let mut encoded = gzip_compress(&data);
+        let n = encoded.len();
+        encoded[n - 1] ^= 0x01; // flip a bit in the little-endian ISIZE field
+        let err = decode_all("gzip", &encoded).expect_err("bad gzip ISIZE must fail");
+        assert_eq!(err.code(), CurlCode::BadContentEncoding);
+        assert_eq!(err.code() as i32, 61);
+    }
+
+    #[test]
+    fn gzip_bad_crc_is_detected_even_when_chunked() {
+        // The trailer check must fire regardless of how the stream is fragmented
+        // across writes (trailer bytes arriving one byte at a time).
+        let data = sample();
+        let mut encoded = gzip_compress(&data);
+        let n = encoded.len();
+        encoded[n - 6] ^= 0x02; // corrupt a CRC32 byte
+        let err = decode_chunked("gzip", &encoded, 1)
+            .expect_err("bad gzip CRC must fail even when chunked");
+        assert_eq!(err.code() as i32, 61);
+    }
+
+    #[test]
+    fn gzip_truncated_trailer_is_tolerated() {
+        // A stream cut off before (or during) its trailer is a truncated
+        // transfer, not a content error: curl's lenient gzip_do_close delivers
+        // the decoded body without failing, and the output is still complete.
+        let data = sample();
+        let encoded = gzip_compress(&data);
+        let n = encoded.len();
+        // The whole 8-byte trailer is missing.
+        assert_eq!(decode_all("gzip", &encoded[..n - 8]).unwrap(), data);
+        // Only part of the trailer arrived (split-trailer truncation).
+        assert_eq!(decode_all("gzip", &encoded[..n - 3]).unwrap(), data);
+        // The intact stream still decodes cleanly (rejection is trailer-specific).
+        assert_eq!(decode_all("gzip", &encoded).unwrap(), data);
+    }
+
+    #[test]
+    fn gzip_multi_member_roundtrips() {
+        // Concatenated gzip members (zlib's transparent multi-member handling)
+        // decode into the concatenation of their bodies, each trailer validated
+        // against its own CRC32/ISIZE.
+        let first = b"first member payload ".repeat(200);
+        let second = b"second member payload ".repeat(200);
+        let mut encoded = gzip_compress(&first);
+        encoded.extend_from_slice(&gzip_compress(&second));
+        let mut expected = first.clone();
+        expected.extend_from_slice(&second);
+        // Whole-buffer and tiny-chunk (header/trailer spanning writes) paths.
+        assert_eq!(decode_all("gzip", &encoded).unwrap(), expected);
+        assert_eq!(decode_chunked("gzip", &encoded, 5).unwrap(), expected);
     }
 
     // ---------------------------------------------------------------------

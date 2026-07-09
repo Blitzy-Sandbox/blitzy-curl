@@ -1038,7 +1038,10 @@ impl CookieJar {
     ///
     /// Equivalent to `Curl_cookie_init(NULL)` followed by the `running = TRUE`
     /// that curl sets once initialization completes: a freshly built jar is in
-    /// the "running" (live-network) state and carries no public-suffix list.
+    /// the "running" (live-network) state and carries the bundled public-suffix
+    /// list, so the "supercookie" domain defense is active by default — parity
+    /// with a curl built against `libpsl`. Use
+    /// [`with_psl(Psl::empty())`](Self::with_psl) for the no-`libpsl` fallback.
     #[must_use]
     pub fn new() -> Self {
         CookieJar {
@@ -1053,7 +1056,11 @@ impl CookieJar {
             lastct: 0,
             running: true,
             newsession: false,
-            psl: Psl::default(),
+            // Load the bundled Public Suffix List so the supercookie defense is
+            // on by default, matching a curl built with libpsl. The list is
+            // parsed once and shared via Arc, so this is cheap. Callers wanting
+            // the no-libpsl behavior use `CookieJar::with_psl(Psl::empty())`.
+            psl: Psl::bundled(),
             filename: None,
             files: Vec::new(),
         }
@@ -2859,8 +2866,52 @@ mod tests {
     }
 
     #[test]
-    fn no_psl_rejects_single_label_domain() {
+    fn default_jar_rejects_public_suffix_supercookie() {
+        // F5-PSL-001: a jar built with `new()` (the default) now carries the
+        // bundled Public Suffix List, so a cookie scoped to a public suffix — a
+        // "supercookie" — is rejected out of the box, matching curl built with
+        // libpsl. Before the fix, `new()` carried no PSL and such cookies were
+        // wrongly accepted via the weaker bad_domain heuristic.
         let mut jar = CookieJar::new();
+        // Multi-label public suffix (`co.uk`).
+        assert!(!add_header(
+            &mut jar,
+            "evil=1; Domain=co.uk",
+            Some("www.bbc.co.uk"),
+            Some("/"),
+            false,
+        ));
+        // Single-label public suffix (`com`).
+        assert!(!add_header(
+            &mut jar,
+            "evil2=1; Domain=com",
+            Some("www.example.com"),
+            Some("/"),
+            false,
+        ));
+        assert!(
+            jar.is_empty(),
+            "supercookies must not enter the default jar"
+        );
+        // A registrable domain (eTLD+1) is still accepted by the same jar.
+        assert!(add_header(
+            &mut jar,
+            "ok=1; Domain=bbc.co.uk",
+            Some("www.bbc.co.uk"),
+            Some("/"),
+            false,
+        ));
+        assert_eq!(jar.len(), 1);
+        assert_eq!(jar.cookies()[0].domain.as_deref(), Some("bbc.co.uk"));
+    }
+
+    #[test]
+    fn no_psl_rejects_single_label_domain() {
+        // Exercise the no-libpsl fallback explicitly. A jar from `new()` now
+        // carries the bundled PSL (which would reject `com` via the public-
+        // suffix check); an empty PSL forces curl's bad_domain heuristic path,
+        // which is what this test is meant to cover.
+        let mut jar = CookieJar::with_psl(Psl::empty());
         // Without a PSL, curl's bad_domain fallback poisons a single-label
         // Domain so it cannot be accepted (the `domain = ":"` trick).
         assert!(!add_header(

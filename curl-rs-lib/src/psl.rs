@@ -49,7 +49,7 @@
 
 use std::fmt;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 // `publicsuffix::Psl` is the trait that provides the `suffix()` and `domain()`
 // query methods on `List`. It is imported anonymously (`as _`) so its methods
@@ -58,6 +58,16 @@ use std::sync::Arc;
 use publicsuffix::{List, Psl as _};
 
 use crate::error::{Error, Result};
+
+/// The Public Suffix List bundled into the library at build time.
+///
+/// This is the verbatim `public_suffix_list.dat` published at
+/// <https://publicsuffix.org/list/>, embedded with [`include_str!`] so the
+/// cookie engine's "supercookie" defense is active out of the box. It is the
+/// pure-Rust equivalent of curl being built against `libpsl`, which ships (or
+/// loads) a list and enables the defense by default. The data is licensed
+/// MPL-2.0 (annotated in `REUSE.toml`), separate from the crate's own license.
+const BUNDLED_PUBLIC_SUFFIX_LIST: &str = include_str!("public_suffix_list.dat");
 
 /// A shared, reference-counted Public Suffix List handle.
 ///
@@ -125,6 +135,32 @@ impl Psl {
     #[must_use]
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    /// Returns a handle backed by the Public Suffix List bundled with the
+    /// library (see [`BUNDLED_PUBLIC_SUFFIX_LIST`]).
+    ///
+    /// This is the list used by default in
+    /// [`CookieJar::new`](crate::cookie::CookieJar::new), giving the cookie
+    /// engine its supercookie defense out of the box — the behavior of a curl
+    /// built with `libpsl`. The embedded list is parsed exactly once, on the
+    /// first call, and cached in a process-wide [`OnceLock`]; every subsequent
+    /// call — and every clone of the returned handle — only bumps the shared
+    /// [`Arc`] reference count, so obtaining the handle is cheap. If the
+    /// embedded data ever fails to parse it degrades to an
+    /// [`empty`](Self::empty) handle rather than panicking, matching the
+    /// conservative no-list fallback (a `bundled_list_is_available_*` unit test
+    /// guards against the embedded data silently regressing to that state).
+    #[must_use]
+    pub fn bundled() -> Self {
+        static BUNDLED: OnceLock<Psl> = OnceLock::new();
+        BUNDLED
+            .get_or_init(|| {
+                BUNDLED_PUBLIC_SUFFIX_LIST
+                    .parse::<Self>()
+                    .unwrap_or_default()
+            })
+            .clone()
     }
 
     /// Parses a handle from raw Public Suffix List bytes.
@@ -241,6 +277,40 @@ co.uk
     fn handle_is_send_sync_clone() {
         fn assert_traits<T: Send + Sync + Clone>() {}
         assert_traits::<Psl>();
+    }
+
+    // ---------------------------------------------------------------------
+    // Bundled Public Suffix List (default-on supercookie defense, F5-PSL-001)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn bundled_list_is_available_and_classifies_correctly() {
+        // The list embedded via include_str! must parse and be live; a silent
+        // parse failure (which would disable the supercookie defense) must be
+        // caught here rather than shipped.
+        let psl = Psl::bundled();
+        assert!(
+            psl.is_available(),
+            "bundled PSL must parse and be available"
+        );
+        // Real public suffixes drawn from the published list.
+        assert!(psl.is_public_suffix("com"));
+        assert!(psl.is_public_suffix("co.uk"));
+        assert!(psl.is_public_suffix("github.io")); // a private-section suffix
+                                                    // Registrable domains (eTLD+1) are not themselves public suffixes.
+        assert!(!psl.is_public_suffix("example.com"));
+        assert!(!psl.is_public_suffix("bbc.co.uk"));
+        assert_eq!(psl.registrable_domain("www.bbc.co.uk"), Some("bbc.co.uk"));
+    }
+
+    #[test]
+    fn bundled_handle_is_cached_and_cheap_to_share() {
+        // Repeated calls return equivalent, cheaply-cloned handles: the list is
+        // parsed once and shared via Arc across every caller and clone.
+        let a = Psl::bundled();
+        let b = Psl::bundled();
+        assert!(a.is_available() && b.is_available());
+        assert_eq!(a.is_public_suffix("co.uk"), b.is_public_suffix("co.uk"));
     }
 
     // ---------------------------------------------------------------------

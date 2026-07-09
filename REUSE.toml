@@ -38,3 +38,13 @@ SPDX-FileCopyrightText = "Daniel Stenberg, <daniel@haxx.se>, et al."
 SPDX-License-Identifier = "curl"
 # If there is licensing/copyright information in or next to these files, prefer that
 precedence = "closest"
+
+# The Public Suffix List (public_suffix_list.dat) is vendored verbatim from
+# https://publicsuffix.org/list/public_suffix_list.dat and bundled into
+# curl-rs-lib so the cookie engine's "supercookie" defense is active by default
+# (parity with a curl built against libpsl). It is licensed under the Mozilla
+# Public License 2.0, not the curl license, so it is annotated separately here.
+[[annotations]]
+path = ["curl-rs-lib/src/public_suffix_list.dat"]
+SPDX-FileCopyrightText = "Mozilla Foundation and the Public Suffix List contributors"
+SPDX-License-Identifier = "MPL-2.0"
