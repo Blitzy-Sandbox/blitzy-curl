@@ -121,7 +121,10 @@ fn is_location_name(name: &[u8]) -> bool {
     for (i, &b) in name.iter().enumerate() {
         // Byte from "Location", or its NUL terminator once we run past the end.
         let a = if i < LOC.len() { LOC[i] } else { 0u8 };
-        if a.to_ascii_lowercase() != b.to_ascii_lowercase() {
+        // ASCII case-insensitive byte compare, matching curl's `curl_strnequal`
+        // (`strncasecmp`) semantics; `u8::eq_ignore_ascii_case` folds only A-Z/a-z
+        // and leaves the NUL sentinel (`a == 0`) comparing equal only to a NUL byte.
+        if !a.eq_ignore_ascii_case(&b) {
             return false;
         }
         if a == 0 {
