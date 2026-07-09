@@ -15,9 +15,47 @@
 //! `Option<String>` filename and an [`OutSink`] enum that unifies a buffered regular file
 //! with the standard streams and the discard ("/dev/null") sink.
 
+// Callback submodules — language rewrites of curl's `src/tool_cb_*.c`, each installing one
+// libcurl transfer callback. Declared here as they land; the operation layer wires the live
+// function pointers onto the easy handle. `seek` ports `src/tool_cb_see.c`
+// (`CURLOPT_SEEKFUNCTION`).
+pub mod seek;
+
 use core::ffi::c_void;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
+
+/// `CURLOPT_DEBUGFUNCTION` — `-v`/`--trace`/`--trace-ascii`/`--trace-time` diagnostic dump
+/// (Rust rewrite of `src/tool_cb_dbg.c`).
+pub mod debug;
+
+/// Body-write callback plus output-file and directory-hierarchy helpers — the
+/// `CURLOPT_WRITEFUNCTION` path (curl's `src/tool_cb_wrt.c`, absorbing `src/tool_dirhie.c`
+/// and `src/tool_dirhie.h`).
+pub mod write;
+
+/// Single-transfer `-#`/`--progress-bar` renderer (curl's `src/tool_cb_prg.c`). Owns the
+/// `CURLOPT_XFERINFOFUNCTION` callback and [`ProgressData`] state for a serial `-#` transfer;
+/// the parallel aggregate meter is the separate [`crate::progress_display`] module.
+pub mod progress;
+
+// Re-export the single-transfer progress-bar surface at the `callbacks` root, so the
+// operation-dispatch and option-application layers refer to `callbacks::ProgressData` /
+// `callbacks::CURL_PROGRESS_*` without reaching into the submodule (mirrors how curl's
+// `tool_cb_prg.h` publishes these). The bar path is not yet wired into `operate.rs`, so these
+// names have no in-crate consumer at this stage — same not-yet-wired status the boundary
+// helpers below carry — hence the targeted `unused_imports` relaxation on the re-export.
+#[allow(unused_imports)]
+pub use progress::{ProgressData, CURL_PROGRESS_BAR, CURL_PROGRESS_STATS};
+// Callback submodules — language rewrites of curl's `src/tool_cb_*.c` (and the socket-option
+// handler lifted from `src/config2setopts.c`), wired in as they are added. `socket` implements
+// the `CURLOPT_OPENSOCKETFUNCTION` (Linux MPTCP) and `CURLOPT_SOCKOPTFUNCTION`
+// (`--ip-tos` / `--vlan-priority`) callbacks and is the only submodule that reaches OS socket
+// primitives directly (its `unsafe` is the narrow OS-integration exception of AAP §0.6.2).
+pub mod socket;
+/// `CURLOPT_READFUNCTION` upload-source read + `CURLOPT_XFERINFOFUNCTION` busy-read unpauser
+/// (Rust rewrite of curl's `src/tool_cb_rea.c`).
+pub mod read;
 
 /// Output destination for a transfer.
 ///

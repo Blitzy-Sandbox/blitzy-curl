@@ -62,9 +62,10 @@ use curl_rs_lib::multi::{
 use curl_rs_lib::{feature_names, version, CurlCode, Easy};
 
 use crate::args::{
-    self, get_args, parse_args, ClobberMode, Diag, FailMode, GlobalConfig, HttpReq,
-    OperationConfig, ParameterError, CONFIG_MAX_LEVELS,
+    self, get_args, parse_args, Diag, FailMode, GlobalConfig, HttpReq, OperationConfig,
+    ParameterError, CONFIG_MAX_LEVELS,
 };
+use crate::callbacks::write::{create_dir_hierarchy, tool_create_output_file};
 use crate::callbacks::{OutSink, OutStruct};
 use crate::progress_display::{ProgressMeter, TransferProgress};
 use crate::urlglob::URLGlob;
@@ -695,12 +696,20 @@ fn tool_ssls_save(diag: Diag, filename: &str) -> CurlCode {
 /// port stores [`config_idx`](Self::config_idx) — an index into `global.operations` —
 /// which aliases the same target without a self-referential borrow (the locked design
 /// decision from Phase 1).
-struct PerTransfer {
+///
+/// Visibility is `pub(crate)` so the CLI callback submodules (`callbacks/read.rs`, curl's
+/// `tool_cb_rea.c`) can reconstitute it from libcurl's opaque userdata pointer and read the
+/// fields the upload read/unpause callbacks need.
+/// Exposed `pub(crate)` (with a `pub(crate)` [`infile`](Self::infile) field) so the
+/// transfer callbacks in [`crate::callbacks`] — notably the `CURLOPT_SEEKFUNCTION`
+/// handler (`callbacks/seek.rs`, curl's `src/tool_cb_see.c`) — can recover this record
+/// from the libcurl `*DATA` userdata pointer and reposition the upload source.
+pub(crate) struct PerTransfer {
     /// Index into `global.operations` of the [`OperationConfig`] driving this transfer
     /// (curl's `per->config`).
     config_idx: usize,
     /// The CLI easy handle, configured by [`setopt::config2setopts`] (curl's `per->curl`).
-    easy: Easy,
+    pub(crate) easy: Easy,
     /// When driven in parallel, the id of this transfer's handle inside the [`Multi`]
     /// (there is no direct C analogue — curl matches by the `CURLINFO_PRIVATE` pointer).
     easy_id: Option<EasyId>,
@@ -712,9 +721,13 @@ struct PerTransfer {
     uploadfile: Option<String>,
     /// The opened upload file. Owning the [`File`] here means the descriptor is closed by
     /// RAII on drop, replacing curl's explicit `per->infd`/`per->infdopen` pair.
-    infile: Option<File>,
+    ///
+    /// `pub(crate)` so the `CURLOPT_SEEKFUNCTION` callback (`callbacks/seek.rs`, curl's
+    /// `src/tool_cb_see.c`) can borrow the descriptor via [`AsRawFd`] to reposition the
+    /// upload source on a redirect or resume (curl seeks `per->infd` directly).
+    pub(crate) infile: Option<File>,
     /// Expected upload size in bytes, or `-1` when unknown (curl's `per->uploadfilesize`).
-    uploadfilesize: i64,
+    pub(crate) uploadfilesize: i64,
     /// Remaining retry attempts (curl's `per->retry_remaining`).
     retry_remaining: i64,
     /// The configured base retry delay in ms (curl's `per->retry_sleep_default`).
@@ -724,7 +737,7 @@ struct PerTransfer {
     /// Count of retries actually performed (curl's `per->num_retries`).
     num_retries: i64,
     /// When this transfer began (curl's `per->start`).
-    start: Instant,
+    pub(crate) start: Instant,
     /// When the current retry window began (curl's `per->retrystart`).
     retrystart: Instant,
     /// For a parallel retry transfer, the instant before which it must not (re)start
@@ -743,7 +756,7 @@ struct PerTransfer {
     /// plus the `dltotal`/`dlnow`/`ultotal`/`ulnow` counters).
     progress: TransferProgress,
     /// Whether the progress meter is suppressed for this transfer (curl's `per->noprogress`).
-    noprogress: bool,
+    pub(crate) noprogress: bool,
     /// The transfer's final result once it has been performed (curl reads the multi
     /// `msg->data.result`; the serial path stores the easy result here).
     result: CurlCode,
@@ -757,6 +770,24 @@ struct PerTransfer {
     /// The multipart body built for `-F` by [`setopt::config2setopts`], owned here for the
     /// transfer's lifetime (curl keeps it on `config->mimepost` and frees it at cleanup).
     mimepost: Option<Mime>,
+    /// Set by the upload read callback when a non-blocking read returned `EAGAIN`, and
+    /// cleared by the read/unpause callbacks once the transfer resumes (curl's
+    /// `config->readbusy`). curl stores this on the per-operation `OperationConfig`; because
+    /// the port's `OperationConfig` is shared across a config's transfers via
+    /// `global.operations`, the flag is denormalized here so it stays transfer-scoped and is
+    /// reachable from the callbacks, which receive only this `PerTransfer`
+    /// (`callbacks/read.rs`, curl's `tool_cb_rea.c`).
+    pub(crate) readbusy: bool,
+    /// `--max-time` budget in milliseconds, or `0` when unset (curl reads `config->timeout_ms`
+    /// inside the read callback). Denormalized from [`OperationConfig::timeout_ms`] at
+    /// [`create_single`] so the read callback — which is handed only this `PerTransfer` — can
+    /// bound how long it blocks waiting for upload input.
+    pub(crate) timeout_ms: i64,
+    /// Diagnostic gate snapshot for warnings emitted from a callback (curl reaches the global
+    /// via `per->config->global`). Captured once at [`create_single`] so the read callback's
+    /// "file grew during upload" warning honours `--silent`/`--show-error` without a
+    /// back-reference to `GlobalConfig`.
+    pub(crate) diag: Diag,
 }
 
 impl PerTransfer {
@@ -795,7 +826,32 @@ impl PerTransfer {
             abort: false,
             skip: false,
             mimepost: None,
+            // Seeded later: `readbusy` toggles during the transfer's read callbacks;
+            // `timeout_ms`/`diag` are denormalized from the config/global in `create_single`.
+            readbusy: false,
+            timeout_ms: 0,
+            diag: Diag::default(),
         }
+    }
+
+    /// The upload input descriptor for this transfer (curl's `per->infd`).
+    ///
+    /// curl stores a raw `int infd`; the port owns the source as [`Option<File>`] (closed by
+    /// RAII on drop). This returns that file's descriptor, or `STDIN_FILENO` (`0`) when the
+    /// upload streams from standard input (`-T -`, `infile` is `None`) — matching curl, where
+    /// `per->infd` defaults to `0` for a stdin upload. Consumed by the read/unpause callbacks
+    /// (`callbacks/read.rs`, curl's `tool_cb_rea.c`).
+    pub(crate) fn infd(&self) -> RawFd {
+        self.infile.as_ref().map_or(0, AsRawFd::as_raw_fd)
+    }
+
+    /// Bytes delivered from the upload read callback so far (curl's `per->uploadedsofar`).
+    ///
+    /// The port tracks the running upload count on the per-transfer progress record; this
+    /// exposes it under curl's field name for the read callback's overshoot clamp
+    /// (`callbacks/read.rs`, curl's `tool_cb_rea.c`).
+    pub(crate) fn uploadedsofar(&self) -> i64 {
+        self.progress.ulnow()
     }
 }
 
@@ -1107,9 +1163,10 @@ fn retrycheck(
 //
 // Rewrite of curl's `post_check_result`, `post_output_handling`,
 // `post_close_output`, and the orchestrating `post_per_transfer`
-// (`src/tool_operate.c`), plus a local port of `tool_create_output_file`
-// (curl's lives in the callback TU `src/tool_cb_wrt.c`, outside this file's
-// source set). Descriptor/handle closing is RAII: dropping a [`File`] or
+// (`src/tool_operate.c`). `tool_create_output_file` (curl's `src/tool_cb_wrt.c`)
+// lives in its C home, the write-callback module [`crate::callbacks::write`], and
+// is imported at the top of this file. Descriptor/handle closing is RAII:
+// dropping a [`File`] or
 // replacing an [`OutSink`] with [`OutSink::None`] closes the underlying fd,
 // so curl's explicit `fclose`/`sclose`/`free` calls become scope exits.
 // ===========================================================================
@@ -1199,7 +1256,7 @@ fn post_output_handling(
         let cond_unmet = false;
         if !cond_unmet
             && per.outs.filename.is_some()
-            && !create_output_file(diag, &mut per.outs, config)
+            && !tool_create_output_file(diag, &mut per.outs, config)
         {
             return CurlCode::WriteError;
         }
@@ -1215,65 +1272,6 @@ fn post_output_handling(
     }
 
     result
-}
-
-/// Create (and open for writing) the configured output file, honoring the `--clobber` policy
-/// (`tool_create_output_file`, tool_cb_wrt.c — ported locally as its C home is outside this
-/// file's source set). `CLOBBER_ALWAYS`, and `CLOBBER_DEFAULT` for a non-Content-Disposition
-/// name, truncate/overwrite; `CLOBBER_NEVER` creates exclusively and, on collision, tries
-/// `name.1` … `name.99`. Returns `false` (with curl's warning) when the file cannot be opened.
-fn create_output_file(diag: Diag, outs: &mut OutStruct, config: &OperationConfig) -> bool {
-    let fname = match outs.filename.clone() {
-        Some(f) if !f.is_empty() => f,
-        // curl DEBUGASSERTs a non-empty filename; without one there is nothing to create.
-        _ => return false,
-    };
-
-    let overwrite = matches!(config.file_clobber_mode, ClobberMode::Always)
-        || (config.file_clobber_mode == ClobberMode::Default && !outs.is_cd_filename);
-
-    let opened: io::Result<File> = if overwrite {
-        // fopen(fname, "wb") — create or truncate.
-        OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&fname)
-    } else {
-        // Exclusive create (O_CREAT | O_EXCL). CLOBBER_NEVER additionally retries with
-        // numbered suffixes while the name keeps colliding.
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&fname);
-        if config.file_clobber_mode == ClobberMode::Never && file.is_err() {
-            let mut next_num = 1;
-            while file.is_err() && next_num < 100 {
-                let candidate = format!("{fname}.{next_num}");
-                next_num += 1;
-                file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&candidate);
-                // curl records the last-tried numbered name (whether or not it succeeded).
-                outs.filename = Some(candidate);
-                outs.alloc_filename = true;
-            }
-        }
-        file
-    };
-
-    match opened {
-        Ok(file) => {
-            outs.regular_file = true;
-            outs.fopened = true;
-            outs.stream = OutSink::File(BufWriter::new(file));
-            outs.bytes = 0;
-            outs.init = 0;
-            true
-        }
-        Err(e) => {
-            warnf(diag, &format!("Failed to open the file {fname}: {e}"));
-            false
-        }
-    }
 }
 
 /// Close the output file and apply the trailing side effects (`post_close_output`,
@@ -1404,9 +1402,9 @@ fn post_per_transfer(global: &mut GlobalConfig, per: &mut PerTransfer) -> (CurlC
 // Part 2f — small shared helpers (`src/tool_helpers.c` + `src/tool_dirhie.c`).
 //
 // `SetHTTPrequest` lives in tool_helpers.c, which is a source-of-truth for this
-// module; `create_dir_hierarchy` lives in tool_dirhie.c and is ported locally
-// because `create_single`/`etag_store`/`setup_*` require it and no dependency
-// exposes it.
+// module. `create_dir_hierarchy` (curl's `src/tool_dirhie.c`) lives in its C home,
+// the write-callback module [`crate::callbacks::write`], and is imported at the
+// top of this file for the `create_single`/`etag_store`/`setup_*` call sites.
 // ===========================================================================
 
 /// Human-readable name of an HTTP request kind, matching curl's `reqname[]` table in
@@ -1445,86 +1443,6 @@ fn set_http_request(diag: Diag, req: HttpReq, store: &mut HttpReq) -> bool {
         );
         true
     }
-}
-
-/// Create every missing directory leading up to (but not including) the file `outfile`
-/// (`create_dir_hierarchy`, tool_dirhie.c). Each path component is created in turn; an
-/// already-existing directory or a permission-denied component is tolerated (to allow
-/// traversal into a pre-existing tree), exactly as curl ignores `EEXIST`/`EACCES`. Any
-/// other failure prints curl's specific per-errno diagnostic and yields
-/// [`CurlCode::WriteError`].
-fn create_dir_hierarchy(diag: Diag, outfile: &str) -> CurlCode {
-    let bytes = outfile.as_bytes();
-    // Path separators: only '/' on the supported (non-Windows) platforms.
-    let is_sep = |b: u8| b == b'/';
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        // Skip a run of leading separators, then span the following component.
-        let seplen = {
-            let mut n = 0;
-            while i + n < bytes.len() && is_sep(bytes[i + n]) {
-                n += 1;
-            }
-            n
-        };
-        let complen = {
-            let mut n = 0;
-            while i + seplen + n < bytes.len() && !is_sep(bytes[i + seplen + n]) {
-                n += 1;
-            }
-            n
-        };
-
-        // The last path component is the file itself (nothing follows it): stop.
-        if i + seplen + complen >= bytes.len() {
-            break;
-        }
-
-        // The directory path so far: everything up to and including this component.
-        let end = i + seplen + complen;
-        let dir = &outfile[..end];
-
-        match std::fs::create_dir(dir) {
-            Ok(()) => {}
-            Err(e) => {
-                use std::io::ErrorKind;
-                match e.kind() {
-                    // Tolerated: already there, or not permitted (keep traversing).
-                    ErrorKind::AlreadyExists | ErrorKind::PermissionDenied => {}
-                    _ => {
-                        show_dir_errno(diag, dir, &e);
-                        return CurlCode::WriteError;
-                    }
-                }
-            }
-        }
-        i = end;
-    }
-    CurlCode::Ok
-}
-
-/// Emit curl's exact per-errno directory-creation diagnostic (`show_dir_errno`,
-/// tool_dirhie.c). The message text is selected from the underlying OS error so downstream
-/// scrapers see the same words curl prints.
-fn show_dir_errno(diag: Diag, name: &str, err: &io::Error) {
-    // Linux errno values used by curl's switch; `raw_os_error` gives the exact code.
-    const ENAMETOOLONG: i32 = 36;
-    const EROFS: i32 = 30;
-    const ENOSPC: i32 = 28;
-    const EDQUOT: i32 = 122;
-    let msg = match err.raw_os_error() {
-        Some(ENAMETOOLONG) => format!("The directory name {name} is too long"),
-        Some(EROFS) => format!("{name} resides on a read-only file system"),
-        Some(ENOSPC) => {
-            format!("No space left on the file system that will contain the directory {name}")
-        }
-        Some(EDQUOT) => {
-            format!("Cannot create directory {name} because you exceeded your quota")
-        }
-        _ => format!("Error creating directory {name}"),
-    };
-    errorf(diag, &msg);
 }
 
 // ===========================================================================
@@ -2136,6 +2054,11 @@ fn create_single(
         per.retry_remaining = config.req_retry;
         per.retry_sleep = per.retry_sleep_default;
         per.retrystart = Instant::now();
+        // Denormalize the config/global values the upload read callbacks consume — they are
+        // handed only this `PerTransfer` (curl reaches them via `per->config`/`->global`):
+        // the `--max-time` budget and the diagnostic gate for the overshoot warning.
+        per.timeout_ms = config.timeout_ms;
+        per.diag = diag;
 
         // --- advance the glob odometer / upload index for the next call ---
         run.urlidx += 1;
