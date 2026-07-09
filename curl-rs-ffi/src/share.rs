@@ -8,7 +8,7 @@
 //! reference implementations `lib/curl_share.c`, `lib/mime.c`, and `lib/formdata.c` (retained in
 //! the tree as read-only source-of-truth references):
 //!
-//! * **Cross-handle sharing (4):** [`curl_share_init`], [`curl_share_setopt`],
+//! * **Cross-handle sharing (4):** [`curl_share_init`], `curl_share_setopt`,
 //!   [`curl_share_cleanup`], [`curl_share_strerror`].
 //! * **MIME multipart (12):** [`curl_mime_init`], [`curl_mime_free`], [`curl_mime_addpart`],
 //!   [`curl_mime_name`], [`curl_mime_filename`], [`curl_mime_type`], [`curl_mime_encoder`],
@@ -50,21 +50,27 @@
 //!
 //! ## Variadic mechanism (MSRV 1.75, `c_variadic` unavailable)
 //!
-//! [`curl_share_setopt`] and [`curl_formadd`] are C variadics (`…, …)`). True Rust C-variadic
+//! `curl_share_setopt` and [`curl_formadd`] are C variadics (`…, …)`). True Rust C-variadic
 //! *definitions* require the nightly-only `c_variadic` feature (rust-lang/rust#44930), which is
-//! unavailable on the pinned stable MSRV (1.75). Consistent with `easy.rs` and `mprintf.rs`, both
-//! functions therefore take fixed parameters and omit the `…`: [`curl_share_setopt`] captures its
-//! single promoted argument as `arg: usize` (ABI-correct on the System V AMD64 target — the third
-//! integer/pointer argument is passed in `rdx` whether or not the callee is declared variadic).
-//! [`curl_formadd`] is the harder case: it does not merely *receive* one promoted argument, it must
-//! *read* an open-ended `CURLFORM_*` option list to build the form chain, and that list cannot be
-//! walked without `va_list` machinery on stable. A C trampoline that walked the varargs is ruled
-//! out by AAP §0.5.2 (no new C linkage). It therefore matches curl's own form-API-disabled build
-//! exactly — returning `CURL_FORMADD_DISABLED` and appending nothing, identical to the
-//! `#else /* if disabled */` stub in `lib/formdata.c` — which is the honest, ABI-compatible signal
-//! (never a false `CURL_FORMADD_OK`). Modern callers use the mime API. `cbindgen` header generation
-//! is best-effort and never clobbers the committed `include/curl/curl.h`, which keeps the real
-//! `…, …)` declarations and remains the authoritative ABI surface.
+//! unavailable on the pinned stable MSRV (1.75). Consistent with `easy.rs`, `multi.rs`, and
+//! `mprintf.rs`, the genuine variadic entry point `curl_share_setopt` is defined in C — a
+//! trampoline in `csrc/variadic_shim.c` that `va_start`/`va_arg` the single promoted argument and
+//! forwards it as a fixed `arg: usize` to the Rust worker [`crs_share_setopt`] below. Routing
+//! through a real `…` entry point keeps the exported symbol correct on every target, including
+//! `aarch64-apple-darwin` where a vararg is passed on the stack rather than in `x2` (QA
+//! F6-VARIADIC); the `crs_`-prefixed worker stays `#[no_mangle]` but is not part of the exported
+//! `curl_*` surface. [`curl_formadd`] is the harder case and is NOT one of the F6-VARIADIC entry
+//! points: it does not merely *receive* one promoted argument, it must *read* an open-ended
+//! `CURLFORM_*` option list to build the form chain — a walk that a simple single-argument
+//! forwarding trampoline (as used for setopt/`curl_m*printf`) cannot perform, and for which there
+//! is no `va_list` Rust worker to forward to (unlike the `curl_mv*printf` siblings). Since this
+//! build disables the form API, [`curl_formadd`] instead matches curl's own form-API-disabled
+//! build exactly — a fixed-arity stub returning `CURL_FORMADD_DISABLED` and appending nothing,
+//! identical to the `#else /* if disabled */` stub in `lib/formdata.c`, which is the honest,
+//! ABI-compatible signal (never a false `CURL_FORMADD_OK`) and reads none of the varargs on any
+//! target. Modern callers use the mime API. `cbindgen` header generation is best-effort and never
+//! clobbers the committed `include/curl/curl.h`, which keeps the real `…, …)` declarations and
+//! remains the authoritative ABI surface.
 
 // Require every unsafe operation to sit inside an explicit `unsafe { … }` block, even inside an
 // `unsafe fn`, so each carries its own adjacent `// SAFETY:` note (AAP §0.7.2). The lowercase C
@@ -430,21 +436,32 @@ pub extern "C" fn curl_share_init() -> *mut c_void {
     .unwrap_or(ptr::null_mut())
 }
 
-/// `CURLSHcode curl_share_setopt(CURLSH *share, CURLSHoption option, ...);`
+/// Fixed-arity worker behind the C-variadic `curl_share_setopt(CURLSH *, CURLSHoption, ...)`.
 ///
-/// Variadic in C; on the stable MSRV the single promoted argument is captured as `arg: usize`
-/// (see the module-level variadic note). Dispatches on `option`:
-/// `CURLSHOPT_SHARE`/`CURLSHOPT_UNSHARE` toggle a `curl_lock_data` class, `CURLSHOPT_LOCKFUNC`/
-/// `CURLSHOPT_UNLOCKFUNC` store the callback pointers, and `CURLSHOPT_USERDATA` stores the token.
-/// Returns `CURLSHE_IN_USE` while the share is attached to a running transfer and
-/// `CURLSHE_BAD_OPTION` for an unknown option or data class, matching `lib/curl_share.c`.
+/// The public `curl_share_setopt` symbol is a genuine C variadic entry point defined in
+/// `csrc/variadic_shim.c` (stable Rust cannot express a `...` definition — `c_variadic` is
+/// nightly-only, and the workspace is pinned to MSRV 1.75, AAP §0.7.3; this is the same
+/// C-trampoline mechanism used by the `curl_m*printf` family). That trampoline captures the single
+/// promoted argument with `va_arg` and forwards it here as a fixed `arg: usize`. Splitting the
+/// variadic boundary into C makes the exported symbol correctly variadic on every target —
+/// including `aarch64-apple-darwin`, where a vararg is passed on the stack rather than in a
+/// register, so the previous fixed-arity export read the wrong slot (QA F6-VARIADIC). The `crs_`
+/// prefix keeps this worker OUT of the exported `curl_*` symbol set (the cdylib version script
+/// exports only `curl_*`), so symbol parity stays exact. It remains `#[no_mangle]` so the C
+/// trampoline can resolve it by name.
+///
+/// Dispatches on `option`: `CURLSHOPT_SHARE`/`CURLSHOPT_UNSHARE` toggle a `curl_lock_data` class,
+/// `CURLSHOPT_LOCKFUNC`/`CURLSHOPT_UNLOCKFUNC` store the callback pointers, and
+/// `CURLSHOPT_USERDATA` stores the token. Returns `CURLSHE_IN_USE` while the share is attached to a
+/// running transfer and `CURLSHE_BAD_OPTION` for an unknown option or data class, matching
+/// `lib/curl_share.c`.
 ///
 /// # Safety
 /// `share` must be null or a valid handle from [`curl_share_init`]; for `LOCKFUNC`/`UNLOCKFUNC`
 /// the promoted argument must be a matching C function pointer (or null); for `SHARE`/`UNSHARE`
 /// it is a `curl_lock_data` promoted to `int`; for `USERDATA` it is an opaque pointer.
 #[no_mangle]
-pub unsafe extern "C" fn curl_share_setopt(share: *mut c_void, option: c_int, arg: usize) -> c_int {
+pub unsafe extern "C" fn crs_share_setopt(share: *mut c_void, option: c_int, arg: usize) -> c_int {
     ffi_guard(CURLSHcode::CURLSHE_INVALID as c_int, move || {
         // SAFETY: `share` honours the documented contract; `share_arc` null-checks and borrows.
         let arc = match unsafe { share_arc(share) } {
@@ -1701,7 +1718,7 @@ mod tests {
         // SAFETY: `sh` live; args are `curl_lock_data` integers.
         unsafe {
             assert_eq!(
-                curl_share_setopt(
+                crs_share_setopt(
                     sh,
                     CURLSHoption::CURLSHOPT_SHARE as c_int,
                     curl_lock_data::CURL_LOCK_DATA_COOKIE as usize,
@@ -1709,7 +1726,7 @@ mod tests {
                 CURLSHcode::CURLSHE_OK as c_int
             );
             assert_eq!(
-                curl_share_setopt(
+                crs_share_setopt(
                     sh,
                     CURLSHoption::CURLSHOPT_SHARE as c_int,
                     curl_lock_data::CURL_LOCK_DATA_DNS as usize,
@@ -1727,7 +1744,7 @@ mod tests {
         // SAFETY: `sh` live.
         unsafe {
             assert_eq!(
-                curl_share_setopt(
+                crs_share_setopt(
                     sh,
                     CURLSHoption::CURLSHOPT_UNSHARE as c_int,
                     curl_lock_data::CURL_LOCK_DATA_COOKIE as usize,
@@ -1743,11 +1760,11 @@ mod tests {
         unsafe {
             // NONE (0), the internal SHARE (1), and out-of-range are BAD_OPTION.
             assert_eq!(
-                curl_share_setopt(sh, CURLSHoption::CURLSHOPT_SHARE as c_int, 0),
+                crs_share_setopt(sh, CURLSHoption::CURLSHOPT_SHARE as c_int, 0),
                 CURLSHcode::CURLSHE_BAD_OPTION as c_int
             );
             assert_eq!(
-                curl_share_setopt(
+                crs_share_setopt(
                     sh,
                     CURLSHoption::CURLSHOPT_SHARE as c_int,
                     curl_lock_data::CURL_LOCK_DATA_SHARE as usize,
@@ -1755,13 +1772,46 @@ mod tests {
                 CURLSHcode::CURLSHE_BAD_OPTION as c_int
             );
             assert_eq!(
-                curl_share_setopt(sh, CURLSHoption::CURLSHOPT_SHARE as c_int, 99),
+                crs_share_setopt(sh, CURLSHoption::CURLSHOPT_SHARE as c_int, 99),
                 CURLSHcode::CURLSHE_BAD_OPTION as c_int
             );
             // Unknown option.
             assert_eq!(
-                curl_share_setopt(sh, 999, 0),
+                crs_share_setopt(sh, 999, 0),
                 CURLSHcode::CURLSHE_BAD_OPTION as c_int
+            );
+            curl_share_cleanup(sh);
+        }
+    }
+
+    /// The genuine C-variadic `curl_share_setopt` entry point — the C trampoline in
+    /// `csrc/variadic_shim.c` (QA F6-VARIADIC) — forwards its single promoted argument to the
+    /// [`crs_share_setopt`] worker. Driving the *real exported symbol* (declared here as a C
+    /// variadic) proves the trampoline + `va_arg` extraction is wired end-to-end under `cargo test`.
+    #[test]
+    fn variadic_share_setopt_trampoline_dispatch() {
+        extern "C" {
+            fn curl_share_setopt(share: *mut c_void, option: c_int, ...) -> c_int;
+        }
+        let sh = curl_share_init();
+        assert!(!sh.is_null());
+        // SAFETY: `sh` is live; CURLSHOPT_SHARE takes a `curl_lock_data` promoted to the vararg
+        // slot, and the unknown id an ignored one — each is the single promoted arg the trampoline
+        // reads.
+        unsafe {
+            assert_eq!(
+                curl_share_setopt(
+                    sh,
+                    CURLSHoption::CURLSHOPT_SHARE as c_int,
+                    curl_lock_data::CURL_LOCK_DATA_COOKIE as usize,
+                ),
+                CURLSHcode::CURLSHE_OK as c_int,
+                "CURLSHOPT_SHARE(COOKIE) must dispatch through the trampoline"
+            );
+            assert_eq!(
+                curl_share_setopt(sh, 999, 0_usize),
+                CURLSHcode::CURLSHE_BAD_OPTION as c_int,
+                "unknown share option id must reach the dispatcher and be rejected"
             );
             curl_share_cleanup(sh);
         }
@@ -1811,9 +1861,9 @@ mod tests {
 
         // SAFETY: `sh` live; args are a fn pointer, a fn pointer, and a userdata pointer.
         unsafe {
-            curl_share_setopt(sh, CURLSHoption::CURLSHOPT_LOCKFUNC as c_int, lock_arg);
-            curl_share_setopt(sh, CURLSHoption::CURLSHOPT_UNLOCKFUNC as c_int, unlock_arg);
-            curl_share_setopt(sh, CURLSHoption::CURLSHOPT_USERDATA as c_int, cptr as usize);
+            crs_share_setopt(sh, CURLSHoption::CURLSHOPT_LOCKFUNC as c_int, lock_arg);
+            crs_share_setopt(sh, CURLSHoption::CURLSHOPT_UNLOCKFUNC as c_int, unlock_arg);
+            crs_share_setopt(sh, CURLSHoption::CURLSHOPT_USERDATA as c_int, cptr as usize);
             let rc = curl_share_cleanup(sh);
             assert_eq!(rc, CURLSHcode::CURLSHE_OK as c_int);
         }
@@ -1844,7 +1894,7 @@ mod tests {
         // SAFETY: `sh` live.
         unsafe {
             assert_eq!(
-                curl_share_setopt(
+                crs_share_setopt(
                     sh,
                     CURLSHoption::CURLSHOPT_SHARE as c_int,
                     curl_lock_data::CURL_LOCK_DATA_DNS as usize,
@@ -1876,7 +1926,7 @@ mod tests {
         // SAFETY: `sh` is a live handle from `curl_share_init`.
         unsafe {
             assert_eq!(
-                curl_share_setopt(
+                crs_share_setopt(
                     sh,
                     CURLSHoption::CURLSHOPT_SHARE as c_int,
                     curl_lock_data::CURL_LOCK_DATA_COOKIE as usize,
@@ -1896,7 +1946,7 @@ mod tests {
         assert!(!h.is_null());
         // SAFETY: `h` is a live easy handle and `sh` a live share; the promoted argument is the
         // `CURLSH *` the option expects.
-        let rc = unsafe { crate::easy::curl_easy_setopt(h, CURLOPT_SHARE, sh as usize) };
+        let rc = unsafe { crate::easy::crs_easy_setopt(h, CURLOPT_SHARE, sh as usize) };
         assert_eq!(rc, ok, "CURLOPT_SHARE must accept a valid share handle");
 
         // The share now reports one attached handle, so setopt/cleanup are refused.
@@ -1946,11 +1996,11 @@ mod tests {
         // SAFETY: both are live handles produced by their `*_init` constructors.
         unsafe {
             assert_eq!(
-                crate::easy::curl_easy_setopt(h, CURLOPT_SHARE, sh as usize),
+                crate::easy::crs_easy_setopt(h, CURLOPT_SHARE, sh as usize),
                 ok
             );
             // Re-issuing `CURLOPT_SHARE` with NULL detaches ("share nothing"), dropping dirty.
-            assert_eq!(crate::easy::curl_easy_setopt(h, CURLOPT_SHARE, 0), ok);
+            assert_eq!(crate::easy::crs_easy_setopt(h, CURLOPT_SHARE, 0), ok);
         }
         {
             // SAFETY: `sh` still live.

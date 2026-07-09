@@ -26,7 +26,7 @@ use libc::{c_char, c_int, c_void, size_t};
 use crate::args::{GlobalConfig, TraceType};
 use crate::callbacks::userdata_mut;
 use crate::operate::warnf;
-use curl_rs_ffi::easy::{curl_easy_getinfo, curl_infotype, curl_off_t, CURLINFO};
+use curl_rs_ffi::easy::{crs_easy_getinfo, curl_infotype, curl_off_t, CURLINFO};
 
 /// Byte substituted for any non-printable octet in the ASCII column (curl `UNPRINTABLE_CHAR`,
 /// `tool_setup.h`).
@@ -241,7 +241,7 @@ pub unsafe extern "C" fn tool_debug_cb(
         // SAFETY: `handle` is the live `CURL *` libcurl passed to this callback; `&mut xfer_id`
         // is a valid `curl_off_t *` for the duration of the call.
         let xfer_ok = unsafe {
-            curl_easy_getinfo(
+            crs_easy_getinfo(
                 handle,
                 CURLINFO::CURLINFO_XFER_ID as c_int,
                 &mut xfer_id as *mut curl_off_t as usize,
@@ -251,7 +251,7 @@ pub unsafe extern "C" fn tool_debug_cb(
             let mut conn_id: curl_off_t = 0;
             // SAFETY: as above; `&mut conn_id` is a valid `curl_off_t *` for the call.
             let conn_ok = unsafe {
-                curl_easy_getinfo(
+                crs_easy_getinfo(
                     handle,
                     CURLINFO::CURLINFO_CONN_ID as c_int,
                     &mut conn_id as *mut curl_off_t as usize,

@@ -156,6 +156,11 @@ clap_complete = "4"       # shell completion generation
 # --- FFI & code generation ---
 cbindgen = "0.29.2"       # C header generation; used by curl-rs-ffi/build.rs as a build-dependency
 libc = "0.2"              # raw FFI bindings for C types at the `extern "C"` boundary
+cc = "1"                  # compiles curl-rs-ffi/csrc/variadic_shim.c (the C-variadic trampolines
+                          # for the curl_m*printf `...` entry points, which stable Rust cannot
+                          # define — see curl-rs-ffi/src/mprintf.rs NOTE). Build-dependency only;
+                          # already in the lock graph transitively (aws-lc-sys/zstd-sys), MIT OR
+                          # Apache-2.0, MSRV <=1.75, so it adds no new crate, license, or gate risk.
 
 # --- Cryptography (authentication mechanisms; pure-Rust) ---
 sha2 = "0.10"             # SHA-256/SHA-512 for Digest auth and checksums

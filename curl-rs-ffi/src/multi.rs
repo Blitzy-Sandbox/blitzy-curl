@@ -54,14 +54,16 @@
 //!
 //! # Variadic ABI note (`curl_multi_setopt`)
 //! curl declares `curl_multi_setopt` as a C variadic (`CURLMoption option, ...)`). True Rust
-//! C-variadics require the unstable `c_variadic` feature, unavailable on the pinned stable
-//! MSRV (1.75, `rust-toolchain.toml`). As in [`crate::easy`]'s `curl_easy_setopt`, this
-//! function therefore takes a single fixed pointer-width `arg: usize` capturing the one
-//! promoted variadic argument every documented call site passes. On the primary supported
-//! target (`x86_64-unknown-linux-gnu`, System V AMD64 ABI) this is ABI-correct: the third
-//! integer argument arrives in `rdx` whether or not the callee is declared variadic.
-//! `cbindgen` header generation is best-effort and never clobbers the committed
-//! `include/curl/multi.h`, which remains the authoritative ABI surface.
+//! C-variadic *definitions* require the unstable `c_variadic` feature, unavailable on the pinned
+//! stable MSRV (1.75, `rust-toolchain.toml`). As in [`crate::easy`], the genuine variadic entry
+//! point is therefore defined in C — a trampoline in `csrc/variadic_shim.c` that `va_start`/
+//! `va_arg` the single promoted argument and forwards it as a fixed pointer-width `usize` to the
+//! Rust worker [`crs_multi_setopt`] below. This keeps the exported symbol correctly variadic on
+//! every supported target, including `aarch64-apple-darwin` where a vararg is passed on the stack
+//! rather than in `x2` (QA F6-VARIADIC). The `crs_`-prefixed worker stays `#[no_mangle]` (so the C
+//! trampoline resolves it) but is NOT part of the exported `curl_*` surface. `cbindgen` header
+//! generation is best-effort and never clobbers the committed `include/curl/multi.h`, which
+//! remains the authoritative ABI surface.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -250,10 +252,10 @@ pub type curl_multi_timer_callback = Option<
     unsafe extern "C" fn(multi: *mut c_void, timeout_ms: c_long, userp: *mut c_void) -> c_int,
 >;
 
-/// `CURLMoption` — options for [`curl_multi_setopt`] (`include/curl/multi.h`).
+/// `CURLMoption` — options for `curl_multi_setopt` (`include/curl/multi.h`).
 ///
 /// Discriminants `1..=19` are frozen to the header; each is used as its exact `c_int` value in
-/// the [`curl_multi_setopt`] dispatch. `CURLMOPT_LASTENTRY` is the trailing sentinel (`20`).
+/// the `curl_multi_setopt` dispatch. `CURLMOPT_LASTENTRY` is the trailing sentinel (`20`).
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CURLMoption {
@@ -479,7 +481,7 @@ struct CurlMulti {
     /// Stored `CURLMOPT_NOTIFYFUNCTION` pointer and its `CURLMOPT_NOTIFYDATA` user datum.
     notify_fn: curl_notify_callback,
     notify_data: SendPtr,
-    /// The stable `CURLM *` self-pointer, captured in [`curl_multi_setopt`] so the timer / notify
+    /// The stable `CURLM *` self-pointer, captured in `curl_multi_setopt` so the timer / notify
     /// / push trampolines can pass it to the C callbacks. Stable because the `Box` is pinned by
     /// `box_into_raw` for the handle's lifetime.
     self_ptr: SendPtr,
@@ -523,7 +525,7 @@ impl CurlMulti {
     }
 
     /// (Re)install the socket-callback trampoline into the core from the currently stored
-    /// `socket_fn` / `socket_data`. Called whenever either is set via [`curl_multi_setopt`], so
+    /// `socket_fn` / `socket_data`. Called whenever either is set via `curl_multi_setopt`, so
     /// the two options may be supplied in any order (matching curl).
     fn rebuild_socket_cb(&mut self) {
         match self.socket_fn {
@@ -1178,20 +1180,30 @@ pub unsafe extern "C" fn curl_multi_timeout(
     )
 }
 
-/// `CURLMcode curl_multi_setopt(CURLM *multi_handle, CURLMoption option, ...);`
+/// Fixed-arity worker behind the C-variadic `curl_multi_setopt(CURLM *, CURLMoption, ...)`.
 ///
-/// Set an option on the multi handle. Variadic in C; here the single promoted argument is taken
-/// as a fixed `arg: usize` (see the module-level variadic note). Function-pointer and user-data
-/// options (`CURLMOPT_{SOCKET,TIMER,PUSH,NOTIFY}{FUNCTION,DATA}`) are stored and installed as
-/// core trampolines; numeric options are forwarded to the core; an unrecognised option yields
-/// `CURLM_UNKNOWN_OPTION`.
+/// The public `curl_multi_setopt` symbol is a genuine C variadic entry point defined in
+/// `csrc/variadic_shim.c` (stable Rust cannot express a `...` definition — `c_variadic` is
+/// nightly-only, and the workspace is pinned to MSRV 1.75, AAP §0.7.3; this is the same
+/// C-trampoline mechanism used by the `curl_m*printf` family). That trampoline captures the single
+/// promoted argument with `va_arg` and forwards it here as a fixed `arg: usize`. Splitting the
+/// variadic boundary into C makes the exported symbol correctly variadic on every target —
+/// including `aarch64-apple-darwin`, where a vararg is passed on the stack rather than in a
+/// register, so the previous fixed-arity export read the wrong slot (QA F6-VARIADIC). The `crs_`
+/// prefix keeps this worker OUT of the exported `curl_*` symbol set (the cdylib version script
+/// exports only `curl_*`), so symbol parity stays exact. It remains `#[no_mangle]` so the C
+/// trampoline can resolve it by name.
+///
+/// Function-pointer and user-data options (`CURLMOPT_{SOCKET,TIMER,PUSH,NOTIFY}{FUNCTION,DATA}`)
+/// are stored and installed as core trampolines; numeric options are forwarded to the core; an
+/// unrecognised option yields `CURLM_UNKNOWN_OPTION`.
 ///
 /// # Safety
 /// `multi_handle` must be null or a live `CURLM *`. For a function-pointer option, `arg` must be a
 /// valid function pointer of the matching callback type (or null to clear); for other options it
 /// must be the value/pointer the option documents.
 #[no_mangle]
-pub unsafe extern "C" fn curl_multi_setopt(
+pub unsafe extern "C" fn crs_multi_setopt(
     multi_handle: *mut c_void,
     option: c_int,
     arg: usize,
@@ -1216,7 +1228,7 @@ pub unsafe extern "C" fn curl_multi_setopt(
 
 /// Apply one `curl_multi_setopt` option to `multi`.
 ///
-/// `arg` is the single promoted variadic argument (see [`curl_multi_setopt`]). Function-pointer
+/// `arg` is the single promoted variadic argument (see `curl_multi_setopt`). Function-pointer
 /// and user-data options are stored on the wrapper and re-installed as trampolines (so the
 /// function and its data may be set in any order); numeric `LONG`/`OFF_T` options are forwarded
 /// to the core [`Multi::setopt_raw`](curl_rs_lib::multi); an unrecognised id yields
@@ -1866,7 +1878,8 @@ mod tests {
         }
     }
 
-    /// `curl_multi_setopt` accepts a recognised numeric option and rejects an unknown id.
+    /// The `crs_multi_setopt` worker (behind the C-variadic `curl_multi_setopt` trampoline)
+    /// accepts a recognised numeric option and rejects an unknown id.
     #[test]
     fn setopt_numeric_and_unknown() {
         let multi = curl_multi_init();
@@ -1874,11 +1887,11 @@ mod tests {
         // SAFETY: `multi` is live; the numeric options take an integer arg, not a pointer.
         unsafe {
             assert_eq!(
-                curl_multi_setopt(multi, CURLMoption::CURLMOPT_MAXCONNECTS as c_int, 10),
+                crs_multi_setopt(multi, CURLMoption::CURLMOPT_MAXCONNECTS as c_int, 10),
                 CURLMcode::CURLM_OK as c_int
             );
             assert_eq!(
-                curl_multi_setopt(
+                crs_multi_setopt(
                     multi,
                     CURLMoption::CURLMOPT_MAX_TOTAL_CONNECTIONS as c_int,
                     8
@@ -1886,8 +1899,36 @@ mod tests {
                 CURLMcode::CURLM_OK as c_int
             );
             assert_eq!(
-                curl_multi_setopt(multi, 99_999, 0),
+                crs_multi_setopt(multi, 99_999, 0),
                 CURLMcode::CURLM_UNKNOWN_OPTION as c_int
+            );
+            assert_eq!(curl_multi_cleanup(multi), CURLMcode::CURLM_OK as c_int);
+        }
+    }
+
+    /// The genuine C-variadic `curl_multi_setopt` entry point — the C trampoline in
+    /// `csrc/variadic_shim.c` (QA F6-VARIADIC) — forwards its single promoted argument to the
+    /// [`crs_multi_setopt`] worker. Driving the *real exported symbol* (declared here as a C
+    /// variadic) proves the trampoline + `va_arg` extraction is wired end-to-end under `cargo test`.
+    #[test]
+    fn variadic_multi_setopt_trampoline_dispatch() {
+        extern "C" {
+            fn curl_multi_setopt(multi_handle: *mut c_void, option: c_int, ...) -> c_int;
+        }
+        let multi = curl_multi_init();
+        assert!(!multi.is_null());
+        // SAFETY: `multi` is live; the numeric option takes an integer arg and the unknown id an
+        // ignored one — each is the single promoted vararg the trampoline reads.
+        unsafe {
+            assert_eq!(
+                curl_multi_setopt(multi, CURLMoption::CURLMOPT_MAXCONNECTS as c_int, 10_usize),
+                CURLMcode::CURLM_OK as c_int,
+                "CURLMOPT_MAXCONNECTS must dispatch through the trampoline"
+            );
+            assert_eq!(
+                curl_multi_setopt(multi, 99_999, 0_usize),
+                CURLMcode::CURLM_UNKNOWN_OPTION as c_int,
+                "unknown multi option id must reach the dispatcher and be rejected"
             );
             assert_eq!(curl_multi_cleanup(multi), CURLMcode::CURLM_OK as c_int);
         }

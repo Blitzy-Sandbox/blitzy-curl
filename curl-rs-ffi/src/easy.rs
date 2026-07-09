@@ -37,19 +37,21 @@
 //! discriminants are transcribed verbatim from `include/curl/curl.h`.
 //!
 //! # Variadic ABI note (`curl_easy_setopt` / `curl_easy_getinfo`)
-//! curl declares these two functions as C variadics (`..., ...)`). True Rust C-variadics
-//! (`extern "C" fn(..., mut args: ...)` / `core::ffi::VaList`) require the unstable `c_variadic`
-//! feature, which is unavailable on the pinned stable MSRV (1.75, `rust-toolchain.toml`). Both
-//! functions therefore take a single fixed pointer-width `arg: usize` that captures the one
-//! promoted variadic argument every documented call site passes. On the primary supported target
-//! (`x86_64-unknown-linux-gnu`, System V AMD64 ABI) this is ABI-correct: the third integer
-//! argument is passed in `rdx` whether the callee is declared variadic or not, and the `al`
-//! vector-count register a variadic caller sets is simply ignored by the fixed-arity callee.
-//! NOTE(portability): this trick is *not* correct for the AAP's pending `aarch64-apple-darwin`
-//! leg, where variadic arguments are passed on the stack rather than in `x2`; that target is not
-//! yet activated (AAP §0.6.5) and must revisit this when it is. `cbindgen` header generation is
-//! best-effort and never clobbers the committed `include/curl/curl.h`, which remains the
-//! authoritative ABI surface and retains the real `..., ...)` declarations.
+//! curl declares these two functions as C variadics (`..., ...)`). True Rust C-variadic
+//! *definitions* (`extern "C" fn(..., mut args: ...)` / `core::ffi::VaList`) require the unstable
+//! `c_variadic` feature, unavailable on the pinned stable MSRV (1.75, `rust-toolchain.toml`). The
+//! genuine variadic entry points `curl_easy_setopt` and `curl_easy_getinfo` are therefore defined
+//! in C — tiny trampolines in `csrc/variadic_shim.c` that `va_start`/`va_arg` the single promoted
+//! argument and forward it as a fixed pointer-width `usize` to the Rust workers [`crs_easy_setopt`]
+//! and [`crs_easy_getinfo`] below (which perform the option/info dispatch). This is the same
+//! C-trampoline mechanism the `curl_m*printf` family uses, and it keeps the exported symbols
+//! correctly variadic on EVERY supported target — crucially including `aarch64-apple-darwin`,
+//! where a vararg is passed on the stack rather than in `x2`, so the earlier fixed-arity export
+//! read the wrong slot (QA F6-VARIADIC). The `crs_`-prefixed workers stay `#[no_mangle]` (so the C
+//! trampolines resolve them by name) but are NOT part of the exported `curl_*` surface — the
+//! cdylib version script exports only `curl_*` — so symbol parity is exact. `cbindgen` header
+//! generation is best-effort and never clobbers the committed `include/curl/curl.h`, which remains
+//! the authoritative ABI surface and retains the real `..., ...)` declarations.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -1021,7 +1023,22 @@ fn strerror_ptr(code: c_int) -> *const c_char {
         Err(poison) => poison.into_inner(),
     };
     let interned = map.entry(code).or_insert_with(|| {
-        let msg = curl_rs_lib::error::strerror(curl_rs_lib::error::from_i32(code));
+        // Map the raw integer to its curl message. A *defined* `CURLcode` uses its exact
+        // `lib/strerror.c` text; any other integer (an out-of-contract value that no libcurl
+        // API ever returns, e.g. `999999` or `-1`) falls back to `curl_easy_strerror`'s
+        // default arm — "Unknown error" (`lib/strerror.c`) — NOT the code-43 message.
+        //
+        // The fallible `TryFrom` is deliberate here in place of `error::from_i32`: the latter
+        // collapses every unknown integer to `BadFunctionArgument`, which would surface code
+        // 43's text for an unknown code. `TryFrom` instead distinguishes an unknown code
+        // (`Err`) from a genuine `CURLE_BAD_FUNCTION_ARGUMENT` (`Ok(BadFunctionArgument)`),
+        // so real codes — including 43 — keep their exact text while only truly unknown
+        // integers get "Unknown error". This mirrors the sibling `curl_multi_strerror` /
+        // `curl_url_strerror` unknown-code arms. (QA F6-STRERROR-FALLBACK)
+        let msg = match curl_rs_lib::error::CurlCode::try_from(code) {
+            Ok(known) => curl_rs_lib::error::strerror(known),
+            Err(_) => "Unknown error",
+        };
         // `msg` is a fixed curl message with no interior NUL; the fallbacks make this total.
         let owned = CString::new(msg)
             .ok()
@@ -1036,7 +1053,7 @@ fn strerror_ptr(code: c_int) -> *const c_char {
 
 /// Apply one `curl_easy_setopt` option to `easy`.
 ///
-/// `arg` is the single promoted variadic argument captured by [`curl_easy_setopt`] (see the
+/// `arg` is the single promoted variadic argument captured by `curl_easy_setopt` (see the
 /// module-level variadic note). Its meaning depends on the option's `CURLOPTTYPE_*` class: a
 /// `long`, an object pointer (`char *`, `struct curl_slist *`, `struct curl_blob *`, callback
 /// data), a function pointer, or a `curl_off_t`. Only the subset of options the current core
@@ -1151,7 +1168,7 @@ fn setopt_dispatch(easy: &mut Easy, option: c_int, arg: usize) -> c_int {
 
 /// Write one `curl_easy_getinfo` result through the caller's out-pointer.
 ///
-/// `arg` is the single promoted variadic argument captured by [`curl_easy_getinfo`]: a pointer to
+/// `arg` is the single promoted variadic argument captured by `curl_easy_getinfo`: a pointer to
 /// caller storage whose target type is encoded in `info`'s high bits (`CURLINFO_TYPEMASK`). Values
 /// the current core [`Easy`] tracks (`CURLINFO_RESPONSE_CODE`, `CURLINFO_PRIMARY_PORT`) are
 /// reported; every other recognised info is written as its typed zero/NULL default (curl likewise
@@ -1321,18 +1338,29 @@ pub unsafe extern "C" fn curl_easy_reset(curl: *mut c_void) {
 // Phase 2 — variadic option / info dispatch (include/curl/easy.h).
 // ===========================================================================
 
-/// `CURLcode curl_easy_setopt(CURL *curl, CURLoption option, ...);`
+/// Fixed-arity worker behind the C-variadic `curl_easy_setopt(CURL *, CURLoption, ...)`.
 ///
-/// Set a single option on the handle. See the module-level variadic note for why the single
-/// promoted argument is received as a fixed `arg: usize`. Returns `CURLE_OK` on success, a mapped
-/// error for a bad value, or `CURLE_UNKNOWN_OPTION` for an unrecognised option id.
+/// The public `curl_easy_setopt` symbol is a genuine C variadic entry point defined in
+/// `csrc/variadic_shim.c` (stable Rust cannot express a `...` definition — `c_variadic` is
+/// nightly-only, and the workspace is pinned to MSRV 1.75, AAP §0.7.3; this is the same
+/// C-trampoline mechanism used by the `curl_m*printf` family). That trampoline captures the single
+/// promoted argument with `va_arg` and forwards it here as a fixed `arg: usize`. Splitting the
+/// variadic boundary into C keeps the option-dispatch logic in safe-ish Rust while making the
+/// exported symbol correctly variadic on every target — including `aarch64-apple-darwin`, where a
+/// vararg is passed on the stack rather than in a register, so the previous fixed-arity export
+/// read the wrong slot (QA F6-VARIADIC). The `crs_` prefix keeps this worker OUT of the exported
+/// `curl_*` symbol set (the cdylib version script exports only `curl_*`), so symbol parity stays
+/// exact. It remains `#[no_mangle]` so the C trampoline can resolve it by name.
+///
+/// Returns `CURLE_OK` on success, a mapped error for a bad value, or `CURLE_UNKNOWN_OPTION` for an
+/// unrecognised option id.
 ///
 /// # Safety
 /// `curl` must be null or a valid, live handle. When `option` is a pointer-typed option, `arg`
 /// must be the corresponding valid pointer (or null) as documented by that option in
 /// `include/curl/curl.h`, valid for the duration of the call.
 #[no_mangle]
-pub unsafe extern "C" fn curl_easy_setopt(curl: *mut c_void, option: c_int, arg: usize) -> c_int {
+pub unsafe extern "C" fn crs_easy_setopt(curl: *mut c_void, option: c_int, arg: usize) -> c_int {
     ffi_guard(
         CURLcode::CURLE_BAD_FUNCTION_ARGUMENT as c_int,
         AssertUnwindSafe(move || {
@@ -1347,17 +1375,22 @@ pub unsafe extern "C" fn curl_easy_setopt(curl: *mut c_void, option: c_int, arg:
     )
 }
 
-/// `CURLcode curl_easy_getinfo(CURL *curl, CURLINFO info, ...);`
+/// Fixed-arity worker behind the C-variadic `curl_easy_getinfo(CURL *, CURLINFO, ...)`.
 ///
-/// Read one piece of information from the handle, writing it through the caller-provided
-/// out-pointer (received as a fixed `arg: usize`; see the module-level variadic note). Returns
-/// `CURLE_OK` on success or `CURLE_UNKNOWN_OPTION` for an unrecognised info id.
+/// See [`crs_easy_setopt`] for the full rationale: the public `curl_easy_getinfo` symbol is the C
+/// variadic trampoline in `csrc/variadic_shim.c`, which forwards the single promoted out-pointer
+/// here as a fixed `arg: usize`. The `crs_` prefix keeps this worker unexported from the cdylib
+/// (only `curl_*` is exported), while `#[no_mangle]` lets the trampoline resolve it.
+///
+/// Reads one piece of information from the handle, writing it through the caller-provided
+/// out-pointer. Returns `CURLE_OK` on success or `CURLE_UNKNOWN_OPTION` for an unrecognised info
+/// id.
 ///
 /// # Safety
 /// `curl` must be null or a valid, live handle; `arg` must be a valid pointer to caller storage of
 /// the type encoded by `info`'s `CURLINFO_TYPEMASK`, valid for the duration of the call.
 #[no_mangle]
-pub unsafe extern "C" fn curl_easy_getinfo(curl: *mut c_void, info: c_int, arg: usize) -> c_int {
+pub unsafe extern "C" fn crs_easy_getinfo(curl: *mut c_void, info: c_int, arg: usize) -> c_int {
     ffi_guard(
         CURLcode::CURLE_BAD_FUNCTION_ARGUMENT as c_int,
         AssertUnwindSafe(move || {
@@ -1708,4 +1741,129 @@ pub unsafe extern "C" fn curl_easy_ssls_export(
             CURLcode::CURLE_OK as c_int
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Borrow the interned, process-lifetime C string returned by [`curl_easy_strerror`] as an
+    /// owned Rust `String` for assertion.
+    fn strerror_text(code: c_int) -> String {
+        let p = curl_easy_strerror(code);
+        assert!(!p.is_null(), "curl_easy_strerror({code}) must be non-null");
+        // SAFETY: the interner returns a valid, NUL-terminated, process-lifetime C string that
+        // the caller must not free; borrowing it for the duration of the test is sound.
+        unsafe { CStr::from_ptr(p) }
+            .to_str()
+            .expect("a curl message is valid UTF-8")
+            .to_owned()
+    }
+
+    /// `curl_easy_strerror` returns curl's exact `lib/strerror.c` text for every *defined*
+    /// `CURLcode`, and its default-arm "Unknown error" for any out-of-contract integer — never
+    /// the code-43 (`CURLE_BAD_FUNCTION_ARGUMENT`) message that the previous `from_i32`-based
+    /// path leaked. (QA F6-STRERROR-FALLBACK)
+    #[test]
+    fn strerror_unknown_codes_report_unknown_error() {
+        // Out-of-contract integers that no libcurl API ever returns must map to curl's default
+        // switch arm, "Unknown error" (`lib/strerror.c`), matching the sibling multi/url
+        // fallbacks and reference curl 8.x.
+        assert_eq!(strerror_text(999_999), "Unknown error");
+        assert_eq!(strerror_text(-1), "Unknown error");
+        assert_eq!(strerror_text(c_int::MAX), "Unknown error");
+
+        // Defined codes keep their exact upstream text. Crucially, code 43
+        // (`CURLE_BAD_FUNCTION_ARGUMENT`) MUST still report its OWN message — the regression the
+        // fix guards against is unknown codes borrowing this text.
+        assert_eq!(strerror_text(0), "No error");
+        assert_eq!(
+            strerror_text(28),
+            "Timeout was reached",
+            "CURLE_OPERATION_TIMEDOUT text must stay exact"
+        );
+        assert_eq!(
+            strerror_text(43),
+            "A libcurl function was given a bad argument",
+            "CURLE_BAD_FUNCTION_ARGUMENT(43) must keep its own text, not leak to unknown codes"
+        );
+    }
+
+    /// The returned pointer is stable across calls for a given code (leak-backed interning),
+    /// upholding curl's contract that the caller must not free it.
+    #[test]
+    fn strerror_pointer_is_interned_stable() {
+        let a = curl_easy_strerror(28);
+        let b = curl_easy_strerror(28);
+        assert!(!a.is_null());
+        assert_eq!(
+            a, b,
+            "curl_easy_strerror must intern (stable pointer per code)"
+        );
+    }
+
+    /// The genuine C-variadic `curl_easy_setopt` / `curl_easy_getinfo` entry points — the C
+    /// trampolines in `csrc/variadic_shim.c` (QA F6-VARIADIC) — forward their single promoted
+    /// argument to the [`crs_easy_setopt`] / [`crs_easy_getinfo`] workers. This test drives the
+    /// *real exported symbols* (declared here as C variadics, exactly as a C consumer would call
+    /// them), not the workers, so it proves the variadic trampoline + `va_arg` extraction is wired
+    /// end-to-end. It is the CI-gated (`cargo test`) analogue of the C-ABI reproduction in the QA
+    /// report, and would catch any regression in the shim or its build wiring.
+    #[test]
+    fn variadic_setopt_getinfo_trampolines_dispatch() {
+        // The public symbols are C variadics; declaring and calling them with `...` is stable Rust
+        // (only *defining* a variadic needs nightly `c_variadic`).
+        extern "C" {
+            fn curl_easy_setopt(curl: *mut c_void, option: c_int, ...) -> c_int;
+            fn curl_easy_getinfo(curl: *mut c_void, info: c_int, ...) -> c_int;
+        }
+        let ok = CURLcode::CURLE_OK as c_int;
+        let url = CString::new("https://example.com/").unwrap();
+        let h = curl_easy_init();
+        assert!(!h.is_null());
+        // SAFETY: `h` is a live handle from `curl_easy_init`. Each call passes exactly one promoted
+        // vararg — a `long` (VERBOSE), a `const char *` (URL), an ignored value (unknown id), and a
+        // `char **` out-pointer (getinfo) — which is what the trampoline reads with `va_arg`.
+        unsafe {
+            // A `long` option promoted through the variadic slot (value 1).
+            assert_eq!(
+                curl_easy_setopt(h, CURLoption::CURLOPT_VERBOSE as c_int, 1_usize),
+                ok,
+                "CURLOPT_VERBOSE must dispatch through the trampoline"
+            );
+            // A pointer option: the `const char *` URL travels the same single vararg slot. A
+            // mis-forwarded slot would surface as CURLE_BAD_FUNCTION_ARGUMENT (null/garbage URL).
+            assert_eq!(
+                curl_easy_setopt(h, CURLoption::CURLOPT_URL as c_int, url.as_ptr()),
+                ok,
+                "CURLOPT_URL must accept the forwarded const char* URL"
+            );
+            // An unknown option id must surface CURLE_UNKNOWN_OPTION (48) — proving the OPTION id
+            // (not merely some register slot) reaches the dispatcher intact.
+            assert_eq!(
+                curl_easy_setopt(h, 999_999, 0_usize),
+                CURLcode::CURLE_UNKNOWN_OPTION as c_int,
+                "unknown option id must reach the dispatcher and be rejected"
+            );
+            // getinfo through the trampoline: seed the out-pointer with a sentinel and require the
+            // call to overwrite it (a STRING info writes NULL pre-transfer). Getting CURLE_OK with
+            // the sentinel cleared proves BOTH the info id and the `char **` out-pointer forwarded
+            // (a garbled id -> CURLE_UNKNOWN_OPTION; a lost pointer -> CURLE_BAD_FUNCTION_ARGUMENT).
+            let mut eff: *const c_char = 0x1 as *const c_char;
+            assert_eq!(
+                curl_easy_getinfo(
+                    h,
+                    CURLINFO::CURLINFO_EFFECTIVE_URL as c_int,
+                    &mut eff as *mut *const c_char,
+                ),
+                ok,
+                "CURLINFO_EFFECTIVE_URL must dispatch through the trampoline"
+            );
+            assert!(
+                eff.is_null(),
+                "getinfo must write NULL through the forwarded out-pointer (pre-transfer STRING)"
+            );
+            curl_easy_cleanup(h);
+        }
+    }
 }

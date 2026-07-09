@@ -41,43 +41,52 @@
 //!
 //! # NOTE — variadic mechanism, MSRV, and the `c_variadic` feature (issue #44930)
 //!
-//! These are true C *variadic* / `va_list` functions. Reading their arguments in Rust requires
-//! either C-variadic function *definitions* (`extern "C" fn(..., ...)`) or [`core::ffi::VaList`].
-//! **Both are gated behind the nightly-only `c_variadic` feature** (rust-lang/rust#44930): they
-//! fail to compile with `error[E0658]` on *stable* — verified on both this workspace's pinned
-//! MSRV toolchain (1.75.0, `rust-toolchain.toml`) and current stable. `curl-rs-ffi` is built on
-//! **stable** by every merge gate (`cargo build --release --workspace`,
-//! `cargo clippy --workspace -- -D warnings`, `cargo +1.75 check --workspace`); only
-//! `curl-rs-lib` runs under `+nightly` (Miri). A `#![feature(c_variadic)]` attribute, moreover,
-//! is only valid at the crate root, which this module does not own. Enabling true variadics
-//! would therefore break the stable build of the entire crate and every consumer of it.
+//! Five of these are true C *variadic* (`...`) functions and five take a `va_list`. Reading `...`
+//! arguments *in Rust* requires either C-variadic function *definitions*
+//! (`extern "C" fn(..., ...)`) or [`core::ffi::VaList`]. **Both are gated behind the nightly-only
+//! `c_variadic` feature** (rust-lang/rust#44930): they fail to compile with `error[E0658]` on
+//! *stable* — verified on both this workspace's pinned MSRV toolchain (1.75.0,
+//! `rust-toolchain.toml`) and current stable. `curl-rs-ffi` is built on **stable** by every merge
+//! gate (`cargo build --release --workspace`, `cargo clippy --workspace -- -D warnings`,
+//! `cargo +1.75 check --workspace`); only `curl-rs-lib` runs under `+nightly` (Miri). A
+//! `#![feature(c_variadic)]` attribute, moreover, is only valid at the crate root. Enabling true
+//! variadics in Rust would therefore break the stable build of the entire crate and every
+//! consumer of it.
 //!
-//! The chosen approach is consequently **stable-only** and keeps the exported ABI locked. It is
-//! two-tier, split by whether an entry point receives a `va_list` it can forward:
+//! The chosen approach keeps the crate **stable-only** while still honouring every caller
+//! argument, by drawing the variadic boundary in a tiny amount of C rather than in Rust. It has
+//! three cooperating parts:
 //!
-//! * The formatting engine ([`format_core`] and friends) is complete, panic-free, and
+//! * **The formatting engine** ([`format_core`] and friends) is complete, panic-free, and
 //!   exhaustively unit-tested against a Rust-native argument source ([`SliceArgs`]); it pulls
-//!   typed arguments through the [`VaArgs`] trait, so a future `c_variadic`-gated `VaList`
-//!   adapter can be dropped in with **zero** engine changes to activate live variadic reads.
-//! * All 10 `#[no_mangle] pub extern "C"` symbols are exported with their exact names and
-//!   return types so the shared object's symbol table matches curl 8.x (`nm -gD`, AAP §0.6.1)
-//!   and so the committed, authoritative `include/curl/mprintf.h` — which carries the real
-//!   `...` / `va_list` declarations and is **never** clobbered — remains the ABI contract.
-//!   (`build.rs` runs `cbindgen` best-effort and downgrades any error to a warning.)
-//! * The five **`va_list`** entry points (`curl_mv*printf`) receive their argument list as a
-//!   named `va_list` parameter. Stable Rust cannot *walk* it, but it can *forward* the opaque
-//!   pointer to the platform C library's `vasprintf(3)`, which expands the arguments; the
-//!   rendered bytes are then emitted through curl's exact write / count / NUL-termination /
-//!   allocation rules (shared with the `...` path via [`Source`]). These entry points therefore
-//!   honour their caller's arguments. Forwarding the `va_list` — rather than re-implementing
-//!   `va_arg` — is the same platform-delegation technique [`out_double`] already uses for
-//!   floating point, and links no new library (the C runtime is always present; AAP §0.5.2).
-//! * The five **`...`** entry points (`curl_mprintf`, `curl_mfprintf`, `curl_msprintf`,
-//!   `curl_msnprintf`, `curl_maprintf`) are variadic *definitions*, for which stable Rust exposes
-//!   no `va_list` at all, so they format against the inert [`EmptyArgs`] source: literal text and
-//!   `%%` render exactly, and conversion specifiers see zero/NULL arguments. Every other
-//!   behaviour (parsing, width/precision/flags, buffer bounds, NUL-termination, return-count and
-//!   allocation contracts) is fully realised and tested for both tiers.
+//!   typed arguments through the [`VaArgs`] trait. This is safe Rust and contains the entire
+//!   format-string dialect.
+//! * **The five `va_list` entry points** (`curl_mv*printf`) are the `#[no_mangle] pub extern "C"`
+//!   Rust workers defined in this module. Stable Rust cannot *walk* a `va_list`, but it can
+//!   *forward* the opaque pointer to the platform C library's `vasprintf(3)`, which expands the
+//!   arguments; the rendered bytes are then emitted through curl's exact write / count /
+//!   NUL-termination / allocation rules via [`Source::Rendered`]. Forwarding the `va_list` —
+//!   rather than re-implementing `va_arg` — is the same platform-delegation technique
+//!   [`out_double`] already uses for floating point, and links no new library (the C runtime is
+//!   always present; AAP §0.5.2).
+//! * **The five `...` entry points** (`curl_mprintf`, `curl_mfprintf`, `curl_msprintf`,
+//!   `curl_msnprintf`, `curl_maprintf`) are defined as three-line C trampolines in
+//!   `csrc/variadic_shim.c` (compiled and statically linked by `build.rs`). Each performs
+//!   `va_start` and forwards the resulting `va_list` to its matching `curl_mv*printf` Rust worker
+//!   above. The C compiler owns the one operation stable Rust cannot express — materialising a
+//!   `va_list` from `...` — so these entry points now honour their caller's arguments fully and
+//!   identically to the `va_list` tier (there is exactly one formatting implementation). The C
+//!   trampoline pattern mirrors curl 8.x's own build layout and confines the variadic mechanism
+//!   to ~40 lines of C outside the Rust type system.
+//!
+//! The net exported symbol table is byte-identical to a hand-written C `libcurl`: all 10
+//! `curl_m*printf` names are present with their exact signatures (`nm -gD`, AAP §0.6.1), and the
+//! committed, authoritative `include/curl/mprintf.h` — which carries the real `...` / `va_list`
+//! declarations and is **never** clobbered — remains the ABI contract. (`build.rs` runs `cbindgen`
+//! best-effort and downgrades any error to a warning; the C-defined `...` prototypes are supplied
+//! to cbindgen via its `trailer`.) The inert [`EmptyArgs`] source is retained only as the
+//! defensive null-`va_list` fallback inside the workers (see [`Source::Format`]); it is no longer
+//! on the normal call path of any entry point.
 //!
 //! # Unsafe & panic policy (AAP §0.6.2 / §0.7.2)
 //!
@@ -256,16 +265,17 @@ trait VaArgs {
     fn arg_ptr(&mut self) -> usize;
 }
 
-/// The inert argument source backing the `...` entry points (and the `va_source` fallback) on the
-/// stable toolchain.
+/// The inert argument source backing the defensive null-`va_list` fallback of the
+/// `curl_mv*printf` workers (see [`va_source`] and [`Source::Format`]).
 ///
-/// See the crate-level `NOTE`: a `...` variadic *definition* exposes no `va_list`, and live C
-/// varargs cannot be *walked* in Rust without the nightly `c_variadic` feature, so every accessor
-/// yields a neutral value (`0` / `0.0` / NULL). Literal text and `%%` therefore render exactly,
-/// while conversion specifiers observe zero/NULL arguments. (The `va_list` entry points do *not*
-/// use this source: they forward their `va_list` to the platform `vasprintf` — see [`Source`] —
-/// and so honour their caller's arguments.) This is the single, well-contained consequence of the
-/// stable-only variadic strategy.
+/// See the crate-level `NOTE`: live C varargs cannot be *walked* in Rust without the nightly
+/// `c_variadic` feature, so every accessor here yields a neutral value (`0` / `0.0` / NULL).
+/// Literal text and `%%` therefore render exactly, while conversion specifiers observe zero/NULL
+/// arguments. This source is reached only when a C consumer invokes a `curl_mv*printf` worker
+/// directly with a null `va_list`; the normal call path — the C `...` trampolines forwarding a
+/// real `va_list`, and any caller passing a live `va_list` — instead expands arguments through the
+/// platform `vasprintf` and yields [`Source::Rendered`], honouring every argument. It remains a
+/// well-contained, defensive consequence of the stable-only variadic strategy.
 struct EmptyArgs;
 
 impl VaArgs for EmptyArgs {
@@ -1367,8 +1377,10 @@ fn append_int(buf: &mut Vec<u8>, n: i64) {
 
 /// Write the running character count back through a `%n` pointer (curl's `MTYPE_INTPTR` branch).
 ///
-/// A NULL pointer — the only value the stable variadic shim can supply for `%n` (see the crate
-/// `NOTE`) — is a no-op, so the count is computed but not stored on the stable path.
+/// A NULL pointer is a no-op: the count is computed but not stored. This is the value seen when a
+/// worker runs against the inert [`EmptyArgs`] null-`va_list` fallback (see the crate `NOTE`); on
+/// the normal path a real `%n` pointer forwarded through the platform `vasprintf` receives the
+/// count as usual.
 fn write_n(addr: usize, flags: u32, done: c_int) {
     if addr == 0 {
         return;
@@ -1608,21 +1620,25 @@ fn c_stdout() -> *mut FILE {
 // ---------------------------------------------------------------------------
 // Shared implementations behind the exported entry points.
 //
-// The `...` and `va_list` variants share every byte of their buffer-management, NUL-termination,
-// and return-count logic; they differ only in where the *content* comes from, captured by
-// [`Source`]. The `...` variants supply `Source::Format` (expanded against the inert
-// [`EmptyArgs`]); the `va_list` variants supply `Source::Rendered` (already expanded by the
-// platform `vasprintf`, see [`va_source`]). Centralising the tail logic keeps every pair
-// byte-identical regardless of tier.
+// Every `curl_mv*printf` worker shares the same buffer-management, NUL-termination, and
+// return-count logic; they differ only in where the *content* comes from, captured by [`Source`].
+// The normal path is `Source::Rendered`: the C trampolines in `csrc/variadic_shim.c` capture the
+// caller's `...` arguments with `va_start` and forward the resulting `va_list`, which [`va_source`]
+// hands to the platform `vasprintf` to produce the final bytes. `Source::Format` is the
+// null-`va_list` fallback — reached only when a C consumer invokes a `curl_mv*printf` worker
+// directly with a null `va_list` — and expands the format against the inert [`EmptyArgs`].
+// Centralising the tail logic keeps the whole family byte-identical regardless of source.
 // ---------------------------------------------------------------------------
 
 /// The origin of the bytes an entry point writes out.
 enum Source {
-    /// A caller `format` string (`...` entry points), read on demand and expanded by
-    /// [`format_core`] against the inert [`EmptyArgs`] (stable Rust cannot walk the varargs).
+    /// A caller `format` string with no accompanying `va_list` (the null-`va_list` fallback of the
+    /// `curl_mv*printf` workers), read on demand and expanded by [`format_core`] against the inert
+    /// [`EmptyArgs`]. The variadic `...` entry points never take this path: their C trampolines
+    /// always forward a real `va_list`, yielding [`Source::Rendered`].
     Format(*const c_char),
-    /// Bytes already expanded by the platform `vasprintf` for a `va_list` entry point, emitted
-    /// verbatim (no further `%`-conversion).
+    /// Bytes already expanded by the platform `vasprintf` from a forwarded `va_list`, emitted
+    /// verbatim (no further `%`-conversion). This is the path taken by the C variadic trampolines.
     Rendered(Vec<u8>),
 }
 
@@ -1787,48 +1803,32 @@ fn aprintf_to_heap(src: Source) -> *mut c_char {
 // ===========================================================================
 // The 10 exported CURL_EXTERN symbols (byte-exact with include/curl/mprintf.h)
 // ===========================================================================
-
-/// `int curl_mprintf(const char *format, ...);`
-///
-/// Format `format` to `stdout` and return the number of characters written. See the crate `NOTE`
-/// regarding variadic arguments on the stable toolchain.
-#[no_mangle]
-pub extern "C" fn curl_mprintf(format: *const c_char) -> c_int {
-    crate::ffi_guard(0, || printf_to_stream(Source::Format(format), c_stdout()))
-}
-
-/// `int curl_mfprintf(FILE *fd, const char *format, ...);`
-///
-/// Format `format` to the stream `fd` and return the number of characters written.
-#[no_mangle]
-pub extern "C" fn curl_mfprintf(fd: *mut FILE, format: *const c_char) -> c_int {
-    crate::ffi_guard(0, || printf_to_stream(Source::Format(format), fd))
-}
-
-/// `int curl_msprintf(char *buffer, const char *format, ...);`
-///
-/// Format `format` into `buffer` (unbounded — the caller guarantees sufficient space),
-/// NUL-terminate, and return the number of characters written (excluding the NUL).
-#[no_mangle]
-pub extern "C" fn curl_msprintf(buffer: *mut c_char, format: *const c_char) -> c_int {
-    crate::ffi_guard(0, || sprintf_to_buffer(Source::Format(format), buffer))
-}
-
-/// `int curl_msnprintf(char *buffer, size_t maxlength, const char *format, ...);`
-///
-/// Format `format` into at most `maxlength` bytes of `buffer` (always NUL-terminating when
-/// `maxlength > 0`) and return the number of bytes actually stored — matching `lib/mprintf.c`,
-/// which reserves the final slot for the terminator even on an exact fit.
-#[no_mangle]
-pub extern "C" fn curl_msnprintf(
-    buffer: *mut c_char,
-    maxlength: size_t,
-    format: *const c_char,
-) -> c_int {
-    crate::ffi_guard(0, || {
-        snprintf_to_buffer(Source::Format(format), buffer, maxlength)
-    })
-}
+//
+// These ten symbols split into two halves that together form the drop-in
+// `curl_m*printf` family:
+//
+//   * The five **variadic** entry points — `curl_mprintf`, `curl_mfprintf`,
+//     `curl_msprintf`, `curl_msnprintf`, and `curl_maprintf` — take the C
+//     `...` ellipsis. They are NOT defined here: a stable-Rust `extern "C"`
+//     function cannot portably read a platform `va_list` because the
+//     `c_variadic` feature that would let it do so is nightly-only, and this
+//     crate is pinned to the MSRV-1.75 stable toolchain (AAP §0.7.3 forbids a
+//     nightly requirement). They are instead defined as thin C trampolines in
+//     `csrc/variadic_shim.c`, compiled and linked by `build.rs`. Each C
+//     trampoline performs `va_start` and forwards the resulting `va_list` to
+//     the matching `curl_mv*printf` worker exported just below, so the real
+//     formatting logic still lives in safe Rust and there is exactly one
+//     implementation of each format path.
+//
+//   * The five **`va_list`** entry points — `curl_mvprintf`, `curl_mvfprintf`,
+//     `curl_mvsprintf`, `curl_mvsnprintf`, and `curl_mvaprintf` — are the Rust
+//     workers defined below. They accept an already-constructed `va_list`
+//     (typed as an opaque `*mut c_void`, which is ABI-identical to `va_list`
+//     on every supported target) and are the forwarding targets of the C
+//     trampolines above as well as being directly callable by C consumers.
+//
+// The net exported symbol set is unchanged from a hand-written C `libcurl`:
+// all ten `curl_m*printf` names are present with byte-exact signatures.
 
 /// `int curl_mvprintf(const char *format, va_list args);`
 ///
@@ -1875,19 +1875,6 @@ pub extern "C" fn curl_mvsnprintf(
     })
 }
 
-/// `char *curl_maprintf(const char *format, ...);`
-///
-/// Format `format` into a freshly allocated heap string and return it (the caller frees it with
-/// [`curl_free`](crate)). Returns an empty string for empty output and null only on an
-/// unrepresentable result, mirroring `lib/mprintf.c`'s `curl_maprintf`.
-#[no_mangle]
-pub extern "C" fn curl_maprintf(format: *const c_char) -> *mut c_char {
-    // The heap-returning entry points cannot use the integer-returning `ffi_guard`; guard against
-    // any unwind directly and yield null (an allocation failure) if one somehow occurs.
-    std::panic::catch_unwind(|| aprintf_to_heap(Source::Format(format)))
-        .unwrap_or(std::ptr::null_mut())
-}
-
 /// `char *curl_mvaprintf(const char *format, va_list args);`
 ///
 /// The `va_list` sibling of [`curl_maprintf`]. `args` is forwarded to the platform `vasprintf(3)`
@@ -1920,9 +1907,10 @@ mod tests {
         Ptr(usize),
     }
 
-    /// A [`VaArgs`] implementation yielding a pre-set sequence of typed values. This is what lets
-    /// the formatting engine be exercised with *real* arguments on the stable toolchain, where the
-    /// exported entry points can only feed the inert [`EmptyArgs`].
+    /// A [`VaArgs`] implementation yielding a pre-set sequence of typed values. This drives the
+    /// formatting engine ([`format_core`]) directly with *real* arguments, isolating the format
+    /// dialect from the FFI/`vasprintf` layer that the C trampolines exercise (see the
+    /// `public_*` tests, which cover the trampolines end to end).
     struct SliceArgs {
         it: std::vec::IntoIter<TestArg>,
     }
@@ -2196,13 +2184,34 @@ mod tests {
         assert_eq!(buf[4], 0);
     }
 
-    // ---- The exported entry points (ABI contract: NUL-termination, return, allocation) ----
+    // ---- The exported C-variadic entry points (the real trampolines from variadic_shim.c) ----
+    //
+    // The `...` entry points — `curl_mprintf`, `curl_msprintf`, `curl_msnprintf`, `curl_maprintf`
+    // — are defined in C (stable Rust cannot express `...`; see the crate module docs). Rust
+    // cannot *define* a C variadic on the stable toolchain, but it can *declare and call* one:
+    // both have been stable since 1.0. Declaring them here as variadic `extern "C"` therefore
+    // exercises the ACTUAL shipped trampolines end to end — `va_start` capture in C, the `va_list`
+    // forwarded to the Rust `curl_mv*printf` worker, and the platform `vasprintf` — including with
+    // real, typed arguments. This is the direct runtime proof of the F6-MPRINTF fix: before it,
+    // the stable-Rust entry points could not read varargs at all.
+    extern "C" {
+        fn curl_mprintf(format: *const c_char, ...) -> c_int;
+        fn curl_msprintf(buffer: *mut c_char, format: *const c_char, ...) -> c_int;
+        fn curl_msnprintf(
+            buffer: *mut c_char,
+            maxlength: size_t,
+            format: *const c_char,
+            ...
+        ) -> c_int;
+        fn curl_maprintf(format: *const c_char, ...) -> *mut c_char;
+    }
 
     #[test]
     fn public_msnprintf_literal() {
         let f = CString::new("hello").unwrap();
         let mut buf = [0i8; 16];
-        let n = curl_msnprintf(buf.as_mut_ptr(), 16, f.as_ptr());
+        // SAFETY: variadic C call whose format consumes no arguments; `buf` has room for "hello\0".
+        let n = unsafe { curl_msnprintf(buf.as_mut_ptr(), 16, f.as_ptr()) };
         assert_eq!(n, 5);
         // SAFETY: `curl_msnprintf` NUL-terminated `buf`, which lives for this scope.
         let out = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
@@ -2213,7 +2222,8 @@ mod tests {
     fn public_msnprintf_truncates() {
         let f = CString::new("hello").unwrap();
         let mut buf = [0i8; 4];
-        let n = curl_msnprintf(buf.as_mut_ptr(), 4, f.as_ptr());
+        // SAFETY: variadic C call; the bounded sink truncates to `max - 1` and NUL-terminates.
+        let n = unsafe { curl_msnprintf(buf.as_mut_ptr(), 4, f.as_ptr()) };
         assert_eq!(n, 3);
         // SAFETY: `curl_msnprintf` NUL-terminated `buf`.
         let out = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
@@ -2224,48 +2234,64 @@ mod tests {
     fn public_msnprintf_zero_max_leaves_buffer_untouched() {
         let f = CString::new("hello").unwrap();
         let mut buf = [0x7fi8; 4];
-        let n = curl_msnprintf(buf.as_mut_ptr(), 0, f.as_ptr());
+        // SAFETY: variadic C call with maxlength 0; curl writes nothing.
+        let n = unsafe { curl_msnprintf(buf.as_mut_ptr(), 0, f.as_ptr()) };
         assert_eq!(n, 0);
         assert_eq!(buf[0], 0x7f); // untouched
     }
 
     #[test]
-    fn public_msnprintf_stable_empty_args_behaviour() {
-        // Documents & locks the stable-toolchain limitation: the public entry points cannot read
-        // varargs, so conversions observe zero/NULL arguments (see the crate NOTE). Literal text
-        // and the field structure are still exact.
-        let f = CString::new("n=%d s=%s").unwrap();
-        let mut buf = [0i8; 32];
-        let n = curl_msnprintf(buf.as_mut_ptr(), 32, f.as_ptr());
+    fn public_msnprintf_reads_real_varargs() {
+        // The whole point of the C trampoline (F6-MPRINTF): real `...` arguments are captured and
+        // formatted with correct types. This positive test replaces the pre-fix test that locked
+        // in the broken behaviour (the stable entry point observing zero/NULL for every argument).
+        let f = CString::new("int=%d str=%s hex=%x").unwrap();
+        let hi = CString::new("hi").unwrap();
+        let mut buf = [0i8; 64];
+        // SAFETY: the format's conversions (`%d`, `%s`, `%x`) match the trailing arguments in
+        // number and type (`c_int`, `char *`, `c_int` read as unsigned); `buf` fits the result.
+        let n = unsafe {
+            curl_msnprintf(
+                buf.as_mut_ptr(),
+                64,
+                f.as_ptr(),
+                42 as c_int,
+                hi.as_ptr(),
+                255 as c_int,
+            )
+        };
         // SAFETY: `curl_msnprintf` NUL-terminated `buf`.
         let out = unsafe { CStr::from_ptr(buf.as_ptr()) }
             .to_str()
             .unwrap()
             .to_owned();
-        assert_eq!(out, "n=0 s=(nil)");
+        assert_eq!(out, "int=42 str=hi hex=ff");
         assert_eq!(n, out.len() as c_int);
     }
 
     #[test]
-    fn public_msprintf_unbounded() {
-        let f = CString::new("abc").unwrap();
+    fn public_msprintf_unbounded_with_varargs() {
+        let f = CString::new("x=%d").unwrap();
         let mut buf = [0i8; 16];
-        let n = curl_msprintf(buf.as_mut_ptr(), f.as_ptr());
+        // SAFETY: one `%d` matches the single trailing `c_int`; `buf` is large enough.
+        let n = unsafe { curl_msprintf(buf.as_mut_ptr(), f.as_ptr(), 9 as c_int) };
         assert_eq!(n, 3);
         // SAFETY: `curl_msprintf` NUL-terminated `buf`.
         let out = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
-        assert_eq!(out, "abc");
+        assert_eq!(out, "x=9");
     }
 
     #[test]
     fn public_maprintf_round_trip_and_free() {
-        let f = CString::new("hello world").unwrap();
-        let p = curl_maprintf(f.as_ptr());
+        let f = CString::new("name=%s n=%d").unwrap();
+        let nm = CString::new("abc").unwrap();
+        // SAFETY: `%s`/`%d` match the trailing `char *`/`c_int` arguments.
+        let p = unsafe { curl_maprintf(f.as_ptr(), nm.as_ptr(), 7 as c_int) };
         assert!(!p.is_null());
         // SAFETY: `p` is a valid NUL-terminated string just returned by `curl_maprintf`; copy it
         // out before freeing so the pointer is not used afterwards.
         let out = unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_owned();
-        assert_eq!(out, "hello world");
+        assert_eq!(out, "name=abc n=7");
         // `curl_free` (a safe `extern "C"` fn) reclaims the `curl_maprintf` allocation via its
         // `CString::from_raw`, the exact inverse of the `CString::into_raw` used to create it.
         crate::global::curl_free(p as *mut c_void);
@@ -2274,7 +2300,8 @@ mod tests {
     #[test]
     fn public_maprintf_empty_is_non_null() {
         let f = CString::new("").unwrap();
-        let p = curl_maprintf(f.as_ptr());
+        // SAFETY: an empty format consumes no arguments.
+        let p = unsafe { curl_maprintf(f.as_ptr()) };
         assert!(!p.is_null());
         // SAFETY: `p` is a valid NUL-terminated (empty) string returned by `curl_maprintf`.
         let out = unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_owned();
@@ -2286,13 +2313,19 @@ mod tests {
     #[test]
     fn null_format_is_safe() {
         // A null format must not dereference null; the int variants return 0 and the heap variant
-        // returns a non-null empty string (safer than curl, which would crash).
-        assert_eq!(curl_mprintf(std::ptr::null()), 0);
+        // returns a non-null empty string (safer than curl, which would crash). The C trampolines
+        // forward the null straight to the Rust worker, whose `vformat_bytes` null-guard makes the
+        // behaviour well-defined.
+        // SAFETY: passing a null format is part of the contract these entry points uphold; no
+        // trailing argument is consumed.
+        assert_eq!(unsafe { curl_mprintf(std::ptr::null()) }, 0);
         let mut buf = [0x7fi8; 8];
-        let n = curl_msnprintf(buf.as_mut_ptr(), 8, std::ptr::null());
+        // SAFETY: null format, bounded buffer; the worker writes an empty, NUL-terminated result.
+        let n = unsafe { curl_msnprintf(buf.as_mut_ptr(), 8, std::ptr::null()) };
         assert_eq!(n, 0);
         assert_eq!(buf[0], 0); // NUL-terminated empty result
-        let p = curl_maprintf(std::ptr::null());
+                               // SAFETY: null format; the heap variant returns a fresh empty string.
+        let p = unsafe { curl_maprintf(std::ptr::null()) };
         assert!(!p.is_null());
         // Reclaim the empty allocation (safe `extern "C"` call).
         crate::global::curl_free(p as *mut c_void);

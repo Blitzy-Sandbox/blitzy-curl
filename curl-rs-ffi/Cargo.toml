@@ -92,3 +92,13 @@ libc = { workspace = true }
 # 0.29.x declares `rust-version = "1.74"` and its full transitive graph compiles on the
 # workspace MSRV 1.75, so it never jeopardizes the `cargo +1.75 check` gate.
 cbindgen = { workspace = true }
+# C toolchain driver (version from [workspace.dependencies]). `build.rs` uses it to compile and
+# statically link the ONE C translation unit of this crate, `csrc/variadic_shim.c` — the
+# C-variadic trampolines for the five `curl_m*printf` `...` entry points. Stable Rust cannot
+# define C-variadic (`...`) functions (the `c_variadic` feature is nightly-only,
+# rust-lang/rust#44930) while the workspace is pinned to MSRV 1.75 on stable (AAP §0.7.3), so the
+# `...` definitions live in a tiny audited C shim that forwards each `va_list` to the crate's
+# Rust `curl_mv*printf` workers (see curl-rs-ffi/src/mprintf.rs). This links NO external C
+# library — only the always-present C runtime (AAP §0.5.2) — and `cc` is already resolved in the
+# lock graph (transitively via aws-lc-sys/zstd-sys), so it introduces no new crate or license.
+cc = { workspace = true }
