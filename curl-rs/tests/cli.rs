@@ -38,8 +38,11 @@ fn version_flag_prints_parity_banner() {
     }
 }
 
-/// With no arguments the tool must exit with status 2 and print usage guidance to stderr,
-/// mirroring curl's no-operand behavior.
+/// With no arguments the tool must exit with status 2 and print curl's exact no-operand
+/// usage guidance to stderr. The message is byte-for-byte curl 8.x's (`src/tool_msgs.c`,
+/// emitted via `helpf(NULL)` in `src/tool_operate.c`) — note the literal `curl:` prefix and
+/// the `curl --help` / `curl --manual` wording, which downstream scrapers match and which the
+/// AAP (§0.7.3) mandates be preserved verbatim rather than rebranded to `curl-rs`.
 #[test]
 fn no_arguments_exits_two_with_usage_guidance() {
     let output = Command::new(CURL_RS_BIN)
@@ -52,8 +55,8 @@ fn no_arguments_exits_two_with_usage_guidance() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("try 'curl-rs --help'"),
-        "expected usage guidance on stderr; got: {stderr}"
+        stderr.contains("curl: try 'curl --help' or 'curl --manual' for more information"),
+        "expected curl's exact usage guidance on stderr; got: {stderr}"
     );
 }
 

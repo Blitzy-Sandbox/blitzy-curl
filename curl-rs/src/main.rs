@@ -71,6 +71,17 @@ mod writeout;
 // `src/tool_writeout_json.c`). Iterates `writeout::VARIABLES` in JSON mode; also exports
 // `json_quoted` for the `--write-out` `:json` value function in `var.rs`.
 mod writeout_json;
+// The `--variable` store and `{{name:func}}` expansion engine (Rust rewrite of `src/var.c`).
+// Owns the higher-level `--variable`/`--expand-<opt>` semantics over the `args::ToolVar` store
+// held in `GlobalConfig::variables`: `setvariable` parses one `--variable` definition
+// (`name=text`, `name@file`, `%name` env import, `name[start-end]` byte range) and `varexpand`
+// substitutes `{{name}}` / `{{name:func:func}}` templates (the `trim`/`json`/`url`/`b64`/`64dec`
+// functions). The argument layer installs these as the `args::VariableSetterHook` /
+// `args::VariableExpanderHook` function pointers; the wiring is performed by the
+// operation-dispatch layer in a later checkpoint (AAP §0.7.3). `var.rs` reuses
+// `writeout_json::json_quoted` for its `:json` function, exactly as curl's `src/var.c` includes
+// `tool_writeout_json.h`.
+mod var;
 // File-time get/set plus portable local-time conversion (Rust rewrite of `src/tool_filetime.c`
 // and `src/toolx/tool_time.c`). `getfiletime` feeds `-z` / `--time-cond` (translated by
 // `setopt.rs` into `CURLOPT_TIMECONDITION` + `CURLOPT_TIMEVALUE`) and `setfiletime` is called
@@ -103,61 +114,70 @@ mod parsecfg;
 // (`operate.rs`) calls `config2setopts` in a later checkpoint (AAP §0.7.3).
 mod setopt;
 
-use clap::Parser;
+// libcurl-parity CLI callbacks (Rust rewrite of curl's `src/tool_cb_*.c`). Defines the
+// `OutStruct`/`OutSink` output-sink model plus the write/read/header/progress/debug/seek/socket
+// callbacks. Consumed by the operation-dispatch layer (`operate.rs`) and the option-application
+// layer (`setopt.rs`).
+mod callbacks;
 
-/// First line of `--version` output, in curl's parity form
-/// `curl-rs/<version> <backends>`. The backend list names the pure-Rust stack that replaces
-/// curl's C libraries (rustls for TLS, flate2/brotli/zstd for content encoding, hyper for
-/// HTTP/1.1+2, quinn for HTTP/3, russh for SSH). The version is inherited from the crate,
-/// which in turn mirrors `LIBCURL_VERSION` via the workspace package version.
-const VERSION_BANNER: &str = concat!(
-    "curl-rs/",
-    env!("CARGO_PKG_VERSION"),
-    " rustls flate2 brotli zstd hyper quinn russh"
-);
+// Transfer dispatch loop — serial and parallel (Rust rewrite of curl's `src/tool_operate.c`
+// plus `tool_operhlp.c` / `tool_ssls.c` / `tool_helpers.c`, absorbing `tool_msgs.c` /
+// `tool_stderr.c`). Drives every transfer, owns the per-transfer lifecycle and retry/etag
+// logic, and hosts the redirect-aware `warnf`/`notef`/`errorf`/`helpf` diagnostics.
+mod operate;
 
-/// curl-rs command-line interface.
+use std::ffi::OsString;
+
+/// Process entry point — a faithful port of curl's `main` (`src/tool_main.c`). It sets up the
+/// diagnostic stream, initializes the process-global configuration and its parser hooks, runs
+/// the library's one-time init, dispatches to [`operate::operate`], and exits with the exact
+/// [`CurlCode`](curl_rs_lib::CurlCode) the operation returned (exit-code parity, AAP §0.7.3).
 ///
-/// The full ~291-flag surface is added, one-to-one with `docs/cmdline-opts/`, in a later
-/// checkpoint. At this foundation checkpoint the only option declared is curl's own
-/// `-V` / `--version` flag; `clap` still provides the built-in `--help` handling and rejects
-/// unrecognized arguments with the standard usage error (exit code 2), matching curl's
-/// option-parsing contract.
-///
-/// `clap`'s automatic version flag is disabled (`disable_version_flag`) so the banner is
-/// emitted verbatim: clap's built-in renderer prints `{name} {version}`, which would double
-/// the program identity (`curl-rs curl-rs/…`). curl prints a single version line, so the flag
-/// is declared explicitly here and handled in `main` to reproduce the AAP §0.6.3 form exactly.
-#[derive(Debug, Parser)]
-#[command(
-    name = "curl-rs",
-    about = "curl-rs - transfer data from or to a server",
-    long_about = None,
-    disable_help_subcommand = true,
-    disable_version_flag = true
-)]
-struct Cli {
-    /// Show version number and exit (curl's `-V` / `--version`).
-    #[arg(short = 'V', long = "version")]
-    version: bool,
-}
-
+/// Runs on a **current-thread** Tokio runtime to match curl 8.x's single-threaded CLI model
+/// (AAP §0.3.2); the multi handle's own multi-thread executor (owned inside `curl-rs-lib`)
+/// drives parallel transfers when `--parallel` is used.
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
-    // `clap` prints and exits (status 0) for `--help`, and rejects any unrecognized argument
-    // with a usage error and exit code 2 — matching curl's parser.
-    let cli = Cli::parse();
+async fn main() {
+    // Initialize the diagnostic stream to real stderr before any message can be emitted
+    // (curl's very first call, `tool_init_stderr()`); `--stderr <file>` may redirect it later
+    // once parsing discovers the flag (applied inside `operate`).
+    operate::tool_init_stderr();
 
-    // `-V` / `--version`: print the parity banner verbatim on stdout and exit 0, matching
-    // curl's single-line version output (AAP §0.6.3). Rendering it here (rather than via
-    // clap's `{name} {version}` renderer) keeps the output byte-exact.
-    if cli.version {
-        println!("{VERSION_BANNER}");
-        std::process::exit(0);
-    }
+    // curl's `main_checkfds()` (reopen closed std fds to /dev/null), SIGPIPE ignore, and
+    // `memory_tracking_init()` are intentionally not carried forward: the standard streams are
+    // guaranteed open by the Rust runtime, SIGPIPE handling requires an `unsafe` libc call
+    // (disallowed outside the FFI crate) and is moot without socket I/O, and allocation
+    // tracking is subsumed by Rust ownership (AAP §0.5.2). Marked NOTE(parity).
 
-    // No URL operand means there is nothing to transfer. Mirror curl's behavior for an
-    // argument-less invocation: print usage guidance on stderr and exit with status 2.
-    eprintln!("curl-rs: try 'curl-rs --help' for more information");
-    std::process::exit(2)
+    // Collect the full argument vector *including* argv[0]; `operate` mirrors curl's argc/argv
+    // indexing (so `argv[1]` is the first real argument).
+    let argv: Vec<OsString> = std::env::args_os().collect();
+
+    // Initialize the process-global CLI configuration (curl's `globalconf_init`). Infallible
+    // here — the operation chain, defaults, and empty stores are set by construction.
+    let mut global = args::GlobalConfig::globalconf_init();
+
+    // Wire the parser hooks that break the module-dependency cycle: `--config`/`-K` dispatches
+    // through `parsecfg`, and `-F`/`--form` through `formparse`. (`--variable` / `--expand-`
+    // have no wired backend at this checkpoint and are accepted as no-ops per the field
+    // contract on `GlobalConfig`.)
+    global.config_parser = Some(parsecfg::config_parser_hook);
+    global.form_parser = Some(formparse::form_parser_hook);
+
+    // Library one-time, process-wide initialization (curl's `curl_global_init`); paired with
+    // `global_cleanup` below.
+    curl_rs_lib::global_init();
+
+    // Start the curl operation. `operate` owns argument parsing, the informational
+    // short-circuits (`--help`/`--version`/…), the share, and the transfer dispatch loop; it
+    // returns the process exit code.
+    let result = operate::operate(&mut global, &argv).await;
+
+    // Library teardown (curl's `curl_global_cleanup`). `global` — the operation chain, the
+    // variable store, and any open streams — is released by RAII when it drops at scope end
+    // (curl's `globalconf_free`).
+    curl_rs_lib::global_cleanup();
+
+    // curl returns `(int)result` from `main`; reproduce the exact exit code.
+    std::process::exit(result.to_i32());
 }

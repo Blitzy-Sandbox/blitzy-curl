@@ -120,6 +120,17 @@ tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 # Filesystem-style glob matching where the CLI needs it (curl-rs-lib EXCLUDES `glob`); curl's
 # own `{a,b}` / `[1-10]` URL globbing is reimplemented separately in `urlglob.rs`.
 glob = { workspace = true }
+# `--variable` expansion functions (`var.rs`): the `{{name:b64}}` / `{{name:64dec}}` functions
+# base64-encode/decode variable content (Rust rewrite of `src/var.c`'s `curlx_base64_encode` /
+# `curlx_base64_decode` calls). The `STANDARD` (padded) engine reproduces curl's alphabet and
+# strict `length % 4 == 0` padding rule, so a bad base64 input yields the parity marker
+# `[64dec-fail]` exactly as curl does.
+base64 = { workspace = true }
+# `--variable` expansion `{{name:url}}` function (`var.rs`): percent-encodes variable content
+# exactly like curl's `curl_easy_escape` (RFC 3986 unreserved `[A-Za-z0-9-._~]` pass through,
+# every other byte `%XX` UPPERCASE). Mirrors the `ISUNRESERVED` set that `curl-rs-lib`'s
+# `escape.rs` already reproduces with this same crate.
+percent-encoding = { workspace = true }
 # `--write-out '%{json}'` structured output (`writeout_json.rs`).
 serde_json = { workspace = true }
 # (De)serializable structures used by write-out/JSON and structured config.

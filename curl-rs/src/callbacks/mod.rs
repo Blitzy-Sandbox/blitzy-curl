@@ -35,6 +35,13 @@ pub enum OutSink {
     /// Standard output.
     Stdout,
     /// Discard (matches `out_null` / redirect to the bit-bucket).
+    ///
+    /// Constructed by the write-callback submodule (`callbacks/write.rs`, curl's
+    /// `tool_cb_wrt.c`) when a transfer's output is routed to the bit-bucket. The
+    /// operation-dispatch layer (`operate.rs`) instead tracks discards via the
+    /// [`OutStruct::out_null`] flag (curl's `outs->out_null`), so it never constructs this
+    /// variant — hence `allow(dead_code)` until the write-callback submodule lands.
+    #[allow(dead_code)]
     Null,
 }
 
@@ -54,6 +61,11 @@ impl OutSink {
     /// short count as an error, so a discard must claim all bytes. Writing to
     /// [`OutSink::None`] is a misuse (no stream has been opened) and yields an error rather
     /// than silently succeeding.
+    ///
+    /// Called by the write-callback submodule (`callbacks/write.rs`, curl's `tool_cb_wrt.c`),
+    /// which owns the body-streaming path; the operation-dispatch layer only opens and closes
+    /// sinks, so `allow(dead_code)` holds until that submodule lands.
+    #[allow(dead_code)]
     pub fn write_all(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             OutSink::File(file) => {
@@ -125,6 +137,11 @@ pub struct OutStruct {
 /// `ptr` must be a valid, non-null, properly-aligned pointer to a live `T` that libcurl was
 /// handed via `CURLOPT_*DATA` and that outlives this borrow; no other alias exists for the
 /// duration (single-threaded CLI runtime).
+///
+/// Used by the callback submodules (`callbacks/{write,read,header,progress,seek,socket,debug}.rs`,
+/// curl's `tool_cb_*.c`) to cross the C ABI; the operation-dispatch layer registers callbacks but
+/// does not implement their bodies, so `allow(dead_code)` holds until those submodules land.
+#[allow(dead_code)]
 pub(crate) unsafe fn userdata_mut<'a, T>(ptr: *mut c_void) -> Option<&'a mut T> {
     // SAFETY: caller guarantees ptr is a valid, uniquely-borrowed *mut T for 'a.
     unsafe { (ptr as *mut T).as_mut() }
@@ -134,6 +151,11 @@ pub(crate) unsafe fn userdata_mut<'a, T>(ptr: *mut c_void) -> Option<&'a mut T> 
 ///
 /// # Safety
 /// `buffer` must point to at least `size * nitems` initialized bytes for `'a`.
+///
+/// Used by the callback submodules (`callbacks/{write,read,header,progress,seek,socket,debug}.rs`,
+/// curl's `tool_cb_*.c`) to view libcurl's callback buffer; the operation-dispatch layer does not
+/// implement callback bodies, so `allow(dead_code)` holds until those submodules land.
+#[allow(dead_code)]
 pub(crate) unsafe fn callback_slice<'a>(buffer: *const u8, size: usize, nitems: usize) -> &'a [u8] {
     let len = size.saturating_mul(nitems);
     if buffer.is_null() || len == 0 {

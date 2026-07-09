@@ -684,6 +684,7 @@ version = "8.19.0-dev"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "base64",
  "chrono",
  "clap",
  "clap_complete",
@@ -691,6 +692,7 @@ dependencies = [
  "curl-rs-lib",
  "glob",
  "libc",
+ "percent-encoding",
  "predicates",
  "serde",
  "serde_json",
