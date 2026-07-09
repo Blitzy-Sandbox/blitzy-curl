@@ -1825,7 +1825,9 @@ pub extern "C" fn curl_msnprintf(
     maxlength: size_t,
     format: *const c_char,
 ) -> c_int {
-    crate::ffi_guard(0, || snprintf_to_buffer(Source::Format(format), buffer, maxlength))
+    crate::ffi_guard(0, || {
+        snprintf_to_buffer(Source::Format(format), buffer, maxlength)
+    })
 }
 
 /// `int curl_mvprintf(const char *format, va_list args);`
@@ -1868,7 +1870,9 @@ pub extern "C" fn curl_mvsnprintf(
     format: *const c_char,
     args: *mut c_void,
 ) -> c_int {
-    crate::ffi_guard(0, || snprintf_to_buffer(va_source(format, args), buffer, maxlength))
+    crate::ffi_guard(0, || {
+        snprintf_to_buffer(va_source(format, args), buffer, maxlength)
+    })
 }
 
 /// `char *curl_maprintf(const char *format, ...);`
@@ -1880,7 +1884,8 @@ pub extern "C" fn curl_mvsnprintf(
 pub extern "C" fn curl_maprintf(format: *const c_char) -> *mut c_char {
     // The heap-returning entry points cannot use the integer-returning `ffi_guard`; guard against
     // any unwind directly and yield null (an allocation failure) if one somehow occurs.
-    std::panic::catch_unwind(|| aprintf_to_heap(Source::Format(format))).unwrap_or(std::ptr::null_mut())
+    std::panic::catch_unwind(|| aprintf_to_heap(Source::Format(format)))
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// `char *curl_mvaprintf(const char *format, va_list args);`

@@ -1484,7 +1484,9 @@ pub unsafe extern "C" fn curl_formget(
                 Err(_) => {
                     // A panicking append callback is treated as an abort of the form walk.
                     failed = true;
-                    return Err(Error::bad_argument("curl_formget: append callback panicked"));
+                    return Err(Error::bad_argument(
+                        "curl_formget: append callback panicked",
+                    ));
                 }
             };
             if n != chunk.len() {

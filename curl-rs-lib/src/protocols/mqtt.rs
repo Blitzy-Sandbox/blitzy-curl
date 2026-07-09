@@ -1806,7 +1806,10 @@ mod tests {
             };
 
             let (_s, res) = tokio::join!(server_task, client_task);
-            assert!(res.unwrap(), "MQTT subscribe DO phase completes in one step");
+            assert!(
+                res.unwrap(),
+                "MQTT subscribe DO phase completes in one step"
+            );
             assert_eq!(
                 collected.lock().expect("sink").as_slice(),
                 b"hello-mqtt",

@@ -578,7 +578,10 @@ mod tests {
     /// (username `user`, password `pencil`, `i=4096`), driven through the full
     /// three-step [`ScramClient::step`] state machine.
     #[test]
-    #[cfg_attr(miri, ignore = "pure-Rust PBKDF2 (4096 HMAC iterations) is prohibitively slow under Miri's interpreter (minutes per test, exceeding the 60-min Gate-5 budget); the KDF is UB-clean safe Rust exercised natively, and SCRAM parse/validate/format paths stay covered by the non-PBKDF2 tests")]
+    #[cfg_attr(
+        miri,
+        ignore = "pure-Rust PBKDF2 (4096 HMAC iterations) is prohibitively slow under Miri's interpreter (minutes per test, exceeding the 60-min Gate-5 budget); the KDF is UB-clean safe Rust exercised natively, and SCRAM parse/validate/format paths stay covered by the non-PBKDF2 tests"
+    )]
     fn rfc5802_scram_sha1_full_exchange() {
         let mut client = ScramClient::with_nonce(
             ScramHash::Sha1,
@@ -611,7 +614,10 @@ mod tests {
 
     /// RFC 7677 §3 — the complete SCRAM-SHA-256 example exchange.
     #[test]
-    #[cfg_attr(miri, ignore = "pure-Rust PBKDF2 (4096 HMAC iterations) is prohibitively slow under Miri's interpreter (minutes per test, exceeding the 60-min Gate-5 budget); the KDF is UB-clean safe Rust exercised natively, and SCRAM parse/validate/format paths stay covered by the non-PBKDF2 tests")]
+    #[cfg_attr(
+        miri,
+        ignore = "pure-Rust PBKDF2 (4096 HMAC iterations) is prohibitively slow under Miri's interpreter (minutes per test, exceeding the 60-min Gate-5 budget); the KDF is UB-clean safe Rust exercised natively, and SCRAM parse/validate/format paths stay covered by the non-PBKDF2 tests"
+    )]
     fn rfc7677_scram_sha256_full_exchange() {
         let mut client =
             ScramClient::with_nonce(ScramHash::Sha256, "user", "pencil", "rOprNGfwEbeRWgbNEkqO");
@@ -680,7 +686,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "pure-Rust PBKDF2 (4096 HMAC iterations) is prohibitively slow under Miri's interpreter (minutes per test, exceeding the 60-min Gate-5 budget); the KDF is UB-clean safe Rust exercised natively, and SCRAM parse/validate/format paths stay covered by the non-PBKDF2 tests")]
+    #[cfg_attr(
+        miri,
+        ignore = "pure-Rust PBKDF2 (4096 HMAC iterations) is prohibitively slow under Miri's interpreter (minutes per test, exceeding the 60-min Gate-5 budget); the KDF is UB-clean safe Rust exercised natively, and SCRAM parse/validate/format paths stay covered by the non-PBKDF2 tests"
+    )]
     fn pbkdf2_hmac_matches_a_known_vector() {
         // The RFC 5802 SaltedPassword for ("pencil", base64("QSXCR+Q6sek8bf92"),
         // 4096) is well-known; verify the manual PBKDF2 against it.
@@ -745,7 +754,10 @@ mod tests {
 
     /// A wrong `ServerSignature` denies the login (`CURLE_LOGIN_DENIED`).
     #[test]
-    #[cfg_attr(miri, ignore = "pure-Rust PBKDF2 (4096 HMAC iterations) is prohibitively slow under Miri's interpreter (minutes per test, exceeding the 60-min Gate-5 budget); the KDF is UB-clean safe Rust exercised natively, and SCRAM parse/validate/format paths stay covered by the non-PBKDF2 tests")]
+    #[cfg_attr(
+        miri,
+        ignore = "pure-Rust PBKDF2 (4096 HMAC iterations) is prohibitively slow under Miri's interpreter (minutes per test, exceeding the 60-min Gate-5 budget); the KDF is UB-clean safe Rust exercised natively, and SCRAM parse/validate/format paths stay covered by the non-PBKDF2 tests"
+    )]
     fn server_signature_mismatch_denies_login() {
         let mut client = ScramClient::with_nonce(
             ScramHash::Sha1,
@@ -765,7 +777,10 @@ mod tests {
 
     /// A server-error (`e=`) in the final message denies the login.
     #[test]
-    #[cfg_attr(miri, ignore = "pure-Rust PBKDF2 (4096 HMAC iterations) is prohibitively slow under Miri's interpreter (minutes per test, exceeding the 60-min Gate-5 budget); the KDF is UB-clean safe Rust exercised natively, and SCRAM parse/validate/format paths stay covered by the non-PBKDF2 tests")]
+    #[cfg_attr(
+        miri,
+        ignore = "pure-Rust PBKDF2 (4096 HMAC iterations) is prohibitively slow under Miri's interpreter (minutes per test, exceeding the 60-min Gate-5 budget); the KDF is UB-clean safe Rust exercised natively, and SCRAM parse/validate/format paths stay covered by the non-PBKDF2 tests"
+    )]
     fn server_error_message_denies_login() {
         let mut client = ScramClient::with_nonce(
             ScramHash::Sha1,
@@ -783,7 +798,10 @@ mod tests {
 
     /// A malformed server-final (neither `v=` nor `e=`) is bad content encoding.
     #[test]
-    #[cfg_attr(miri, ignore = "pure-Rust PBKDF2 (4096 HMAC iterations) is prohibitively slow under Miri's interpreter (minutes per test, exceeding the 60-min Gate-5 budget); the KDF is UB-clean safe Rust exercised natively, and SCRAM parse/validate/format paths stay covered by the non-PBKDF2 tests")]
+    #[cfg_attr(
+        miri,
+        ignore = "pure-Rust PBKDF2 (4096 HMAC iterations) is prohibitively slow under Miri's interpreter (minutes per test, exceeding the 60-min Gate-5 budget); the KDF is UB-clean safe Rust exercised natively, and SCRAM parse/validate/format paths stay covered by the non-PBKDF2 tests"
+    )]
     fn malformed_server_final_is_rejected() {
         let mut client = ScramClient::with_nonce(
             ScramHash::Sha1,
@@ -801,7 +819,10 @@ mod tests {
 
     /// Trailing extensions after the verifier are ignored.
     #[test]
-    #[cfg_attr(miri, ignore = "pure-Rust PBKDF2 (4096 HMAC iterations) is prohibitively slow under Miri's interpreter (minutes per test, exceeding the 60-min Gate-5 budget); the KDF is UB-clean safe Rust exercised natively, and SCRAM parse/validate/format paths stay covered by the non-PBKDF2 tests")]
+    #[cfg_attr(
+        miri,
+        ignore = "pure-Rust PBKDF2 (4096 HMAC iterations) is prohibitively slow under Miri's interpreter (minutes per test, exceeding the 60-min Gate-5 budget); the KDF is UB-clean safe Rust exercised natively, and SCRAM parse/validate/format paths stay covered by the non-PBKDF2 tests"
+    )]
     fn server_final_with_trailing_extension_verifies() {
         let mut client = ScramClient::with_nonce(
             ScramHash::Sha1,
@@ -822,7 +843,10 @@ mod tests {
     /// Calling `step` after the exchange completed is a protocol misuse and
     /// surfaces as `CURLE_AUTH_ERROR`.
     #[test]
-    #[cfg_attr(miri, ignore = "pure-Rust PBKDF2 (4096 HMAC iterations) is prohibitively slow under Miri's interpreter (minutes per test, exceeding the 60-min Gate-5 budget); the KDF is UB-clean safe Rust exercised natively, and SCRAM parse/validate/format paths stay covered by the non-PBKDF2 tests")]
+    #[cfg_attr(
+        miri,
+        ignore = "pure-Rust PBKDF2 (4096 HMAC iterations) is prohibitively slow under Miri's interpreter (minutes per test, exceeding the 60-min Gate-5 budget); the KDF is UB-clean safe Rust exercised natively, and SCRAM parse/validate/format paths stay covered by the non-PBKDF2 tests"
+    )]
     fn step_after_completion_is_an_auth_error() {
         let mut client = ScramClient::with_nonce(
             ScramHash::Sha1,

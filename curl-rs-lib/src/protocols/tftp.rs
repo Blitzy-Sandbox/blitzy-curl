@@ -1609,7 +1609,11 @@ impl Protocol for TftpHandler {
                         format!("no address for {host}:{port}"),
                     )
                 })?;
-            let bind_addr = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+            let bind_addr = if server.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
             let socket = UdpSocket::bind(bind_addr)
                 .await
                 .map_err(|e| Error::with_context(CurlCode::CouldntConnect, e.to_string()))?;
@@ -2345,7 +2349,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets")]
+    #[cfg_attr(
+        miri,
+        ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets"
+    )]
     async fn handler_do_it_downloads_to_sink() {
         // End-to-end through the handler: `do_it` resolves host/port, binds its
         // own UDP socket, drives `TftpConn::run`, and streams the downloaded file
@@ -2356,7 +2363,13 @@ mod tests {
         let server = serve_download(server_sock, file.clone(), false, 512);
 
         let collected = Arc::new(Mutex::new(Vec::new()));
-        let mut ctx = handler_ctx(server_addr, "/h.txt", false, None, Some(Arc::clone(&collected)));
+        let mut ctx = handler_ctx(
+            server_addr,
+            "/h.txt",
+            false,
+            None,
+            Some(Arc::clone(&collected)),
+        );
 
         let client = HANDLER.do_it(&mut ctx);
         let (_srv, cres) = tokio::time::timeout(Duration::from_secs(10), async {
@@ -2369,7 +2382,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets")]
+    #[cfg_attr(
+        miri,
+        ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets"
+    )]
     async fn handler_do_it_download_without_sink_still_succeeds() {
         // With no sink installed the download still runs to completion; the bytes
         // are discarded (← a body write with no client destination).
@@ -2390,7 +2406,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets")]
+    #[cfg_attr(
+        miri,
+        ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets"
+    )]
     async fn handler_do_it_uploads_body() {
         // Upload path: the in-memory request body is the WRQ source; the handler
         // sends it block-by-block and the server reassembles the exact bytes.
@@ -2399,13 +2418,7 @@ mod tests {
         let server_addr = server_sock.local_addr().unwrap();
         let server = serve_upload(server_sock, 512);
 
-        let mut ctx = handler_ctx(
-            server_addr,
-            "/up.bin",
-            true,
-            Some(payload.clone()),
-            None,
-        );
+        let mut ctx = handler_ctx(server_addr, "/up.bin", true, Some(payload.clone()), None);
 
         let client = HANDLER.do_it(&mut ctx);
         let (received, cres) = tokio::time::timeout(Duration::from_secs(10), async {
@@ -2418,7 +2431,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets")]
+    #[cfg_attr(
+        miri,
+        ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets"
+    )]
     async fn handler_do_it_server_error_maps_curl_code() {
         // A server `ERROR` packet surfaces through the handler as the frozen
         // `CURLE_TFTP_*` code (code 1 = "file not found" ⇒ CURLE_TFTP_NOTFOUND).
@@ -2439,7 +2455,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets")]
+    #[cfg_attr(
+        miri,
+        ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets"
+    )]
     async fn handler_do_it_missing_filename_is_illegal() {
         // A path of just "/" leaves an empty filename after the leading-slash
         // skip; `build_first_request` rejects it as CURLE_TFTP_ILLEGAL before any
@@ -2450,7 +2469,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets")]
+    #[cfg_attr(
+        miri,
+        ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets"
+    )]
     async fn handler_do_it_builds_curl_faithful_filename() {
         // Wire-parity proof: a URL path of "/hello%20world.txt;mode=octet" must
         // reach the RRQ as filename "hello world.txt" (leading '/' skipped, %20
@@ -2469,11 +2491,9 @@ mod tests {
             let rrq = &buf[..n];
             // opcode (2) + filename \0 + mode \0 + options…
             let fname_start = 2;
-            let fname_end = fname_start
-                + rrq[fname_start..].iter().position(|&b| b == 0).unwrap();
+            let fname_end = fname_start + rrq[fname_start..].iter().position(|&b| b == 0).unwrap();
             let mode_start = fname_end + 1;
-            let mode_end = mode_start
-                + rrq[mode_start..].iter().position(|&b| b == 0).unwrap();
+            let mode_end = mode_start + rrq[mode_start..].iter().position(|&b| b == 0).unwrap();
             *checked_srv.lock().unwrap() = Some((
                 rrq[fname_start..fname_end].to_vec(),
                 rrq[mode_start..mode_end].to_vec(),
@@ -2515,7 +2535,10 @@ mod tests {
         assert_eq!(urldecode_reject_zero(b"foo%20bar").unwrap(), b"foo bar");
         assert_eq!(urldecode_reject_zero(b"100%").unwrap(), b"100%"); // trailing % literal
         assert_eq!(urldecode_reject_zero(b"a%zzb").unwrap(), b"a%zzb"); // non-hex literal
-        assert_eq!(urldecode_reject_zero(b"caf%C3%A9").unwrap(), "café".as_bytes());
+        assert_eq!(
+            urldecode_reject_zero(b"caf%C3%A9").unwrap(),
+            "café".as_bytes()
+        );
         assert!(urldecode_reject_zero(b"x%00y").is_err()); // decoded NUL rejected
     }
 
@@ -2603,7 +2626,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets")]
+    #[cfg_attr(
+        miri,
+        ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets"
+    )]
     async fn e2e_download_with_oack_multiblock() {
         let file: Vec<u8> = (0u8..37).collect(); // 37 bytes / blksize 8 → 5 blocks
         let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2632,7 +2658,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets")]
+    #[cfg_attr(
+        miri,
+        ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets"
+    )]
     async fn e2e_download_without_oack_single_block() {
         let file: Vec<u8> = b"hello world".to_vec();
         let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2659,7 +2688,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets")]
+    #[cfg_attr(
+        miri,
+        ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets"
+    )]
     async fn e2e_upload_multiblock() {
         let payload: Vec<u8> = (0u8..=255).cycle().take(1000).collect();
         let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2690,7 +2722,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets")]
+    #[cfg_attr(
+        miri,
+        ignore = "runs a real UDP (SOCK_DGRAM) TFTP exchange via tokio::net::UdpSocket; Miri supports only TCP sockets"
+    )]
     async fn e2e_server_error_maps_to_curl_code() {
         let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_sock.local_addr().unwrap();

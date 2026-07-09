@@ -1607,8 +1607,7 @@ impl Protocol for RtspHandler {
                 let mut interleave = RtpInterleave::new();
                 match ctx.sink.as_deref_mut() {
                     Some(s) => {
-                        pump_interleave(stream, &mut interleave, &mask, true, Vec::new(), s)
-                            .await?
+                        pump_interleave(stream, &mut interleave, &mask, true, Vec::new(), s).await?
                     }
                     None => {
                         let mut discard = DiscardTransferSink;

@@ -113,8 +113,8 @@ mod ntlm {
     fn des_set_odd_parity(bytes: &mut [u8; 8]) {
         for b in bytes.iter_mut() {
             let x = *b;
-            let parity = ((x >> 7) ^ (x >> 6) ^ (x >> 5) ^ (x >> 4) ^ (x >> 3) ^ (x >> 2) ^ (x >> 1))
-                & 0x01;
+            let parity =
+                ((x >> 7) ^ (x >> 6) ^ (x >> 5) ^ (x >> 4) ^ (x >> 3) ^ (x >> 2) ^ (x >> 1)) & 0x01;
             if parity == 0 {
                 *b |= 0x01;
             } else {
@@ -543,9 +543,8 @@ fn smb_urldecode_reject_ctrl(input: &str) -> Result<String> {
         out.push(byte);
     }
 
-    String::from_utf8(out).map_err(|_| {
-        Error::with_context(CurlCode::UrlMalformat, "non-UTF-8 byte in SMB URL path")
-    })
+    String::from_utf8(out)
+        .map_err(|_| Error::with_context(CurlCode::UrlMalformat, "non-UTF-8 byte in SMB URL path"))
 }
 
 /// Parse an SMB URL path into `(share, file_path)` (← `smb_parse_url_path`).

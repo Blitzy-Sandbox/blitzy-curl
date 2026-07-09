@@ -2928,7 +2928,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[cfg_attr(miri, ignore = "asserts a wall-clock timing bound (elapsed < 300ms for concurrent transfers) that Miri's interpreter (orders of magnitude slower than native) cannot satisfy; the concurrency logic itself is UB-clean")]
+    #[cfg_attr(
+        miri,
+        ignore = "asserts a wall-clock timing bound (elapsed < 300ms for concurrent transfers) that Miri's interpreter (orders of magnitude slower than native) cannot satisfy; the concurrency logic itself is UB-clean"
+    )]
     async fn run_async_executes_transfers_in_parallel() {
         let mut multi = Multi::new();
         for _ in 0..4 {

@@ -286,7 +286,10 @@ mod tests {
     // from the hosts database), so they never depend on external DNS.
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "invokes the real system resolver (tokio::net::lookup_host -> getaddrinfo), which creates a UDP (SOCK_DGRAM) socket; Miri supports only TCP sockets")]
+    #[cfg_attr(
+        miri,
+        ignore = "invokes the real system resolver (tokio::net::lookup_host -> getaddrinfo), which creates a UDP (SOCK_DGRAM) socket; Miri supports only TCP sockets"
+    )]
     async fn resolve_ipv4_literal_returns_single_stamped_endpoint() {
         let resolver = SystemResolver::new();
         let address = resolver
@@ -300,7 +303,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "invokes the real system resolver (tokio::net::lookup_host -> getaddrinfo), which creates a UDP (SOCK_DGRAM) socket; Miri supports only TCP sockets")]
+    #[cfg_attr(
+        miri,
+        ignore = "invokes the real system resolver (tokio::net::lookup_host -> getaddrinfo), which creates a UDP (SOCK_DGRAM) socket; Miri supports only TCP sockets"
+    )]
     async fn resolve_whatever_localhost_is_non_empty_and_ordered() {
         let resolver = SystemResolver::new();
         let address = resolver
@@ -316,7 +322,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "invokes the real system resolver (tokio::net::lookup_host -> getaddrinfo), which creates a UDP (SOCK_DGRAM) socket; Miri supports only TCP sockets")]
+    #[cfg_attr(
+        miri,
+        ignore = "invokes the real system resolver (tokio::net::lookup_host -> getaddrinfo), which creates a UDP (SOCK_DGRAM) socket; Miri supports only TCP sockets"
+    )]
     async fn resolve_ipv4_literal_as_v6_fails_with_couldnt_resolve_host() {
         let resolver = SystemResolver::new();
         // Requesting IPv6-only for a host that only has an IPv4 address is a
@@ -331,7 +340,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "invokes the real system resolver (tokio::net::lookup_host -> getaddrinfo), which creates a UDP (SOCK_DGRAM) socket; Miri supports only TCP sockets")]
+    #[cfg_attr(
+        miri,
+        ignore = "invokes the real system resolver (tokio::net::lookup_host -> getaddrinfo), which creates a UDP (SOCK_DGRAM) socket; Miri supports only TCP sockets"
+    )]
     async fn resolve_via_dyn_resolver_is_object_safe() {
         // The backend must be usable as `&dyn Resolver` — that object safety is why
         // the trait returns a boxed `ResolveFuture` rather than using `async fn`.
@@ -345,7 +357,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "invokes the real system resolver (tokio::net::lookup_host -> getaddrinfo), which creates a UDP (SOCK_DGRAM) socket; Miri supports only TCP sockets")]
+    #[cfg_attr(
+        miri,
+        ignore = "invokes the real system resolver (tokio::net::lookup_host -> getaddrinfo), which creates a UDP (SOCK_DGRAM) socket; Miri supports only TCP sockets"
+    )]
     async fn resolve_v6_respects_ipv6_availability() {
         let resolver = SystemResolver::new();
         let result = resolver.resolve("::1", 80, IpVersion::V6).await;

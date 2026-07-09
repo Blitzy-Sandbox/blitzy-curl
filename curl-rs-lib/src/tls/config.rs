@@ -1246,7 +1246,10 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn build_default_with_webpki_roots_succeeds() {
         // The default config uses the built-in Mozilla roots and a real
         // (root-certificate) verifier.
@@ -1259,7 +1262,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn secure_path_requires_trust_anchors() {
         // verify_peer = true but no CA source and built-in roots disabled: the
         // real verifier cannot be built without anchors -> SSL CA badfile.
@@ -1271,7 +1277,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn insecure_build_needs_no_trust_anchors() {
         // The accept-all verifier does not consult any trust store, so the
         // build succeeds even with no roots at all — behaviorally proving the
@@ -1294,7 +1303,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn no_server_cert_verification_advertises_schemes() {
         let provider = resolve_default_provider().expect("provider");
         let verifier = NoServerCertVerification::new(provider);
@@ -1308,7 +1320,10 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn ca_info_valid_pem_file_loads() {
         let (cert_pem, _key) = ephemeral_cert_and_key();
         let mut file = tempfile::NamedTempFile::new().expect("temp CA file");
@@ -1319,7 +1334,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn ca_info_blob_valid_pem_loads() {
         let (cert_pem, _key) = ephemeral_cert_and_key();
         let cfg = TlsConfig::default().with_ca_info_blob(cert_pem);
@@ -1346,7 +1364,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn ca_path_directory_of_pems_loads() {
         let dir = tempfile::tempdir().expect("temp dir");
         let (cert_pem, _key) = ephemeral_cert_and_key();
@@ -1364,7 +1385,10 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn client_cert_and_key_blob_round_trip() {
         let (cert_pem, key_pem) = ephemeral_cert_and_key();
         let cfg = TlsConfig::default()
@@ -1376,7 +1400,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn client_cert_and_key_files_build_full_config() {
         let (cert_pem, key_pem) = ephemeral_cert_and_key();
         let mut cert_file = tempfile::NamedTempFile::new().expect("cert file");
@@ -1400,7 +1427,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn key_without_cert_is_certproblem() {
         let (_cert, key_pem) = ephemeral_cert_and_key();
         let cfg = TlsConfig::default().with_client_key_blob(key_pem);
@@ -1409,7 +1439,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn encrypted_key_password_is_unsupported_certproblem() {
         let (cert_pem, key_pem) = ephemeral_cert_and_key();
         let cfg = TlsConfig::default()
@@ -1443,7 +1476,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn cipher_token_resolves_known_names() {
         let provider = resolve_default_provider().expect("provider");
         let available = &provider.cipher_suites;
@@ -1464,7 +1500,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn known_tls13_cipher_is_selected() {
         let provider = resolve_default_provider().expect("provider");
         let cfg = TlsConfig::default().with_cipher_list13("TLS_AES_128_GCM_SHA256");
@@ -1476,7 +1515,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn only_unknown_ciphers_in_both_lists_is_sslcipher() {
         let provider = resolve_default_provider().expect("provider");
         let cfg = TlsConfig::default()
@@ -1490,7 +1532,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn no_cipher_list_uses_defaults_and_builds() {
         // With no cipher lists set, build() must not restrict suites.
         let config = TlsConfig::default().build().expect("default ciphers build");
@@ -1499,7 +1544,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn cipher_list_only_keeps_tls13_defaults() {
         // Setting only the TLS 1.2 list must not drop TLS 1.3 defaults.
         let provider = resolve_default_provider().expect("provider");
@@ -1577,7 +1625,10 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn alpn_protocols_are_set_on_built_config() {
         let alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let config = TlsConfig::default()
@@ -1600,7 +1651,10 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI crypto; unsupported under Miri"
+    )]
     fn session_cache_is_installed() {
         let cfg = TlsConfig::default().with_session_cache(SessionCache::new());
         // Build succeeds and the resumption store is wired without panicking.

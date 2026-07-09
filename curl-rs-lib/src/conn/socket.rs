@@ -773,7 +773,9 @@ fn apply_tcp_options(socket: &TcpSocket, opts: &SocketOptions) {
     // to raw `libc` nor change observable behavior — the connect proceeds
     // without TFO, which differs only in first-flight latency.
     if opts.tcp_fastopen {
-        tracing::debug!("TCP Fast Open requested but not applied (no portable safe socket2 TFO setter)");
+        tracing::debug!(
+            "TCP Fast Open requested but not applied (no portable safe socket2 TFO setter)"
+        );
     }
 }
 

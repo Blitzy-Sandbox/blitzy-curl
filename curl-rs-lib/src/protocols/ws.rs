@@ -1733,13 +1733,19 @@ struct AsyncIoWs<'a> {
 impl WsIo for AsyncIoWs<'_> {
     async fn ws_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
         // `&mut dyn TransferStream` is `AsyncRead + Unpin`, so `read` applies.
-        self.stream.read(buf).await.map_err(|e| io_err_to_curl(&e, false))
+        self.stream
+            .read(buf)
+            .await
+            .map_err(|e| io_err_to_curl(&e, false))
     }
 
     async fn ws_send(&mut self, buf: &[u8]) -> Result<usize> {
         // A single `write` may accept fewer bytes than offered; the engine's
         // flush / partial-send accounting already tolerates a short count.
-        self.stream.write(buf).await.map_err(|e| io_err_to_curl(&e, true))
+        self.stream
+            .write(buf)
+            .await
+            .map_err(|e| io_err_to_curl(&e, true))
     }
 }
 
@@ -1840,8 +1846,7 @@ impl Protocol for WsHandler {
                     ctx.request.path.as_str()
                 };
                 let host_hdr = ws_host_header(&ctx.request);
-                let extra: Vec<&str> =
-                    ctx.request.headers.iter().map(String::as_str).collect();
+                let extra: Vec<&str> = ctx.request.headers.iter().map(String::as_str).collect();
                 let engine = match ctx
                     .proto_state
                     .as_mut()
@@ -1862,19 +1867,14 @@ impl Protocol for WsHandler {
             // so the transport borrow ends before the accept loop reborrows it.
             {
                 let stream = ctx.io.as_deref_mut().ok_or_else(|| {
-                    Error::with_context(
-                        CurlCode::CouldntConnect,
-                        "[WS] no transport for handshake",
-                    )
+                    Error::with_context(CurlCode::CouldntConnect, "[WS] no transport for handshake")
                 })?;
                 let mut io = AsyncIoWs { stream };
                 let mut off = 0usize;
                 while off < request_bytes.len() {
                     let n = io.ws_send(&request_bytes[off..]).await?;
                     if n == 0 {
-                        return Err(send_err(
-                            "[WS] connection closed during handshake send",
-                        ));
+                        return Err(send_err("[WS] connection closed during handshake send"));
                     }
                     off += n;
                 }
@@ -2681,10 +2681,7 @@ mod tests {
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
-        fn poll_shutdown(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
     }
@@ -2700,7 +2697,8 @@ mod tests {
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
              Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
         );
-        ws.accept(resp.as_bytes()).expect("engine reaches accepted state");
+        ws.accept(resp.as_bytes())
+            .expect("engine reaches accepted state");
         ws
     }
 
@@ -2747,7 +2745,10 @@ mod tests {
             )
             .into_bytes();
             resp.extend_from_slice(&[0x81, 0x02, b'h', b'i']);
-            server_io.write_all(&resp).await.expect("server write 101+frame");
+            server_io
+                .write_all(&resp)
+                .await
+                .expect("server write 101+frame");
             server_io.flush().await.expect("server flush");
             // Observe the client's CLOSE frame from DONE.
             let mut close = Vec::new();
@@ -2766,7 +2767,10 @@ mod tests {
         let sink_data = Arc::new(Mutex::new(Vec::new()));
         ctx.sink = Some(Box::new(VecSink(Arc::clone(&sink_data))));
 
-        HANDLER.setup_connection(&mut ctx).await.expect("setup_connection ok");
+        HANDLER
+            .setup_connection(&mut ctx)
+            .await
+            .expect("setup_connection ok");
         let done = HANDLER.do_it(&mut ctx).await.expect("do_it handshake ok");
         assert!(done, "WS do_it reports the DO phase complete after the 101");
 
@@ -2782,7 +2786,10 @@ mod tests {
             "the server TEXT frame is decoded into the client sink"
         );
 
-        HANDLER.done(&mut ctx, Ok(()), false).await.expect("done ok");
+        HANDLER
+            .done(&mut ctx, Ok(()), false)
+            .await
+            .expect("done ok");
         assert!(
             ctx.proto_state.is_none(),
             "done releases the per-transfer WebSocket engine state"
@@ -2800,9 +2807,8 @@ mod tests {
     /// do_it maps a non-`101` handshake response to `CURLE_HTTP_RETURNED_ERROR`.
     #[test]
     fn handler_do_it_rejects_non_101() {
-        let (io, _sent) = MockStream::new(
-            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_vec(),
-        );
+        let (io, _sent) =
+            MockStream::new(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_vec());
         let mut ctx = TransferCtx::new();
         ctx.io = Some(Box::new(io));
         ctx.request.host = "h".to_string();

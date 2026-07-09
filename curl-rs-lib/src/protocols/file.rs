@@ -705,10 +705,7 @@ async fn stream_file_body<W: ClientWrite>(
 /// Render a directory as a newline-separated listing (← curl's
 /// `opendir`/`readdir` branch), skipping entries whose name begins with `.`.
 /// Returns the number of body bytes written.
-async fn write_directory_listing<W: ClientWrite>(
-    path: &Path,
-    sink: &mut W,
-) -> Result<u64> {
+async fn write_directory_listing<W: ClientWrite>(path: &Path, sink: &mut W) -> Result<u64> {
     let mut entries = fs::read_dir(path)
         .await
         .map_err(|_| Error::from(CurlCode::ReadError))?;
@@ -989,11 +986,7 @@ impl Protocol for FileProtocol {
                 // request body; its length is the known upload size.
                 let up_req = UploadRequest {
                     resume_from: ctx.request.resume_from,
-                    infilesize: ctx
-                        .request
-                        .body
-                        .as_ref()
-                        .map_or(-1, |b| b.len() as i64),
+                    infilesize: ctx.request.body.as_ref().map_or(-1, |b| b.len() as i64),
                     new_file_perms: DEFAULT_NEW_FILE_PERMS,
                 };
                 // `&[u8]` implements `AsyncRead`; an absent body is an empty

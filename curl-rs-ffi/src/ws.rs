@@ -431,7 +431,8 @@ mod tests {
         let mut nread: size_t = 123;
         let mut meta: *const curl_ws_frame = &sentinel;
         // SAFETY: null handle with valid out-parameters — the documented NULL-handle path.
-        let rc = unsafe { curl_ws_recv(ptr::null_mut(), ptr::null_mut(), 0, &mut nread, &mut meta) };
+        let rc =
+            unsafe { curl_ws_recv(ptr::null_mut(), ptr::null_mut(), 0, &mut nread, &mut meta) };
         assert_eq!(rc, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT as c_int);
         assert_eq!(nread, 0);
         assert!(meta.is_null());
@@ -467,8 +468,16 @@ mod tests {
     fn send_tolerates_null_sent_on_null_handle() {
         // A NULL `sent` must be tolerated even on the bad-handle path (matches curl).
         // SAFETY: null handle and null `sent` — must be safe.
-        let rc =
-            unsafe { curl_ws_send(ptr::null_mut(), ptr::null(), 0, ptr::null_mut(), 0, CURLWS_PONG) };
+        let rc = unsafe {
+            curl_ws_send(
+                ptr::null_mut(),
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                0,
+                CURLWS_PONG,
+            )
+        };
         assert_eq!(rc, CURLcode::CURLE_BAD_FUNCTION_ARGUMENT as c_int);
     }
 

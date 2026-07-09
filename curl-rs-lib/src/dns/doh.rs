@@ -1689,7 +1689,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI (eager TlsConfig::build for the HTTPS DoH endpoint); Miri cannot interpret foreign functions")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI (eager TlsConfig::build for the HTTPS DoH endpoint); Miri cannot interpret foreign functions"
+    )]
     fn resolver_parses_https_url_with_default_port() {
         let r = DohResolver::new("https://doh.example/dns-query").expect("valid https DoH URL");
         assert_eq!(r.host, "doh.example");
@@ -1698,7 +1701,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "exercises aws-lc-rs C-FFI (eager TlsConfig::build for the HTTPS DoH endpoint); Miri cannot interpret foreign functions")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises aws-lc-rs C-FFI (eager TlsConfig::build for the HTTPS DoH endpoint); Miri cannot interpret foreign functions"
+    )]
     fn resolver_parses_explicit_port() {
         let r = DohResolver::new("https://doh.example:8443/q").unwrap();
         assert_eq!(r.port, 8443);

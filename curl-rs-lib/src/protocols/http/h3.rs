@@ -1070,7 +1070,10 @@ mod tests {
     // ---- End-to-end over a real in-process QUIC + HTTP/3 exchange -----
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "performs a real QUIC handshake (quinn -> rustls -> ring/aws-lc-rs C-FFI); Miri cannot interpret foreign functions")]
+    #[cfg_attr(
+        miri,
+        ignore = "performs a real QUIC handshake (quinn -> rustls -> ring/aws-lc-rs C-FFI); Miri cannot interpret foreign functions"
+    )]
     async fn end_to_end_get_receives_response_body() {
         let addr = spawn_server(ServerBehavior::RespondOk).await;
         // `--insecure` client: trust the ephemeral self-signed cert AND exercise
@@ -1097,7 +1100,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "performs a real QUIC handshake (quinn -> rustls -> ring/aws-lc-rs C-FFI); Miri cannot interpret foreign functions")]
+    #[cfg_attr(
+        miri,
+        ignore = "performs a real QUIC handshake (quinn -> rustls -> ring/aws-lc-rs C-FFI); Miri cannot interpret foreign functions"
+    )]
     async fn quic_handshake_failure_maps_to_96() {
         // Server presents a self-signed cert; the client uses DEFAULT
         // verification (no `--insecure`), so the handshake fails fast with a
@@ -1118,7 +1124,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "performs a real QUIC handshake (quinn -> rustls -> ring/aws-lc-rs C-FFI); Miri cannot interpret foreign functions")]
+    #[cfg_attr(
+        miri,
+        ignore = "performs a real QUIC handshake (quinn -> rustls -> ring/aws-lc-rs C-FFI); Miri cannot interpret foreign functions"
+    )]
     async fn http3_stream_reset_maps_to_95() {
         // Server accepts the request then resets the stream with a non-zero
         // HTTP/3 code before any body → CURLE_HTTP3 (95).

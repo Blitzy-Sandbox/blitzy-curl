@@ -2116,7 +2116,10 @@ mod tests {
         let handler: &dyn Protocol = &HANDLER;
         let mut ctx = TransferCtx::new();
         handler.done(&mut ctx, Ok(()), false).await.unwrap();
-        handler.done(&mut ctx, Err(Error::Recv), true).await.unwrap();
+        handler
+            .done(&mut ctx, Err(Error::Recv), true)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

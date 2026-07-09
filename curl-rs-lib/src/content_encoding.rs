@@ -1348,7 +1348,10 @@ mod tests {
 
     #[cfg(feature = "zstd")]
     #[test]
-    #[cfg_attr(miri, ignore = "exercises zstd C-FFI (zstd-sys); Miri cannot interpret foreign functions")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises zstd C-FFI (zstd-sys); Miri cannot interpret foreign functions"
+    )]
     fn zstd_roundtrip() {
         let data = sample();
         let encoded = zstd_compress(&data);
@@ -1418,7 +1421,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "compresses/decompresses a 512 KiB buffer; the pure-Rust codec is prohibitively slow under Miri's interpreter (minutes/test) and is UB-clean — the CWE-400 ceiling logic is covered by the smaller roundtrip/within-ceiling tests that run natively under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "compresses/decompresses a 512 KiB buffer; the pure-Rust codec is prohibitively slow under Miri's interpreter (minutes/test) and is UB-clean — the CWE-400 ceiling logic is covered by the smaller roundtrip/within-ceiling tests that run natively under Miri"
+    )]
     fn gzip_bomb_exceeding_limit_is_rejected() {
         // 512 KiB of zeros compresses to a few hundred bytes; decoding it under
         // a 32 KiB ceiling must abort with CURLE_TOO_LARGE (100) rather than
@@ -1435,7 +1441,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "compresses/decompresses a 512 KiB buffer; the pure-Rust codec is prohibitively slow under Miri's interpreter (minutes/test) and is UB-clean — the CWE-400 ceiling logic is covered by the smaller roundtrip/within-ceiling tests that run natively under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "compresses/decompresses a 512 KiB buffer; the pure-Rust codec is prohibitively slow under Miri's interpreter (minutes/test) and is UB-clean — the CWE-400 ceiling logic is covered by the smaller roundtrip/within-ceiling tests that run natively under Miri"
+    )]
     fn deflate_bomb_exceeding_limit_is_rejected() {
         // Same bomb shape through the zlib/deflate inflate loop, which enforces
         // the ceiling cumulatively inside `run_inflate`.
@@ -1451,7 +1460,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "compresses/decompresses a 512 KiB buffer; the pure-Rust codec is prohibitively slow under Miri's interpreter (minutes/test) and is UB-clean — the CWE-400 ceiling logic is covered by the smaller roundtrip/within-ceiling tests that run natively under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "compresses/decompresses a 512 KiB buffer; the pure-Rust codec is prohibitively slow under Miri's interpreter (minutes/test) and is UB-clean — the CWE-400 ceiling logic is covered by the smaller roundtrip/within-ceiling tests that run natively under Miri"
+    )]
     fn raw_deflate_bomb_exceeding_limit_is_rejected() {
         // The headerless raw-DEFLATE fallback path must honor the ceiling too:
         // a raw stream that expands past the limit is rejected as TooLarge, not
@@ -1497,7 +1509,10 @@ mod tests {
 
     #[cfg(feature = "brotli")]
     #[test]
-    #[cfg_attr(miri, ignore = "compresses/decompresses a 512 KiB buffer; the pure-Rust codec is prohibitively slow under Miri's interpreter (minutes/test) and is UB-clean — the CWE-400 ceiling logic is covered by the smaller roundtrip/within-ceiling tests that run natively under Miri")]
+    #[cfg_attr(
+        miri,
+        ignore = "compresses/decompresses a 512 KiB buffer; the pure-Rust codec is prohibitively slow under Miri's interpreter (minutes/test) and is UB-clean — the CWE-400 ceiling logic is covered by the smaller roundtrip/within-ceiling tests that run natively under Miri"
+    )]
     fn brotli_bomb_exceeding_limit_is_rejected() {
         let encoded = brotli_compress(&zeros(512 * 1024));
         let mut unencoder = Unencoder::from_content_encoding("br").unwrap();
@@ -1512,7 +1527,10 @@ mod tests {
 
     #[cfg(feature = "zstd")]
     #[test]
-    #[cfg_attr(miri, ignore = "exercises zstd C-FFI (zstd-sys); Miri cannot interpret foreign functions")]
+    #[cfg_attr(
+        miri,
+        ignore = "exercises zstd C-FFI (zstd-sys); Miri cannot interpret foreign functions"
+    )]
     fn zstd_bomb_exceeding_limit_is_rejected() {
         let encoded = zstd_compress(&zeros(512 * 1024));
         let mut unencoder = Unencoder::from_content_encoding("zstd").unwrap();

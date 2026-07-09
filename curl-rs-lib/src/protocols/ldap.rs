@@ -717,7 +717,10 @@ fn ber_push_len(out: &mut Vec<u8>, len: usize) {
     // Long form: `0x80 | number-of-length-bytes`, then the big-endian length
     // with leading zero bytes stripped.
     let bytes = len.to_be_bytes();
-    let first = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+    let first = bytes
+        .iter()
+        .position(|&b| b != 0)
+        .unwrap_or(bytes.len() - 1);
     let significant = &bytes[first..];
     out.push(0x80 | significant.len() as u8);
     out.extend_from_slice(significant);
@@ -1117,7 +1120,7 @@ fn build_search_request(
     ber_int(&mut op, BER_INTEGER, 0); // timeLimit = 0 (no limit)
     ber_bool(&mut op, false); // typesOnly = FALSE
     op.extend_from_slice(filter_ber); // filter
-    // AttributeSelection ::= SEQUENCE OF LDAPString.
+                                      // AttributeSelection ::= SEQUENCE OF LDAPString.
     let mut attrsel = Vec::new();
     for attr in attributes {
         ber_tlv(&mut attrsel, BER_OCTET_STRING, attr);
@@ -1470,7 +1473,9 @@ mod tests {
                 .read_exact(&mut raw[..n])
                 .await
                 .expect("pdu long length");
-            raw[..n].iter().fold(0usize, |acc, &b| (acc << 8) | b as usize)
+            raw[..n]
+                .iter()
+                .fold(0usize, |acc, &b| (acc << 8) | b as usize)
         };
         let mut body = vec![0u8; len];
         stream.read_exact(&mut body).await.expect("pdu body");
@@ -1865,9 +1870,13 @@ mod tests {
     #[test]
     fn ber_reader_rejects_truncated_and_indefinite_length() {
         // A tag that promises two content bytes but supplies none.
-        assert!(BerReader::new(&[BER_OCTET_STRING, 0x02]).read_tlv().is_err());
+        assert!(BerReader::new(&[BER_OCTET_STRING, 0x02])
+            .read_tlv()
+            .is_err());
         // The indefinite form (0x80) is rejected — LDAP is definite-length only.
-        assert!(BerReader::new(&[BER_OCTET_STRING, 0x80]).read_tlv().is_err());
+        assert!(BerReader::new(&[BER_OCTET_STRING, 0x80])
+            .read_tlv()
+            .is_err());
         // A 5-byte long-form length is beyond the 4-byte cap.
         assert!(BerReader::new(&[BER_OCTET_STRING, 0x85, 0, 0, 0, 0, 0])
             .read_tlv()
@@ -1942,7 +1951,10 @@ mod tests {
         // Build a searchResultEntry on the wire, then decode it back through the
         // same path `run_ldap` uses (`read_pdu` → `parse_message` →
         // `parse_search_entry`) and assert the reconstructed LDIF.
-        let op = entry_op(b"uid=jdoe", &[(b"cn", &[b"John"]), (b"mail", &[b"a@x", b"b@x"])]);
+        let op = entry_op(
+            b"uid=jdoe",
+            &[(b"cn", &[b"John"]), (b"mail", &[b"a@x", b"b@x"])],
+        );
         let full = encode_message(4, LDAP_RES_SEARCH_ENTRY, &op);
 
         let mut outer = BerReader::new(&full);
@@ -2007,7 +2019,10 @@ mod tests {
         ctx.io = Some(Box::new(client));
         ctx.sink = Some(Box::new(RecordingSink(received.clone())));
 
-        let done = HANDLER.do_it(&mut ctx).await.expect("do_it drives to completion");
+        let done = HANDLER
+            .do_it(&mut ctx)
+            .await
+            .expect("do_it drives to completion");
         assert!(done);
         assert_eq!(
             *received.lock().unwrap(),
@@ -2146,6 +2161,9 @@ mod tests {
         // `done` performs no teardown of its own (the connection filter chain
         // owns socket lifetime) and reports success.
         let mut ctx = TransferCtx::new();
-        HANDLER.done(&mut ctx, Ok(()), false).await.expect("done ok");
+        HANDLER
+            .done(&mut ctx, Ok(()), false)
+            .await
+            .expect("done ok");
     }
 }
