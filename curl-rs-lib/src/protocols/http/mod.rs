@@ -1634,6 +1634,26 @@ fn resolve_h3_addr(conn: &Connection) -> Result<SocketAddr> {
 /// response-header size ceilings (← `Curl_bump_headersize` + the
 /// `data->info.httpcode`/`contenttype` writes in `Curl_http`).
 fn record_response(ctx: &mut TransferCtx, resp: HttpResp) -> Result<()> {
+    // Response-header COUNT ceiling (← the header-store guard in
+    // `Curl_http_header`, `lib/headers.c`:
+    //   if(Curl_llist_count(&data->state.httphdrs) >= MAX_HTTP_RESP_HEADER_COUNT) {
+    //       failf(data, "Too many response headers, %d is max", ...);
+    //       return CURLE_TOO_LARGE;
+    //   }
+    // curl accepts up to MAX_HTTP_RESP_HEADER_COUNT (5000) stored header lines
+    // and rejects the next one with CURLE_TOO_LARGE. `map_response` records one
+    // `HeaderList` entry per received header line, so the stored count maps
+    // directly onto `headers.count()`. This is version-agnostic on purpose:
+    // curl's guard lives in the generic header handler and so governs HTTP/1,
+    // HTTP/2, and HTTP/3 alike. The message text is byte-for-byte with curl's
+    // `failf` so downstream stderr scrapers keep matching.
+    if resp.headers.count() > MAX_HTTP_RESP_HEADER_COUNT {
+        return Err(Error::with_context(
+            CurlCode::TooLarge,
+            format!("Too many response headers, {MAX_HTTP_RESP_HEADER_COUNT} is max"),
+        ));
+    }
+
     // Diagnostics observed by `curl_easy_getinfo` (CURLINFO_RESPONSE_CODE,
     // CURLINFO_CONTENT_TYPE) and the CLI write-out / xattr paths.
     ctx.info.httpcode = resp.status;
@@ -1706,8 +1726,9 @@ impl Protocol for HttpHandler {
 
             // Build the request and body from the (immutable) request options;
             // owning them ends that borrow before the mutable `conn`/`sink`
-            // borrows below.
-            let req = build_http_request(&ctx.request)?;
+            // borrows below. `req` is mutable so the version-dependent
+            // `Expect: 100-continue` decision (below) can amend the headers.
+            let mut req = build_http_request(&ctx.request)?;
             let body = request_body_bytes(&ctx.request);
 
             // Version is chosen from the connection's negotiated state.
@@ -1720,6 +1741,43 @@ impl Protocol for HttpHandler {
                 })?;
                 select_http_version(conn, &neg)
             };
+
+            // `Expect: 100-continue` announcement (← `addexpect` in `Curl_http`).
+            // Once the wire version is known, decide whether to announce the
+            // expectation. curl only adds it for HTTP/1.1 uploads whose body is
+            // of unknown length or larger than `EXPECT_100_THRESHOLD`, and never
+            // when the caller already supplied an `Expect` header (of any value).
+            // `data->state.disableexpect` is a runtime flag curl raises only
+            // after a 417 retry, so on this first-attempt path it is `false`.
+            // A pre-existing `Expect` header suppresses the auto-add exactly as
+            // curl's `Curl_checkheaders(data, "Expect")` guard does.
+            if version == 11 && req.headers.get("Expect").is_none() {
+                // Mirror `Curl_creader_client_length`: a materialised body has a
+                // known length; an upload with no materialised body is of unknown
+                // length (-1); anything else contributes no body (0).
+                let client_len = match &body {
+                    Some(b) => b.len() as i64,
+                    None if ctx.request.upload => -1,
+                    None => 0,
+                };
+                let mut announce = String::new();
+                let announced = addexpect(
+                    ExpectInput {
+                        upgrade_pending: false,
+                        custom_headers: &[],
+                        disableexpect: false,
+                        httpversion: 11,
+                        client_len,
+                    },
+                    &mut announce,
+                )?;
+                if announced {
+                    // `build_request` forwards `req.headers` to hyper verbatim, so
+                    // adding the field here places `Expect: 100-continue` on the
+                    // wire (matching curl's request head).
+                    req.headers.add("Expect", "100-continue");
+                }
+            }
 
             // Drive the exchange. `conn` and `sink` are disjoint fields of `ctx`,
             // so both can be borrowed mutably at once (the disjoint-field-borrow
@@ -3674,6 +3732,36 @@ mod tests {
         assert_eq!(err.code(), CurlCode::RecvError);
     }
 
+    #[test]
+    fn record_response_enforces_header_count() {
+        // Regression for the response-header COUNT ceiling (QA F3-H1-001).
+        // curl accepts up to MAX_HTTP_RESP_HEADER_COUNT (5000) response headers
+        // and rejects the next one with CURLE_TOO_LARGE (integer 100).
+        // `record_response` is the version-agnostic enforcement point.
+
+        // Exactly the limit is accepted.
+        let mut ctx = TransferCtx::new();
+        let mut resp = HttpResp::make(200, Some("OK"));
+        for i in 0..MAX_HTTP_RESP_HEADER_COUNT {
+            resp.headers.add(format!("X-H-{i}"), "v");
+        }
+        assert_eq!(resp.headers.count(), MAX_HTTP_RESP_HEADER_COUNT);
+        assert!(
+            record_response(&mut ctx, resp).is_ok(),
+            "a response with exactly the header limit must be accepted"
+        );
+
+        // One header over the limit is rejected with CURLE_TOO_LARGE.
+        let mut ctx2 = TransferCtx::new();
+        let mut resp2 = HttpResp::make(200, Some("OK"));
+        for i in 0..=MAX_HTTP_RESP_HEADER_COUNT {
+            resp2.headers.add(format!("X-H-{i}"), "v");
+        }
+        assert_eq!(resp2.headers.count(), MAX_HTTP_RESP_HEADER_COUNT + 1);
+        let err = record_response(&mut ctx2, resp2).unwrap_err();
+        assert_eq!(err.code(), CurlCode::TooLarge);
+    }
+
     // ---- HTTP/2 header transform -----------------------------------------
 
     #[test]
@@ -4437,5 +4525,109 @@ mod tests {
         assert_eq!(collected.lock().expect("sink").as_slice(), b"hello");
         assert_eq!(ctx.info.httpcode, 200);
         assert_eq!(ctx.info.contenttype.as_deref(), Some("text/plain"));
+    }
+
+    // ---- Expect: 100-continue over the do_it exchange -------------------
+
+    /// Drive an HTTP/1.1 `POST` end-to-end through `do_it` over a real
+    /// `FilterChain`, returning the request head the mock server received. The
+    /// server reads the full request (head + `body.len()` bytes) before
+    /// replying, so the client's send always completes — hyper's low-level
+    /// client sends the body without waiting for a `100` (the `expect_continue`
+    /// gate is server-side only), so no announcement can deadlock this exchange.
+    async fn post_and_capture_request_head(body: Vec<u8>) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let body_len = body.len();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let mut data = Vec::new();
+            // Read through the head terminator, then capture the head.
+            let head_end = loop {
+                if let Some(p) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break p + 4;
+                }
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break data.len();
+                }
+                data.extend_from_slice(&buf[..n]);
+            };
+            let head = data[..head_end].to_vec();
+            // Drain the declared body so the client's send completes.
+            while data.len() < head_end + body_len {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buf[..n]);
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = sock.shutdown().await;
+            head
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut chain = FilterChain::new(FIRSTSOCKET);
+        chain.add(Box::new(MockTcpFilter {
+            stream: Some(stream),
+        }));
+        let mut conn = Connection::new(Scheme::new("http", 80), "127.0.0.1", addr.port());
+        conn.cfilter[FIRSTSOCKET] = Some(chain);
+
+        let mut ctx = TransferCtx::new();
+        ctx.request.scheme = "http".to_string();
+        ctx.request.host = "127.0.0.1".to_string();
+        ctx.request.port = addr.port();
+        ctx.request.path = "/upload".to_string();
+        ctx.request.method = "POST".to_string();
+        ctx.request.upload = true;
+        ctx.request.body = Some(body);
+        ctx.conn = Some(Box::new(conn));
+
+        HANDLER.setup_connection(&mut ctx).await.unwrap();
+        let done = HANDLER
+            .do_it(&mut ctx)
+            .await
+            .expect("do_it drives the HTTP/1.1 POST");
+        assert!(done, "HTTP do_it reports the DO phase complete in one step");
+
+        srv.await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn do_it_emits_expect_100_for_large_upload() {
+        // Regression for the Expect: 100-continue wiring (QA F3-H1-002). A POST
+        // whose body exceeds EXPECT_100_THRESHOLD must announce
+        // `Expect: 100-continue` on the wire, matching curl's `addexpect` for
+        // large uploads. Before the fix the header was never emitted.
+        let head =
+            post_and_capture_request_head(vec![b'x'; EXPECT_100_THRESHOLD as usize + 1]).await;
+        let lower = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        assert!(
+            lower.contains("expect: 100-continue"),
+            "large upload must announce Expect: 100-continue; head was:\n{}",
+            String::from_utf8_lossy(&head)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn do_it_omits_expect_100_for_small_upload() {
+        // The complement: a small POST body (below the threshold) must NOT
+        // announce Expect, so small uploads pay no extra round-trip (curl skips
+        // Expect for small PUT/POST — `addexpect`).
+        let head = post_and_capture_request_head(vec![b'x'; 16]).await;
+        let lower = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        assert!(
+            !lower.contains("expect:"),
+            "small upload must NOT announce Expect; head was:\n{}",
+            String::from_utf8_lossy(&head)
+        );
     }
 }

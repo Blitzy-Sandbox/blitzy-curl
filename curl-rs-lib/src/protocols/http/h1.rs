@@ -50,7 +50,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use crate::conn::filters::FilterChain;
 use crate::conn::{Connection, FIRSTSOCKET};
 use crate::error::{CurlCode, Error, Result};
-use crate::protocols::http::{HttpReqData, HttpResp};
+use crate::protocols::http::{HttpReqData, HttpResp, MAX_HTTP_RESP_HEADER_COUNT};
 
 // ===========================================================================
 // Constants (mirroring `lib/http1.h`)
@@ -853,7 +853,20 @@ where
     // Build the request first so malformed input fails before any I/O.
     let hyper_req = build_request(req, http_minor, body, req_keepalive)?;
 
-    let (mut sender, conn) = http1::handshake(io)
+    // Raise hyper's response-header parse ceiling from its default of 100 to
+    // curl's `MAX_HTTP_RESP_HEADER_COUNT` (5000). Without this, a perfectly
+    // ordinary response bearing more than 100 header lines would be rejected by
+    // the parser — far below curl 8.x's documented limit. `max_headers` sizes an
+    // in-parser buffer of `val` slots per response, so we cap it at exactly one
+    // above the curl limit: this lets the parser hand the boundary case (the
+    // 5001st header) up to `record_response`, which maps the overflow to
+    // `CURLE_TOO_LARGE`, matching curl's "accept 5000, reject the 5001st" rule
+    // (← `MAX_HTTP_RESP_HEADER_COUNT`, `lib/http.h`; the header-store guard in
+    // `lib/headers.c`). Kept modest to bound per-response allocation.
+    let mut builder = http1::Builder::new();
+    builder.max_headers(MAX_HTTP_RESP_HEADER_COUNT + 1);
+    let (mut sender, conn) = builder
+        .handshake(io)
         .await
         .map_err(|e| classify_hyper(&e, Phase::Head))?;
     tokio::pin!(conn);
@@ -1552,6 +1565,52 @@ mod tests {
         let c = ci_pos(&captured, "x-charlie").expect("x-charlie present");
         assert!(a < b && b < c, "header order not preserved: {a} {b} {c}");
         assert_eq!(resp.status, 204);
+    }
+
+    #[tokio::test]
+    async fn h1_accepts_response_headers_above_hyper_default() {
+        // Regression for the response-header COUNT ceiling (QA F3-H1-001).
+        // hyper's parser defaults to 100 headers; curl accepts up to
+        // MAX_HTTP_RESP_HEADER_COUNT (5000). A response with 200 header lines —
+        // ordinary yet above hyper's default — must be parsed successfully,
+        // proving `h1_exchange` raised the ceiling. Before the fix this response
+        // was rejected outright.
+        const N: usize = 200;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut sock).await;
+            let mut resp = String::from("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n");
+            for i in 0..N {
+                resp.push_str(&format!("X-H-{i:04}: v\r\n"));
+            }
+            resp.push_str("\r\nOK");
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let reqdata = HttpReqData::make("GET", None, Some("host.test"), Some("/many"));
+        let mut body: Vec<u8> = Vec::new();
+        let (resp, _) = h1_exchange(
+            TokioIo::new(stream),
+            &reqdata,
+            1,
+            RequestBody::Empty,
+            true,
+            |d: &[u8]| -> Result<()> {
+                body.extend_from_slice(d);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        srv.await.unwrap();
+        assert_eq!(resp.status, 200);
+        // The last custom header (well past the old 100 limit) was retained.
+        assert_eq!(resp.headers.get("x-h-0199"), Some("v"));
+        assert_eq!(body, b"OK");
     }
 
     // ---- Phase 2: perform() end-to-end over a real FilterChain ----------
