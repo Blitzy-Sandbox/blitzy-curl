@@ -1269,8 +1269,16 @@ impl FtpConn {
 
         if ftpcode == 234 || ftpcode == 334 {
             // Bring up TLS on the control channel (blocking, as in curl).
+            //
+            // ← `Curl_ssl_cfilter_add(data, conn, FIRSTSOCKET)`: splice a TLS
+            //   filter onto the head of the (already-connected, plaintext)
+            //   control chain, then drive the blocking connect below so the
+            //   AUTH TLS handshake actually runs. Setting `ftp_use_control_ssl`
+            //   alone would leave the channel in the clear — the filter is what
+            //   performs the upgrade. Guarded on `is_ssl` so an implicit-FTPS
+            //   chain that already carries TLS is not double-wrapped.
             if !conn.is_ssl(FIRSTSOCKET) {
-                conn.bits.ftp_use_control_ssl = true;
+                crate::conn::connect::ssl_cfilter_add(conn, FIRSTSOCKET)?;
             }
             match conn.connect(FIRSTSOCKET, true).await {
                 Ok(_) => {
@@ -4952,5 +4960,278 @@ mod tests {
         ftpc.domore_pollset_engine(&conn, &mut ps);
         // In FTP_STOP we watch the primary socket for the data-connection event.
         assert_eq!(ps.action_of(11), crate::protocols::CURL_POLL_IN);
+    }
+
+    // =======================================================================
+    // F4-FTP-001: explicit FTPS `AUTH TLS` control-channel upgrade (RFC 4217).
+    //
+    // Regression coverage for the real defect: `auth_resp` used to flip
+    // `ftp_use_control_ssl` to true on a `234` *without ever installing a TLS
+    // filter*, so the "encrypted" control channel actually stayed in the clear
+    // and `is_ssl(FIRSTSOCKET)` remained false. The fix splices a genuine
+    // `rustls` filter via `ssl_cfilter_add` and performs a blocking handshake.
+    //
+    // This test drives the real login FSM (220 -> AUTH TLS -> 234 -> handshake
+    // -> USER/PASS/PBSZ 0/PROT P/PWD) against an in-process server whose control
+    // socket is a real `tokio_rustls` acceptor using an ephemeral `rcgen`
+    // certificate that the client trusts as a private CA (validation stays ON).
+    // If the handshake did not actually occur, the acceptor would never see a
+    // ClientHello and the post-`234` dialogue could not complete — so a green
+    // result is proof the control channel is genuinely encrypted end to end.
+    // =======================================================================
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Installs the process-default aws-lc-rs crypto provider (idempotent).
+    fn ftps_ensure_provider() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
+    /// An ephemeral self-signed `localhost` server config plus its certificate
+    /// in PEM, so the client can trust it as a private CA (cert validation on).
+    fn ftps_make_server_config() -> (Arc<rustls::ServerConfig>, Vec<u8>) {
+        ftps_ensure_provider();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("rcgen self-signed generation");
+        let ca_pem = certified.cert.pem().into_bytes();
+        let cert_der = certified.cert.der().clone();
+        let key_der = rustls_pki_types::PrivateKeyDer::Pkcs8(
+            rustls_pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()),
+        );
+        let cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("server config builds");
+        (Arc::new(cfg), ca_pem)
+    }
+
+    /// Reads one CRLF-terminated line, byte-by-byte, so no bytes past the line
+    /// (e.g. a following TLS ClientHello on the plaintext leg) are consumed.
+    /// Returns the line without its trailing CRLF, or `None` at EOF.
+    async fn ftps_read_crlf_line<R>(r: &mut R) -> Option<String>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match r.read(&mut byte).await {
+                Ok(0) | Err(_) => {
+                    return if line.is_empty() {
+                        None
+                    } else {
+                        Some(String::from_utf8_lossy(&line).into_owned())
+                    };
+                }
+                Ok(_) => {
+                    line.push(byte[0]);
+                    if line.ends_with(b"\r\n") {
+                        line.truncate(line.len() - 2);
+                        return Some(String::from_utf8_lossy(&line).into_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    /// The control-channel transport leaf: bridges the FTP filter chain to one
+    /// half of an in-memory duplex whose other half is owned by the in-process
+    /// FTPS server. The SSL filter added by `ssl_cfilter_add` sits *above* this
+    /// leaf and drives its ciphertext through it via `send_next`/`recv_next` —
+    /// exactly as the real socket filter sits beneath TLS in production.
+    struct FtpsBridgeLeaf {
+        stream: tokio::io::DuplexStream,
+        fd: i32,
+    }
+
+    impl ConnectionFilter for FtpsBridgeLeaf {
+        fn name(&self) -> &'static str {
+            "FTPS-BRIDGE-TEST"
+        }
+        fn cf_type(&self) -> CfType {
+            CfType::IP_CONNECT
+        }
+        fn connect<'a>(
+            &'a mut self,
+            _cx: &'a mut FilterCtx<'_>,
+            _blocking: bool,
+        ) -> CfFuture<'a, Result<bool>> {
+            // The in-memory duplex needs no dial — connected on creation.
+            Box::pin(async { Ok(true) })
+        }
+        fn send<'a>(
+            &'a mut self,
+            _cx: &'a mut FilterCtx<'_>,
+            buf: &'a [u8],
+            _eos: bool,
+        ) -> CfFuture<'a, Result<usize>> {
+            Box::pin(async move { self.stream.write(buf).await.map_err(|_| Error::Send) })
+        }
+        fn recv<'a>(
+            &'a mut self,
+            _cx: &'a mut FilterCtx<'_>,
+            buf: &'a mut [u8],
+        ) -> CfFuture<'a, Result<usize>> {
+            Box::pin(async move { self.stream.read(buf).await.map_err(|_| Error::Recv) })
+        }
+        fn data_pending(&self, _cx: &QueryCtx<'_>) -> bool {
+            false
+        }
+        fn query(&self, _cx: &QueryCtx<'_>, query: CfQuery, out: &mut QueryOut) -> Result<()> {
+            match query {
+                CfQuery::Socket => {
+                    *out = QueryOut::Socket(self.fd);
+                    Ok(())
+                }
+                CfQuery::Transport => {
+                    *out = QueryOut::Transport(Transport::Tcp);
+                    Ok(())
+                }
+                _ => Err(Error::Code(CurlCode::UnknownOption)),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ftps_auth_tls_upgrades_control_channel() {
+        let (server_cfg, ca_pem) = ftps_make_server_config();
+        let (client_half, mut server_half) = tokio::io::duplex(64 * 1024);
+
+        // In-process FTPS server: plaintext 220 + AUTH-TLS handshake, then the
+        // encrypted login dialogue. Returns every command line it received
+        // (index 0 is the plaintext `AUTH TLS`; the rest arrive over TLS).
+        let server = tokio::spawn(async move {
+            let mut commands: Vec<String> = Vec::new();
+
+            server_half
+                .write_all(b"220 blitzy FTPS server ready\r\n")
+                .await
+                .expect("write 220");
+            server_half.flush().await.expect("flush 220");
+
+            // Exactly one plaintext command — must be `AUTH TLS`.
+            let auth = ftps_read_crlf_line(&mut server_half)
+                .await
+                .expect("AUTH command line");
+            commands.push(auth);
+            server_half
+                .write_all(b"234 AUTH TLS OK; initializing TLS\r\n")
+                .await
+                .expect("write 234");
+            server_half.flush().await.expect("flush 234");
+
+            // The control channel goes TLS from here (the client hand-shakes).
+            let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
+            let mut tls = acceptor
+                .accept(server_half)
+                .await
+                .expect("server TLS accept (client must have hand-shaken)");
+
+            // Encrypted login dialogue.
+            let user = ftps_read_crlf_line(&mut tls).await.expect("USER");
+            commands.push(user);
+            tls.write_all(b"331 Password required\r\n")
+                .await
+                .expect("331");
+            tls.flush().await.expect("flush 331");
+
+            let pass = ftps_read_crlf_line(&mut tls).await.expect("PASS");
+            commands.push(pass);
+            tls.write_all(b"230 User logged in\r\n").await.expect("230");
+            tls.flush().await.expect("flush 230");
+
+            let pbsz = ftps_read_crlf_line(&mut tls).await.expect("PBSZ");
+            commands.push(pbsz);
+            tls.write_all(b"200 PBSZ=0\r\n").await.expect("200 pbsz");
+            tls.flush().await.expect("flush pbsz");
+
+            let prot = ftps_read_crlf_line(&mut tls).await.expect("PROT");
+            commands.push(prot);
+            tls.write_all(b"200 Protection level set to Private\r\n")
+                .await
+                .expect("200 prot");
+            tls.flush().await.expect("flush prot");
+
+            // Absolute path -> the FSM skips SYST and parks at FTP_STOP.
+            let pwd = ftps_read_crlf_line(&mut tls).await.expect("PWD");
+            commands.push(pwd);
+            tls.write_all(b"257 \"/\" is the current directory\r\n")
+                .await
+                .expect("257");
+            tls.flush().await.expect("flush 257");
+
+            commands
+        });
+
+        // Client: a plaintext control chain whose single leaf is the duplex
+        // bridge; the login FSM must upgrade it to TLS on the 234.
+        let mut conn = Connection::new(Scheme::new("ftp", 21), "localhost", 21);
+        let mut chain = FilterChain::new(FIRSTSOCKET);
+        chain.add(Box::new(FtpsBridgeLeaf {
+            stream: client_half,
+            fd: 42,
+        }));
+        conn.cfilter[FIRSTSOCKET] = Some(chain);
+        conn.user = Some("u".into());
+        conn.passwd = Some("p".into());
+        // Trust the server's ephemeral cert as a private CA (validation ON).
+        conn.ssl_config = Arc::new(
+            crate::tls::TlsConfig::default()
+                .with_webpki_roots(false)
+                .with_ca_info_blob(ca_pem),
+        );
+
+        // Explicit FTPS: CURLUSESSL_ALL + CURLFTPAUTH_TLS.
+        let mut ftpc = FtpConn::new();
+        ftpc.begin_transfer(
+            Ftp::default(),
+            FtpParams {
+                ftpsslauth: ftpsslauth::TLS,
+                ..FtpParams::default()
+            },
+        );
+        ftpc.use_ssl = usessl::ALL;
+
+        let done = ftpc
+            .run_connect(&mut conn)
+            .await
+            .expect("FTPS AUTH TLS connect must succeed");
+        assert!(done, "connect phase should reach FTP_STOP");
+
+        // The control channel is genuinely TLS now (the fix's whole point).
+        assert!(
+            conn.is_ssl(FIRSTSOCKET),
+            "control channel must be upgraded to TLS after AUTH TLS + 234"
+        );
+        assert!(
+            conn.bits.ftp_use_control_ssl,
+            "ftp_use_control_ssl must be set after the upgrade"
+        );
+        assert!(
+            conn.bits.ftp_use_data_ssl,
+            "PROT P must enable data-channel protection under CURLUSESSL_ALL"
+        );
+
+        let commands = server.await.expect("server task joins");
+        assert_eq!(
+            commands.first().map(String::as_str),
+            Some("AUTH TLS"),
+            "first (plaintext) control command must be AUTH TLS"
+        );
+        assert!(
+            commands.iter().any(|c| c == "USER u"),
+            "USER must be sent over the upgraded channel; got {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c == "PASS p"),
+            "PASS must be sent over the upgraded channel; got {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c == "PBSZ 0"),
+            "PBSZ 0 must be sent over TLS; got {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c == "PROT P"),
+            "PROT P must be sent over TLS; got {commands:?}"
+        );
     }
 }

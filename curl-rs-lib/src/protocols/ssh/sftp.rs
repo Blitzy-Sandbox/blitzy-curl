@@ -114,17 +114,20 @@ struct RequestConfig {
 impl RequestConfig {
     /// Resolve the request configuration for `session`.
     ///
-    /// The transfer-critical fields (`upload`, `resume_from`, `use_range`,
-    /// `range`, `infilesize`, `no_body`, `get_filetime`, `list_only`) are read
-    /// from the per-transfer [`SshRequest`](super::SshRequest) the handler
-    /// populated from [`crate::protocols::TransferRequest`] (and the set-only
-    /// options the setopt layer drives directly) before the DO phase (← curl
-    /// reading `data->state.*` / `data->set.*` / `data->req.*` off the easy
-    /// handle). The remaining set-only options the engine does not carry
-    /// (`remote_append`, `ftp_create_missing_dirs`, and the create-mode bits)
-    /// keep curl's documented defaults — the same defaults curl applies when the
-    /// corresponding `CURLOPT_*` is unset (`--append` off, no directory
-    /// creation, `0755`/`0644` modes).
+    /// The transfer-critical and set-only fields carried on the per-transfer
+    /// [`SshRequest`](super::SshRequest) (`upload`, `resume_from`, `use_range`,
+    /// `range`, `infilesize`, `no_body`, `get_filetime`, `list_only`, and
+    /// `create_missing_dirs`) are read from the request the handler populated
+    /// from [`crate::protocols::TransferRequest`] (and the set-only options the
+    /// setopt layer drives directly) before the DO phase (← curl reading
+    /// `data->state.*` / `data->set.*` / `data->req.*` off the easy handle).
+    /// `create_missing_dirs` mirrors `data->set.ftp_create_missing_dirs`
+    /// (`CURLOPT_FTP_CREATE_MISSING_DIRS`): when set, a failed upload open walks
+    /// and creates the path prefixes (the `SSH_SFTP_CREATE_DIRS_*` states). The
+    /// remaining set-only options the engine does not carry (`remote_append` and
+    /// the create-mode bits) keep curl's documented defaults — the same defaults
+    /// curl applies when the corresponding `CURLOPT_*` is unset (`--append` off,
+    /// `0755`/`0644` modes).
     fn resolve(session: &SshSession) -> Self {
         let req = &session.req;
         RequestConfig {
@@ -136,7 +139,7 @@ impl RequestConfig {
             resume_from: req.resume_from,
             use_range: req.use_range,
             range: req.range.clone(),
-            create_missing_dirs: false,
+            create_missing_dirs: req.create_missing_dirs,
             infilesize: req.infilesize,
             new_directory_perms: 0o755,
             new_file_perms: 0o644,

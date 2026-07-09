@@ -74,6 +74,20 @@ struct ServerState {
     mtime: u32,
     /// The directory entries the server returns from `readdir`.
     entries: Vec<String>,
+    /// Directories the server has created via SFTP `mkdir`, in issue order.
+    /// Populated by [`SftpTestServer::mkdir`] so a test can assert the client
+    /// walked the `SSH_SFTP_CREATE_DIRS_*` states and issued the right prefixes.
+    created_dirs: Vec<String>,
+    /// When set, [`SftpTestServer::open`] fails with `NO_SUCH_FILE` until the
+    /// target's parent directory has been created via `mkdir`, so an upload to a
+    /// nested path must first create the missing tree (create-missing-dirs).
+    /// Off by default, so the existing root-level upload/download tests keep
+    /// their unconditional-success behavior.
+    enforce_parent_dirs: bool,
+    /// When set, every authentication attempt is rejected so the client
+    /// exhausts each mechanism and fails with `CURLE_LOGIN_DENIED` (67),
+    /// exercising the negative auth path without hanging.
+    reject_auth: bool,
 }
 
 type SharedState = Arc<Mutex<ServerState>>;
@@ -231,6 +245,46 @@ fn password_setup(scheme: SshScheme) -> SshSetup {
     }
 }
 
+/// A public-key SSH setup pointing at the in-process test server. The server
+/// accepts any offered key, so the fixed [`SERVER_KEY`] doubles as the client's
+/// private key: it is written to a throwaway file whose path is handed to the
+/// private-key option (← `STRING_SSH_PRIVATE_KEY`). Password / agent / GSSAPI /
+/// keyboard-interactive are disabled so only the public-key path
+/// ([`SshSession::auth_publickey`](super::SshSession)) is exercised.
+///
+/// The returned [`tempfile::NamedTempFile`] guard MUST be kept alive by the
+/// caller for the whole connection: `auth_publickey` reads the key file lazily
+/// during the handshake, so dropping the guard early would delete the file
+/// before it is read.
+fn key_setup(scheme: SshScheme) -> (SshSetup, tempfile::NamedTempFile) {
+    use std::io::Write as _;
+    let mut keyfile = tempfile::NamedTempFile::new().expect("create temp SSH key file");
+    keyfile
+        .write_all(SERVER_KEY.as_bytes())
+        .expect("write temp SSH key file");
+    keyfile.flush().expect("flush temp SSH key file");
+    let setup = SshSetup {
+        scheme: Some(scheme),
+        host: "127.0.0.1".to_string(),
+        port: super::PORT_SSH,
+        user: Some("tester".to_string()),
+        // No password: the private key file is the only credential offered, so
+        // success proves the public-key mechanism completed on its own.
+        password: None,
+        private_key: Some(keyfile.path().to_path_buf()),
+        insecure: true,
+        auth_types: SshAuthTypes {
+            publickey: true,
+            password: false,
+            gssapi: false,
+            keyboard: false,
+            agent: false,
+        },
+        ..SshSetup::default()
+    };
+    (setup, keyfile)
+}
+
 // ===========================================================================
 // A capturing client write sink (← the `CLIENTWRITE_BODY` callback).
 // ===========================================================================
@@ -290,6 +344,31 @@ impl russh::server::Handler for TestSshServer {
         _user: &str,
         _password: &str,
     ) -> std::result::Result<russh::server::Auth, Self::Error> {
+        if self.state.lock().unwrap().reject_auth {
+            return Ok(russh::server::Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            });
+        }
+        Ok(russh::server::Auth::Accept)
+    }
+
+    /// Accept any offered public key (the signature russh already verified
+    /// against the offered key proves possession of the matching private key),
+    /// unless the test asked for every method to be rejected. This is what lets
+    /// the key-based auth path (`SshSession::auth_publickey`) be driven to
+    /// success in-process.
+    async fn auth_publickey(
+        &mut self,
+        _user: &str,
+        _public_key: &russh::keys::ssh_key::PublicKey,
+    ) -> std::result::Result<russh::server::Auth, Self::Error> {
+        if self.state.lock().unwrap().reject_auth {
+            return Ok(russh::server::Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            });
+        }
         Ok(russh::server::Auth::Accept)
     }
 
@@ -380,6 +459,23 @@ fn spawn_server(server_half: tokio::io::DuplexStream, state: SharedState) {
 // The server-side SFTP handler (← the `russh_sftp::server` example template).
 // ===========================================================================
 
+/// The parent directory of an absolute remote path, or `None` when the path
+/// has no directory component below the root. For `/newdir/upload.txt` this is
+/// `Some("/newdir")`; for `/upload.txt` it is `None` (the parent is the root).
+/// This mirrors the prefixes curl's `SSH_SFTP_CREATE_DIRS` walk issues via
+/// `mkdir`, so [`SftpTestServer::open`] can gate a nested upload on its parent
+/// having been created first while never gating a root-level target.
+#[cfg(feature = "sftp")]
+fn parent_dir(path: &str) -> Option<String> {
+    let idx = path.rfind('/')?;
+    let parent = &path[..idx];
+    if parent.is_empty() {
+        None
+    } else {
+        Some(parent.to_string())
+    }
+}
+
 #[cfg(feature = "sftp")]
 struct SftpTestServer {
     state: SharedState,
@@ -445,6 +541,23 @@ impl russh_sftp::server::Handler for SftpTestServer {
         _pflags: russh_sftp::protocol::OpenFlags,
         _attrs: russh_sftp::protocol::FileAttributes,
     ) -> std::result::Result<russh_sftp::protocol::Handle, Self::Error> {
+        // Create-missing-dirs gate: when `enforce_parent_dirs` is set, refuse to
+        // open a file whose parent directory has not yet been created via
+        // `mkdir`. This forces an upload to a nested path through the
+        // `SSH_SFTP_CREATE_DIRS_*` states (mkdir each prefix, then retry the
+        // open), exactly as `CURLOPT_FTP_CREATE_MISSING_DIRS` demands. Off by
+        // default, so the root-level upload/download tests keep their
+        // unconditional-success behavior.
+        {
+            let g = self.state.lock().unwrap();
+            if g.enforce_parent_dirs {
+                if let Some(parent) = parent_dir(&filename) {
+                    if !g.created_dirs.iter().any(|d| d == &parent) {
+                        return Err(russh_sftp::protocol::StatusCode::NoSuchFile);
+                    }
+                }
+            }
+        }
         // Use the path as the opaque handle; the client echoes it back.
         Ok(russh_sftp::protocol::Handle {
             id,
@@ -522,6 +635,24 @@ impl russh_sftp::server::Handler for SftpTestServer {
             }
             g.uploaded[start..end].copy_from_slice(&data);
         }
+        Ok(russh_sftp::protocol::Status {
+            id,
+            status_code: russh_sftp::protocol::StatusCode::Ok,
+            error_message: "Ok".to_string(),
+            language_tag: "en-US".to_string(),
+        })
+    }
+
+    async fn mkdir(
+        &mut self,
+        id: u32,
+        path: String,
+        _attrs: russh_sftp::protocol::FileAttributes,
+    ) -> std::result::Result<russh_sftp::protocol::Status, Self::Error> {
+        // Record the created directory (in issue order) so a test can assert the
+        // client walked the `SSH_SFTP_CREATE_DIRS_*` states and issued the right
+        // prefix; the gated `open` above then succeeds once the parent exists.
+        self.state.lock().unwrap().created_dirs.push(path);
         Ok(russh_sftp::protocol::Status {
             id,
             status_code: russh_sftp::protocol::StatusCode::Ok,
@@ -795,6 +926,198 @@ async fn sftp_filetime_is_propagated_from_stat() {
 
     assert_eq!(engine.filetime, Some(i64::from(MTIME)));
     assert_eq!(captured.lock().unwrap().as_slice(), BODY);
+}
+
+// ---------------------------------------------------------------------------
+// F4-SSH-001: runtime coverage for the four SSH behaviours the QA report found
+// untested — (a) public-key auth success, (b) create-missing-directories on
+// upload, (c) host-key mismatch rejection, (d) prompt auth-failure without a
+// hang. Each drives the real client engine over the in-process russh server.
+// ---------------------------------------------------------------------------
+
+/// F4-SSH-001(a): the public-key authentication path succeeds end to end and a
+/// download completes over it. Only a private-key file is configured (no
+/// password), so reaching `SSH_STOP` with the body captured proves
+/// [`SshSession::auth_publickey`](super::SshSession) drove the key mechanism to
+/// success — the transport being the counted filter chain throughout.
+#[cfg(feature = "sftp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sftp_public_key_auth_succeeds_and_downloads() {
+    const BODY: &[u8] = b"authenticated by public key\n";
+
+    let state: SharedState = Arc::new(Mutex::new(ServerState {
+        download: BODY.to_vec(),
+        mtime: 1_700_000_000,
+        ..ServerState::default()
+    }));
+
+    let (filter_half, server_half) = tokio::io::duplex(1 << 20);
+    spawn_server(server_half, Arc::clone(&state));
+
+    let counters = Counters::new();
+    let conn = conn_over_filter("sftp", filter_half, &counters);
+
+    // Key-only credentials: the private-key file is the sole secret offered.
+    let (setup, _keyfile) = key_setup(SshScheme::Sftp);
+    let mut engine = SshSession::new(setup);
+    engine.proto.path = "/keyed.txt".to_string();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mut ctx = TransferCtx::new();
+    ctx.conn = Some(Box::new(conn));
+    ctx.proto_state = Some(Box::new(engine));
+    ctx.sink = Some(Box::new(VecSink(Arc::clone(&captured))));
+
+    let done = super::SFTP_HANDLER
+        .do_it(&mut ctx)
+        .await
+        .expect("SFTP download over public-key auth");
+    assert!(done, "SFTP DO phase should reach SSH_STOP under key auth");
+
+    assert_eq!(captured.lock().unwrap().as_slice(), BODY);
+    assert!(
+        counters.sent.load(Ordering::SeqCst) > 0,
+        "no bytes sent through the filter chain"
+    );
+    assert!(
+        counters.recvd.load(Ordering::SeqCst) > 0,
+        "no bytes received through the filter chain"
+    );
+}
+
+/// F4-SSH-001(b): with create-missing-directories enabled, an upload to a
+/// nested path whose parent does not yet exist walks the
+/// `SSH_SFTP_CREATE_DIRS_*` states — `mkdir` the missing prefix, then retry the
+/// open — instead of failing. The server rejects the first open (`enforce_
+/// parent_dirs`), records the `mkdir`, and lets the retry succeed. Because
+/// `create_missing_dirs` is a set-only option the shared `TransferRequest` does
+/// not carry (like `get_filetime`), it is set on the engine request directly
+/// and the session is driven via `run_over_chain` rather than the `do_it`
+/// projection (which always defaults the flag off). This is the behavioural
+/// proof for the `create_missing_dirs` wiring fix in `sftp.rs`.
+#[cfg(feature = "sftp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sftp_upload_creates_missing_directories() {
+    const PAYLOAD: &[u8] = b"payload written into a freshly created directory\n";
+
+    let state: SharedState = Arc::new(Mutex::new(ServerState {
+        enforce_parent_dirs: true,
+        ..ServerState::default()
+    }));
+
+    let (filter_half, server_half) = tokio::io::duplex(1 << 20);
+    spawn_server(server_half, Arc::clone(&state));
+
+    let counters = Counters::new();
+    let mut conn = conn_over_filter("sftp", filter_half, &counters);
+
+    let mut engine = SshSession::new(password_setup(SshScheme::Sftp));
+    engine.proto.path = "/newdir/nested.txt".to_string();
+    // Upload payload + the set-only create-missing-dirs option, set exactly
+    // where the setopt layer drives them onto the engine.
+    engine.req.upload = true;
+    engine.req.infilesize = PAYLOAD.len() as i64;
+    engine.req.create_missing_dirs = true;
+    engine.upload = Some(PAYLOAD.to_vec());
+
+    let chain = conn.cfilter[FIRSTSOCKET].as_mut().unwrap();
+    engine
+        .run_over_chain(chain)
+        .await
+        .expect("SFTP create-missing-dirs upload run over chain");
+
+    // The nested upload must have created the missing parent and then written
+    // the whole payload into it.
+    assert_eq!(
+        state.lock().unwrap().created_dirs,
+        vec!["/newdir".to_string()],
+        "client did not mkdir the missing parent directory"
+    );
+    assert_eq!(
+        state.lock().unwrap().uploaded.as_slice(),
+        PAYLOAD,
+        "payload not written after directory creation"
+    );
+    assert!(counters.sent.load(Ordering::SeqCst) > 0);
+}
+
+/// F4-SSH-001(c): a pinned SHA-256 host-key fingerprint that does not match the
+/// key the server presents aborts the handshake with
+/// [`CurlCode::PeerFailedVerification`] (60) — curl's `CURLE_PEER_FAILED_
+/// VERIFICATION`. Verification is on (`insecure = false`) and the pin is
+/// deliberately wrong, so `check_server_key` rejects and `connect` surfaces 60
+/// before any transfer.
+#[cfg(feature = "sftp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sftp_host_key_mismatch_is_rejected() {
+    let state: SharedState = Arc::new(Mutex::new(ServerState::default()));
+
+    let (filter_half, server_half) = tokio::io::duplex(1 << 20);
+    spawn_server(server_half, Arc::clone(&state));
+
+    let counters = Counters::new();
+    let mut conn = conn_over_filter("sftp", filter_half, &counters);
+
+    // Verification ON, with a pin that cannot match the server's real key.
+    let setup = SshSetup {
+        insecure: false,
+        host_pubkey_sha256: Some("SHA256:0000000000000000000000000000000000000000000".to_string()),
+        ..password_setup(SshScheme::Sftp)
+    };
+    let mut engine = SshSession::new(setup);
+    engine.proto.path = "/whatever.txt".to_string();
+
+    let chain = conn.cfilter[FIRSTSOCKET].as_mut().unwrap();
+    let err = engine
+        .run_over_chain(chain)
+        .await
+        .expect_err("host-key mismatch must fail the connection");
+    assert_eq!(
+        err.code(),
+        CurlCode::PeerFailedVerification,
+        "expected CURLE_PEER_FAILED_VERIFICATION (60), got {:?}",
+        err.code()
+    );
+}
+
+/// F4-SSH-001(d): when every authentication mechanism is refused, the client
+/// exhausts its methods and fails **promptly** with [`CurlCode::LoginDenied`]
+/// (67) — curl's `CURLE_LOGIN_DENIED` — rather than hanging. The whole run is
+/// wrapped in a [`tokio::time::timeout`] so a regression that blocks on auth
+/// would fail the test instead of stalling it.
+#[cfg(feature = "sftp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sftp_auth_failure_fails_fast_without_hanging() {
+    let state: SharedState = Arc::new(Mutex::new(ServerState {
+        // The server denies every auth attempt (as if the credentials were
+        // wrong), so the client must give up rather than retry forever.
+        reject_auth: true,
+        ..ServerState::default()
+    }));
+
+    let (filter_half, server_half) = tokio::io::duplex(1 << 20);
+    spawn_server(server_half, Arc::clone(&state));
+
+    let counters = Counters::new();
+    let mut conn = conn_over_filter("sftp", filter_half, &counters);
+
+    let mut engine = SshSession::new(password_setup(SshScheme::Sftp));
+    engine.proto.path = "/denied.txt".to_string();
+
+    let chain = conn.cfilter[FIRSTSOCKET].as_mut().unwrap();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        engine.run_over_chain(chain),
+    )
+    .await
+    .expect("auth failure must resolve promptly, not hang");
+    let err = outcome.expect_err("rejected authentication must fail the connection");
+    assert_eq!(
+        err.code(),
+        CurlCode::LoginDenied,
+        "expected CURLE_LOGIN_DENIED (67), got {:?}",
+        err.code()
+    );
 }
 
 // ===========================================================================

@@ -493,11 +493,20 @@ impl ConnectionFilter for SslFilter {
             let mut ibuf = vec![0u8; SSL_PUMP_BUF];
 
             let stream = loop {
-                // Push whatever ciphertext rustls has produced down the chain.
+                // Advance the handshake as far as it can go without more input.
+                // This is what makes rustls *produce* its next outbound flight
+                // (e.g. the ClientHello on the first pass), so it MUST run before
+                // the drain below — otherwise the freshly produced ciphertext
+                // would sit unflushed in `bridge` while we block on `recv_next`,
+                // deadlocking the very first flight (the peer never receives the
+                // ClientHello, so it never replies).
+                let ready = poll_once(handshake.as_mut()).await;
+
+                // Flush whatever ciphertext that poll produced down the chain
+                // *before* we either finish or block waiting on the peer.
                 drain_outbound(cx, &mut bridge, &mut obuf).await?;
 
-                // Advance the handshake as far as it can go without more input.
-                if let Some(res) = poll_once(handshake.as_mut()).await {
+                if let Some(res) = ready {
                     break res?;
                 }
 
@@ -514,8 +523,8 @@ impl ConnectionFilter for SslFilter {
                     .map_err(|e| Error::tls(format!("TLS bridge write failed: {e}")))?;
             };
 
-            // Flush the client's final flight, buffered during the last poll.
-            drain_outbound(cx, &mut bridge, &mut obuf).await?;
+            // The client's final flight (produced by the last poll) was already
+            // flushed by the in-loop `drain_outbound` that runs after every poll.
 
             tracing::trace!(target: "curl::cf", filter = "SSL", server = %server_name, "TLS handshake complete");
             self.tls = Some(stream);
@@ -838,6 +847,49 @@ pub fn cf_setup_add(
     };
     let chain = conn.cfilter[sockindex].get_or_insert_with(|| FilterChain::new(sockindex));
     chain.add(Box::new(SetupFilter::new(transport, ssl_mode, flags)));
+    Ok(())
+}
+
+/// Splices a TLS (`SSL`) filter onto the **head** of `conn`'s filter chain at
+/// `sockindex`, so the next [`Connection::connect`] performs a TLS handshake
+/// over the already-established transport (`Curl_ssl_cfilter_add` in
+/// `lib/vtls/vtls.c`).
+///
+/// This is the mechanism behind an explicit TLS *upgrade* of an
+/// already-connected **plaintext** control channel — most notably FTP's `AUTH
+/// TLS` (RFC 4217): the greeting and the `AUTH` command are exchanged in the
+/// clear, the server answers `234`, and only then is the TLS layer added and
+/// driven. curl prepends the new filter with `Curl_conn_cf_add` (the SSL filter
+/// becomes the new chain head), which is exactly what [`FilterChain::add`]
+/// does. Because the transport below is already connected and every filter's
+/// `connect` is idempotent (the socket / happy-eyeballs filters return early
+/// once established, and the `SETUP` meta-filter is a no-op once `Done`), the
+/// subsequent [`Connection::connect`] re-drives the lower chain harmlessly and
+/// runs only the freshly added TLS handshake — after which
+/// [`Connection::is_ssl`] reports the control channel secured.
+///
+/// # Errors
+///
+/// Returns [`Error::bad_argument`] for an out-of-range `sockindex` or when no
+/// filter chain is installed there (there is no established transport to
+/// upgrade), and propagates [`SslFilter::new`]'s TLS-setup errors.
+pub fn ssl_cfilter_add(conn: &mut Connection, sockindex: usize) -> Result<()> {
+    if sockindex >= conn.cfilter.len() {
+        return Err(Error::bad_argument(format!(
+            "ssl_cfilter_add: invalid socket index {sockindex}"
+        )));
+    }
+    // Build the TLS filter from the connection's own TLS config and origin host
+    // name (the SNI / certificate-verification identity) before borrowing the
+    // chain mutably; the immutable borrow of `conn` ends once `ssl` is owned.
+    let ssl = SslFilter::new(&conn.ssl_config, conn.host.name.clone())?;
+    let chain = conn.cfilter[sockindex].as_mut().ok_or_else(|| {
+        Error::bad_argument(format!(
+            "ssl_cfilter_add: no filter chain at socket index {sockindex}"
+        ))
+    })?;
+    // `Curl_conn_cf_add`: prepend the SSL filter as the new chain head.
+    chain.add(Box::new(ssl));
     Ok(())
 }
 

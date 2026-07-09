@@ -869,6 +869,15 @@ pub struct SshRequest {
     /// `CURLOPT_DIRLISTONLY` (← `data->set.list_only`). When unset the listing
     /// is the full server `ls -l`-style longname, matching curl's default.
     pub list_only: bool,
+    /// Whether missing intermediate directories should be created before an
+    /// SFTP upload, i.e. `--ftp-create-dirs` / `CURLOPT_FTP_CREATE_MISSING_DIRS`
+    /// (← `data->set.ftp_create_missing_dirs`). When set, an SFTP upload whose
+    /// open fails with `NO_SUCH_FILE`/`FAILURE` on a multi-segment path walks
+    /// the `/`-separated prefixes issuing `mkdir` for each, then retries the
+    /// open — exactly as curl's `SSH_SFTP_CREATE_DIRS_*` states do. When unset
+    /// the upload fails as soon as a parent directory is missing, matching
+    /// curl's default (the option is off unless the caller enables it).
+    pub create_missing_dirs: bool,
 }
 
 impl SshRequest {
@@ -886,6 +895,7 @@ impl SshRequest {
             infilesize: -1,
             get_filetime: false,
             list_only: false,
+            create_missing_dirs: false,
         }
     }
 }
@@ -2094,14 +2104,16 @@ fn ssh_request_from(req: &crate::protocols::TransferRequest) -> SshRequest {
         use_range: req.range.is_some(),
         range: req.range.clone().unwrap_or_default(),
         infilesize,
-        // `CURLOPT_FILETIME` and `CURLOPT_DIRLISTONLY` are set-only options the
-        // shared `TransferRequest` does not carry; they default to curl's
-        // CURLOPT-unset values here (no filetime probe, full `ls -l` listing).
-        // The setopt layer that owns those options drives them onto the engine
-        // directly, the same way the transfer-critical fields above are the only
-        // request state this generic projection can see.
+        // `CURLOPT_FILETIME`, `CURLOPT_DIRLISTONLY`, and
+        // `CURLOPT_FTP_CREATE_MISSING_DIRS` are set-only options the shared
+        // `TransferRequest` does not carry; they default to curl's CURLOPT-unset
+        // values here (no filetime probe, full `ls -l` listing, and no directory
+        // creation). The setopt layer that owns those options drives them onto
+        // the engine directly, the same way the transfer-critical fields above
+        // are the only request state this generic projection can see.
         get_filetime: false,
         list_only: false,
+        create_missing_dirs: false,
     }
 }
 
