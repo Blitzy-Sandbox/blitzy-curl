@@ -68,14 +68,33 @@ const DIRMODE: u32 = 0o750;
 /// The `diag` parameter carries the `--silent`/`--show-error` gating that curl's `warnf`
 /// reads from the global config (this crate's emitters take it explicitly).
 pub fn tool_create_output_file(diag: Diag, outs: &mut OutStruct, config: &OperationConfig) -> bool {
+    // Delegate to the clobber-mode-parameterized opener so callers that hold only the clobber
+    // policy — notably the live body sink in `operate.rs`, which streams to `per->outs` without
+    // a back-reference to the whole `OperationConfig` — can open the lazily-created output file
+    // through the identical code path.
+    open_output_file(diag, outs, config.file_clobber_mode)
+}
+
+/// Create/open the configured output file honoring an explicit `--clobber`/`--no-clobber`
+/// policy, returning `true` on success. This is the body of curl's `tool_create_output_file`
+/// parameterized by [`ClobberMode`] instead of `&OperationConfig`, so the live transfer sink
+/// (`operate.rs`, curl's `per->outs` open-on-first-write) can open a lazily-created output file
+/// while holding only the clobber policy. [`tool_create_output_file`] is the thin
+/// `&OperationConfig` wrapper retained for the existing callback callers; both share this
+/// single implementation so the clobber and error-message semantics stay byte-identical.
+pub(crate) fn open_output_file(
+    diag: Diag,
+    outs: &mut OutStruct,
+    clobber_mode: ClobberMode,
+) -> bool {
     // curl `DEBUGASSERT`s a present, non-empty filename; without one there is nothing to open.
     let fname = match outs.filename.clone() {
         Some(f) if !f.is_empty() => f,
         _ => return false,
     };
 
-    let opened: io::Result<File> = if config.file_clobber_mode == ClobberMode::Always
-        || (config.file_clobber_mode == ClobberMode::Default && !outs.is_cd_filename)
+    let opened: io::Result<File> = if clobber_mode == ClobberMode::Always
+        || (clobber_mode == ClobberMode::Default && !outs.is_cd_filename)
     {
         // Truncating overwrite (curl's `fopen(fname, "wb")`).
         OpenOptions::new()
@@ -91,7 +110,7 @@ pub fn tool_create_output_file(diag: Diag, outs: &mut OutStruct, config: &Operat
         // CLOBBER_NEVER: on collision, retry with numbered suffixes `fname.1` … `fname.99`,
         // continuing only while the failure is `EEXIST`/`EISDIR` and the limit is not reached
         // (curl's numbered-retry `while` loop).
-        if config.file_clobber_mode == ClobberMode::Never && file.is_err() {
+        if clobber_mode == ClobberMode::Never && file.is_err() {
             let mut next_num = 1;
             while file.is_err() && is_errno(&file, &[libc::EEXIST, libc::EISDIR]) && next_num < 100
             {
@@ -531,5 +550,156 @@ mod tests {
             create_dir_hierarchy(qdiag(), &outfile),
             CurlCode::Ok
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // tool_write_cb — the CURLOPT_WRITEFUNCTION body sink. These drive the raw
+    // C-ABI callback directly (a `WriteData` behind a `*mut c_void`, exactly as
+    // libcurl invokes it) to cover the body-output path wired for QA F8 Issue 1.
+    // sz == 1 per the CURLOPT_WRITEFUNCTION contract, so bytes == nmemb.
+    // -----------------------------------------------------------------------
+
+    /// Invoke `tool_write_cb` with a byte payload and a mutable `WriteData` context.
+    fn call_write_cb(buf: &mut [u8], wd: &mut WriteData) -> usize {
+        // SAFETY: `buf` is a live slice for the call; `wd` is a valid, uniquely-borrowed
+        // WriteData whose `outs`/`config` pointers outlive this invocation — the exact
+        // contract libcurl upholds when it calls the write callback.
+        unsafe {
+            tool_write_cb(
+                buf.as_mut_ptr() as *mut c_char,
+                1,
+                buf.len(),
+                wd as *mut WriteData as *mut c_void,
+            )
+        }
+    }
+
+    #[test]
+    fn write_cb_null_userdata_signals_error() {
+        // A null CURLOPT_WRITEDATA must fail the callback without dereferencing the buffer.
+        let rc = unsafe { tool_write_cb(core::ptr::null_mut(), 1, 4, core::ptr::null_mut()) };
+        assert_eq!(rc, CURL_WRITEFUNC_ERROR);
+    }
+
+    #[test]
+    fn write_cb_out_null_counts_but_discards() {
+        // The discard sink (`--output /dev/null` bit-bucket) consumes the bytes and writes
+        // nothing: it returns the full count yet never opens a stream or advances `bytes`.
+        let mut outs = OutStruct {
+            out_null: true,
+            ..OutStruct::default()
+        };
+        let mut config = OperationConfig::new();
+        let mut wd = WriteData {
+            outs: &mut outs,
+            config: &mut config,
+            isatty: false,
+            diag: qdiag(),
+            curl: core::ptr::null_mut(),
+        };
+        let mut buf = b"discarded".to_vec();
+        let rc = call_write_cb(&mut buf, &mut wd);
+        assert_eq!(rc, buf.len(), "out_null must report all bytes consumed");
+        assert!(!outs.stream.is_open(), "out_null must not open a stream");
+        assert_eq!(outs.bytes, 0, "out_null must not accumulate bytes");
+    }
+
+    #[test]
+    fn write_cb_lazily_opens_file_and_streams_body() {
+        // The normal path: the destination is opened on first write, the payload lands in the
+        // file, and `bytes` advances by the write count (curl returns `nmemb`).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.out");
+        let mut outs = OutStruct {
+            filename: Some(path.to_string_lossy().into_owned()),
+            ..OutStruct::default()
+        };
+        let mut config = OperationConfig::new();
+        config.file_clobber_mode = ClobberMode::Always;
+
+        let mut buf = b"hello body".to_vec();
+        let expected = buf.len();
+        {
+            let mut wd = WriteData {
+                outs: &mut outs,
+                config: &mut config,
+                isatty: false,
+                diag: qdiag(),
+                curl: core::ptr::null_mut(),
+            };
+            let rc = call_write_cb(&mut buf, &mut wd);
+            assert_eq!(rc, expected, "a full write returns nmemb");
+        }
+        assert!(outs.stream.is_open(), "the file must have been opened");
+        assert_eq!(outs.bytes, expected as i64, "bytes must track the write");
+        // Flush the BufWriter and confirm the payload actually reached disk.
+        outs.stream.flush().unwrap();
+        let mut got = String::new();
+        File::open(&path).unwrap().read_to_string(&mut got).unwrap();
+        assert_eq!(got, "hello body");
+    }
+
+    #[test]
+    fn write_cb_refuses_binary_on_terminal() {
+        // curl's guard: binary bytes (a NUL) to a terminal, before 2000 bytes, without
+        // --output-binary, are refused with a synthetic error rather than splattered.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("term.out");
+        let mut outs = OutStruct {
+            filename: Some(path.to_string_lossy().into_owned()),
+            ..OutStruct::default()
+        };
+        let mut config = OperationConfig::new();
+        config.file_clobber_mode = ClobberMode::Always;
+        // Pre-open the sink so the lazy-open is skipped and the binary guard is what fires.
+        assert!(tool_create_output_file(qdiag(), &mut outs, &config));
+
+        let mut buf = vec![b'A', 0u8, b'B'];
+        {
+            let mut wd = WriteData {
+                outs: &mut outs,
+                config: &mut config,
+                isatty: true,
+                diag: qdiag(),
+                curl: core::ptr::null_mut(),
+            };
+            let rc = call_write_cb(&mut buf, &mut wd);
+            assert_eq!(rc, CURL_WRITEFUNC_ERROR, "binary-to-tty must error");
+        }
+        assert!(
+            config.synthetic_error,
+            "the guard must raise the synthetic-error marker"
+        );
+        assert_eq!(outs.bytes, 0, "no bytes are written when the guard fires");
+    }
+
+    #[test]
+    fn write_cb_allows_binary_on_terminal_when_opted_in() {
+        // With `--output-binary` (terminal_binary_ok) the same NUL-bearing payload is written.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("term_ok.out");
+        let mut outs = OutStruct {
+            filename: Some(path.to_string_lossy().into_owned()),
+            ..OutStruct::default()
+        };
+        let mut config = OperationConfig::new();
+        config.file_clobber_mode = ClobberMode::Always;
+        config.terminal_binary_ok = true;
+
+        let mut buf = vec![b'A', 0u8, b'B'];
+        let expected = buf.len();
+        {
+            let mut wd = WriteData {
+                outs: &mut outs,
+                config: &mut config,
+                isatty: true,
+                diag: qdiag(),
+                curl: core::ptr::null_mut(),
+            };
+            let rc = call_write_cb(&mut buf, &mut wd);
+            assert_eq!(rc, expected, "opted-in binary write returns nmemb");
+        }
+        assert!(!config.synthetic_error, "no synthetic error when opted in");
+        assert_eq!(outs.bytes, expected as i64);
     }
 }

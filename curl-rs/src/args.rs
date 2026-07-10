@@ -1354,6 +1354,11 @@ pub struct GlobalConfig {
     /// the requested filename here for `main.rs` to apply once parsing completes. `Some`
     /// with the literal `"-"` requests stdout, matching curl.
     pub stderr_file: Option<String>,
+    /// Optional `<category>` subject captured from `--help [category]`. curl passes this
+    /// directly to `tool_help(category)`; this rewrite defers help rendering until after
+    /// parsing (see `operate.rs`), so the subject is stashed here when `--help` is seen.
+    /// `None` for a bare `--help` (the default, curated help page).
+    pub help_category: Option<String>,
     /// `--config` parser hook (see [`ConfigParserHook`]). `None` until `main.rs` wires
     /// `parsecfg.rs`; when unset, `--config` is accepted but its file is skipped.
     pub config_parser: Option<ConfigParserHook>,
@@ -1415,6 +1420,7 @@ impl GlobalConfig {
             trace_set: false,
             trace_config: Vec::new(),
             stderr_file: None,
+            help_category: None,
             config_parser: None,
             variable_setter: None,
             variable_expander: None,
@@ -1526,19 +1532,23 @@ pub const REDIR_PROTOS: &[&str] = &["http", "https", "ftp", "ftps"];
 // ---------------------------------------------------------------------------
 
 /// Determine the terminal width used to wrap diagnostics, mirroring
-/// `get_terminal_columns` (src/terminal.c): honor `$COLUMNS` when it parses to a
-/// number greater than 20, otherwise fall back to curl's default of 79. (The C
-/// `ioctl(TIOCGWINSZ)` fallback requires `unsafe`/`libc`, which is forbidden in
-/// this module; the `$COLUMNS` path and the 79 default are reproduced exactly.)
+/// Terminal width, in columns, used by [`voutf`] for word-wrapping.
+///
+/// This must match curl's `get_terminal_columns()` (src/terminal.c) exactly so the
+/// wrap column — and therefore the byte-for-byte stderr output that log scrapers
+/// depend on (AAP §0.7.1) — is identical to curl in every environment. curl's
+/// resolution order is: honor `$COLUMNS` (when it parses to a number in the
+/// `(20, 10000]` range), otherwise query `ioctl(TIOCGWINSZ)` on stdin, otherwise
+/// fall back to the fixed default of 79.
+///
+/// Earlier this port omitted the `ioctl` leg (believing it required forbidden
+/// `unsafe`), which made `voutf` wrap at 79 even inside a wide interactive terminal
+/// — diverging from curl, whose `ioctl` reports the true width. The crate now has a
+/// faithful [`crate::terminal::get_terminal_columns`] whose single narrow `unsafe`
+/// `ioctl` call is an AAP-sanctioned OS-integration primitive, so this delegates to
+/// it and reproduces all three legs of curl's algorithm.
 fn terminal_columns() -> usize {
-    if let Ok(colp) = std::env::var("COLUMNS") {
-        if let Ok((num, _)) = str_number(&colp, 10000) {
-            if num > 20 {
-                return num as usize;
-            }
-        }
-    }
-    79
+    crate::terminal::get_terminal_columns() as usize
 }
 
 /// A small `Copy` snapshot of the [`GlobalConfig`] fields that gate diagnostic
@@ -8004,7 +8014,11 @@ pub fn getparameter(
                 nextarg = Some(String::from_utf8_lossy(rest).into_owned());
                 singleopt = true; // do not loop anymore after this
             } else if ad.cmd == Cmd::Help {
-                // `--help`/`-h` is special: signal help regardless of any arg.
+                // `--help`/`-h` is special: signal help regardless of any arg. Capture the
+                // optional `<category>` subject (curl's `tool_help(category)` argument) so the
+                // deferred render site in `operate.rs` can filter by category (← the
+                // `num_args(0..=1)` optional-subject handling; `src/tool_help.c`).
+                global.help_category = nextarg.clone();
                 return Err(ParameterError::HelpRequested);
             } else if nextarg.is_none() {
                 return Err(ParameterError::RequiresParameter);

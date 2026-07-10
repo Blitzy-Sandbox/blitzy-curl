@@ -458,6 +458,7 @@ pub async fn perform<F>(
     addr: SocketAddr,
     req: HttpReqData,
     body: Option<Bytes>,
+    fail_on_error: bool,
     mut write_body: F,
 ) -> Result<HttpResp>
 where
@@ -524,6 +525,14 @@ where
             .map_err(|e| map_h3_stream_error(&host, port, &e, false))?;
         let mut resp = response_head_to_httpresp(&response);
 
+        // `CURLOPT_FAILONERROR` (`-f`): an HTTP error status (>= 400) suppresses
+        // delivery of the response body to the client (curl's `k->ignorebody`),
+        // so `curl -f` prints nothing on a `404`. The status is known here,
+        // before the first DATA chunk; the body is still drained from the stream
+        // (byte counting and clean termination are preserved) but not forwarded
+        // to `write_body`.
+        let suppress_body = fail_on_error && resp.status >= 400;
+
         // Response body: stream each chunk to the write-out path as it arrives.
         loop {
             match stream.recv_data().await {
@@ -531,7 +540,9 @@ where
                     while chunk.has_remaining() {
                         let n = {
                             let piece = chunk.chunk();
-                            write_body(piece)?;
+                            if !suppress_body {
+                                write_body(piece)?;
+                            }
                             piece.len()
                         };
                         received.fetch_add(n as u64, Ordering::Relaxed);
@@ -1084,7 +1095,7 @@ mod tests {
         let mut body = Vec::new();
         let resp = tokio::time::timeout(
             Duration::from_secs(15),
-            perform(&mut conn, addr, req, None, |chunk| {
+            perform(&mut conn, addr, req, None, false, |chunk| {
                 body.extend_from_slice(chunk);
                 Ok(())
             }),
@@ -1114,7 +1125,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(15),
-            perform(&mut conn, addr, req, None, |_chunk| Ok(())),
+            perform(&mut conn, addr, req, None, false, |_chunk| Ok(())),
         )
         .await
         .expect("perform timed out");
@@ -1137,7 +1148,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(15),
-            perform(&mut conn, addr, req, None, |_chunk| Ok(())),
+            perform(&mut conn, addr, req, None, false, |_chunk| Ok(())),
         )
         .await
         .expect("perform timed out");

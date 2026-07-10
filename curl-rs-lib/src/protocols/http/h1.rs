@@ -844,6 +844,7 @@ async fn h1_exchange<S, W>(
     http_minor: i32,
     body: RequestBody,
     req_keepalive: bool,
+    fail_on_error: bool,
     mut write_body: W,
 ) -> Result<(HttpResp, bool)>
 where
@@ -918,6 +919,15 @@ where
     let reusable = response_keep_alive(http_minor, &parts.headers, req_keepalive);
     let mut resp = map_response(&parts);
 
+    // `CURLOPT_FAILONERROR` (`-f`/`--fail`): once the status line reports an HTTP
+    // error (>= 400), curl stops handing the response body to the client
+    // (`k->ignorebody`), which is why `curl -f` on a `404` prints nothing. The
+    // status is known here — before the first body frame is read — so the
+    // write-out is gated from the outset. The body is still drained from the
+    // socket below (so keep-alive accounting is unaffected); only its delivery
+    // to `write_body` is suppressed.
+    let suppress_body = fail_on_error && resp.status >= 400;
+
     // Phase C: stream the body, recording trailers, draining until EOF.
     loop {
         tokio::select! {
@@ -927,7 +937,9 @@ where
                     Some(Ok(fr)) => {
                         if fr.is_data() {
                             if let Ok(data) = fr.into_data() {
-                                write_body(data.as_ref())?;
+                                if !suppress_body {
+                                    write_body(data.as_ref())?;
+                                }
                             }
                         } else if let Ok(trailers) = fr.into_trailers() {
                             for (name, value) in trailers.iter() {
@@ -989,6 +1001,7 @@ pub async fn perform<W>(
     req: HttpReqData,
     http_minor: i32,
     body: RequestBody,
+    fail_on_error: bool,
     write_body: W,
 ) -> Result<HttpResp>
 where
@@ -1022,7 +1035,15 @@ where
         let (hyper_side, bridge_side) = tokio::io::duplex(DUPLEX_BUF_LEN);
         let io = TokioIo::new(hyper_side);
 
-        let exchange = h1_exchange(io, &req, http_minor, body, req_keepalive, write_body);
+        let exchange = h1_exchange(
+            io,
+            &req,
+            http_minor,
+            body,
+            req_keepalive,
+            fail_on_error,
+            write_body,
+        );
         let pump = pump_bridge(chain, bridge_side);
         tokio::pin!(exchange);
         tokio::pin!(pump);
@@ -1428,6 +1449,7 @@ mod tests {
             1,
             RequestBody::Empty,
             true,
+            false,
             |d: &[u8]| -> Result<()> {
                 body.extend_from_slice(d);
                 Ok(())
@@ -1471,6 +1493,7 @@ mod tests {
             1,
             RequestBody::Sized(b"payload!".to_vec()),
             true,
+            false,
             |d: &[u8]| -> Result<()> {
                 body.extend_from_slice(d);
                 Ok(())
@@ -1512,6 +1535,7 @@ mod tests {
             1,
             RequestBody::Empty,
             true,
+            false,
             |d: &[u8]| -> Result<()> {
                 body.extend_from_slice(d);
                 Ok(())
@@ -1551,6 +1575,7 @@ mod tests {
             1,
             RequestBody::Empty,
             true,
+            false,
             |d: &[u8]| -> Result<()> {
                 body.extend_from_slice(d);
                 Ok(())
@@ -1598,6 +1623,7 @@ mod tests {
             1,
             RequestBody::Empty,
             true,
+            false,
             |d: &[u8]| -> Result<()> {
                 body.extend_from_slice(d);
                 Ok(())
@@ -1646,6 +1672,7 @@ mod tests {
             reqdata,
             1,
             RequestBody::Empty,
+            false,
             |d: &[u8]| -> Result<()> {
                 body.extend_from_slice(d);
                 Ok(())

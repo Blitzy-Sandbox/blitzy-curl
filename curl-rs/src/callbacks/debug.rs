@@ -200,12 +200,9 @@ pub unsafe extern "C" fn tool_debug_cb(
         None => return 0,
     };
 
-    // Snapshot the Copy scalar fields up front so the mutable borrow taken below to lazily open
-    // the trace file does not conflict with reading them.
-    let tracetime = global.tracetime;
+    // Snapshot the trace-ids toggle up front (the remaining trace scalars are read inside
+    // [`tool_debug_emit`], which owns the sink resolution and formatting).
     let traceids = global.traceids;
-    let tracetype = global.tracetype;
-    let isatty = global.isatty;
 
     // View the payload as bytes. libcurl passes `size` readable bytes at `data`; a null pointer
     // or zero length yields an empty slice, and `size` is re-derived from the slice so every
@@ -215,21 +212,6 @@ pub unsafe extern "C" fn tool_debug_cb(
         &[]
     } else {
         unsafe { core::slice::from_raw_parts(data as *const u8, size) }
-    };
-    let size = data_slice.len();
-
-    // --- timestamp column (`--trace-time`) -------------------------------------------------
-    // curl: hms_for_sec() + "%s.%06ld " over gettimeofday(); chrono::Local reproduces the same
-    // local "HH:MM:SS.uuuuuu " string, trailing space included.
-    let timebuf: String = if tracetime {
-        let now = Local::now();
-        format!(
-            "{}.{:06} ",
-            now.format("%H:%M:%S"),
-            now.timestamp_subsec_micros()
-        )
-    } else {
-        String::new()
     };
 
     // --- xfer/conn id column (`--trace-ids`) -----------------------------------------------
@@ -269,6 +251,48 @@ pub unsafe extern "C" fn tool_debug_cb(
         String::new()
     };
 
+    tool_debug_emit(global, type_, data_slice, idsbuf.as_str());
+    0
+}
+
+/// Safe core of the `-v`/`--trace` trace formatter — curl's `tool_debug_cb` body minus the
+/// `unsafe` FFI pointer recovery. Renders one trace record (a `CURLINFO_*` category plus its
+/// payload bytes) to the resolved trace sink (`stderr`/`stdout`/the `--trace <file>`), exactly as
+/// curl 8.x does.
+///
+/// Split out so that both the C-ABI [`tool_debug_cb`] (which recovers `global` from
+/// `CURLOPT_DEBUGDATA` and derives `idsbuf` from the live `CURL *`) and the CLI's library-driven
+/// trace drain in `operate.rs` (which already holds `&mut GlobalConfig` after a
+/// [`crate`]-internal `perform_transfer`) share one byte-exact implementation without duplicating
+/// it or crossing the FFI boundary a second time. `idsbuf` is the pre-rendered `--trace-ids`
+/// column (empty when unused); only the FFI path has a handle from which to read
+/// `CURLINFO_XFER_ID`/`CONN_ID`, so the caller supplies it.
+pub(crate) fn tool_debug_emit(
+    global: &mut GlobalConfig,
+    type_: curl_infotype,
+    data_slice: &[u8],
+    idsbuf: &str,
+) {
+    // Snapshot the Copy scalar fields up front so the mutable borrow taken below to lazily open
+    // the trace file does not conflict with reading them.
+    let tracetype = global.tracetype;
+    let isatty = global.isatty;
+    let size = data_slice.len();
+
+    // --- timestamp column (`--trace-time`) -------------------------------------------------
+    // curl: hms_for_sec() + "%s.%06ld " over gettimeofday(); chrono::Local reproduces the same
+    // local "HH:MM:SS.uuuuuu " string, trailing space included.
+    let timebuf: String = if global.tracetime {
+        let now = Local::now();
+        format!(
+            "{}.{:06} ",
+            now.format("%H:%M:%S"),
+            now.timestamp_subsec_micros()
+        )
+    } else {
+        String::new()
+    };
+
     // --- resolve the output sink -----------------------------------------------------------
     // curl's default is tool_stderr; on first use `trace_stream` is opened from `trace_dump`:
     // "-" => stdout, "%" => stderr, else a freshly created file (`trace_fopened = TRUE`).
@@ -293,7 +317,7 @@ pub unsafe extern "C" fn tool_debug_cb(
                     Err(_) => {
                         // curl: warnf("Failed to create/open output") then skip this record.
                         warnf(global.diag(), "Failed to create/open output");
-                        return 0;
+                        return;
                     }
                 }
             }
@@ -320,7 +344,7 @@ pub unsafe extern "C" fn tool_debug_cb(
                     while i < size - 1 {
                         if data_slice[i] == b'\n' {
                             if !newl {
-                                log_line_start(&mut buf, &timebuf, &idsbuf, type_);
+                                log_line_start(&mut buf, &timebuf, idsbuf, type_);
                             }
                             let _ = buf.write_all(&data_slice[st..=i]);
                             st = i + 1;
@@ -331,7 +355,7 @@ pub unsafe extern "C" fn tool_debug_cb(
                     // Tail from the last LF to the end (curl writes data+st, i-st+1 with
                     // i == size-1 here).
                     if !newl {
-                        log_line_start(&mut buf, &timebuf, &idsbuf, type_);
+                        log_line_start(&mut buf, &timebuf, idsbuf, type_);
                     }
                     let _ = buf.write_all(&data_slice[st..size]);
                 }
@@ -340,7 +364,7 @@ pub unsafe extern "C" fn tool_debug_cb(
             }
             curl_infotype::CURLINFO_TEXT | curl_infotype::CURLINFO_HEADER_IN => {
                 if !newl {
-                    log_line_start(&mut buf, &timebuf, &idsbuf, type_);
+                    log_line_start(&mut buf, &timebuf, idsbuf, type_);
                 }
                 let _ = buf.write_all(data_slice);
                 newl = size > 0 && data_slice[size - 1] != b'\n';
@@ -355,7 +379,7 @@ pub unsafe extern "C" fn tool_debug_cb(
                     // shown iff the output is NOT a std stream, or std but not a terminal.
                     if !isatty || !output_is_std {
                         if !newl {
-                            log_line_start(&mut buf, &timebuf, &idsbuf, type_);
+                            log_line_start(&mut buf, &timebuf, idsbuf, type_);
                         }
                         let _ = writeln!(buf, "[{size} bytes data]");
                         newl = false;
@@ -372,7 +396,7 @@ pub unsafe extern "C" fn tool_debug_cb(
         NEWL.with(|c| c.set(newl));
         TRACED_DATA.with(|c| c.set(traced_data));
         write_sink(global, target, &buf);
-        return 0;
+        return;
     }
 
     // --- non-plain (`--trace` / `--trace-ascii`) -------------------------------------------
@@ -387,7 +411,7 @@ pub unsafe extern "C" fn tool_debug_cb(
             dump(
                 &mut buf,
                 &timebuf,
-                &idsbuf,
+                idsbuf,
                 "=> Send header",
                 data_slice,
                 tracetype,
@@ -397,7 +421,7 @@ pub unsafe extern "C" fn tool_debug_cb(
             dump(
                 &mut buf,
                 &timebuf,
-                &idsbuf,
+                idsbuf,
                 "=> Send data",
                 data_slice,
                 tracetype,
@@ -407,7 +431,7 @@ pub unsafe extern "C" fn tool_debug_cb(
             dump(
                 &mut buf,
                 &timebuf,
-                &idsbuf,
+                idsbuf,
                 "<= Recv header",
                 data_slice,
                 tracetype,
@@ -417,7 +441,7 @@ pub unsafe extern "C" fn tool_debug_cb(
             dump(
                 &mut buf,
                 &timebuf,
-                &idsbuf,
+                idsbuf,
                 "<= Recv data",
                 data_slice,
                 tracetype,
@@ -427,7 +451,7 @@ pub unsafe extern "C" fn tool_debug_cb(
             dump(
                 &mut buf,
                 &timebuf,
-                &idsbuf,
+                idsbuf,
                 "<= Recv SSL data",
                 data_slice,
                 tracetype,
@@ -437,7 +461,7 @@ pub unsafe extern "C" fn tool_debug_cb(
             dump(
                 &mut buf,
                 &timebuf,
-                &idsbuf,
+                idsbuf,
                 "=> Send SSL data",
                 data_slice,
                 tracetype,
@@ -447,7 +471,33 @@ pub unsafe extern "C" fn tool_debug_cb(
     }
 
     write_sink(global, target, &buf);
-    0
+}
+
+/// Render a batch of `-v`/`--trace` records captured by the library engine.
+///
+/// curl-rs drives `curl-rs-lib` directly rather than through `CURLOPT_DEBUGFUNCTION`, so a
+/// transfer buffers its trace events (see `Easy::take_debug_log`) and the CLI drains them here
+/// once the transfer returns and the borrow on `global` is free again. Each library
+/// [`DebugInfoType`](curl_rs_lib::protocols::DebugInfoType) maps onto the matching
+/// `curl_infotype`, then [`tool_debug_emit`] renders it byte-for-byte as curl's `tool_debug_cb`
+/// would — so `-v`/`--trace`/`--trace-ascii` output (markers, hex/ascii dump, `--trace <file>`
+/// target, `--trace-time` column) is identical to curl 8.x. The `--trace-ids` column is empty on
+/// this path: it is derived from a live FFI handle, which the direct library drive does not use.
+pub(crate) fn emit_library_trace(
+    global: &mut GlobalConfig,
+    records: Vec<(curl_rs_lib::protocols::DebugInfoType, Vec<u8>)>,
+) {
+    use curl_rs_lib::protocols::DebugInfoType;
+    for (ty, bytes) in records {
+        let type_ = match ty {
+            DebugInfoType::Text => curl_infotype::CURLINFO_TEXT,
+            DebugInfoType::HeaderIn => curl_infotype::CURLINFO_HEADER_IN,
+            DebugInfoType::HeaderOut => curl_infotype::CURLINFO_HEADER_OUT,
+            DebugInfoType::DataIn => curl_infotype::CURLINFO_DATA_IN,
+            DebugInfoType::DataOut => curl_infotype::CURLINFO_DATA_OUT,
+        };
+        tool_debug_emit(global, type_, &bytes, "");
+    }
 }
 
 /// Write the assembled trace bytes to the resolved sink and flush (curl's `fflush(stream)`).
@@ -591,5 +641,184 @@ mod tests {
             out,
             b"09:00:00.000000 [2-1] => Send header, 2 bytes (0x2)\n0000: Hi\n".to_vec()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Emit state-machine tests — `tool_debug_emit` sink resolution + dispatch
+    // and the `emit_library_trace` type mapping. These drive the emitter to a
+    // real `--trace <file>` target (the deterministic, non-`Plain` `Bin`/`Ascii`
+    // formats) so the assembled bytes can be read back and asserted. They cover
+    // the `-v`/`--trace` plumbing added for QA F8 Issue 1 (observability), which
+    // was previously exercised only through the CLI integration harness.
+    // -----------------------------------------------------------------------
+
+    /// A `GlobalConfig` whose trace output is redirected to `path` in the given
+    /// format, so a subsequent read of `path` returns exactly the emitter's bytes.
+    fn cfg_tracing_to(path: &std::path::Path, ty: TraceType) -> GlobalConfig {
+        let mut g = GlobalConfig::new();
+        g.tracetype = ty;
+        g.trace_dump = Some(path.to_str().unwrap().to_string());
+        g
+    }
+
+    #[test]
+    fn tool_debug_emit_bin_hex_dumps_header_out_to_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("trace.bin");
+        let mut g = cfg_tracing_to(&path, TraceType::Bin);
+
+        tool_debug_emit(
+            &mut g,
+            curl_infotype::CURLINFO_HEADER_OUT,
+            b"GET / HTTP/1.1\r\n",
+            "",
+        );
+        let out = std::fs::read(&path).expect("read trace file");
+        let text = String::from_utf8_lossy(&out);
+        // The full (hex + ascii) dump: descriptive header, byte count, hex of 'G'/'E'/'T', ascii.
+        assert!(
+            text.contains("=> Send header, 16 bytes (0x10)"),
+            "got: {text:?}"
+        );
+        assert!(text.contains("47 45 54"), "hex of GET missing: {text:?}");
+        assert!(
+            text.contains("GET / HTTP/1.1"),
+            "ascii column missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn tool_debug_emit_ascii_dumps_data_in_to_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("trace.ascii");
+        let mut g = cfg_tracing_to(&path, TraceType::Ascii);
+
+        tool_debug_emit(&mut g, curl_infotype::CURLINFO_DATA_IN, b"hello", "");
+        let out = std::fs::read(&path).expect("read trace file");
+        let text = String::from_utf8_lossy(&out);
+        // ASCII-only dump: no hex column, just the descriptive header and the payload.
+        assert!(
+            text.contains("<= Recv data, 5 bytes (0x5)"),
+            "got: {text:?}"
+        );
+        assert!(
+            text.contains("0000: hello"),
+            "ascii payload missing: {text:?}"
+        );
+        assert!(
+            !text.contains("68 65 6c 6c 6f"),
+            "ascii mode must not emit hex"
+        );
+    }
+
+    #[test]
+    fn tool_debug_emit_text_writes_star_prefix_verbatim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("trace.text");
+        // TEXT is emitted the same way in every non-Plain format (verbatim after "* ").
+        let mut g = cfg_tracing_to(&path, TraceType::Bin);
+
+        tool_debug_emit(
+            &mut g,
+            curl_infotype::CURLINFO_TEXT,
+            b"Trying 127.0.0.1:80...\n",
+            "",
+        );
+        let out = std::fs::read(&path).expect("read trace file");
+        assert_eq!(out, b"* Trying 127.0.0.1:80...\n".to_vec());
+    }
+
+    #[test]
+    fn emit_library_trace_maps_all_types_and_writes() {
+        use curl_rs_lib::protocols::DebugInfoType;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("trace.lib");
+        let mut g = cfg_tracing_to(&path, TraceType::Bin);
+
+        // One record of each library trace type; emit_library_trace maps each onto its
+        // curl_infotype and renders it via tool_debug_emit.
+        let records = vec![
+            (DebugInfoType::Text, b"Connected\n".to_vec()),
+            (DebugInfoType::HeaderOut, b"GET / HTTP/1.1\r\n".to_vec()),
+            (DebugInfoType::HeaderIn, b"HTTP/1.1 200 OK\r\n".to_vec()),
+            (DebugInfoType::DataOut, b"body-out".to_vec()),
+            (DebugInfoType::DataIn, b"body-in".to_vec()),
+        ];
+        emit_library_trace(&mut g, records);
+
+        let out = std::fs::read(&path).expect("read trace file");
+        let text = String::from_utf8_lossy(&out);
+        // The TEXT record renders with the "* " marker; each dump record carries its
+        // descriptive header, confirming the DebugInfoType → curl_infotype mapping.
+        assert!(text.contains("* Connected"), "TEXT mapping: {text:?}");
+        assert!(
+            text.contains("=> Send header"),
+            "HeaderOut mapping: {text:?}"
+        );
+        assert!(
+            text.contains("<= Recv header"),
+            "HeaderIn mapping: {text:?}"
+        );
+        assert!(text.contains("=> Send data"), "DataOut mapping: {text:?}");
+        assert!(text.contains("<= Recv data"), "DataIn mapping: {text:?}");
+    }
+
+    #[test]
+    fn tool_debug_emit_plain_verbose_uses_line_markers_and_data_note() {
+        // The default `-v` format (`TraceType::Plain`): headers get their one-char line markers
+        // ("< ", "> ") and body records collapse to a single "[N bytes data]" note. Reset the
+        // function-local `newl`/`traced_data` thread-locals so the run starts from curl's initial
+        // `static bool` state regardless of harness thread reuse.
+        NEWL.with(|c| c.set(false));
+        TRACED_DATA.with(|c| c.set(false));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("trace.plain");
+        let mut g = cfg_tracing_to(&path, TraceType::Plain);
+        // isatty=false so the "[N bytes data]" note is emitted (curl shows it unless the same tty
+        // already displays the payload).
+        g.isatty = false;
+
+        tool_debug_emit(
+            &mut g,
+            curl_infotype::CURLINFO_HEADER_IN,
+            b"HTTP/1.1 200 OK\r\n",
+            "",
+        );
+        tool_debug_emit(
+            &mut g,
+            curl_infotype::CURLINFO_HEADER_OUT,
+            b"GET / HTTP/1.1\r\nHost: example\r\n\r\n",
+            "",
+        );
+        tool_debug_emit(&mut g, curl_infotype::CURLINFO_DATA_IN, b"hello", "");
+
+        let out = std::fs::read(&path).expect("read trace file");
+        let text = String::from_utf8_lossy(&out);
+        // Received header → "< " marker, verbatim.
+        assert!(
+            text.contains("< HTTP/1.1 200 OK"),
+            "recv header marker: {text:?}"
+        );
+        // Sent header → "> " marker on each line of the block.
+        assert!(
+            text.contains("> GET / HTTP/1.1"),
+            "send request line: {text:?}"
+        );
+        assert!(
+            text.contains("> Host: example"),
+            "send Host header: {text:?}"
+        );
+        // Body → single "{ [N bytes data]" note (DATA_IN marker "{ ").
+        assert!(text.contains("{ [5 bytes data]"), "data note: {text:?}");
+        // Plain mode must never emit a hex/ascii dump.
+        assert!(
+            !text.contains("0000:"),
+            "plain mode must not hex-dump: {text:?}"
+        );
+
+        // Leave the thread-locals as curl would after these records (defensive reset).
+        NEWL.with(|c| c.set(false));
+        TRACED_DATA.with(|c| c.set(false));
     }
 }

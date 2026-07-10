@@ -6,7 +6,7 @@
 
 ### 1.1 Project Overview
 
-curl-rs is a complete language-level rewrite of the curl C codebase (version 8.19.0-DEV) into idiomatic Rust, producing three crates within a Cargo workspace: **curl-rs-lib** (core library replacing all 179 C source files in `lib/`), **curl-rs** (CLI binary replacing 43 C source files in `src/`), and **curl-rs-ffi** (FFI compatibility layer exposing 100 `curl_*` symbols for libcurl ABI drop-in compatibility). The project eliminates all manual C memory management via Rust ownership semantics, replaces seven C TLS backends with a single rustls implementation, and targets byte-for-byte functional parity with curl 8.x across HTTP/1.1, HTTP/2, HTTP/3, FTP/FTPS, SFTP, SCP, and 15+ additional protocols. The rewrite totals 215,153 lines of Rust across 155 source files with 2,545 Rust-native tests passing (all-features build; 2,273 with default features).
+curl-rs is a complete language-level rewrite of the curl C codebase (version 8.19.0-DEV) into idiomatic Rust, producing three crates within a Cargo workspace: **curl-rs-lib** (core library replacing all 179 C source files in `lib/`), **curl-rs** (CLI binary replacing 43 C source files in `src/`), and **curl-rs-ffi** (FFI compatibility layer exposing 100 `curl_*` symbols for libcurl ABI drop-in compatibility). The project eliminates all manual C memory management via Rust ownership semantics, replaces seven C TLS backends with a single rustls implementation, and targets byte-for-byte functional parity with curl 8.x across HTTP/1.1, HTTP/2, HTTP/3, FTP/FTPS, SFTP, SCP, and 15+ additional protocols. The rewrite totals 215,153 lines of Rust across 155 source files with 2,572 Rust-native tests passing (all-features build; 2,300 with default features).
 
 ### 1.2 Completion Status
 
@@ -30,8 +30,8 @@ pie title Project Completion — 84.2%
 - ✅ All 155 Rust source files created matching the AAP target architecture exactly (106 lib + 35 CLI + 14 FFI)
 - ✅ Complete Cargo workspace with three crates builds successfully (`cargo build --release --workspace` — zero errors)
 - ✅ Zero clippy warnings under `-D warnings` strict mode
-- ✅ 2,545 Rust-native tests passing with zero failures under `--all-features` (1,963 lib + 405 CLI [402 unit + 3 integration] + 164 FFI + 13 lib doc-tests); 2,273 pass with default features
-- ✅ 81.34% line coverage achieved (83.31% region), exceeding the 80% line-coverage gate (`cargo llvm-cov --workspace`, +stable)
+- ✅ 2,572 Rust-native tests passing with zero failures under `--all-features` (1,964 lib + 431 CLI [428 unit + 3 integration] + 164 FFI + 13 lib doc-tests); 2,300 pass with default features
+- ✅ 81.86% line coverage achieved (83.68% region), exceeding the 80% line-coverage gate (`cargo llvm-cov --workspace`, +stable)
 - ✅ Miri validation passed — zero undefined behavior across 1,626 curl-rs-lib tests + 13 doc-tests (65 real-crypto / FFI-handshake tests guarded via `#[cfg_attr(miri, ignore)]`)
 - ✅ AddressSanitizer validation passed — zero violations across the FFI boundary (164 curl-rs-ffi tests)
 - ✅ Zero `unsafe` blocks in `protocols/`, `tls/`, and `transfer.rs` (AAP hard constraint met)
@@ -88,7 +88,7 @@ pie title Project Completion — 84.2%
 | Build Scripts | 10 | curl-rs-lib/build.rs (20,662 lines — symbol inventory generation), curl-rs-ffi/build.rs (38,037 lines — cbindgen invocation) |
 | Documentation | 10 | README.md (Rust workspace instructions), INSTALL.md, INTERNALS.md, CURL-DISABLE.md, HTTP3.md, RUSTLS.md, CONNECTION-FILTERS.md, CURLX.md, TLS-SESSIONS.md |
 | Standalone Feature Modules | 25 | cookie.rs (cookie jar), hsts.rs (HSTS preload), altsvc.rs (Alt-Svc cache), netrc.rs (netrc parser), progress.rs, request.rs, content_encoding.rs (gzip/brotli/zstd), ratelimit.rs, psl.rs, idn.rs |
-| Testing & Validation | 35 | 2,545 Rust-native tests written and passing (all-features; 2,273 default), Miri validation (1,626 lib + 13 doc tests, zero UB), ASAN validation (164 FFI tests), coverage gate achievement (81.34% line / 83.31% region) |
+| Testing & Validation | 35 | 2,572 Rust-native tests written and passing (all-features; 2,300 default), Miri validation (1,626 lib + 13 doc tests, zero UB), ASAN validation (164 FFI tests), coverage gate achievement (81.86% line / 83.68% region) |
 | Quality Fixes & Patches | 15 | Clippy compliance, test warning resolution, feature flag gating, QA checkpoint fixes, documentation corrections across 8 fix commits |
 | **Total Completed** | **640** | |
 
@@ -123,14 +123,14 @@ pie title Project Completion — 84.2%
 
 | Test Category | Framework | Total Tests | Passed | Failed | Coverage % | Notes |
 |--------------|-----------|-------------|--------|--------|------------|-------|
-| Unit Tests (curl-rs-lib) | cargo test --all-features | 1,963 | 1,963 | 0 | 81.34% line / 83.31% region (workspace) | Core library — protocols, TLS, auth, DNS, proxy, utilities, connection, transfer |
+| Unit Tests (curl-rs-lib) | cargo test --all-features | 1,964 | 1,964 | 0 | 81.86% line / 83.68% region (workspace) | Core library — protocols, TLS, auth, DNS, proxy, utilities, connection, transfer |
 | Unit Tests (curl-rs) | cargo test -p curl-rs --bins | 402 | 402 | 0 | Included above | CLI binary — args, config, callbacks, writeout, formparse, urlglob, operate, setopt |
 | Integration Tests (curl-rs) | cargo test -p curl-rs --test cli | 3 | 3 | 0 | Included above | CLI end-to-end harness (`curl-rs/tests/cli.rs`) |
 | Unit Tests (curl-rs-ffi) | cargo test -p curl-rs-ffi | 164 | 164 | 0 | Included above | FFI boundary — symbol signatures, type layouts, error code mapping |
 | Doc Tests | cargo test --doc | 13 | 13 | 0 | N/A | Inline documentation examples (6 additional ignored — compile-only examples) |
 | Memory Safety (Miri) | cargo +nightly miri test -p curl-rs-lib | 1,626 (+13 doc) | 1,626 (+13 doc) | 0 | N/A | Non-FFI core; 65 real-crypto/FFI-handshake tests guarded (Miri cannot interpret ring/aws-lc-rs foreign fns) |
 | Address Sanitizer | ASan-instrumented build (curl-rs-ffi) | 164 | 164 | 0 | N/A | FFI boundary — zero memory violations |
-| **Total (Rust-native, all-features)** | | **2,545** | **2,545** | **0** | **81.34% line / 83.31% region** | All-features build; default-features build = 2,273 passing. Miri/ASan rows are validation reruns of existing tests, not additive to the total. |
+| **Total (Rust-native, all-features)** | | **2,572** | **2,572** | **0** | **81.86% line / 83.68% region** | All-features build; default-features build = 2,300 passing. Miri/ASan rows are validation reruns of existing tests, not additive to the total. |
 
 ---
 
@@ -171,7 +171,7 @@ pie title Project Completion — 84.2%
 | Every `unsafe` in FFI with `// SAFETY:` comment | ✅ Pass | All unsafe blocks in `curl-rs-ffi/src/` carry SAFETY invariant comments |
 | rustls exclusively — no C TLS linkage | ✅ Pass | `rustls = "0.23"` in Cargo.toml; no openssl/native-tls/schannel deps |
 | Cargo clippy `-D warnings` clean | ✅ Pass | Zero warnings on full workspace |
-| ≥80% line coverage on protocols/ and transfer.rs | ✅ Pass | 81.34% workspace line coverage / 83.31% region (`cargo llvm-cov --workspace`); transfer.rs 83.64% line |
+| ≥80% line coverage on protocols/ and transfer.rs | ✅ Pass | 81.86% workspace line coverage / 83.68% region (`cargo llvm-cov --workspace`); transfer.rs 83.64% line |
 | Miri — zero violations (non-FFI) | ✅ Pass | 1,626 lib + 13 doc tests passed, zero undefined behavior (65 real-crypto tests guarded) |
 | AddressSanitizer — zero violations (FFI) | ✅ Pass | 164 curl-rs-ffi tests, zero violations |
 | Zero TODO/FIXME/unimplemented in production code | ✅ Pass | Grep across all 3 crates returns 0 matches |
@@ -251,7 +251,7 @@ pie title Project Hours Breakdown
 
 ### Achievements
 
-The curl-rs project has achieved **84.2% completion** (640 hours completed out of 760 total project hours). The autonomous Blitzy agents delivered a complete C-to-Rust rewrite of the curl 8.19.0-DEV codebase — 215,153 lines of Rust across 155 source files organized in a 3-crate Cargo workspace. All code compiles cleanly, passes clippy strict mode, and all 2,545 Rust-native tests pass with zero failures under `--all-features` (2,273 with default features). Memory safety has been validated through both Miri (1,626 lib + 13 doc tests, zero undefined behavior) and AddressSanitizer (164 FFI tests, zero violations). The binary successfully performs HTTP and HTTPS transfers against live endpoints, and the FFI library exports 100 `curl_*` function symbols.
+The curl-rs project has achieved **84.2% completion** (640 hours completed out of 760 total project hours). The autonomous Blitzy agents delivered a complete C-to-Rust rewrite of the curl 8.19.0-DEV codebase — 215,153 lines of Rust across 155 source files organized in a 3-crate Cargo workspace. All code compiles cleanly, passes clippy strict mode, and all 2,572 Rust-native tests pass with zero failures under `--all-features` (2,300 with default features). Memory safety has been validated through both Miri (1,626 lib + 13 doc tests, zero undefined behavior) and AddressSanitizer (164 FFI tests, zero violations). The binary successfully performs HTTP and HTTPS transfers against live endpoints, and the FFI library exports 100 `curl_*` function symbols.
 
 ### Remaining Gaps
 
@@ -267,7 +267,7 @@ The primary gap is the **curl 8.x integration test suite** — the AAP's binary 
 
 ### Production Readiness Assessment
 
-The project is **not yet production-ready** due to the unvalidated curl 8.x test suite integration. The code quality is high (zero warnings, zero memory violations, 81.34% line coverage / 83.31% region), but functional parity with C curl has only been demonstrated for HTTP/HTTPS. The remaining 120 hours (15.8% of total scope) are primarily testing, validation, and production-hardening tasks rather than new code development.
+The project is **not yet production-ready** due to the unvalidated curl 8.x test suite integration. The code quality is high (zero warnings, zero memory violations, 81.86% line coverage / 83.68% region), but functional parity with C curl has only been demonstrated for HTTP/HTTPS. The remaining 120 hours (15.8% of total scope) are primarily testing, validation, and production-hardening tasks rather than new code development.
 
 ---
 
@@ -337,8 +337,8 @@ cargo build --release --workspace
 ```bash
 # Run all tests
 cargo test --workspace --no-fail-fast
-# Expected (default features): 2,273 passed, 0 failed, 6 ignored
-# Expected (--all-features):   2,545 passed, 0 failed, 6 ignored
+# Expected (default features): 2,300 passed, 0 failed, 6 ignored
+# Expected (--all-features):   2,572 passed, 0 failed, 6 ignored
 
 # Clippy lint check
 cargo clippy --workspace -- -D warnings
@@ -387,9 +387,9 @@ cargo llvm-cov --workspace
 |---------|---------|
 | `cargo build --workspace` | Debug build of all 3 crates |
 | `cargo build --release --workspace` | Release build |
-| `cargo test --workspace --no-fail-fast` | Run all workspace tests (2,273 default / 2,545 all-features) |
-| `cargo test -p curl-rs-lib` | Library tests only (1,691 default / 1,963 all-features) |
-| `cargo test -p curl-rs` | CLI tests only (402 unit + 3 integration) |
+| `cargo test --workspace --no-fail-fast` | Run all workspace tests (2,300 default / 2,572 all-features) |
+| `cargo test -p curl-rs-lib` | Library tests only (1,692 default / 1,964 all-features) |
+| `cargo test -p curl-rs` | CLI tests only (428 unit + 3 integration) |
 | `cargo test -p curl-rs-ffi` | FFI tests only (164 tests) |
 | `cargo clippy --workspace -- -D warnings` | Lint check (strict) |
 | `cargo +nightly miri test -p curl-rs-lib` | Memory safety check |

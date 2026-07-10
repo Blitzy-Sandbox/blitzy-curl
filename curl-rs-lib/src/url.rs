@@ -1290,6 +1290,95 @@ pub struct Info {
     /// `data->info.contenttype` `NULL`. The CLI consults it for `--xattr`
     /// (`user.mime_type`) and `--write-out %{content_type}`.
     pub contenttype: Option<String>,
+    /// Total number of body bytes received during the transfer, as read back by
+    /// `CURLINFO_SIZE_DOWNLOAD_T` (curl's `data->progress.dl.cur_size`). Counts
+    /// every body byte delivered to the client sink regardless of the output
+    /// destination (including the `/dev/null` bit-bucket), so `--write-out
+    /// %{size_download}` reports the real received size. `0` until a transfer
+    /// runs.
+    pub size_download: i64,
+    /// Total number of body bytes uploaded during the transfer, as read back by
+    /// `CURLINFO_SIZE_UPLOAD_T` (curl's `data->progress.ul.cur_size`). Set to the
+    /// length of the request body actually sent (`-d`/`-T` payload). `0` until a
+    /// transfer runs or when no body is sent.
+    pub size_upload: i64,
+    /// Time, in **microseconds**, from the start of the transfer until the name
+    /// resolution completed, as read back by `CURLINFO_NAMELOOKUP_TIME_T`
+    /// (curl's `data->progress.t_nslookup`). `0` until a transfer runs; curl's
+    /// `*_TIME_T` getinfo variants likewise report `0` when unmeasured.
+    pub namelookup_time_us: i64,
+    /// Time, in **microseconds**, from the start of the transfer until the TCP
+    /// connection to the remote (or proxy) completed, as read back by
+    /// `CURLINFO_CONNECT_TIME_T` (curl's `data->progress.t_connect`). `0` until a
+    /// transfer runs.
+    pub connect_time_us: i64,
+    /// Time, in **microseconds**, from the start of the transfer until the
+    /// TLS/SSL handshake completed, as read back by `CURLINFO_APPCONNECT_TIME_T`
+    /// (curl's `data->progress.t_appconnect`). `0` for cleartext connections
+    /// (curl reports `0` for a non-TLS transfer) and `0` until a transfer runs.
+    pub appconnect_time_us: i64,
+    /// Time, in **microseconds**, from the start of the transfer until just
+    /// before the request is sent (all connection setup complete), as read back
+    /// by `CURLINFO_PRETRANSFER_TIME_T` (curl's `data->progress.t_pretransfer`).
+    /// `0` until a transfer runs.
+    pub pretransfer_time_us: i64,
+    /// Time, in **microseconds**, from the start of the transfer until the first
+    /// byte of the response was received, as read back by
+    /// `CURLINFO_STARTTRANSFER_TIME_T` (curl's `data->progress.t_starttransfer`).
+    /// `0` until a transfer runs.
+    pub starttransfer_time_us: i64,
+    /// Total transfer time, in **microseconds**, from start to completion, as
+    /// read back by `CURLINFO_TOTAL_TIME_T` (curl's `data->progress.timespent`).
+    /// This is the value reported by `--write-out %{time_total}` and the
+    /// denominator for the `%{speed_download}` / `%{speed_upload}` rates. `0`
+    /// until a transfer runs.
+    pub total_time_us: i64,
+    /// The reason phrase of the most recent HTTP response (e.g. `"OK"` for a
+    /// `200`), when the response carried one. Recorded alongside
+    /// [`httpcode`](Info::httpcode) so the `-v`/`--trace` formatter can
+    /// reconstruct the received status line (`< HTTP/1.1 <code> <reason>`);
+    /// `None` when the response had no reason phrase or no transfer has run.
+    pub resp_reason: Option<String>,
+    /// The ordered `(name, value)` header fields of the most recent HTTP
+    /// response head, captured for the `-v`/`--trace` `< ` (HEADER_IN) dump.
+    /// Empty until an HTTP transfer records a response; not consulted by any
+    /// non-trace path, so it costs nothing when tracing is off.
+    pub resp_headers: Vec<(String, String)>,
+}
+
+/// A [`TransferSink`](crate::protocols::TransferSink) adapter that counts the body bytes it
+/// forwards to an inner sink, feeding `CURLINFO_SIZE_DOWNLOAD_T`. It wraps the client's sink
+/// inside [`Easy::perform_transfer`] so the received-byte total is measured independently of
+/// where the client ultimately writes the data (a file, stdout, or the `/dev/null`
+/// bit-bucket), exactly as curl's internal `dl.cur_size` counter is decoupled from the write
+/// callback's destination.
+struct CountingSink {
+    /// The client's real body sink.
+    inner: Box<dyn crate::protocols::TransferSink>,
+    /// Shared running total of forwarded body bytes.
+    counter: Arc<std::sync::atomic::AtomicI64>,
+    /// When `Some` (only while `-v`/`--trace` is active), a shared buffer that accumulates a copy
+    /// of every received body byte so [`Easy::perform_transfer`] can render the `{ [N bytes
+    /// data]` summary (or, under `--trace`, the hex/ascii dump) after the response head. `None`
+    /// on the normal path, so no body copy is made when tracing is off.
+    capture: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
+}
+
+impl crate::protocols::TransferSink for CountingSink {
+    fn write(&mut self, data: &[u8]) -> Result<()> {
+        // Count first, then forward; a rejected write still reflects the bytes curl's counter
+        // would have tallied before the write callback signalled failure.
+        self.counter
+            .fetch_add(data.len() as i64, std::sync::atomic::Ordering::SeqCst);
+        // Copy into the trace buffer when tracing is active (curl's debug callback sees the same
+        // body bytes it delivers to the write callback).
+        if let Some(buf) = &self.capture {
+            if let Ok(mut b) = buf.lock() {
+                b.extend_from_slice(data);
+            }
+        }
+        self.inner.write(data)
+    }
 }
 
 impl Info {
@@ -1374,6 +1463,20 @@ pub struct Easy {
     /// [`Easy::detach_share`] and [`Drop`] release it, so `curl_share_cleanup`
     /// observes `CURLSHE_IN_USE` for exactly as long as a handle is attached.
     pub share: Option<Arc<Share>>,
+    /// Whether the owner wants `-v`/`--trace` diagnostics captured for the next transfer
+    /// (curl's `data->set.verbose` / an installed `CURLOPT_DEBUGFUNCTION`). When `true`,
+    /// [`Easy::perform_transfer`] records the transfer's trace events into
+    /// [`debug_log`](Easy::debug_log); when `false` (the default) no records are captured and the
+    /// hot path is unaffected. The CLI sets it from `global.tracetype` before each transfer.
+    pub trace_enabled: bool,
+    /// Buffered `-v`/`--trace` records captured during the last transfer, in emission order
+    /// (curl streams each to `CURLOPT_DEBUGFUNCTION` as it happens; the CLI drives the library
+    /// directly rather than through the FFI, so records are buffered here and drained afterwards
+    /// with [`take_debug_log`](Easy::take_debug_log)). Empty unless
+    /// [`trace_enabled`](Easy::trace_enabled) was set. Each entry pairs a
+    /// [`DebugInfoType`](crate::protocols::DebugInfoType) with its raw payload bytes, which the
+    /// CLI renders through curl's byte-exact trace formatter.
+    pub debug_log: Vec<(crate::protocols::DebugInfoType, Vec<u8>)>,
 }
 
 impl Easy {
@@ -1404,6 +1507,10 @@ impl Easy {
             // starts attached to no share (the caller must re-issue
             // `CURLOPT_SHARE` to share), so `dirty` is not inadvertently bumped.
             share: None,
+            // A duplicated handle starts with a fresh operational state, so it captures no
+            // trace and carries no buffered `-v`/`--trace` records until its owner opts in.
+            trace_enabled: false,
+            debug_log: Vec::new(),
         }
     }
 
@@ -2663,6 +2770,349 @@ impl Easy {
         Ok(cache.find_or_create(conn))
     }
 
+    /// Drive this fully-configured handle through one real network transfer,
+    /// streaming received body bytes to `sink` and recording the response
+    /// diagnostics into [`self.info`](Easy::info).
+    ///
+    /// This is the async core of `curl_easy_perform` (`lib/easy.c`) — the
+    /// DO/PERFORM counterpart to [`create_conn`](Easy::create_conn) (curl's
+    /// `Curl_connect`). Where `create_conn` resolves the *connection identity*
+    /// against the pool, this method establishes a **live** connection and runs
+    /// the protocol exchange:
+    ///
+    /// 1. map the URL scheme to its protocol handler (identity + `&dyn Protocol`
+    ///    behavior vtable);
+    /// 2. derive host / port / path / query from the parsed URL and stamp them
+    ///    onto `request` (the caller supplies only the request-specific options —
+    ///    method, headers, body, …);
+    /// 3. build a live [`Connection`](crate::conn::Connection), resolve the host
+    ///    ([`crate::dns::resolve`]), and connect its filter chain
+    ///    ([`conn_setup`](crate::conn::connect::conn_setup) +
+    ///    [`connect_with_timeout`](crate::conn::connect::connect_with_timeout));
+    /// 4. drive the handler lifecycle — `setup_connection` → `connect` →
+    ///    `connecting` → `do_it` → `done` — over that connection, exactly as
+    ///    curl's `multi_runsingle` steps the state machine;
+    /// 5. copy the per-transfer [`Info`] the handler populated
+    ///    (`CURLINFO_RESPONSE_CODE`, `CURLINFO_CONTENT_TYPE`, …) back onto the
+    ///    handle so the CLI's `--write-out`/xattr and `curl_easy_getinfo`
+    ///    observe it.
+    ///
+    /// A non-network scheme (`file:`) skips DNS, socket setup, and connect,
+    /// exactly as curl treats `PROTOPT_NONETWORK`.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces every failure from URL parsing, protocol lookup, DNS resolution,
+    /// connection setup, and the protocol exchange as the corresponding
+    /// [`CurlCode`]. The `done` phase always runs (with the DO status forwarded)
+    /// so the handler can release resources even when the DO phase failed.
+    ///
+    /// Enable or disable `-v`/`--trace` diagnostic capture for the next
+    /// [`perform_transfer`](Easy::perform_transfer) (curl's `data->set.verbose` /
+    /// `CURLOPT_DEBUGFUNCTION` registration). When enabled, that transfer records its trace
+    /// events into [`debug_log`](Easy::debug_log) for the caller to drain; when disabled (the
+    /// default) the transfer captures nothing.
+    pub fn set_trace_enabled(&mut self, on: bool) {
+        self.trace_enabled = on;
+    }
+
+    /// Take the `-v`/`--trace` records captured by the last transfer, leaving the buffer empty
+    /// (curl's `CURLOPT_DEBUGFUNCTION` fires per event; the CLI drives the library directly, so it
+    /// drains the buffered records here and renders them through curl's trace formatter). Returns
+    /// an empty vector when tracing was disabled or no transfer has run.
+    pub fn take_debug_log(&mut self) -> Vec<(crate::protocols::DebugInfoType, Vec<u8>)> {
+        std::mem::take(&mut self.debug_log)
+    }
+
+    pub async fn perform_transfer(
+        &mut self,
+        mut request: crate::protocols::TransferRequest,
+        sink: Box<dyn crate::protocols::TransferSink>,
+    ) -> Result<()> {
+        use crate::conn::connect::{conn_setup, connect_with_timeout};
+        use crate::conn::{
+            Connection as LiveConn, Scheme as LiveScheme, CURL_CF_SSL_DEFAULT, FIRSTSOCKET,
+        };
+        use crate::dns::system::SystemResolver;
+        use crate::dns::{resolve, DnsCache, IpVersion, ResolveOptions};
+        use crate::protocols::{scheme_handler, TransferCtx};
+
+        // Transfer-clock origin (← curl's `Curl_pgrsStartNow`, which stamps
+        // `data->progress.t_startsingle` at the top of a transfer). Every
+        // `CURLINFO_*_TIME_T` value is an offset in **microseconds** from this
+        // instant, so `--write-out %{time_total}` and the `%{speed_*}` rates
+        // report real elapsed time. The accumulators default to `0`, so a phase
+        // that never runs (e.g. name resolution for a `file://` transfer) leaves
+        // its timer at `0`, exactly as curl reports `0` for an unmeasured phase.
+        let t_start = std::time::Instant::now();
+        let mut t_namelookup_us: i64 = 0;
+        let mut t_connect_us: i64 = 0;
+        let mut t_appconnect_us: i64 = 0;
+
+        // `-v`/`--trace` capture (curl's `CURLOPT_DEBUGFUNCTION` stream). When tracing is on,
+        // records are buffered here in emission order and drained by the CLI afterwards; when off
+        // the whole block is skipped, leaving the hot path untouched. `peer_ip` is the connected
+        // remote address, filled after name resolution for the `* Trying/Connected` text lines.
+        use crate::protocols::DebugInfoType;
+        let trace_on = self.trace_enabled;
+        let mut trace_records: Vec<(DebugInfoType, Vec<u8>)> = Vec::new();
+        let mut peer_ip: Option<String> = None;
+
+        // --- 1. Scheme → protocol handler (identity + behavior vtable). ---
+        let scheme = self
+            .url_get_part(CurlUPart::Scheme, 0, urlapi::UrlCode::NoScheme)?
+            .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
+        let scheme_lc = scheme.to_ascii_lowercase();
+
+        // The identity handler (default port, no-network flag) drives port
+        // resolution; the behavior handler carries the `&dyn Protocol` vtable
+        // used to run the exchange. Both are keyed on the same scheme string.
+        let ident = get_scheme_handler(&scheme_lc)
+            .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
+        let psh =
+            scheme_handler(&scheme_lc).ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
+        let handler = psh
+            .handler
+            .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
+
+        // --- 2. Host / port / path / query from the parsed URL. ---
+        let host = self
+            .url_get_part(CurlUPart::Host, 0, urlapi::UrlCode::NoHost)?
+            .ok_or_else(|| Error::from(CurlCode::UrlMalformat))?;
+        let host = idnconvert_host(&host)?;
+        let port = self.resolve_remote_port(&ident)?;
+        // Path is never "missing" (the URL parser defaults it to "/"); Query is
+        // absent as `NoQuery`, which `url_get_part` maps to `None`.
+        let path = self
+            .url_get_part(CurlUPart::Path, 0, urlapi::UrlCode::UnknownPart)?
+            .unwrap_or_else(|| "/".to_string());
+        let query = self.url_get_part(CurlUPart::Query, 0, urlapi::UrlCode::NoQuery)?;
+
+        // Stamp the URL-derived fields onto the request (the caller filled the
+        // request-specific options — method, headers, body, credentials, …).
+        request.scheme = scheme_lc.clone();
+        request.host = host.clone();
+        request.port = port;
+        request.path = path;
+        request.query = query;
+
+        // --- 3. Build the live connection. ---
+        let is_nonetwork = ident.is_nonetwork();
+        let live_scheme = LiveScheme {
+            name: scheme_lc.clone(),
+            default_port: ident.default_port,
+            is_ssl: psh.is_secure(),
+            no_network: is_nonetwork,
+        };
+        let mut conn = LiveConn::new(live_scheme, host.clone(), port);
+        // Map the handle's `CURLOPT_IPRESOLVE` onto the resolver's family
+        // preference (the discriminants match curl's `CURL_IPRESOLVE_*`).
+        conn.ip_version = match self.set.ipver {
+            IpResolve::V4 => IpVersion::V4,
+            IpResolve::V6 => IpVersion::V6,
+            IpResolve::Whatever => IpVersion::Whatever,
+        };
+
+        // --- 4. Resolve + connect the filter chain (network schemes only). ---
+        if !is_nonetwork {
+            // A per-transfer DNS cache seeds the resolve; a shared handle would
+            // consult its shared cache, but a single serial transfer needs only
+            // a fresh one (localhost / IP literals resolve without the network).
+            let cache = DnsCache::new();
+            let resolver = SystemResolver::new();
+            let opts = ResolveOptions::new(&resolver);
+            let dns = resolve(&cache, &host, port, conn.ip_version, false, &opts).await?;
+            // Name resolution complete (← `data->progress.t_nslookup`).
+            t_namelookup_us = t_start.elapsed().as_micros() as i64;
+            // Record the connected remote address for the `-v`/`--trace` `* Trying …` /
+            // `* Connected to …` text lines (curl's `Curl_verboseconnect`).
+            if trace_on {
+                peer_ip = dns.endpoints().first().map(|sa| sa.ip().to_string());
+                if let Some(ip) = &peer_ip {
+                    trace_records.push((
+                        DebugInfoType::Text,
+                        format!("  Trying {ip}:{port}...\n").into_bytes(),
+                    ));
+                }
+            }
+
+            // Build the default `SETUP` filter stack (TCP → [proxy] → [TLS] →
+            // happy-eyeballs) and drive it to connected. `CURL_CF_SSL_DEFAULT`
+            // lets the scheme decide TLS (on for `https`/`ftps`/…, off for
+            // cleartext), matching curl's `ssl_mode` default.
+            conn_setup(&mut conn, FIRSTSOCKET, dns, CURL_CF_SSL_DEFAULT).await?;
+            let connect_ms = request
+                .connect_timeout
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            connect_with_timeout(&mut conn, FIRSTSOCKET, connect_ms).await?;
+            // Connection established (← `data->progress.t_connect`). The filter
+            // chain drives TCP and, for a secure scheme, the TLS handshake in one
+            // step here, so the app-connect timer (TLS-handshake-complete,
+            // `data->progress.t_appconnect`) coincides with connect for a secure
+            // transfer and stays `0` for a cleartext one — matching curl, which
+            // reports `t_appconnect == 0` for a non-TLS connection.
+            t_connect_us = t_start.elapsed().as_micros() as i64;
+            if psh.is_secure() {
+                t_appconnect_us = t_connect_us;
+            }
+            // `* Connected to <host> (<ip>) port <port>` (curl's `Curl_verboseconnect`).
+            if trace_on {
+                let ip = peer_ip.as_deref().unwrap_or(host.as_str());
+                trace_records.push((
+                    DebugInfoType::Text,
+                    format!("Connected to {host} ({ip}) port {port}\n").into_bytes(),
+                ));
+            }
+        }
+
+        // Bytes actually sent as the request body (`-d`/`-T` payload), recorded for
+        // `CURLINFO_SIZE_UPLOAD_T` once the transfer completes.
+        let upload_bytes = request.body.as_ref().map_or(0, |b| b.len() as i64);
+
+        // `-v`/`--trace` request-side records, built from `request` before it is moved into the
+        // transfer context. For HTTP(S) the sent request head is rendered by the handler's own
+        // assembler (so the `> ` block matches the wire, `Authorization` included); the request
+        // body, if any, is the `} ` (DATA_OUT) payload.
+        if trace_on {
+            if matches!(scheme_lc.as_str(), "http" | "https") {
+                let head = crate::protocols::http::trace_request_head_bytes(&request);
+                if !head.is_empty() {
+                    trace_records.push((DebugInfoType::HeaderOut, head));
+                }
+            }
+            if let Some(body) = request.body.as_ref() {
+                if !body.is_empty() {
+                    trace_records.push((DebugInfoType::DataOut, body.clone()));
+                }
+            }
+        }
+
+        // --- 5. Drive the protocol exchange over the live connection. ---
+        let mut ctx = TransferCtx::new();
+        ctx.request = request;
+        ctx.conn = Some(Box::new(conn));
+        // Wrap the caller's sink so every delivered body byte is counted for
+        // `CURLINFO_SIZE_DOWNLOAD_T`, regardless of the client's output destination
+        // (curl counts received body bytes independently of where they are written).
+        // When tracing, a capture buffer additionally accumulates the received body for the
+        // `{ ` (DATA_IN) dump emitted after the response head.
+        let downloaded = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let body_capture: Option<Arc<std::sync::Mutex<Vec<u8>>>> = if trace_on {
+            Some(Arc::new(std::sync::Mutex::new(Vec::new())))
+        } else {
+            None
+        };
+        ctx.sink = Some(Box::new(CountingSink {
+            inner: sink,
+            counter: Arc::clone(&downloaded),
+            capture: body_capture.as_ref().map(Arc::clone),
+        }));
+
+        // Handler lifecycle (← `multi_runsingle`): SETUP → CONNECT → CONNECTING →
+        // DO → DONE. The default `connect`/`connecting` report "ready" in one
+        // step (the filter chain already connected the socket above); a protocol
+        // that needs extra round-trips (e.g. a pingpong greeting) drives them
+        // here, yielding between non-ready polls.
+        handler.setup_connection(&mut ctx).await?;
+        while !handler.connect(&mut ctx).await? {
+            tokio::task::yield_now().await;
+        }
+        while !handler.connecting(&mut ctx).await? {
+            tokio::task::yield_now().await;
+        }
+
+        // All connection setup (transport + protocol handshake) is complete and
+        // the request is about to be sent (← `data->progress.t_pretransfer`).
+        let t_pretransfer_us = t_start.elapsed().as_micros() as i64;
+
+        // DO phase (send the request, read the response, stream the body to the
+        // sink, record diagnostics). The DONE phase runs unconditionally with the
+        // DO status forwarded so the handler can clean up on both paths (curl's
+        // `Curl_done(..., status, premature)`), then the original DO result is
+        // propagated (preserving its full error context).
+        let do_res = handler.do_it(&mut ctx).await;
+        // The response has been received (← `data->progress.t_starttransfer`).
+        // `do_it` reads the response head and streams the body, so this marks
+        // "response available"; for the small, low-latency exchanges the CLI
+        // drives this closely tracks curl's first-response-byte timestamp.
+        let t_starttransfer_us = t_start.elapsed().as_micros() as i64;
+        let premature = do_res.is_err();
+        let status_for_done: Result<()> = match &do_res {
+            Ok(_) => Ok(()),
+            Err(e) => Err(Error::from(e.code())),
+        };
+        handler.done(&mut ctx, status_for_done, premature).await?;
+
+        // --- 6. Reconcile response diagnostics into the handle. ---
+        self.info = std::mem::take(&mut ctx.info);
+        // Stamp the connection scheme (`info.conn_scheme`, ← `create_conn`).
+        // Protocol handlers populate `httpcode`/`contenttype` but not the scheme
+        // identity, so record it here from the URL scheme that selected the
+        // handler. `CURLINFO_SCHEME` and the CLI's retry classifier
+        // (`retrycheck`, which retries transient HTTP 5xx/4xx only when the
+        // scheme is HTTP(S)) both read it; leaving it `None` would silently
+        // disable `--retry` on HTTP status codes.
+        self.info.conn_scheme = Some(scheme_lc.clone());
+        // Record the transferred byte counts for `CURLINFO_SIZE_DOWNLOAD_T` /
+        // `CURLINFO_SIZE_UPLOAD_T` (set after the `info` move so they are not
+        // overwritten by the handler's diagnostics).
+        self.info.size_download = downloaded.load(std::sync::atomic::Ordering::SeqCst);
+        self.info.size_upload = upload_bytes;
+        // Record the phase timers (microseconds from `t_start`) for the
+        // `CURLINFO_*_TIME_T` getinfo variants and `--write-out %{time_*}` /
+        // `%{speed_*}`. `total_time` is stamped last so it always covers the
+        // whole transfer including the DONE phase (← `data->progress.timespent`,
+        // set by `Curl_pgrsDone`).
+        self.info.namelookup_time_us = t_namelookup_us;
+        self.info.connect_time_us = t_connect_us;
+        self.info.appconnect_time_us = t_appconnect_us;
+        self.info.pretransfer_time_us = t_pretransfer_us;
+        self.info.starttransfer_time_us = t_starttransfer_us;
+        self.info.total_time_us = t_start.elapsed().as_micros() as i64;
+
+        // --- 6b. Finish the `-v`/`--trace` record stream (response side). ---
+        // curl delivers the response head to `CURLOPT_DEBUGFUNCTION` one `< ` (HEADER_IN) line
+        // per header, then the received body as `{ ` (DATA_IN); the closing text mirrors curl's
+        // connection-teardown note. Records are handed to `debug_log` for the CLI to render.
+        if trace_on {
+            if matches!(scheme_lc.as_str(), "http" | "https") && self.info.httpcode != 0 {
+                // Status line: `< HTTP/1.1 <code> <reason>` (one HEADER_IN record).
+                let reason = self.info.resp_reason.clone().unwrap_or_default();
+                let status_line = if reason.is_empty() {
+                    format!("HTTP/1.1 {}\r\n", self.info.httpcode)
+                } else {
+                    format!("HTTP/1.1 {} {reason}\r\n", self.info.httpcode)
+                };
+                trace_records.push((DebugInfoType::HeaderIn, status_line.into_bytes()));
+                // One HEADER_IN record per response header line, matching curl.
+                for (name, value) in &self.info.resp_headers {
+                    trace_records.push((
+                        DebugInfoType::HeaderIn,
+                        format!("{name}: {value}\r\n").into_bytes(),
+                    ));
+                }
+                // Blank line terminating the response head.
+                trace_records.push((DebugInfoType::HeaderIn, b"\r\n".to_vec()));
+            }
+            // Received body → `{ ` (DATA_IN). The capture buffer holds the exact delivered bytes.
+            if let Some(buf) = &body_capture {
+                if let Ok(b) = buf.lock() {
+                    if !b.is_empty() {
+                        trace_records.push((DebugInfoType::DataIn, b.clone()));
+                    }
+                }
+            }
+            // Closing note (curl's `* Connection #0 to host <host> left intact`).
+            trace_records.push((
+                DebugInfoType::Text,
+                format!("Connection #0 to host {host} left intact\n").into_bytes(),
+            ));
+            self.debug_log = trace_records;
+        }
+        do_res.map(|_done| ())
+    }
+
     /// Sets the auto-referer for the next request from the current URL, stripping
     /// credentials and the fragment — the `CURLOPT_AUTOREFERER` branch of
     /// `Curl_http_follow`.
@@ -3461,5 +3911,86 @@ mod tests {
         assert!(!is_absolute_url("/relative/path"));
         assert!(!is_absolute_url("relative"));
         assert!(!is_absolute_url("//scheme-relative"));
+    }
+
+    // --- perform_transfer (the curl_easy_perform DO/PERFORM core) ------------
+
+    /// A minimal recording sink that accumulates the received body bytes, so a
+    /// test can assert exactly what `perform_transfer` streamed out.
+    #[cfg(feature = "http")]
+    struct VecSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    #[cfg(feature = "http")]
+    impl crate::protocols::TransferSink for VecSink {
+        fn write(&mut self, data: &[u8]) -> Result<()> {
+            self.0.lock().expect("sink lock").extend_from_slice(data);
+            Ok(())
+        }
+    }
+
+    /// End-to-end proof that [`Easy::perform_transfer`] performs **real network
+    /// I/O**: it resolves `127.0.0.1`, connects a live filter chain, sends a
+    /// GET, streams the response body to the sink, and records the response
+    /// diagnostics onto the handle (review finding F8-1: the CLI performed no
+    /// network I/O because this driver did not exist / was unwired).
+    #[cfg(feature = "http")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_transfer_drives_real_http_get() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // A one-shot HTTP/1.1 origin server on an ephemeral loopback port.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let mut data = Vec::new();
+            while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buf[..n]);
+            }
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\
+                  Connection: close\r\n\r\nhello",
+            )
+            .await
+            .unwrap();
+            let _ = sock.shutdown().await;
+            data
+        });
+
+        // Configure a handle exactly as the CLI does: parse the URL onto the
+        // handle, then drive the transfer through the library core.
+        let mut easy = Easy::open();
+        easy.set_url(&format!("http://127.0.0.1:{}/e2e", addr.port()))
+            .expect("set_url");
+
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let sink = Box::new(VecSink(Arc::clone(&collected)));
+
+        let req = crate::protocols::TransferRequest {
+            method: "GET".to_string(),
+            ..Default::default()
+        };
+
+        easy.perform_transfer(req, sink)
+            .await
+            .expect("perform_transfer drives a real GET");
+
+        // The server observed a GET on the requested path.
+        let captured = srv.await.unwrap();
+        assert!(
+            captured.starts_with(b"GET /e2e HTTP/1.1\r\n"),
+            "server must observe the GET request line"
+        );
+
+        // The body was streamed to the sink and the diagnostics recorded.
+        assert_eq!(collected.lock().expect("sink").as_slice(), b"hello");
+        assert_eq!(easy.info.httpcode, 200);
+        assert_eq!(easy.info.contenttype.as_deref(), Some("text/plain"));
     }
 }

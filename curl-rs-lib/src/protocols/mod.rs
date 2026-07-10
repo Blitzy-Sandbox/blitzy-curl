@@ -549,6 +549,33 @@ pub trait TransferSink: Send {
     fn write(&mut self, data: &[u8]) -> Result<()>;
 }
 
+/// The category of a `-v`/`--trace` diagnostic record — the safe-Rust mirror of the subset of
+/// curl's `curl_infotype` (`include/curl/curl.h`) that the transfer engine emits.
+///
+/// [`Easy::perform_transfer`](crate::url::Easy::perform_transfer) buffers records tagged with one
+/// of these categories (the connection text, the sent request head, the received response head,
+/// and the body payload) when tracing is enabled; the CLI drains and renders them through curl's
+/// byte-exact `tool_debug_cb` formatter, mapping each variant onto the matching `CURLINFO_*`
+/// value so `-v`/`--trace`/`--trace-ascii` output is identical to curl 8.x. Kept protocol-neutral
+/// (no `SSL_DATA_*`: TLS payloads are ciphertext the client never sees) and free of any FFI type,
+/// so the safe core names no C enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugInfoType {
+    /// Informational text curl prefixes with `* ` (connection progress, e.g. "Trying …",
+    /// "Connected to …") — curl's `CURLINFO_TEXT`.
+    Text,
+    /// A received header block, rendered with the `< ` marker — curl's `CURLINFO_HEADER_IN`.
+    HeaderIn,
+    /// A sent header block, rendered with the `> ` marker — curl's `CURLINFO_HEADER_OUT`.
+    HeaderOut,
+    /// Received body bytes, rendered as `{ [N bytes data]` (or a hex/ascii dump under `--trace`)
+    /// — curl's `CURLINFO_DATA_IN`.
+    DataIn,
+    /// Sent body bytes, rendered as `} [N bytes data]` (or a dump under `--trace`) — curl's
+    /// `CURLINFO_DATA_OUT`.
+    DataOut,
+}
+
 /// The per-transfer request parameters a [`Protocol`] handler reads to drive
 /// its engine — the subset of curl's `struct UserDefined` / `struct
 /// SingleRequest` that the auxiliary protocols consume.
@@ -599,6 +626,17 @@ pub struct TransferRequest {
     /// request options; protocol handlers (e.g. FILE) read it to emit metadata
     /// and stop before the body.
     pub no_body: bool,
+    /// Whether `CURLOPT_FAILONERROR` (`-f`/`--fail`) is set (←
+    /// `data->set.http_fail_on_error`). When `true`, an HTTP response whose
+    /// status is `>= 400` must not deliver its body to the client sink — curl's
+    /// `k->ignorebody` behavior under failonerror, which is why `curl -f` on a
+    /// `404` prints nothing. The HTTP handler consults it after the response
+    /// head is parsed (the status arrives before the first body byte) to gate
+    /// the body write-out; the terminal exit-code mapping to
+    /// [`CurlCode::HttpReturnedError`](crate::error::CurlCode::HttpReturnedError)
+    /// is owned by the CLI post-transfer path. `false` (the default) leaves the
+    /// body delivered exactly as before.
+    pub fail_on_error: bool,
     /// Resume/range low offset in bytes (← `data->state.resume_from`, as
     /// computed by curl's `Curl_range` from [`range`](Self::range) /
     /// `CURLOPT_RESUME_FROM`). A negative value counts back from the end of the

@@ -1060,6 +1060,7 @@ async fn h2_exchange<S, W>(
     req: &HttpReqData,
     is_ssl: bool,
     body: Option<Vec<u8>>,
+    fail_on_error: bool,
     mut write_body: W,
 ) -> Result<HttpResp>
 where
@@ -1085,6 +1086,13 @@ where
 
     let resp = stream.recv_response().await?;
 
+    // `CURLOPT_FAILONERROR` (`-f`): an HTTP error status (>= 400) suppresses
+    // delivery of the response body to the client (curl's `k->ignorebody`), so
+    // `curl -f` prints nothing on a `404`. The status is known here, before the
+    // first DATA frame is drained; the body is still read off the stream (so the
+    // exchange terminates cleanly) but not forwarded to `write_body`.
+    let suppress_body = fail_on_error && resp.status >= 400;
+
     // Drain the response body to the sink until end of stream.
     let mut buf = vec![0u8; H2_RECV_BUF_LEN];
     loop {
@@ -1092,7 +1100,9 @@ where
         if n == 0 {
             break;
         }
-        write_body(&buf[..n])?;
+        if !suppress_body {
+            write_body(&buf[..n])?;
+        }
     }
 
     Ok(resp)
@@ -1129,6 +1139,7 @@ pub(crate) async fn perform<W>(
     conn: &mut Connection,
     req: HttpReqData,
     body: Option<Vec<u8>>,
+    fail_on_error: bool,
     write_body: W,
 ) -> Result<HttpResp>
 where
@@ -1157,7 +1168,7 @@ where
         // engine uses.
         let (h2_side, bridge_side) = tokio::io::duplex(DUPLEX_BUF_LEN);
 
-        let exchange = h2_exchange(h2_side, &req, is_ssl, body, write_body);
+        let exchange = h2_exchange(h2_side, &req, is_ssl, body, fail_on_error, write_body);
         let pump = pump_bridge(chain, bridge_side);
         tokio::pin!(exchange);
         tokio::pin!(pump);
@@ -2072,7 +2083,7 @@ mod tests {
 
         let req = HttpReqData::make("GET", Some("http"), Some("example.com"), Some("/"));
         let mut body: Vec<u8> = Vec::new();
-        let resp = perform(&mut conn, req, None, |d: &[u8]| -> Result<()> {
+        let resp = perform(&mut conn, req, None, false, |d: &[u8]| -> Result<()> {
             body.extend_from_slice(d);
             Ok(())
         })

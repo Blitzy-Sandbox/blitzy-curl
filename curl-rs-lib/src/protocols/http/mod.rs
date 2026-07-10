@@ -1510,6 +1510,45 @@ fn authority_for(scheme: &str, host: &str, port: u16) -> String {
 /// are driven across requests by the transfer driver; the initial request
 /// carries Basic credentials when supplied, matching curl's default when
 /// `--user` is given without a specific scheme.
+/// Render the HTTP request head this transfer will send, in curl's `-v`/`--trace` `> `
+/// (HEADER_OUT) wire form: the request line, the derived `Host` header, and the
+/// option/auth-derived header block, terminated by the blank line.
+///
+/// Delegates to [`build_http_request`] so the rendered head is exactly what the handler
+/// assembles — same header order, same `--user` Basic-auth rule — keeping the trace honest. In
+/// particular an `Authorization` header (Basic from `--user`, or a caller-supplied Bearer) is
+/// shown verbatim, exactly as curl 8.x prints it under `-v`; the plaintext `--user` password is
+/// never emitted because Basic transmits it base64-encoded. Returns an empty vector if the head
+/// cannot be built (e.g. malformed credentials), so the caller simply emits no `> ` block. The
+/// wire version is rendered as `HTTP/1.1` (the request-line form curl shows for the common
+/// case); the negotiated 2/3 upgrade does not change the header vocabulary.
+pub(crate) fn trace_request_head_bytes(req: &super::TransferRequest) -> Vec<u8> {
+    let out = match build_http_request(req) {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    let method = if out.method.is_empty() {
+        "GET"
+    } else {
+        out.method.as_str()
+    };
+    let path = out.path.as_deref().unwrap_or("/");
+    let mut head = format!("{method} {path} HTTP/1.1\r\n");
+    if let Some(auth) = out.authority.as_deref() {
+        head.push_str("Host: ");
+        head.push_str(auth);
+        head.push_str("\r\n");
+    }
+    for (name, value) in out.headers.iter() {
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    head.into_bytes()
+}
+
 fn build_http_request(req: &super::TransferRequest) -> Result<HttpReqData> {
     let method = if req.method.is_empty() {
         "GET"
@@ -1549,6 +1588,14 @@ fn build_http_request(req: &super::TransferRequest) -> Result<HttpReqData> {
         if !out.headers.contains("Referer") {
             out.headers.add("Referer", referer);
         }
+    }
+    // Default `Accept: */*` — curl always emits this unless the caller supplied
+    // their own Accept header (← `lib/http.c:2911-2912`:
+    // `if(!Curl_checkheaders(data, STRCONST("Accept"))) ... "Accept: */*\r\n"`).
+    // Placed after User-Agent/Referer and before Accept-Encoding to match curl's
+    // canonical request-header wire order.
+    if !out.headers.contains("Accept") {
+        out.headers.add("Accept", "*/*");
     }
     if let Some(enc) = req.accept_encoding.as_deref() {
         if !out.headers.contains("Accept-Encoding") {
@@ -1660,6 +1707,18 @@ fn record_response(ctx: &mut TransferCtx, resp: HttpResp) -> Result<()> {
     if let Some(ct) = resp.headers.get("content-type") {
         ctx.info.set_content_type(ct);
     }
+
+    // Capture the response reason phrase and header fields for the `-v`/`--trace`
+    // `< ` (HEADER_IN) dump reconstructed by `Easy::perform_transfer`. This is a
+    // handful of small strings and is only consulted by the trace path, so it is
+    // negligible when tracing is off (and `resp` is still owned here — the header
+    // store below moves it).
+    ctx.info.resp_reason = resp.description.clone();
+    ctx.info.resp_headers = resp
+        .headers
+        .iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect();
 
     // Header-size accounting + ceiling enforcement over the response head.
     let connect_only = ctx.request.connect_only;
@@ -1782,6 +1841,10 @@ impl Protocol for HttpHandler {
             // Drive the exchange. `conn` and `sink` are disjoint fields of `ctx`,
             // so both can be borrowed mutably at once (the disjoint-field-borrow
             // pattern documented on `TransferCtx`).
+            // `CURLOPT_FAILONERROR` (`-f`): captured (a `Copy` bool) before the
+            // `conn`/`sink` borrows so the per-version engines can suppress the
+            // body of an HTTP error response (>= 400) at the source.
+            let fail_on_error = ctx.request.fail_on_error;
             let resp = {
                 let conn = ctx.conn.as_deref_mut().ok_or_else(|| {
                     Error::with_context(
@@ -1804,13 +1867,31 @@ impl Protocol for HttpHandler {
                     30 => {
                         let addr = resolve_h3_addr(conn)?;
                         let b = body.map(Bytes::from);
-                        h3::perform(conn, addr, req, b, &mut write_body).await?
+                        h3::perform(conn, addr, req, b, fail_on_error, &mut write_body).await?
                     }
-                    20 => h2::perform(conn, req, body, &mut write_body).await?,
+                    20 => h2::perform(conn, req, body, fail_on_error, &mut write_body).await?,
                     10 => {
-                        h1::perform(conn, req, 0, request_body_for(body), &mut write_body).await?
+                        h1::perform(
+                            conn,
+                            req,
+                            0,
+                            request_body_for(body),
+                            fail_on_error,
+                            &mut write_body,
+                        )
+                        .await?
                     }
-                    _ => h1::perform(conn, req, 1, request_body_for(body), &mut write_body).await?,
+                    _ => {
+                        h1::perform(
+                            conn,
+                            req,
+                            1,
+                            request_body_for(body),
+                            fail_on_error,
+                            &mut write_body,
+                        )
+                        .await?
+                    }
                 }
             };
 

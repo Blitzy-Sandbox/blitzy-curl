@@ -609,11 +609,14 @@ fn string_from_info(ci: CurlInfo, easy: &Easy) -> Option<String> {
         CurlInfo::Scheme => easy.info.conn_scheme.clone(),
         CurlInfo::RedirectUrl => easy.info.wouldredirect.clone(),
         CurlInfo::EffectiveUrl => effective_url(easy),
+        // The response `Content-Type`, recorded by the transfer engine
+        // (`data->info.contenttype`); `None` when the response carried no such
+        // header, which the emitter renders as absent (nothing / `null`).
+        CurlInfo::ContentType => easy.info.contenttype.clone(),
         // No corresponding datum exposed by the core handle yet; curl's getinfo
         // returns a NULL pointer here, which the emitter renders as absent
         // (nothing / `null`).
-        CurlInfo::ContentType
-        | CurlInfo::FtpEntryPath
+        CurlInfo::FtpEntryPath
         | CurlInfo::LocalIp
         | CurlInfo::EffectiveMethod
         | CurlInfo::Referer
@@ -698,17 +701,19 @@ fn long_special(id: WriteoutId, _easy: &Easy, per_result: CurlCode) -> Option<i6
 
 /// `curl_off_t` value for a variable whose `ci` is an off_t-typed `CURLINFO_*`.
 /// getinfo of an off_t always succeeds, so this always yields a value.
-fn offset_from_info(ci: CurlInfo, _easy: &Easy) -> i64 {
+fn offset_from_info(ci: CurlInfo, easy: &Easy) -> i64 {
     match ci {
-        // Sizes/speeds/ids are not yet measured on the core handle; getinfo
-        // returns 0.
-        CurlInfo::ConnId
-        | CurlInfo::SizeDownloadT
-        | CurlInfo::SizeUploadT
-        | CurlInfo::SpeedDownloadT
-        | CurlInfo::SpeedUploadT
-        | CurlInfo::EarlydataSentT
-        | CurlInfo::XferId => 0,
+        // Body bytes received / sent, measured by the transfer engine
+        // (`data->progress.dl.cur_size` / `ul.cur_size`).
+        CurlInfo::SizeDownloadT => easy.info.size_download,
+        CurlInfo::SizeUploadT => easy.info.size_upload,
+        // Average transfer rates over the whole transfer (`bytes / time_total`),
+        // derived from the measured byte counts and the total-time timer.
+        CurlInfo::SpeedDownloadT => speed_per_sec(easy.info.size_download, easy.info.total_time_us),
+        CurlInfo::SpeedUploadT => speed_per_sec(easy.info.size_upload, easy.info.total_time_us),
+        // Connection / transfer ids and early-data counters are not measured on
+        // the core handle; getinfo returns 0.
+        CurlInfo::ConnId | CurlInfo::EarlydataSentT | CurlInfo::XferId => 0,
         _ => 0,
     }
 }
@@ -724,20 +729,42 @@ fn offset_special(id: WriteoutId, _easy: &Easy) -> Option<i64> {
 
 /// Microsecond time value for a `*_TIME_T` `CURLINFO_*`. getinfo of a time
 /// value always succeeds (0 when unmeasured), so this yields `Some`.
-fn time_us(ci: Option<CurlInfo>, _easy: &Easy) -> Option<i64> {
+///
+/// The phase timers are stamped by [`Easy::perform_transfer`] as microsecond
+/// offsets from the transfer clock's origin (curl's `data->progress.t_*`), so an
+/// `Easy` that has not run a transfer reports `0` for every timer — matching
+/// curl's getinfo, which returns `0` for an unmeasured phase.
+fn time_us(ci: Option<CurlInfo>, easy: &Easy) -> Option<i64> {
+    let info = &easy.info;
     match ci {
-        Some(
-            CurlInfo::AppconnectTimeT
-            | CurlInfo::ConnectTimeT
-            | CurlInfo::NamelookupTimeT
-            | CurlInfo::PosttransferTimeT
-            | CurlInfo::PretransferTimeT
-            | CurlInfo::QueueTimeT
-            | CurlInfo::RedirectTimeT
-            | CurlInfo::StarttransferTimeT
-            | CurlInfo::TotalTimeT,
-        ) => Some(0),
+        Some(CurlInfo::NamelookupTimeT) => Some(info.namelookup_time_us),
+        Some(CurlInfo::ConnectTimeT) => Some(info.connect_time_us),
+        Some(CurlInfo::AppconnectTimeT) => Some(info.appconnect_time_us),
+        Some(CurlInfo::PretransferTimeT) => Some(info.pretransfer_time_us),
+        Some(CurlInfo::StarttransferTimeT) => Some(info.starttransfer_time_us),
+        Some(CurlInfo::TotalTimeT) => Some(info.total_time_us),
+        // POSTTRANSFER (the instant the request finished being sent) is not
+        // separately measured; curl's value lies between pretransfer and
+        // starttransfer, so report pretransfer (the request-send origin).
+        Some(CurlInfo::PosttransferTimeT) => Some(info.pretransfer_time_us),
+        // The easy path performs no request queuing, and this single-exchange
+        // driver follows no redirect, so both report `0` (curl reports `0` for
+        // an unqueued, non-redirected transfer).
+        Some(CurlInfo::QueueTimeT | CurlInfo::RedirectTimeT) => Some(0),
         _ => None,
+    }
+}
+
+/// Transfer rate in bytes/second for `CURLINFO_SPEED_DOWNLOAD_T` /
+/// `CURLINFO_SPEED_UPLOAD_T`: `bytes / total_time_seconds`, i.e.
+/// `bytes * 1_000_000 / total_time_us` (curl computes the average speed over the
+/// whole transfer, `data->progress.dl.speed`). Returns `0` when no time has
+/// elapsed (an `Easy` that has not transferred), matching curl's `0` rate.
+fn speed_per_sec(bytes: i64, total_us: i64) -> i64 {
+    if total_us <= 0 {
+        0
+    } else {
+        bytes.saturating_mul(1_000_000) / total_us
     }
 }
 

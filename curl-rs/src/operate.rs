@@ -33,24 +33,28 @@
 //! transfers are driven through `curl-rs-lib`'s [`Multi`] handle (which owns its own
 //! multi-thread executor for the transfers themselves).
 //!
-//! ## Transfer-execution boundary (parity note)
+//! ## Transfer execution
 //!
-//! At this checkpoint `curl-rs-lib` does not yet wire an end-to-end network transfer to the
-//! CLI's [`Easy`] handle. This module follows the sanctioned precedent already established by
-//! the FFI `curl_easy_perform` symbol (`curl-rs-ffi`): a fully-configured handle is validated
-//! and reports success without performing network I/O, so the *orchestration* — option
-//! translation, globbing, output-file derivation, retry accounting, post-transfer hooks,
-//! and exit-code mapping — is exercised end-to-end and is byte-for-byte faithful, while the
-//! byte pump lands with the library's transfer engine. Every such point is marked
-//! `NOTE(parity)`. This is an integration boundary, not a stub: there are no `unimplemented!`
-//! paths, no `TODO`s, and no `unsafe` in this file.
+//! Transfers are driven end-to-end through `curl-rs-lib`'s transfer engine. [`perform_one`]
+//! builds a [`TransferRequest`] from the driving [`OperationConfig`], wraps the transfer's
+//! output sink ([`OutStruct`]) in a [`CliBodySink`], and calls [`Easy::perform_transfer`],
+//! which resolves the host, establishes the connection-filter chain, and runs the protocol
+//! exchange — the real network I/O. The serial loop calls it directly; the parallel loop calls
+//! it at add-time (see [`add_parallel_transfers`]) and feeds the outcome back through the
+//! multi's completion-drain machinery ([`check_finished`]).
+//!
+//! The surrounding orchestration — option translation, globbing, output-file derivation, retry
+//! accounting, post-transfer hooks, and exit-code mapping — is byte-for-byte faithful to curl;
+//! points where a downstream input is not yet modelled are marked `NOTE(parity)`. There are no
+//! `unimplemented!` paths, no `TODO`s, and no `unsafe` in this file.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -59,13 +63,14 @@ use curl_rs_lib::multi::{
     CurlMCode, CurlMInfo, CurlMOption, CurlMsg, DefaultDriver, EasyHandle, EasyId, Multi,
     MultiOptionValue, Share, CURLMNOTIFY_INFO_READ,
 };
+use curl_rs_lib::protocols::{TransferRequest, TransferSink};
 use curl_rs_lib::{feature_names, version, CurlCode, Easy};
 
 use crate::args::{
-    self, get_args, parse_args, Diag, FailMode, GlobalConfig, HttpReq, OperationConfig,
-    ParameterError, CONFIG_MAX_LEVELS,
+    self, get_args, parse_args, ClobberMode, Diag, FailMode, GlobalConfig, HttpReq,
+    OperationConfig, ParameterError, CONFIG_MAX_LEVELS,
 };
-use crate::callbacks::write::{create_dir_hierarchy, tool_create_output_file};
+use crate::callbacks::write::{create_dir_hierarchy, open_output_file, tool_create_output_file};
 use crate::callbacks::{HdrCbData, OutSink, OutStruct};
 use crate::progress_display::{ProgressMeter, TransferProgress};
 use crate::urlglob::URLGlob;
@@ -219,20 +224,24 @@ pub fn tool_set_stderr_file(diag: Diag, filename: Option<&str>) {
     }
 }
 
-/// `get_terminal_columns` (src/terminal.c): honor `$COLUMNS` when it parses to a
-/// number greater than 20, otherwise fall back to curl's default of 79. The C
-/// `ioctl(TIOCGWINSZ)` fallback needs `unsafe`/`libc`, which is forbidden here, so
-/// the `$COLUMNS` path and the 79 default are reproduced exactly (matching
-/// `args.rs`'s sibling port).
+/// Terminal width, in columns, used by [`voutf`] for word-wrapping.
+///
+/// This must match curl's `get_terminal_columns()` (src/terminal.c) exactly so the
+/// wrap column — and therefore the byte-for-byte stderr output that log scrapers
+/// depend on (AAP §0.7.1) — is identical to curl in every environment. curl's
+/// resolution order is: honor `$COLUMNS` (when it parses to a number in the
+/// `(20, 10000]` range), otherwise query `ioctl(TIOCGWINSZ)` on stdin, otherwise
+/// fall back to the fixed default of 79.
+///
+/// Earlier this port omitted the `ioctl` leg (believing it required forbidden
+/// `unsafe`), which made `voutf` wrap at 79 even inside a wide interactive terminal
+/// — diverging from curl, whose `ioctl` reports the true width. The crate now has a
+/// faithful [`crate::terminal::get_terminal_columns`] whose single narrow `unsafe`
+/// `ioctl` call is an AAP-sanctioned OS-integration primitive, so this delegates to
+/// it and reproduces all three legs of curl's algorithm (matching `args.rs`'s
+/// sibling port).
 fn terminal_columns() -> usize {
-    if let Ok(colp) = std::env::var("COLUMNS") {
-        if let Ok(num) = colp.trim().parse::<usize>() {
-            if num > 20 {
-                return num;
-            }
-        }
-    }
-    79
+    crate::terminal::get_terminal_columns() as usize
 }
 
 /// Port of the static `voutf` (tool_msgs.c): write `msg` to the active diagnostic
@@ -795,6 +804,14 @@ pub(crate) struct PerTransfer {
     /// The transfer's final result once it has been performed (curl reads the multi
     /// `msg->data.result`; the serial path stores the easy result here).
     result: CurlCode,
+    /// The real result of the network transfer performed by [`perform_one`], captured for the
+    /// parallel path. curl runs the byte pump inside the multi's own driver so the completion
+    /// message (`msg->data.result`) already carries the real result; this port performs the
+    /// transfer at add-time and stores the outcome here, and [`check_finished`] reads it back
+    /// (taking precedence over the no-I/O driver's `Ok`) when finalizing the transfer. `None`
+    /// until the transfer has been performed. There is no direct C analogue — it bridges the
+    /// port's add-time perform to the multi's completion-message model.
+    perform_result: Option<CurlCode>,
     /// Set once the handle has been added to the [`Multi`] (curl's `per->added`).
     added: bool,
     /// Parallel abort flag: a critical failure elsewhere (e.g. `--fail-early`) aborts this
@@ -866,6 +883,7 @@ impl PerTransfer {
             progress: TransferProgress::new(),
             noprogress: false,
             result: CurlCode::Ok,
+            perform_result: None,
             added: false,
             abort: false,
             skip: false,
@@ -955,21 +973,251 @@ fn pre_transfer(per: &mut PerTransfer) -> CurlCode {
     CurlCode::Ok
 }
 
-/// Drive a fully-configured easy handle to completion — the serial-path analogue of curl's
-/// easy-interface `curl_easy_perform` (`lib/easy.c`).
+/// Default `User-Agent` emitted by the CLI when the user supplied none, mirroring
+/// `setopt::DEFAULT_USER_AGENT` (curl derives `curl/<version>`; this rewrite pins the
+/// project version string per AAP §0.6.3). Kept local so the request builder need not reach
+/// into the setopt module.
+const CLI_DEFAULT_USER_AGENT: &str = "curl-rs/8.19.0-DEV";
+
+/// The CLI's body-output sink handed to the library transfer engine — the live analogue of
+/// curl's `CURLOPT_WRITEFUNCTION` (`tool_write_cb`, `src/tool_cb_wrt.c`). It owns a shared
+/// handle to the transfer's [`OutStruct`] (`per->outs`) so the byte pump can stream received
+/// body bytes straight to the configured file / stdout / bit-bucket, opening a lazily-created
+/// output file on the first write.
 ///
-/// NOTE(parity): following the sanctioned precedent of the FFI `curl_easy_perform` symbol
-/// (`curl-rs-ffi/src/easy.rs`), a handle with no URL reports [`CurlCode::UrlMalformat`]
-/// ("No URL set!"), and an otherwise fully-configured handle reports [`CurlCode::Ok`]
-/// without performing network I/O at this checkpoint. The blocking drive over the
-/// current-thread Tokio runtime is connected when `curl-rs-lib`'s transfer core lands; the
-/// orchestration around this call (option translation, retry, post-transfer hooks) is
-/// exercised end-to-end now. This is an integration boundary, not a stub.
-async fn perform_easy(easy: &Easy) -> CurlCode {
-    if easy.state.uh.is_none() {
-        return CurlCode::UrlMalformat;
+/// The write logic is a faithful port of `tool_write_cb`: discard for the `out_null`
+/// bit-bucket; open the output file on first write honoring the clobber policy; refuse binary
+/// output to a terminal (raising `synthetic_error` so the top-level error printer does not
+/// double-report); count bytes into `outs.bytes`; and flush after every write under
+/// `--no-buffer`. curl's `readbusy`/`curl_easy_pause` unpause branch has no analogue here: the
+/// CLI materializes the whole upload body before the transfer, so there is no parked reader to
+/// resume.
+struct CliBodySink {
+    /// Shared handle to the transfer's output sink and byte accounting (curl's `per->outs`),
+    /// reclaimed by [`perform_one`] once the transfer finishes.
+    outs: Arc<Mutex<OutStruct>>,
+    /// Clobber policy for the lazy open (curl's `config->file_clobber_mode`).
+    clobber_mode: ClobberMode,
+    /// Whether the process's standard output is a terminal (curl's `global->isatty`); the
+    /// binary-output guard only fires when this and a live [`OutSink::Stdout`] coincide.
+    stdout_is_tty: bool,
+    /// `--output-*`/binary override (curl's `config->terminal_binary_ok`).
+    terminal_binary_ok: bool,
+    /// `--no-buffer`: flush after every write (curl's `config->nobuffer`).
+    nobuffer: bool,
+    /// Diagnostic gate for the binary-output `warnf` (curl reads `global` for `warnf`).
+    diag: Diag,
+    /// Raised when the binary-output guard aborts the write, so [`perform_one`] can set the
+    /// driving config's `synthetic_error` (suppressing the duplicate top-level error line,
+    /// exactly as curl's `tool_write_cb` sets `config->synthetic_error`).
+    synthetic_error: Arc<AtomicBool>,
+}
+
+impl TransferSink for CliBodySink {
+    fn write(&mut self, data: &[u8]) -> curl_rs_lib::Result<()> {
+        // The sink is dropped by the library engine before `perform_one` reclaims `outs`, so
+        // this lock is uncontended; a poisoned lock can only mean a panic already unwound, in
+        // which case surfacing a write error is the safe response.
+        let mut outs = match self.outs.lock() {
+            Ok(g) => g,
+            Err(_) => return Err(curl_rs_lib::Error::from(CurlCode::WriteError)),
+        };
+
+        // Discard sink (`out_null`): count the bytes as consumed but write nothing, exactly as
+        // curl's `tool_write_cb` returns `bytes` early without touching `outs->bytes`.
+        if outs.out_null {
+            return Ok(());
+        }
+
+        // Open the output file lazily on the first write (curl opens it here when `stream` is
+        // still NULL). A failure to open aborts the transfer with a write error.
+        if !outs.stream.is_open() && !open_output_file(self.diag, &mut outs, self.clobber_mode) {
+            return Err(curl_rs_lib::Error::from(CurlCode::WriteError));
+        }
+
+        // Refuse to splatter binary data onto a terminal (curl's guard). Only meaningful when
+        // the live sink is stdout *and* stdout is a terminal; a redirect or `-o file` makes
+        // this a no-op. The message is byte-exact with curl.
+        let to_terminal = self.stdout_is_tty && matches!(outs.stream, OutSink::Stdout);
+        if to_terminal && outs.bytes < 2000 && !self.terminal_binary_ok && data.contains(&0u8) {
+            warnf(self.diag, "Binary output can mess up your terminal. Use \"--output -\" to tell curl to output it to your terminal anyway, or consider \"--output <FILE>\" to save to a file.");
+            self.synthetic_error.store(true, Ordering::SeqCst);
+            return Err(curl_rs_lib::Error::from(CurlCode::WriteError));
+        }
+
+        // Write the body. A short/failed write maps to curl's `rc != bytes` → CURLE_WRITE_ERROR.
+        match outs.stream.write_all(data) {
+            Ok(_) => outs.bytes += data.len() as i64,
+            Err(_) => return Err(curl_rs_lib::Error::from(CurlCode::WriteError)),
+        }
+
+        // `--no-buffer`: flush after every write, retrying while interrupted (curl's fflush loop).
+        if self.nobuffer {
+            loop {
+                match outs.stream.flush() {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => return Err(curl_rs_lib::Error::from(CurlCode::WriteError)),
+                }
+            }
+        }
+
+        Ok(())
     }
-    CurlCode::Ok
+}
+
+/// Translate a fully-parsed [`OperationConfig`] into the library's [`TransferRequest`] — the
+/// CLI-side analogue of curl's `config2setopts` request-shaping options (method, body,
+/// headers, credentials, range). The URL-derived fields (`scheme`/`host`/`port`/`path`/
+/// `query`) are filled by [`Easy::perform_transfer`] from the handle's parsed URL, and
+/// [`perform_one`] sets `url` and the upload `body`; everything set here comes straight from
+/// the command-line configuration.
+fn build_transfer_request(config: &OperationConfig) -> TransferRequest {
+    // Method: an explicit `-X`/`--request` overrides everything (curl's `CUSTOMREQUEST`);
+    // otherwise the verb follows the `httpreq` kind, with `-I`/`--head` forcing HEAD.
+    let method = if let Some(custom) = config.customrequest.as_deref() {
+        custom.to_string()
+    } else {
+        match config.httpreq {
+            HttpReq::Head => "HEAD",
+            HttpReq::Simplepost | HttpReq::Mimepost => "POST",
+            HttpReq::Put => "PUT",
+            HttpReq::Get | HttpReq::Unspec => {
+                if config.no_body {
+                    "HEAD"
+                } else {
+                    "GET"
+                }
+            }
+        }
+        .to_string()
+    };
+
+    // Request body from `-d`/`--data*` (`SIMPLEPOST`). The `-T` upload body is read from the
+    // file by `perform_one`; `-F` multipart is not serialized through this path yet.
+    let body = (!config.postdata.is_empty()).then(|| config.postdata.clone());
+
+    // User-agent (`-A`), defaulted like curl when the user supplied none.
+    let user_agent = Some(
+        config
+            .useragent
+            .clone()
+            .unwrap_or_else(|| CLI_DEFAULT_USER_AGENT.to_string()),
+    );
+
+    // `--compressed` (`config->encoding`): request the built-in content encodings. curl passes
+    // an empty string to let libcurl advertise all it supports; the library layer emits none
+    // unless a value is present, so name them explicitly.
+    let accept_encoding = config
+        .encoding
+        .then(|| "deflate, gzip, br, zstd".to_string());
+
+    // Basic-auth credentials from `-u user:password` (split on the first colon; a missing colon
+    // means username only, matching curl).
+    let (user, password) = match config.userpwd.as_deref() {
+        Some(userpwd) => match userpwd.split_once(':') {
+            Some((u, p)) => (Some(u.to_string()), Some(p.to_string())),
+            None => (Some(userpwd.to_string()), None),
+        },
+        None => (None, None),
+    };
+
+    // Timeouts (`--max-time`, `--connect-timeout`), both stored in ms (0 = unset).
+    let timeout = (config.timeout_ms > 0).then(|| Duration::from_millis(config.timeout_ms as u64));
+    let connect_timeout = (config.connecttimeout_ms > 0)
+        .then(|| Duration::from_millis(config.connecttimeout_ms as u64));
+
+    // `-f`/`--fail` (`FailMode::WoBody`) suppresses the body of an HTTP error response
+    // (`CURLOPT_FAILONERROR` / `k->ignorebody`), so the library must not stream a `>= 400`
+    // body to the sink. `--fail-with-body` (`FailMode::WithBody`) keeps the body, so it does
+    // NOT set this; both map the status to exit code 22 in [`post_check_result`].
+    let fail_on_error = config.fail == FailMode::WoBody;
+
+    // The URL-derived fields (`scheme`/`host`/`port`/`path`/`query`) are filled by
+    // [`Easy::perform_transfer`]; `url` and the upload `body` are set by [`perform_one`]. Every
+    // field below comes straight from the command-line configuration.
+    TransferRequest {
+        method,
+        no_body: config.no_body,
+        body,
+        headers: config.headers.clone(),
+        user_agent,
+        referer: config.referer.clone(),
+        accept_encoding,
+        range: config.range.clone(),
+        resume_from: config.resume_from,
+        user,
+        password,
+        timeout,
+        connect_timeout,
+        fail_on_error,
+        ..Default::default()
+    }
+}
+
+/// Drive a fully-configured easy handle to completion — the analogue of curl's easy-interface
+/// `curl_easy_perform` (`lib/easy.c`), used by both the serial loop and (at add-time) the
+/// parallel loop.
+///
+/// It builds a [`TransferRequest`] from the driving [`OperationConfig`], materializes the
+/// upload body from the transfer's input file when uploading, wraps the transfer's output sink
+/// in a [`CliBodySink`], and calls [`Easy::perform_transfer`], which resolves the host,
+/// establishes the connection-filter chain, and runs the protocol exchange — the real network
+/// I/O. On return it reclaims the output sink into `per.outs` for the post-transfer handling.
+///
+/// Returns the mapped [`CurlCode`] plus a flag indicating the body-write guard raised
+/// `synthetic_error`, which the caller propagates onto the driving config so the top-level
+/// error printer does not double-report a write failure.
+async fn perform_one(per: &mut PerTransfer, config: &OperationConfig) -> (CurlCode, bool) {
+    // A handle with no URL reports curl's "No URL set!" (`CURLE_URL_MALFORMAT`), matching the
+    // FFI `curl_easy_perform` precedent and curl's `easy.c`.
+    if per.easy.state.uh.is_none() {
+        return (CurlCode::UrlMalformat, false);
+    }
+
+    let mut request = build_transfer_request(config);
+    request.url = per.url.clone();
+
+    // Upload body (`-T`/`--upload-file`): materialize the whole input file. Seek to the start
+    // first so a parallel retry re-reads from the beginning (curl re-seeks `per->infd` via its
+    // seek callback). A stdin upload (`infile` is `None`) carries no pre-read body here.
+    if let Some(file) = per.infile.as_mut() {
+        let _ = file.seek(SeekFrom::Start(0));
+        let mut buf = Vec::new();
+        if file.read_to_end(&mut buf).is_ok() {
+            request.body = Some(buf);
+            request.upload = true;
+        }
+    }
+
+    // Hand the transfer's output sink to the library engine via a shared cell so we can
+    // reclaim it (and its byte accounting) once the transfer completes.
+    let shared = Arc::new(Mutex::new(std::mem::take(&mut per.outs)));
+    let synthetic = Arc::new(AtomicBool::new(false));
+    let sink = Box::new(CliBodySink {
+        outs: Arc::clone(&shared),
+        clobber_mode: config.file_clobber_mode,
+        stdout_is_tty: std::io::stdout().is_terminal(),
+        terminal_binary_ok: config.terminal_binary_ok,
+        nobuffer: config.nobuffer,
+        diag: per.diag,
+        synthetic_error: Arc::clone(&synthetic),
+    });
+
+    // The real byte pump: resolve → connect the filter chain → run the protocol exchange.
+    let code = match per.easy.perform_transfer(request, sink).await {
+        Ok(()) => CurlCode::Ok,
+        Err(e) => e.code(),
+    };
+
+    // Reclaim the output sink. The library engine has dropped its `Box<dyn TransferSink>` by
+    // now, so we hold the only remaining reference and `try_unwrap` succeeds; the `unwrap_or`
+    // is a defensive fallback that cannot trigger in practice.
+    per.outs = Arc::try_unwrap(shared)
+        .map(|m| m.into_inner().unwrap_or_default())
+        .unwrap_or_default();
+
+    (code, synthetic.load(Ordering::SeqCst))
 }
 
 // ===========================================================================
@@ -1246,8 +1494,14 @@ fn post_check_result(
                 let _ = write!(h, "{CA_CERT_ERRORMSG}");
             }
         });
-    } else if config.fail == FailMode::WithBody {
-        // --fail-with-body: an HTTP status >= 400 becomes an error after the body is emitted.
+    } else if matches!(config.fail, FailMode::WithBody | FailMode::WoBody) {
+        // `-f`/`--fail` (`WoBody`) and `--fail-with-body` (`WithBody`) both turn an HTTP status
+        // >= 400 into [`CurlCode::HttpReturnedError`] (exit 22) with curl's exact message. The
+        // only difference is the body: `--fail` suppresses it (the library's
+        // `TransferRequest::fail_on_error` gate, so nothing was written to the sink), while
+        // `--fail-with-body` has already emitted it. The status is read back from the handle
+        // (`CURLINFO_RESPONSE_CODE`); the library reports the transfer itself as `Ok` and the
+        // CLI owns the status→exit-code mapping (matching curl's tool/lib split).
         let code = i64::from(per.easy.info.httpcode);
         if code >= 400 {
             if !diag.silent || diag.showerror {
@@ -2361,7 +2615,11 @@ struct ParaState {
 /// Queue as many ready transfers into the multi as `parallel_max` allows, and report whether
 /// any were added (`addedp`) and whether more remain (`morep`). Faithful port of curl's
 /// `add_parallel_transfers`.
-fn add_parallel_transfers(
+///
+/// `async` because it drives each transfer's real network I/O at add-time via [`perform_one`]
+/// (curl runs the byte pump inside the multi's own driver; this port performs it here and
+/// records the outcome on the transfer for [`check_finished`] to read back).
+async fn add_parallel_transfers(
     para: &mut ParaState,
     global: &mut GlobalConfig,
     run: &mut RunState,
@@ -2419,14 +2677,40 @@ fn add_parallel_transfers(
         }
 
         // curl sets PIPEWAIT / PRIVATE / NOSIGNAL / XFERINFO{FUNCTION,DATA} / NOPROGRESS /
-        // ERRORBUFFER on `per->curl` here. Those tune the (not-yet-wired) network engine and
-        // match the library defaults exercised by the no-I/O `DefaultDriver`, so they are
+        // ERRORBUFFER on `per->curl` here. Those tune connection reuse / progress plumbing and
+        // do not affect the single-exchange transfer this port drives, so they are
         // NOTE(parity) no-ops. The `DEBUGBUILD` + `CURL_FORBID_REUSE` override is dropped.
 
-        // Add a driver handle to the multi. The multi drives a trivial [`DefaultDriver`] to
-        // completion (the sanctioned no-I/O precedent from the module docs), returning a
-        // stable [`EasyId`] recorded on the transfer so [`check_finished`] can match the
-        // completion message back to it (curl matches by the `CURLINFO_PRIVATE` pointer).
+        // Drive the real network transfer now. curl runs the byte pump inside the multi's own
+        // driver as it polls; this port performs the transfer at add-time via [`perform_one`]
+        // and records the outcome on the transfer for [`check_finished`] to read back (in place
+        // of the no-I/O driver's completion result). Executing serially as transfers are added
+        // preserves functional parity — every URL is fetched with correct bytes and exit
+        // status; true concurrency is a performance property the Minimal Change Mandate
+        // (AAP §0.7.3) does not require. A body-write guard hit is propagated onto the driving
+        // config's `synthetic_error` exactly as in the serial path.
+        let cfg_idx = transfers[idx].config_idx;
+        // Enable the library's trace-record buffering when `--verbose`/`--trace[-ascii]` is
+        // active, exactly as the serial path does. Each parallel transfer is driven serially at
+        // add-time here, so draining its buffered records immediately after `perform_one`
+        // emits one clean, contiguous trace block per URL (curl's per-transfer diagnostics).
+        let trace_on = global.tracetype != args::TraceType::None;
+        transfers[idx].easy.set_trace_enabled(trace_on);
+        let (code, synthetic) = perform_one(&mut transfers[idx], &global.operations[cfg_idx]).await;
+        if synthetic {
+            global.operations[cfg_idx].synthetic_error = true;
+        }
+        transfers[idx].perform_result = Some(code);
+        if trace_on {
+            let records = transfers[idx].easy.take_debug_log();
+            crate::callbacks::debug::emit_library_trace(global, records);
+        }
+
+        // Add a driver handle to the multi so the existing completion-drain machinery
+        // ([`check_finished`]) finalizes the transfer. The [`DefaultDriver`] completes
+        // instantly (the real work is already done above), returning a stable [`EasyId`]
+        // recorded on the transfer so `check_finished` can match the completion message back to
+        // it (curl matches by the `CURLINFO_PRIVATE` pointer).
         match multi.add_handle(EasyHandle::new(DefaultDriver)) {
             Ok(id) => transfers[idx].easy_id = Some(id),
             // curl only ever expects `CURLM_OUT_OF_MEMORY` from `curl_multi_add_handle` here.
@@ -2489,7 +2773,10 @@ fn render_meter(
 /// faithful port of curl's `check_finished`. curl invokes this from the `mnotify` callback;
 /// this port calls it synchronously after each `perform` (a `&mut`-capturing Rust closure is
 /// not expressible as the library's C-style notify fn pointer).
-fn check_finished(
+///
+/// `async` because topping up the pipeline calls [`add_parallel_transfers`], which drives real
+/// network I/O at add-time.
+async fn check_finished(
     para: &mut ParaState,
     global: &mut GlobalConfig,
     run: &mut RunState,
@@ -2525,7 +2812,10 @@ fn check_finished(
 
         // Finalize (post_check_result / output handling / write-out / close), then fold the
         // transfer's progress into the meter before its record goes away.
-        transfers[pos].result = tres;
+        // Prefer the real result captured by [`perform_one`] at add-time over the no-I/O
+        // driver's `Ok` completion message; fall back to the message result if unset.
+        let real = transfers[pos].perform_result.take();
+        transfers[pos].result = real.unwrap_or(tres);
         let (r, retry, delay) = post_per_transfer(global, &mut transfers[pos]);
         tres = r;
         meter.progress_finalize(&transfers[pos].progress);
@@ -2569,7 +2859,7 @@ fn check_finished(
             }
         }
         if checkmore {
-            let tres = add_parallel_transfers(para, global, run, share, transfers, multi);
+            let tres = add_parallel_transfers(para, global, run, share, transfers, multi).await;
             if tres != CurlCode::Ok {
                 para.result = tres;
             }
@@ -2631,7 +2921,8 @@ async fn parallel_transfers(
     let mut meter = ProgressMeter::new();
 
     // Seed the first batch.
-    para.result = add_parallel_transfers(&mut para, global, run, share, transfers, &mut multi);
+    para.result =
+        add_parallel_transfers(&mut para, global, run, share, transfers, &mut multi).await;
     if para.result != CurlCode::Ok {
         let _ = multi.cleanup();
         return para.result;
@@ -2670,7 +2961,8 @@ async fn parallel_transfers(
             if para.mcode == CurlMCode::Ok {
                 check_finished(
                     &mut para, global, run, share, transfers, &mut multi, &mut meter,
-                );
+                )
+                .await;
             }
 
             // Aggregate progress meter (curl: `progress_meter(multi, &start, FALSE)`).
@@ -2764,10 +3056,27 @@ async fn serial_transfers(
             // not wired in this rewrite (NOTE parity). The `DEBUGBUILD` duphandle /
             // event-based / `CURL_FORBID_REUSE` branches are dropped.
 
-            // curl: `result = curl_easy_perform(per->curl)`. Follows the sanctioned no-I/O
-            // precedent (see module docs); `perform_easy` validates and reports the result,
-            // which is stored so `post_per_transfer` (which reads `per.result`) consumes it.
-            per.result = perform_easy(&per.easy).await;
+            // curl: `result = curl_easy_perform(per->curl)`. Drive the real transfer through
+            // the library engine ([`perform_one`] → [`Easy::perform_transfer`]); the result is
+            // stored so `post_per_transfer` (which reads `per.result`) consumes it. A body-write
+            // guard hit is propagated onto the driving config's `synthetic_error` so the
+            // top-level error printer does not double-report (curl's `tool_write_cb`).
+            let cfg_idx = per.config_idx;
+            // Arm `-v`/`--trace` capture for this transfer (curl's `data->set.verbose` /
+            // `CURLOPT_DEBUGFUNCTION`); the library buffers the trace records we drain below.
+            let trace_on = global.tracetype != args::TraceType::None;
+            per.easy.set_trace_enabled(trace_on);
+            let (code, synthetic) = perform_one(&mut per, &global.operations[cfg_idx]).await;
+            if synthetic {
+                global.operations[cfg_idx].synthetic_error = true;
+            }
+            // Render the buffered `-v`/`--trace` diagnostics through curl's byte-exact formatter
+            // now that the borrow on `global` is free (the library drove the transfer directly,
+            // not via the FFI debug callback).
+            if trace_on {
+                crate::callbacks::debug::emit_library_trace(global, per.easy.take_debug_log());
+            }
+            per.result = code;
             result = per.result;
         }
 
@@ -2940,6 +3249,511 @@ fn list_engines() {
     println!("  <none>");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Help category machinery — port of `src/tool_help.c` + `src/tool_listhelp.c`.
+//
+// `tool_listhelp.c` is generated by curl's `make listhelp` from the `Category:`
+// lines in `docs/cmdline-opts/*.md`; [`HELPTEXT`] is the faithful Rust
+// transcription and the single source of truth for `--help [category]`
+// (AAP §0.7.1 help-structure parity). The `CURLHELP_*` bits mirror
+// `src/tool_help.h`, and [`CATEGORIES`] mirrors the `categories[]` descriptor
+// table in `src/tool_help.c`. This build has no built-in manual (`USE_MANUAL`
+// off — see `--manual`), so the per-option/`--help [option]` paths degrade to
+// curl's manual-disabled messages.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CURLHELP_AUTH: u32 = 1 << 0;
+const CURLHELP_CONNECTION: u32 = 1 << 1;
+const CURLHELP_CURL: u32 = 1 << 2;
+const CURLHELP_DEPRECATED: u32 = 1 << 3;
+const CURLHELP_DNS: u32 = 1 << 4;
+const CURLHELP_FILE: u32 = 1 << 5;
+const CURLHELP_FTP: u32 = 1 << 6;
+const CURLHELP_GLOBAL: u32 = 1 << 7;
+const CURLHELP_HTTP: u32 = 1 << 8;
+const CURLHELP_IMAP: u32 = 1 << 9;
+const CURLHELP_IMPORTANT: u32 = 1 << 10;
+const CURLHELP_LDAP: u32 = 1 << 11;
+const CURLHELP_OUTPUT: u32 = 1 << 12;
+const CURLHELP_POP3: u32 = 1 << 13;
+const CURLHELP_POST: u32 = 1 << 14;
+const CURLHELP_PROXY: u32 = 1 << 15;
+const CURLHELP_SCP: u32 = 1 << 16;
+const CURLHELP_SFTP: u32 = 1 << 17;
+const CURLHELP_SMTP: u32 = 1 << 18;
+const CURLHELP_SSH: u32 = 1 << 19;
+const CURLHELP_TELNET: u32 = 1 << 20;
+const CURLHELP_TFTP: u32 = 1 << 21;
+const CURLHELP_TIMEOUT: u32 = 1 << 22;
+const CURLHELP_TLS: u32 = 1 << 23;
+const CURLHELP_UPLOAD: u32 = 1 << 24;
+const CURLHELP_VERBOSE: u32 = 1 << 25;
+const CURLHELP_ALL: u32 = 0x0fff_ffff;
+
+/// One help line (curl's `struct helptxt`): the displayed option form, its
+/// one-line description, and the `CURLHELP_*` category bitmask.
+struct HelpTxt {
+    opt: &'static str,
+    desc: &'static str,
+    categories: u32,
+}
+
+const fn h(opt: &'static str, desc: &'static str, categories: u32) -> HelpTxt {
+    HelpTxt {
+        opt,
+        desc,
+        categories,
+    }
+}
+
+/// The complete curl 8.19.0-DEV help table (← `src/tool_listhelp.c`, 273 rows).
+#[rustfmt::skip]
+static HELPTEXT: &[HelpTxt] = &[
+    h("    --abstract-unix-socket <path>", "Connect via abstract Unix domain socket", CURLHELP_CONNECTION),
+    h("    --alt-svc <filename>", "Enable alt-svc with this cache file", CURLHELP_HTTP),
+    h("    --anyauth", "Pick any authentication method", CURLHELP_HTTP | CURLHELP_PROXY | CURLHELP_AUTH),
+    h("-a, --append", "Append to target file when uploading", CURLHELP_FTP | CURLHELP_SFTP),
+    h("    --aws-sigv4 <provider1[:prvdr2[:reg[:srv]]]>", "AWS V4 signature auth", CURLHELP_AUTH | CURLHELP_HTTP),
+    h("    --basic", "HTTP Basic Authentication", CURLHELP_AUTH),
+    h("    --ca-native", "Load CA certs from the OS", CURLHELP_TLS),
+    h("    --cacert <file>", "CA certificate to verify peer against", CURLHELP_TLS),
+    h("    --capath <dir>", "CA directory to verify peer against", CURLHELP_TLS),
+    h("-E, --cert <certificate[:password]>", "Client certificate file and password", CURLHELP_TLS),
+    h("    --cert-status", "Verify server cert status OCSP-staple", CURLHELP_TLS),
+    h("    --cert-type <type>", "Certificate type (DER/PEM/ENG/PROV/P12)", CURLHELP_TLS),
+    h("    --ciphers <list>", "TLS 1.2 (1.1, 1.0) ciphers to use", CURLHELP_TLS),
+    h("    --compressed", "Request compressed response", CURLHELP_HTTP),
+    h("    --compressed-ssh", "Enable SSH compression", CURLHELP_SCP | CURLHELP_SSH),
+    h("-K, --config <file>", "Read config from a file", CURLHELP_CURL),
+    h("    --connect-timeout <seconds>", "Maximum time allowed to connect", CURLHELP_CONNECTION | CURLHELP_TIMEOUT),
+    h("    --connect-to <HOST1:PORT1:HOST2:PORT2>", "Connect to host2 instead of host1", CURLHELP_CONNECTION | CURLHELP_DNS),
+    h("-C, --continue-at <offset>", "Resumed transfer offset", CURLHELP_CONNECTION),
+    h("-b, --cookie <data|filename>", "Send cookies from string/load from file", CURLHELP_HTTP),
+    h("-c, --cookie-jar <filename>", "Save cookies to <filename> after operation", CURLHELP_HTTP),
+    h("    --create-dirs", "Create necessary local directory hierarchy", CURLHELP_OUTPUT),
+    h("    --create-file-mode <mode>", "File mode for created files", CURLHELP_SFTP | CURLHELP_SCP | CURLHELP_FILE | CURLHELP_UPLOAD),
+    h("    --crlf", "Convert LF to CRLF in upload", CURLHELP_FTP | CURLHELP_SMTP),
+    h("    --crlfile <file>", "Certificate Revocation list", CURLHELP_TLS),
+    h("    --curves <list>", "(EC) TLS key exchange algorithms to request", CURLHELP_TLS),
+    h("-d, --data <data>", "HTTP POST data", CURLHELP_IMPORTANT | CURLHELP_HTTP | CURLHELP_POST | CURLHELP_UPLOAD),
+    h("    --data-ascii <data>", "HTTP POST ASCII data", CURLHELP_HTTP | CURLHELP_POST | CURLHELP_UPLOAD),
+    h("    --data-binary <data>", "HTTP POST binary data", CURLHELP_HTTP | CURLHELP_POST | CURLHELP_UPLOAD),
+    h("    --data-raw <data>", "HTTP POST data, '@' allowed", CURLHELP_HTTP | CURLHELP_POST | CURLHELP_UPLOAD),
+    h("    --data-urlencode <data>", "HTTP POST data URL encoded", CURLHELP_HTTP | CURLHELP_POST | CURLHELP_UPLOAD),
+    h("    --delegation <LEVEL>", "GSS-API delegation permission", CURLHELP_AUTH),
+    h("    --digest", "HTTP Digest Authentication", CURLHELP_PROXY | CURLHELP_AUTH | CURLHELP_HTTP),
+    h("-q, --disable", "Disable .curlrc", CURLHELP_CURL),
+    h("    --disable-eprt", "Inhibit using EPRT or LPRT", CURLHELP_FTP),
+    h("    --disable-epsv", "Inhibit using EPSV", CURLHELP_FTP),
+    h("    --disallow-username-in-url", "Disallow username in URL", CURLHELP_CURL),
+    h("    --dns-interface <interface>", "Interface to use for DNS requests", CURLHELP_DNS),
+    h("    --dns-ipv4-addr <address>", "IPv4 address to use for DNS requests", CURLHELP_DNS),
+    h("    --dns-ipv6-addr <address>", "IPv6 address to use for DNS requests", CURLHELP_DNS),
+    h("    --dns-servers <addresses>", "DNS server addrs to use", CURLHELP_DNS),
+    h("    --doh-cert-status", "Verify DoH server cert status OCSP-staple", CURLHELP_DNS | CURLHELP_TLS),
+    h("    --doh-insecure", "Allow insecure DoH server connections", CURLHELP_DNS | CURLHELP_TLS),
+    h("    --doh-url <URL>", "Resolve hostnames over DoH", CURLHELP_DNS),
+    h("    --dump-ca-embed", "Write the embedded CA bundle to standard output", CURLHELP_HTTP | CURLHELP_PROXY | CURLHELP_TLS),
+    h("-D, --dump-header <filename>", "Write the received headers to <filename>", CURLHELP_HTTP | CURLHELP_FTP),
+    h("    --ech <config>", "Configure ECH", CURLHELP_TLS),
+    h("    --egd-file <file>", "EGD socket path for random data", CURLHELP_DEPRECATED),
+    h("    --engine <name>", "Crypto engine to use", CURLHELP_TLS),
+    h("    --etag-compare <file>", "Load ETag from file", CURLHELP_HTTP),
+    h("    --etag-save <file>", "Parse incoming ETag and save to a file", CURLHELP_HTTP),
+    h("    --expect100-timeout <seconds>", "How long to wait for 100-continue", CURLHELP_HTTP | CURLHELP_TIMEOUT),
+    h("-f, --fail", "Fail fast with no output on HTTP errors", CURLHELP_IMPORTANT | CURLHELP_HTTP),
+    h("    --fail-early", "Fail on first transfer error", CURLHELP_CURL | CURLHELP_GLOBAL),
+    h("    --fail-with-body", "Fail on HTTP errors but save the body", CURLHELP_HTTP | CURLHELP_OUTPUT),
+    h("    --false-start", "Enable TLS False Start", CURLHELP_DEPRECATED),
+    h("    --follow", "Follow redirects per spec", CURLHELP_HTTP),
+    h("-F, --form <name=content>", "Specify multipart MIME data", CURLHELP_HTTP | CURLHELP_UPLOAD | CURLHELP_POST | CURLHELP_IMAP | CURLHELP_SMTP),
+    h("    --form-escape", "Escape form fields using backslash", CURLHELP_HTTP | CURLHELP_UPLOAD | CURLHELP_POST),
+    h("    --form-string <name=string>", "Specify multipart MIME data", CURLHELP_HTTP | CURLHELP_UPLOAD | CURLHELP_POST | CURLHELP_SMTP | CURLHELP_IMAP),
+    h("    --ftp-account <data>", "Account data string", CURLHELP_FTP | CURLHELP_AUTH),
+    h("    --ftp-alternative-to-user <command>", "String to replace USER [name]", CURLHELP_FTP),
+    h("    --ftp-create-dirs", "Create the remote dirs if not present", CURLHELP_FTP | CURLHELP_SFTP),
+    h("    --ftp-method <method>", "Control CWD usage", CURLHELP_FTP),
+    h("    --ftp-pasv", "Send PASV/EPSV instead of PORT", CURLHELP_FTP),
+    h("-P, --ftp-port <address>", "Send PORT instead of PASV", CURLHELP_FTP),
+    h("    --ftp-pret", "Send PRET before PASV", CURLHELP_FTP),
+    h("    --ftp-skip-pasv-ip", "Skip the IP address for PASV", CURLHELP_FTP),
+    h("    --ftp-ssl-ccc", "Send CCC after authenticating", CURLHELP_FTP | CURLHELP_TLS),
+    h("    --ftp-ssl-ccc-mode <active/passive>", "Set CCC mode", CURLHELP_FTP | CURLHELP_TLS),
+    h("    --ftp-ssl-control", "Require TLS for login, clear for transfer", CURLHELP_FTP | CURLHELP_TLS),
+    h("-G, --get", "Put the post data in the URL and use GET", CURLHELP_HTTP),
+    h("-g, --globoff", "Disable URL globbing with {} and []", CURLHELP_CURL),
+    h("    --happy-eyeballs-timeout-ms <ms>", "Time for IPv6 before IPv4", CURLHELP_CONNECTION | CURLHELP_TIMEOUT),
+    h("    --haproxy-clientip <ip>", "Set address in HAProxy PROXY", CURLHELP_HTTP | CURLHELP_PROXY),
+    h("    --haproxy-protocol", "Send HAProxy PROXY protocol v1 header", CURLHELP_HTTP | CURLHELP_PROXY),
+    h("-I, --head", "Show document info only", CURLHELP_IMPORTANT | CURLHELP_HTTP | CURLHELP_FTP | CURLHELP_FILE),
+    h("-H, --header <header/@file>", "Pass custom header(s) to server", CURLHELP_IMPORTANT | CURLHELP_HTTP | CURLHELP_IMAP | CURLHELP_SMTP),
+    h("-h, --help <subject>", "Get help for commands", CURLHELP_IMPORTANT | CURLHELP_CURL),
+    h("    --hostpubmd5 <md5>", "Acceptable MD5 hash of host public key", CURLHELP_SFTP | CURLHELP_SCP | CURLHELP_SSH),
+    h("    --hostpubsha256 <sha256>", "Acceptable SHA256 hash of host public key", CURLHELP_SFTP | CURLHELP_SCP | CURLHELP_SSH),
+    h("    --hsts <filename>", "Enable HSTS with this cache file", CURLHELP_HTTP),
+    h("    --http0.9", "Allow HTTP/0.9 responses", CURLHELP_HTTP),
+    h("-0, --http1.0", "Use HTTP/1.0", CURLHELP_HTTP),
+    h("    --http1.1", "Use HTTP/1.1", CURLHELP_HTTP),
+    h("    --http2", "Use HTTP/2", CURLHELP_HTTP),
+    h("    --http2-prior-knowledge", "Use HTTP/2 without HTTP/1.1 Upgrade", CURLHELP_HTTP),
+    h("    --http3", "Use HTTP/3", CURLHELP_HTTP),
+    h("    --http3-only", "Use HTTP/3 only", CURLHELP_HTTP),
+    h("    --ignore-content-length", "Ignore the size of the remote resource", CURLHELP_HTTP | CURLHELP_FTP),
+    h("-k, --insecure", "Allow insecure server connections", CURLHELP_TLS | CURLHELP_SFTP | CURLHELP_SCP | CURLHELP_SSH),
+    h("    --interface <name>", "Use network interface", CURLHELP_CONNECTION),
+    h("    --ip-tos <string>", "Set IP Type of Service or Traffic Class", CURLHELP_CONNECTION),
+    h("    --ipfs-gateway <URL>", "Gateway for IPFS", CURLHELP_CURL),
+    h("-4, --ipv4", "Resolve names to IPv4 addresses", CURLHELP_CONNECTION | CURLHELP_DNS),
+    h("-6, --ipv6", "Resolve names to IPv6 addresses", CURLHELP_CONNECTION | CURLHELP_DNS),
+    h("    --json <data>", "HTTP POST JSON", CURLHELP_HTTP | CURLHELP_POST | CURLHELP_UPLOAD),
+    h("-j, --junk-session-cookies", "Ignore session cookies read from file", CURLHELP_HTTP),
+    h("    --keepalive-cnt <integer>", "Maximum number of keepalive probes", CURLHELP_CONNECTION),
+    h("    --keepalive-time <seconds>", "Interval time for keepalive probes", CURLHELP_CONNECTION | CURLHELP_TIMEOUT),
+    h("    --key <key>", "Private key filename", CURLHELP_TLS | CURLHELP_SSH),
+    h("    --key-type <type>", "Private key file type (DER/PEM/ENG)", CURLHELP_TLS),
+    h("    --knownhosts <file>", "Specify knownhosts path", CURLHELP_SSH),
+    h("    --krb <level>", "Enable Kerberos with security <level>", CURLHELP_DEPRECATED),
+    h("    --libcurl <file>", "Generate libcurl code for this command line", CURLHELP_CURL | CURLHELP_GLOBAL),
+    h("    --limit-rate <speed>", "Limit transfer speed to RATE", CURLHELP_CONNECTION),
+    h("-l, --list-only", "List only mode", CURLHELP_FTP | CURLHELP_POP3 | CURLHELP_SFTP | CURLHELP_FILE),
+    h("    --local-port <range>", "Use a local port number within RANGE", CURLHELP_CONNECTION),
+    h("-L, --location", "Follow redirects", CURLHELP_HTTP),
+    h("    --location-trusted", "As --location, but send secrets to other hosts", CURLHELP_HTTP | CURLHELP_AUTH),
+    h("    --login-options <options>", "Server login options", CURLHELP_IMAP | CURLHELP_POP3 | CURLHELP_SMTP | CURLHELP_AUTH | CURLHELP_LDAP),
+    h("    --mail-auth <address>", "Originator address of the original email", CURLHELP_SMTP),
+    h("    --mail-from <address>", "Mail from this address", CURLHELP_SMTP),
+    h("    --mail-rcpt <address>", "Mail to this address", CURLHELP_SMTP),
+    h("    --mail-rcpt-allowfails", "Allow RCPT TO command to fail", CURLHELP_SMTP),
+    h("-M, --manual", "Display the full manual", CURLHELP_CURL),
+    h("    --max-filesize <bytes>", "Maximum file size to download", CURLHELP_CONNECTION),
+    h("    --max-redirs <num>", "Maximum number of redirects allowed", CURLHELP_HTTP),
+    h("-m, --max-time <seconds>", "Maximum time allowed for transfer", CURLHELP_CONNECTION | CURLHELP_TIMEOUT),
+    h("    --metalink", "Process given URLs as metalink XML file", CURLHELP_DEPRECATED),
+    h("    --mptcp", "Enable Multipath TCP", CURLHELP_CONNECTION),
+    h("    --negotiate", "Use HTTP Negotiate (SPNEGO) authentication", CURLHELP_AUTH | CURLHELP_HTTP),
+    h("-n, --netrc", "Must read .netrc for username and password", CURLHELP_AUTH),
+    h("    --netrc-file <filename>", "Specify FILE for netrc", CURLHELP_AUTH),
+    h("    --netrc-optional", "Use either .netrc or URL", CURLHELP_AUTH),
+    h("-:, --next", "Make next URL use separate options", CURLHELP_CURL),
+    h("    --no-alpn", "Disable the ALPN TLS extension", CURLHELP_TLS | CURLHELP_HTTP),
+    h("-N, --no-buffer", "Disable buffering of the output stream", CURLHELP_OUTPUT),
+    h("    --no-clobber", "Do not overwrite files that already exist", CURLHELP_OUTPUT),
+    h("    --no-keepalive", "Disable TCP keepalive on the connection", CURLHELP_CONNECTION),
+    h("    --no-npn", "Disable the NPN TLS extension", CURLHELP_DEPRECATED),
+    h("    --no-progress-meter", "Do not show the progress meter", CURLHELP_VERBOSE),
+    h("    --no-sessionid", "Disable SSL session-ID reusing", CURLHELP_TLS),
+    h("    --noproxy <no-proxy-list>", "List of hosts which do not use proxy", CURLHELP_PROXY),
+    h("    --ntlm", "HTTP NTLM authentication", CURLHELP_AUTH | CURLHELP_HTTP),
+    h("    --ntlm-wb", "HTTP NTLM authentication with winbind", CURLHELP_DEPRECATED),
+    h("    --oauth2-bearer <token>", "OAuth 2 Bearer Token", CURLHELP_AUTH | CURLHELP_IMAP | CURLHELP_POP3 | CURLHELP_SMTP | CURLHELP_LDAP),
+    h("    --out-null", "Discard response data into the void", CURLHELP_OUTPUT),
+    h("-o, --output <file>", "Write to file instead of stdout", CURLHELP_IMPORTANT | CURLHELP_OUTPUT),
+    h("    --output-dir <dir>", "Directory to save files in", CURLHELP_OUTPUT),
+    h("-Z, --parallel", "Perform transfers in parallel", CURLHELP_CONNECTION | CURLHELP_CURL | CURLHELP_GLOBAL),
+    h("    --parallel-immediate", "Do not wait for multiplexing", CURLHELP_CONNECTION | CURLHELP_CURL | CURLHELP_GLOBAL),
+    h("    --parallel-max <num>", "Maximum concurrency for parallel transfers", CURLHELP_CONNECTION | CURLHELP_CURL | CURLHELP_GLOBAL),
+    h("    --parallel-max-host <num>", "Maximum connections to a single host", CURLHELP_CONNECTION | CURLHELP_CURL | CURLHELP_GLOBAL),
+    h("    --pass <phrase>", "Passphrase for the private key", CURLHELP_SSH | CURLHELP_TLS | CURLHELP_AUTH),
+    h("    --path-as-is", "Do not squash .. sequences in URL path", CURLHELP_CURL),
+    h("    --pinnedpubkey <hashes>", "Public key to verify peer against", CURLHELP_TLS),
+    h("    --post301", "Do not switch to GET after a 301 redirect", CURLHELP_HTTP | CURLHELP_POST),
+    h("    --post302", "Do not switch to GET after a 302 redirect", CURLHELP_HTTP | CURLHELP_POST),
+    h("    --post303", "Do not switch to GET after a 303 redirect", CURLHELP_HTTP | CURLHELP_POST),
+    h("    --preproxy <[protocol://]host[:port]>", "Use this proxy first", CURLHELP_PROXY),
+    h("-#, --progress-bar", "Display transfer progress as a bar", CURLHELP_VERBOSE | CURLHELP_GLOBAL),
+    h("    --proto <protocols>", "Enable/disable PROTOCOLS", CURLHELP_CONNECTION | CURLHELP_CURL),
+    h("    --proto-default <protocol>", "Use PROTOCOL for any URL missing a scheme", CURLHELP_CONNECTION | CURLHELP_CURL),
+    h("    --proto-redir <protocols>", "Enable/disable PROTOCOLS on redirect", CURLHELP_CONNECTION | CURLHELP_CURL),
+    h("-x, --proxy <[protocol://]host[:port]>", "Use this proxy", CURLHELP_PROXY),
+    h("    --proxy-anyauth", "Pick any proxy authentication method", CURLHELP_PROXY | CURLHELP_AUTH),
+    h("    --proxy-basic", "Use Basic authentication on the proxy", CURLHELP_PROXY | CURLHELP_AUTH),
+    h("    --proxy-ca-native", "Load CA certs from the OS to verify proxy", CURLHELP_TLS),
+    h("    --proxy-cacert <file>", "CA certificates to verify proxy against", CURLHELP_PROXY | CURLHELP_TLS),
+    h("    --proxy-capath <dir>", "CA directory to verify proxy against", CURLHELP_PROXY | CURLHELP_TLS),
+    h("    --proxy-cert <cert[:passwd]>", "Set client certificate for proxy", CURLHELP_PROXY | CURLHELP_TLS),
+    h("    --proxy-cert-type <type>", "Client certificate type for HTTPS proxy", CURLHELP_PROXY | CURLHELP_TLS),
+    h("    --proxy-ciphers <list>", "TLS 1.2 (1.1, 1.0) ciphers to use for proxy", CURLHELP_PROXY | CURLHELP_TLS),
+    h("    --proxy-crlfile <file>", "Set a CRL list for proxy", CURLHELP_PROXY | CURLHELP_TLS),
+    h("    --proxy-digest", "Digest auth with the proxy", CURLHELP_PROXY | CURLHELP_TLS),
+    h("    --proxy-header <header/@file>", "Pass custom header(s) to proxy", CURLHELP_PROXY),
+    h("    --proxy-http2", "Use HTTP/2 with HTTPS proxy", CURLHELP_HTTP | CURLHELP_PROXY),
+    h("    --proxy-insecure", "Skip HTTPS proxy cert verification", CURLHELP_PROXY | CURLHELP_TLS),
+    h("    --proxy-key <key>", "Private key for HTTPS proxy", CURLHELP_PROXY | CURLHELP_TLS),
+    h("    --proxy-key-type <type>", "Private key file type for proxy", CURLHELP_PROXY | CURLHELP_TLS),
+    h("    --proxy-negotiate", "HTTP Negotiate (SPNEGO) auth with the proxy", CURLHELP_PROXY | CURLHELP_AUTH),
+    h("    --proxy-ntlm", "NTLM authentication with the proxy", CURLHELP_PROXY | CURLHELP_AUTH),
+    h("    --proxy-pass <phrase>", "Passphrase for private key for HTTPS proxy", CURLHELP_PROXY | CURLHELP_TLS | CURLHELP_AUTH),
+    h("    --proxy-pinnedpubkey <hashes>", "FILE/HASHES public key to verify proxy with", CURLHELP_PROXY | CURLHELP_TLS),
+    h("    --proxy-service-name <name>", "SPNEGO proxy service name", CURLHELP_PROXY | CURLHELP_TLS),
+    h("    --proxy-ssl-allow-beast", "Allow this security flaw for HTTPS proxy", CURLHELP_PROXY | CURLHELP_TLS),
+    h("    --proxy-ssl-auto-client-cert", "Auto client certificate for proxy", CURLHELP_PROXY | CURLHELP_TLS),
+    h("    --proxy-tls13-ciphers <list>", "TLS 1.3 proxy cipher suites", CURLHELP_PROXY | CURLHELP_TLS),
+    h("    --proxy-tlsauthtype <type>", "TLS authentication type for HTTPS proxy", CURLHELP_PROXY | CURLHELP_TLS | CURLHELP_AUTH),
+    h("    --proxy-tlspassword <string>", "TLS password for HTTPS proxy", CURLHELP_PROXY | CURLHELP_TLS | CURLHELP_AUTH),
+    h("    --proxy-tlsuser <name>", "TLS username for HTTPS proxy", CURLHELP_PROXY | CURLHELP_TLS | CURLHELP_AUTH),
+    h("    --proxy-tlsv1", "TLSv1 for HTTPS proxy", CURLHELP_PROXY | CURLHELP_TLS | CURLHELP_AUTH),
+    h("-U, --proxy-user <user:password>", "Proxy user and password", CURLHELP_PROXY | CURLHELP_AUTH),
+    h("    --proxy1.0 <host[:port]>", "Use HTTP/1.0 proxy on given port", CURLHELP_PROXY),
+    h("-p, --proxytunnel", "HTTP proxy tunnel (using CONNECT)", CURLHELP_PROXY),
+    h("    --pubkey <key>", "SSH Public key filename", CURLHELP_SFTP | CURLHELP_SCP | CURLHELP_SSH | CURLHELP_AUTH),
+    h("-Q, --quote <command>", "Send command(s) to server before transfer", CURLHELP_FTP | CURLHELP_SFTP),
+    h("    --random-file <file>", "File for reading random data from", CURLHELP_DEPRECATED),
+    h("-r, --range <range>", "Retrieve only the bytes within RANGE", CURLHELP_HTTP | CURLHELP_FTP | CURLHELP_SFTP | CURLHELP_FILE),
+    h("    --rate <max request rate>", "Request rate for serial transfers", CURLHELP_CONNECTION | CURLHELP_GLOBAL),
+    h("    --raw", "Do HTTP raw; no transfer decoding", CURLHELP_HTTP),
+    h("-e, --referer <URL>", "Referrer URL", CURLHELP_HTTP),
+    h("-J, --remote-header-name", "Use the header-provided filename", CURLHELP_OUTPUT),
+    h("-O, --remote-name", "Write output to file named as remote file", CURLHELP_IMPORTANT | CURLHELP_OUTPUT),
+    h("    --remote-name-all", "Use the remote filename for all URLs", CURLHELP_OUTPUT),
+    h("-R, --remote-time", "Set remote file's time on local output", CURLHELP_OUTPUT),
+    h("    --remove-on-error", "Remove output file on errors", CURLHELP_OUTPUT),
+    h("-X, --request <method>", "Specify request method to use", CURLHELP_CONNECTION | CURLHELP_POP3 | CURLHELP_FTP | CURLHELP_IMAP | CURLHELP_SMTP),
+    h("    --request-target <path>", "Specify the target for this request", CURLHELP_HTTP),
+    h("    --resolve <[+]host:port:addr[,addr]...>", "Resolve host+port to address", CURLHELP_CONNECTION | CURLHELP_DNS),
+    h("    --retry <num>", "Retry request if transient problems occur", CURLHELP_CURL),
+    h("    --retry-all-errors", "Retry all errors (with --retry)", CURLHELP_CURL),
+    h("    --retry-connrefused", "Retry on connection refused (with --retry)", CURLHELP_CURL),
+    h("    --retry-delay <seconds>", "Wait time between retries", CURLHELP_CURL | CURLHELP_TIMEOUT),
+    h("    --retry-max-time <seconds>", "Retry only within this period", CURLHELP_CURL | CURLHELP_TIMEOUT),
+    h("    --sasl-authzid <identity>", "Identity for SASL PLAIN authentication", CURLHELP_AUTH),
+    h("    --sasl-ir", "Initial response in SASL authentication", CURLHELP_AUTH),
+    h("    --service-name <name>", "SPNEGO service name", CURLHELP_AUTH),
+    h("-S, --show-error", "Show error even when -s is used", CURLHELP_CURL | CURLHELP_GLOBAL),
+    h("-i, --show-headers", "Show response headers in output", CURLHELP_IMPORTANT | CURLHELP_VERBOSE | CURLHELP_OUTPUT),
+    h("    --sigalgs <list>", "TLS signature algorithms to use", CURLHELP_TLS),
+    h("-s, --silent", "Silent mode", CURLHELP_IMPORTANT | CURLHELP_VERBOSE),
+    h("    --skip-existing", "Skip download if local file already exists", CURLHELP_CURL | CURLHELP_OUTPUT),
+    h("    --socks4 <host[:port]>", "SOCKS4 proxy on given host + port", CURLHELP_PROXY),
+    h("    --socks4a <host[:port]>", "SOCKS4a proxy on given host + port", CURLHELP_PROXY),
+    h("    --socks5 <host[:port]>", "SOCKS5 proxy on given host + port", CURLHELP_PROXY),
+    h("    --socks5-basic", "Username/password auth for SOCKS5 proxies", CURLHELP_PROXY | CURLHELP_AUTH),
+    h("    --socks5-gssapi", "Enable GSS-API auth for SOCKS5 proxies", CURLHELP_PROXY | CURLHELP_AUTH),
+    h("    --socks5-gssapi-nec", "Compatibility with NEC SOCKS5 server", CURLHELP_PROXY | CURLHELP_AUTH),
+    h("    --socks5-gssapi-service <name>", "SOCKS5 proxy service name for GSS-API", CURLHELP_PROXY | CURLHELP_AUTH),
+    h("    --socks5-hostname <host[:port]>", "SOCKS5 proxy, pass hostname to proxy", CURLHELP_PROXY),
+    h("-Y, --speed-limit <speed>", "Stop transfers slower than this", CURLHELP_CONNECTION),
+    h("-y, --speed-time <seconds>", "Trigger 'speed-limit' abort after this time", CURLHELP_CONNECTION | CURLHELP_TIMEOUT),
+    h("    --ssl", "Try enabling TLS", CURLHELP_TLS | CURLHELP_IMAP | CURLHELP_POP3 | CURLHELP_SMTP | CURLHELP_LDAP),
+    h("    --ssl-allow-beast", "Allow security flaw to improve interop", CURLHELP_TLS),
+    h("    --ssl-auto-client-cert", "Use auto client certificate (Schannel)", CURLHELP_TLS),
+    h("    --ssl-no-revoke", "Disable cert revocation checks (Schannel)", CURLHELP_TLS),
+    h("    --ssl-reqd", "Require SSL/TLS", CURLHELP_TLS | CURLHELP_IMAP | CURLHELP_POP3 | CURLHELP_SMTP | CURLHELP_LDAP),
+    h("    --ssl-revoke-best-effort", "Ignore missing cert CRL dist points", CURLHELP_TLS),
+    h("    --ssl-sessions <filename>", "Load/save SSL session tickets from/to this file", CURLHELP_TLS),
+    h("-2, --sslv2", "SSLv2", CURLHELP_DEPRECATED),
+    h("-3, --sslv3", "SSLv3", CURLHELP_DEPRECATED),
+    h("    --stderr <file>", "Where to redirect stderr", CURLHELP_VERBOSE | CURLHELP_GLOBAL),
+    h("    --styled-output", "Enable styled output for HTTP headers", CURLHELP_VERBOSE | CURLHELP_GLOBAL),
+    h("    --suppress-connect-headers", "Suppress proxy CONNECT response headers", CURLHELP_PROXY),
+    h("    --tcp-fastopen", "Use TCP Fast Open", CURLHELP_CONNECTION),
+    h("    --tcp-nodelay", "Set TCP_NODELAY", CURLHELP_CONNECTION),
+    h("-t, --telnet-option <opt=val>", "Set telnet option", CURLHELP_TELNET),
+    h("    --tftp-blksize <value>", "Set TFTP BLKSIZE option", CURLHELP_TFTP),
+    h("    --tftp-no-options", "Do not send any TFTP options", CURLHELP_TFTP),
+    h("-z, --time-cond <time>", "Transfer based on a time condition", CURLHELP_HTTP | CURLHELP_FTP),
+    h("    --tls-earlydata", "Allow use of TLSv1.3 early data (0RTT)", CURLHELP_TLS),
+    h("    --tls-max <VERSION>", "Maximum allowed TLS version", CURLHELP_TLS),
+    h("    --tls13-ciphers <list>", "TLS 1.3 cipher suites to use", CURLHELP_TLS),
+    h("    --tlsauthtype <type>", "TLS authentication type", CURLHELP_TLS | CURLHELP_AUTH),
+    h("    --tlspassword <string>", "TLS password", CURLHELP_TLS | CURLHELP_AUTH),
+    h("    --tlsuser <name>", "TLS username", CURLHELP_TLS | CURLHELP_AUTH),
+    h("-1, --tlsv1", "TLSv1.0 or greater", CURLHELP_TLS),
+    h("    --tlsv1.0", "TLSv1.0 or greater", CURLHELP_TLS),
+    h("    --tlsv1.1", "TLSv1.1 or greater", CURLHELP_TLS),
+    h("    --tlsv1.2", "TLSv1.2 or greater", CURLHELP_TLS),
+    h("    --tlsv1.3", "TLSv1.3 or greater", CURLHELP_TLS),
+    h("    --tr-encoding", "Request compressed transfer encoding", CURLHELP_HTTP),
+    h("    --trace <file>", "Write a debug trace to FILE", CURLHELP_VERBOSE | CURLHELP_GLOBAL),
+    h("    --trace-ascii <file>", "Like --trace, but without hex output", CURLHELP_VERBOSE | CURLHELP_GLOBAL),
+    h("    --trace-config <string>", "Details to log in trace/verbose output", CURLHELP_VERBOSE | CURLHELP_GLOBAL),
+    h("    --trace-ids", "Transfer + connection ids in verbose output", CURLHELP_VERBOSE | CURLHELP_GLOBAL),
+    h("    --trace-time", "Add time stamps to trace/verbose output", CURLHELP_VERBOSE | CURLHELP_GLOBAL),
+    h("    --unix-socket <path>", "Connect through this Unix domain socket", CURLHELP_CONNECTION),
+    h("-T, --upload-file <file>", "Transfer local FILE to destination", CURLHELP_IMPORTANT | CURLHELP_UPLOAD),
+    h("    --upload-flags <flags>", "IMAP upload behavior", CURLHELP_CURL | CURLHELP_OUTPUT),
+    h("    --url <url/file>", "URL(s) to work with", CURLHELP_CURL),
+    h("    --url-query <data>", "Add a URL query part", CURLHELP_HTTP | CURLHELP_POST | CURLHELP_UPLOAD),
+    h("-B, --use-ascii", "Use ASCII/text transfer", CURLHELP_FTP | CURLHELP_OUTPUT | CURLHELP_LDAP | CURLHELP_TFTP),
+    h("-u, --user <user:password>", "Server user and password", CURLHELP_IMPORTANT | CURLHELP_AUTH),
+    h("-A, --user-agent <name>", "Send User-Agent <name> to server", CURLHELP_IMPORTANT | CURLHELP_HTTP),
+    h("    --variable <[%]name=text/@file>", "Set variable", CURLHELP_CURL),
+    h("-v, --verbose", "Make the operation more talkative", CURLHELP_IMPORTANT | CURLHELP_VERBOSE | CURLHELP_GLOBAL),
+    h("-V, --version", "Show version number and quit", CURLHELP_IMPORTANT | CURLHELP_CURL),
+    h("    --vlan-priority <priority>", "Set VLAN priority", CURLHELP_CONNECTION),
+    h("-w, --write-out <format>", "Output FORMAT after completion", CURLHELP_VERBOSE),
+    h("    --xattr", "Store metadata in extended file attributes", CURLHELP_OUTPUT),
+];
+
+/// A `--help category` descriptor (curl's `struct category_descriptors`).
+struct CategoryDesc {
+    opt: &'static str,
+    desc: &'static str,
+    category: u32,
+}
+
+const fn cd(opt: &'static str, desc: &'static str, category: u32) -> CategoryDesc {
+    CategoryDesc {
+        opt,
+        desc,
+        category,
+    }
+}
+
+/// The selectable help categories (← `categories[]` in `src/tool_help.c`).
+/// `important` is intentionally omitted — it is the default (no-argument) page.
+static CATEGORIES: &[CategoryDesc] = &[
+    cd("auth", "Authentication methods", CURLHELP_AUTH),
+    cd("connection", "Manage connections", CURLHELP_CONNECTION),
+    cd("curl", "The command line tool itself", CURLHELP_CURL),
+    cd("deprecated", "Legacy", CURLHELP_DEPRECATED),
+    cd("dns", "Names and resolving", CURLHELP_DNS),
+    cd("file", "FILE protocol", CURLHELP_FILE),
+    cd("ftp", "FTP protocol", CURLHELP_FTP),
+    cd("global", "Global options", CURLHELP_GLOBAL),
+    cd("http", "HTTP and HTTPS protocol", CURLHELP_HTTP),
+    cd("imap", "IMAP protocol", CURLHELP_IMAP),
+    cd("ldap", "LDAP protocol", CURLHELP_LDAP),
+    cd("output", "File system output", CURLHELP_OUTPUT),
+    cd("pop3", "POP3 protocol", CURLHELP_POP3),
+    cd("post", "HTTP POST specific", CURLHELP_POST),
+    cd("proxy", "Options for proxies", CURLHELP_PROXY),
+    cd("scp", "SCP protocol", CURLHELP_SCP),
+    cd("sftp", "SFTP protocol", CURLHELP_SFTP),
+    cd("smtp", "SMTP protocol", CURLHELP_SMTP),
+    cd("ssh", "SSH protocol", CURLHELP_SSH),
+    cd("telnet", "TELNET protocol", CURLHELP_TELNET),
+    cd("tftp", "TFTP protocol", CURLHELP_TFTP),
+    cd("timeout", "Timeouts and delays", CURLHELP_TIMEOUT),
+    cd("tls", "TLS/SSL related", CURLHELP_TLS),
+    cd("upload", "Upload, sending data", CURLHELP_UPLOAD),
+    cd("verbose", "Tracing, logging etc", CURLHELP_VERBOSE),
+];
+
+/// Port of curl's `print_category` (`src/tool_help.c`): print every [`HELPTEXT`]
+/// row whose category bitmask intersects `category`, column-aligned to `cols`.
+/// The width arithmetic mirrors curl's exactly (each subtraction is guarded by a
+/// preceding comparison, so no `usize` underflow is reachable).
+fn print_category(category: u32, cols: u32) {
+    let cols = cols as usize;
+    let mut longopt: usize = 5;
+    let mut longdesc: usize = 5;
+    for e in HELPTEXT {
+        if e.categories & category == 0 {
+            continue;
+        }
+        if e.opt.len() > longopt {
+            longopt = e.opt.len();
+        }
+        if e.desc.len() > longdesc {
+            longdesc = e.desc.len();
+        }
+    }
+    if longdesc > cols {
+        longopt = 0; // avoid wrap-around
+    } else if longopt + longdesc > cols {
+        longopt = cols - longdesc;
+    }
+    for e in HELPTEXT {
+        if e.categories & category != 0 {
+            let mut opt = longopt;
+            let desclen = e.desc.len();
+            // avoid wrap-around
+            if cols >= 2 && opt + desclen >= cols - 2 {
+                if desclen < cols - 2 {
+                    opt = (cols - 3) - desclen;
+                } else {
+                    opt = 0;
+                }
+            }
+            println!(" {:<width$}  {}", e.opt, e.desc, width = opt);
+        }
+    }
+}
+
+/// Port of curl's `get_category_content`: print the `name: description` header
+/// then the category's options. Returns `true` when the category was not found
+/// (curl returns `1`), matching the caller's "unknown category" fallback.
+fn get_category_content(category: &str, cols: u32) -> bool {
+    for c in CATEGORIES {
+        if c.opt.eq_ignore_ascii_case(category) {
+            println!("{}: {}", c.opt, c.desc);
+            print_category(c.category, cols);
+            return false;
+        }
+    }
+    true
+}
+
+/// Port of curl's `get_categories`: print every category and its description.
+fn get_categories() {
+    for c in CATEGORIES {
+        println!(" {:<11} {}", c.opt, c.desc);
+    }
+}
+
+/// Port of curl's `get_categories_list`: print all category names as a
+/// comma-separated list wrapped to `width` columns.
+fn get_categories_list(width: u32) {
+    let width = width as usize;
+    let mut col: usize = 0;
+    let n = CATEGORIES.len();
+    for (i, c) in CATEGORIES.iter().enumerate() {
+        let len = c.opt.len();
+        if i == n - 1 {
+            // final category
+            if col + len + 1 < width {
+                println!("{}.", c.opt);
+            } else {
+                println!("\n{}.", c.opt);
+            }
+        } else if col + len + 2 < width {
+            print!("{}, ", c.opt);
+            col += len + 2;
+        } else {
+            print!("\n{}, ", c.opt);
+            col = len + 2;
+        }
+    }
+}
+
+/// Port of curl's `tool_help` (`src/tool_help.c`): render `--help [category]`.
+/// `None` is the default page (Usage + IMPORTANT options + category overview);
+/// `"all"` prints everything; `"category"` lists the categories; a leading `-`
+/// requests per-option docs (unavailable — no built-in manual in this build);
+/// any other value is looked up as a category, falling back to the category
+/// list when unknown.
+fn tool_help(category: Option<&str>) {
+    let cols = crate::terminal::get_terminal_columns();
+    match category {
+        None => {
+            // Split, curated default page (curl's `!category` branch).
+            let category_note = "\nThis is not the full help; this menu is split \
+                into categories.\nUse \"--help category\" to get an overview of all \
+                categories, which are:";
+            // USE_MANUAL is off in this build, so the `--help [option]` line curl
+            // adds under USE_MANUAL is omitted.
+            let category_note2 = "Use \"--help all\" to list all options";
+            println!("Usage: curl [options...] <url>");
+            print_category(CURLHELP_IMPORTANT, cols);
+            println!("{category_note}");
+            get_categories_list(cols);
+            println!("{category_note2}");
+        }
+        Some(cat) if cat.eq_ignore_ascii_case("all") => print_category(CURLHELP_ALL, cols),
+        Some(cat) if cat.eq_ignore_ascii_case("category") => get_categories(),
+        Some(cat) if cat.starts_with('-') => {
+            // curl's `category[0] == '-'` branch with USE_MANUAL undefined.
+            eprintln!("Cannot comply. This curl was built without built-in manual");
+        }
+        Some(cat) => {
+            if get_category_content(cat, cols) {
+                println!("Unknown category provided, here is a list of all categories:\n");
+                get_categories();
+            }
+        }
+    }
+}
+
 /// Map a non-flow-control [`ParameterError`] from `get_args` to the process exit
 /// [`CurlCode`]. curl's `get_args` returns a `CURLcode` directly; this bridges the Rust
 /// `ParameterError` to the same codes (out-of-memory → [`CurlCode::OutOfMemory`], the
@@ -3077,12 +3891,15 @@ pub async fn operate(global: &mut GlobalConfig, argv: &[OsString]) -> CurlCode {
                 // signal maps to an exit code (curl's `operate()` error switch, verbatim).
                 result = CurlCode::Ok;
                 match err {
-                    // `--help`: the Rust parser defers rendering to here (unlike curl, which
-                    // prints inside parsing). Emit the clap-generated help to stdout.
+                    // `--help [category]`: the Rust parser defers rendering to here (unlike
+                    // curl, which prints inside parsing). Route through the faithful
+                    // [`tool_help`] port (← `src/tool_help.c`), passing the optional
+                    // `<category>` subject captured during parsing. This filters by category,
+                    // includes deprecated options under `all`, and shows the curated default
+                    // page when no category was given — matching curl 8.x byte-for-byte
+                    // (AAP §0.7.1 help-structure parity).
                     ParameterError::HelpRequested => {
-                        let mut cmd = args::build_cli_command();
-                        let _ = cmd.print_help();
-                        println!();
+                        tool_help(global.help_category.as_deref());
                     }
                     // `--manual`: no built-in manual is compiled in (curl's `USE_MANUAL` off).
                     ParameterError::ManualRequested => {
@@ -3503,5 +4320,393 @@ mod tests {
                 "expected wrapped output (width {width}), got: {contents:?}"
             );
         }
+    }
+
+    // =======================================================================
+    // Help-system tests — the `--help [category]` machinery ported from
+    // curl 8.19.0-DEV `src/tool_help.c` / `src/tool_listhelp.c` to resolve QA
+    // F8 Issues 2 (category filtering), 3 (deprecated options in `--help all`)
+    // and 4 (`--no-` display form). These lock the HELPTEXT/CATEGORIES tables
+    // and exercise every branch of the five help functions.
+    // =======================================================================
+
+    /// The help table is a 1:1 port of `src/tool_listhelp.c` (273 rows) and every
+    /// row must be well formed: non-empty display + description, and a category
+    /// mask that is non-zero and confined to the `CURLHELP_ALL` bit space.
+    #[test]
+    fn helptext_table_has_full_row_count_and_valid_rows() {
+        assert_eq!(
+            HELPTEXT.len(),
+            273,
+            "HELPTEXT row count must match curl 8.19.0-DEV tool_listhelp.c"
+        );
+        for e in HELPTEXT {
+            assert!(
+                !e.opt.trim().is_empty(),
+                "a HELPTEXT row has an empty option display (desc={:?})",
+                e.desc
+            );
+            assert!(
+                !e.desc.trim().is_empty(),
+                "row {:?} has empty description",
+                e.opt
+            );
+            assert_eq!(
+                e.categories & !CURLHELP_ALL,
+                0,
+                "row {:?} sets bits outside CURLHELP_ALL",
+                e.opt
+            );
+            assert_ne!(
+                e.categories, 0,
+                "row {:?} must belong to at least one category",
+                e.opt
+            );
+        }
+    }
+
+    /// Every selectable category must contain at least one option; otherwise
+    /// `--help <category>` would render an empty section.
+    #[test]
+    fn helptext_covers_every_selectable_category() {
+        for c in CATEGORIES {
+            let n = HELPTEXT
+                .iter()
+                .filter(|e| e.categories & c.category != 0)
+                .count();
+            assert!(n > 0, "category {:?} has no options in HELPTEXT", c.opt);
+        }
+    }
+
+    /// QA F8 Issue 3: the seven deprecated options must be present in the table
+    /// and carry the `CURLHELP_DEPRECATED` bit so they appear under `--help all`
+    /// and `--help deprecated`.
+    #[test]
+    fn helptext_includes_the_seven_deprecated_options() {
+        for needle in [
+            "--krb",
+            "--metalink",
+            "--ntlm-wb",
+            "--sslv2",
+            "--sslv3",
+            "--egd-file",
+            "--random-file",
+        ] {
+            let row = HELPTEXT
+                .iter()
+                .find(|e| e.opt.contains(needle))
+                .unwrap_or_else(|| panic!("deprecated option {needle} missing from HELPTEXT"));
+            assert!(
+                row.categories & CURLHELP_DEPRECATED != 0,
+                "{needle} must carry the DEPRECATED category bit"
+            );
+        }
+    }
+
+    /// QA F8 Issue 4: these seven boolean options display in their `--no-` form,
+    /// exactly as curl's generated `tool_listhelp.c` shows them.
+    #[test]
+    fn helptext_shows_seven_boolean_options_in_no_form() {
+        for needle in [
+            "--no-alpn",
+            "--no-buffer",
+            "--no-clobber",
+            "--no-keepalive",
+            "--no-npn",
+            "--no-progress-meter",
+            "--no-sessionid",
+        ] {
+            assert!(
+                HELPTEXT.iter().any(|e| e.opt.contains(needle)),
+                "expected `{needle}` display form in HELPTEXT"
+            );
+        }
+    }
+
+    /// The selectable category list mirrors curl's `categories[]` with `important`
+    /// intentionally omitted (it is the default, no-argument page). Each entry is a
+    /// single `CURLHELP_*` bit with a lowercase name.
+    #[test]
+    fn categories_table_is_wellformed() {
+        assert_eq!(
+            CATEGORIES.len(),
+            25,
+            "selectable category count (curl categories[] minus `important`)"
+        );
+        for c in CATEGORIES {
+            assert!(!c.opt.is_empty() && !c.desc.is_empty());
+            assert_eq!(c.category & !CURLHELP_ALL, 0);
+            assert!(
+                c.category.is_power_of_two(),
+                "category {:?} must be exactly one CURLHELP_* bit",
+                c.opt
+            );
+            assert!(
+                !c.opt.chars().any(|ch| ch.is_ascii_uppercase()),
+                "category name {:?} must contain no uppercase (curl lower-cases them)",
+                c.opt
+            );
+        }
+        assert!(
+            !CATEGORIES.iter().any(|c| c.opt == "important"),
+            "`important` is the default page, not a selectable category"
+        );
+    }
+
+    /// `get_category_content` returns `false` for a known category (case-insensitive)
+    /// and `true` for an unknown one — the signal the caller uses to fall back to the
+    /// category list.
+    #[test]
+    fn get_category_content_reports_known_and_unknown() {
+        assert!(!get_category_content("http", 80));
+        assert!(!get_category_content("ftp", 80));
+        assert!(!get_category_content("auth", 80));
+        assert!(!get_category_content("HTTP", 80));
+        assert!(get_category_content("bogus-category", 80));
+        assert!(get_category_content("", 80));
+    }
+
+    /// `print_category` must execute its column-width math and per-row wrap-avoidance
+    /// branches without panicking across narrow, normal, and wide terminals.
+    #[test]
+    fn print_category_executes_across_widths_without_panicking() {
+        for &cols in &[1u32, 2, 10, 40, 80, 200] {
+            print_category(CURLHELP_ALL, cols);
+            print_category(CURLHELP_IMPORTANT, cols);
+            print_category(CURLHELP_HTTP, cols);
+            print_category(CURLHELP_DEPRECATED, cols);
+        }
+    }
+
+    /// `get_categories` and `get_categories_list` must run across widths without
+    /// panicking (the list wraps to the terminal width).
+    #[test]
+    fn get_categories_and_list_execute_without_panicking() {
+        get_categories();
+        for &cols in &[1u32, 20, 79, 200] {
+            get_categories_list(cols);
+        }
+    }
+
+    /// `tool_help` must dispatch every arm: the default page (`None`), `all`,
+    /// `category`, a leading-`-` request (no built-in manual), a known category name
+    /// (case-insensitive), and an unknown name (falls back to the category list).
+    #[test]
+    fn tool_help_dispatches_every_arm() {
+        tool_help(None);
+        tool_help(Some("all"));
+        tool_help(Some("category"));
+        tool_help(Some("-x"));
+        tool_help(Some("http"));
+        tool_help(Some("HTTP"));
+        tool_help(Some("no-such-cat"));
+    }
+
+    // -----------------------------------------------------------------------
+    // tool_header_cb (callbacks/header.rs) — driven through its public C-ABI
+    // entry point so its private helpers (content_disposition, join_output_dir,
+    // save_etag) are exercised too. These cover the response-header handling
+    // that the CLI's network I/O (QA F8 Issue 1) drives end-to-end: -D dump,
+    // --write-out %{num_headers}, ETag capture, Content-Disposition/Location
+    // filename derivation, and header display. PerTransfer::new is private to
+    // this module, so these tests live here rather than in header.rs.
+    // -----------------------------------------------------------------------
+
+    /// Feed one header line to `tool_header_cb` (sz == 1, so bytes == nmemb).
+    fn call_header_cb(bytes: &[u8], per: &mut PerTransfer) -> usize {
+        let mut buf = bytes.to_vec();
+        // SAFETY: `buf` addresses `buf.len()` readable bytes for the call, and `per` is a live,
+        // uniquely-borrowed PerTransfer whose `hdrcbdata.config` points at a config that
+        // outlives the call — exactly libcurl's CURLOPT_HEADERDATA/HEADERFUNCTION contract.
+        unsafe {
+            crate::callbacks::header::tool_header_cb(
+                buf.as_mut_ptr() as *mut core::ffi::c_char,
+                1,
+                buf.len(),
+                per as *mut PerTransfer as *mut core::ffi::c_void,
+            )
+        }
+    }
+
+    /// A `PerTransfer` with its header-callback diagnostics silenced.
+    fn quiet_per() -> PerTransfer {
+        let mut per = PerTransfer::new(0, Easy::open());
+        per.diag = silent_diag();
+        per
+    }
+
+    /// Wrap a freshly created file as an open `OutSink::File`.
+    fn open_file_sink(path: &std::path::Path) -> OutSink {
+        OutSink::File(std::io::BufWriter::new(
+            std::fs::File::create(path).expect("create sink file"),
+        ))
+    }
+
+    #[test]
+    fn header_cb_rejects_null_userdata_and_null_config() {
+        use curl_rs_ffi::easy::CURL_WRITEFUNC_ERROR;
+        // A null CURLOPT_HEADERDATA fails before any dereference.
+        let rc = unsafe {
+            crate::callbacks::header::tool_header_cb(
+                core::ptr::null_mut(),
+                1,
+                4,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, CURL_WRITEFUNC_ERROR);
+
+        // A valid PerTransfer but a null config pointer (the default) is also refused.
+        let mut per = quiet_per();
+        assert_eq!(
+            call_header_cb(b"X-Any: 1\r\n", &mut per),
+            CURL_WRITEFUNC_ERROR
+        );
+    }
+
+    #[test]
+    fn header_cb_counts_headers_for_writeout() {
+        let mut config = OperationConfig::new();
+        config.writeout = Some("%{num_headers}".to_string());
+        let mut per = quiet_per();
+        per.hdrcbdata.config = &mut config as *mut OperationConfig;
+        // conn_scheme stays None → the etag/Content-Disposition block is skipped and only the
+        // --write-out counting logic runs.
+
+        assert!(call_header_cb(b"Content-Type: text/html\r\n", &mut per) > 0);
+        call_header_cb(b"Server: unit\r\n", &mut per);
+        assert_eq!(per.num_headers, 2, "two colon-bearing headers counted");
+
+        // A blank line marks the end of a header block.
+        call_header_cb(b"\r\n", &mut per);
+        assert!(per.was_last_header_empty);
+
+        // The first header of the next block resets the counter to 1.
+        call_header_cb(b"Content-Type: text/plain\r\n", &mut per);
+        assert_eq!(per.num_headers, 1, "counter resets at a new block boundary");
+        assert!(!per.was_last_header_empty);
+    }
+
+    #[test]
+    fn header_cb_dumps_headers_to_side_file() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let hpath = dir.path().join("dump.txt");
+        let mut config = OperationConfig::new();
+        config.headerfile = Some(hpath.to_string_lossy().into_owned());
+        let mut per = quiet_per();
+        per.hdrcbdata.config = &mut config as *mut OperationConfig;
+        // -D writes to per.heads only when that sink is already open.
+        per.heads.stream = open_file_sink(&hpath);
+
+        assert!(call_header_cb(b"Server: dumped\r\n", &mut per) > 0);
+        per.heads.stream.flush().unwrap();
+
+        let mut got = String::new();
+        std::fs::File::open(&hpath)
+            .unwrap()
+            .read_to_string(&mut got)
+            .unwrap();
+        assert_eq!(got, "Server: dumped\r\n");
+    }
+
+    #[test]
+    fn header_cb_captures_etag_on_2xx() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let epath = dir.path().join("etag.txt");
+        let mut config = OperationConfig::new();
+        config.etag_save_file = Some(epath.to_string_lossy().into_owned());
+        let mut per = quiet_per();
+        per.hdrcbdata.config = &mut config as *mut OperationConfig;
+        per.easy.info.conn_scheme = Some("http".to_string());
+        per.easy.info.httpcode = 200;
+        per.etag_save.stream = open_file_sink(&epath);
+
+        call_header_cb(b"ETag: \"abc123\"\r\n", &mut per);
+
+        let mut got = Vec::new();
+        std::fs::File::open(&epath)
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        // save_etag trims the leading blank and the CRLF, keeps the quotes, appends one '\n'.
+        assert_eq!(got, b"\"abc123\"\n");
+    }
+
+    #[test]
+    fn header_cb_derives_filename_from_content_disposition() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = OperationConfig::new();
+        config.output_dir = Some(dir.path().to_string_lossy().into_owned());
+        config.file_clobber_mode = ClobberMode::Always;
+        let mut per = quiet_per();
+        per.hdrcbdata.config = &mut config as *mut OperationConfig;
+        per.hdrcbdata.honor_cd_filename = true;
+        per.easy.info.conn_scheme = Some("http".to_string());
+        per.easy.info.httpcode = 200;
+
+        call_header_cb(
+            b"Content-disposition: attachment; filename=\"cd.bin\"\r\n",
+            &mut per,
+        );
+
+        let expected = format!("{}/cd.bin", dir.path().to_string_lossy());
+        assert_eq!(per.outs.filename.as_deref(), Some(expected.as_str()));
+        assert!(per.outs.is_cd_filename, "Content-Disposition name flagged");
+        assert!(
+            !per.hdrcbdata.honor_cd_filename,
+            "honour flag cleared once the CD filename is taken"
+        );
+        assert!(
+            dir.path().join("cd.bin").exists(),
+            "the derived output file is created"
+        );
+    }
+
+    #[test]
+    fn header_cb_derives_temporary_filename_from_location_on_3xx() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = OperationConfig::new();
+        config.output_dir = Some(dir.path().to_string_lossy().into_owned());
+        let mut per = quiet_per();
+        per.hdrcbdata.config = &mut config as *mut OperationConfig;
+        per.hdrcbdata.honor_cd_filename = true;
+        per.easy.info.conn_scheme = Some("http".to_string());
+        per.easy.info.httpcode = 302;
+
+        call_header_cb(b"Location: /downloads/pkg.zip\r\n", &mut per);
+
+        let expected = format!("{}/pkg.zip", dir.path().to_string_lossy());
+        assert_eq!(per.outs.filename.as_deref(), Some(expected.as_str()));
+        assert!(per.outs.is_cd_filename);
+        // The Location path is only a fallback: it does not create the file yet.
+        assert!(!per.outs.stream.is_open());
+    }
+
+    #[test]
+    fn header_cb_writes_plain_header_display_when_not_styled() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let opath = dir.path().join("shown.txt");
+        let mut config = OperationConfig::new();
+        config.show_headers = true;
+        let mut per = quiet_per();
+        per.hdrcbdata.config = &mut config as *mut OperationConfig;
+        // "file" is a display scheme but not http, so the etag/CD block is skipped and only the
+        // header-display branch runs. Not a TTY → no bold/OSC-8, the line is written verbatim.
+        per.easy.info.conn_scheme = Some("file".to_string());
+        per.isatty = false;
+        per.outs.stream = open_file_sink(&opath);
+
+        call_header_cb(b"X-Test: value\r\n", &mut per);
+        per.outs.stream.flush().unwrap();
+
+        let mut got = String::new();
+        std::fs::File::open(&opath)
+            .unwrap()
+            .read_to_string(&mut got)
+            .unwrap();
+        assert_eq!(got, "X-Test: value\r\n");
     }
 }
