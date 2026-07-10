@@ -35,9 +35,13 @@ platforms (AmigaOS, OpenVMS, OS-400, RISC-OS) are not carried forward. There is 
 
 ## Dependencies
 
-All runtime dependencies are sourced exclusively from crates.io; no C
-cryptographic or transport library is linked. We use these crates (the versions
-below are the resolved pins from the root `Cargo.toml`):
+All runtime dependencies are sourced exclusively from crates.io; no C TLS or
+transport library is linked. (`rustls`' default `aws-lc-rs` crypto provider does
+statically link the AWS-LC C cryptographic core — this is the standard rustls
+default, shared with the alternative `ring` provider — but no C TLS-protocol or
+transport library is linked, and rustls itself implements the TLS protocol in
+pure Rust.) We use these crates (the versions below are the resolved pins from
+the root `Cargo.toml`):
 
 - Async runtime & utilities: `tokio` 1.49.0 (sole async runtime), `tokio-util`
   0.7, `futures-util` 0.3, `pin-project-lite` 0.2, `bytes` 1, `socket2` 0.5
@@ -50,15 +54,16 @@ below are the resolved pins from the root `Cargo.toml`):
 - DNS: `hickory-resolver` 0.25.2 (optional, behind the default-off `hickory-dns`
   feature; the default resolver is the Tokio system resolver)
 - CLI: `clap` 4.5.54, `clap_complete` 4
-- Authentication crypto (pure Rust): `sha2` 0.10, `md-5` 0.10, `md4` 0.10, `hmac`
-  0.12, `des` 0.8, `base64` 0.22, `rand` 0.8
+- Authentication crypto (pure Rust): `sha2` 0.10, `sha1` 0.10 (SCRAM-SHA-1 SASL),
+  `md-5` 0.10, `md4` 0.10, `hmac` 0.12, `des` 0.8, `base64` 0.22, `rand` 0.8
 - Content encoding: `flate2` 1, `brotli` 8, `zstd` 0.13
 - URL / IDN / PSL: `url` 2, `percent-encoding` 2, `idna` 1, `publicsuffix` 2,
   `glob` 0.3
 - Serialization, time & logging: `serde` 1, `serde_json` 1, `chrono` 0.4,
   `tracing` 0.1, `tracing-subscriber` 0.3
 - Errors: `thiserror` 2 (library), `anyhow` 1 (CLI)
-- FFI & codegen: `cbindgen` 0.29.2 (build-dependency), `libc` 0.2
+- FFI & codegen: `cbindgen` 0.29.2 (build-dependency), `cc` 1 (build-dependency,
+  compiles the FFI C-variadic shim `curl-rs-ffi/csrc/variadic_shim.c`), `libc` 0.2
 
 Two of these pins deviate from the versions named in the original technical
 specification, because those versions do not resolve or build and would fail the
@@ -118,7 +123,7 @@ artifact* (written under the Cargo build output directory) that is checked
 against the committed `include/curl/curl.h`; the committed header is never
 overwritten. Downstream C/C++ consumers keep including the same header path and
 relink against `libcurl_rs_ffi` without source changes. The public surface reproduces the curl 8.x `CURL_EXTERN`
-functions (about 101 across the 13 public headers), and the `CURLcode`,
+functions (about 101 across the 12 public headers in `include/curl/`), and the `CURLcode`,
 `CURLoption`, and `CURLINFO` integer values are frozen for ABI parity.
 
 ## Workspace layout
@@ -128,7 +133,8 @@ The workspace has three crates:
 - `curl-rs-lib` — the core library: protocol handlers, connection management,
   TLS, authentication, DNS, content encoding, URL handling, the transfer core,
   and file-backed state. Replaces `lib/`.
-- `curl-rs` — the `clap`-based CLI binary, preserving the full curl flag surface.
+- `curl-rs` — the `clap`-based CLI binary, preserving the full curl flag surface;
+  its `clap` argument definitions are derived 1:1 from `docs/cmdline-opts/`.
   Replaces `src/`.
 - `curl-rs-ffi` — the C-ABI compatibility shim (`extern "C"` `curl_*` symbols plus
   the `cbindgen`-generated header). Replaces the hand-authored public headers, and

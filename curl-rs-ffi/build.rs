@@ -282,14 +282,29 @@ exec "$REAL_LD" "$@"
 ///
 /// # Mechanism (cdylib-only, no global build configuration)
 ///
-/// A tiny generated `sh` wrapper (see [`ELF_LINKER_WRAPPER_TEMPLATE`]) is installed as `ld` in an
-/// `$OUT_DIR` directory and selected via the C driver's `-B<dir>` subprogram search prefix. The
-/// prefix is emitted with `rustc-cdylib-link-arg`, so it applies **only** to the cdylib link — the
+/// A tiny generated `sh` wrapper (see [`ELF_LINKER_WRAPPER_TEMPLATE`]) is installed in an
+/// `$OUT_DIR` directory under every `ld` basename a driver might search (`ld`, `ld.bfd`,
+/// `ld.gold`) and selected via the C driver's `-B<dir>` subprogram search prefix. The prefix is
+/// emitted with `rustc-cdylib-link-arg`, so it applies **only** to the cdylib link — the
 /// `staticlib` archive (consumed by `tests/libtest/*.c`) and the `rlib` (consumed by the `curl-rs`
 /// CLI) are linked normally. The wrapper replaces rustc's version script with `$OUT_DIR`'s
-/// `{ global: curl_*; local: *; };` and execs the real `ld` (resolved via `cc -print-prog-name=ld`
+/// `{ global: curl_*; local: *; };` and execs the real `ld` (resolved via `cc -print-prog-name`
 /// so cross toolchains pick the matching linker). `curl_*` is exact for this crate: all public FFI
 /// symbols use that prefix and Rust internals never do, so nothing non-`curl_*` can leak.
+///
+/// # Selecting a linker flavor the wrapper can intercept
+///
+/// The wrapper only takes effect if the C driver actually invokes an `ld*` program it can find in
+/// the `-B` dir. Modern rustc stable (verified 1.96) defaults to `-fuse-ld=lld`, pointing at its
+/// **bundled** `rust-lld` (`<sysroot>/.../gcc-ld/ld.lld`), so the driver searches for `ld.lld` and
+/// bypasses an `ld`-named wrapper entirely — the failure mode that left the C-variadic trampolines
+/// `local`. To make interception deterministic across toolchains, this function additionally emits
+/// `-fuse-ld=bfd` as a cdylib link arg. A later `-fuse-ld` overrides rustc's earlier `-fuse-ld=lld`
+/// on the driver command line, forcing GNU BFD `ld` (search basename `ld.bfd`, which our `-B` dir
+/// supplies — rustc's bundled `gcc-ld` dir holds only `*lld*` tools and cannot shadow it). MSRV
+/// 1.75 emits no `-fuse-ld` at all and would use system `ld`; the `-fuse-ld=bfd` override plus the
+/// multi-basename install cover that case too. BFD honors the substituted version script identically
+/// to gold/lld, and forcing BFD for this single `.so` has no effect on the CLI binary or archives.
 ///
 /// Every `curl_*` trampoline is additionally forced to be a GC root via `--undefined`, so
 /// `--gc-sections` cannot drop it before the version script promotes it (belt-and-suspenders with
@@ -299,16 +314,24 @@ fn configure_exported_symbols_elf() {
         std::env::var("OUT_DIR").expect("OUT_DIR is always set by Cargo for build scripts");
     let out = PathBuf::from(&out_dir);
 
-    // Resolve the exact `ld` the C driver would invoke, so the wrapper execs the right linker on
-    // both native and cross toolchains. `CC` (honoured by the `cc` crate) takes precedence.
+    // Resolve the exact BFD `ld` the C driver would invoke, so the wrapper execs the right linker on
+    // both native and cross toolchains. `CC` (honoured by the `cc` crate) takes precedence. Because
+    // we force the cdylib link onto BFD (`-fuse-ld=bfd`, below), prefer the `ld.bfd` basename and
+    // fall back to plain `ld` (which is BFD on GNU toolchains). `cc -print-prog-name=NAME` returns
+    // an absolute path when NAME is found and the bare literal otherwise, so a result containing a
+    // path separator indicates a real resolution; otherwise we retry with `ld`.
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-    let real_ld = std::process::Command::new(cc)
-        .arg("-print-prog-name=ld")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+    let resolve_ld = |name: &str| -> Option<String> {
+        std::process::Command::new(&cc)
+            .arg(format!("-print-prog-name={name}"))
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| s.contains(std::path::MAIN_SEPARATOR))
+    };
+    let real_ld = resolve_ld("ld.bfd")
+        .or_else(|| resolve_ld("ld"))
         .unwrap_or_else(|| "ld".to_string());
 
     // Version script: export exactly the curl_* C API, hide everything else.
@@ -316,25 +339,48 @@ fn configure_exported_symbols_elf() {
     std::fs::write(&vs_path, "{ global: curl_*; local: *; };\n")
         .expect("write curl-rs cdylib version script");
 
-    // Generate the wrapper `ld` and make it executable.
+    // Generate the linker wrapper and make it executable.
+    //
+    // The wrapper must be installed under EVERY basename the C driver might search for `ld`, because
+    // which basename is used depends on the active `-fuse-ld` flavor: a bare link searches `ld`,
+    // `-fuse-ld=bfd` searches `ld.bfd`, and `-fuse-ld=gold` searches `ld.gold`. Modern rustc (>=1.x
+    // stable — verified 1.96 here) defaults to `-fuse-ld=lld` with its own bundled `rust-lld` under
+    // `<sysroot>/lib/rustlib/<triple>/bin/gcc-ld/ld.lld`, so the driver would look for `ld.lld` and
+    // never consult an `ld`-only wrapper (the reason the original single-`ld` install silently
+    // failed on this toolchain, leaving the C-variadic trampolines local). We therefore also force
+    // the cdylib link onto GNU BFD ld below (`-fuse-ld=bfd`), whose search basename is `ld.bfd`;
+    // installing under all three names keeps the wrapper effective regardless of whether a given
+    // toolchain honors that override, uses system `ld` (e.g. MSRV 1.75, which emits no `-fuse-ld`),
+    // or is configured for gold. Every name execs the same real BFD `ld` (`real_ld`, an absolute
+    // path resolved without our `-B`, so there is no wrapper self-recursion).
     let wrap_dir = out.join("curlrs-ld");
     std::fs::create_dir_all(&wrap_dir).expect("create curl-rs linker-wrapper dir");
-    let wrap_path = wrap_dir.join("ld");
     let script = ELF_LINKER_WRAPPER_TEMPLATE
         .replace("__REAL_LD__", &real_ld)
         .replace("__MYVS__", &vs_path.display().to_string());
-    std::fs::write(&wrap_path, script).expect("write curl-rs linker wrapper");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&wrap_path)
-            .expect("stat curl-rs linker wrapper")
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&wrap_path, perms).expect("chmod curl-rs linker wrapper");
+    for basename in ["ld", "ld.bfd", "ld.gold"] {
+        let wrap_path = wrap_dir.join(basename);
+        std::fs::write(&wrap_path, &script).expect("write curl-rs linker wrapper");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&wrap_path)
+                .expect("stat curl-rs linker wrapper")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&wrap_path, perms).expect("chmod curl-rs linker wrapper");
+        }
     }
 
-    // Point the cdylib link's C driver at our wrapper `ld` (cdylib-only).
+    // Force the cdylib link onto GNU BFD ld (cdylib-only). rustc's own `-fuse-ld=lld` appears
+    // earlier on the driver command line and a later `-fuse-ld` wins, so this deterministically
+    // overrides it; the driver then searches for `ld.bfd`, which our `-B` dir supplies (rustc's
+    // bundled `gcc-ld` dir contains only the `*lld*` tools, so it does not shadow ours). BFD fully
+    // honors the `{ global: curl_*; local: *; }` version script our wrapper substitutes. This flag
+    // is emitted only on ELF targets (this function); the Mach-O path is unaffected.
+    println!("cargo:rustc-cdylib-link-arg=-fuse-ld=bfd");
+
+    // Point the cdylib link's C driver at our wrapper dir (cdylib-only).
     println!("cargo:rustc-cdylib-link-arg=-B{}", wrap_dir.display());
 
     // Keep each C-variadic trampoline as an explicit GC root (harmless with +whole-archive).

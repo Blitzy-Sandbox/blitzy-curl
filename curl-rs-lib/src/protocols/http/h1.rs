@@ -50,7 +50,9 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use crate::conn::filters::FilterChain;
 use crate::conn::{Connection, FIRSTSOCKET};
 use crate::error::{CurlCode, Error, Result};
-use crate::protocols::http::{HttpReqData, HttpResp, MAX_HTTP_RESP_HEADER_COUNT};
+use crate::protocols::http::{
+    HttpReqData, HttpResp, MAX_HTTP_RESP_HEADER_COUNT, MAX_HTTP_RESP_HEADER_SIZE,
+};
 
 // ===========================================================================
 // Constants (mirroring `lib/http1.h`)
@@ -614,6 +616,31 @@ enum Phase {
 /// * connection closed/cancelled before a head -> `CURLE_GOT_NOTHING` (52)
 /// * anything else -> `CURLE_RECV_ERROR` (56)
 fn classify_hyper(e: &hyper::Error, phase: Phase) -> Error {
+    // A `Parse::TooLarge` while obtaining the response head means hyper hit one
+    // of its configured ceilings. Because `max_buf_size` is sized to curl's
+    // absolute header-byte ceiling (see the builder in `h1_exchange`), a byte
+    // overflow is caught first by `record_response`/`bump_headersize`
+    // (-> `CURLE_RECV_ERROR` 56). The remaining head `TooLarge` is therefore a
+    // *header-count* overflow past `max_headers` (httparse `TooManyHeaders`
+    // -> `Parse::TooLarge`), which curl reports as `CURLE_TOO_LARGE` (100) with
+    // the exact "Too many response headers, N is max" text (← the header-store
+    // `failf` in `lib/headers.c`).
+    //
+    // hyper exposes the precise `Error::is_parse_too_large()` predicate only
+    // under `feature = "server"`; as an HTTP client we cannot call it. We
+    // instead recognise the variant by its stable public `Display` text
+    // ("message head is too large" — the sole `Parse` description containing
+    // "too large"; `UriTooLong` renders "URI too long"), double-guarded by
+    // `is_parse()` so a non-parse error whose message coincidentally contained
+    // the phrase could never match. This arm MUST precede the generic
+    // `is_parse()` arm below, which would otherwise claim the error first and
+    // misclassify count overflow as `CURLE_WEIRD_SERVER_REPLY` (8).
+    if matches!(phase, Phase::Head) && e.is_parse() && e.to_string().contains("too large") {
+        return Error::with_context(
+            CurlCode::TooLarge,
+            format!("Too many response headers, {MAX_HTTP_RESP_HEADER_COUNT} is max"),
+        );
+    }
     if e.is_parse() || e.is_parse_status() {
         return Error::with_context(
             CurlCode::WeirdServerReply,
@@ -866,6 +893,20 @@ where
     // `lib/headers.c`). Kept modest to bound per-response allocation.
     let mut builder = http1::Builder::new();
     builder.max_headers(MAX_HTTP_RESP_HEADER_COUNT + 1);
+    // Raise hyper's head-buffer ceiling to curl's absolute response-header byte
+    // limit (`MAX_HTTP_RESP_HEADER_SIZE * 20`, i.e. 6,144,000 bytes — the same
+    // `max * 20` bound enforced by `bump_headersize`). hyper's default
+    // (`DEFAULT_MAX_BUFFER_SIZE`, ~408 KiB) is *below* curl's per-transfer
+    // ceiling, so without this a head between ~408 KiB and 6 MB would be
+    // rejected by the parser (`Parse::TooLarge`) before `record_response` could
+    // apply curl's real size rule. By admitting any head curl itself would
+    // accept, we make `record_response`/`bump_headersize` the authoritative
+    // *size* gate (overflow -> `CURLE_RECV_ERROR` 56 with the exact "Too large
+    // response headers" text), leaving `max_headers` as the sole *count* gate
+    // (overflow -> `CURLE_TOO_LARGE` 100, mapped in `classify_hyper`). This is
+    // parity-consistent: curl buffers the same ceiling, so no new exposure is
+    // introduced (← `MAX_HTTP_RESP_HEADER_SIZE`, `lib/http.h`).
+    builder.max_buf_size(MAX_HTTP_RESP_HEADER_SIZE.saturating_mul(20));
     let (mut sender, conn) = builder
         .handshake(io)
         .await

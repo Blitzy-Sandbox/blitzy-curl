@@ -32,7 +32,14 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+// The bare `AsyncRead`/`AsyncWrite` traits are used only as bounds on the
+// hand-written SCP server helpers (`scp_server_side`/`scp_read_line`), which are
+// themselves `#[cfg(feature = "scp")]`. Gating the import identically keeps a
+// single-protocol `--features sftp` test build warning-clean (the `Ext` traits
+// above are exercised by both SFTP and SCP paths, so they stay ungated).
+#[cfg(feature = "scp")]
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::{SshAuthTypes, SshScheme, SshSession, SshSetup};
 use crate::conn::filters::{CfFuture, FilterCtx, QueryCtx, QueryOut};
@@ -71,18 +78,24 @@ struct ServerState {
     /// The file body the server captured from an upload (SFTP write / SCP `-t`).
     uploaded: Vec<u8>,
     /// The mtime the server reports from `stat`/`fstat` (for `CURLOPT_FILETIME`).
+    /// Read only by the SFTP `stat`/`fstat` handler, so it is `sftp`-gated to
+    /// keep a single-protocol `--features scp` test build warning-clean.
+    #[cfg(feature = "sftp")]
     mtime: u32,
     /// The directory entries the server returns from `readdir`.
+    #[cfg(feature = "sftp")]
     entries: Vec<String>,
     /// Directories the server has created via SFTP `mkdir`, in issue order.
     /// Populated by [`SftpTestServer::mkdir`] so a test can assert the client
     /// walked the `SSH_SFTP_CREATE_DIRS_*` states and issued the right prefixes.
+    #[cfg(feature = "sftp")]
     created_dirs: Vec<String>,
     /// When set, [`SftpTestServer::open`] fails with `NO_SUCH_FILE` until the
     /// target's parent directory has been created via `mkdir`, so an upload to a
     /// nested path must first create the missing tree (create-missing-dirs).
     /// Off by default, so the existing root-level upload/download tests keep
     /// their unconditional-success behavior.
+    #[cfg(feature = "sftp")]
     enforce_parent_dirs: bool,
     /// When set, every authentication attempt is rejected so the client
     /// exhausts each mechanism and fails with `CURLE_LOGIN_DENIED` (67),
@@ -256,6 +269,11 @@ fn password_setup(scheme: SshScheme) -> SshSetup {
 /// caller for the whole connection: `auth_publickey` reads the key file lazily
 /// during the handshake, so dropping the guard early would delete the file
 /// before it is read.
+// Only the SFTP public-key test (`sftp_public_key_auth_succeeds_and_downloads`)
+// drives this helper, and that test is `#[cfg(feature = "sftp")]`; gate the
+// helper the same way so a single-protocol `--features scp` build does not warn
+// about an unused function.
+#[cfg(feature = "sftp")]
 fn key_setup(scheme: SshScheme) -> (SshSetup, tempfile::NamedTempFile) {
     use std::io::Write as _;
     let mut keyfile = tempfile::NamedTempFile::new().expect("create temp SSH key file");

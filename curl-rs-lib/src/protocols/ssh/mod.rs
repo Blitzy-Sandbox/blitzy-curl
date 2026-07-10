@@ -1643,17 +1643,45 @@ impl SshSession {
         tokio::pin!(ops);
         tokio::pin!(pump);
 
+        // The SSH state machine (`ops`) is authoritative for the returned error:
+        // it produces curl's *meaningful* protocol code — e.g. a host-key
+        // rejection surfaces `CURLE_PEER_FAILED_VERIFICATION` (60) and an
+        // exhausted auth chain surfaces `CURLE_LOGIN_DENIED` (67). When a peer
+        // tears the connection down mid-handshake, the transport `pump` can
+        // observe the socket error a scheduler poll *before* `ops` resolves its
+        // own error; the `biased` ordering only breaks ties within a single poll,
+        // so surfacing the pump error the instant it fires would
+        // nondeterministically mask the deterministic curl code (observed as a
+        // ~20% flaky `RecvError` in place of `PeerFailedVerification`). Instead a
+        // pump error is *stashed*, not returned: `pump_bridge` owns `bridge` and
+        // drops it on return, which closes russh's transport peer and makes `ops`
+        // complete promptly (the same EOF-on-drop mechanism the clean-EOF path
+        // already relies on — so this adds no hang risk). We then prefer `ops`'s
+        // result, falling back to the stashed transport error only if `ops`
+        // itself completed successfully.
         let mut pump_done = false;
+        let mut pump_err: Option<Error> = None;
         loop {
             tokio::select! {
                 biased;
-                r = &mut ops => break r,
+                r = &mut ops => {
+                    return match r {
+                        Ok(()) => match pump_err {
+                            Some(e) => Err(e),
+                            None => Ok(()),
+                        },
+                        Err(e) => Err(e),
+                    };
+                }
                 p = &mut pump, if !pump_done => {
                     pump_done = true;
-                    // Surface a transport error; on a clean peer EOF keep looping
-                    // so the SSH operation can complete its teardown. The pump's
-                    // duplex write half drops on return, signalling EOF to russh.
-                    p?;
+                    // On a clean peer EOF (`Ok`) keep looping so the SSH operation
+                    // can complete its teardown. On a transport error, stash it
+                    // and let `ops` produce the authoritative result first; the
+                    // dropped `bridge` guarantees `ops` will not block.
+                    if let Err(e) = p {
+                        pump_err = Some(e);
+                    }
                 }
             }
         }

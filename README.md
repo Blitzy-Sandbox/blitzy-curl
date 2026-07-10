@@ -40,7 +40,9 @@ The Rust code is organized as a Cargo workspace with three member crates:
   TLS, authentication, DNS, content encoding, URL handling, the transfer core,
   and file-backed state. It replaces the C `lib/` tree.
 - `curl-rs` — the [`clap`](https://docs.rs/clap)-based command-line binary that
-  preserves the full curl flag surface. It replaces the C `src/` tree.
+  preserves the full curl flag surface; its `clap` argument definitions are
+  derived 1:1 from the option pages in `docs/cmdline-opts/`. It replaces the C
+  `src/` tree.
 - `curl-rs-ffi` — the C-ABI compatibility layer. It exposes
   `libcurl`-compatible `curl_*` symbols; its build runs
   [`cbindgen`](https://github.com/mozilla/cbindgen) to produce a header
