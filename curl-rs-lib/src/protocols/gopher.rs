@@ -918,6 +918,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        miri,
+        ignore = "drives a real rustls handshake (rcgen-issued cert + tokio_rustls TlsAcceptor/TlsConnector), which invokes the ring/aws-lc-rs C crypto backend; Miri cannot interpret foreign functions. The gophers exchange logic is UB-clean; this matches the C-FFI test-guard pattern used throughout the TLS/QUIC suites (AAP §0.6.4)."
+    )]
     async fn gophers_runs_gopher_exchange_over_tls() {
         let (server_cfg, ca_pem) = make_server();
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);

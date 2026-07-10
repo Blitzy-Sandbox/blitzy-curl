@@ -67,7 +67,38 @@ use crate::error::{Error, Result};
 /// pure-Rust equivalent of curl being built against `libpsl`, which ships (or
 /// loads) a list and enables the defense by default. The data is licensed
 /// MPL-2.0 (annotated in `REUSE.toml`), separate from the crate's own license.
+///
+/// Under the Miri interpreter (`cfg(miri)`) this constant is replaced by the
+/// tiny fixture defined below. Parsing the full ~15.7K-rule list takes many
+/// minutes under Miri (the interpreter runs orders of magnitude slower than
+/// native code), which makes the memory-safety gate non-terminating in bounded
+/// time (QA finding G5-1). The fixture drives the *identical* parse and
+/// suffix/domain lookup code paths — so Miri still validates them for undefined
+/// behavior — while covering every rule the PSL and cookie unit tests assert.
+/// Native and production builds are entirely unaffected: `cfg(miri)` is active
+/// only when the crate is executed under the Miri interpreter.
+#[cfg(not(miri))]
 const BUNDLED_PUBLIC_SUFFIX_LIST: &str = include_str!("public_suffix_list.dat");
+
+/// Miri-only lightweight substitute for [`BUNDLED_PUBLIC_SUFFIX_LIST`] (see the
+/// note on that constant for the rationale, QA G5-1). It is a valid Public
+/// Suffix List document that contains exactly the rules exercised by the unit
+/// tests: the ICANN suffixes `com`, `uk`, and `co.uk`, and the private-section
+/// suffix `github.io`. This keeps `cargo +nightly miri test` terminating in
+/// bounded time while still exercising the parser and the `suffix`/`domain`
+/// lookups (including the ICANN/private section handling) for UB.
+#[cfg(miri)]
+const BUNDLED_PUBLIC_SUFFIX_LIST: &str = "\
+// ===BEGIN ICANN DOMAINS===
+com
+uk
+co.uk
+// ===END ICANN DOMAINS===
+
+// ===BEGIN PRIVATE DOMAINS===
+github.io
+// ===END PRIVATE DOMAINS===
+";
 
 /// A shared, reference-counted Public Suffix List handle.
 ///

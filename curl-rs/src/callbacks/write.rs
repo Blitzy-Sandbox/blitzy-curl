@@ -373,3 +373,163 @@ pub unsafe extern "C" fn tool_write_cb(
 
     rc
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::args::{ClobberMode, Diag, OperationConfig};
+    use std::io::Read;
+    use std::path::Path;
+
+    fn qdiag() -> Diag {
+        // Silent so the parity `warnf`/`errorf` messages do not pollute test output; the
+        // logic under test is independent of whether the diagnostic is printed.
+        Diag {
+            silent: true,
+            showerror: false,
+            tracing: false,
+        }
+    }
+
+    #[test]
+    fn create_output_file_truncating_opens_and_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+        let mut outs = OutStruct {
+            filename: Some(path.to_string_lossy().into_owned()),
+            ..OutStruct::default()
+        };
+        let mut config = OperationConfig::new();
+        config.file_clobber_mode = ClobberMode::Always;
+
+        assert!(tool_create_output_file(qdiag(), &mut outs, &config));
+        assert!(
+            outs.regular_file,
+            "a real file must be flagged regular_file"
+        );
+        assert!(outs.fopened, "we opened it, so fopened must be set");
+        assert!(outs.stream.is_open());
+        assert_eq!(outs.bytes, 0);
+
+        // The returned sink must actually write to the created path.
+        outs.stream.write_all(b"payload").unwrap();
+        outs.stream.flush().unwrap();
+        drop(outs.stream);
+        let mut got = String::new();
+        File::open(&path).unwrap().read_to_string(&mut got).unwrap();
+        assert_eq!(got, "payload");
+    }
+
+    #[test]
+    fn create_output_file_empty_or_missing_name_fails() {
+        let config = OperationConfig::new();
+        // Absent filename.
+        let mut none = OutStruct::default();
+        assert!(!tool_create_output_file(qdiag(), &mut none, &config));
+        // Present-but-empty filename (curl DEBUGASSERTs a non-empty name).
+        let mut empty = OutStruct {
+            filename: Some(String::new()),
+            ..OutStruct::default()
+        };
+        assert!(!tool_create_output_file(qdiag(), &mut empty, &config));
+    }
+
+    #[test]
+    fn create_output_file_open_failure_returns_false() {
+        // A path inside a directory that does not exist cannot be created -> Err -> false.
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = dir.path().join("no_such_subdir").join("file.out");
+        let mut outs = OutStruct {
+            filename: Some(bogus.to_string_lossy().into_owned()),
+            ..OutStruct::default()
+        };
+        let mut config = OperationConfig::new();
+        config.file_clobber_mode = ClobberMode::Always;
+        assert!(!tool_create_output_file(qdiag(), &mut outs, &config));
+        assert!(!outs.stream.is_open());
+    }
+
+    #[test]
+    fn create_output_file_never_mode_uses_numbered_suffix_on_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dl");
+        // Pre-create the target so exclusive-create collides and the numbered retry kicks in.
+        File::create(&target).unwrap();
+        let base = target.to_string_lossy().into_owned();
+
+        let mut outs = OutStruct {
+            filename: Some(base.clone()),
+            ..OutStruct::default()
+        };
+        let mut config = OperationConfig::new();
+        config.file_clobber_mode = ClobberMode::Never;
+
+        assert!(tool_create_output_file(qdiag(), &mut outs, &config));
+        // curl records the numbered name it actually opened; first free is `dl.1`.
+        let used = outs.filename.clone().unwrap();
+        assert_eq!(
+            used,
+            format!("{base}.1"),
+            "must fall back to the `.1` suffix"
+        );
+        assert!(
+            outs.alloc_filename,
+            "a generated name is owned/alloc_filename"
+        );
+        assert!(
+            Path::new(&used).exists(),
+            "the numbered file must exist on disk"
+        );
+        assert!(outs.fopened);
+    }
+
+    #[test]
+    fn is_errno_matches_only_requested_codes() {
+        let eexist: io::Result<File> = Err(io::Error::from_raw_os_error(libc::EEXIST));
+        assert!(is_errno(&eexist, &[libc::EEXIST, libc::EISDIR]));
+        assert!(!is_errno(&eexist, &[libc::ENOENT]));
+        // A success carries no errno.
+        let dir = tempfile::tempdir().unwrap();
+        let ok: io::Result<File> = File::create(dir.path().join("x"));
+        assert!(!is_errno(&ok, &[libc::EEXIST]));
+    }
+
+    #[test]
+    fn create_dir_hierarchy_builds_nested_dirs_but_not_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let outfile = format!("{root}/a/b/c/file.txt");
+
+        assert!(matches!(
+            create_dir_hierarchy(qdiag(), &outfile),
+            CurlCode::Ok
+        ));
+        assert!(Path::new(&format!("{root}/a")).is_dir());
+        assert!(Path::new(&format!("{root}/a/b")).is_dir());
+        assert!(Path::new(&format!("{root}/a/b/c")).is_dir());
+        // The trailing component is the file itself and must NOT be created.
+        assert!(!Path::new(&outfile).exists());
+    }
+
+    #[test]
+    fn create_dir_hierarchy_with_no_directory_component_is_noop_ok() {
+        // A bare filename (no `/`) has only a trailing file component -> nothing to create.
+        assert!(matches!(
+            create_dir_hierarchy(qdiag(), "just_a_file.txt"),
+            CurlCode::Ok
+        ));
+        assert!(!Path::new("just_a_file.txt").exists());
+    }
+
+    #[test]
+    fn create_dir_hierarchy_tolerates_preexisting_dirs() {
+        // The tempdir root already exists; every prefix up to it is EEXIST-tolerated.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let outfile = format!("{root}/only.txt");
+        assert!(matches!(
+            create_dir_hierarchy(qdiag(), &outfile),
+            CurlCode::Ok
+        ));
+    }
+}

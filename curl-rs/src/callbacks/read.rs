@@ -253,3 +253,36 @@ pub unsafe extern "C" fn tool_readbusy_cb(
         CURL_PROGRESSFUNC_CONTINUE
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waitfd_reports_readiness_on_a_real_pipe() {
+        // A pipe is a non-socket descriptor — exactly the case curl uses `poll` for.
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `pipe` writes two fds into the 2-element array we own.
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "pipe() must succeed");
+        let (rd, wr) = (fds[0], fds[1]);
+
+        // Empty pipe with a 0ms budget -> poll times out (0) -> not ready.
+        assert!(!waitfd(0, rd), "an empty pipe must not report readiness");
+
+        // Make the read end readable, then poll must report it ready.
+        // SAFETY: `wr` is a valid open descriptor; we write exactly one byte from a valid ptr.
+        let n = unsafe { libc::write(wr, b"x".as_ptr().cast::<c_void>(), 1) };
+        assert_eq!(n, 1);
+        assert!(
+            waitfd(0, rd),
+            "a pipe with pending data must report readiness"
+        );
+
+        // SAFETY: both descriptors are valid and owned by this test; close once each.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+    }
+}

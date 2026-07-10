@@ -5092,6 +5092,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg_attr(
+        miri,
+        ignore = "drives a real rustls handshake (rcgen-issued cert + tokio_rustls TlsAcceptor), \
+                  which invokes the ring/aws-lc-rs C crypto backend; Miri cannot interpret foreign \
+                  functions. The FTPS control-channel logic is UB-clean; this matches the C-FFI \
+                  test-guard pattern used throughout the TLS/QUIC suites (AAP §0.6.4)."
+    )]
     async fn ftps_auth_tls_upgrades_control_channel() {
         let (server_cfg, ca_pem) = ftps_make_server_config();
         let (client_half, mut server_half) = tokio::io::duplex(64 * 1024);

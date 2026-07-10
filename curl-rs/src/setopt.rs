@@ -2165,3 +2165,415 @@ pub fn config2setopts(
     src.finish(global, diag);
     Ok(())
 }
+
+// ===========================================================================
+// Tests — the CLI→libcurl option-translation layer.
+//
+// `config2setopts` and its grouping helpers only mutate an in-memory `Easy`
+// handle plus the `--libcurl` accumulation buffer; no network or filesystem I/O
+// is performed. That makes the whole translation surface unit-testable: a fully
+// populated `OperationConfig` can be applied and the resulting handle mutations
+// asserted directly, exactly as curl's `config2setopts.c` is exercised by the
+// test-suite's `--libcurl` comparisons.
+// ===========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh library easy handle seeded with curl's default `UserDefined`
+    /// block (`Curl_open` + `Curl_init_userdefined`).
+    fn new_easy() -> Easy {
+        Easy::open()
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure integer/enum mapping helpers — direct ports of the `config2setopts.c`
+    // switch statements. Each asserts the ABI-integer → library-enum contract.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn map_method_covers_every_request_kind() {
+        assert_eq!(map_method(CfgHttpReq::Head), ReqMethod::Head);
+        assert_eq!(map_method(CfgHttpReq::Mimepost), ReqMethod::PostMime);
+        assert_eq!(map_method(CfgHttpReq::Simplepost), ReqMethod::Post);
+        assert_eq!(map_method(CfgHttpReq::Put), ReqMethod::Put);
+        assert_eq!(map_method(CfgHttpReq::Get), ReqMethod::Get);
+        // UNSPEC also defaults to GET, matching curl's `TOOL_HTTPREQ_UNSPEC`.
+        assert_eq!(map_method(CfgHttpReq::Unspec), ReqMethod::Get);
+    }
+
+    #[test]
+    fn map_ipresolve_maps_v4_v6_and_whatever() {
+        assert_eq!(map_ipresolve(curlabi::CURL_IPRESOLVE_V4), IpResolve::V4);
+        assert_eq!(map_ipresolve(curlabi::CURL_IPRESOLVE_V6), IpResolve::V6);
+        assert_eq!(
+            map_ipresolve(curlabi::CURL_IPRESOLVE_WHATEVER),
+            IpResolve::Whatever
+        );
+        // An out-of-range selector falls back to WHATEVER.
+        assert_eq!(map_ipresolve(999), IpResolve::Whatever);
+    }
+
+    #[test]
+    fn map_proxytype_covers_all_variants() {
+        assert_eq!(map_proxytype(curlabi::CURLPROXY_HTTP), ProxyType::Http);
+        assert_eq!(
+            map_proxytype(curlabi::CURLPROXY_HTTP_1_0),
+            ProxyType::Http1_0
+        );
+        assert_eq!(map_proxytype(curlabi::CURLPROXY_HTTPS), ProxyType::Https);
+        assert_eq!(map_proxytype(curlabi::CURLPROXY_HTTPS2), ProxyType::Https2);
+        assert_eq!(map_proxytype(curlabi::CURLPROXY_SOCKS4), ProxyType::Socks4);
+        assert_eq!(map_proxytype(curlabi::CURLPROXY_SOCKS5), ProxyType::Socks5);
+        assert_eq!(
+            map_proxytype(curlabi::CURLPROXY_SOCKS4A),
+            ProxyType::Socks4a
+        );
+        assert_eq!(
+            map_proxytype(curlabi::CURLPROXY_SOCKS5_HOSTNAME),
+            ProxyType::Socks5Hostname
+        );
+        // Unknown proxy codes default to a plain HTTP proxy.
+        assert_eq!(map_proxytype(42), ProxyType::Http);
+    }
+
+    #[test]
+    fn map_ftpmethod_maps_all_three() {
+        assert_eq!(
+            map_ftpmethod(curlabi::CURLFTPMETHOD_NOCWD),
+            FtpFileMethod::NoCwd
+        );
+        assert_eq!(
+            map_ftpmethod(curlabi::CURLFTPMETHOD_SINGLECWD),
+            FtpFileMethod::SingleCwd
+        );
+        assert_eq!(
+            map_ftpmethod(curlabi::CURLFTPMETHOD_MULTICWD),
+            FtpFileMethod::MultiCwd
+        );
+        // DEFAULT (0) also resolves to the MULTICWD fallback.
+        assert_eq!(
+            map_ftpmethod(curlabi::CURLFTPMETHOD_DEFAULT),
+            FtpFileMethod::MultiCwd
+        );
+    }
+
+    #[test]
+    fn map_netrc_maps_levels() {
+        assert_eq!(map_netrc(0), NetrcLevel::Ignored);
+        assert_eq!(map_netrc(1), NetrcLevel::Optional);
+        assert_eq!(map_netrc(2), NetrcLevel::Required);
+        // Anything outside {1,2} is IGNORED.
+        assert_eq!(map_netrc(7), NetrcLevel::Ignored);
+    }
+
+    #[test]
+    fn tlsversion_packs_min_in_low_and_max_in_high_bits() {
+        // No explicit min/max → the TLS 1.2 floor with no ceiling.
+        assert_eq!(tlsversion(0, 0), curlabi::CURL_SSLVERSION_TLSV1_2);
+        // A pure minimum of TLS 1.3.
+        assert_eq!(tlsversion(4, 0), curlabi::CURL_SSLVERSION_TLSV1_3);
+        // A max-only below TLS 1.2 pins the minimum to the max (C special-case).
+        assert_eq!(tlsversion(0, 2) & 0xffff, curlabi::CURL_SSLVERSION_TLSV1_1);
+        // Min 1.0 + max 1.3: floor in the low 16 bits, ceiling in the high bits.
+        let both = tlsversion(1, 4);
+        assert_eq!(both & 0xffff, curlabi::CURL_SSLVERSION_TLSV1_0);
+        assert!(
+            both > 0xffff,
+            "a requested maximum must populate the high bits"
+        );
+    }
+
+    #[test]
+    fn setopt_bad_tolerates_notbuiltin_and_unknown_option_only() {
+        // The benign "not compiled in / unknown option" codes are tolerated.
+        assert!(!setopt_bad(CurlCode::Ok));
+        assert!(!setopt_bad(CurlCode::NotBuiltIn));
+        assert!(!setopt_bad(CurlCode::UnknownOption));
+        // Any other non-OK code is lethal.
+        assert!(setopt_bad(CurlCode::OutOfMemory));
+        assert!(setopt_bad(CurlCode::FailedInit));
+    }
+
+    #[test]
+    fn split_userpwd_splits_on_first_colon() {
+        assert_eq!(
+            split_userpwd("user:pass"),
+            ("user".to_string(), Some("pass".to_string()))
+        );
+        // Only the FIRST colon separates; the remainder is the password verbatim.
+        assert_eq!(
+            split_userpwd("u:p:q"),
+            ("u".to_string(), Some("p:q".to_string()))
+        );
+        // No colon → no password component.
+        assert_eq!(split_userpwd("bare"), ("bare".to_string(), None));
+        // A trailing colon yields an empty (but present) password.
+        assert_eq!(
+            split_userpwd("user:"),
+            ("user".to_string(), Some(String::new()))
+        );
+    }
+
+    #[test]
+    fn scheme_predicates_classify_families() {
+        assert!(is_http("http") && is_http("https"));
+        assert!(!is_http("ftp"));
+        assert!(is_ftp("ftp") && is_ftp("ftps"));
+        assert!(!is_ftp("http"));
+        assert!(is_ssh("scp") && is_ssh("sftp"));
+        assert!(!is_ssh("http"));
+    }
+
+    // -----------------------------------------------------------------------
+    // config2setopts — the master applier. Each scenario drives the full
+    // cascade and asserts a representative, helper-specific handle mutation.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config2setopts_minimal_http_get_sets_url_and_method() {
+        let mut easy = new_easy();
+        let mut config = OperationConfig::new();
+        let global = GlobalConfig::new();
+        let mut url = "http://example.com/".to_string();
+        let mut mime: Option<Mime> = None;
+
+        config2setopts(&mut easy, &mut config, &global, &mut url, &mut mime)
+            .expect("a minimal HTTP GET config applies cleanly");
+
+        // GET is the default method; quick_exit is always enabled for the CLI.
+        assert_eq!(easy.set.method, ReqMethod::Get);
+        assert!(easy.set.quick_exit);
+    }
+
+    #[test]
+    fn config2setopts_synthetic_error_is_propagated() {
+        let mut easy = new_easy();
+        let mut config = OperationConfig::new();
+        config.synthetic_error = true;
+        let global = GlobalConfig::new();
+        let mut url = "http://example.com/".to_string();
+        let mut mime: Option<Mime> = None;
+
+        let err = config2setopts(&mut easy, &mut config, &global, &mut url, &mut mime)
+            .expect_err("a synthetic error must abort option application");
+        assert_eq!(err, CurlCode::FailedInit);
+    }
+
+    #[test]
+    fn config2setopts_maximal_https_applies_across_all_helpers() {
+        let mut easy = new_easy();
+        let mut config = OperationConfig::new();
+        let global = GlobalConfig::new();
+
+        // --- proxy_setopts ---
+        config.proxy = Some("http://proxy.example:3128".to_string());
+        config.proxyver = curlabi::CURLPROXY_SOCKS5;
+        config.proxyuserpwd = Some("puser:ppass".to_string());
+        config.proxytunnel = true;
+        config.preproxy = Some("http://pre.example:8080".to_string());
+        config.proxybasic = true;
+        config.noproxy = Some("localhost".to_string());
+        config.suppress_connect_headers = true;
+        config.proxy_service_name = Some("HTTP".to_string());
+        config.haproxy_protocol = true;
+        config.haproxy_clientip = Some("203.0.113.7".to_string());
+
+        // --- http_setopts / cookie_setopts ---
+        config.followlocation = 1;
+        config.unrestricted_auth = true;
+        config.autoreferer = true;
+        config.maxredirs = 7;
+        config.httpversion = 2;
+        config.encoding = true;
+        config.tr_encoding = true;
+        config.altsvc = Some("altsvc.txt".to_string());
+        config.hsts = Some("hsts.txt".to_string());
+        config.cookies = vec!["a=1".to_string(), "b=2".to_string()];
+        config.cookiefiles = vec!["cookies.txt".to_string()];
+        config.cookiejar = Some("jar.txt".to_string());
+        config.cookiesession = true;
+        config.headers = vec!["X-Test: 1".to_string()];
+        config.referer = Some("http://ref.example/".to_string());
+        config.useragent = Some("test-agent/1.0".to_string());
+
+        // --- config2setopts top-level scalars/strings ---
+        config.no_body = true;
+        config.dirlistonly = true;
+        config.use_ascii = true;
+        config.login_options = Some("AUTH=NTLM".to_string());
+        config.userpwd = Some("user:pass".to_string());
+        config.range = Some("0-1023".to_string());
+        config.timeout_ms = 30_000;
+        config.connecttimeout_ms = 5_000;
+        config.authtype = curlabi::CURLAUTH_BASIC;
+        config.oauth_bearer = Some("token123".to_string());
+        config.request_target = Some("*".to_string());
+        config.netrc = true;
+        config.netrc_file = Some("netrc".to_string());
+        config.crlf = true;
+        config.quote = vec!["PWD".to_string()];
+        config.postquote = vec!["QUIT".to_string()];
+        config.prequote = vec!["SYST".to_string()];
+        config.customrequest = Some("GET".to_string());
+        config.iface = Some("eth0".to_string());
+        config.dns_servers = Some("1.1.1.1".to_string());
+        config.dns_interface = Some("eth0".to_string());
+        config.telnet_options = vec!["TTYPE=vt100".to_string()];
+        config.doh_url = Some("https://doh.example/dns-query".to_string());
+        config.max_filesize = 1_000_000;
+        config.ip_version = curlabi::CURL_IPRESOLVE_V6;
+        config.service_name = Some("HTTP".to_string());
+        config.ignorecl = true;
+        config.localport = 8000;
+        config.localportrange = 10;
+        config.raw = true;
+        config.tftp_blksize = 1024;
+        config.mail_from = Some("from@example".to_string());
+        config.mail_rcpt = vec!["to@example".to_string()];
+        config.mail_rcpt_allowfails = true;
+        config.create_file_mode = 0o644;
+        config.resolve = vec!["example.com:443:127.0.0.1".to_string()];
+        config.connect_to = vec!["example.com::proxy.example:".to_string()];
+        config.gssapi_delegation = 1;
+        config.mail_auth = Some("auth@example".to_string());
+        config.sasl_authzid = Some("authzid".to_string());
+        config.sasl_ir = true;
+        config.unix_socket_path = Some("/run/curl.sock".to_string());
+        config.proto_default = Some("https".to_string());
+        config.tftp_no_options = true;
+        config.happy_eyeballs_timeout_ms = 1234;
+        config.disallow_username_in_url = true;
+        config.upload_flags = 1;
+        config.socks5_gssapi_nec = true;
+        config.socks5_auth = curlabi::CURLAUTH_BASIC;
+
+        // --- ssl_ca_setopts / ssl_setopts ---
+        config.cacert = Some("ca.pem".to_string());
+        config.capath = Some("/etc/ssl/certs".to_string());
+        config.cert = Some("client.pem".to_string());
+        config.cert_type = Some("PEM".to_string());
+        config.key = Some("client.key".to_string());
+        config.key_type = Some("PEM".to_string());
+        config.key_passwd = Some("secret".to_string());
+        config.crlfile = Some("crl.pem".to_string());
+        config.pinnedpubkey = Some("sha256//abc".to_string());
+        config.cipher_list = Some("HIGH".to_string());
+
+        // --- tcp_setopts ---
+        config.tcp_nodelay = true;
+        config.tcp_fastopen = true;
+        config.alivecnt = 3;
+        config.alivetime = 60;
+
+        let mut url = "https://example.com/path".to_string();
+        let mut mime: Option<Mime> = None;
+
+        config2setopts(&mut easy, &mut config, &global, &mut url, &mut mime)
+            .expect("a fully-populated HTTPS config applies cleanly");
+
+        // Spot-check mutations produced by several distinct helpers.
+        assert_eq!(easy.set.proxy.as_deref(), Some("http://proxy.example:3128"));
+        assert_eq!(easy.set.proxytype, ProxyType::Socks5);
+        assert_eq!(easy.set.maxredirs, 7);
+        assert_eq!(easy.set.use_netrc, NetrcLevel::Required);
+        assert_eq!(easy.set.ipver, IpResolve::V6);
+        assert!(easy.set.follow_location);
+        assert_eq!(easy.set.localport, 8000);
+    }
+
+    #[test]
+    fn config2setopts_ftp_upload_maps_to_put() {
+        let mut easy = new_easy();
+        let mut config = OperationConfig::new();
+        config.httpreq = CfgHttpReq::Put;
+        config.ftp_append = true;
+        config.ftp_create_dirs = true;
+        config.use_resume = true;
+        config.resume_from = 512;
+        let global = GlobalConfig::new();
+        let mut url = "ftp://ftp.example/dir/file.bin".to_string();
+        let mut mime: Option<Mime> = None;
+
+        config2setopts(&mut easy, &mut config, &global, &mut url, &mut mime)
+            .expect("an FTP upload config applies cleanly");
+
+        // -T maps to a PUT/upload request.
+        assert_eq!(easy.set.method, ReqMethod::Put);
+    }
+
+    #[test]
+    fn config2setopts_https_insecure_applies_cleanly() {
+        let mut easy = new_easy();
+        let mut config = OperationConfig::new();
+        config.insecure_ok = true;
+        let global = GlobalConfig::new();
+        let mut url = "https://self-signed.example/".to_string();
+        let mut mime: Option<Mime> = None;
+
+        // The -k path must warn (to stderr) and then apply without erroring.
+        config2setopts(&mut easy, &mut config, &global, &mut url, &mut mime)
+            .expect("an --insecure HTTPS config applies cleanly");
+    }
+
+    #[test]
+    fn config2setopts_simple_post_installs_body() {
+        let mut easy = new_easy();
+        let mut config = OperationConfig::new();
+        config.httpreq = CfgHttpReq::Simplepost;
+        config.postfields = Some("field=value".to_string());
+        config.postdata = b"field=value".to_vec();
+        let global = GlobalConfig::new();
+        let mut url = "http://example.com/submit".to_string();
+        let mut mime: Option<Mime> = None;
+
+        config2setopts(&mut easy, &mut config, &global, &mut url, &mut mime)
+            .expect("a simple POST config applies cleanly");
+        assert_eq!(easy.set.method, ReqMethod::Post);
+    }
+
+    // -----------------------------------------------------------------------
+    // Direct helper calls for the SSH group. The default feature set does not
+    // register the sftp/scp schemes, so the branch is driven with an explicit
+    // `use_proto` and a fresh accumulator rather than through a URL.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ssh_setopts_with_knownhosts_and_keys_succeeds() {
+        let mut config = OperationConfig::new();
+        config.key = Some("id_ed25519".to_string());
+        config.pubkey = Some("id_ed25519.pub".to_string());
+        config.hostpubmd5 = Some("00112233445566778899aabbccddeeff".to_string());
+        config.hostpubsha256 = Some("sha256hash".to_string());
+        config.ssh_compression = true;
+        // An explicit known_hosts path takes the strict-host-key branch without
+        // touching the filesystem.
+        config.knownhosts = Some("/tmp/blitzy_adhoc_known_hosts".to_string());
+        let global = GlobalConfig::new();
+        let mut src = EasySrc::new(false);
+
+        ssh_setopts(&config, "sftp", global.diag(), &mut src)
+            .expect("SFTP with an explicit known_hosts applies cleanly");
+    }
+
+    #[test]
+    fn ssh_setopts_insecure_skips_known_hosts_requirement() {
+        let mut config = OperationConfig::new();
+        config.insecure_ok = true;
+        let global = GlobalConfig::new();
+        let mut src = EasySrc::new(false);
+
+        // With -k the known_hosts requirement is bypassed entirely.
+        ssh_setopts(&config, "scp", global.diag(), &mut src)
+            .expect("insecure SCP applies without a known_hosts file");
+    }
+
+    #[test]
+    fn ssh_setopts_is_noop_for_non_ssh_scheme() {
+        let config = OperationConfig::new();
+        let global = GlobalConfig::new();
+        let mut src = EasySrc::new(false);
+        // A non-SSH scheme returns immediately via the early `is_ssh` guard.
+        ssh_setopts(&config, "http", global.diag(), &mut src).expect("no-op for http");
+    }
+}

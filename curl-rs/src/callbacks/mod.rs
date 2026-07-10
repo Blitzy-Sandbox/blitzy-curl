@@ -213,3 +213,111 @@ pub(crate) unsafe fn callback_slice<'a>(buffer: *const u8, size: usize, nitems: 
     // SAFETY: caller guarantees buffer covers len initialized bytes.
     unsafe { core::slice::from_raw_parts(buffer, len) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn outsink_default_is_none_and_not_open() {
+        let s = OutSink::default();
+        assert!(matches!(s, OutSink::None));
+        assert!(!s.is_open(), "the default (unopened) sink must not be open");
+    }
+
+    #[test]
+    fn outsink_null_counts_bytes_but_writes_nothing() {
+        // The discard sink reports the full length so libcurl never sees a short write,
+        // yet stores nothing (curl's `out_null` path).
+        let mut s = OutSink::Null;
+        assert!(s.is_open(), "Null is an open sink");
+        assert_eq!(s.write_all(b"abcdef").unwrap(), 6);
+        assert_eq!(s.write_all(&[]).unwrap(), 0);
+        s.flush().unwrap();
+    }
+
+    #[test]
+    fn outsink_none_write_is_notconnected_error() {
+        let mut s = OutSink::None;
+        let err = s.write_all(b"x").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        // flush on an unopened sink is a no-op success.
+        s.flush().unwrap();
+    }
+
+    #[test]
+    fn outsink_file_writes_through_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.out");
+        let f = File::create(&path).unwrap();
+        let mut s = OutSink::File(BufWriter::new(f));
+        assert!(s.is_open());
+        assert_eq!(s.write_all(b"hello world").unwrap(), 11);
+        s.flush().unwrap();
+        drop(s); // close the BufWriter/File so the bytes are durable
+
+        let mut got = String::new();
+        File::open(&path).unwrap().read_to_string(&mut got).unwrap();
+        assert_eq!(got, "hello world");
+    }
+
+    #[test]
+    fn outsink_stdout_is_open_and_flushes() {
+        // Exercise the Stdout arm without emitting visible noise (empty write).
+        let mut s = OutSink::Stdout;
+        assert!(s.is_open());
+        assert_eq!(s.write_all(&[]).unwrap(), 0);
+        s.flush().unwrap();
+    }
+
+    #[test]
+    fn outstruct_default_is_empty_stream_none() {
+        let o = OutStruct::default();
+        assert!(o.filename.is_none());
+        assert!(!o.stream.is_open());
+        assert_eq!(o.bytes, 0);
+        assert_eq!(o.init, 0);
+        assert!(!o.alloc_filename);
+        assert!(!o.is_cd_filename);
+        assert!(!o.regular_file);
+        assert!(!o.fopened);
+        assert!(!o.out_null);
+    }
+
+    #[test]
+    fn callback_slice_handles_null_zero_and_valid() {
+        // null buffer -> empty slice regardless of the claimed length.
+        // SAFETY: a null pointer with any size must yield the empty-slice fast path.
+        let empty = unsafe { callback_slice(std::ptr::null(), 4, 8) };
+        assert!(empty.is_empty());
+
+        let data = [1u8, 2, 3, 4, 5, 6];
+        // zero element count -> empty slice even with a valid pointer.
+        // SAFETY: len == 0 takes the empty-slice fast path; the pointer is not dereferenced.
+        let zero = unsafe { callback_slice(data.as_ptr(), 0, 3) };
+        assert!(zero.is_empty());
+
+        // size * nitems == 6 -> the whole backing array is viewed.
+        // SAFETY: `data` owns 6 initialized bytes and outlives the borrow.
+        let full = unsafe { callback_slice(data.as_ptr(), 2, 3) };
+        assert_eq!(full, &data[..]);
+    }
+
+    #[test]
+    fn userdata_mut_round_trips_and_rejects_null() {
+        let mut value: u64 = 40;
+        let ptr = std::ptr::addr_of_mut!(value).cast::<c_void>();
+        // SAFETY: `ptr` is the live, uniquely-borrowed `*mut u64` of `value`.
+        let borrowed = unsafe { userdata_mut::<u64>(ptr) }.expect("non-null must reconstitute");
+        *borrowed += 2;
+        assert_eq!(
+            value, 42,
+            "mutation through the reconstituted &mut must be visible"
+        );
+
+        // SAFETY: a null userdata pointer must yield None, never a dangling reference.
+        let none = unsafe { userdata_mut::<u64>(std::ptr::null_mut()) };
+        assert!(none.is_none());
+    }
+}

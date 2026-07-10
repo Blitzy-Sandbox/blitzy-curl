@@ -8718,4 +8718,347 @@ mod tests {
             .iter()
             .any(|n| n.url.as_deref() == Some("https://z/")));
     }
+
+    // ---- numeric parameter helpers (tool_paramhlp.c) ------------------------
+
+    fn qdiag() -> Diag {
+        Diag {
+            silent: true,
+            showerror: false,
+            tracing: false,
+        }
+    }
+
+    #[test]
+    fn str2num_parses_signed_and_rejects_trailing_or_garbage() {
+        assert_eq!(str2num("10").unwrap(), 10);
+        assert_eq!(str2num("-5").unwrap(), -5);
+        assert_eq!(str2num("0").unwrap(), 0);
+        assert_eq!(str2num("abc").unwrap_err(), ParameterError::BadNumeric);
+        // The whole string must be consumed (curlx_str_single(&str, '\0')).
+        assert_eq!(str2num("10x").unwrap_err(), ParameterError::BadNumeric);
+        assert_eq!(str2num("").unwrap_err(), ParameterError::BadNumeric);
+    }
+
+    #[test]
+    fn str2unum_rejects_negative() {
+        assert_eq!(str2unum("7").unwrap(), 7);
+        assert_eq!(str2unum("-1").unwrap_err(), ParameterError::NegativeNumeric);
+    }
+
+    #[test]
+    fn str2unummax_enforces_upper_bound() {
+        assert_eq!(str2unummax("5", 10).unwrap(), 5);
+        assert_eq!(str2unummax("10", 10).unwrap(), 10);
+        assert_eq!(
+            str2unummax("11", 10).unwrap_err(),
+            ParameterError::NumberTooLarge
+        );
+    }
+
+    #[test]
+    fn oct2nummax_parses_octal_and_flags_overflow_and_garbage() {
+        // 0o755 == 493; within the 0o777 cap.
+        assert_eq!(oct2nummax("755", 0o777).unwrap(), 0o755);
+        // '8' is not an octal digit.
+        assert_eq!(
+            oct2nummax("8", 0o777).unwrap_err(),
+            ParameterError::BadNumeric
+        );
+        // 0o7777 == 4095 exceeds the 0o777 cap.
+        assert_eq!(
+            oct2nummax("7777", 0o777).unwrap_err(),
+            ParameterError::NumberTooLarge
+        );
+    }
+
+    #[test]
+    fn secs2ms_scales_seconds_and_fraction_to_milliseconds() {
+        assert_eq!(secs2ms("1").unwrap(), 1000);
+        assert_eq!(secs2ms("1.5").unwrap(), 1500);
+        assert_eq!(secs2ms("0.25").unwrap(), 250);
+        assert_eq!(secs2ms("abc").unwrap_err(), ParameterError::BadNumeric);
+    }
+
+    #[test]
+    fn str2offset_is_nonnegative_and_whole_string() {
+        assert_eq!(str2offset("100").unwrap(), 100);
+        // No negative handling: a leading '-' is not a number.
+        assert_eq!(str2offset("-1").unwrap_err(), ParameterError::BadNumeric);
+        assert_eq!(str2offset("12ab").unwrap_err(), ParameterError::BadNumeric);
+    }
+
+    #[test]
+    fn str2tls_max_maps_known_versions() {
+        assert_eq!(str2tls_max("default").unwrap(), 0);
+        assert_eq!(str2tls_max("1.0").unwrap(), 1);
+        assert_eq!(str2tls_max("1.3").unwrap(), 4);
+        assert_eq!(str2tls_max("9.9").unwrap_err(), ParameterError::BadUse);
+    }
+
+    #[test]
+    fn get_size_parameter_handles_units_and_fractions() {
+        assert_eq!(get_size_parameter("10").unwrap(), 10);
+        assert_eq!(get_size_parameter("1B").unwrap(), 1);
+        assert_eq!(get_size_parameter("2K").unwrap(), 2048);
+        // 1*1024 + (0.5 * 1024) == 1536.
+        assert_eq!(get_size_parameter("1.5K").unwrap(), 1536);
+        // Unknown unit letter.
+        assert_eq!(
+            get_size_parameter("5X").unwrap_err(),
+            ParameterError::BadUse
+        );
+        // A fraction with no unit is meaningless.
+        assert_eq!(
+            get_size_parameter("1.5").unwrap_err(),
+            ParameterError::BadUse
+        );
+    }
+
+    // ---- enum-string validators (never fail; unknown -> default + warn) -----
+
+    #[test]
+    fn ftpfilemethod_maps_known_and_defaults_unknown() {
+        let d = qdiag();
+        assert_eq!(
+            ftpfilemethod(d, "singlecwd"),
+            curlabi::CURLFTPMETHOD_SINGLECWD
+        );
+        assert_eq!(ftpfilemethod(d, "NOCWD"), curlabi::CURLFTPMETHOD_NOCWD);
+        assert_eq!(
+            ftpfilemethod(d, "multicwd"),
+            curlabi::CURLFTPMETHOD_MULTICWD
+        );
+        // Unknown -> documented default (MULTICWD).
+        assert_eq!(ftpfilemethod(d, "bogus"), curlabi::CURLFTPMETHOD_MULTICWD);
+    }
+
+    #[test]
+    fn ftpcccmethod_maps_known_and_defaults_unknown() {
+        let d = qdiag();
+        assert_eq!(ftpcccmethod(d, "active"), curlabi::CURLFTPSSL_CCC_ACTIVE);
+        assert_eq!(ftpcccmethod(d, "passive"), curlabi::CURLFTPSSL_CCC_PASSIVE);
+        assert_eq!(ftpcccmethod(d, "bogus"), curlabi::CURLFTPSSL_CCC_PASSIVE);
+    }
+
+    #[test]
+    fn delegation_maps_known_and_defaults_unknown() {
+        let d = qdiag();
+        assert_eq!(delegation(d, "none"), curlabi::CURLGSSAPI_DELEGATION_NONE);
+        assert_eq!(
+            delegation(d, "policy"),
+            curlabi::CURLGSSAPI_DELEGATION_POLICY_FLAG
+        );
+        assert_eq!(delegation(d, "always"), curlabi::CURLGSSAPI_DELEGATION_FLAG);
+        assert_eq!(delegation(d, "bogus"), curlabi::CURLGSSAPI_DELEGATION_NONE);
+    }
+
+    // ---- protocol-set parsing ----------------------------------------------
+
+    #[test]
+    fn proto_token_is_case_insensitive_and_rejects_unknown() {
+        assert_eq!(proto_token("HTTP"), Some("http"));
+        assert_eq!(proto_token("sFtP"), Some("sftp"));
+        assert!(proto_token("notaproto").is_none());
+    }
+
+    #[test]
+    fn check_protocol_accepts_builtins_and_rejects_others() {
+        assert!(check_protocol("https").is_ok());
+        assert!(check_protocol("ftp").is_ok());
+        assert_eq!(
+            check_protocol("frobnicate").unwrap_err(),
+            ParameterError::LibcurlUnsupportedProtocol
+        );
+    }
+
+    #[test]
+    fn proto2num_evaluates_modifiers_against_seed() {
+        let d = qdiag();
+        let empty: &[&'static str] = &[];
+        // `=p` clears then sets a single scheme.
+        assert_eq!(proto2num(d, empty, "=https").unwrap(), "https");
+        // A bare/`+p` adds onto the seed.
+        assert_eq!(proto2num(d, empty, "http").unwrap(), "http");
+        assert_eq!(proto2num(d, empty, "+ftp").unwrap(), "ftp");
+        // A deny against an empty set yields nothing -> BadUse.
+        assert_eq!(
+            proto2num(d, empty, "-http").unwrap_err(),
+            ParameterError::BadUse
+        );
+        // An unknown scheme after `=` clears the set and leaves it empty -> BadUse.
+        assert_eq!(
+            proto2num(d, empty, "=bogus").unwrap_err(),
+            ParameterError::BadUse
+        );
+    }
+
+    // ---- certificate / string / list helpers --------------------------------
+
+    #[test]
+    fn parse_cert_parameter_splits_name_and_passphrase() {
+        // No separator -> whole string is the name.
+        assert_eq!(
+            parse_cert_parameter("cert.pem").unwrap(),
+            ("cert.pem".to_string(), None)
+        );
+        // First unescaped ':' separates name from passphrase.
+        assert_eq!(
+            parse_cert_parameter("cert.pem:secret").unwrap(),
+            ("cert.pem".to_string(), Some("secret".to_string()))
+        );
+        // A PKCS#11 URI is taken verbatim (its ':' is not a separator).
+        assert_eq!(
+            parse_cert_parameter("pkcs11:token=foo").unwrap(),
+            ("pkcs11:token=foo".to_string(), None)
+        );
+        // A backslash escapes a literal colon into the name.
+        assert_eq!(
+            parse_cert_parameter("c\\:d").unwrap(),
+            ("c:d".to_string(), None)
+        );
+        assert_eq!(
+            parse_cert_parameter("").unwrap_err(),
+            ParameterError::BlankString
+        );
+    }
+
+    #[test]
+    fn getstr_stores_and_enforces_blank_policy() {
+        let mut store: Option<String> = None;
+        getstr(&mut store, "value", DENY_BLANK).unwrap();
+        assert_eq!(store.as_deref(), Some("value"));
+        // DENY_BLANK rejects an empty value.
+        assert_eq!(
+            getstr(&mut store, "", DENY_BLANK).unwrap_err(),
+            ParameterError::BlankString
+        );
+        // ALLOW_BLANK stores the empty string.
+        getstr(&mut store, "", ALLOW_BLANK).unwrap();
+        assert_eq!(store.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn url_encode_percent_encodes_reserved_bytes() {
+        assert_eq!(url_encode(b"abcXYZ0-9_.~"), "abcXYZ0-9_.~");
+        assert_eq!(url_encode(b"a b/c"), "a%20b%2Fc");
+        assert_eq!(url_encode(&[0x00, 0xff]), "%00%FF");
+    }
+
+    #[test]
+    fn add2list_and_inlist_track_header_membership() {
+        let mut list: Vec<String> = Vec::new();
+        add2list(&mut list, "Host: example.com").unwrap();
+        add2list(&mut list, "Accept: */*").unwrap();
+        assert_eq!(list.len(), 2);
+        // Case-insensitive, name terminated by ':' or ';'.
+        assert!(inlist(&list, "host"));
+        assert!(inlist(&list, "Accept"));
+        // A prefix that is not colon/semicolon-terminated does not match.
+        assert!(!inlist(&list, "Hos"));
+        assert!(!inlist(&list, "Content-Type"));
+    }
+
+    #[test]
+    fn file2string_strips_newlines_and_file2memory_is_raw() {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"line1\r\nline2\n").unwrap();
+        f.flush().unwrap();
+        let p = f.path().to_str().unwrap();
+        // file2string drops CR/LF (curl reads a "string" line-joined).
+        assert_eq!(file2string(p).unwrap(), "line1line2");
+        // file2memory returns the bytes unchanged.
+        assert_eq!(file2memory(p).unwrap(), b"line1\r\nline2\n");
+    }
+
+    // ---- dispatcher-completeness invariants over the whole OPTIONS table ----
+
+    /// The flow-control commands never "apply" — they short-circuit `getparameter`
+    /// with a signal (`--help`/`--manual`/`--version`/`--engine list`/
+    /// `--dump-ca-embed`) or split the operation (`--next`), so they are excluded
+    /// from the "applies cleanly" invariants below.
+    fn is_flow_control_cmd(cmd: Cmd) -> bool {
+        matches!(
+            cmd,
+            Cmd::Help | Cmd::Manual | Cmd::Version | Cmd::Engine | Cmd::DumpCaEmbed | Cmd::Next
+        )
+    }
+
+    #[test]
+    fn every_boolean_option_applies_cleanly() {
+        // Invariant: `opt_bool` must handle every ARG_BOOL row in OPTIONS. On a fresh
+        // config, `--<name>` must apply without error for all of them (only the
+        // flow-control rows signal instead of applying).
+        let mut checked = 0usize;
+        for o in OPTIONS.iter().filter(|o| o.typ == ArgType::Bool) {
+            if is_flow_control_cmd(o.cmd) {
+                continue;
+            }
+            let mut g = GlobalConfig::new();
+            g.silent = true; // suppress any parity warnings to stderr
+            let flag = format!("--{}", o.lname);
+            let r = getparameter(&flag, None, &mut g, CONFIG_MAX_LEVELS);
+            assert!(r.is_ok(), "{flag} (bool) errored: {:?}", r.err());
+            checked += 1;
+        }
+        assert!(checked > 40, "expected many boolean options, saw {checked}");
+    }
+
+    #[test]
+    fn every_valueless_none_option_applies_cleanly() {
+        // Invariant: every ARG_NONE row (except flow-control) is handled by `opt_none`
+        // and applies without error.
+        let mut checked = 0usize;
+        for o in OPTIONS.iter().filter(|o| o.typ == ArgType::None_) {
+            if is_flow_control_cmd(o.cmd) {
+                continue;
+            }
+            let mut g = GlobalConfig::new();
+            g.silent = true;
+            let flag = format!("--{}", o.lname);
+            let r = getparameter(&flag, None, &mut g, CONFIG_MAX_LEVELS);
+            assert!(r.is_ok(), "{flag} (none) errored: {:?}", r.err());
+            checked += 1;
+        }
+        assert!(
+            checked > 5,
+            "expected several ARG_NONE options, saw {checked}"
+        );
+    }
+
+    #[test]
+    fn every_value_option_is_dispatch_reachable() {
+        // Invariant: every ARG_STRG/ARG_FILE row is wired into `opt_string`/`opt_file`
+        // — i.e. it never falls through to the `default` arm that returns
+        // OptionUnknown. A benign value ("1") may still be rejected by an option's own
+        // validator (e.g. BadNumeric, or BadUse from `existingfile` on a path that does
+        // not exist), which is acceptable here; we assert only that the handler exists.
+        let mut checked = 0usize;
+        for o in OPTIONS.iter().filter(|o| o.typ.takes_arg()) {
+            if is_flow_control_cmd(o.cmd) {
+                continue;
+            }
+            let mut g = GlobalConfig::new();
+            g.silent = true;
+            let flag = format!("--{}", o.lname);
+            // Most options accept a benign numeric value; `--upload-flags` validates its
+            // value against a fixed IMAP-flag vocabulary (an unknown *token* legitimately
+            // yields OptionUnknown, faithful to curl's `parse_upload_flags`), so hand it a
+            // real flag name to exercise the success path instead.
+            let val = if o.cmd == Cmd::UploadFlags {
+                "seen"
+            } else {
+                "1"
+            };
+            let r = getparameter(&flag, Some(val), &mut g, CONFIG_MAX_LEVELS);
+            assert_ne!(
+                r.err(),
+                Some(ParameterError::OptionUnknown),
+                "{flag} (value) fell through to OptionUnknown — missing from the switch"
+            );
+            checked += 1;
+        }
+        assert!(checked > 100, "expected many value options, saw {checked}");
+    }
 }
