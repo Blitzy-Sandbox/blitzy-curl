@@ -2999,6 +2999,22 @@ impl Easy {
         let mut method = base_request.method.clone();
         let mut body = base_request.body.clone();
 
+        // Working authentication credentials and the origin they belong to
+        // (← curl's `data->state.aptr.user/passwd` plus `data->state.first_host`
+        // / `data->state.first_remote_port`). The first hop fixes the credential
+        // origin; a redirect to any *different* scheme/host/port drops the Basic
+        // credentials and a caller-supplied `Authorization:`/`Cookie:` header so
+        // they are never re-sent to a foreign host — exactly the cross-origin
+        // strip performed by `Curl_http_follow` / `Curl_auth_allowed_to_host`.
+        // Once stripped they stay stripped for the remainder of the chain.
+        // `--location-trusted` (`CURLOPT_UNRESTRICTED_AUTH`) opts out of the
+        // strip and keeps sending credentials to every host in the chain.
+        let unrestricted_auth = self.set.allow_auth_to_other_hosts;
+        let mut cred_user = base_request.user.clone();
+        let mut cred_password = base_request.password.clone();
+        let mut cred_origin: Option<(String, String, u16)> = None;
+        let mut strip_sensitive_headers = false;
+
         // Redirect-follow loop (← curl's `multi_runsingle` re-entering the SETUP
         // state after `Curl_follow` installs a new URL on the handle). A single
         // iteration for a non-redirected transfer; each followed `3xx`
@@ -3061,6 +3077,39 @@ impl Easy {
             }
             request.method = method.clone();
             request.body = body.clone();
+
+            // Cross-origin credential strip (← `Curl_http_follow` +
+            // `Curl_auth_allowed_to_host`). The first hop records the credential
+            // origin; any later hop whose (scheme, host, port) differs drops the
+            // Basic credentials and any caller-supplied `Authorization:`/`Cookie:`
+            // header so they never leak to a foreign host. The decision latches:
+            // once a foreign origin is reached the credentials stay stripped for
+            // every remaining hop. `--location-trusted` disables the strip.
+            if !unrestricted_auth {
+                let this_origin = (scheme_lc.clone(), host.clone(), port);
+                match &cred_origin {
+                    None => cred_origin = Some(this_origin),
+                    Some(origin) => {
+                        if *origin != this_origin {
+                            cred_user = None;
+                            cred_password = None;
+                            strip_sensitive_headers = true;
+                        }
+                    }
+                }
+            }
+            // Use the (possibly cleared) working credentials for this hop and, once
+            // a foreign origin has been reached, drop sensitive caller-supplied
+            // headers so `Authorization:`/`Cookie:` are not forwarded cross-host.
+            request.user = cred_user.clone();
+            request.password = cred_password.clone();
+            if strip_sensitive_headers {
+                request.headers.retain(|line| {
+                    let name = line.split(':').next().unwrap_or("").trim();
+                    !name.eq_ignore_ascii_case("Authorization")
+                        && !name.eq_ignore_ascii_case("Cookie")
+                });
+            }
 
             // --- 3. Build the live connection. ---
             let is_nonetwork = ident.is_nonetwork();
@@ -4445,5 +4494,111 @@ mod tests {
             easy.state.followlocation, 1,
             "exactly one redirect was followed"
         );
+    }
+
+    /// End-to-end proof that [`Easy::perform_transfer`] strips Basic credentials
+    /// on a *cross-origin* redirect — the AAP §0.6.1 cross-host `Authorization`
+    /// stripping gate, surfaced while re-verifying F10-REDIR-01. curl sends the
+    /// `-u` credentials to the first origin but must never forward them to a
+    /// redirect target on a different origin (here a different port) unless
+    /// `CURLOPT_UNRESTRICTED_AUTH` / `--location-trusted` opts in. Two listeners
+    /// on distinct ports model the two origins; the followed request to the
+    /// second origin must carry no `Authorization` header.
+    #[cfg(feature = "http")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_transfer_strips_credentials_on_cross_origin_redirect() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn read_request_head(sock: &mut tokio::net::TcpStream) -> Vec<u8> {
+            let mut buf = [0u8; 4096];
+            let mut data = Vec::new();
+            while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buf[..n]);
+            }
+            data
+        }
+
+        // Origin A issues the redirect; origin B is the cross-origin target
+        // (a distinct ephemeral port ⇒ a different origin).
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        let port_b = addr_b.port();
+
+        // Origin A: 302 → an *absolute* URL on origin B.
+        let srv_a = tokio::spawn(async move {
+            let (mut s1, _) = listener_a.accept().await.unwrap();
+            let req1 = read_request_head(&mut s1).await;
+            let redirect = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port_b}/final\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            s1.write_all(redirect.as_bytes()).await.unwrap();
+            let _ = s1.shutdown().await;
+            req1
+        });
+
+        // Origin B: answers the followed request with the real body.
+        let srv_b = tokio::spawn(async move {
+            let (mut s2, _) = listener_b.accept().await.unwrap();
+            let req2 = read_request_head(&mut s2).await;
+            s2.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\
+                  Connection: close\r\n\r\nhello",
+            )
+            .await
+            .unwrap();
+            let _ = s2.shutdown().await;
+            req2
+        });
+
+        let mut easy = Easy::open();
+        easy.set_url(&format!("http://127.0.0.1:{}/start", addr_a.port()))
+            .expect("set_url");
+        // `-L` / CURLOPT_FOLLOWLOCATION.
+        easy.set.follow_location = true;
+
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let sink = Box::new(VecSink(Arc::clone(&collected)));
+        // `-u secretuser:secretpass` → Basic credentials on the request template.
+        let req = crate::protocols::TransferRequest {
+            method: "GET".to_string(),
+            user: Some("secretuser".to_string()),
+            password: Some("secretpass".to_string()),
+            ..Default::default()
+        };
+
+        easy.perform_transfer(req, sink)
+            .await
+            .expect("perform_transfer follows the cross-origin redirect");
+
+        let req1 = srv_a.await.unwrap();
+        let req2 = srv_b.await.unwrap();
+        let head1 = String::from_utf8_lossy(&req1).to_ascii_lowercase();
+        let head2 = String::from_utf8_lossy(&req2).to_ascii_lowercase();
+
+        // Hop 1 (the credential origin) carries the Basic header…
+        assert!(
+            head1.contains("authorization: basic"),
+            "the first request to the credential origin must carry Basic auth; got: {head1}"
+        );
+        // …but hop 2 (a different origin) must NOT — the credentials are stripped
+        // so they never leak to a foreign host.
+        assert!(
+            !head2.contains("authorization"),
+            "credentials must be stripped on the cross-origin redirect; leaked in: {head2}"
+        );
+
+        // The handle still lands on the final 200 and counts exactly one redirect.
+        assert_eq!(easy.info.httpcode, 200);
+        assert_eq!(collected.lock().expect("sink").as_slice(), b"hello");
+        assert_eq!(easy.state.followlocation, 1);
     }
 }
