@@ -690,10 +690,14 @@ fn long_from_info(ci: CurlInfo, easy: &Easy) -> i64 {
 
 /// `long` value for a `CURLINFO_NONE` (special-cased) long variable — curl's
 /// `writeLong` switch over `wovar->id`.
-fn long_special(id: WriteoutId, _easy: &Easy, per_result: CurlCode) -> Option<i64> {
+fn long_special(id: WriteoutId, easy: &Easy, per_result: CurlCode) -> Option<i64> {
     match id {
-        // Per-transfer counters default to zero here.
-        WriteoutId::NumRetry | WriteoutId::NumCerts | WriteoutId::NumHeaders => Some(0),
+        // Per-transfer counters not tracked by the core handle default to zero here.
+        WriteoutId::NumRetry | WriteoutId::NumCerts => Some(0),
+        // `%{num_headers}` is the count of response headers in the final response
+        // (curl's `per->num_headers`, maintained by the header callback). The core
+        // handle stores exactly those headers, so their count is the faithful value.
+        WriteoutId::NumHeaders => Some(easy.info.resp_headers.len() as i64),
         WriteoutId::Exitcode => Some(i64::from(per_result.to_i32())),
         _ => None,
     }
@@ -1035,19 +1039,40 @@ fn current_time() -> (i64, u32) {
 }
 
 /// Fetch one response header value — the Rust seam for curl's
-/// `curl_easy_header`. Returns `(value, index, amount)`.
+/// `curl_easy_header`. Returns `(value, index, amount)` where `amount` is the
+/// total number of headers matching `name` and `index` is the 0-based
+/// occurrence just returned.
 ///
-/// The core `curl-rs-lib` handle exposes no header-retrieval API, so this
-/// currently yields `None` (no headers available), which makes `%header{…}`
-/// emit nothing — the faithful result for a handle without stored headers.
-/// When a header API lands, only this function needs to change.
+/// Reads the response headers captured by the core handle
+/// ([`Easy::info`]`.resp_headers`). Only the final response's headers are
+/// retained, so any `request` index beyond the last (`request > 0`) has no
+/// stored headers: curl's `CURLH_HEADER` selects the last request for
+/// `request == -1`, and `request == 0` is that same (only) response here.
+/// Header names are matched case-insensitively, mirroring libcurl's
+/// case-insensitive header hash.
 fn easy_header(
-    _easy: &Easy,
-    _name: &[u8],
-    _index: usize,
-    _request: i32,
+    easy: &Easy,
+    name: &[u8],
+    index: usize,
+    request: i32,
 ) -> Option<(String, usize, usize)> {
-    None
+    if request > 0 {
+        return None;
+    }
+    let name = core::str::from_utf8(name).ok()?;
+    // `amount` counts every header matching `name`; `hit` captures the value of
+    // the `index`-th match (0-based) as we pass it.
+    let mut amount = 0usize;
+    let mut hit: Option<String> = None;
+    for (hname, hvalue) in &easy.info.resp_headers {
+        if hname.eq_ignore_ascii_case(name) {
+            if amount == index {
+                hit = Some(hvalue.clone());
+            }
+            amount += 1;
+        }
+    }
+    hit.map(|value| (value, index, amount))
 }
 
 /// Emit a `name:all:[sep]` separator, honouring the `\r \n \t \}` escapes —

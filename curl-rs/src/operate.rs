@@ -1066,6 +1066,145 @@ impl TransferSink for CliBodySink {
     }
 }
 
+/// A body sink that buffers every received byte in memory. curl has no direct analogue (its
+/// write callback streams straight to the output); this exists solely to support the CLI's
+/// `-i`/`--include` header-before-body ordering. The library streams the body during the
+/// transfer, before the CLI knows the response headers, so for `-i` we collect the body here and
+/// flush it to `per.outs` only *after* the header callback has emitted the response headers to the
+/// same stream (see [`perform_one`]). This mirrors curl, whose header callback writes headers to
+/// `outs->stream` before the write callback appends the body.
+struct CliBufferSink {
+    /// The accumulated body bytes, reclaimed by [`perform_one`] once the transfer finishes.
+    buf: Arc<Mutex<Vec<u8>>>,
+}
+
+impl TransferSink for CliBufferSink {
+    fn write(&mut self, data: &[u8]) -> curl_rs_lib::Result<()> {
+        // The library engine drops the sink before `perform_one` reclaims `buf`, so this lock is
+        // uncontended; a poisoned lock can only follow a panic unwind, where surfacing a write
+        // error is the safe response.
+        match self.buf.lock() {
+            Ok(mut buf) => {
+                buf.extend_from_slice(data);
+                Ok(())
+            }
+            Err(_) => Err(curl_rs_lib::Error::from(CurlCode::WriteError)),
+        }
+    }
+}
+
+/// Replay the final response's headers through the CLI header callback
+/// (`callbacks/header.rs::tool_header_cb`) after the transfer completes — the deferred wiring of
+/// curl's always-installed `CURLOPT_HEADERFUNCTION` / `CURLOPT_HEADERDATA`. curl streams headers to
+/// this callback as they arrive; the Rust transfer engine instead records them on the handle
+/// ([`Easy`]`::info.resp_headers`), so we reconstruct the on-the-wire header block — the status
+/// line, one `Name: value` line per header, then the terminating blank line — and feed each line to
+/// the callback exactly as libcurl would (`size == 1`, `nmemb == line length`).
+///
+/// Running post-transfer is sound and race-free: the callback's only reads of `per.easy` (the
+/// connection scheme, the response code, and the URL handle for OSC-8 `Location:` links) are valid
+/// now that [`Easy::perform_transfer`] has released its `&mut per.easy` borrow. This drives the
+/// header effects that are well-defined once the body has already been received: `-D`/`--dump-header`
+/// (to `per.heads`), `--etag-save` (to `per.etag_save`), and `-i`/`--include` styled header output
+/// (to `per.outs`). `-J`/`-OJ` Content-Disposition filename derivation is NOT driven here — it must
+/// select the output name before the body opens the file, which a post-transfer replay cannot do —
+/// so `per.hdrcbdata.honor_cd_filename` is left disabled and the `content_disposition` branch of the
+/// callback never fires (see the note in `create_single`).
+fn run_header_replay(per: &mut PerTransfer, config: &OperationConfig) {
+    // No HTTP response was received (e.g. a connection failure, or a non-HTTP protocol that records
+    // no response headers): there is nothing to replay — curl's header callback simply never fires.
+    if per.easy.info.httpcode == 0 && per.easy.info.resp_headers.is_empty() {
+        return;
+    }
+
+    // Bind the config back-pointer to the live borrow for the duration of the replay. The callback
+    // only ever *reads* through it (`&*per.hdrcbdata.config`), never writes, so deriving a `*mut`
+    // from this shared reference is sound. Binding here (rather than caching it during setup)
+    // guarantees the pointer cannot dangle past an `operations` reallocation.
+    per.hdrcbdata.config = config as *const OperationConfig as *mut OperationConfig;
+
+    // Reconstruct the response head exactly as delivered on the wire. The status-line prefix is
+    // HTTP/1.1 (the transfer engine's `-v`/`--trace` head reconstruction does the same); this is
+    // the HTTP header-display path and parity is measured against HTTP/1.1 responses.
+    let info = &per.easy.info;
+    let mut lines: Vec<Vec<u8>> = Vec::with_capacity(info.resp_headers.len() + 2);
+    let status_line = match info.resp_reason.as_deref() {
+        Some(reason) if !reason.is_empty() => format!("HTTP/1.1 {} {reason}\r\n", info.httpcode),
+        _ => format!("HTTP/1.1 {}\r\n", info.httpcode),
+    };
+    lines.push(status_line.into_bytes());
+    for (name, value) in &info.resp_headers {
+        lines.push(format!("{name}: {value}\r\n").into_bytes());
+    }
+    // The blank line terminating the header block: curl delivers this trailing CRLF too, and it
+    // drives the header callback's `%{num_headers}` block-boundary reset.
+    lines.push(b"\r\n".to_vec());
+
+    // Feed each reconstructed line to the header callback using libcurl's CURLOPT_HEADERDATA
+    // convention (`userdata` = the live `*mut PerTransfer`). A short/failed return aborts the
+    // remaining lines, matching libcurl treating a header-callback short write as a transfer abort.
+    for mut line in lines {
+        let len = line.len();
+        // SAFETY: `line` owns `len` readable bytes for the duration of the call, and `per` is a
+        // live, uniquely-borrowed `PerTransfer` whose `hdrcbdata.config` was just bound to a config
+        // that outlives the call — exactly libcurl's CURLOPT_HEADERDATA/HEADERFUNCTION contract, and
+        // identical to this module's `call_header_cb` test harness. The prior `&per.easy.info`
+        // borrow ends here (all data was copied into `lines`), so forming `per as *mut _` is sound.
+        let rc = unsafe {
+            crate::callbacks::header::tool_header_cb(
+                line.as_mut_ptr() as *mut core::ffi::c_char,
+                1,
+                len,
+                per as *mut PerTransfer as *mut core::ffi::c_void,
+            )
+        };
+        if rc != len {
+            break;
+        }
+    }
+}
+
+/// Flush a buffered response body (see [`CliBufferSink`]) to `per.outs` through the standard
+/// [`CliBodySink`] write path, so the body inherits curl's exact output semantics (bit-bucket
+/// discard, lazy open honoring the clobber policy, the binary-output-to-terminal guard, byte
+/// accounting, and `--no-buffer` flushing). Used only on the `-i`/`--include` path, *after*
+/// [`run_header_replay`] has written the response headers, to preserve header-before-body order.
+/// Returns the resulting [`CurlCode`] so a body-write failure (e.g. the binary-output guard)
+/// propagates to the transfer result exactly as curl's write callback does.
+fn flush_buffered_body(
+    per: &mut PerTransfer,
+    config: &OperationConfig,
+    body: &[u8],
+    synthetic: &Arc<AtomicBool>,
+) -> CurlCode {
+    if body.is_empty() {
+        return CurlCode::Ok;
+    }
+    let diag = per.diag;
+    // Move `per.outs` into a shared cell for the sink, then reclaim it — the same pattern the
+    // streaming path uses. The header callback already opened the stream (for `-i`), so
+    // `CliBodySink::write` sees it open and appends the body, preserving header-before-body order.
+    let shared = Arc::new(Mutex::new(std::mem::take(&mut per.outs)));
+    let mut sink = CliBodySink {
+        outs: Arc::clone(&shared),
+        clobber_mode: config.file_clobber_mode,
+        stdout_is_tty: std::io::stdout().is_terminal(),
+        terminal_binary_ok: config.terminal_binary_ok,
+        nobuffer: config.nobuffer,
+        diag,
+        synthetic_error: Arc::clone(synthetic),
+    };
+    let result = sink.write(body);
+    drop(sink);
+    per.outs = Arc::try_unwrap(shared)
+        .map(|m| m.into_inner().unwrap_or_default())
+        .unwrap_or_default();
+    match result {
+        Ok(()) => CurlCode::Ok,
+        Err(e) => e.code(),
+    }
+}
+
 /// Translate a fully-parsed [`OperationConfig`] into the library's [`TransferRequest`] — the
 /// CLI-side analogue of curl's `config2setopts` request-shaping options (method, body,
 /// headers, credentials, range). The URL-derived fields (`scheme`/`host`/`port`/`path`/
@@ -1190,32 +1329,85 @@ async fn perform_one(per: &mut PerTransfer, config: &OperationConfig) -> (CurlCo
         }
     }
 
-    // Hand the transfer's output sink to the library engine via a shared cell so we can
-    // reclaim it (and its byte accounting) once the transfer completes.
-    let shared = Arc::new(Mutex::new(std::mem::take(&mut per.outs)));
     let synthetic = Arc::new(AtomicBool::new(false));
-    let sink = Box::new(CliBodySink {
-        outs: Arc::clone(&shared),
-        clobber_mode: config.file_clobber_mode,
-        stdout_is_tty: std::io::stdout().is_terminal(),
-        terminal_binary_ok: config.terminal_binary_ok,
-        nobuffer: config.nobuffer,
-        diag: per.diag,
-        synthetic_error: Arc::clone(&synthetic),
-    });
 
-    // The real byte pump: resolve → connect the filter chain → run the protocol exchange.
-    let code = match per.easy.perform_transfer(request, sink).await {
-        Ok(()) => CurlCode::Ok,
-        Err(e) => e.code(),
+    // Whether the response-header callback (`callbacks/header.rs::tool_header_cb`) has any
+    // observable effect for this transfer: `-i`/`--include` (`show_headers`), `-D`/`--dump-header`
+    // (`headerfile`), or `--etag-save` (`etag_save_file`). curl always installs the header
+    // callback; we replay it over the recorded response headers only when it would actually do
+    // something. `-J`/`-OJ` Content-Disposition filename derivation is deliberately excluded: it
+    // must run before the body opens the output file, which the post-transfer replay cannot honor
+    // (see the note in `create_single`), so we leave `honor_cd_filename` disabled and `-OJ` keeps
+    // its pre-existing URL-basename behavior rather than erroring in the replay.
+    let header_cb_active =
+        config.show_headers || config.headerfile.is_some() || config.etag_save_file.is_some();
+
+    let code = if config.show_headers {
+        // `-i`/`--include`: the response headers must precede the body in the SAME output stream
+        // (`per.outs`). The library streams the body during the transfer, before the CLI knows the
+        // response headers, so buffer the body now; after the transfer, emit the headers through
+        // the header callback and then flush the buffered body — preserving curl's
+        // header-before-body ordering (curl's header callback writes to `outs->stream` before the
+        // write callback appends the body). `per.outs` is intentionally NOT moved out here so the
+        // header callback can open and write to it directly.
+        let body_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink = Box::new(CliBufferSink {
+            buf: Arc::clone(&body_buf),
+        });
+        let code = match per.easy.perform_transfer(request, sink).await {
+            Ok(()) => CurlCode::Ok,
+            Err(e) => e.code(),
+        };
+        let body = Arc::try_unwrap(body_buf)
+            .map(|m| m.into_inner().unwrap_or_default())
+            .unwrap_or_default();
+
+        // Emit the response headers (to `per.outs`, plus `-D` dump / `--etag-save` side files),
+        // then append the buffered body to the same now-open stream.
+        run_header_replay(per, config);
+        let flush_code = flush_buffered_body(per, config, &body, &synthetic);
+        // A successful transfer whose body flush fails (e.g. the binary-output-to-terminal guard)
+        // takes the flush error, exactly as curl's write callback would abort the transfer.
+        if code == CurlCode::Ok {
+            flush_code
+        } else {
+            code
+        }
+    } else {
+        // Streaming path: hand the output sink to the library engine via a shared cell so we can
+        // reclaim it (and its byte accounting) once the transfer completes.
+        let shared = Arc::new(Mutex::new(std::mem::take(&mut per.outs)));
+        let sink = Box::new(CliBodySink {
+            outs: Arc::clone(&shared),
+            clobber_mode: config.file_clobber_mode,
+            stdout_is_tty: std::io::stdout().is_terminal(),
+            terminal_binary_ok: config.terminal_binary_ok,
+            nobuffer: config.nobuffer,
+            diag: per.diag,
+            synthetic_error: Arc::clone(&synthetic),
+        });
+
+        // The real byte pump: resolve → connect the filter chain → run the protocol exchange.
+        let code = match per.easy.perform_transfer(request, sink).await {
+            Ok(()) => CurlCode::Ok,
+            Err(e) => e.code(),
+        };
+
+        // Reclaim the output sink. The library engine has dropped its `Box<dyn TransferSink>` by
+        // now, so we hold the only remaining reference and `try_unwrap` succeeds; the `unwrap_or`
+        // is a defensive fallback that cannot trigger in practice.
+        per.outs = Arc::try_unwrap(shared)
+            .map(|m| m.into_inner().unwrap_or_default())
+            .unwrap_or_default();
+
+        // Dump headers (`-D`) and save the ETag (`--etag-save`) via the header callback.
+        // `show_headers` is false here, so nothing is written to `per.outs`; the callback touches
+        // only the dump/etag side files (order-independent of the body already streamed above).
+        if header_cb_active {
+            run_header_replay(per, config);
+        }
+        code
     };
-
-    // Reclaim the output sink. The library engine has dropped its `Box<dyn TransferSink>` by
-    // now, so we hold the only remaining reference and `try_unwrap` succeeds; the `unwrap_or`
-    // is a defensive fallback that cannot trigger in practice.
-    per.outs = Arc::try_unwrap(shared)
-        .map(|m| m.into_inner().unwrap_or_default())
-        .unwrap_or_default();
 
     (code, synthetic.load(Ordering::SeqCst))
 }
@@ -2327,12 +2519,23 @@ fn create_single(
         // platforms stdout is already binary, so `CURL_BINMODE` is a no-op (NOTE(parity)).
         config.terminal_binary_ok = per.outfile.as_deref() == Some("-");
 
-        // NOTE(parity): curl's `setup_header_cb` populates `per->hdrcbdata`
-        // (`honor_cd_filename = content_disposition && useremote`, plus the outs/heads/etag
-        // associations) for the header write callback. That CLI callback lives in a separate
-        // module not yet wired to the transfer engine, and the streams it references are
-        // already owned by this [`PerTransfer`]; the association is applied when the header
-        // write path lands.
+        // curl's `setup_header_cb` populates `per->hdrcbdata` for the header write callback
+        // (`callbacks/header.rs::tool_header_cb`). The output/dump/etag streams it references
+        // (`per.outs`, `per.heads`, `per.etag_save`) are already owned by this [`PerTransfer`];
+        // here we set the isatty/styled_output snapshots that gate the bold/OSC-8 header styling on
+        // the `-i`/`--include` display path. The `config` back-pointer is bound to a live borrow in
+        // [`perform_one`] just before the header callback runs, so it is never stored across a
+        // possible `operations` reallocation.
+        //
+        // `honor_cd_filename` (curl's `content_disposition && useremote`, for `-J`/`-OJ`
+        // Content-Disposition filename derivation) is intentionally left at its default (false):
+        // curl derives that filename from its header callback *during* the transfer, before the
+        // body opens the output file, whereas this rewrite replays headers *after* the transfer
+        // (see [`run_header_replay`]) — too late to redirect the body, and `content_disposition`
+        // rightly refuses once the stream is open. Enabling `-OJ` filename derivation requires a
+        // pre-body header hook and is out of scope for the header-display wiring here.
+        per.isatty = global.isatty;
+        per.styled_output = global.styled_output;
 
         // --- translate the configuration onto the easy handle ---
         if let Err(code) = setopt::config2setopts(

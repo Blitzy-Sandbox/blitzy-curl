@@ -25,9 +25,17 @@
 //! — on unix `LINK` (OSC 8) is always defined. The `#ifndef HAVE_FTRUNCATE` seek
 //! fallback becomes [`std::fs::File::set_len`].
 //!
-//! Integration status: like the sibling callbacks (`read`, `seek`, `write`), this
-//! module is the CLI-side callback surface. It is fully implemented but not yet
-//! wired into the transfer engine, hence the `#[allow(dead_code)]` markers.
+//! Integration: this module is the CLI-side response-header callback surface (curl's
+//! always-installed `CURLOPT_HEADERFUNCTION`/`CURLOPT_HEADERDATA`). Because the Rust transfer
+//! engine records response headers on the handle (`Easy::info.resp_headers`) rather than
+//! streaming them to a callback, [`operate::perform_one`] replays the recorded header block
+//! through [`tool_header_cb`] once the transfer completes — driving `-i`/`--include` display,
+//! `-D`/`--dump-header`, and `--etag-save`. The callback also implements `-J`/`-OJ`
+//! Content-Disposition filename derivation ([`content_disposition`]), but the *post-transfer*
+//! replay leaves that path disabled (`hdrcbdata.honor_cd_filename` stays `false`): a filename
+//! must be chosen before the body opens the output file, which a post-transfer replay cannot do,
+//! so `-OJ` keeps its URL-basename behavior rather than eagerly renaming. Enabling it requires a
+//! pre-body header hook (see the note in `operate::create_single`).
 
 use core::ffi::{c_char, c_void};
 use std::io::{Seek, SeekFrom, Write};
@@ -64,7 +72,6 @@ const LINKOFF: &str = "\x1b]8;;\x1b\\";
 /// `config` pointer mirrors C's `hdrcbdata->config` (which, in curl, is the same
 /// pointer as `per->config`) and follows the raw-pointer-to-`OperationConfig`
 /// precedent set by `write.rs`'s `WriteData`.
-#[allow(dead_code)]
 pub struct HdrCbData {
     /// The active [`OperationConfig`] (same object as `per`'s config). Held as a
     /// raw pointer to match curl's `hdrcbdata->config` and to avoid tying the
@@ -93,19 +100,16 @@ impl Default for HdrCbData {
 /// (`curl_strnequal(prefix, buf, strlen(prefix))`). Returns `false` when `s` is
 /// shorter than `prefix` — safer than the C `strncasecmp`, which may read past a
 /// short buffer, and behaviourally identical for real (longer) header lines.
-#[allow(dead_code)]
 fn checkprefix(s: &[u8], prefix: &[u8]) -> bool {
     s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 /// `ISBLANK`: space or tab.
-#[allow(dead_code)]
 fn is_blank(b: u8) -> bool {
     b == b' ' || b == b'\t'
 }
 
 /// `ISSPACE` (C locale): space, tab, LF, CR, vertical tab, form feed.
-#[allow(dead_code)]
 fn is_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
@@ -115,7 +119,6 @@ fn is_space(b: u8) -> bool {
 /// Compares `name` against the literal `"Location"` using `strncasecmp`
 /// semantics: byte-for-byte case-insensitive comparison bounded by `name.len()`,
 /// stopping at the terminating NUL of `"Location"`.
-#[allow(dead_code)]
 fn is_location_name(name: &[u8]) -> bool {
     const LOC: &[u8] = b"Location";
     for (i, &b) in name.iter().enumerate() {
@@ -140,7 +143,6 @@ fn is_location_name(name: &[u8]) -> bool {
 ///
 /// Consumes ASCII digits from the front of `s`, saturating on overflow. Returns
 /// `None` when no digit is present (i.e. the C parser would have failed).
-#[allow(dead_code)]
 fn parse_leading_number(s: &[u8]) -> Option<i64> {
     let mut i = 0usize;
     let mut num: i64 = 0;
@@ -170,7 +172,6 @@ fn parse_leading_number(s: &[u8]) -> Option<i64> {
 /// the result is truncated at the first CR/LF. Returns `None` when a trailing
 /// path separator leaves an empty basename. The `_WIN32`/`MSDOS`
 /// `sanitize_file_name` post-processing is intentionally dropped.
-#[allow(dead_code)]
 fn parse_filename(ptr: &[u8], len: usize, stop: u8) -> Option<String> {
     // curlx_memdup0(ptr, len): copy `len` bytes; NUL-terminate. Subsequent str*
     // operations treat the first embedded NUL as the end of the string.
@@ -239,7 +240,6 @@ fn parse_filename(ptr: &[u8], len: usize, stop: u8) -> Option<String> {
 /// cleared afterwards (C frees the slist and NULLs it on both success and
 /// failure). Returns `Ok(())` on success and `Err(())` on any write failure —
 /// `write.rs` maps the error to `CURL_WRITEFUNC_ERROR`.
-#[allow(dead_code)]
 pub fn tool_write_headers(hdrcbdata: &mut HdrCbData, stream: &mut OutSink) -> Result<(), ()> {
     let mut result: Result<(), ()> = Ok(());
     for h in &hdrcbdata.headlist {
@@ -269,7 +269,6 @@ pub fn tool_write_headers(hdrcbdata: &mut HdrCbData, stream: &mut OutSink) -> Re
 /// `fwrite`/`fflush` errors here. A non-regular sink (e.g. stdout) cannot be
 /// truncated — curl's `ftruncate` on such a descriptor fails — so that also maps
 /// to the write-error signal. Returns `0` on success.
-#[allow(dead_code)]
 fn save_etag(etag_h: &[u8], etag_save: &mut OutStruct) -> usize {
     let n = etag_h.len();
     // eot = endp - 1 (the header's last byte). Only act when it is a newline.
@@ -318,7 +317,6 @@ fn save_etag(etag_h: &[u8], etag_save: &mut OutStruct) -> usize {
 
 /// Join a derived filename with `--output-dir` when set, mirroring C's
 /// `curl_maprintf("%s/%s", output_dir, filename)`.
-#[allow(dead_code)]
 fn join_output_dir(config: &OperationConfig, filename: String) -> String {
     match config.output_dir.as_deref() {
         Some(dir) => format!("{dir}/{filename}"),
@@ -340,7 +338,6 @@ fn join_output_dir(config: &OperationConfig, filename: String) -> String {
 /// the skipped leading whitespace of the original location, `LINK`, the resolved
 /// absolute URL, `LINKST`, the location bytes after the leading whitespace (which
 /// deliberately still include any trailing CR/LF, as in curl), then `LINKOFF`.
-#[allow(dead_code)]
 fn build_linked_location(
     effective_url: Option<&str>,
     location: &[u8],
@@ -406,7 +403,6 @@ fn build_linked_location(
 /// (C's `locout` label). `effective_url` is the transfer's effective URL — the
 /// base for resolving a relative redirect — supplied by the caller instead of a
 /// raw `CURL*` to keep this function free of FFI `unsafe`.
-#[allow(dead_code)]
 fn write_linked_location(
     effective_url: Option<&str>,
     location: &[u8],
@@ -432,7 +428,6 @@ fn write_linked_location(
 /// the full header line (`cb` bytes); `response` is the HTTP status. Returns `0`
 /// normally, `cb` when a header was buffered for later writing, or
 /// `CURL_WRITEFUNC_ERROR` on failure — matching curl exactly.
-#[allow(dead_code)]
 fn content_disposition(str_bytes: &[u8], cb: usize, per: &mut PerTransfer, response: i64) -> usize {
     let diag = per.diag;
     // SAFETY: `per.hdrcbdata.config` is the OperationConfig installed alongside the
@@ -541,7 +536,6 @@ fn content_disposition(str_bytes: &[u8], cb: usize, per: &mut PerTransfer, respo
 /// call, and `userdata` must be the `*mut PerTransfer` registered via
 /// `CURLOPT_HEADERDATA`, valid and exclusively borrowable (the CLI drives the
 /// transfer engine single-threaded).
-#[allow(dead_code)]
 pub unsafe extern "C" fn tool_header_cb(
     ptr: *mut c_char,
     size: usize,
