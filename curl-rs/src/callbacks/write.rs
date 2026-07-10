@@ -576,7 +576,11 @@ mod tests {
 
     #[test]
     fn write_cb_null_userdata_signals_error() {
-        // A null CURLOPT_WRITEDATA must fail the callback without dereferencing the buffer.
+        // SAFETY: `tool_write_cb` is an `extern "C"` callback whose first action is to
+        // null-check `userdata` (via `userdata_mut`) and return `CURL_WRITEFUNC_ERROR`
+        // before dereferencing either `userdata` or `buffer`. Passing null pointers here
+        // therefore touches no memory and is sound — this test exercises exactly that
+        // null-guarded path (a null `CURLOPT_WRITEDATA` must fail without a deref).
         let rc = unsafe { tool_write_cb(core::ptr::null_mut(), 1, 4, core::ptr::null_mut()) };
         assert_eq!(rc, CURL_WRITEFUNC_ERROR);
     }

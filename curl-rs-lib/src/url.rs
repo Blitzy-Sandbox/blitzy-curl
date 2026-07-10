@@ -1381,6 +1381,115 @@ impl crate::protocols::TransferSink for CountingSink {
     }
 }
 
+/// A body sink that buffers received bytes in memory instead of forwarding them
+/// to the client.
+///
+/// Used by [`Easy::perform_transfer`] for each hop of a redirect chain while
+/// `CURLOPT_FOLLOWLOCATION` is active: a followed `3xx` response body is
+/// discarded (curl's `k->ignorebody` on a redirect), and the final response's
+/// buffered body is flushed to the real client sink once the loop terminates.
+/// This keeps intermediate redirect bodies off the output exactly as curl does.
+struct BufferSink {
+    /// Shared accumulator; the owning transfer either discards it (redirect) or
+    /// drains it into the client sink (final response).
+    buf: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl crate::protocols::TransferSink for BufferSink {
+    fn write(&mut self, data: &[u8]) -> Result<()> {
+        if let Ok(mut b) = self.buf.lock() {
+            b.extend_from_slice(data);
+        }
+        Ok(())
+    }
+}
+
+/// Maps a request method verb onto the [`HttpReq`] state kind so the RFC 7231
+/// redirect method-switch (`apply_redirect_method_switch`, driven by
+/// [`Easy::follow`]) operates on the real method rather than the `Get` default.
+///
+/// The three standard body-bearing verbs map to their kinds; a bodiless `GET`
+/// (`-I`/`--head` forces the `HEAD` verb, but a `GET` with `no_body` is still a
+/// HEAD-shaped request) maps to `Head`. Any other verb — including a custom
+/// `-X`/`CURLOPT_CUSTOMREQUEST` method such as `DELETE` or `PATCH` — maps to
+/// `Get`, which curl treats as method-preserving across a redirect (a custom
+/// method is carried through unchanged), matching curl's `CUSTOMREQUEST`
+/// behavior.
+fn httpreq_from_method(method: &str, no_body: bool) -> HttpReq {
+    match method {
+        "POST" => HttpReq::Post,
+        "PUT" => HttpReq::Put,
+        "HEAD" => HttpReq::Head,
+        "GET" if no_body => HttpReq::Head,
+        _ => HttpReq::Get,
+    }
+}
+
+/// The ALPN protocol identifiers to offer on an HTTPS handshake, derived from
+/// the handle's effective `CURLOPT_HTTP_VERSION` preference
+/// ([`UserDefined::httpwant`]) — a faithful port of curl's ALPN-offer selection
+/// in `lib/http.c` (`Curl_http_size`/`alpn_setup`).
+///
+/// * `CURL_HTTP_VERSION_1_0` (`1`) / `CURL_HTTP_VERSION_1_1` (`2`) restrict the
+///   offer to `http/1.1`.
+/// * Every other value — `NONE` (`0`), `2_0` (`3`), `2TLS` (`4`), and the
+///   HTTP/3 selectors (`30`/`31`, which negotiate `h3` over QUIC on a separate
+///   path) — offers `h2, http/1.1`, matching curl's default HTTPS ALPN set.
+fn alpn_offer_for_httpwant(httpwant: i64) -> Vec<Vec<u8>> {
+    // CURL_HTTP_VERSION_1_0 == 1, CURL_HTTP_VERSION_1_1 == 2.
+    if httpwant == 1 || httpwant == 2 {
+        vec![crate::tls::ALPN_HTTP_1_1.to_vec()]
+    } else {
+        crate::tls::default_https_alpn()
+    }
+}
+
+/// Returns the redirect target from a completed response when it is a `3xx`
+/// carrying a `Location:` header that the follow logic should chase.
+///
+/// The status codes are curl's redirect set (`301`, `302`, `303`, `307`,
+/// `308`); the header lookup is case-insensitive per RFC 7230. Returns `None`
+/// for any non-redirect status or a redirect without a usable `Location`.
+fn redirect_location(info: &Info) -> Option<String> {
+    if !matches!(info.httpcode, 301 | 302 | 303 | 307 | 308) {
+        return None;
+    }
+    info.resp_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Appends the `-v`/`--trace` response-head records (status line + one record
+/// per header + the terminating blank line) for an HTTP(S) hop, mirroring
+/// curl's per-line `CURLINFO_HEADER_IN` delivery. A no-op for a non-HTTP scheme
+/// or a hop that recorded no status.
+fn push_response_head_trace(
+    records: &mut Vec<(crate::protocols::DebugInfoType, Vec<u8>)>,
+    info: &Info,
+    scheme: &str,
+) {
+    use crate::protocols::DebugInfoType;
+    if !matches!(scheme, "http" | "https") || info.httpcode == 0 {
+        return;
+    }
+    let reason = info.resp_reason.clone().unwrap_or_default();
+    let status_line = if reason.is_empty() {
+        format!("HTTP/1.1 {}\r\n", info.httpcode)
+    } else {
+        format!("HTTP/1.1 {} {reason}\r\n", info.httpcode)
+    };
+    records.push((DebugInfoType::HeaderIn, status_line.into_bytes()));
+    for (name, value) in &info.resp_headers {
+        records.push((
+            DebugInfoType::HeaderIn,
+            format!("{name}: {value}\r\n").into_bytes(),
+        ));
+    }
+    records.push((DebugInfoType::HeaderIn, b"\r\n".to_vec()));
+}
+
 impl Info {
     /// Record the response `Content-Type` header value (← the `data->info.contenttype`
     /// assignment in curl's `Curl_http_readwrite_headers`, `lib/http.c`).
@@ -2826,7 +2935,7 @@ impl Easy {
 
     pub async fn perform_transfer(
         &mut self,
-        mut request: crate::protocols::TransferRequest,
+        base_request: crate::protocols::TransferRequest,
         sink: Box<dyn crate::protocols::TransferSink>,
     ) -> Result<()> {
         use crate::conn::connect::{conn_setup, connect_with_timeout};
@@ -2841,261 +2950,392 @@ impl Easy {
         // `data->progress.t_startsingle` at the top of a transfer). Every
         // `CURLINFO_*_TIME_T` value is an offset in **microseconds** from this
         // instant, so `--write-out %{time_total}` and the `%{speed_*}` rates
-        // report real elapsed time. The accumulators default to `0`, so a phase
-        // that never runs (e.g. name resolution for a `file://` transfer) leaves
-        // its timer at `0`, exactly as curl reports `0` for an unmeasured phase.
+        // report real elapsed time. The clock is started once and spans the
+        // whole redirect chain, so `%{time_total}` is cumulative exactly as
+        // curl reports it; the per-phase timers (declared per-hop inside the
+        // loop and written onto `info` each hop) track the final request, and
+        // `total_time` is stamped once after the loop.
         let t_start = std::time::Instant::now();
-        let mut t_namelookup_us: i64 = 0;
-        let mut t_connect_us: i64 = 0;
-        let mut t_appconnect_us: i64 = 0;
 
         // `-v`/`--trace` capture (curl's `CURLOPT_DEBUGFUNCTION` stream). When tracing is on,
         // records are buffered here in emission order and drained by the CLI afterwards; when off
-        // the whole block is skipped, leaving the hot path untouched. `peer_ip` is the connected
-        // remote address, filled after name resolution for the `* Trying/Connected` text lines.
+        // the whole block is skipped, leaving the hot path untouched. Records accumulate across
+        // every hop of a redirect chain, so `-v` shows each request/response pair like curl.
         use crate::protocols::DebugInfoType;
         let trace_on = self.trace_enabled;
         let mut trace_records: Vec<(DebugInfoType, Vec<u8>)> = Vec::new();
-        let mut peer_ip: Option<String> = None;
 
-        // --- 1. Scheme → protocol handler (identity + behavior vtable). ---
-        let scheme = self
-            .url_get_part(CurlUPart::Scheme, 0, urlapi::UrlCode::NoScheme)?
-            .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
-        let scheme_lc = scheme.to_ascii_lowercase();
+        // Whether HTTP `Location:` redirects are followed (`-L` /
+        // `CURLOPT_FOLLOWLOCATION`). When off, the loop below runs exactly once
+        // and streams straight to the client sink — the pre-redirect behavior,
+        // byte-for-byte unchanged.
+        let follow_enabled = self.set.follow_location;
 
-        // The identity handler (default port, no-network flag) drives port
-        // resolution; the behavior handler carries the `&dyn Protocol` vtable
-        // used to run the exchange. Both are keyed on the same scheme string.
-        let ident = get_scheme_handler(&scheme_lc)
-            .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
-        let psh =
-            scheme_handler(&scheme_lc).ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
-        let handler = psh
-            .handler
-            .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
+        // Sync the handle's request-method state from the inbound request so the
+        // RFC 7231 redirect method-switch (`apply_redirect_method_switch`,
+        // invoked by `follow`) operates on the actual method rather than the
+        // `HttpReq::Get` default. Without this, a redirected `POST` would not be
+        // downgraded to `GET`.
+        self.state.httpreq = httpreq_from_method(&base_request.method, base_request.no_body);
 
-        // --- 2. Host / port / path / query from the parsed URL. ---
-        let host = self
-            .url_get_part(CurlUPart::Host, 0, urlapi::UrlCode::NoHost)?
-            .ok_or_else(|| Error::from(CurlCode::UrlMalformat))?;
-        let host = idnconvert_host(&host)?;
-        let port = self.resolve_remote_port(&ident)?;
-        // Path is never "missing" (the URL parser defaults it to "/"); Query is
-        // absent as `NoQuery`, which `url_get_part` maps to `None`.
-        let path = self
-            .url_get_part(CurlUPart::Path, 0, urlapi::UrlCode::UnknownPart)?
-            .unwrap_or_else(|| "/".to_string());
-        let query = self.url_get_part(CurlUPart::Query, 0, urlapi::UrlCode::NoQuery)?;
-
-        // Stamp the URL-derived fields onto the request (the caller filled the
-        // request-specific options — method, headers, body, credentials, …).
-        request.scheme = scheme_lc.clone();
-        request.host = host.clone();
-        request.port = port;
-        request.path = path;
-        request.query = query;
-
-        // --- 3. Build the live connection. ---
-        let is_nonetwork = ident.is_nonetwork();
-        let live_scheme = LiveScheme {
-            name: scheme_lc.clone(),
-            default_port: ident.default_port,
-            is_ssl: psh.is_secure(),
-            no_network: is_nonetwork,
-        };
-        let mut conn = LiveConn::new(live_scheme, host.clone(), port);
-        // Map the handle's `CURLOPT_IPRESOLVE` onto the resolver's family
-        // preference (the discriminants match curl's `CURL_IPRESOLVE_*`).
-        conn.ip_version = match self.set.ipver {
-            IpResolve::V4 => IpVersion::V4,
-            IpResolve::V6 => IpVersion::V6,
-            IpResolve::Whatever => IpVersion::Whatever,
-        };
-
-        // --- 4. Resolve + connect the filter chain (network schemes only). ---
-        if !is_nonetwork {
-            // A per-transfer DNS cache seeds the resolve; a shared handle would
-            // consult its shared cache, but a single serial transfer needs only
-            // a fresh one (localhost / IP literals resolve without the network).
-            let cache = DnsCache::new();
-            let resolver = SystemResolver::new();
-            let opts = ResolveOptions::new(&resolver);
-            let dns = resolve(&cache, &host, port, conn.ip_version, false, &opts).await?;
-            // Name resolution complete (← `data->progress.t_nslookup`).
-            t_namelookup_us = t_start.elapsed().as_micros() as i64;
-            // Record the connected remote address for the `-v`/`--trace` `* Trying …` /
-            // `* Connected to …` text lines (curl's `Curl_verboseconnect`).
-            if trace_on {
-                peer_ip = dns.endpoints().first().map(|sa| sa.ip().to_string());
-                if let Some(ip) = &peer_ip {
-                    trace_records.push((
-                        DebugInfoType::Text,
-                        format!("  Trying {ip}:{port}...\n").into_bytes(),
-                    ));
-                }
-            }
-
-            // Build the default `SETUP` filter stack (TCP → [proxy] → [TLS] →
-            // happy-eyeballs) and drive it to connected. `CURL_CF_SSL_DEFAULT`
-            // lets the scheme decide TLS (on for `https`/`ftps`/…, off for
-            // cleartext), matching curl's `ssl_mode` default.
-            conn_setup(&mut conn, FIRSTSOCKET, dns, CURL_CF_SSL_DEFAULT).await?;
-            let connect_ms = request
-                .connect_timeout
-                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-                .unwrap_or(0);
-            connect_with_timeout(&mut conn, FIRSTSOCKET, connect_ms).await?;
-            // Connection established (← `data->progress.t_connect`). The filter
-            // chain drives TCP and, for a secure scheme, the TLS handshake in one
-            // step here, so the app-connect timer (TLS-handshake-complete,
-            // `data->progress.t_appconnect`) coincides with connect for a secure
-            // transfer and stays `0` for a cleartext one — matching curl, which
-            // reports `t_appconnect == 0` for a non-TLS connection.
-            t_connect_us = t_start.elapsed().as_micros() as i64;
-            if psh.is_secure() {
-                t_appconnect_us = t_connect_us;
-            }
-            // `* Connected to <host> (<ip>) port <port>` (curl's `Curl_verboseconnect`).
-            if trace_on {
-                let ip = peer_ip.as_deref().unwrap_or(host.as_str());
-                trace_records.push((
-                    DebugInfoType::Text,
-                    format!("Connected to {host} ({ip}) port {port}\n").into_bytes(),
-                ));
-            }
-        }
-
-        // Bytes actually sent as the request body (`-d`/`-T` payload), recorded for
-        // `CURLINFO_SIZE_UPLOAD_T` once the transfer completes.
-        let upload_bytes = request.body.as_ref().map_or(0, |b| b.len() as i64);
-
-        // `-v`/`--trace` request-side records, built from `request` before it is moved into the
-        // transfer context. For HTTP(S) the sent request head is rendered by the handler's own
-        // assembler (so the `> ` block matches the wire, `Authorization` included); the request
-        // body, if any, is the `} ` (DATA_OUT) payload.
-        if trace_on {
-            if matches!(scheme_lc.as_str(), "http" | "https") {
-                let head = crate::protocols::http::trace_request_head_bytes(&request);
-                if !head.is_empty() {
-                    trace_records.push((DebugInfoType::HeaderOut, head));
-                }
-            }
-            if let Some(body) = request.body.as_ref() {
-                if !body.is_empty() {
-                    trace_records.push((DebugInfoType::DataOut, body.clone()));
-                }
-            }
-        }
-
-        // --- 5. Drive the protocol exchange over the live connection. ---
-        let mut ctx = TransferCtx::new();
-        ctx.request = request;
-        ctx.conn = Some(Box::new(conn));
-        // Wrap the caller's sink so every delivered body byte is counted for
-        // `CURLINFO_SIZE_DOWNLOAD_T`, regardless of the client's output destination
-        // (curl counts received body bytes independently of where they are written).
-        // When tracing, a capture buffer additionally accumulates the received body for the
-        // `{ ` (DATA_IN) dump emitted after the response head.
+        // The client sink is installed on the FINAL response only; each followed
+        // `3xx` response body is discarded (curl's `k->ignorebody` on a
+        // redirect). Held in an `Option` so a single non-redirected transfer
+        // still hands it straight to the engine.
+        let mut client_sink: Option<Box<dyn crate::protocols::TransferSink>> = Some(sink);
+        // Running total of body bytes delivered to the client (the final
+        // response's size, matching curl's `CURLINFO_SIZE_DOWNLOAD_T`).
         let downloaded = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        // Trace copy of the *final* response body (`{ ` DATA_IN), populated
+        // after the loop decides which hop is terminal.
         let body_capture: Option<Arc<std::sync::Mutex<Vec<u8>>>> = if trace_on {
             Some(Arc::new(std::sync::Mutex::new(Vec::new())))
         } else {
             None
         };
-        ctx.sink = Some(Box::new(CountingSink {
-            inner: sink,
-            counter: Arc::clone(&downloaded),
-            capture: body_capture.as_ref().map(Arc::clone),
-        }));
 
-        // Handler lifecycle (← `multi_runsingle`): SETUP → CONNECT → CONNECTING →
-        // DO → DONE. The default `connect`/`connecting` report "ready" in one
-        // step (the filter chain already connected the socket above); a protocol
-        // that needs extra round-trips (e.g. a pingpong greeting) drives them
-        // here, yielding between non-ready polls.
-        handler.setup_connection(&mut ctx).await?;
-        while !handler.connect(&mut ctx).await? {
-            tokio::task::yield_now().await;
-        }
-        while !handler.connecting(&mut ctx).await? {
-            tokio::task::yield_now().await;
-        }
+        // The working method and body; the RFC 7231 switch may turn a redirected
+        // POST/PUT into a bodiless GET across hops. Seeded from the request.
+        let mut method = base_request.method.clone();
+        let mut body = base_request.body.clone();
 
-        // All connection setup (transport + protocol handshake) is complete and
-        // the request is about to be sent (← `data->progress.t_pretransfer`).
-        let t_pretransfer_us = t_start.elapsed().as_micros() as i64;
+        // Redirect-follow loop (← curl's `multi_runsingle` re-entering the SETUP
+        // state after `Curl_follow` installs a new URL on the handle). A single
+        // iteration for a non-redirected transfer; each followed `3xx`
+        // re-resolves the new host and reconnects.
+        let final_do_res: Result<()> = loop {
+            let mut peer_ip: Option<String> = None;
+            // Per-hop phase timers (microseconds from `t_start`). A phase that
+            // never runs for this hop (e.g. name resolution for a `file://`
+            // transfer) stays `0`, exactly as curl reports an unmeasured phase.
+            let mut t_namelookup_us: i64 = 0;
+            let mut t_connect_us: i64 = 0;
+            let mut t_appconnect_us: i64 = 0;
 
-        // DO phase (send the request, read the response, stream the body to the
-        // sink, record diagnostics). The DONE phase runs unconditionally with the
-        // DO status forwarded so the handler can clean up on both paths (curl's
-        // `Curl_done(..., status, premature)`), then the original DO result is
-        // propagated (preserving its full error context).
-        let do_res = handler.do_it(&mut ctx).await;
-        // The response has been received (← `data->progress.t_starttransfer`).
-        // `do_it` reads the response head and streams the body, so this marks
-        // "response available"; for the small, low-latency exchanges the CLI
-        // drives this closely tracks curl's first-response-byte timestamp.
-        let t_starttransfer_us = t_start.elapsed().as_micros() as i64;
-        let premature = do_res.is_err();
-        let status_for_done: Result<()> = match &do_res {
-            Ok(_) => Ok(()),
-            Err(e) => Err(Error::from(e.code())),
-        };
-        handler.done(&mut ctx, status_for_done, premature).await?;
+            // --- 1. Scheme → protocol handler (identity + behavior vtable),
+            // read from the *current* URL (updated by `follow` on each hop). ---
+            let scheme = self
+                .url_get_part(CurlUPart::Scheme, 0, urlapi::UrlCode::NoScheme)?
+                .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
+            let scheme_lc = scheme.to_ascii_lowercase();
 
-        // --- 6. Reconcile response diagnostics into the handle. ---
-        self.info = std::mem::take(&mut ctx.info);
-        // Stamp the connection scheme (`info.conn_scheme`, ← `create_conn`).
-        // Protocol handlers populate `httpcode`/`contenttype` but not the scheme
-        // identity, so record it here from the URL scheme that selected the
-        // handler. `CURLINFO_SCHEME` and the CLI's retry classifier
-        // (`retrycheck`, which retries transient HTTP 5xx/4xx only when the
-        // scheme is HTTP(S)) both read it; leaving it `None` would silently
-        // disable `--retry` on HTTP status codes.
-        self.info.conn_scheme = Some(scheme_lc.clone());
-        // Record the transferred byte counts for `CURLINFO_SIZE_DOWNLOAD_T` /
-        // `CURLINFO_SIZE_UPLOAD_T` (set after the `info` move so they are not
-        // overwritten by the handler's diagnostics).
-        self.info.size_download = downloaded.load(std::sync::atomic::Ordering::SeqCst);
-        self.info.size_upload = upload_bytes;
-        // Record the phase timers (microseconds from `t_start`) for the
-        // `CURLINFO_*_TIME_T` getinfo variants and `--write-out %{time_*}` /
-        // `%{speed_*}`. `total_time` is stamped last so it always covers the
-        // whole transfer including the DONE phase (← `data->progress.timespent`,
-        // set by `Curl_pgrsDone`).
-        self.info.namelookup_time_us = t_namelookup_us;
-        self.info.connect_time_us = t_connect_us;
-        self.info.appconnect_time_us = t_appconnect_us;
-        self.info.pretransfer_time_us = t_pretransfer_us;
-        self.info.starttransfer_time_us = t_starttransfer_us;
-        self.info.total_time_us = t_start.elapsed().as_micros() as i64;
+            // The identity handler (default port, no-network flag) drives port
+            // resolution; the behavior handler carries the `&dyn Protocol` vtable
+            // used to run the exchange. Both are keyed on the same scheme string.
+            let ident = get_scheme_handler(&scheme_lc)
+                .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
+            let psh = scheme_handler(&scheme_lc)
+                .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
+            let handler = psh
+                .handler
+                .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
 
-        // --- 6b. Finish the `-v`/`--trace` record stream (response side). ---
-        // curl delivers the response head to `CURLOPT_DEBUGFUNCTION` one `< ` (HEADER_IN) line
-        // per header, then the received body as `{ ` (DATA_IN); the closing text mirrors curl's
-        // connection-teardown note. Records are handed to `debug_log` for the CLI to render.
-        if trace_on {
-            if matches!(scheme_lc.as_str(), "http" | "https") && self.info.httpcode != 0 {
-                // Status line: `< HTTP/1.1 <code> <reason>` (one HEADER_IN record).
-                let reason = self.info.resp_reason.clone().unwrap_or_default();
-                let status_line = if reason.is_empty() {
-                    format!("HTTP/1.1 {}\r\n", self.info.httpcode)
-                } else {
-                    format!("HTTP/1.1 {} {reason}\r\n", self.info.httpcode)
-                };
-                trace_records.push((DebugInfoType::HeaderIn, status_line.into_bytes()));
-                // One HEADER_IN record per response header line, matching curl.
-                for (name, value) in &self.info.resp_headers {
+            // --- 2. Host / port / path / query from the parsed URL. ---
+            let host = self
+                .url_get_part(CurlUPart::Host, 0, urlapi::UrlCode::NoHost)?
+                .ok_or_else(|| Error::from(CurlCode::UrlMalformat))?;
+            let host = idnconvert_host(&host)?;
+            let port = self.resolve_remote_port(&ident)?;
+            // Path is never "missing" (the URL parser defaults it to "/"); Query is
+            // absent as `NoQuery`, which `url_get_part` maps to `None`.
+            let path = self
+                .url_get_part(CurlUPart::Path, 0, urlapi::UrlCode::UnknownPart)?
+                .unwrap_or_else(|| "/".to_string());
+            let query = self.url_get_part(CurlUPart::Query, 0, urlapi::UrlCode::NoQuery)?;
+            // The full effective URL of this hop (← `data->state.url`), used by
+            // the HTTP-derived request-line assemblers and `%{url_effective}`.
+            let effective_url = self
+                .url_get_part(CurlUPart::Url, 0, urlapi::UrlCode::UnknownPart)?
+                .unwrap_or_default();
+
+            // Build this hop's request from the caller's template, stamping the
+            // URL-derived fields and the (possibly switched) method/body.
+            let mut request = base_request.clone();
+            request.scheme = scheme_lc.clone();
+            request.host = host.clone();
+            request.port = port;
+            request.path = path;
+            request.query = query;
+            if !effective_url.is_empty() {
+                request.url = effective_url;
+            }
+            request.method = method.clone();
+            request.body = body.clone();
+
+            // --- 3. Build the live connection. ---
+            let is_nonetwork = ident.is_nonetwork();
+            let live_scheme = LiveScheme {
+                name: scheme_lc.clone(),
+                default_port: ident.default_port,
+                is_ssl: psh.is_secure(),
+                no_network: is_nonetwork,
+            };
+            let mut conn = LiveConn::new(live_scheme, host.clone(), port);
+            // Map the handle's `CURLOPT_IPRESOLVE` onto the resolver's family
+            // preference (the discriminants match curl's `CURL_IPRESOLVE_*`).
+            conn.ip_version = match self.set.ipver {
+                IpResolve::V4 => IpVersion::V4,
+                IpResolve::V6 => IpVersion::V6,
+                IpResolve::Whatever => IpVersion::Whatever,
+            };
+
+            // --- 3b. Thread the handle's TLS posture + ALPN into the connection
+            // for secure schemes (F10-TLS-01/02/03; ← curl's `ssl_config`
+            // propagation in `create_conn`/`cf-ssl`). Without this the
+            // connection always used the hardcoded default-secure config with no
+            // ALPN, so `--insecure`, `--cacert`/`--capath`, and HTTP/2-over-TLS
+            // negotiation were all inert. A cleartext scheme keeps the default
+            // (its `ssl_config` is never consulted). ---
+            if psh.is_secure() {
+                let s = &self.set.ssl;
+                let mut tls = crate::tls::TlsConfig::new()
+                    .with_verify_peer(s.verify_peer)
+                    // `CURLOPT_SSL_VERIFYHOST` is the integer `2` when enabled; any
+                    // non-zero value means "verify" (curl treats `1` as `2`).
+                    .with_verify_host(s.verify_host != 0)
+                    .with_verify_status(s.verify_status)
+                    // The curl tool already emitted the `--insecure` warning at the
+                    // CLI layer (honoring `-s`); the library engine must not print a
+                    // second, silent-mode-ignoring copy.
+                    .with_insecure_warning(false)
+                    // Offer ALPN derived from the effective HTTP-version preference
+                    // so HTTPS handshakes advertise `h2, http/1.1` (curl wire parity).
+                    .with_alpn(alpn_offer_for_httpwant(self.set.httpwant));
+                // Custom trust anchors (`--cacert` / `--capath`) when supplied.
+                if let Some(ca) = &s.ca_info {
+                    tls = tls.with_ca_info(ca.clone());
+                }
+                if let Some(cap) = &s.ca_path {
+                    tls = tls.with_ca_path(cap.clone());
+                }
+                conn.ssl_config = Arc::new(tls);
+                conn.bits.tls_enable_alpn = true;
+            }
+
+            // --- 4. Resolve + connect the filter chain (network schemes only). ---
+            if !is_nonetwork {
+                // A per-transfer DNS cache seeds the resolve; a shared handle would
+                // consult its shared cache, but a single serial transfer needs only
+                // a fresh one (localhost / IP literals resolve without the network).
+                let cache = DnsCache::new();
+                let resolver = SystemResolver::new();
+                let opts = ResolveOptions::new(&resolver);
+                let dns = resolve(&cache, &host, port, conn.ip_version, false, &opts).await?;
+                // Name resolution complete (← `data->progress.t_nslookup`).
+                t_namelookup_us = t_start.elapsed().as_micros() as i64;
+                // Record the connected remote address for the `-v`/`--trace` `* Trying …` /
+                // `* Connected to …` text lines (curl's `Curl_verboseconnect`).
+                if trace_on {
+                    peer_ip = dns.endpoints().first().map(|sa| sa.ip().to_string());
+                    if let Some(ip) = &peer_ip {
+                        trace_records.push((
+                            DebugInfoType::Text,
+                            format!("  Trying {ip}:{port}...\n").into_bytes(),
+                        ));
+                    }
+                }
+
+                // Build the default `SETUP` filter stack (TCP → [proxy] → [TLS] →
+                // happy-eyeballs) and drive it to connected. `CURL_CF_SSL_DEFAULT`
+                // lets the scheme decide TLS (on for `https`/`ftps`/…, off for
+                // cleartext), matching curl's `ssl_mode` default.
+                conn_setup(&mut conn, FIRSTSOCKET, dns, CURL_CF_SSL_DEFAULT).await?;
+                let connect_ms = request
+                    .connect_timeout
+                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                    .unwrap_or(0);
+                connect_with_timeout(&mut conn, FIRSTSOCKET, connect_ms).await?;
+                // Connection established (← `data->progress.t_connect`). The filter
+                // chain drives TCP and, for a secure scheme, the TLS handshake in one
+                // step here, so the app-connect timer (TLS-handshake-complete,
+                // `data->progress.t_appconnect`) coincides with connect for a secure
+                // transfer and stays `0` for a cleartext one — matching curl, which
+                // reports `t_appconnect == 0` for a non-TLS connection.
+                t_connect_us = t_start.elapsed().as_micros() as i64;
+                if psh.is_secure() {
+                    t_appconnect_us = t_connect_us;
+                }
+                // `* Connected to <host> (<ip>) port <port>` (curl's `Curl_verboseconnect`).
+                if trace_on {
+                    let ip = peer_ip.as_deref().unwrap_or(host.as_str());
                     trace_records.push((
-                        DebugInfoType::HeaderIn,
-                        format!("{name}: {value}\r\n").into_bytes(),
+                        DebugInfoType::Text,
+                        format!("Connected to {host} ({ip}) port {port}\n").into_bytes(),
                     ));
                 }
-                // Blank line terminating the response head.
-                trace_records.push((DebugInfoType::HeaderIn, b"\r\n".to_vec()));
             }
-            // Received body → `{ ` (DATA_IN). The capture buffer holds the exact delivered bytes.
+
+            // Bytes actually sent as the request body (`-d`/`-T` payload), recorded for
+            // `CURLINFO_SIZE_UPLOAD_T` once the transfer completes.
+            let upload_bytes = request.body.as_ref().map_or(0, |b| b.len() as i64);
+
+            // `-v`/`--trace` request-side records, built from `request` before it is moved into the
+            // transfer context. For HTTP(S) the sent request head is rendered by the handler's own
+            // assembler (so the `> ` block matches the wire, `Authorization` included); the request
+            // body, if any, is the `} ` (DATA_OUT) payload.
+            if trace_on {
+                if matches!(scheme_lc.as_str(), "http" | "https") {
+                    let head = crate::protocols::http::trace_request_head_bytes(&request);
+                    if !head.is_empty() {
+                        trace_records.push((DebugInfoType::HeaderOut, head));
+                    }
+                }
+                if let Some(b) = request.body.as_ref() {
+                    if !b.is_empty() {
+                        trace_records.push((DebugInfoType::DataOut, b.clone()));
+                    }
+                }
+            }
+
+            // --- 5. Drive the protocol exchange over the live connection. ---
+            let mut ctx = TransferCtx::new();
+            ctx.request = request;
+            ctx.conn = Some(Box::new(conn));
+            // Choose this hop's sink. When following redirects the terminal hop
+            // is not yet known, so buffer the body: a followed `3xx` body is
+            // discarded and the final body is flushed to the client sink after
+            // the loop. When not following, wrap the client sink so every
+            // delivered byte is counted for `CURLINFO_SIZE_DOWNLOAD_T` and, when
+            // tracing, copied for the `{ ` (DATA_IN) dump — the unchanged
+            // single-transfer path (direct streaming, no buffering).
+            let iter_buffer: Option<Arc<std::sync::Mutex<Vec<u8>>>>;
+            if follow_enabled {
+                let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+                iter_buffer = Some(Arc::clone(&buf));
+                ctx.sink = Some(Box::new(BufferSink { buf }));
+            } else {
+                iter_buffer = None;
+                let real = client_sink
+                    .take()
+                    .expect("client sink present for a non-redirected transfer");
+                ctx.sink = Some(Box::new(CountingSink {
+                    inner: real,
+                    counter: Arc::clone(&downloaded),
+                    capture: body_capture.as_ref().map(Arc::clone),
+                }));
+            }
+
+            // Handler lifecycle (← `multi_runsingle`): SETUP → CONNECT → CONNECTING →
+            // DO → DONE. The default `connect`/`connecting` report "ready" in one
+            // step (the filter chain already connected the socket above); a protocol
+            // that needs extra round-trips (e.g. a pingpong greeting) drives them
+            // here, yielding between non-ready polls.
+            handler.setup_connection(&mut ctx).await?;
+            while !handler.connect(&mut ctx).await? {
+                tokio::task::yield_now().await;
+            }
+            while !handler.connecting(&mut ctx).await? {
+                tokio::task::yield_now().await;
+            }
+
+            // All connection setup (transport + protocol handshake) is complete and
+            // the request is about to be sent (← `data->progress.t_pretransfer`).
+            let t_pretransfer_us = t_start.elapsed().as_micros() as i64;
+
+            // DO phase (send the request, read the response, stream the body to the
+            // sink, record diagnostics). The DONE phase runs unconditionally with the
+            // DO status forwarded so the handler can clean up on both paths (curl's
+            // `Curl_done(..., status, premature)`), then the original DO result is
+            // propagated (preserving its full error context).
+            let do_res = handler.do_it(&mut ctx).await;
+            // The response has been received (← `data->progress.t_starttransfer`).
+            let t_starttransfer_us = t_start.elapsed().as_micros() as i64;
+            let premature = do_res.is_err();
+            let status_for_done: Result<()> = match &do_res {
+                Ok(_) => Ok(()),
+                Err(e) => Err(Error::from(e.code())),
+            };
+            handler.done(&mut ctx, status_for_done, premature).await?;
+
+            // --- 6. Reconcile response diagnostics into the handle. ---
+            self.info = std::mem::take(&mut ctx.info);
+            // Stamp the connection scheme (`info.conn_scheme`, ← `create_conn`);
+            // the CLI retry classifier and `CURLINFO_SCHEME` read it.
+            self.info.conn_scheme = Some(scheme_lc.clone());
+            self.info.size_upload = upload_bytes;
+            // Record this hop's phase timers (microseconds from `t_start`) for
+            // the `CURLINFO_*_TIME_T` getinfo variants and `--write-out
+            // %{time_*}`/`%{speed_*}`. Set after the `info` move so they are not
+            // overwritten; on a redirect chain the final hop's values persist,
+            // matching curl, which reports the last request's phase times.
+            self.info.namelookup_time_us = t_namelookup_us;
+            self.info.connect_time_us = t_connect_us;
+            self.info.appconnect_time_us = t_appconnect_us;
+            self.info.pretransfer_time_us = t_pretransfer_us;
+            self.info.starttransfer_time_us = t_starttransfer_us;
+
+            // Response-head trace for this hop (one `< ` line per header),
+            // recorded for every hop so a redirect chain shows each response.
+            if trace_on {
+                push_response_head_trace(&mut trace_records, &self.info, &scheme_lc);
+            }
+
+            // --- 7. Redirect decision. Follow only a real `3xx` carrying a
+            // `Location:` and only when the DO phase itself succeeded (a
+            // transport error is surfaced, never chased). ---
+            let redirect_target = if follow_enabled && do_res.is_ok() {
+                redirect_location(&self.info)
+            } else {
+                None
+            };
+
+            if let Some(location) = redirect_target {
+                // Intermediate redirect: its buffered body is discarded (curl
+                // suppresses the redirect body). Advance the URL, enforce
+                // `CURLOPT_MAXREDIRS`, strip cross-origin credentials, and switch
+                // the method per RFC 7231 — all via the existing `follow`.
+                let prev = self.state.httpreq;
+                if let Err(e) = self.follow(&location, FollowType::Redir) {
+                    // Redirect limit exceeded (`CURLE_TOO_MANY_REDIRECTS`) or an
+                    // unparsable target: surface it, finalizing diagnostics below.
+                    break Err(e);
+                }
+                // Propagate a POST/other → GET switch onto the working request
+                // (`follow` applied it to `state.httpreq`); a bodiless GET drops
+                // the request body. A 307/308 leaves the method untouched.
+                if self.state.httpreq == HttpReq::Get && prev != HttpReq::Get {
+                    method = "GET".to_string();
+                    body = None;
+                }
+                // The buffered redirect body is intentionally dropped here.
+                drop(iter_buffer);
+                continue;
+            }
+
+            // --- Final response. Flush a buffered body to the client sink and
+            // account it for `CURLINFO_SIZE_DOWNLOAD_T`. (The non-following path
+            // already streamed directly through `CountingSink`.) ---
+            if let Some(buf) = iter_buffer {
+                let bytes = buf.lock().map(|b| b.clone()).unwrap_or_default();
+                downloaded.store(bytes.len() as i64, std::sync::atomic::Ordering::SeqCst);
+                if let Some(mut real) = client_sink.take() {
+                    if !bytes.is_empty() {
+                        real.write(&bytes)?;
+                    }
+                    // `real` drops here; the transfer is complete and the sink is
+                    // never consulted again (the loop is about to break).
+                }
+                if let Some(cap) = &body_capture {
+                    if let Ok(mut c) = cap.lock() {
+                        *c = bytes;
+                    }
+                }
+            }
+            break do_res.map(|_done| ());
+        };
+
+        // --- 8. Reconcile the cumulative byte count + total time onto the final
+        // `info`. The per-hop phase timers were stamped inside the loop; here we
+        // record the total downloaded size (`CURLINFO_SIZE_DOWNLOAD_T`, summed by
+        // the counting sink / final flush) and `total_time`, stamped last so it
+        // always covers the whole transfer including any redirect chain and the
+        // DONE phase (← `data->progress.timespent`, set by `Curl_pgrsDone`). ---
+        self.info.size_download = downloaded.load(std::sync::atomic::Ordering::SeqCst);
+        self.info.total_time_us = t_start.elapsed().as_micros() as i64;
+
+        // --- 8b. Finish the `-v`/`--trace` stream: the final response body
+        // (`{ ` DATA_IN) then curl's connection-teardown note. ---
+        if trace_on {
             if let Some(buf) = &body_capture {
                 if let Ok(b) = buf.lock() {
                     if !b.is_empty() {
@@ -3103,14 +3343,18 @@ impl Easy {
                     }
                 }
             }
-            // Closing note (curl's `* Connection #0 to host <host> left intact`).
+            let final_host = self
+                .url_get_part(CurlUPart::Host, 0, urlapi::UrlCode::NoHost)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             trace_records.push((
                 DebugInfoType::Text,
-                format!("Connection #0 to host {host} left intact\n").into_bytes(),
+                format!("Connection #0 to host {final_host} left intact\n").into_bytes(),
             ));
             self.debug_log = trace_records;
         }
-        do_res.map(|_done| ())
+        final_do_res
     }
 
     /// Sets the auto-referer for the next request from the current URL, stripping
@@ -3992,5 +4236,214 @@ mod tests {
         assert_eq!(collected.lock().expect("sink").as_slice(), b"hello");
         assert_eq!(easy.info.httpcode, 200);
         assert_eq!(easy.info.contenttype.as_deref(), Some("text/plain"));
+    }
+
+    // --- F10 redirect + TLS-threading helper logic ---------------------------
+
+    /// The request-method → [`HttpReq`] mapping that seeds the redirect
+    /// method-switch (F10-REDIR-01). The three body-bearing verbs map to their
+    /// kinds; a bodiless `GET` maps to `Head`; any custom verb maps to `Get`
+    /// (curl carries a `CUSTOMREQUEST` method through a redirect unchanged).
+    #[test]
+    fn httpreq_from_method_maps_verbs() {
+        assert_eq!(httpreq_from_method("POST", false), HttpReq::Post);
+        assert_eq!(httpreq_from_method("PUT", false), HttpReq::Put);
+        assert_eq!(httpreq_from_method("HEAD", true), HttpReq::Head);
+        assert_eq!(httpreq_from_method("GET", false), HttpReq::Get);
+        // A GET forced bodiless (`-I` shape) is a HEAD-kind request.
+        assert_eq!(httpreq_from_method("GET", true), HttpReq::Head);
+        // A custom method is method-preserving (mapped to the Get kind, which
+        // `apply_redirect_method_switch` leaves untouched).
+        assert_eq!(httpreq_from_method("DELETE", false), HttpReq::Get);
+        assert_eq!(httpreq_from_method("PATCH", false), HttpReq::Get);
+    }
+
+    /// The ALPN offer derived from `CURLOPT_HTTP_VERSION` (F10-TLS-03). A forced
+    /// HTTP/1.0 or 1.1 preference restricts the offer to `http/1.1`; every other
+    /// value offers the default `h2, http/1.1` set (curl's HTTPS ALPN parity).
+    #[test]
+    fn alpn_offer_reflects_http_version_preference() {
+        // CURL_HTTP_VERSION_1_0 == 1, CURL_HTTP_VERSION_1_1 == 2.
+        assert_eq!(
+            alpn_offer_for_httpwant(1),
+            vec![crate::tls::ALPN_HTTP_1_1.to_vec()]
+        );
+        assert_eq!(
+            alpn_offer_for_httpwant(2),
+            vec![crate::tls::ALPN_HTTP_1_1.to_vec()]
+        );
+        // NONE (0), 2_0 (3), 2TLS (4) → default h2 + http/1.1.
+        let default = crate::tls::default_https_alpn();
+        assert_eq!(alpn_offer_for_httpwant(0), default);
+        assert_eq!(alpn_offer_for_httpwant(3), default);
+        assert_eq!(alpn_offer_for_httpwant(4), default);
+        // The default set advertises HTTP/2 ahead of HTTP/1.1.
+        assert_eq!(
+            default.first().map(Vec::as_slice),
+            Some(crate::tls::ALPN_H2)
+        );
+    }
+
+    /// Redirect detection (F10-REDIR-01): a `3xx` status with a `Location:`
+    /// yields the trimmed target (header lookup case-insensitive); a
+    /// non-redirect status, or a redirect without a usable `Location`, yields
+    /// `None` so the loop terminates.
+    #[test]
+    fn redirect_location_detects_3xx_with_location() {
+        let redir = Info {
+            httpcode: 302,
+            resp_headers: vec![
+                ("Server".to_string(), "test".to_string()),
+                ("LOCATION".to_string(), "  /next  ".to_string()),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(redirect_location(&redir).as_deref(), Some("/next"));
+
+        // 200 is not a redirect even with a (spurious) Location.
+        let ok = Info {
+            httpcode: 200,
+            resp_headers: vec![("Location".to_string(), "/x".to_string())],
+            ..Default::default()
+        };
+        assert_eq!(redirect_location(&ok), None);
+
+        // 301/303/307/308 are all in the redirect set.
+        for code in [301, 303, 307, 308] {
+            let r = Info {
+                httpcode: code,
+                resp_headers: vec![("Location".to_string(), "/y".to_string())],
+                ..Default::default()
+            };
+            assert_eq!(redirect_location(&r).as_deref(), Some("/y"), "code {code}");
+        }
+
+        // A 302 without a Location does not redirect.
+        let no_loc = Info {
+            httpcode: 302,
+            resp_headers: vec![("Server".to_string(), "test".to_string())],
+            ..Default::default()
+        };
+        assert_eq!(redirect_location(&no_loc), None);
+    }
+
+    /// The `-v`/`--trace` response-head record stream: status line + one record
+    /// per header + a terminating blank line, all `HeaderIn`; a no-op for a
+    /// non-HTTP scheme or a hop with no status.
+    #[test]
+    fn push_response_head_trace_emits_status_and_headers() {
+        use crate::protocols::DebugInfoType;
+        let info = Info {
+            httpcode: 200,
+            resp_reason: Some("OK".to_string()),
+            resp_headers: vec![
+                ("Content-Type".to_string(), "text/plain".to_string()),
+                ("Content-Length".to_string(), "5".to_string()),
+            ],
+            ..Default::default()
+        };
+        let mut recs: Vec<(DebugInfoType, Vec<u8>)> = Vec::new();
+        push_response_head_trace(&mut recs, &info, "https");
+        // Status line + 2 headers + blank line = 4 records, all HeaderIn.
+        assert_eq!(recs.len(), 4);
+        assert!(recs
+            .iter()
+            .all(|(t, _)| matches!(t, DebugInfoType::HeaderIn)));
+        assert_eq!(recs[0].1, b"HTTP/1.1 200 OK\r\n");
+        assert_eq!(recs[1].1, b"Content-Type: text/plain\r\n");
+        assert_eq!(recs[3].1, b"\r\n");
+
+        // A non-HTTP scheme records nothing.
+        let mut none: Vec<(DebugInfoType, Vec<u8>)> = Vec::new();
+        push_response_head_trace(&mut none, &info, "ftp");
+        assert!(none.is_empty());
+    }
+
+    /// End-to-end proof that [`Easy::perform_transfer`] follows an HTTP `302`
+    /// when `CURLOPT_FOLLOWLOCATION` is set (review finding F10-REDIR-01: the
+    /// driver never invoked the redirect logic, so `-L` returned the `302`
+    /// itself with `num_redirects == 0`). The origin serves a `302 → /final` on
+    /// the first connection and `200 hello` on the second; the handle must land
+    /// on the final response, deliver only the final body, and count one
+    /// redirect.
+    #[cfg(feature = "http")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perform_transfer_follows_302_redirect() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn read_request_head(sock: &mut tokio::net::TcpStream) -> Vec<u8> {
+            let mut buf = [0u8; 4096];
+            let mut data = Vec::new();
+            while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buf[..n]);
+            }
+            data
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            // Hop 1: 302 → /final (empty body, curl suppresses the redirect body).
+            let (mut s1, _) = listener.accept().await.unwrap();
+            let _ = read_request_head(&mut s1).await;
+            s1.write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: /final\r\n\
+                  Content-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let _ = s1.shutdown().await;
+
+            // Hop 2: the followed request, answered with the real body.
+            let (mut s2, _) = listener.accept().await.unwrap();
+            let req2 = read_request_head(&mut s2).await;
+            s2.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\
+                  Connection: close\r\n\r\nhello",
+            )
+            .await
+            .unwrap();
+            let _ = s2.shutdown().await;
+            req2
+        });
+
+        let mut easy = Easy::open();
+        easy.set_url(&format!("http://127.0.0.1:{}/start", addr.port()))
+            .expect("set_url");
+        // `-L` / CURLOPT_FOLLOWLOCATION.
+        easy.set.follow_location = true;
+
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let sink = Box::new(VecSink(Arc::clone(&collected)));
+        let req = crate::protocols::TransferRequest {
+            method: "GET".to_string(),
+            ..Default::default()
+        };
+
+        easy.perform_transfer(req, sink)
+            .await
+            .expect("perform_transfer follows the redirect");
+
+        // The second (followed) request targeted the redirect location.
+        let req2 = srv.await.unwrap();
+        assert!(
+            req2.starts_with(b"GET /final HTTP/1.1\r\n"),
+            "the followed request must target /final"
+        );
+
+        // The handle landed on the final 200 response, delivered only the final
+        // body, and counted exactly one followed redirect.
+        assert_eq!(easy.info.httpcode, 200);
+        assert_eq!(collected.lock().expect("sink").as_slice(), b"hello");
+        assert_eq!(
+            easy.state.followlocation, 1,
+            "exactly one redirect was followed"
+        );
     }
 }

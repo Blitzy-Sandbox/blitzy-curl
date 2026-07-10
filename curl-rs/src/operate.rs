@@ -4545,7 +4545,12 @@ mod tests {
     #[test]
     fn header_cb_rejects_null_userdata_and_null_config() {
         use curl_rs_ffi::easy::CURL_WRITEFUNC_ERROR;
-        // A null CURLOPT_HEADERDATA fails before any dereference.
+        // SAFETY: `tool_header_cb` is an `extern "C"` callback whose first action is to
+        // null-check `userdata` (via `userdata_mut`) and return `CURL_WRITEFUNC_ERROR`
+        // before dereferencing either `userdata` or the header buffer. Passing null
+        // pointers here therefore touches no memory and is sound — this test exercises
+        // exactly that null-guarded path (a null `CURLOPT_HEADERDATA` must fail without
+        // a deref).
         let rc = unsafe {
             crate::callbacks::header::tool_header_cb(
                 core::ptr::null_mut(),

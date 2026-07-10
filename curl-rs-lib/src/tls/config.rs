@@ -238,6 +238,22 @@ pub struct TlsConfig {
     /// logging is *also* enabled automatically whenever the `SSLKEYLOGFILE`
     /// environment variable is set (see [`super::keylog::is_enabled`]).
     pub keylog: bool,
+
+    // --- Insecure-warning ownership -----------------------------------------
+    /// Whether [`TlsConfig::build`] itself emits [`INSECURE_WARNING`] to stderr
+    /// when verification is disabled (`verify_peer == false`). **Default
+    /// `true`**, so a config built directly (a library/FFI consumer that sets
+    /// `CURLOPT_SSL_VERIFYPEER = 0`, or a unit test) still gets curl's
+    /// warning-before-connect behavior.
+    ///
+    /// The curl *tool* owns the `--insecure` warning at the CLI layer (it prints
+    /// the richer message and, crucially, honors `-s`/`--silent`). When the
+    /// transfer engine threads a handle's `--insecure` posture into a
+    /// connection it therefore sets this to `false` (via
+    /// [`TlsConfig::with_insecure_warning`]) so the library does **not** print a
+    /// second copy — a copy that would also ignore silent mode. Exactly one
+    /// warning is emitted, and it respects `-s`, preserving curl 8.x parity.
+    pub warn_insecure: bool,
 }
 
 impl Default for TlsConfig {
@@ -270,6 +286,7 @@ impl Default for TlsConfig {
             pinned_pubkey: None,
             session_cache: None,
             keylog: false,
+            warn_insecure: true,
         }
     }
 }
@@ -315,6 +332,19 @@ impl TlsConfig {
     pub fn insecure(mut self) -> Self {
         self.verify_peer = false;
         self.verify_host = false;
+        self
+    }
+
+    /// Controls whether [`TlsConfig::build`] emits [`INSECURE_WARNING`] itself
+    /// when verification is disabled (see [`warn_insecure`](TlsConfig::warn_insecure)).
+    ///
+    /// The transfer engine sets this to `false` when it has threaded a handle's
+    /// `--insecure` posture from the CLI, because the curl tool already printed
+    /// the warning (honoring `-s`); this prevents a duplicate, silent-mode-
+    /// ignoring copy from the library. A config built directly leaves it `true`.
+    #[must_use]
+    pub fn with_insecure_warning(mut self, warn: bool) -> Self {
+        self.warn_insecure = warn;
         self
     }
 
@@ -920,7 +950,13 @@ impl TlsConfig {
         } else {
             // The warning MUST be emitted BEFORE the config is built/returned,
             // matching curl's warning-before-connect ordering for --insecure.
-            emit_insecure_warning();
+            // Suppressed when the caller (the transfer engine threading a CLI
+            // handle) has already printed it — the curl tool owns the message
+            // and honors `-s`, so the library must not emit a second, silent-
+            // mode-ignoring copy (see `warn_insecure`).
+            if self.warn_insecure {
+                emit_insecure_warning();
+            }
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoServerCertVerification::new(
