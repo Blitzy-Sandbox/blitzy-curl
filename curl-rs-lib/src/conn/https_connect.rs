@@ -352,6 +352,36 @@ fn alpn_str_or_none(s: &str) -> Option<String> {
 // TlsEstablishFilter — the H21 baller leaf (TCP + rustls over an owned stream).
 // ===========================================================================
 
+/// Map a raw `tokio-rustls` read outcome onto curl's receive semantics,
+/// tolerating a peer that closes the connection without a TLS `close_notify`.
+///
+/// rustls deliberately surfaces a TCP close that omitted the `close_notify`
+/// alert as [`io::ErrorKind::UnexpectedEof`] (see the rustls manual, section
+/// `_03_howto` "unexpected EOF") so an application can detect a truncation
+/// attack. curl's default backend (OpenSSL) instead *tolerates* this at the
+/// transport layer: it reports an ordinary end-of-stream and lets the protocol
+/// layer judge completeness from the HTTP framing. A response whose body is
+/// fully framed (Content-Length satisfied, or the chunked terminator seen)
+/// therefore succeeds (exit `0`), while a genuinely short body is still caught
+/// by that framing check and reported as a receive/partial failure.
+///
+/// This mapping mirrors curl 8.x for parity (FA-SEC-004, §0.7.1): a missing
+/// `close_notify` becomes a clean EOF (`Ok(0)`), so the caller (`hyper`, or a
+/// `pingpong`/raw protocol) applies the identical completeness check. It is
+/// **not** a relaxation of certificate validation — it concerns only the TLS
+/// closure alert, exactly as in curl 8.x built against OpenSSL. Any other read
+/// error remains a [`CurlCode::RecvError`] carrying curl's `failf`-style text.
+fn map_tls_read(result: std::io::Result<usize>) -> Result<usize> {
+    match result {
+        Ok(n) => Ok(n),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(0),
+        Err(e) => Err(Error::with_context(
+            CurlCode::RecvError,
+            format!("TLS read failed: {e}"),
+        )),
+    }
+}
+
 /// The leaf filter of the **H2/H1 baller**: it opens a TCP connection and
 /// completes a TLS handshake over the *owned* stream via
 /// [`crate::tls::TlsConnector`], offering `h2` then `http/1.1` by ALPN and
@@ -469,9 +499,7 @@ impl ConnectionFilter for TlsEstablishFilter {
     ) -> CfFuture<'a, Result<usize>> {
         Box::pin(async move {
             match self.stream.as_mut() {
-                Some(stream) => stream.read(buf).await.map_err(|e| {
-                    Error::with_context(CurlCode::RecvError, format!("TLS read failed: {e}"))
-                }),
+                Some(stream) => map_tls_read(stream.read(buf).await),
                 None => Err(Error::with_context(
                     CurlCode::RecvError,
                     "TLS stream is not connected",
@@ -1992,6 +2020,38 @@ mod tests {
             !filter.cf_type().contains(CfType::SSL),
             "SSL is only OR-ed in after a TLS winner is adopted"
         );
+    }
+
+    // =======================================================================
+    // close_notify tolerance (FA-SEC-004): a peer that closes without a TLS
+    // close_notify must be surfaced as a clean EOF, mirroring curl/OpenSSL, so
+    // the protocol layer decides completeness from the HTTP framing.
+    // =======================================================================
+    #[test]
+    fn tls_read_tolerates_missing_close_notify() {
+        use std::io::{Error as IoError, ErrorKind};
+
+        // A normal read is passed through unchanged.
+        assert_eq!(map_tls_read(Ok(42)).expect("normal read"), 42);
+
+        // rustls' "peer closed connection without sending TLS close_notify"
+        // (an UnexpectedEof) becomes a clean EOF (0 bytes) — hyper then decides
+        // completeness from Content-Length / chunked framing (curl parity).
+        let no_notify = IoError::new(
+            ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify",
+        );
+        assert_eq!(
+            map_tls_read(Err(no_notify)).expect("missing close_notify tolerated"),
+            0
+        );
+
+        // Any other read error remains a receive failure (CURLE_RECV_ERROR, 56),
+        // so genuine transport faults are never masked.
+        let reset = IoError::new(ErrorKind::ConnectionReset, "connection reset");
+        let err = map_tls_read(Err(reset)).expect_err("a real error must not be tolerated");
+        assert_eq!(err.code(), CurlCode::RecvError);
+        assert_eq!(err.code_i32(), 56);
     }
 
     // =======================================================================

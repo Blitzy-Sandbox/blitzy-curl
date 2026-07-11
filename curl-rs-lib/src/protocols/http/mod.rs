@@ -1539,10 +1539,32 @@ pub(crate) fn trace_request_head_bytes(req: &super::TransferRequest) -> Vec<u8> 
         head.push_str(auth);
         head.push_str("\r\n");
     }
+    // Render every option/auth-derived header except `Content-Type`, which curl prints last —
+    // right after the framing `Content-Length` — for a request that carries a body. Holding it
+    // back keeps the `-v` head byte-order-faithful to curl 8.x (`… Content-Length … Content-Type`).
+    let mut content_type: Option<&str> = None;
     for (name, value) in out.headers.iter() {
+        if name.eq_ignore_ascii_case("Content-Type") {
+            content_type = Some(value);
+            continue;
+        }
         head.push_str(name);
         head.push_str(": ");
         head.push_str(value);
+        head.push_str("\r\n");
+    }
+    // `Content-Length` is chosen by the transport (hyper) at send time from the body length, so
+    // it is not present in `out.headers`; synthesize it here so `-v`/`--trace` shows the same
+    // `> Content-Length:` line curl prints for a sized body (`-d` post or `-T` upload). Only when
+    // the caller did not already carry an explicit framing header.
+    if let Some(body) = req.body.as_ref() {
+        if !out.headers.contains("Content-Length") && !out.headers.contains("Transfer-Encoding") {
+            head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        }
+    }
+    if let Some(ct) = content_type {
+        head.push_str("Content-Type: ");
+        head.push_str(ct);
         head.push_str("\r\n");
     }
     head.push_str("\r\n");
@@ -1602,6 +1624,22 @@ fn build_http_request(req: &super::TransferRequest) -> Result<HttpReqData> {
             out.headers.add("Accept-Encoding", enc);
         }
     }
+    // `Range:` header from `CURLOPT_RANGE` (`-r`) or the resume offset
+    // (`CURLOPT_RESUME_FROM` / `-C`), added only when the caller supplied no
+    // explicit `Range` header (← `lib/http.c`: `Curl_add_buffer` of
+    // `data->state.range` under the `!Curl_checkheaders(data, "Range")` guard).
+    // A `CURLOPT_RANGE` string is sent verbatim as `bytes=<range>`; a bare
+    // resume offset becomes the open-ended `bytes=<n>-`. The two are mutually
+    // exclusive at the CLI (`--continue-at` rejects `--range`), so `range`
+    // takes precedence here without ambiguity.
+    if !out.headers.contains("Range") {
+        if let Some(r) = req.range.as_deref().filter(|s| !s.is_empty()) {
+            out.headers.add("Range", format!("bytes={r}"));
+        } else if req.resume_from > 0 {
+            out.headers.add("Range", format!("bytes={}-", req.resume_from));
+        }
+    }
+
     // Basic auth when credentials are present and the caller did not already
     // supply an Authorization header (← the default `--user` path).
     if (req.user.is_some() || req.password.is_some()) && !out.headers.contains("Authorization") {
@@ -1614,6 +1652,20 @@ fn build_http_request(req: &super::TransferRequest) -> Result<HttpReqData> {
             .and_then(|v| v.strip_suffix("\r\n"))
         {
             out.headers.add("Authorization", value);
+        }
+    }
+
+    // Library-supplied default `Content-Type:` for a body libcurl originated
+    // (← `lib/http.c`: `application/x-www-form-urlencoded` for `HTTPREQ_POST`,
+    // the `multipart/form-data; boundary=…` type for a form/mime post). Applied
+    // only when the caller supplied no explicit `Content-Type` header, so a
+    // user `-H 'Content-Type: …'` always wins — exactly curl's
+    // `!Curl_checkheaders(data, "Content-Type")` rule. Keyed on the request
+    // kind carried in [`post_content_type`](crate::protocols::TransferRequest),
+    // not the HTTP method, so `curl -X DELETE -d …` still carries the type.
+    if let Some(ct) = req.post_content_type.as_deref() {
+        if !out.headers.contains("Content-Type") {
+            out.headers.add("Content-Type", ct);
         }
     }
 

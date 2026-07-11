@@ -709,6 +709,20 @@ pub struct TransferRequest {
     /// (libcurl core emits none unless the option is set). For RTSP this is
     /// emitted only on `DESCRIBE`, matching `rtsp_do`.
     pub accept_encoding: Option<String>,
+    /// The default `Content-Type:` header value libcurl supplies for a request
+    /// body it originated (← `lib/http.c`: for `HTTPREQ_POST` libcurl adds
+    /// `Content-Type: application/x-www-form-urlencoded`, and for
+    /// `HTTPREQ_POST_FORM`/`HTTPREQ_POST_MIME` the `multipart/form-data;
+    /// boundary=…` type). `None` (the default) means no library-supplied type.
+    ///
+    /// This mirrors curl's rule exactly: the type is keyed on the *request
+    /// kind* (`data->state.httpreq`), not the HTTP method, so `curl -X DELETE
+    /// -d …` still carries `application/x-www-form-urlencoded`. It is applied by
+    /// [`http::build_http_request`](crate::protocols::http) only when the caller
+    /// supplied no explicit `Content-Type` header (a user `-H 'Content-Type: …'`
+    /// always wins). An upload (`-T`, `HTTPREQ_PUT`) leaves this `None`, matching
+    /// curl which sends no default type for a raw upload.
+    pub post_content_type: Option<String>,
 }
 
 /// The per-call context threaded through every [`Protocol`] method — the

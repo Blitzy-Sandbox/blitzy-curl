@@ -1332,6 +1332,25 @@ impl Error {
         strerror(self.code())
     }
 
+    /// Returns the custom, human-readable context message this error carries, if
+    /// any — the analogue of the string curl's `failf()` writes into
+    /// `CURLOPT_ERRORBUFFER`.
+    ///
+    /// Only [`Error::WithContext`] carries such a message; every other variant
+    /// returns `None`, so a caller (e.g. the CLI's `curl: (code) <msg>` printer)
+    /// can reproduce curl's "error buffer first, else `strerror`" behavior: use
+    /// this message when present, otherwise fall back to [`message`](Error::message).
+    /// This is what surfaces, for example, the `.onion` rejection text
+    /// "Not resolving .onion address (RFC 7686)" instead of the generic
+    /// `CURLE_COULDNT_RESOLVE_HOST` strerror (§0.7.1 observability parity).
+    #[must_use]
+    pub fn context_message(&self) -> Option<&str> {
+        match self {
+            Error::WithContext { message, .. } => Some(message.as_str()),
+            _ => None,
+        }
+    }
+
     /// Constructs a host-resolution error ([`Error::Resolve`]).
     pub fn resolve(host: impl Into<String>) -> Self {
         Error::Resolve(host.into())
@@ -1699,6 +1718,31 @@ mod tests {
         assert_eq!(
             Error::with_context(CurlCode::Ssh, "handshake failed").to_string(),
             "handshake failed"
+        );
+    }
+
+    #[test]
+    fn context_message_only_for_with_context() {
+        // WithContext exposes its custom detail (the `failf`-equivalent string the
+        // CLI surfaces error-buffer-first), preserving the code independently.
+        let onion = Error::with_context(
+            CurlCode::CouldntResolveHost,
+            "Not resolving .onion address (RFC 7686)",
+        );
+        assert_eq!(
+            onion.context_message(),
+            Some("Not resolving .onion address (RFC 7686)")
+        );
+        assert_eq!(onion.code(), CurlCode::CouldntResolveHost);
+
+        // Typed and Code variants carry no context message, so the CLI falls back
+        // to `strerror` for them (no text regression for resolve/connect/TLS/etc.).
+        assert_eq!(Error::resolve("example.com").context_message(), None);
+        assert_eq!(Error::Timeout.context_message(), None);
+        assert_eq!(Error::Code(CurlCode::CouldntConnect).context_message(), None);
+        assert_eq!(
+            Error::peer_failed_verification("bad cert").context_message(),
+            None
         );
     }
 

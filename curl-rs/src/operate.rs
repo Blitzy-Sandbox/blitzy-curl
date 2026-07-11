@@ -58,13 +58,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use curl_rs_lib::mime::Mime;
+use curl_rs_lib::mime::{Mime, MimeStrategy};
 use curl_rs_lib::multi::{
     CurlMCode, CurlMInfo, CurlMOption, CurlMsg, DefaultDriver, EasyHandle, EasyId, Multi,
     MultiOptionValue, Share, CURLMNOTIFY_INFO_READ,
 };
 use curl_rs_lib::protocols::{TransferRequest, TransferSink};
-use curl_rs_lib::{feature_names, version, CurlCode, Easy};
+use curl_rs_lib::{feature_names, supported_protocols, version, CurlCode, Easy};
 
 use crate::args::{
     self, get_args, parse_args, ClobberMode, Diag, FailMode, GlobalConfig, HttpReq,
@@ -804,6 +804,16 @@ pub(crate) struct PerTransfer {
     /// The transfer's final result once it has been performed (curl reads the multi
     /// `msg->data.result`; the serial path stores the easy result here).
     result: CurlCode,
+    /// The context message the transfer's failing [`Error`] carried, if any — the port's
+    /// analogue of curl's `per->errorbuffer`. curl passes `CURLOPT_ERRORBUFFER` into libcurl,
+    /// which `failf()` fills with a detailed message; the tool then prints that buffer in
+    /// preference to `curl_easy_strerror` (`tool_operate.c: post_transfer`). The Rust engine
+    /// returns a typed [`Error`] instead, so the byte-pump boundary in [`perform_one`] captures
+    /// [`Error::context_message`] here (present only for context-bearing errors, e.g. the
+    /// `.onion` rejection "Not resolving .onion address (RFC 7686)"). `None` on success or when
+    /// the error carries no custom message, in which case [`post_check_result`] falls back to
+    /// the generic `strerror` text — reproducing curl's error-buffer-first behavior.
+    error_message: Option<String>,
     /// The real result of the network transfer performed by [`perform_one`], captured for the
     /// parallel path. curl runs the byte pump inside the multi's own driver so the completion
     /// message (`msg->data.result`) already carries the real result; this port performs the
@@ -822,6 +832,16 @@ pub(crate) struct PerTransfer {
     /// The multipart body built for `-F` by [`setopt::config2setopts`], owned here for the
     /// transfer's lifetime (curl keeps it on `config->mimepost` and frees it at cleanup).
     mimepost: Option<Mime>,
+    /// The `-F` multipart body materialized to bytes, produced once from [`mimepost`] on the
+    /// first [`perform_one`] and reused on every retry. curl streams the live mime via
+    /// `Curl_mime_read` and re-reads it each attempt through its seek callback; because our
+    /// [`Mime`] is consumed by [`Mime::to_bytes`], the bytes are cached here so a retried
+    /// transfer resends an identical body (paralleling the `-T` path, which re-reads its file
+    /// from the start each attempt). `None` when no `-F` body was built.
+    mimepost_body: Option<Vec<u8>>,
+    /// The `multipart/form-data; boundary=…` `Content-Type` matching [`mimepost_body`], carried
+    /// alongside it so the header and the body always reference the same boundary.
+    mimepost_content_type: Option<String>,
     /// Set by the upload read callback when a non-blocking read returned `EAGAIN`, and
     /// cleared by the read/unpause callbacks once the transfer resumes (curl's
     /// `config->readbusy`). curl stores this on the per-operation `OperationConfig`; because
@@ -883,11 +903,16 @@ impl PerTransfer {
             progress: TransferProgress::new(),
             noprogress: false,
             result: CurlCode::Ok,
+            // curl zero-inits `per->errorbuffer` to an empty string; the port starts with no
+            // captured context message and fills it at the byte-pump boundary on failure.
+            error_message: None,
             perform_result: None,
             added: false,
             abort: false,
             skip: false,
             mimepost: None,
+            mimepost_body: None,
+            mimepost_content_type: None,
             // Seeded later: `readbusy` toggles during the transfer's read callbacks;
             // `timeout_ms`/`diag` are denormalized from the config/global in `create_single`.
             readbusy: false,
@@ -1236,6 +1261,16 @@ fn build_transfer_request(config: &OperationConfig) -> TransferRequest {
     // file by `perform_one`; `-F` multipart is not serialized through this path yet.
     let body = (!config.postdata.is_empty()).then(|| config.postdata.clone());
 
+    // Default `Content-Type` libcurl attaches to a `-d` body (`HTTPREQ_POST`):
+    // `application/x-www-form-urlencoded` (← `lib/http.c`). It is keyed on the request KIND, not
+    // the method, so `-X DELETE -d …` still carries it; a user `-H 'Content-Type: …'` overrides
+    // it downstream in [`build_http_request`] via the `!Curl_checkheaders` guard. `-G` moves the
+    // data into the query and resets `httpreq` to `Get` in [`single_transfer`] (which runs before
+    // this), so no type is added there. `-F` multipart (`Mimepost`) is deliberately excluded here:
+    // its `multipart/form-data; boundary=…` type is produced when the mime body is serialized.
+    let post_content_type = (config.httpreq == HttpReq::Simplepost && body.is_some())
+        .then(|| "application/x-www-form-urlencoded".to_string());
+
     // User-agent (`-A`), defaulted like curl when the user supplied none.
     let user_agent = Some(
         config
@@ -1285,6 +1320,7 @@ fn build_transfer_request(config: &OperationConfig) -> TransferRequest {
         accept_encoding,
         range: config.range.clone(),
         resume_from: config.resume_from,
+        post_content_type,
         user,
         password,
         timeout,
@@ -1329,6 +1365,40 @@ async fn perform_one(per: &mut PerTransfer, config: &OperationConfig) -> (CurlCo
         }
     }
 
+    // Multipart body (`-F`/`--form`): serialize the mime tree that
+    // `config2setopts` built (via `formparse::tool2curlmime`) into the request
+    // body and attach the matching `multipart/form-data; boundary=…`
+    // Content-Type. curl installs the live mime as a streaming read source
+    // (`Curl_mime_read`) and re-reads it on each retry through its seek
+    // callback; our `Mime` is consumed by `to_bytes`, so it is materialized
+    // once into `per` and the cached bytes are reused on any retry (the `-T`
+    // path above likewise resends its file each attempt). The Content-Type
+    // boundary and the body boundary come from the same `Mime`, so they always
+    // agree. The type flows through `post_content_type`, which `build_http_request`
+    // emits only when the caller supplied no explicit `Content-Type` (a user
+    // `-H 'Content-Type: …'` still wins), matching curl's `Curl_checkheaders`.
+    if per.mimepost_body.is_none() {
+        if let Some(mime) = per.mimepost.take() {
+            let content_type = mime.content_type_header(MimeStrategy::Form);
+            match mime.to_bytes(MimeStrategy::Form) {
+                Ok(bytes) => {
+                    per.mimepost_body = Some(bytes);
+                    per.mimepost_content_type = Some(content_type);
+                }
+                Err(e) => {
+                    // A file part that cannot be read aborts the transfer,
+                    // mirroring curl's read-callback failure (`CURLE_READ_ERROR`).
+                    warnf(per.diag, &format!("Failed to read multipart data: {e}"));
+                    return (CurlCode::ReadError, false);
+                }
+            }
+        }
+    }
+    if let Some(bytes) = per.mimepost_body.as_ref() {
+        request.body = Some(bytes.clone());
+        request.post_content_type = per.mimepost_content_type.clone();
+    }
+
     let synthetic = Arc::new(AtomicBool::new(false));
 
     // Whether the response-header callback (`callbacks/header.rs::tool_header_cb`) has any
@@ -1354,10 +1424,19 @@ async fn perform_one(per: &mut PerTransfer, config: &OperationConfig) -> (CurlCo
         let sink = Box::new(CliBufferSink {
             buf: Arc::clone(&body_buf),
         });
+        let mut err_ctx: Option<String> = None;
         let code = match per.easy.perform_transfer(request, sink).await {
             Ok(()) => CurlCode::Ok,
-            Err(e) => e.code(),
+            Err(e) => {
+                // curl's `failf()` fills CURLOPT_ERRORBUFFER with a detailed message; capture this
+                // error's context message (present only for context-bearing errors) so
+                // `post_check_result` prints it in preference to the generic strerror
+                // (error-buffer-first parity, §0.7.1). `None` leaves the strerror fallback intact.
+                err_ctx = e.context_message().map(str::to_owned);
+                e.code()
+            }
         };
+        per.error_message = err_ctx;
         let body = Arc::try_unwrap(body_buf)
             .map(|m| m.into_inner().unwrap_or_default())
             .unwrap_or_default();
@@ -1388,10 +1467,19 @@ async fn perform_one(per: &mut PerTransfer, config: &OperationConfig) -> (CurlCo
         });
 
         // The real byte pump: resolve → connect the filter chain → run the protocol exchange.
+        let mut err_ctx: Option<String> = None;
         let code = match per.easy.perform_transfer(request, sink).await {
             Ok(()) => CurlCode::Ok,
-            Err(e) => e.code(),
+            Err(e) => {
+                // curl's `failf()` fills CURLOPT_ERRORBUFFER with a detailed message; capture this
+                // error's context message (present only for context-bearing errors) so
+                // `post_check_result` prints it in preference to the generic strerror
+                // (error-buffer-first parity, §0.7.1). `None` leaves the strerror fallback intact.
+                err_ctx = e.context_message().map(str::to_owned);
+                e.code()
+            }
         };
+        per.error_message = err_ctx;
 
         // Reclaim the output sink. The library engine has dropped its `Box<dyn TransferSink>` by
         // now, so we hold the only remaining reference and `try_unwrap` succeeds; the `unwrap_or`
@@ -1677,9 +1765,14 @@ fn post_check_result(
     result: CurlCode,
 ) -> CurlCode {
     if !config.synthetic_error && result != CurlCode::Ok && (!diag.silent || diag.showerror) {
-        // curl consults `per->errorbuffer` first; `Easy` carries no error buffer yet, so the
-        // code's canonical message is used (equivalent to `curl_easy_strerror`).
-        let msg = result.message();
+        // curl consults `per->errorbuffer` first (the library's `failf()` fills it with a
+        // detailed message), falling back to `curl_easy_strerror` when it is empty. The port
+        // captures that context message into `per.error_message` at the byte-pump boundary
+        // ([`perform_one`]); use it when present, otherwise the code's canonical `strerror`
+        // text. This reproduces curl's error-buffer-first selection — e.g. surfacing the
+        // `.onion` rejection "Not resolving .onion address (RFC 7686)" rather than the generic
+        // "Could not resolve host" (§0.7.1 observability parity).
+        let msg: &str = per.error_message.as_deref().unwrap_or(result.message());
         with_diag_writer(|h| {
             let _ = writeln!(h, "curl: ({}) {msg}", result.to_i32());
             if result == CurlCode::PeerFailedVerification {
@@ -3404,17 +3497,6 @@ async fn run_all_transfers(
 // informational outputs it dispatches (`--version`, `--engine list`).
 // ===========================================================================
 
-/// The compiled-in protocol schemes reported by `--version`, mirroring
-/// `lib/version.c`'s `supported_protocols[]` (alphabetical, RTMP/RTMPS dropped per AAP
-/// §0.2.2). `curl-rs-lib` exposes no protocol-registry accessor and `curl-rs-ffi` is not a
-/// dependency of this crate, so this list is maintained locally in lockstep with
-/// `curl-rs-ffi`'s `PROTOCOLS`; reconcile both if a library accessor is later exposed.
-const PROTOCOLS: &[&str] = &[
-    "dict", "file", "ftp", "ftps", "gopher", "gophers", "http", "https", "imap", "imaps", "ldap",
-    "ldaps", "mqtt", "mqtts", "pop3", "pop3s", "rtsp", "scp", "sftp", "smb", "smbs", "smtp",
-    "smtps", "telnet", "tftp", "ws", "wss",
-];
-
 /// Print the `--version` banner block — faithful port of curl's `tool_version_info`
 /// (`src/tool_help.c`), to stdout. The first line is the mandated self-contained banner
 /// (AAP §0.6.3); the `Protocols:` and `Features:` lines mirror curl's layout (single leading
@@ -3427,9 +3509,12 @@ fn print_version_info() {
     // curl prints `Release-Date: <LIBCURL_TIMESTAMP>`; an in-development build is unreleased.
     println!("Release-Date: [unreleased]");
 
-    // curl: `Protocols:` followed by each built-in scheme.
+    // curl: `Protocols:` followed by each built-in scheme. Sourced from the library's single
+    // source of truth ([`supported_protocols`]), which advertises exactly the schemes compiled
+    // into `curl-rs-lib` — so `--version` and actual capability stay in sync (FA-CLI-002),
+    // reproducing curl's `#ifdef`-driven `supported_protocols[]`.
     let mut line = String::from("Protocols:");
-    for proto in PROTOCOLS {
+    for proto in supported_protocols() {
         line.push(' ');
         line.push_str(proto);
     }

@@ -1151,9 +1151,17 @@ fn proxy_setopts(easy: &mut Easy, config: &OperationConfig, src: &mut EasySrc) {
 }
 
 /// `cookie_setopts`: assemble the `-b` cookie header, load cookie files, set the
-/// jar, and mark a new session. Returns an error if the joined cookie header
-/// would exceed `MAX_COOKIE_LINE`, matching curl's dynbuf cap.
-fn cookie_setopts(config: &OperationConfig, diag: Diag, src: &mut EasySrc) -> Result<(), CurlCode> {
+/// jar, and mark a new session. Applies every option to the live handle (so the
+/// transfer engine actually sends `Cookie:`, captures `Set-Cookie:`, and writes
+/// the `-c` jar) in addition to emitting it into the `--libcurl` source. Returns
+/// an error if the joined cookie header would exceed `MAX_COOKIE_LINE`, matching
+/// curl's dynbuf cap.
+fn cookie_setopts(
+    easy: &mut Easy,
+    config: &OperationConfig,
+    diag: Diag,
+    src: &mut EasySrc,
+) -> Result<(), CurlCode> {
     if !config.cookies.is_empty() {
         let mut cookies = String::new();
         for (idx, c) in config.cookies.iter().enumerate() {
@@ -1176,18 +1184,35 @@ fn cookie_setopts(config: &OperationConfig, diag: Diag, src: &mut EasySrc) -> Re
                 return Err(CurlCode::OutOfMemory);
             }
         }
+        // `CURLOPT_COOKIE`: the inline cookie header string, sent verbatim by the
+        // transfer engine (not stored in the jar).
+        easy.set.cookie = Some(cookies.clone());
         src.str("CURLOPT_COOKIE", &cookies);
     }
 
+    // `CURLOPT_COOKIEFILE` (`-b file`): register each read file; a non-empty list
+    // turns the jar engine on.
+    easy.set.cookiefiles = config.cookiefiles.clone();
     for cf in &config.cookiefiles {
         src.str("CURLOPT_COOKIEFILE", cf);
     }
 
+    // `CURLOPT_COOKIEJAR` (`-c`): the end-of-transfer write target (also enables
+    // the jar engine even with no read file).
+    easy.set.cookiejar = config.cookiejar.clone();
     if let Some(jar) = &config.cookiejar {
         src.str("CURLOPT_COOKIEJAR", jar);
     }
 
+    // `CURLOPT_COOKIESESSION` (`-j`): start a fresh session (discard session
+    // cookies when loading the jar file).
+    easy.set.cookiesession = config.cookiesession;
     src.long("CURLOPT_COOKIESESSION", i64::from(config.cookiesession));
+
+    // Build/seed the live jar from the options just applied (curl's
+    // `Curl_cookie_init`): reads the registered files and arms `Set-Cookie:`
+    // capture + `-c` persistence for the transfer.
+    easy.cookie_init();
     Ok(())
 }
 
@@ -1263,20 +1288,32 @@ fn http_setopts(
     easy.set.http09_allowed = config.http09_allowed;
     src.long("CURLOPT_HTTP09_ALLOWED", i64::from(config.http09_allowed));
 
+    // `--alt-svc <file>` (`CURLOPT_ALTSVC`): apply the cache-file path to the
+    // handle AND emit the `--libcurl` source line. Applying it enables the
+    // Alt-Svc engine so the file is read at init and rewritten after the
+    // transfer with any `Alt-Svc:` header captured from responses.
     if let Some(altsvc) = &config.altsvc {
+        easy.set.altsvc_file = Some(altsvc.clone());
         src.str("CURLOPT_ALTSVC", altsvc);
     }
+    easy.altsvc_init();
 
+    // `--hsts <file>` (`CURLOPT_HSTS`): apply the cache-file path to the handle
+    // AND emit the `--libcurl` source line. Applying it enables the HSTS engine
+    // (read at init, `http`→`https` upgrade for known hosts, rewritten after the
+    // transfer with any `Strict-Transport-Security:` header captured).
     if let Some(hsts) = &config.hsts {
+        easy.set.hsts_file = Some(hsts.clone());
         src.str("CURLOPT_HSTS", hsts);
     }
+    easy.hsts_init();
 
     if config.expect100timeout_ms > 0 {
         easy.set.expect_100_timeout = config.expect100timeout_ms;
         src.long("CURLOPT_EXPECT_100_TIMEOUT_MS", config.expect100timeout_ms);
     }
 
-    cookie_setopts(config, diag, src)?;
+    cookie_setopts(easy, config, diag, src)?;
 
     // Keep proxy and origin headers separate over an HTTPS proxy or an explicit
     // tunnel, so `--header` content does not leak into CONNECT requests.
@@ -2105,6 +2142,11 @@ pub fn config2setopts(
         }
     }
 
+    // `--resolve` (`CURLOPT_RESOLVE`): carry the custom `host:port:addr` entries
+    // onto the handle so [`Easy::perform_transfer`] seeds each hop's DNS cache
+    // with them (via `Curl_loadhostpairs`), in addition to emitting the option
+    // into the `--libcurl` source dump.
+    easy.set.resolve = config.resolve.clone();
     src.slist("CURLOPT_RESOLVE", &config.resolve);
     src.slist("CURLOPT_CONNECT_TO", &config.connect_to);
 

@@ -254,6 +254,71 @@ pub fn feature_names() -> &'static [&'static str] {
         .as_slice()
 }
 
+/// The compiled-in protocol schemes, as reported by `curl --version` and the FFI
+/// `curl_version_info()->protocols` — the single source of truth for both the CLI
+/// (`curl-rs`) and the C-ABI shim (`curl-rs-ffi`), which each merely render this slice.
+///
+/// This mirrors `lib/version.c`'s `supported_protocols[]` — alphabetically sorted, with
+/// RTMP/RTMPS dropped per AAP §0.2.2. Crucially it stays in sync with the protocol feature
+/// matrix OWNED by this crate (AAP §0.5.3): a scheme appears only when its Cargo feature is
+/// compiled in, exactly matching [`crate::protocols::scheme_handler`] (a disabled scheme
+/// returns `None` there and is therefore not advertised here). This reproduces curl's
+/// `#ifdef`-driven synchronization between `--version` output and actual capability — a stock
+/// curl built with `CURL_DISABLE_GOPHER` neither handles nor advertises `gopher`. The feature
+/// predicates are evaluated in THIS crate, the only place where `cfg!(feature = "…")` resolves
+/// against the protocol matrix; the consumer crates declare no such features and so cannot
+/// gate correctly themselves.
+///
+/// Assembled once and cached, so repeated calls return the same slice.
+#[must_use]
+pub fn supported_protocols() -> &'static [&'static str] {
+    static PROTOCOLS: OnceLock<Vec<&'static str>> = OnceLock::new();
+    PROTOCOLS
+        .get_or_init(|| {
+            // `(scheme, enabled)` candidates in alphabetical order (version.c ordering),
+            // filtered to the compiled feature set. Each `enabled` flag uses the SAME feature
+            // gate as the matching `scheme_handler` arm, so `--version` and capability agree.
+            // TLS-secured variants ride their base protocol's feature (e.g. `https` on `http`,
+            // `ftps` on `ftp`); rustls is always compiled, so no separate TLS gate is needed.
+            // `scp`/`sftp` ride the `ssh` gate. Composing with `cfg!()` (rather than an
+            // init-then-push Vec) keeps `clippy::vec_init_then_push` quiet.
+            const CANDIDATES: [(&str, bool); 27] = [
+                ("dict", cfg!(feature = "dict")),
+                ("file", cfg!(feature = "file")),
+                ("ftp", cfg!(feature = "ftp")),
+                ("ftps", cfg!(feature = "ftp")),
+                ("gopher", cfg!(feature = "gopher")),
+                ("gophers", cfg!(feature = "gopher")),
+                ("http", cfg!(feature = "http")),
+                ("https", cfg!(feature = "http")),
+                ("imap", cfg!(feature = "imap")),
+                ("imaps", cfg!(feature = "imap")),
+                ("ldap", cfg!(feature = "ldap")),
+                ("ldaps", cfg!(feature = "ldap")),
+                ("mqtt", cfg!(feature = "mqtt")),
+                ("mqtts", cfg!(feature = "mqtt")),
+                ("pop3", cfg!(feature = "pop3")),
+                ("pop3s", cfg!(feature = "pop3")),
+                ("rtsp", cfg!(feature = "rtsp")),
+                ("scp", cfg!(feature = "ssh")),
+                ("sftp", cfg!(feature = "ssh")),
+                ("smb", cfg!(feature = "smb")),
+                ("smbs", cfg!(feature = "smb")),
+                ("smtp", cfg!(feature = "smtp")),
+                ("smtps", cfg!(feature = "smtp")),
+                ("telnet", cfg!(feature = "telnet")),
+                ("tftp", cfg!(feature = "tftp")),
+                ("ws", cfg!(feature = "websockets")),
+                ("wss", cfg!(feature = "websockets")),
+            ];
+            CANDIDATES
+                .iter()
+                .filter_map(|&(scheme, enabled)| enabled.then_some(scheme))
+                .collect()
+        })
+        .as_slice()
+}
+
 // ===========================================================================
 // Process-wide lifecycle (← `lib/easy.c` `curl_global_init` / `curl_global_cleanup`).
 // ===========================================================================
@@ -607,6 +672,56 @@ mod tests {
         let mut sorted = names.to_vec();
         sorted.sort_by_key(|s| s.to_ascii_lowercase());
         assert_eq!(names, sorted.as_slice());
+    }
+
+    #[test]
+    fn supported_protocols_track_compiled_features() {
+        // `--version` / `curl_version_info()->protocols` must advertise EXACTLY the schemes
+        // whose Cargo feature is compiled in — curl's `#ifdef`-driven sync between the reported
+        // protocol list and actual capability (FA-CLI-002). Each scheme's presence therefore
+        // equals its feature predicate, evaluated here in the crate that owns the matrix.
+        let protos = supported_protocols();
+        for (scheme, enabled) in [
+            ("http", cfg!(feature = "http")),
+            ("https", cfg!(feature = "http")),
+            ("ftp", cfg!(feature = "ftp")),
+            ("ftps", cfg!(feature = "ftp")),
+            ("dict", cfg!(feature = "dict")),
+            ("imap", cfg!(feature = "imap")),
+            ("pop3", cfg!(feature = "pop3")),
+            ("smtp", cfg!(feature = "smtp")),
+            ("mqtt", cfg!(feature = "mqtt")),
+            ("rtsp", cfg!(feature = "rtsp")),
+            ("telnet", cfg!(feature = "telnet")),
+            ("tftp", cfg!(feature = "tftp")),
+            ("gopher", cfg!(feature = "gopher")),
+            ("gophers", cfg!(feature = "gopher")),
+            ("ldap", cfg!(feature = "ldap")),
+            ("ldaps", cfg!(feature = "ldap")),
+            ("smb", cfg!(feature = "smb")),
+            ("smbs", cfg!(feature = "smb")),
+            ("ws", cfg!(feature = "websockets")),
+            ("wss", cfg!(feature = "websockets")),
+            ("scp", cfg!(feature = "ssh")),
+            ("sftp", cfg!(feature = "ssh")),
+            ("file", cfg!(feature = "file")),
+        ] {
+            assert_eq!(
+                protos.contains(&scheme),
+                enabled,
+                "scheme {scheme:?} advertised={} but feature-enabled={enabled}",
+                protos.contains(&scheme),
+            );
+        }
+        // RTMP/RTMPS are dropped entirely (AAP §0.2.2) — never advertised.
+        assert!(!protos.contains(&"rtmp") && !protos.contains(&"rtmps"));
+        // Alphabetically sorted (version.c ordering) and free of duplicates.
+        let mut sorted = protos.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(protos, sorted.as_slice(), "protocols must be alphabetical");
+        let mut dedup = sorted.clone();
+        dedup.dedup();
+        assert_eq!(dedup.len(), protos.len(), "protocols must be unique");
     }
 
     #[test]

@@ -1074,6 +1074,10 @@ fn setopt_dispatch(easy: &mut Easy, option: c_int, arg: usize) -> c_int {
     const OPT_PATH_AS_IS: c_int = CURLoption::CURLOPT_PATH_AS_IS as c_int;
     const OPT_HTTP_VERSION: c_int = CURLoption::CURLOPT_HTTP_VERSION as c_int;
     const OPT_SHARE: c_int = CURLoption::CURLOPT_SHARE as c_int;
+    const OPT_COOKIE: c_int = CURLoption::CURLOPT_COOKIE as c_int;
+    const OPT_COOKIEFILE: c_int = CURLoption::CURLOPT_COOKIEFILE as c_int;
+    const OPT_COOKIEJAR: c_int = CURLoption::CURLOPT_COOKIEJAR as c_int;
+    const OPT_COOKIESESSION: c_int = CURLoption::CURLOPT_COOKIESESSION as c_int;
 
     match option {
         OPT_URL => {
@@ -1152,6 +1156,73 @@ fn setopt_dispatch(easy: &mut Easy, option: c_int, arg: usize) -> c_int {
                     None => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT as c_int,
                 }
             }
+        }
+        OPT_COOKIE => {
+            // STRINGPOINT: the inline `Cookie:` contents (`-b name=value`), stored verbatim as
+            // curl's `data->set.str[STRING_COOKIE]` and sent on every request; a NULL argument
+            // clears it (curl frees the copied string). The cookie engine consults this at
+            // transfer time via `cookie_init` + `perform_transfer`.
+            let ptr = arg as *const c_char;
+            if ptr.is_null() {
+                easy.set.cookie = None;
+                CURLcode::CURLE_OK as c_int
+            } else {
+                // SAFETY: a non-null STRINGPOINT argument is a NUL-terminated C string per the
+                // setopt contract; `cstr_to_str` bounds the borrow to this call and UTF-8-checks it.
+                match unsafe { cstr_to_str(ptr) } {
+                    Some(s) => {
+                        easy.set.cookie = Some(s.to_owned());
+                        CURLcode::CURLE_OK as c_int
+                    }
+                    None => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT as c_int,
+                }
+            }
+        }
+        OPT_COOKIEFILE => {
+            // STRINGPOINT: a cookie file to read (`-b file`), appended to the read list exactly as
+            // curl accumulates `data->state.cookielist` across repeated `CURLOPT_COOKIEFILE` calls
+            // (an empty string activates the engine without reading a file). A NULL argument clears
+            // the accumulated list, matching curl's "disable the cookie engine" reset.
+            let ptr = arg as *const c_char;
+            if ptr.is_null() {
+                easy.set.cookiefiles.clear();
+                CURLcode::CURLE_OK as c_int
+            } else {
+                // SAFETY: as above — a non-null STRINGPOINT argument is a valid C string.
+                match unsafe { cstr_to_str(ptr) } {
+                    Some(s) => {
+                        easy.set.cookiefiles.push(s.to_owned());
+                        CURLcode::CURLE_OK as c_int
+                    }
+                    None => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT as c_int,
+                }
+            }
+        }
+        OPT_COOKIEJAR => {
+            // STRINGPOINT: the `-c` write target (`data->set.str[STRING_COOKIEJAR]`). Setting it
+            // arms the jar engine so the accumulated cookies are flushed to this path at the end of
+            // the transfer (`perform_transfer` → `save_cookies`, curl's cleanup-time flush). A NULL
+            // argument clears the target.
+            let ptr = arg as *const c_char;
+            if ptr.is_null() {
+                easy.set.cookiejar = None;
+                CURLcode::CURLE_OK as c_int
+            } else {
+                // SAFETY: as above — a non-null STRINGPOINT argument is a valid C string.
+                match unsafe { cstr_to_str(ptr) } {
+                    Some(s) => {
+                        easy.set.cookiejar = Some(s.to_owned());
+                        CURLcode::CURLE_OK as c_int
+                    }
+                    None => CURLcode::CURLE_BAD_FUNCTION_ARGUMENT as c_int,
+                }
+            }
+        }
+        OPT_COOKIESESSION => {
+            // LONG: `-j` / `CURLOPT_COOKIESESSION` — start a fresh cookie session, discarding
+            // session cookies when the jar file is loaded (`data->set.cookiesession`).
+            easy.set.cookiesession = arg != 0;
+            CURLcode::CURLE_OK as c_int
         }
         // Any other option: accepted (no-op) if it is a real curl option, else unknown.
         _ => {
@@ -1409,6 +1480,55 @@ pub unsafe extern "C" fn crs_easy_getinfo(curl: *mut c_void, info: c_int, arg: u
 // Phase 3 — transfer and connection helpers (include/curl/easy.h).
 // ===========================================================================
 
+/// A [`TransferSink`](curl_rs_lib::protocols::TransferSink) that writes the received body to the
+/// process's standard output — curl's default write target when no `CURLOPT_WRITEFUNCTION` is
+/// installed (`lib/easy.c` defaults `data->set.fwrite_func` to `fwrite` onto `stdout`).
+///
+/// NOTE(parity): the core [`Easy`] does not yet model `CURLOPT_WRITEFUNCTION` / `CURLOPT_WRITEDATA`,
+/// so a `curl_easy_perform` driven through the FFI writes to stdout exactly like curl's default
+/// sink. When the handle models a caller write callback, this sink dispatches through the C
+/// callback trampoline instead; the default-sink behavior remains unchanged.
+struct StdoutSink;
+
+impl curl_rs_lib::protocols::TransferSink for StdoutSink {
+    fn write(&mut self, data: &[u8]) -> Result<(), curl_rs_lib::Error> {
+        use std::io::Write;
+        std::io::stdout().write_all(data).map_err(|e| {
+            curl_rs_lib::Error::with_context(
+                curl_rs_lib::CurlCode::WriteError,
+                format!("failed to write the response body to stdout: {e}"),
+            )
+        })
+    }
+}
+
+/// Build a [`TransferRequest`](curl_rs_lib::protocols::TransferRequest) from the options the core
+/// [`Easy`] currently models, for the FFI `curl_easy_perform` drive.
+///
+/// [`Easy::perform_transfer`](curl_rs_lib::url::Easy::perform_transfer) derives the connection
+/// target (scheme / host / port / path / query) from the handle's parsed URL, and reads the
+/// redirect / auth-scope / cookie state directly from the handle, so only the request-shaping
+/// fields the handle stores are seeded here — every other field keeps its [`Default`]. The method
+/// is mapped from the handle's `CURLOPT_*`-driven [`HttpReq`](curl_rs_lib::url::HttpReq) exactly as
+/// curl derives `data->state.httpreq`.
+fn build_ffi_transfer_request(easy: &Easy) -> curl_rs_lib::protocols::TransferRequest {
+    use curl_rs_lib::url::HttpReq;
+    let method = match easy.set.method {
+        HttpReq::Get => "GET",
+        HttpReq::Head => "HEAD",
+        HttpReq::Put => "PUT",
+        HttpReq::Post | HttpReq::PostForm | HttpReq::PostMime => "POST",
+    };
+    curl_rs_lib::protocols::TransferRequest {
+        method: method.to_owned(),
+        no_body: matches!(easy.set.method, HttpReq::Head),
+        user: easy.set.username.clone(),
+        password: easy.set.password.clone(),
+        connect_only: easy.set.connect_only,
+        ..Default::default()
+    }
+}
+
 /// `CURLcode curl_easy_perform(CURL *curl);`
 ///
 /// Perform the configured transfer, blocking until it completes.
@@ -1420,9 +1540,9 @@ pub unsafe extern "C" fn curl_easy_perform(curl: *mut c_void) -> c_int {
     ffi_guard(
         CURLcode::CURLE_BAD_FUNCTION_ARGUMENT as c_int,
         AssertUnwindSafe(move || {
-            // SAFETY: per the C contract `curl` is null or a live `Easy`; `as_ref` null-checks and
-            // borrows for this call only.
-            let easy = match unsafe { as_ref::<Easy>(curl as *const Easy) } {
+            // SAFETY: per the C contract `curl` is null or a live `Easy`; `as_mut` null-checks and
+            // borrows mutably for this call only (the transfer mutates the handle's state / info).
+            let easy = match unsafe { as_mut::<Easy>(curl as *mut Easy) } {
                 Some(easy) => easy,
                 None => return CURLcode::CURLE_BAD_FUNCTION_ARGUMENT as c_int,
             };
@@ -1430,11 +1550,26 @@ pub unsafe extern "C" fn curl_easy_perform(curl: *mut c_void) -> c_int {
             if easy.state.uh.is_none() {
                 return CURLcode::CURLE_URL_MALFORMAT as c_int;
             }
-            // NOTE(parity): the async transfer engine (`curl_rs_lib` transfer/multi core) is not
-            // yet wired to `Easy`, so a fully-configured handle reports success without performing
-            // network I/O at this checkpoint. The blocking drive over the current-thread Tokio
-            // runtime is connected when the transfer core lands; the ABI contract is exact now.
-            CURLcode::CURLE_OK as c_int
+            // Arm the cookie engine from the handle's cookie options (curl's `Curl_cookie_init`,
+            // driven at `curl_easy_perform` setup): load any `CURLOPT_COOKIEFILE` files and remember
+            // the `CURLOPT_COOKIEJAR` flush target. The inline `CURLOPT_COOKIE` string is sent
+            // regardless of the jar engine; `perform_transfer` emits the `Cookie:` header, captures
+            // `Set-Cookie:`, and flushes the jar at end of transfer (its `save_cookies` step —
+            // curl's cleanup-time cookie flush). Called unconditionally, exactly as the CLI does
+            // (`curl-rs/src/setopt.rs`): the FFI crate inherits `curl-rs-lib`'s default feature set
+            // (which includes `cookies`, curl's default-on `CURL_DISABLE_COOKIES=0`), so
+            // `cookie_init` is always present — a consumer-side `#[cfg(feature = "cookies")]` would
+            // be silently always-false here since this crate declares no such feature.
+            easy.cookie_init();
+            // Build the request from the options the core `Easy` models and drive the transfer to
+            // completion on a private current-thread runtime (curl's blocking, single-threaded easy
+            // model). The body is streamed to stdout — curl's default sink when no write callback
+            // is installed. `perform_blocking` maps a runtime-creation failure to `CURLE_FAILED_INIT`
+            // and otherwise returns the transfer's own `CURLcode`; `to_curlcode` bridges the typed
+            // error back to its frozen integer value.
+            let request = build_ffi_transfer_request(easy);
+            let sink: Box<dyn curl_rs_lib::protocols::TransferSink> = Box::new(StdoutSink);
+            to_curlcode(easy.perform_blocking(request, sink))
         }),
     )
 }

@@ -1042,7 +1042,39 @@ pub struct UserDefined {
     /// `CURLOPT_NETRC_FILE` — explicit `.netrc` path, if any.
     pub netrc_file: Option<PathBuf>,
 
+    // --- cookies ---
+    /// `CURLOPT_COOKIE` — an inline cookie string (`-b name=value`) sent
+    /// verbatim in the `Cookie:` request header. This is NOT stored in the jar
+    /// (it never appears in a `-c` save), matching curl's `data->set.str`
+    /// `[STRING_COOKIE]`. Multiple `-b` values are concatenated with `"; "`.
+    pub cookie: Option<String>,
+    /// `CURLOPT_COOKIEFILE` — cookie files to read (`-b file`). A non-empty list
+    /// (or a set [`cookiejar`](UserDefined::cookiejar)) turns the jar engine on.
+    /// Mirrors curl's `data->state.cookielist`.
+    pub cookiefiles: Vec<String>,
+    /// `CURLOPT_COOKIEJAR` — path the jar is written to at end of transfer
+    /// (`-c`). Setting it enables the jar engine even with no read file.
+    pub cookiejar: Option<String>,
+    /// `CURLOPT_COOKIESESSION` — start a new cookie session (`-j`), discarding
+    /// session cookies when loading the jar file (`data->set.cookiesession`).
+    pub cookiesession: bool,
+    /// `CURLOPT_HSTS` — the HSTS cache file (`--hsts`). Setting it enables the
+    /// HSTS engine: the file is read at init (if present) and rewritten after
+    /// the transfer. Mirrors curl's `data->set.str[STRING_HSTS]`.
+    pub hsts_file: Option<String>,
+    /// `CURLOPT_ALTSVC` — the Alt-Svc cache file (`--alt-svc`). Setting it
+    /// enables the Alt-Svc engine (read at init, rewritten after the
+    /// transfer). Mirrors curl's `data->set.str[STRING_ALTSVC]`.
+    pub altsvc_file: Option<String>,
+
     // --- addressing ---
+    /// `CURLOPT_RESOLVE` — custom `host:port:addr[,addr…]` pre-resolution
+    /// entries (`--resolve`), stored verbatim in curl's `--resolve` syntax
+    /// (including the `+`/`-`/`*` prefixes). Applied to each hop's DNS cache via
+    /// [`crate::dns::load_host_pairs`] before name resolution, so a matching
+    /// host short-circuits to the caller-supplied address. Empty by default.
+    /// Mirrors curl's `data->set.resolve` `curl_slist`, so `duphandle` clones it.
+    pub resolve: Vec<String>,
     /// `CURLOPT_IPRESOLVE`. Default [`IpResolve::Whatever`].
     pub ipver: IpResolve,
     /// `CURLOPT_LOCALPORT` — bind to a specific local port (`0` = any).
@@ -1191,6 +1223,14 @@ impl Default for UserDefined {
             use_netrc: NetrcLevel::Ignored,
             netrc_file: None,
 
+            cookie: None,
+            cookiefiles: Vec::new(),
+            cookiejar: None,
+            cookiesession: false,
+            hsts_file: None,
+            altsvc_file: None,
+
+            resolve: Vec::new(),
             ipver: IpResolve::Whatever,
             localport: 0,
             localportrange: 0,
@@ -1540,6 +1580,30 @@ pub struct EasyState {
     pub referer: Option<String>,
     /// The `.netrc` store, cached across lookups (curl's `state.netrc`).
     pub netrc: Netrc,
+    /// The live cookie jar (curl's `data->cookies`), present when the cookie
+    /// engine is enabled (a `CURLOPT_COOKIEFILE`/`-b file` was given or a
+    /// `CURLOPT_COOKIEJAR`/`-c` path is set). Created and seeded by
+    /// [`Easy::cookie_init`], consulted per hop to emit the `Cookie:` header,
+    /// updated from each response's `Set-Cookie:`, and written by
+    /// [`Easy::save_cookies`]. `None` when no jar engine is active (inline
+    /// `-b name=value` cookies are sent without a jar). Compiled only with the
+    /// `cookies` feature (curl's `CURL_DISABLE_COOKIES` removes the engine).
+    #[cfg(feature = "cookies")]
+    pub cookies: Option<crate::cookie::CookieJar>,
+    /// The live HSTS cache (curl's `data->hsts`), present when `CURLOPT_HSTS`/
+    /// `--hsts` supplied a cache file. Created and seeded from the file (if it
+    /// exists) by [`Easy::hsts_init`], consulted per hop to upgrade an
+    /// `http://` URL to `https://` for a known HSTS host, updated from each
+    /// response's `Strict-Transport-Security:` header, and written back by
+    /// [`Easy::save_hsts`]. `None` when no HSTS engine is active. The save
+    /// target file path lives on [`UserDefined::hsts_file`].
+    pub hsts: Option<crate::hsts::Hsts>,
+    /// The live Alt-Svc cache (curl's `data->asi`), present when
+    /// `CURLOPT_ALTSVC`/`--alt-svc` supplied a cache file. Created and seeded
+    /// by [`Easy::altsvc_init`], updated from each response's `Alt-Svc:`
+    /// header, and written back by [`Easy::save_altsvc`]. `None` when inactive.
+    /// The save target file path lives on [`UserDefined::altsvc_file`].
+    pub altsvc: Option<crate::altsvc::AltSvc>,
     /// The HTTP status code of the response that triggered the current redirect
     /// (curl's `state.httpreq`/`req.httpcode` context); tracked so
     /// [`Easy::follow`] can decide `POST`→`GET` switching.
@@ -2631,6 +2695,150 @@ impl Easy {
         Ok(())
     }
 
+    /// Initialises the cookie jar from the handle's cookie options — the
+    /// analogue of curl's `Curl_cookie_init` driven by `CURLOPT_COOKIEFILE` /
+    /// `CURLOPT_COOKIEJAR`.
+    ///
+    /// The jar engine is enabled when at least one cookie file was registered
+    /// (`-b file`) or a jar-write path was set (`-c`); an inline
+    /// `-b name=value` cookie alone does NOT create a jar (it is sent verbatim
+    /// from [`UserDefined::cookie`]). When enabled, every registered file is
+    /// read (a missing/unreadable file is non-fatal — curl warns and
+    /// continues), the `-j` new-session flag is applied, and the `-c` write
+    /// path is remembered for [`save_cookies`](Easy::save_cookies). Calling it
+    /// again rebuilds the jar from the current options.
+    ///
+    /// Compiled only with the `cookies` feature (curl's `CURL_DISABLE_COOKIES`).
+    #[cfg(feature = "cookies")]
+    pub fn cookie_init(&mut self) {
+        let engine_on = !self.set.cookiefiles.is_empty() || self.set.cookiejar.is_some();
+        if !engine_on {
+            self.state.cookies = None;
+            return;
+        }
+        let mut jar = crate::cookie::CookieJar::new();
+        // `-j` / `CURLOPT_COOKIESESSION`: discard session cookies on load.
+        jar.set_newsession(self.set.cookiesession);
+        // Register the read files (`-b file`); the special name "-" is stdin.
+        for file in &self.set.cookiefiles {
+            if !file.is_empty() {
+                jar.add_file(file.clone());
+            }
+        }
+        // Read them now. curl treats a missing/unreadable cookie file as a
+        // non-fatal warning (the jar simply starts empty), so a load error is
+        // logged and swallowed rather than failing the transfer.
+        if let Err(e) = jar.load_files() {
+            tracing::warn!("failed to read a cookie file: {e}");
+        }
+        // Remember the `-c` write target for the end-of-transfer save.
+        if let Some(jarfile) = &self.set.cookiejar {
+            jar.set_jar_file(jarfile.clone());
+        }
+        self.state.cookies = Some(jar);
+    }
+
+    /// Writes the cookie jar to the `CURLOPT_COOKIEJAR` (`-c`) file — curl's
+    /// end-of-transfer cookie flush at handle cleanup. A no-op when no `-c`
+    /// path was set or the jar engine is off. Any I/O failure is logged and
+    /// swallowed (curl warns to stderr yet still exits successfully).
+    ///
+    /// Compiled only with the `cookies` feature (curl's `CURL_DISABLE_COOKIES`).
+    #[cfg(feature = "cookies")]
+    pub fn save_cookies(&mut self) {
+        let jarfile = self.set.cookiejar.clone();
+        if jarfile.is_none() {
+            return;
+        }
+        if let Some(jar) = self.state.cookies.as_mut() {
+            if let Err(e) = jar.save(jarfile.as_deref()) {
+                tracing::warn!("failed to save cookie jar: {e}");
+            }
+        }
+    }
+
+    /// Initialises the HSTS cache from `CURLOPT_HSTS` / `--hsts` — the analogue
+    /// of curl's `Curl_hsts_loadfile` driven at `curl_easy_perform` setup.
+    ///
+    /// The engine is enabled only when a cache file path is set. The file is
+    /// read now if it exists; a missing file is non-fatal (curl starts with an
+    /// empty cache and creates the file on save), and any other read error is
+    /// logged and swallowed so the transfer still proceeds. Calling it again
+    /// rebuilds the cache from the current path.
+    pub fn hsts_init(&mut self) {
+        let path = match self.set.hsts_file.as_deref().filter(|p| !p.is_empty()) {
+            Some(p) => p.to_string(),
+            None => {
+                self.state.hsts = None;
+                return;
+            }
+        };
+        let mut hsts = crate::hsts::Hsts::new();
+        // Seed from the existing file when present. A non-existent file is the
+        // normal first-run case and must not fail the transfer.
+        if std::path::Path::new(&path).exists() {
+            if let Err(e) = hsts.load_file(&path) {
+                tracing::warn!("failed to read the HSTS cache file: {e}");
+            }
+        }
+        self.state.hsts = Some(hsts);
+    }
+
+    /// Writes the HSTS cache back to the `--hsts` file — curl's end-of-transfer
+    /// `Curl_hsts_save`. A no-op when no HSTS path was set or the engine is
+    /// off. Any I/O failure is logged and swallowed (curl warns yet still
+    /// exits successfully).
+    pub fn save_hsts(&mut self) {
+        let file = self.set.hsts_file.clone();
+        if file.as_deref().filter(|p| !p.is_empty()).is_none() {
+            return;
+        }
+        if let Some(hsts) = self.state.hsts.as_ref() {
+            if let Err(e) = hsts.save(file.as_deref()) {
+                tracing::warn!("failed to save the HSTS cache: {e}");
+            }
+        }
+    }
+
+    /// Initialises the Alt-Svc cache from `CURLOPT_ALTSVC` / `--alt-svc` — the
+    /// analogue of curl's `Curl_altsvc_init`.
+    ///
+    /// The engine is enabled only when a cache file path is set. The file is
+    /// read now if it exists (a missing file is the normal first-run case; any
+    /// read error is logged and swallowed). Calling it again rebuilds the cache
+    /// from the current path.
+    pub fn altsvc_init(&mut self) {
+        let path = match self.set.altsvc_file.as_deref().filter(|p| !p.is_empty()) {
+            Some(p) => p.to_string(),
+            None => {
+                self.state.altsvc = None;
+                return;
+            }
+        };
+        let mut altsvc = crate::altsvc::AltSvc::new();
+        if std::path::Path::new(&path).exists() {
+            if let Err(e) = altsvc.load(&path) {
+                tracing::warn!("failed to read the alt-svc cache file: {e}");
+            }
+        }
+        self.state.altsvc = Some(altsvc);
+    }
+
+    /// Writes the Alt-Svc cache back to the `--alt-svc` file — curl's
+    /// end-of-transfer `Curl_altsvc_save`. A no-op when no path was set or the
+    /// engine is off. Any I/O failure is logged and swallowed.
+    pub fn save_altsvc(&mut self) {
+        let file = self.set.altsvc_file.clone();
+        if file.as_deref().filter(|p| !p.is_empty()).is_none() {
+            return;
+        }
+        if let Some(altsvc) = self.state.altsvc.as_ref() {
+            if let Err(e) = altsvc.save(file.as_deref()) {
+                tracing::warn!("failed to save the alt-svc cache: {e}");
+            }
+        }
+    }
+
     /// Fills in default credentials for a connection that still has none — a
     /// rewrite of curl's `set_login`.
     ///
@@ -3015,11 +3223,24 @@ impl Easy {
         let mut cred_origin: Option<(String, String, u16)> = None;
         let mut strip_sensitive_headers = false;
 
+        // `--max-time` / `CURLOPT_TIMEOUT`: the overall deadline for the whole
+        // transfer, spanning the entire redirect chain (← curl arms
+        // `Curl_expire(data, timeout, EXPIRE_TIMEOUT)` at transfer start and
+        // fails the transfer with `CURLE_OPERATION_TIMEDOUT` when it fires, no
+        // matter which phase is in flight). It is distinct from the per-connect
+        // `--connect-timeout` budget applied inside the loop below. `None`
+        // (option unset / zero) means "no overall limit", matching curl.
+        let overall_timeout = base_request.timeout;
+
         // Redirect-follow loop (← curl's `multi_runsingle` re-entering the SETUP
         // state after `Curl_follow` installs a new URL on the handle). A single
         // iteration for a non-redirected transfer; each followed `3xx`
-        // re-resolves the new host and reconnects.
-        let final_do_res: Result<()> = loop {
+        // re-resolves the new host and reconnects. The loop is packaged as one
+        // future so the overall `--max-time` deadline can bound the entire chain
+        // with a single `tokio::time::timeout`; on expiry the in-flight future is
+        // cancelled at its next await point and the transfer reports code 28.
+        let redirect_loop = async {
+            loop {
             let mut peer_ip: Option<String> = None;
             // Per-hop phase timers (microseconds from `t_start`). A phase that
             // never runs for this hop (e.g. name resolution for a `file://`
@@ -3064,12 +3285,76 @@ impl Easy {
                 .url_get_part(CurlUPart::Url, 0, urlapi::UrlCode::UnknownPart)?
                 .unwrap_or_default();
 
+            // --- 2b. HSTS upgrade (← curl's `Curl_hsts` check in `create_conn`).
+            // When the scheme is cleartext `http` and the host is a known HSTS
+            // host, upgrade this hop to `https` before any connection is made —
+            // this is the read side of the HSTS cache that complements the
+            // `Strict-Transport-Security:` capture below. curl keeps an explicit
+            // port (or a `CURLOPT_PORT`/`--port` override) and promotes only the
+            // default http port (80) to the https default (443); the scheme,
+            // scheme handlers, port, and effective URL are all rewritten so the
+            // TLS filter is selected and `%{url_effective}` reports the https
+            // URL. A `* Switched from HTTP to HTTPS due to HSTS => …` note is
+            // emitted under `-v`/`--trace`, mirroring curl's `infof`. All later
+            // per-hop logic (connection build, TLS posture, request line, cookie
+            // scoping, Alt-Svc source ALPN) then observes the upgraded values. ---
+            let (scheme_lc, ident, psh, handler, port, effective_url) = if scheme_lc == "http"
+                && self.state.hsts.as_ref().is_some_and(|h| h.is_hsts(&host))
+            {
+                let up_ident = get_scheme_handler("https")
+                    .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
+                let up_psh = scheme_handler("https")
+                    .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
+                let up_handler = up_psh
+                    .handler
+                    .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
+                // An explicit URL port or a `--port` override is preserved; a
+                // bare `http://host` (default port 80) becomes the https default.
+                let explicit_port = self.set.use_port != 0
+                    || self
+                        .url_get_part(CurlUPart::Port, 0, urlapi::UrlCode::NoPort)?
+                        .is_some();
+                let up_port = if explicit_port {
+                    port
+                } else {
+                    up_ident.default_port
+                };
+                // Swap the effective URL's leading `http://` → `https://` for
+                // `%{url_effective}` and the upgrade trace line.
+                let up_url = match effective_url.strip_prefix("http://") {
+                    Some(rest) => format!("https://{rest}"),
+                    None => effective_url.clone(),
+                };
+                if trace_on {
+                    trace_records.push((
+                        DebugInfoType::Text,
+                        format!("Switched from HTTP to HTTPS due to HSTS => {up_url}\n")
+                            .into_bytes(),
+                    ));
+                }
+                (
+                    "https".to_string(),
+                    up_ident,
+                    up_psh,
+                    up_handler,
+                    up_port,
+                    up_url,
+                )
+            } else {
+                (scheme_lc, ident, psh, handler, port, effective_url)
+            };
+
             // Build this hop's request from the caller's template, stamping the
             // URL-derived fields and the (possibly switched) method/body.
             let mut request = base_request.clone();
             request.scheme = scheme_lc.clone();
             request.host = host.clone();
             request.port = port;
+            // Keep this hop's path for cookie storage after `request` is consumed
+            // by the DO phase (the `Set-Cookie:` capture needs the request path).
+            // Only needed when the `cookies` feature compiles the capture block.
+            #[cfg(feature = "cookies")]
+            let cookie_path = path.clone();
             request.path = path;
             request.query = query;
             if !effective_url.is_empty() {
@@ -3098,17 +3383,95 @@ impl Easy {
                     }
                 }
             }
-            // Use the (possibly cleared) working credentials for this hop and, once
-            // a foreign origin has been reached, drop sensitive caller-supplied
-            // headers so `Authorization:`/`Cookie:` are not forwarded cross-host.
-            request.user = cred_user.clone();
-            request.password = cred_password.clone();
+            // Working credentials for this hop: the (possibly cross-origin-stripped)
+            // `--user` credentials by default.
+            let mut hop_user = cred_user.clone();
+            let mut hop_password = cred_password.clone();
+
+            // `.netrc` credential source (← curl's `override_login`, run per
+            // connection): when `--netrc`/`--netrc-optional` is active and no
+            // `--user` was supplied, look up THIS hop's host in the `.netrc` file.
+            // A match supplies the credentials for this hop. Because the lookup is
+            // per-host, netrc credentials are naturally scoped to each host in a
+            // redirect chain (curl's `conn->bits.netrc`) rather than being carried
+            // forward and stripped like `--user` credentials, so a redirect to a
+            // different machine listed in `.netrc` picks up that machine's login.
+            // `--netrc` (required) treats a hard file error as fatal
+            // (`CURLE_READ_ERROR`); `--netrc-optional` and a plain "no match" fall
+            // back to sending no credentials, exactly as curl does.
+            if self.set.use_netrc != NetrcLevel::Ignored && base_request.user.is_none() {
+                let netrcfile = self.set.netrc_file.clone();
+                match self.state.netrc.parse(&host, None, netrcfile.as_deref()) {
+                    Ok(creds) => {
+                        if creds.login.is_some() || creds.password.is_some() {
+                            // A password but no login uses a blank user (curl's
+                            // `strdup("")`), so Basic auth still forms `:password`.
+                            hop_user = creds
+                                .login
+                                .or_else(|| creds.password.as_ref().map(|_| String::new()));
+                            hop_password = creds.password;
+                        }
+                    }
+                    Err(NetrcCode::NoMatch) => {}
+                    Err(_) if self.set.use_netrc == NetrcLevel::Optional => {}
+                    Err(_) => {
+                        break Err(Error::with_context(CurlCode::ReadError, ".netrc error"));
+                    }
+                }
+            }
+
+            // Use the working credentials for this hop and, once a foreign origin
+            // has been reached, drop sensitive caller-supplied headers so
+            // `Authorization:`/`Cookie:` are not forwarded cross-host.
+            request.user = hop_user;
+            request.password = hop_password;
             if strip_sensitive_headers {
                 request.headers.retain(|line| {
                     let name = line.split(':').next().unwrap_or("").trim();
                     !name.eq_ignore_ascii_case("Authorization")
                         && !name.eq_ignore_ascii_case("Cookie")
                 });
+            }
+
+            // --- 2b. Outgoing `Cookie:` header (← curl's `Curl_cookie_getlist`
+            // joined with the inline `CURLOPT_COOKIE` string). The inline cookie
+            // string set via `-b name=value` mirrors libcurl's `CURLOPT_COOKIE`:
+            // it is emitted verbatim on every hop of the transfer, including
+            // cross-host redirects. It is deliberately NOT one of the
+            // caller-supplied headers subject to the cross-origin strip above —
+            // curl only strips an explicit `-H 'Cookie: …'` header cross-host
+            // (verified against curl 8.x), while the `CURLOPT_COOKIE` string
+            // persists. Jar cookies are always domain/path/scheme-scoped by
+            // `cookie_header`, so they too are safe to emit on every hop. The
+            // synthesized header is added only when the caller has no surviving
+            // `Cookie:` header of their own (an explicit `-H 'Cookie: …'` wins,
+            // and the cross-host strip above has already removed a foreign one).
+            // Compiled only with the `cookies` feature — curl's
+            // `CURL_DISABLE_COOKIES` removes the whole engine, `CURLOPT_COOKIE`
+            // (inline `-b`) included, so no `Cookie:` header is synthesized. ---
+            #[cfg(feature = "cookies")]
+            {
+                let mut cookie_parts: Vec<String> = Vec::new();
+                if let Some(inline) = self.set.cookie.as_deref().filter(|s| !s.is_empty()) {
+                    cookie_parts.push(inline.to_string());
+                }
+                if let Some(jar) = self.state.cookies.as_mut() {
+                    if let Some(h) = jar.cookie_header(&host, &request.path, psh.is_secure()) {
+                        cookie_parts.push(h);
+                    }
+                }
+                let has_manual_cookie = request.headers.iter().any(|line| {
+                    line.split(':')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .eq_ignore_ascii_case("Cookie")
+                });
+                if !cookie_parts.is_empty() && !has_manual_cookie {
+                    request
+                        .headers
+                        .push(format!("Cookie: {}", cookie_parts.join("; ")));
+                }
             }
 
             // --- 3. Build the live connection. ---
@@ -3167,6 +3530,15 @@ impl Easy {
                 // consult its shared cache, but a single serial transfer needs only
                 // a fresh one (localhost / IP literals resolve without the network).
                 let cache = DnsCache::new();
+                // `--resolve` / `CURLOPT_RESOLVE`: pre-populate this hop's cache so a
+                // named `host:port` short-circuits real resolution to the supplied
+                // address (← curl seeds `data->dns.hostcache` via
+                // `Curl_loadhostpairs` before `Curl_resolv`). Applied every hop so a
+                // redirect target listed in `--resolve` is honored too; a malformed
+                // entry surfaces curl's `CURLE_SETOPT_OPTION_SYNTAX`.
+                if !self.set.resolve.is_empty() {
+                    crate::dns::load_host_pairs(&cache, &self.set.resolve)?;
+                }
                 let resolver = SystemResolver::new();
                 let opts = ResolveOptions::new(&resolver);
                 let dns = resolve(&cache, &host, port, conn.ip_version, false, &opts).await?;
@@ -3223,10 +3595,17 @@ impl Easy {
             // assembler (so the `> ` block matches the wire, `Authorization` included); the request
             // body, if any, is the `} ` (DATA_OUT) payload.
             if trace_on {
-                if matches!(scheme_lc.as_str(), "http" | "https") {
-                    let head = crate::protocols::http::trace_request_head_bytes(&request);
-                    if !head.is_empty() {
-                        trace_records.push((DebugInfoType::HeaderOut, head));
+                // The HTTP(S) request-head assembler lives in `protocols::http`, which is
+                // compiled only under the `http` feature. Gate the call so `--no-default-features`
+                // (and any build without `http`) still compiles; without the HTTP handler there is
+                // no `http`/`https` transfer and hence no request head to render here.
+                #[cfg(feature = "http")]
+                {
+                    if matches!(scheme_lc.as_str(), "http" | "https") {
+                        let head = crate::protocols::http::trace_request_head_bytes(&request);
+                        if !head.is_empty() {
+                            trace_records.push((DebugInfoType::HeaderOut, head));
+                        }
                     }
                 }
                 if let Some(b) = request.body.as_ref() {
@@ -3313,6 +3692,87 @@ impl Easy {
             self.info.pretransfer_time_us = t_pretransfer_us;
             self.info.starttransfer_time_us = t_starttransfer_us;
 
+            // --- 6b. Ingest this hop's `Set-Cookie:` response headers into the
+            // jar (← curl's `Curl_cookie_add` invoked per `Set-Cookie:` during
+            // the header callback). The headers are collected first so the
+            // immutable `info` borrow is released before the jar is mutated. Each
+            // cookie is stored against THIS hop's host/path/scheme, so a later
+            // hop (and a `-c` save) sees it with the correct domain scoping. A
+            // cookie the jar rejects (bad domain, supercookie, …) is dropped
+            // silently, exactly as curl does. Compiled only with the `cookies`
+            // feature (curl's `CURL_DISABLE_COOKIES` removes the engine). ---
+            #[cfg(feature = "cookies")]
+            if self.state.cookies.is_some() {
+                let set_cookies: Vec<String> = self
+                    .info
+                    .resp_headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("Set-Cookie"))
+                    .map(|(_, value)| value.clone())
+                    .collect();
+                if !set_cookies.is_empty() {
+                    let is_tls = psh.is_secure();
+                    if let Some(jar) = self.state.cookies.as_mut() {
+                        for line in &set_cookies {
+                            let _ =
+                                jar.add(true, false, line, Some(&host), Some(&cookie_path), is_tls);
+                        }
+                    }
+                }
+            }
+
+            // --- 6c. Ingest this hop's `Strict-Transport-Security:` response
+            // header into the HSTS cache (← curl's `Curl_hsts_parse`, invoked
+            // from the header callback). Values are collected first so the
+            // immutable `info` borrow is released before the cache is mutated.
+            // The parser stores the entry against THIS hop's host, ignores an
+            // IP-literal host (RFC 6797 §8.3), and rejects a malformed header
+            // without failing the transfer — exactly as curl does. ---
+            if self.state.hsts.is_some() {
+                let sts_values: Vec<String> = self
+                    .info
+                    .resp_headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("Strict-Transport-Security"))
+                    .map(|(_, value)| value.clone())
+                    .collect();
+                if let Some(hsts) = self.state.hsts.as_mut() {
+                    for value in &sts_values {
+                        let _ = hsts.parse(&host, value);
+                    }
+                }
+            }
+
+            // --- 6d. Ingest this hop's `Alt-Svc:` response header into the
+            // Alt-Svc cache (← curl's `Curl_altsvc_parse`). The source ALPN is
+            // the HTTP version negotiated on this connection
+            // (← `Curl_conn_get_alpn_id`): `h2`/`h3` map directly and everything
+            // else (HTTP/1.x, or a torn-down/unknown connection) is recorded as
+            // `h1`, matching curl for a completed HTTP/1.1 exchange. `srchost`/
+            // `srcport` are this hop's origin. Invalid alternatives are rejected
+            // individually without failing the header or the transfer. ---
+            if self.state.altsvc.is_some() {
+                let altsvc_values: Vec<String> = self
+                    .info
+                    .resp_headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("Alt-Svc"))
+                    .map(|(_, value)| value.clone())
+                    .collect();
+                if !altsvc_values.is_empty() {
+                    let src_alpn = match ctx.conn.as_ref().map_or(0, |c| c.http_version()) {
+                        20 => crate::altsvc::AlpnId::H2,
+                        30 => crate::altsvc::AlpnId::H3,
+                        _ => crate::altsvc::AlpnId::H1,
+                    };
+                    if let Some(altsvc) = self.state.altsvc.as_mut() {
+                        for value in &altsvc_values {
+                            let _ = altsvc.parse(value, src_alpn, &host, port);
+                        }
+                    }
+                }
+            }
+
             // Response-head trace for this hop (one `< ` line per header),
             // recorded for every hop so a redirect chain shows each response.
             if trace_on {
@@ -3371,6 +3831,19 @@ impl Easy {
                 }
             }
             break do_res.map(|_done| ());
+            }
+        };
+
+        // Drive the redirect loop, bounding the whole chain by the overall
+        // `--max-time` deadline when one is set. A fired deadline maps to curl's
+        // `CURLE_OPERATION_TIMEDOUT` (28); the post-loop reconciliation below
+        // still runs so `%{time_total}` and any partial `-v` trace are recorded.
+        let final_do_res: Result<()> = match overall_timeout {
+            Some(d) => match tokio::time::timeout(d, redirect_loop).await {
+                Ok(res) => res,
+                Err(_elapsed) => Err(Error::from(CurlCode::OperationTimedout)),
+            },
+            None => redirect_loop.await,
         };
 
         // --- 8. Reconcile the cumulative byte count + total time onto the final
@@ -3381,6 +3854,23 @@ impl Easy {
         // DONE phase (← `data->progress.timespent`, set by `Curl_pgrsDone`). ---
         self.info.size_download = downloaded.load(std::sync::atomic::Ordering::SeqCst);
         self.info.total_time_us = t_start.elapsed().as_micros() as i64;
+
+        // --- 8a. Persist the cookie jar (← curl's cookie flush at handle
+        // cleanup): write the `-c` file with every jar cookie, including those
+        // just captured from this transfer's `Set-Cookie:` headers. Runs
+        // regardless of transfer outcome (curl saves on cleanup even after an
+        // error) and is a no-op when no `-c` path was set. Compiled only with
+        // the `cookies` feature (curl's `CURL_DISABLE_COOKIES`). ---
+        #[cfg(feature = "cookies")]
+        self.save_cookies();
+
+        // --- 8a'. Persist the HSTS and Alt-Svc caches (← curl's
+        // `Curl_hsts_save` / `Curl_altsvc_save` at handle cleanup): rewrite the
+        // `--hsts` / `--alt-svc` files with every cached entry, including those
+        // just captured from this transfer's `Strict-Transport-Security:` /
+        // `Alt-Svc:` headers. Each is a no-op when its file path was not set. ---
+        self.save_hsts();
+        self.save_altsvc();
 
         // --- 8b. Finish the `-v`/`--trace` stream: the final response body
         // (`{ ` DATA_IN) then curl's connection-teardown note. ---
@@ -3404,6 +3894,44 @@ impl Easy {
             self.debug_log = trace_records;
         }
         final_do_res
+    }
+
+    /// Blocking wrapper around [`perform_transfer`](Easy::perform_transfer) for
+    /// the synchronous C easy API (`curl_easy_perform`), which curl documents as
+    /// blocking the calling thread until the transfer completes.
+    ///
+    /// curl's easy interface is single-threaded (`lib/easy.c` runs the transfer
+    /// on the caller's thread), so this builds a private **current-thread** Tokio
+    /// runtime — the same flavor the CLI selects (`#[tokio::main(flavor =
+    /// "current_thread")]`) — and drives the async transfer to completion on it.
+    /// The runtime is created per call and dropped when the transfer finishes,
+    /// mirroring curl's per-`curl_easy_perform` execution model and leaving the
+    /// handle reusable for a subsequent perform.
+    ///
+    /// This is memory-safe (no `unsafe`), so the FFI crate can call through here
+    /// and keep its dependency profile to the core crate alone — the Tokio
+    /// runtime construction stays in `curl-rs-lib`, never in the `unsafe` FFI
+    /// boundary. The cookie-jar flush, HSTS/Alt-Svc persistence, and all wire
+    /// behavior are performed by [`perform_transfer`](Easy::perform_transfer)
+    /// exactly as on the CLI path.
+    ///
+    /// Returns [`CurlCode::FailedInit`] (curl's `CURLE_FAILED_INIT`) if the
+    /// runtime cannot be created, otherwise the transfer's own result.
+    pub fn perform_blocking(
+        &mut self,
+        base_request: crate::protocols::TransferRequest,
+        sink: Box<dyn crate::protocols::TransferSink>,
+    ) -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                Error::with_context(
+                    CurlCode::FailedInit,
+                    format!("failed to create the transfer runtime: {e}"),
+                )
+            })?;
+        runtime.block_on(self.perform_transfer(base_request, sink))
     }
 
     /// Sets the auto-referer for the next request from the current URL, stripping
@@ -4285,6 +4813,63 @@ mod tests {
         assert_eq!(collected.lock().expect("sink").as_slice(), b"hello");
         assert_eq!(easy.info.httpcode, 200);
         assert_eq!(easy.info.contenttype.as_deref(), Some("text/plain"));
+    }
+
+    /// End-to-end proof that [`Easy::perform_blocking`] — the synchronous
+    /// wrapper the FFI `curl_easy_perform` drives — builds its own
+    /// current-thread runtime and runs a **real** HTTP GET to completion
+    /// (FA-FMT-001 step 3: the FFI transfer engine now performs network I/O).
+    /// The test itself stays synchronous (no `#[tokio::test]`) because
+    /// `perform_blocking` calls `Runtime::block_on`, which must not run inside
+    /// an existing runtime; the one-shot origin server therefore lives on a
+    /// plain OS thread.
+    #[cfg(feature = "http")]
+    #[test]
+    fn perform_blocking_drives_real_http_get() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let srv = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let mut data = Vec::new();
+            // Drain the request head so the client's write completes before we
+            // answer (mirrors the async sibling test's read loop).
+            loop {
+                let n = sock.read(&mut buf).expect("read");
+                if n == 0 || data.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                data.extend_from_slice(&buf[..n]);
+                if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\
+                  Connection: close\r\n\r\nhello",
+            )
+            .expect("write response");
+            let _ = sock.flush();
+        });
+
+        let mut easy = Easy::open();
+        easy.set_url(&format!("http://127.0.0.1:{}/e2e", addr.port()))
+            .expect("set url");
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let sink = Box::new(VecSink(Arc::clone(&collected)));
+        let req = crate::protocols::TransferRequest {
+            method: "GET".to_string(),
+            ..Default::default()
+        };
+        easy.perform_blocking(req, sink)
+            .expect("perform_blocking drives a real GET");
+        srv.join().expect("server thread");
+        assert_eq!(collected.lock().expect("sink").as_slice(), b"hello");
+        assert_eq!(easy.info.httpcode, 200);
     }
 
     // --- F10 redirect + TLS-threading helper logic ---------------------------

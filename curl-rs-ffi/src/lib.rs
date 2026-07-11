@@ -543,17 +543,6 @@ pub const CURL_VERSION_HSTS: c_int = 1 << 28;
 pub const CURL_VERSION_GSASL: c_int = 1 << 29;
 pub const CURL_VERSION_THREADSAFE: c_int = 1 << 30;
 
-/// Compiled-in protocol schemes reported by [`curl_version_info`], alphabetically sorted to
-/// match `lib/version.c`'s `supported_protocols[]`. RTMP/RTMPS are absent (dropped, AAP §0.2.2).
-//
-// NOTE: this is the AAP-supported protocol set; reconcile with a `curl-rs-lib` protocol
-// registry accessor if/when one is exposed.
-const PROTOCOLS: &[&str] = &[
-    "dict", "file", "ftp", "ftps", "gopher", "gophers", "http", "https", "imap", "imaps", "ldap",
-    "ldaps", "mqtt", "mqtts", "pop3", "pop3s", "rtsp", "scp", "sftp", "smb", "smbs", "smtp",
-    "smtps", "telnet", "tftp", "ws", "wss",
-];
-
 /// Human-readable feature names reported by [`curl_version_info`], alphabetically sorted to
 /// match `lib/version.c`'s features table, restricted to features actually built into this
 /// workspace. Each corresponds to a `CURL_VERSION_*` bit set in [`BUILT_FEATURES`].
@@ -643,7 +632,12 @@ fn build_version_info() -> VersionInfo {
         ssl_version_num: 0,
         // flate2 is the libz-equivalent (gzip/deflate). Reported as "flate2".
         libz_version: leak_cstr("flate2"),
-        protocols: leak_cstr_array(PROTOCOLS),
+        // Compiled-in protocol schemes, sourced from the core crate's single source of truth
+        // ([`curl_rs_lib::supported_protocols`]) so `curl_version_info()->protocols` advertises
+        // exactly the schemes built into `curl-rs-lib` (FA-CLI-002) — matching curl's
+        // `#ifdef`-driven `supported_protocols[]` and staying in lockstep with the CLI's
+        // `--version`. RTMP/RTMPS are absent (dropped, AAP §0.2.2).
+        protocols: leak_cstr_array(curl_rs_lib::supported_protocols()),
         // c-ares removed (Tokio system resolver replaces it) → null / 0.
         ares: std::ptr::null(),
         ares_num: 0,
@@ -959,7 +953,7 @@ mod tests {
         assert!(!info.feature_names.is_null());
         // SAFETY: both arrays are process-lifetime and NULL-terminated by construction.
         let proto_count = unsafe { count_null_terminated(info.protocols) };
-        assert_eq!(proto_count, super::PROTOCOLS.len());
+        assert_eq!(proto_count, curl_rs_lib::supported_protocols().len());
         // SAFETY: as above.
         let feat_count = unsafe { count_null_terminated(info.feature_names) };
         assert_eq!(feat_count, super::FEATURE_NAMES.len());
