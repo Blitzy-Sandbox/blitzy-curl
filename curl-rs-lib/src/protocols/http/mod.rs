@@ -1636,7 +1636,8 @@ fn build_http_request(req: &super::TransferRequest) -> Result<HttpReqData> {
         if let Some(r) = req.range.as_deref().filter(|s| !s.is_empty()) {
             out.headers.add("Range", format!("bytes={r}"));
         } else if req.resume_from > 0 {
-            out.headers.add("Range", format!("bytes={}-", req.resume_from));
+            out.headers
+                .add("Range", format!("bytes={}-", req.resume_from));
         }
     }
 

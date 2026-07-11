@@ -1739,7 +1739,10 @@ mod tests {
         // to `strerror` for them (no text regression for resolve/connect/TLS/etc.).
         assert_eq!(Error::resolve("example.com").context_message(), None);
         assert_eq!(Error::Timeout.context_message(), None);
-        assert_eq!(Error::Code(CurlCode::CouldntConnect).context_message(), None);
+        assert_eq!(
+            Error::Code(CurlCode::CouldntConnect).context_message(),
+            None
+        );
         assert_eq!(
             Error::peer_failed_verification("bad cert").context_message(),
             None

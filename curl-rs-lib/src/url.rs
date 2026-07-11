@@ -3241,596 +3241,602 @@ impl Easy {
         // cancelled at its next await point and the transfer reports code 28.
         let redirect_loop = async {
             loop {
-            let mut peer_ip: Option<String> = None;
-            // Per-hop phase timers (microseconds from `t_start`). A phase that
-            // never runs for this hop (e.g. name resolution for a `file://`
-            // transfer) stays `0`, exactly as curl reports an unmeasured phase.
-            let mut t_namelookup_us: i64 = 0;
-            let mut t_connect_us: i64 = 0;
-            let mut t_appconnect_us: i64 = 0;
+                let mut peer_ip: Option<String> = None;
+                // Per-hop phase timers (microseconds from `t_start`). A phase that
+                // never runs for this hop (e.g. name resolution for a `file://`
+                // transfer) stays `0`, exactly as curl reports an unmeasured phase.
+                let mut t_namelookup_us: i64 = 0;
+                let mut t_connect_us: i64 = 0;
+                let mut t_appconnect_us: i64 = 0;
 
-            // --- 1. Scheme → protocol handler (identity + behavior vtable),
-            // read from the *current* URL (updated by `follow` on each hop). ---
-            let scheme = self
-                .url_get_part(CurlUPart::Scheme, 0, urlapi::UrlCode::NoScheme)?
-                .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
-            let scheme_lc = scheme.to_ascii_lowercase();
-
-            // The identity handler (default port, no-network flag) drives port
-            // resolution; the behavior handler carries the `&dyn Protocol` vtable
-            // used to run the exchange. Both are keyed on the same scheme string.
-            let ident = get_scheme_handler(&scheme_lc)
-                .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
-            let psh = scheme_handler(&scheme_lc)
-                .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
-            let handler = psh
-                .handler
-                .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
-
-            // --- 2. Host / port / path / query from the parsed URL. ---
-            let host = self
-                .url_get_part(CurlUPart::Host, 0, urlapi::UrlCode::NoHost)?
-                .ok_or_else(|| Error::from(CurlCode::UrlMalformat))?;
-            let host = idnconvert_host(&host)?;
-            let port = self.resolve_remote_port(&ident)?;
-            // Path is never "missing" (the URL parser defaults it to "/"); Query is
-            // absent as `NoQuery`, which `url_get_part` maps to `None`.
-            let path = self
-                .url_get_part(CurlUPart::Path, 0, urlapi::UrlCode::UnknownPart)?
-                .unwrap_or_else(|| "/".to_string());
-            let query = self.url_get_part(CurlUPart::Query, 0, urlapi::UrlCode::NoQuery)?;
-            // The full effective URL of this hop (← `data->state.url`), used by
-            // the HTTP-derived request-line assemblers and `%{url_effective}`.
-            let effective_url = self
-                .url_get_part(CurlUPart::Url, 0, urlapi::UrlCode::UnknownPart)?
-                .unwrap_or_default();
-
-            // --- 2b. HSTS upgrade (← curl's `Curl_hsts` check in `create_conn`).
-            // When the scheme is cleartext `http` and the host is a known HSTS
-            // host, upgrade this hop to `https` before any connection is made —
-            // this is the read side of the HSTS cache that complements the
-            // `Strict-Transport-Security:` capture below. curl keeps an explicit
-            // port (or a `CURLOPT_PORT`/`--port` override) and promotes only the
-            // default http port (80) to the https default (443); the scheme,
-            // scheme handlers, port, and effective URL are all rewritten so the
-            // TLS filter is selected and `%{url_effective}` reports the https
-            // URL. A `* Switched from HTTP to HTTPS due to HSTS => …` note is
-            // emitted under `-v`/`--trace`, mirroring curl's `infof`. All later
-            // per-hop logic (connection build, TLS posture, request line, cookie
-            // scoping, Alt-Svc source ALPN) then observes the upgraded values. ---
-            let (scheme_lc, ident, psh, handler, port, effective_url) = if scheme_lc == "http"
-                && self.state.hsts.as_ref().is_some_and(|h| h.is_hsts(&host))
-            {
-                let up_ident = get_scheme_handler("https")
+                // --- 1. Scheme → protocol handler (identity + behavior vtable),
+                // read from the *current* URL (updated by `follow` on each hop). ---
+                let scheme = self
+                    .url_get_part(CurlUPart::Scheme, 0, urlapi::UrlCode::NoScheme)?
                     .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
-                let up_psh = scheme_handler("https")
+                let scheme_lc = scheme.to_ascii_lowercase();
+
+                // The identity handler (default port, no-network flag) drives port
+                // resolution; the behavior handler carries the `&dyn Protocol` vtable
+                // used to run the exchange. Both are keyed on the same scheme string.
+                let ident = get_scheme_handler(&scheme_lc)
                     .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
-                let up_handler = up_psh
+                let psh = scheme_handler(&scheme_lc)
+                    .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
+                let handler = psh
                     .handler
                     .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
-                // An explicit URL port or a `--port` override is preserved; a
-                // bare `http://host` (default port 80) becomes the https default.
-                let explicit_port = self.set.use_port != 0
-                    || self
-                        .url_get_part(CurlUPart::Port, 0, urlapi::UrlCode::NoPort)?
-                        .is_some();
-                let up_port = if explicit_port {
-                    port
-                } else {
-                    up_ident.default_port
-                };
-                // Swap the effective URL's leading `http://` → `https://` for
-                // `%{url_effective}` and the upgrade trace line.
-                let up_url = match effective_url.strip_prefix("http://") {
-                    Some(rest) => format!("https://{rest}"),
-                    None => effective_url.clone(),
-                };
-                if trace_on {
-                    trace_records.push((
-                        DebugInfoType::Text,
-                        format!("Switched from HTTP to HTTPS due to HSTS => {up_url}\n")
-                            .into_bytes(),
-                    ));
-                }
-                (
-                    "https".to_string(),
-                    up_ident,
-                    up_psh,
-                    up_handler,
-                    up_port,
-                    up_url,
-                )
-            } else {
-                (scheme_lc, ident, psh, handler, port, effective_url)
-            };
 
-            // Build this hop's request from the caller's template, stamping the
-            // URL-derived fields and the (possibly switched) method/body.
-            let mut request = base_request.clone();
-            request.scheme = scheme_lc.clone();
-            request.host = host.clone();
-            request.port = port;
-            // Keep this hop's path for cookie storage after `request` is consumed
-            // by the DO phase (the `Set-Cookie:` capture needs the request path).
-            // Only needed when the `cookies` feature compiles the capture block.
-            #[cfg(feature = "cookies")]
-            let cookie_path = path.clone();
-            request.path = path;
-            request.query = query;
-            if !effective_url.is_empty() {
-                request.url = effective_url;
-            }
-            request.method = method.clone();
-            request.body = body.clone();
+                // --- 2. Host / port / path / query from the parsed URL. ---
+                let host = self
+                    .url_get_part(CurlUPart::Host, 0, urlapi::UrlCode::NoHost)?
+                    .ok_or_else(|| Error::from(CurlCode::UrlMalformat))?;
+                let host = idnconvert_host(&host)?;
+                let port = self.resolve_remote_port(&ident)?;
+                // Path is never "missing" (the URL parser defaults it to "/"); Query is
+                // absent as `NoQuery`, which `url_get_part` maps to `None`.
+                let path = self
+                    .url_get_part(CurlUPart::Path, 0, urlapi::UrlCode::UnknownPart)?
+                    .unwrap_or_else(|| "/".to_string());
+                let query = self.url_get_part(CurlUPart::Query, 0, urlapi::UrlCode::NoQuery)?;
+                // The full effective URL of this hop (← `data->state.url`), used by
+                // the HTTP-derived request-line assemblers and `%{url_effective}`.
+                let effective_url = self
+                    .url_get_part(CurlUPart::Url, 0, urlapi::UrlCode::UnknownPart)?
+                    .unwrap_or_default();
 
-            // Cross-origin credential strip (← `Curl_http_follow` +
-            // `Curl_auth_allowed_to_host`). The first hop records the credential
-            // origin; any later hop whose (scheme, host, port) differs drops the
-            // Basic credentials and any caller-supplied `Authorization:`/`Cookie:`
-            // header so they never leak to a foreign host. The decision latches:
-            // once a foreign origin is reached the credentials stay stripped for
-            // every remaining hop. `--location-trusted` disables the strip.
-            if !unrestricted_auth {
-                let this_origin = (scheme_lc.clone(), host.clone(), port);
-                match &cred_origin {
-                    None => cred_origin = Some(this_origin),
-                    Some(origin) => {
-                        if *origin != this_origin {
-                            cred_user = None;
-                            cred_password = None;
-                            strip_sensitive_headers = true;
-                        }
-                    }
-                }
-            }
-            // Working credentials for this hop: the (possibly cross-origin-stripped)
-            // `--user` credentials by default.
-            let mut hop_user = cred_user.clone();
-            let mut hop_password = cred_password.clone();
-
-            // `.netrc` credential source (← curl's `override_login`, run per
-            // connection): when `--netrc`/`--netrc-optional` is active and no
-            // `--user` was supplied, look up THIS hop's host in the `.netrc` file.
-            // A match supplies the credentials for this hop. Because the lookup is
-            // per-host, netrc credentials are naturally scoped to each host in a
-            // redirect chain (curl's `conn->bits.netrc`) rather than being carried
-            // forward and stripped like `--user` credentials, so a redirect to a
-            // different machine listed in `.netrc` picks up that machine's login.
-            // `--netrc` (required) treats a hard file error as fatal
-            // (`CURLE_READ_ERROR`); `--netrc-optional` and a plain "no match" fall
-            // back to sending no credentials, exactly as curl does.
-            if self.set.use_netrc != NetrcLevel::Ignored && base_request.user.is_none() {
-                let netrcfile = self.set.netrc_file.clone();
-                match self.state.netrc.parse(&host, None, netrcfile.as_deref()) {
-                    Ok(creds) => {
-                        if creds.login.is_some() || creds.password.is_some() {
-                            // A password but no login uses a blank user (curl's
-                            // `strdup("")`), so Basic auth still forms `:password`.
-                            hop_user = creds
-                                .login
-                                .or_else(|| creds.password.as_ref().map(|_| String::new()));
-                            hop_password = creds.password;
-                        }
-                    }
-                    Err(NetrcCode::NoMatch) => {}
-                    Err(_) if self.set.use_netrc == NetrcLevel::Optional => {}
-                    Err(_) => {
-                        break Err(Error::with_context(CurlCode::ReadError, ".netrc error"));
-                    }
-                }
-            }
-
-            // Use the working credentials for this hop and, once a foreign origin
-            // has been reached, drop sensitive caller-supplied headers so
-            // `Authorization:`/`Cookie:` are not forwarded cross-host.
-            request.user = hop_user;
-            request.password = hop_password;
-            if strip_sensitive_headers {
-                request.headers.retain(|line| {
-                    let name = line.split(':').next().unwrap_or("").trim();
-                    !name.eq_ignore_ascii_case("Authorization")
-                        && !name.eq_ignore_ascii_case("Cookie")
-                });
-            }
-
-            // --- 2b. Outgoing `Cookie:` header (← curl's `Curl_cookie_getlist`
-            // joined with the inline `CURLOPT_COOKIE` string). The inline cookie
-            // string set via `-b name=value` mirrors libcurl's `CURLOPT_COOKIE`:
-            // it is emitted verbatim on every hop of the transfer, including
-            // cross-host redirects. It is deliberately NOT one of the
-            // caller-supplied headers subject to the cross-origin strip above —
-            // curl only strips an explicit `-H 'Cookie: …'` header cross-host
-            // (verified against curl 8.x), while the `CURLOPT_COOKIE` string
-            // persists. Jar cookies are always domain/path/scheme-scoped by
-            // `cookie_header`, so they too are safe to emit on every hop. The
-            // synthesized header is added only when the caller has no surviving
-            // `Cookie:` header of their own (an explicit `-H 'Cookie: …'` wins,
-            // and the cross-host strip above has already removed a foreign one).
-            // Compiled only with the `cookies` feature — curl's
-            // `CURL_DISABLE_COOKIES` removes the whole engine, `CURLOPT_COOKIE`
-            // (inline `-b`) included, so no `Cookie:` header is synthesized. ---
-            #[cfg(feature = "cookies")]
-            {
-                let mut cookie_parts: Vec<String> = Vec::new();
-                if let Some(inline) = self.set.cookie.as_deref().filter(|s| !s.is_empty()) {
-                    cookie_parts.push(inline.to_string());
-                }
-                if let Some(jar) = self.state.cookies.as_mut() {
-                    if let Some(h) = jar.cookie_header(&host, &request.path, psh.is_secure()) {
-                        cookie_parts.push(h);
-                    }
-                }
-                let has_manual_cookie = request.headers.iter().any(|line| {
-                    line.split(':')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .eq_ignore_ascii_case("Cookie")
-                });
-                if !cookie_parts.is_empty() && !has_manual_cookie {
-                    request
-                        .headers
-                        .push(format!("Cookie: {}", cookie_parts.join("; ")));
-                }
-            }
-
-            // --- 3. Build the live connection. ---
-            let is_nonetwork = ident.is_nonetwork();
-            let live_scheme = LiveScheme {
-                name: scheme_lc.clone(),
-                default_port: ident.default_port,
-                is_ssl: psh.is_secure(),
-                no_network: is_nonetwork,
-            };
-            let mut conn = LiveConn::new(live_scheme, host.clone(), port);
-            // Map the handle's `CURLOPT_IPRESOLVE` onto the resolver's family
-            // preference (the discriminants match curl's `CURL_IPRESOLVE_*`).
-            conn.ip_version = match self.set.ipver {
-                IpResolve::V4 => IpVersion::V4,
-                IpResolve::V6 => IpVersion::V6,
-                IpResolve::Whatever => IpVersion::Whatever,
-            };
-
-            // --- 3b. Thread the handle's TLS posture + ALPN into the connection
-            // for secure schemes (F10-TLS-01/02/03; ← curl's `ssl_config`
-            // propagation in `create_conn`/`cf-ssl`). Without this the
-            // connection always used the hardcoded default-secure config with no
-            // ALPN, so `--insecure`, `--cacert`/`--capath`, and HTTP/2-over-TLS
-            // negotiation were all inert. A cleartext scheme keeps the default
-            // (its `ssl_config` is never consulted). ---
-            if psh.is_secure() {
-                let s = &self.set.ssl;
-                let mut tls = crate::tls::TlsConfig::new()
-                    .with_verify_peer(s.verify_peer)
-                    // `CURLOPT_SSL_VERIFYHOST` is the integer `2` when enabled; any
-                    // non-zero value means "verify" (curl treats `1` as `2`).
-                    .with_verify_host(s.verify_host != 0)
-                    .with_verify_status(s.verify_status)
-                    // The curl tool already emitted the `--insecure` warning at the
-                    // CLI layer (honoring `-s`); the library engine must not print a
-                    // second, silent-mode-ignoring copy.
-                    .with_insecure_warning(false)
-                    // Offer ALPN derived from the effective HTTP-version preference
-                    // so HTTPS handshakes advertise `h2, http/1.1` (curl wire parity).
-                    .with_alpn(alpn_offer_for_httpwant(self.set.httpwant));
-                // Custom trust anchors (`--cacert` / `--capath`) when supplied.
-                if let Some(ca) = &s.ca_info {
-                    tls = tls.with_ca_info(ca.clone());
-                }
-                if let Some(cap) = &s.ca_path {
-                    tls = tls.with_ca_path(cap.clone());
-                }
-                conn.ssl_config = Arc::new(tls);
-                conn.bits.tls_enable_alpn = true;
-            }
-
-            // --- 4. Resolve + connect the filter chain (network schemes only). ---
-            if !is_nonetwork {
-                // A per-transfer DNS cache seeds the resolve; a shared handle would
-                // consult its shared cache, but a single serial transfer needs only
-                // a fresh one (localhost / IP literals resolve without the network).
-                let cache = DnsCache::new();
-                // `--resolve` / `CURLOPT_RESOLVE`: pre-populate this hop's cache so a
-                // named `host:port` short-circuits real resolution to the supplied
-                // address (← curl seeds `data->dns.hostcache` via
-                // `Curl_loadhostpairs` before `Curl_resolv`). Applied every hop so a
-                // redirect target listed in `--resolve` is honored too; a malformed
-                // entry surfaces curl's `CURLE_SETOPT_OPTION_SYNTAX`.
-                if !self.set.resolve.is_empty() {
-                    crate::dns::load_host_pairs(&cache, &self.set.resolve)?;
-                }
-                let resolver = SystemResolver::new();
-                let opts = ResolveOptions::new(&resolver);
-                let dns = resolve(&cache, &host, port, conn.ip_version, false, &opts).await?;
-                // Name resolution complete (← `data->progress.t_nslookup`).
-                t_namelookup_us = t_start.elapsed().as_micros() as i64;
-                // Record the connected remote address for the `-v`/`--trace` `* Trying …` /
-                // `* Connected to …` text lines (curl's `Curl_verboseconnect`).
-                if trace_on {
-                    peer_ip = dns.endpoints().first().map(|sa| sa.ip().to_string());
-                    if let Some(ip) = &peer_ip {
+                // --- 2b. HSTS upgrade (← curl's `Curl_hsts` check in `create_conn`).
+                // When the scheme is cleartext `http` and the host is a known HSTS
+                // host, upgrade this hop to `https` before any connection is made —
+                // this is the read side of the HSTS cache that complements the
+                // `Strict-Transport-Security:` capture below. curl keeps an explicit
+                // port (or a `CURLOPT_PORT`/`--port` override) and promotes only the
+                // default http port (80) to the https default (443); the scheme,
+                // scheme handlers, port, and effective URL are all rewritten so the
+                // TLS filter is selected and `%{url_effective}` reports the https
+                // URL. A `* Switched from HTTP to HTTPS due to HSTS => …` note is
+                // emitted under `-v`/`--trace`, mirroring curl's `infof`. All later
+                // per-hop logic (connection build, TLS posture, request line, cookie
+                // scoping, Alt-Svc source ALPN) then observes the upgraded values. ---
+                let (scheme_lc, ident, psh, handler, port, effective_url) = if scheme_lc == "http"
+                    && self.state.hsts.as_ref().is_some_and(|h| h.is_hsts(&host))
+                {
+                    let up_ident = get_scheme_handler("https")
+                        .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
+                    let up_psh = scheme_handler("https")
+                        .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
+                    let up_handler = up_psh
+                        .handler
+                        .ok_or_else(|| Error::from(CurlCode::UnsupportedProtocol))?;
+                    // An explicit URL port or a `--port` override is preserved; a
+                    // bare `http://host` (default port 80) becomes the https default.
+                    let explicit_port = self.set.use_port != 0
+                        || self
+                            .url_get_part(CurlUPart::Port, 0, urlapi::UrlCode::NoPort)?
+                            .is_some();
+                    let up_port = if explicit_port {
+                        port
+                    } else {
+                        up_ident.default_port
+                    };
+                    // Swap the effective URL's leading `http://` → `https://` for
+                    // `%{url_effective}` and the upgrade trace line.
+                    let up_url = match effective_url.strip_prefix("http://") {
+                        Some(rest) => format!("https://{rest}"),
+                        None => effective_url.clone(),
+                    };
+                    if trace_on {
                         trace_records.push((
                             DebugInfoType::Text,
-                            format!("  Trying {ip}:{port}...\n").into_bytes(),
+                            format!("Switched from HTTP to HTTPS due to HSTS => {up_url}\n")
+                                .into_bytes(),
+                        ));
+                    }
+                    (
+                        "https".to_string(),
+                        up_ident,
+                        up_psh,
+                        up_handler,
+                        up_port,
+                        up_url,
+                    )
+                } else {
+                    (scheme_lc, ident, psh, handler, port, effective_url)
+                };
+
+                // Build this hop's request from the caller's template, stamping the
+                // URL-derived fields and the (possibly switched) method/body.
+                let mut request = base_request.clone();
+                request.scheme = scheme_lc.clone();
+                request.host = host.clone();
+                request.port = port;
+                // Keep this hop's path for cookie storage after `request` is consumed
+                // by the DO phase (the `Set-Cookie:` capture needs the request path).
+                // Only needed when the `cookies` feature compiles the capture block.
+                #[cfg(feature = "cookies")]
+                let cookie_path = path.clone();
+                request.path = path;
+                request.query = query;
+                if !effective_url.is_empty() {
+                    request.url = effective_url;
+                }
+                request.method = method.clone();
+                request.body = body.clone();
+
+                // Cross-origin credential strip (← `Curl_http_follow` +
+                // `Curl_auth_allowed_to_host`). The first hop records the credential
+                // origin; any later hop whose (scheme, host, port) differs drops the
+                // Basic credentials and any caller-supplied `Authorization:`/`Cookie:`
+                // header so they never leak to a foreign host. The decision latches:
+                // once a foreign origin is reached the credentials stay stripped for
+                // every remaining hop. `--location-trusted` disables the strip.
+                if !unrestricted_auth {
+                    let this_origin = (scheme_lc.clone(), host.clone(), port);
+                    match &cred_origin {
+                        None => cred_origin = Some(this_origin),
+                        Some(origin) => {
+                            if *origin != this_origin {
+                                cred_user = None;
+                                cred_password = None;
+                                strip_sensitive_headers = true;
+                            }
+                        }
+                    }
+                }
+                // Working credentials for this hop: the (possibly cross-origin-stripped)
+                // `--user` credentials by default.
+                let mut hop_user = cred_user.clone();
+                let mut hop_password = cred_password.clone();
+
+                // `.netrc` credential source (← curl's `override_login`, run per
+                // connection): when `--netrc`/`--netrc-optional` is active and no
+                // `--user` was supplied, look up THIS hop's host in the `.netrc` file.
+                // A match supplies the credentials for this hop. Because the lookup is
+                // per-host, netrc credentials are naturally scoped to each host in a
+                // redirect chain (curl's `conn->bits.netrc`) rather than being carried
+                // forward and stripped like `--user` credentials, so a redirect to a
+                // different machine listed in `.netrc` picks up that machine's login.
+                // `--netrc` (required) treats a hard file error as fatal
+                // (`CURLE_READ_ERROR`); `--netrc-optional` and a plain "no match" fall
+                // back to sending no credentials, exactly as curl does.
+                if self.set.use_netrc != NetrcLevel::Ignored && base_request.user.is_none() {
+                    let netrcfile = self.set.netrc_file.clone();
+                    match self.state.netrc.parse(&host, None, netrcfile.as_deref()) {
+                        Ok(creds) => {
+                            if creds.login.is_some() || creds.password.is_some() {
+                                // A password but no login uses a blank user (curl's
+                                // `strdup("")`), so Basic auth still forms `:password`.
+                                hop_user = creds
+                                    .login
+                                    .or_else(|| creds.password.as_ref().map(|_| String::new()));
+                                hop_password = creds.password;
+                            }
+                        }
+                        Err(NetrcCode::NoMatch) => {}
+                        Err(_) if self.set.use_netrc == NetrcLevel::Optional => {}
+                        Err(_) => {
+                            break Err(Error::with_context(CurlCode::ReadError, ".netrc error"));
+                        }
+                    }
+                }
+
+                // Use the working credentials for this hop and, once a foreign origin
+                // has been reached, drop sensitive caller-supplied headers so
+                // `Authorization:`/`Cookie:` are not forwarded cross-host.
+                request.user = hop_user;
+                request.password = hop_password;
+                if strip_sensitive_headers {
+                    request.headers.retain(|line| {
+                        let name = line.split(':').next().unwrap_or("").trim();
+                        !name.eq_ignore_ascii_case("Authorization")
+                            && !name.eq_ignore_ascii_case("Cookie")
+                    });
+                }
+
+                // --- 2b. Outgoing `Cookie:` header (← curl's `Curl_cookie_getlist`
+                // joined with the inline `CURLOPT_COOKIE` string). The inline cookie
+                // string set via `-b name=value` mirrors libcurl's `CURLOPT_COOKIE`:
+                // it is emitted verbatim on every hop of the transfer, including
+                // cross-host redirects. It is deliberately NOT one of the
+                // caller-supplied headers subject to the cross-origin strip above —
+                // curl only strips an explicit `-H 'Cookie: …'` header cross-host
+                // (verified against curl 8.x), while the `CURLOPT_COOKIE` string
+                // persists. Jar cookies are always domain/path/scheme-scoped by
+                // `cookie_header`, so they too are safe to emit on every hop. The
+                // synthesized header is added only when the caller has no surviving
+                // `Cookie:` header of their own (an explicit `-H 'Cookie: …'` wins,
+                // and the cross-host strip above has already removed a foreign one).
+                // Compiled only with the `cookies` feature — curl's
+                // `CURL_DISABLE_COOKIES` removes the whole engine, `CURLOPT_COOKIE`
+                // (inline `-b`) included, so no `Cookie:` header is synthesized. ---
+                #[cfg(feature = "cookies")]
+                {
+                    let mut cookie_parts: Vec<String> = Vec::new();
+                    if let Some(inline) = self.set.cookie.as_deref().filter(|s| !s.is_empty()) {
+                        cookie_parts.push(inline.to_string());
+                    }
+                    if let Some(jar) = self.state.cookies.as_mut() {
+                        if let Some(h) = jar.cookie_header(&host, &request.path, psh.is_secure()) {
+                            cookie_parts.push(h);
+                        }
+                    }
+                    let has_manual_cookie = request.headers.iter().any(|line| {
+                        line.split(':')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .eq_ignore_ascii_case("Cookie")
+                    });
+                    if !cookie_parts.is_empty() && !has_manual_cookie {
+                        request
+                            .headers
+                            .push(format!("Cookie: {}", cookie_parts.join("; ")));
+                    }
+                }
+
+                // --- 3. Build the live connection. ---
+                let is_nonetwork = ident.is_nonetwork();
+                let live_scheme = LiveScheme {
+                    name: scheme_lc.clone(),
+                    default_port: ident.default_port,
+                    is_ssl: psh.is_secure(),
+                    no_network: is_nonetwork,
+                };
+                let mut conn = LiveConn::new(live_scheme, host.clone(), port);
+                // Map the handle's `CURLOPT_IPRESOLVE` onto the resolver's family
+                // preference (the discriminants match curl's `CURL_IPRESOLVE_*`).
+                conn.ip_version = match self.set.ipver {
+                    IpResolve::V4 => IpVersion::V4,
+                    IpResolve::V6 => IpVersion::V6,
+                    IpResolve::Whatever => IpVersion::Whatever,
+                };
+
+                // --- 3b. Thread the handle's TLS posture + ALPN into the connection
+                // for secure schemes (F10-TLS-01/02/03; ← curl's `ssl_config`
+                // propagation in `create_conn`/`cf-ssl`). Without this the
+                // connection always used the hardcoded default-secure config with no
+                // ALPN, so `--insecure`, `--cacert`/`--capath`, and HTTP/2-over-TLS
+                // negotiation were all inert. A cleartext scheme keeps the default
+                // (its `ssl_config` is never consulted). ---
+                if psh.is_secure() {
+                    let s = &self.set.ssl;
+                    let mut tls = crate::tls::TlsConfig::new()
+                        .with_verify_peer(s.verify_peer)
+                        // `CURLOPT_SSL_VERIFYHOST` is the integer `2` when enabled; any
+                        // non-zero value means "verify" (curl treats `1` as `2`).
+                        .with_verify_host(s.verify_host != 0)
+                        .with_verify_status(s.verify_status)
+                        // The curl tool already emitted the `--insecure` warning at the
+                        // CLI layer (honoring `-s`); the library engine must not print a
+                        // second, silent-mode-ignoring copy.
+                        .with_insecure_warning(false)
+                        // Offer ALPN derived from the effective HTTP-version preference
+                        // so HTTPS handshakes advertise `h2, http/1.1` (curl wire parity).
+                        .with_alpn(alpn_offer_for_httpwant(self.set.httpwant));
+                    // Custom trust anchors (`--cacert` / `--capath`) when supplied.
+                    if let Some(ca) = &s.ca_info {
+                        tls = tls.with_ca_info(ca.clone());
+                    }
+                    if let Some(cap) = &s.ca_path {
+                        tls = tls.with_ca_path(cap.clone());
+                    }
+                    conn.ssl_config = Arc::new(tls);
+                    conn.bits.tls_enable_alpn = true;
+                }
+
+                // --- 4. Resolve + connect the filter chain (network schemes only). ---
+                if !is_nonetwork {
+                    // A per-transfer DNS cache seeds the resolve; a shared handle would
+                    // consult its shared cache, but a single serial transfer needs only
+                    // a fresh one (localhost / IP literals resolve without the network).
+                    let cache = DnsCache::new();
+                    // `--resolve` / `CURLOPT_RESOLVE`: pre-populate this hop's cache so a
+                    // named `host:port` short-circuits real resolution to the supplied
+                    // address (← curl seeds `data->dns.hostcache` via
+                    // `Curl_loadhostpairs` before `Curl_resolv`). Applied every hop so a
+                    // redirect target listed in `--resolve` is honored too; a malformed
+                    // entry surfaces curl's `CURLE_SETOPT_OPTION_SYNTAX`.
+                    if !self.set.resolve.is_empty() {
+                        crate::dns::load_host_pairs(&cache, &self.set.resolve)?;
+                    }
+                    let resolver = SystemResolver::new();
+                    let opts = ResolveOptions::new(&resolver);
+                    let dns = resolve(&cache, &host, port, conn.ip_version, false, &opts).await?;
+                    // Name resolution complete (← `data->progress.t_nslookup`).
+                    t_namelookup_us = t_start.elapsed().as_micros() as i64;
+                    // Record the connected remote address for the `-v`/`--trace` `* Trying …` /
+                    // `* Connected to …` text lines (curl's `Curl_verboseconnect`).
+                    if trace_on {
+                        peer_ip = dns.endpoints().first().map(|sa| sa.ip().to_string());
+                        if let Some(ip) = &peer_ip {
+                            trace_records.push((
+                                DebugInfoType::Text,
+                                format!("  Trying {ip}:{port}...\n").into_bytes(),
+                            ));
+                        }
+                    }
+
+                    // Build the default `SETUP` filter stack (TCP → [proxy] → [TLS] →
+                    // happy-eyeballs) and drive it to connected. `CURL_CF_SSL_DEFAULT`
+                    // lets the scheme decide TLS (on for `https`/`ftps`/…, off for
+                    // cleartext), matching curl's `ssl_mode` default.
+                    conn_setup(&mut conn, FIRSTSOCKET, dns, CURL_CF_SSL_DEFAULT).await?;
+                    let connect_ms = request
+                        .connect_timeout
+                        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                        .unwrap_or(0);
+                    connect_with_timeout(&mut conn, FIRSTSOCKET, connect_ms).await?;
+                    // Connection established (← `data->progress.t_connect`). The filter
+                    // chain drives TCP and, for a secure scheme, the TLS handshake in one
+                    // step here, so the app-connect timer (TLS-handshake-complete,
+                    // `data->progress.t_appconnect`) coincides with connect for a secure
+                    // transfer and stays `0` for a cleartext one — matching curl, which
+                    // reports `t_appconnect == 0` for a non-TLS connection.
+                    t_connect_us = t_start.elapsed().as_micros() as i64;
+                    if psh.is_secure() {
+                        t_appconnect_us = t_connect_us;
+                    }
+                    // `* Connected to <host> (<ip>) port <port>` (curl's `Curl_verboseconnect`).
+                    if trace_on {
+                        let ip = peer_ip.as_deref().unwrap_or(host.as_str());
+                        trace_records.push((
+                            DebugInfoType::Text,
+                            format!("Connected to {host} ({ip}) port {port}\n").into_bytes(),
                         ));
                     }
                 }
 
-                // Build the default `SETUP` filter stack (TCP → [proxy] → [TLS] →
-                // happy-eyeballs) and drive it to connected. `CURL_CF_SSL_DEFAULT`
-                // lets the scheme decide TLS (on for `https`/`ftps`/…, off for
-                // cleartext), matching curl's `ssl_mode` default.
-                conn_setup(&mut conn, FIRSTSOCKET, dns, CURL_CF_SSL_DEFAULT).await?;
-                let connect_ms = request
-                    .connect_timeout
-                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-                    .unwrap_or(0);
-                connect_with_timeout(&mut conn, FIRSTSOCKET, connect_ms).await?;
-                // Connection established (← `data->progress.t_connect`). The filter
-                // chain drives TCP and, for a secure scheme, the TLS handshake in one
-                // step here, so the app-connect timer (TLS-handshake-complete,
-                // `data->progress.t_appconnect`) coincides with connect for a secure
-                // transfer and stays `0` for a cleartext one — matching curl, which
-                // reports `t_appconnect == 0` for a non-TLS connection.
-                t_connect_us = t_start.elapsed().as_micros() as i64;
-                if psh.is_secure() {
-                    t_appconnect_us = t_connect_us;
-                }
-                // `* Connected to <host> (<ip>) port <port>` (curl's `Curl_verboseconnect`).
+                // Bytes actually sent as the request body (`-d`/`-T` payload), recorded for
+                // `CURLINFO_SIZE_UPLOAD_T` once the transfer completes.
+                let upload_bytes = request.body.as_ref().map_or(0, |b| b.len() as i64);
+
+                // `-v`/`--trace` request-side records, built from `request` before it is moved into the
+                // transfer context. For HTTP(S) the sent request head is rendered by the handler's own
+                // assembler (so the `> ` block matches the wire, `Authorization` included); the request
+                // body, if any, is the `} ` (DATA_OUT) payload.
                 if trace_on {
-                    let ip = peer_ip.as_deref().unwrap_or(host.as_str());
-                    trace_records.push((
-                        DebugInfoType::Text,
-                        format!("Connected to {host} ({ip}) port {port}\n").into_bytes(),
-                    ));
-                }
-            }
-
-            // Bytes actually sent as the request body (`-d`/`-T` payload), recorded for
-            // `CURLINFO_SIZE_UPLOAD_T` once the transfer completes.
-            let upload_bytes = request.body.as_ref().map_or(0, |b| b.len() as i64);
-
-            // `-v`/`--trace` request-side records, built from `request` before it is moved into the
-            // transfer context. For HTTP(S) the sent request head is rendered by the handler's own
-            // assembler (so the `> ` block matches the wire, `Authorization` included); the request
-            // body, if any, is the `} ` (DATA_OUT) payload.
-            if trace_on {
-                // The HTTP(S) request-head assembler lives in `protocols::http`, which is
-                // compiled only under the `http` feature. Gate the call so `--no-default-features`
-                // (and any build without `http`) still compiles; without the HTTP handler there is
-                // no `http`/`https` transfer and hence no request head to render here.
-                #[cfg(feature = "http")]
-                {
-                    if matches!(scheme_lc.as_str(), "http" | "https") {
-                        let head = crate::protocols::http::trace_request_head_bytes(&request);
-                        if !head.is_empty() {
-                            trace_records.push((DebugInfoType::HeaderOut, head));
+                    // The HTTP(S) request-head assembler lives in `protocols::http`, which is
+                    // compiled only under the `http` feature. Gate the call so `--no-default-features`
+                    // (and any build without `http`) still compiles; without the HTTP handler there is
+                    // no `http`/`https` transfer and hence no request head to render here.
+                    #[cfg(feature = "http")]
+                    {
+                        if matches!(scheme_lc.as_str(), "http" | "https") {
+                            let head = crate::protocols::http::trace_request_head_bytes(&request);
+                            if !head.is_empty() {
+                                trace_records.push((DebugInfoType::HeaderOut, head));
+                            }
+                        }
+                    }
+                    if let Some(b) = request.body.as_ref() {
+                        if !b.is_empty() {
+                            trace_records.push((DebugInfoType::DataOut, b.clone()));
                         }
                     }
                 }
-                if let Some(b) = request.body.as_ref() {
-                    if !b.is_empty() {
-                        trace_records.push((DebugInfoType::DataOut, b.clone()));
-                    }
+
+                // --- 5. Drive the protocol exchange over the live connection. ---
+                let mut ctx = TransferCtx::new();
+                ctx.request = request;
+                ctx.conn = Some(Box::new(conn));
+                // Choose this hop's sink. When following redirects the terminal hop
+                // is not yet known, so buffer the body: a followed `3xx` body is
+                // discarded and the final body is flushed to the client sink after
+                // the loop. When not following, wrap the client sink so every
+                // delivered byte is counted for `CURLINFO_SIZE_DOWNLOAD_T` and, when
+                // tracing, copied for the `{ ` (DATA_IN) dump — the unchanged
+                // single-transfer path (direct streaming, no buffering).
+                let iter_buffer: Option<Arc<std::sync::Mutex<Vec<u8>>>>;
+                if follow_enabled {
+                    let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    iter_buffer = Some(Arc::clone(&buf));
+                    ctx.sink = Some(Box::new(BufferSink { buf }));
+                } else {
+                    iter_buffer = None;
+                    let real = client_sink
+                        .take()
+                        .expect("client sink present for a non-redirected transfer");
+                    ctx.sink = Some(Box::new(CountingSink {
+                        inner: real,
+                        counter: Arc::clone(&downloaded),
+                        capture: body_capture.as_ref().map(Arc::clone),
+                    }));
                 }
-            }
 
-            // --- 5. Drive the protocol exchange over the live connection. ---
-            let mut ctx = TransferCtx::new();
-            ctx.request = request;
-            ctx.conn = Some(Box::new(conn));
-            // Choose this hop's sink. When following redirects the terminal hop
-            // is not yet known, so buffer the body: a followed `3xx` body is
-            // discarded and the final body is flushed to the client sink after
-            // the loop. When not following, wrap the client sink so every
-            // delivered byte is counted for `CURLINFO_SIZE_DOWNLOAD_T` and, when
-            // tracing, copied for the `{ ` (DATA_IN) dump — the unchanged
-            // single-transfer path (direct streaming, no buffering).
-            let iter_buffer: Option<Arc<std::sync::Mutex<Vec<u8>>>>;
-            if follow_enabled {
-                let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-                iter_buffer = Some(Arc::clone(&buf));
-                ctx.sink = Some(Box::new(BufferSink { buf }));
-            } else {
-                iter_buffer = None;
-                let real = client_sink
-                    .take()
-                    .expect("client sink present for a non-redirected transfer");
-                ctx.sink = Some(Box::new(CountingSink {
-                    inner: real,
-                    counter: Arc::clone(&downloaded),
-                    capture: body_capture.as_ref().map(Arc::clone),
-                }));
-            }
+                // Handler lifecycle (← `multi_runsingle`): SETUP → CONNECT → CONNECTING →
+                // DO → DONE. The default `connect`/`connecting` report "ready" in one
+                // step (the filter chain already connected the socket above); a protocol
+                // that needs extra round-trips (e.g. a pingpong greeting) drives them
+                // here, yielding between non-ready polls.
+                handler.setup_connection(&mut ctx).await?;
+                while !handler.connect(&mut ctx).await? {
+                    tokio::task::yield_now().await;
+                }
+                while !handler.connecting(&mut ctx).await? {
+                    tokio::task::yield_now().await;
+                }
 
-            // Handler lifecycle (← `multi_runsingle`): SETUP → CONNECT → CONNECTING →
-            // DO → DONE. The default `connect`/`connecting` report "ready" in one
-            // step (the filter chain already connected the socket above); a protocol
-            // that needs extra round-trips (e.g. a pingpong greeting) drives them
-            // here, yielding between non-ready polls.
-            handler.setup_connection(&mut ctx).await?;
-            while !handler.connect(&mut ctx).await? {
-                tokio::task::yield_now().await;
-            }
-            while !handler.connecting(&mut ctx).await? {
-                tokio::task::yield_now().await;
-            }
+                // All connection setup (transport + protocol handshake) is complete and
+                // the request is about to be sent (← `data->progress.t_pretransfer`).
+                let t_pretransfer_us = t_start.elapsed().as_micros() as i64;
 
-            // All connection setup (transport + protocol handshake) is complete and
-            // the request is about to be sent (← `data->progress.t_pretransfer`).
-            let t_pretransfer_us = t_start.elapsed().as_micros() as i64;
+                // DO phase (send the request, read the response, stream the body to the
+                // sink, record diagnostics). The DONE phase runs unconditionally with the
+                // DO status forwarded so the handler can clean up on both paths (curl's
+                // `Curl_done(..., status, premature)`), then the original DO result is
+                // propagated (preserving its full error context).
+                let do_res = handler.do_it(&mut ctx).await;
+                // The response has been received (← `data->progress.t_starttransfer`).
+                let t_starttransfer_us = t_start.elapsed().as_micros() as i64;
+                let premature = do_res.is_err();
+                let status_for_done: Result<()> = match &do_res {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(Error::from(e.code())),
+                };
+                handler.done(&mut ctx, status_for_done, premature).await?;
 
-            // DO phase (send the request, read the response, stream the body to the
-            // sink, record diagnostics). The DONE phase runs unconditionally with the
-            // DO status forwarded so the handler can clean up on both paths (curl's
-            // `Curl_done(..., status, premature)`), then the original DO result is
-            // propagated (preserving its full error context).
-            let do_res = handler.do_it(&mut ctx).await;
-            // The response has been received (← `data->progress.t_starttransfer`).
-            let t_starttransfer_us = t_start.elapsed().as_micros() as i64;
-            let premature = do_res.is_err();
-            let status_for_done: Result<()> = match &do_res {
-                Ok(_) => Ok(()),
-                Err(e) => Err(Error::from(e.code())),
-            };
-            handler.done(&mut ctx, status_for_done, premature).await?;
+                // --- 6. Reconcile response diagnostics into the handle. ---
+                self.info = std::mem::take(&mut ctx.info);
+                // Stamp the connection scheme (`info.conn_scheme`, ← `create_conn`);
+                // the CLI retry classifier and `CURLINFO_SCHEME` read it.
+                self.info.conn_scheme = Some(scheme_lc.clone());
+                self.info.size_upload = upload_bytes;
+                // Record this hop's phase timers (microseconds from `t_start`) for
+                // the `CURLINFO_*_TIME_T` getinfo variants and `--write-out
+                // %{time_*}`/`%{speed_*}`. Set after the `info` move so they are not
+                // overwritten; on a redirect chain the final hop's values persist,
+                // matching curl, which reports the last request's phase times.
+                self.info.namelookup_time_us = t_namelookup_us;
+                self.info.connect_time_us = t_connect_us;
+                self.info.appconnect_time_us = t_appconnect_us;
+                self.info.pretransfer_time_us = t_pretransfer_us;
+                self.info.starttransfer_time_us = t_starttransfer_us;
 
-            // --- 6. Reconcile response diagnostics into the handle. ---
-            self.info = std::mem::take(&mut ctx.info);
-            // Stamp the connection scheme (`info.conn_scheme`, ← `create_conn`);
-            // the CLI retry classifier and `CURLINFO_SCHEME` read it.
-            self.info.conn_scheme = Some(scheme_lc.clone());
-            self.info.size_upload = upload_bytes;
-            // Record this hop's phase timers (microseconds from `t_start`) for
-            // the `CURLINFO_*_TIME_T` getinfo variants and `--write-out
-            // %{time_*}`/`%{speed_*}`. Set after the `info` move so they are not
-            // overwritten; on a redirect chain the final hop's values persist,
-            // matching curl, which reports the last request's phase times.
-            self.info.namelookup_time_us = t_namelookup_us;
-            self.info.connect_time_us = t_connect_us;
-            self.info.appconnect_time_us = t_appconnect_us;
-            self.info.pretransfer_time_us = t_pretransfer_us;
-            self.info.starttransfer_time_us = t_starttransfer_us;
-
-            // --- 6b. Ingest this hop's `Set-Cookie:` response headers into the
-            // jar (← curl's `Curl_cookie_add` invoked per `Set-Cookie:` during
-            // the header callback). The headers are collected first so the
-            // immutable `info` borrow is released before the jar is mutated. Each
-            // cookie is stored against THIS hop's host/path/scheme, so a later
-            // hop (and a `-c` save) sees it with the correct domain scoping. A
-            // cookie the jar rejects (bad domain, supercookie, …) is dropped
-            // silently, exactly as curl does. Compiled only with the `cookies`
-            // feature (curl's `CURL_DISABLE_COOKIES` removes the engine). ---
-            #[cfg(feature = "cookies")]
-            if self.state.cookies.is_some() {
-                let set_cookies: Vec<String> = self
-                    .info
-                    .resp_headers
-                    .iter()
-                    .filter(|(name, _)| name.eq_ignore_ascii_case("Set-Cookie"))
-                    .map(|(_, value)| value.clone())
-                    .collect();
-                if !set_cookies.is_empty() {
-                    let is_tls = psh.is_secure();
-                    if let Some(jar) = self.state.cookies.as_mut() {
-                        for line in &set_cookies {
-                            let _ =
-                                jar.add(true, false, line, Some(&host), Some(&cookie_path), is_tls);
+                // --- 6b. Ingest this hop's `Set-Cookie:` response headers into the
+                // jar (← curl's `Curl_cookie_add` invoked per `Set-Cookie:` during
+                // the header callback). The headers are collected first so the
+                // immutable `info` borrow is released before the jar is mutated. Each
+                // cookie is stored against THIS hop's host/path/scheme, so a later
+                // hop (and a `-c` save) sees it with the correct domain scoping. A
+                // cookie the jar rejects (bad domain, supercookie, …) is dropped
+                // silently, exactly as curl does. Compiled only with the `cookies`
+                // feature (curl's `CURL_DISABLE_COOKIES` removes the engine). ---
+                #[cfg(feature = "cookies")]
+                if self.state.cookies.is_some() {
+                    let set_cookies: Vec<String> = self
+                        .info
+                        .resp_headers
+                        .iter()
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("Set-Cookie"))
+                        .map(|(_, value)| value.clone())
+                        .collect();
+                    if !set_cookies.is_empty() {
+                        let is_tls = psh.is_secure();
+                        if let Some(jar) = self.state.cookies.as_mut() {
+                            for line in &set_cookies {
+                                let _ = jar.add(
+                                    true,
+                                    false,
+                                    line,
+                                    Some(&host),
+                                    Some(&cookie_path),
+                                    is_tls,
+                                );
+                            }
                         }
                     }
                 }
-            }
 
-            // --- 6c. Ingest this hop's `Strict-Transport-Security:` response
-            // header into the HSTS cache (← curl's `Curl_hsts_parse`, invoked
-            // from the header callback). Values are collected first so the
-            // immutable `info` borrow is released before the cache is mutated.
-            // The parser stores the entry against THIS hop's host, ignores an
-            // IP-literal host (RFC 6797 §8.3), and rejects a malformed header
-            // without failing the transfer — exactly as curl does. ---
-            if self.state.hsts.is_some() {
-                let sts_values: Vec<String> = self
-                    .info
-                    .resp_headers
-                    .iter()
-                    .filter(|(name, _)| name.eq_ignore_ascii_case("Strict-Transport-Security"))
-                    .map(|(_, value)| value.clone())
-                    .collect();
-                if let Some(hsts) = self.state.hsts.as_mut() {
-                    for value in &sts_values {
-                        let _ = hsts.parse(&host, value);
-                    }
-                }
-            }
-
-            // --- 6d. Ingest this hop's `Alt-Svc:` response header into the
-            // Alt-Svc cache (← curl's `Curl_altsvc_parse`). The source ALPN is
-            // the HTTP version negotiated on this connection
-            // (← `Curl_conn_get_alpn_id`): `h2`/`h3` map directly and everything
-            // else (HTTP/1.x, or a torn-down/unknown connection) is recorded as
-            // `h1`, matching curl for a completed HTTP/1.1 exchange. `srchost`/
-            // `srcport` are this hop's origin. Invalid alternatives are rejected
-            // individually without failing the header or the transfer. ---
-            if self.state.altsvc.is_some() {
-                let altsvc_values: Vec<String> = self
-                    .info
-                    .resp_headers
-                    .iter()
-                    .filter(|(name, _)| name.eq_ignore_ascii_case("Alt-Svc"))
-                    .map(|(_, value)| value.clone())
-                    .collect();
-                if !altsvc_values.is_empty() {
-                    let src_alpn = match ctx.conn.as_ref().map_or(0, |c| c.http_version()) {
-                        20 => crate::altsvc::AlpnId::H2,
-                        30 => crate::altsvc::AlpnId::H3,
-                        _ => crate::altsvc::AlpnId::H1,
-                    };
-                    if let Some(altsvc) = self.state.altsvc.as_mut() {
-                        for value in &altsvc_values {
-                            let _ = altsvc.parse(value, src_alpn, &host, port);
+                // --- 6c. Ingest this hop's `Strict-Transport-Security:` response
+                // header into the HSTS cache (← curl's `Curl_hsts_parse`, invoked
+                // from the header callback). Values are collected first so the
+                // immutable `info` borrow is released before the cache is mutated.
+                // The parser stores the entry against THIS hop's host, ignores an
+                // IP-literal host (RFC 6797 §8.3), and rejects a malformed header
+                // without failing the transfer — exactly as curl does. ---
+                if self.state.hsts.is_some() {
+                    let sts_values: Vec<String> = self
+                        .info
+                        .resp_headers
+                        .iter()
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("Strict-Transport-Security"))
+                        .map(|(_, value)| value.clone())
+                        .collect();
+                    if let Some(hsts) = self.state.hsts.as_mut() {
+                        for value in &sts_values {
+                            let _ = hsts.parse(&host, value);
                         }
                     }
                 }
-            }
 
-            // Response-head trace for this hop (one `< ` line per header),
-            // recorded for every hop so a redirect chain shows each response.
-            if trace_on {
-                push_response_head_trace(&mut trace_records, &self.info, &scheme_lc);
-            }
-
-            // --- 7. Redirect decision. Follow only a real `3xx` carrying a
-            // `Location:` and only when the DO phase itself succeeded (a
-            // transport error is surfaced, never chased). ---
-            let redirect_target = if follow_enabled && do_res.is_ok() {
-                redirect_location(&self.info)
-            } else {
-                None
-            };
-
-            if let Some(location) = redirect_target {
-                // Intermediate redirect: its buffered body is discarded (curl
-                // suppresses the redirect body). Advance the URL, enforce
-                // `CURLOPT_MAXREDIRS`, strip cross-origin credentials, and switch
-                // the method per RFC 7231 — all via the existing `follow`.
-                let prev = self.state.httpreq;
-                if let Err(e) = self.follow(&location, FollowType::Redir) {
-                    // Redirect limit exceeded (`CURLE_TOO_MANY_REDIRECTS`) or an
-                    // unparsable target: surface it, finalizing diagnostics below.
-                    break Err(e);
-                }
-                // Propagate a POST/other → GET switch onto the working request
-                // (`follow` applied it to `state.httpreq`); a bodiless GET drops
-                // the request body. A 307/308 leaves the method untouched.
-                if self.state.httpreq == HttpReq::Get && prev != HttpReq::Get {
-                    method = "GET".to_string();
-                    body = None;
-                }
-                // The buffered redirect body is intentionally dropped here.
-                drop(iter_buffer);
-                continue;
-            }
-
-            // --- Final response. Flush a buffered body to the client sink and
-            // account it for `CURLINFO_SIZE_DOWNLOAD_T`. (The non-following path
-            // already streamed directly through `CountingSink`.) ---
-            if let Some(buf) = iter_buffer {
-                let bytes = buf.lock().map(|b| b.clone()).unwrap_or_default();
-                downloaded.store(bytes.len() as i64, std::sync::atomic::Ordering::SeqCst);
-                if let Some(mut real) = client_sink.take() {
-                    if !bytes.is_empty() {
-                        real.write(&bytes)?;
-                    }
-                    // `real` drops here; the transfer is complete and the sink is
-                    // never consulted again (the loop is about to break).
-                }
-                if let Some(cap) = &body_capture {
-                    if let Ok(mut c) = cap.lock() {
-                        *c = bytes;
+                // --- 6d. Ingest this hop's `Alt-Svc:` response header into the
+                // Alt-Svc cache (← curl's `Curl_altsvc_parse`). The source ALPN is
+                // the HTTP version negotiated on this connection
+                // (← `Curl_conn_get_alpn_id`): `h2`/`h3` map directly and everything
+                // else (HTTP/1.x, or a torn-down/unknown connection) is recorded as
+                // `h1`, matching curl for a completed HTTP/1.1 exchange. `srchost`/
+                // `srcport` are this hop's origin. Invalid alternatives are rejected
+                // individually without failing the header or the transfer. ---
+                if self.state.altsvc.is_some() {
+                    let altsvc_values: Vec<String> = self
+                        .info
+                        .resp_headers
+                        .iter()
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("Alt-Svc"))
+                        .map(|(_, value)| value.clone())
+                        .collect();
+                    if !altsvc_values.is_empty() {
+                        let src_alpn = match ctx.conn.as_ref().map_or(0, |c| c.http_version()) {
+                            20 => crate::altsvc::AlpnId::H2,
+                            30 => crate::altsvc::AlpnId::H3,
+                            _ => crate::altsvc::AlpnId::H1,
+                        };
+                        if let Some(altsvc) = self.state.altsvc.as_mut() {
+                            for value in &altsvc_values {
+                                let _ = altsvc.parse(value, src_alpn, &host, port);
+                            }
+                        }
                     }
                 }
-            }
-            break do_res.map(|_done| ());
+
+                // Response-head trace for this hop (one `< ` line per header),
+                // recorded for every hop so a redirect chain shows each response.
+                if trace_on {
+                    push_response_head_trace(&mut trace_records, &self.info, &scheme_lc);
+                }
+
+                // --- 7. Redirect decision. Follow only a real `3xx` carrying a
+                // `Location:` and only when the DO phase itself succeeded (a
+                // transport error is surfaced, never chased). ---
+                let redirect_target = if follow_enabled && do_res.is_ok() {
+                    redirect_location(&self.info)
+                } else {
+                    None
+                };
+
+                if let Some(location) = redirect_target {
+                    // Intermediate redirect: its buffered body is discarded (curl
+                    // suppresses the redirect body). Advance the URL, enforce
+                    // `CURLOPT_MAXREDIRS`, strip cross-origin credentials, and switch
+                    // the method per RFC 7231 — all via the existing `follow`.
+                    let prev = self.state.httpreq;
+                    if let Err(e) = self.follow(&location, FollowType::Redir) {
+                        // Redirect limit exceeded (`CURLE_TOO_MANY_REDIRECTS`) or an
+                        // unparsable target: surface it, finalizing diagnostics below.
+                        break Err(e);
+                    }
+                    // Propagate a POST/other → GET switch onto the working request
+                    // (`follow` applied it to `state.httpreq`); a bodiless GET drops
+                    // the request body. A 307/308 leaves the method untouched.
+                    if self.state.httpreq == HttpReq::Get && prev != HttpReq::Get {
+                        method = "GET".to_string();
+                        body = None;
+                    }
+                    // The buffered redirect body is intentionally dropped here.
+                    drop(iter_buffer);
+                    continue;
+                }
+
+                // --- Final response. Flush a buffered body to the client sink and
+                // account it for `CURLINFO_SIZE_DOWNLOAD_T`. (The non-following path
+                // already streamed directly through `CountingSink`.) ---
+                if let Some(buf) = iter_buffer {
+                    let bytes = buf.lock().map(|b| b.clone()).unwrap_or_default();
+                    downloaded.store(bytes.len() as i64, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(mut real) = client_sink.take() {
+                        if !bytes.is_empty() {
+                            real.write(&bytes)?;
+                        }
+                        // `real` drops here; the transfer is complete and the sink is
+                        // never consulted again (the loop is about to break).
+                    }
+                    if let Some(cap) = &body_capture {
+                        if let Ok(mut c) = cap.lock() {
+                            *c = bytes;
+                        }
+                    }
+                }
+                break do_res.map(|_done| ());
             }
         };
 
