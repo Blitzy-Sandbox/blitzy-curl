@@ -65,6 +65,33 @@
       "schedule": [
         "* * 10 * *"
       ]
+    },
+    {
+      "description": "Manage Rust crate dependencies declared in the workspace and member Cargo.toml manifests via Renovate's built-in cargo manager (crates.io only)",
+      "matchManagers": [
+        "cargo"
+      ],
+      "commitMessagePrefix": "Cargo: ",
+      "labels": [
+        "dependencies"
+      ],
+      "groupName": "cargo dependencies",
+      "enabled": true
+    },
+    {
+      "description": "Group pre-release (0.0.x) HTTP/3 crates to reduce update churn",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "h3",
+        "h3-quinn"
+      ],
+      "commitMessagePrefix": "Cargo: ",
+      "labels": [
+        "dependencies"
+      ],
+      "groupName": "http3 pre-release crates"
     }
   ],
   "customManagers": [
@@ -79,20 +106,6 @@
       ],
       "versioningTemplate": "{{#if versioning}}{{{versioning}}}{{else}}semver{{/if}}",
       "extractVersionTemplate": "{{#if extractVersion}}{{{extractVersion}}}{{else}}^v?(?<version>.+)${{/if}}"
-    },
-    {
-      "customType": "regex",
-      "managerFilePatterns": [
-        "/^\\.github/workflows/http3-linux\\.yml$/",
-        "/^\\.github/workflows/linux\\.yml$/"
-      ],
-      "matchStrings": [
-        "OPENSSL_VERSION: (?<currentValue>.*)\\s"
-      ],
-      "datasourceTemplate": "github-tags",
-      "depNameTemplate": "openssl/openssl",
-      "versioningTemplate": "semver",
-      "extractVersionTemplate": "^openssl-(?<version>.*)$"
     },
     {
       "customType": "regex",

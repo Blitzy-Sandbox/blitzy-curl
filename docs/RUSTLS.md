@@ -6,80 +6,50 @@ SPDX-License-Identifier: curl
 
 # Rustls
 
-[Rustls is a TLS backend written in Rust](https://docs.rs/rustls/). curl can
-be built to use it as an alternative to OpenSSL or other TLS backends. We use
-the [rustls-ffi C bindings](https://github.com/rustls/rustls-ffi). This
-version of curl is compatible with `rustls-ffi` v0.15.x.
+[Rustls](https://docs.rs/rustls/) is the one and only TLS backend in this Rust
+rewrite of curl, used natively through the `rustls` crate (version 0.23.36) and
+compiled in as an ordinary `crates.io` dependency.
 
-## Getting rustls-ffi
+The other TLS backends that curl historically supported (OpenSSL, GnuTLS,
+mbedTLS, wolfSSL, Schannel, and Apple Secure Transport) have been removed. There
+is no choice of backend, and no C TLS library is linked in any build.
 
-To build `curl` with `rustls` support you need to have `rustls-ffi` available first.
-There are three options for this:
+The `rustls` backend is mandatory and always compiled in; it is not optional and
+cannot be disabled.
 
-1. Install it from your package manager, if available.
-2. Download pre-built binaries.
-3. Build it from source.
+The `rustls` support stack is `tokio-rustls` 0.26.4 (the asynchronous stream
+adapter), `rustls-pki-types` 1 and `rustls-pemfile` 2 (certificate and key
+parsing), and `webpki-roots` 1 (the bundled root-certificate store).
 
-### Installing rustls-ffi from a package manager
+## Building
 
-See the [rustls-ffi README] for packaging status. Availability and details for installation
-differ between distributions.
+The `rustls` crate needs no separate installation, prerequisite, or build flag.
+Build curl with Cargo, and `rustls` is pulled in automatically:
 
-Once installed, build `curl` using `--with-rustls`.
+```
+% git clone https://github.com/curl/curl
+% cd curl
+% cargo build --release --workspace
+```
 
-    % git clone https://github.com/curl/curl
-    % cd curl
-    % autoreconf -fi
-    % ./configure --with-rustls
-    % make
+The build needs the Rust 2021 edition toolchain with a minimum supported Rust
+version of 1.75, pinned by `rust-toolchain.toml`. Install the toolchain with
+[rustup] if you do not already have it.
 
-[rustls-ffi README]: https://github.com/rustls/rustls-ffi?tab=readme-ov-file
+## Certificate verification
 
-### Downloading pre-built rustls-ffi binaries
+Because `rustls` is the single audited default, certificate validation is on by
+default, matching `CURLOPT_SSL_VERIFYPEER = 1` and `CURLOPT_SSL_VERIFYHOST = 2`.
+Peer certificates are validated against the compiled-in Mozilla
+root-certificate bundle provided by `webpki-roots`. This WebPKI trust-anchor set
+is the default and only trust source; no platform or OS trust-store integration
+is configured.
 
-Pre-built binaries are available on the [releases page] on GitHub for releases since 0.15.0.
-Download the appropriate archive for your platform and extract it to a directory of your choice
-(e.g. `${HOME}/rustls-ffi-built`).
+The `--insecure` (`-k`) option disables verification. Before it proceeds, curl
+prints a warning to stderr, so the security downgrade is always visible. The
+option keeps the same name and semantics it has in curl 8.x.
 
-Once downloaded, build `curl` using `--with-rustls` and the path to the extracted binaries.
+Consolidating on one audited TLS backend is the security rationale for this
+change, and the TLS code contains zero `unsafe`.
 
-    % git clone https://github.com/curl/curl
-    % cd curl
-    % autoreconf -fi
-    % ./configure --with-rustls=${HOME}/rustls-ffi-built
-    % make
-
-[releases page]: https://github.com/rustls/rustls-ffi/releases
-
-### Building rustls-ffi from source
-
-Building `rustls-ffi` from source requires both a rust compiler, and the [cargo-c] cargo plugin.
-
-To install a Rust compiler, use [rustup] or your package manager to install
-the **1.73+** or newer toolchain.
-
-To install `cargo-c`, use your [package manager][cargo-c pkg], download
-[a pre-built archive][cargo-c prebuilt], or build it from source with `cargo install cargo-c`.
-
-Next, check out, build, and install the appropriate version of `rustls-ffi` using `cargo`:
-
-    % git clone https://github.com/rustls/rustls-ffi -b v0.15.0
-    % cd rustls-ffi
-    % cargo capi install --release --prefix=${HOME}/rustls-ffi-built
-
-Now configure and build `curl` using `--with-rustls`:
-
-    % git clone https://github.com/curl/curl
-    % cd curl
-    % autoreconf -fi
-    % ./configure --with-rustls=${HOME}/rustls-ffi-built
-    % make
-
-See the [rustls-ffi README][cryptography provider] for more information on cryptography providers and
-their build/platform requirements.
-
-[cargo-c]: https://github.com/lu-zero/cargo-c
 [rustup]: https://rustup.rs/
-[cargo-c pkg]: https://github.com/lu-zero/cargo-c?tab=readme-ov-file#availability
-[cargo-c prebuilt]: https://github.com/lu-zero/cargo-c/releases
-[cryptography provider]: https://github.com/cpu/rustls-ffi?tab=readme-ov-file#cryptography-provider

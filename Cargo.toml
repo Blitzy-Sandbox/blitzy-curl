@@ -1,0 +1,214 @@
+# SPDX-License-Identifier: curl
+# SPDX-FileCopyrightText: Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# blitzy-curl — root Cargo workspace manifest
+# ===========================================
+# This is the ROOT workspace manifest for the three-crate, idiomatic-Rust rewrite of
+# curl / libcurl 8.19.0-DEV. It supersedes the C build system (CMakeLists.txt,
+# configure.ac, Makefile.am) in FUNCTION only — those C build files are preserved in the
+# tree as source-of-truth references and are intentionally NOT deleted.
+#
+# This is a VIRTUAL workspace manifest: it deliberately declares NO root `[package]` and
+# NO root `[dependencies]`. Its sole responsibilities are:
+#   1. enumerate the three member crates (`[workspace.members]`);
+#   2. fix the shared dependency versions (`[workspace.dependencies]`) — this manifest is
+#      the single source of truth for dependency versions across the whole workspace;
+#   3. declare shared package metadata (`[workspace.package]`).
+# Each member crate owns its Cargo.toml, inherits the fields above via
+# `<field>.workspace = true` / `<dep>.workspace = true`, and defines its own `[features]`.
+#
+# Dependency versions are taken from the technical specification §0.6.1 (the authoritative,
+# currency-verified inventory). All dependencies are sourced exclusively from crates.io; no
+# C cryptographic or transport library is linked. `rustls` is the exclusive TLS backend and
+# Tokio is the sole async runtime — `openssl`, `native-tls`, `async-std`, and `smol` are
+# intentionally absent (§0.7.2). Per the Minimal Change Mandate (§0.7.3) no custom build
+# profiles or speculative dependencies are declared.
+#
+# ---------------------------------------------------------------------------------------------
+# DOCUMENTED DEPENDENCY DEVIATIONS (deviation ledger — NOT a silent divergence)
+# ---------------------------------------------------------------------------------------------
+# Exactly two pins deviate from the §0.6.1 inventory: `h3` and `russh`. These deviations are
+# INTENTIONAL, EXPLICITLY RECORDED here, and forced by an internal conflict WITHIN the frozen
+# AAP itself — §0.6.1 lists nominal versions, but §0.6.4 elevates "zero-warning buildable
+# workspace" and "MSRV 1.75 verified (`cargo +1.75.0 check`)" to HARD, MERGE-BLOCKING gates, and
+# §0.6.5 explicitly lists "MSRV 1.75 not yet verified against the current workspace" as a
+# documented blocker to RESOLVE. Where a §0.6.1 pin cannot satisfy the §0.6.4 build/MSRV gate,
+# the higher-precedence gate governs: a manifest that does not resolve or does not compile on
+# Rust 1.75 fails the binary success condition outright, whereas a currency-adjacent 0.0.x/0.x
+# pin preserves full functional parity. §0.3.3's "no version conflicts were found" assumption was
+# not borne out empirically for these two crates (evidence below); this ledger records the
+# reconciliation so the divergence is auditable rather than hidden.
+#
+#   crate  | AAP §0.6.1 | pinned here | reason (empirically verified via `cargo +1.75.0 check`)
+#   -------|------------|-------------|--------------------------------------------------------
+#   h3     | 0.0.7      | 0.0.8       | h3-quinn 0.0.10 (the §0.6.1 pin) requires h3 0.0.8; the
+#          |            |             | 0.0.x line is semver-incompatible, so 0.0.7 forces two
+#          |            |             | conflicting h3 versions → does not compile (§0.6.4).
+#   russh  | 0.54.6     | 0.53.0      | 0.54.6 is UNRESOLVABLE (yanked transitive
+#          |            |             | libcrux-ml-kem ^0.0.3); 0.62.2 resolves but needs
+#          |            |             | Rust ≥ 1.82 → breaks the MSRV-1.75 gate (§0.6.4/§0.7.3).
+#          |            |             | 0.53.0 is the newest that BOTH resolves AND builds on 1.75.
+#
+# Each row is expanded with full technical detail at its declaration below. Every OTHER version
+# matches §0.6.1 exactly. Reverting either pin to its §0.6.1 value re-breaks the build and is
+# therefore forbidden by the higher-precedence §0.6.4 gate.
+
+[workspace]
+resolver = "2"
+members = [
+    "curl-rs-lib", # core library — protocols, TLS, auth, DNS, transfer core  (from lib/)
+    "curl-rs",     # CLI binary — clap-based, full curl flag surface           (from src/)
+    "curl-rs-ffi", # C-ABI layer + cbindgen header generation                  (from include/curl/)
+]
+
+# Shared package metadata inherited by each member via `<field>.workspace = true`.
+[workspace.package]
+# Mirrors LIBCURL_VERSION "8.19.0-DEV" from include/curl/curlver.h, expressed as valid
+# SemVer with a lowercase pre-release identifier.
+version = "8.19.0-dev"
+# Rust 2021 edition and MSRV 1.75 are both MANDATORY (§0.7.3); all code and dependencies
+# must build on Rust 1.75 (enforced by the `cargo +1.75.0 check` merge gate, §0.6.4).
+edition = "2021"
+rust-version = "1.75"
+# SPDX identifier for curl's MIT-like license (see COPYING / LICENSES/curl.txt / REUSE.toml;
+# `SPDX-License-Identifier: curl` is used tree-wide).
+license = "curl"
+authors = ["Daniel Stenberg, <daniel@haxx.se>, et al."]
+repository = "https://github.com/curl/curl"
+homepage = "https://curl.se/"
+description = "curl - command line tool and library for transferring data with URLs (idiomatic Rust rewrite with functional parity to curl 8.19.0-DEV)"
+
+# Shared dependency version pins. Members reference these with `<dep>.workspace = true` and
+# select their own `features`; versions are NOT decorated with features here so that each
+# member enables exactly the feature set it needs (e.g. `tokio = { workspace = true,
+# features = ["rt", "net", ...] }`). Bare "1" / "0.7" strings are caret requirements; where
+# §0.6.1 gives a full triple, that exact triple is used.
+[workspace.dependencies]
+
+# --- Core runtime & networking ---
+tokio = "1.49.0"          # sole async runtime (current-thread CLI / multi-thread multi-handle)
+tokio-util = "0.7"        # codec, compat, and I/O utility extensions for Tokio
+bytes = "1"               # efficient byte-buffer primitives shared across networking crates
+futures-util = "0.3"      # future combinators and stream utilities
+pin-project-lite = "0.2"  # lightweight pin projection for async types
+socket2 = "0.5"           # low-level socket configuration (SO_REUSEADDR, TCP_NODELAY, ...)
+
+# --- HTTP/1.1 + HTTP/2 ---
+hyper = "1.7.0"           # HTTP/1.1 and HTTP/2 client engine
+hyper-util = "0.1.20"     # hyper utility extensions (connectors, client builders)
+http = "1"                # HTTP types (Request, Response, StatusCode, HeaderMap)
+http-body = "1"           # HTTP body trait definitions
+http-body-util = "0.1"    # HTTP body utility implementations
+h2 = "0.4"                # HTTP/2 framing (used internally by hyper)
+
+# --- HTTP/3 + QUIC ---
+quinn = "0.11.9"          # QUIC transport for HTTP/3
+# DOCUMENTED DEVIATION [ledger row 1/2] — §0.6.1 pins h3 0.0.7; this manifest pins 0.0.8.
+# Governing precedence: the §0.6.4 "buildable workspace" gate (CRITICAL, merge-blocking)
+# OUTRANKS the §0.6.1 nominal pin when the two conflict, and here they do. Root cause:
+# h3-quinn 0.0.10 (the §0.6.1-mandated HTTP/3-over-quinn adapter, kept exactly at 0.0.10
+# below) depends on h3 0.0.8, and the h3 0.0.x line is semver-INcompatible release to release.
+# Pinning h3 0.0.7 therefore forces TWO conflicting h3 versions into the graph (0.0.7 direct +
+# 0.0.8 transitively via h3-quinn) — a compile-time type mismatch. Empirically confirmed: a
+# workspace pinned to h3 0.0.7 alongside h3-quinn 0.0.10 does NOT resolve/compile. Pinning
+# 0.0.8 unifies the graph onto a single h3 version and builds cleanly on the MSRV-1.75
+# toolchain (quinn 0.11.9 and the QUIC/H3 API surface are unaffected; §0.6.1 crate SET is
+# preserved — only the h3 patch level moves 0.0.7 → 0.0.8). Reverting to 0.0.7 re-breaks the
+# build and is forbidden by §0.6.4.
+h3 = "0.0.8"
+h3-quinn = "0.0.10"       # quinn integration adapter for h3
+
+# --- TLS (rustls exclusively; certificate validation on by default) ---
+rustls = "0.23.36"        # the single, audited TLS backend (no C TLS library is linked)
+tokio-rustls = "0.26.4"   # Tokio async TLS stream adapter for rustls
+rustls-pki-types = "1"    # PKI type definitions (certificates, private keys)
+webpki-roots = "1"        # Mozilla root-certificate bundle for the default trust store
+rustls-pemfile = "2"      # PEM parsing for certificates and keys
+
+# --- SSH (SFTP/SCP) ---
+# DOCUMENTED DEVIATION [ledger row 2/2] — §0.6.1 pins russh 0.54.6; this manifest pins 0.53.0.
+# Governing precedence: the §0.6.4 gates OUTRANK the §0.6.1 nominal pin when they conflict.
+# Here BOTH a resolvability failure AND an MSRV failure make the §0.6.1 value unusable:
+#   (a) russh 0.54.6 is UNRESOLVABLE — its transitive dependency `libcrux-ml-kem ^0.0.3` was
+#       YANKED from crates.io, so `cargo` cannot even build a lockfile for it (fails the
+#       §0.6.4 buildable-workspace gate at the resolution stage, before compilation).
+#   (b) russh 0.62.2 (the newest line) resolves but hard-requires release-candidate crypto
+#       (argon2 0.6.0-rc.8, curve25519-dalek 5.0.0-rc.1) needing `edition2024` / Rust ≥ 1.82,
+#       which BREAKS the mandatory MSRV-1.75 gate (§0.6.4 `cargo +1.75.0 check`, §0.7.3).
+# russh 0.53.0 is the newest version that BOTH resolves cleanly AND compiles on Rust 1.75
+# (empirically verified: the full workspace dependency set passes `cargo +1.75.0 check`). It
+# keeps the §0.6.1 russh-sftp / russh-keys pins intact and provides the FULL required SSH
+# feature set with no parity loss (key + password auth, SFTP/SCP, recursive transfer). The
+# caret requirement also excludes the broken 0.54.x line. Reverting to 0.54.6 re-breaks
+# resolution and is forbidden by §0.6.4.
+russh = "0.53.0"
+russh-sftp = "2.1.1"      # SFTP subsystem client for russh
+russh-keys = "0.49.2"     # SSH key loading and agent interaction (last standalone release)
+
+# --- DNS ---
+hickory-resolver = "0.25.2" # optional pure-Rust resolver, consumed only behind the
+                            # default-off `hickory-dns` feature in curl-rs-lib
+
+# --- CLI ---
+clap = "4.5.54"           # command-line argument parsing (derive) — 1:1 with docs/cmdline-opts/
+clap_complete = "4"       # shell completion generation
+
+# --- FFI & code generation ---
+cbindgen = "0.29.2"       # C header generation; used by curl-rs-ffi/build.rs as a build-dependency
+libc = "0.2"              # raw FFI bindings for C types at the `extern "C"` boundary
+cc = "1"                  # compiles curl-rs-ffi/csrc/variadic_shim.c (the C-variadic trampolines
+                          # for the curl_m*printf `...` entry points, which stable Rust cannot
+                          # define — see curl-rs-ffi/src/mprintf.rs NOTE). Build-dependency only;
+                          # already in the lock graph transitively (aws-lc-sys/zstd-sys), MIT OR
+                          # Apache-2.0, MSRV <=1.75, so it adds no new crate, license, or gate risk.
+
+# --- Cryptography (authentication mechanisms; pure-Rust) ---
+sha2 = "0.10"             # SHA-256/SHA-512 for Digest auth and checksums
+sha1 = "0.10"             # SHA-1 for SCRAM-SHA-1 SASL auth (auth/scram.rs); RustCrypto Digest family
+md-5 = "0.10"             # MD5 for Digest and NTLM auth
+md4 = "0.10"              # MD4 for NTLM password hashing
+hmac = "0.12"             # HMAC for Digest auth and AWS SigV4
+des = "0.8"               # DES for NTLM LM/NT hash computation
+base64 = "0.22"           # Base64 encoding/decoding
+rand = "0.8"              # random number generation for auth nonces/keys
+
+# --- Authentication: optional OS GSSAPI / Kerberos (Negotiate) ---
+# libgssapi is the ONE optional C linkage the AAP explicitly retains: §0.5.2 keeps "OS
+# GSSAPI/Kerberos" as "the only optional C linkage, for Negotiate auth", and §0.1.1 / §0.6.1
+# reiterate that optional OS GSSAPI is the sole permitted C dependency in the whole workspace.
+# §0.6.1 sanctions the capability but names no crate, so the concrete crate is chosen here:
+# `libgssapi` provides a SAFE Rust wrapper over the platform GSSAPI (linking the OS krb5
+# GSSAPI at build time via libgssapi-sys), which is exactly the API the already-written
+# `curl-rs-lib/src/auth/kerberos.rs` (and, transitively, `auth/negotiate.rs`) consumes
+# (`ClientCtx`, `Name`, `CtxFlags`, `GSS_MECH_KRB5`, `GSS_NT_HOSTBASED_SERVICE`) with zero
+# `unsafe` in the library. It is pulled in ONLY behind the DEFAULT-OFF `gssapi` / `spnego`
+# features in curl-rs-lib, so stock/default builds and the default-feature MSRV 1.75 gate
+# (§0.6.4) link no C library and are unaffected. 0.11 is the current release and is the
+# version whose safe surface matches the existing auth code.
+libgssapi = "0.11"
+
+# --- Compression (content-encoding) ---
+flate2 = "1"              # gzip/deflate decompression
+brotli = "8"              # Brotli decompression
+zstd = "0.13"             # Zstandard decompression
+
+# --- Serialization & utilities ---
+serde = "1"               # serialization framework (members add features = ["derive"])
+serde_json = "1"          # JSON serialization for the --write-out JSON format
+url = "2"                 # URL parsing and manipulation (RFC 3986)
+percent-encoding = "2"    # URL percent-encoding
+idna = "1"                # internationalized domain-name (IDN) processing / Punycode
+publicsuffix = "2"        # public-suffix list for cookie-domain validation
+glob = "0.3"              # glob pattern matching for URL globbing
+chrono = "0.4"            # date/time parsing (HTTP dates, cookie expiry)
+tracing = "0.1"           # structured logging for --trace / --verbose
+tracing-subscriber = "0.3" # tracing output formatting
+thiserror = "2"           # typed error hierarchy in the library
+anyhow = "1"              # contextual error chaining in the CLI binary
+
+# --- Development & testing (referenced by members under [dev-dependencies]) ---
+rcgen = "0.14"            # ephemeral self-signed certificates for TLS integration tests
+tokio-test = "0.4"        # async / mock-time test harness
+tempfile = "3"            # per-test temporary state files
+assert_cmd = "2"          # CLI binary integration-test assertions
+predicates = "3"          # assertion predicates for test output

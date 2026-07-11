@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: curl
+# SPDX-FileCopyrightText: Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# blitzy-curl — Rust toolchain pin
+# ================================
+# Pins the Rust toolchain used to build the three-crate workspace (curl-rs-lib,
+# curl-rs, curl-rs-ffi) so every contributor and every CI leg builds with a
+# consistent, MSRV-compliant toolchain. rustup automatically selects this toolchain
+# for any `cargo`/`rustc` invocation run from anywhere inside the repository.
+#
+# Authoritative references (blitzy-docs/technical-specifications.md):
+#   §0.7.3  "MSRV and Edition" / "CI and Toolchain" — Rust edition 2021, MSRV pinned
+#           at 1.75; all code and dependencies must compile on Rust 1.75.
+#   §0.6.2  "External Reference Updates" — rust-toolchain.toml pins the channel at the
+#           MSRV floor.
+#   §0.3.1  target tree — "rust-toolchain.toml (channel + MSRV 1.75, edition 2021)".
+#   §0.6.4  merge gate — `cargo +1.75 check --workspace` (MSRV verification).
+#
+# Design notes (Minimal Change Mandate, §0.7.3 — only channel/components/profile):
+#   * The channel is pinned to the exact MSRV, "1.75.0" (not "stable"). Pinning the
+#     floor makes the default `cargo build`/`check`/`test` enforce MSRV 1.75 locally
+#     and by default, so violations surface immediately instead of only in the
+#     dedicated CI gate. Explicit `+toolchain` overrides always win over this file, so
+#     CI still runs `cargo +stable` (clippy/fmt/test on latest stable), `cargo
+#     +nightly` (Miri + rust-src), and the coverage leg without contention.
+#   * The nightly toolchain (Miri, rust-src) is intentionally NOT pinned here; it is
+#     supplied via an explicit `+nightly` override in CI (§0.7.3), never as the default.
+#   * `edition = "2021"` lives in Cargo.toml ([workspace.package]); it is a manifest
+#     setting and rust-toolchain.toml has no `edition` field.
+#   * `targets` are intentionally omitted: the GitHub Actions matrix installs the
+#     per-leg target on each of the four supported triples itself, so listing them
+#     here would only add install friction to every local rustup invocation.
+
+[toolchain]
+# Exact MSRV pin (§0.7.3). Kept in lock-step with `rust-version` in Cargo.toml.
+channel = "1.75.0"
+
+# Components required by the merge-blocking CI gates (§0.6.4):
+#   clippy             — lint gate       (`cargo clippy --workspace -- -D warnings`)
+#   rustfmt            — formatting gate  (`cargo fmt --check`)
+#   llvm-tools-preview — coverage backend (`cargo llvm-cov --workspace`)
+components = ["clippy", "rustfmt", "llvm-tools-preview"]
+
+# Install the lean base set (rustc, cargo, rust-std) plus exactly the components
+# listed above — reproducible and minimal, with no rust-docs/analysis extras.
+profile = "minimal"

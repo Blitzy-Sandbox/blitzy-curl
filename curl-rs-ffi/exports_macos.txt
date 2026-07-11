@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: curl
+# SPDX-FileCopyrightText: Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# Mach-O exported-symbols list for the curl-rs-ffi cdylib (libcurl_rs_ffi.dylib) on Apple targets
+# (x86_64/aarch64 -apple-darwin). It is the macOS counterpart of `exports.map` and is applied ONLY
+# to the cdylib link, via `cargo:rustc-cdylib-link-arg=-Wl,-exported_symbols_list,...` in build.rs.
+#
+# ld64's `-exported_symbols_list` is an ALLOWLIST: only the symbols matching a pattern here are
+# exported; every other symbol is hidden. This mirrors `exports.map`'s `{ global: curl_*; local:
+# *; }` on ELF and serves the same two purposes:
+#   1. Export every public `curl_*` symbol — including the C-variadic trampolines from
+#      `csrc/variadic_shim.c`, which are referenced by no Rust code and would otherwise be dropped
+#      / hidden (see exports.map for the full rationale).
+#   2. Hide all Rust std/allocator/panic internals and crate-private helpers, so the dylib exposes
+#      ONLY the curl C API (AAP §0.6.1).
+#
+# On Mach-O, C symbols carry a leading underscore, so the pattern is `_curl_*` (ld64 supports `*`
+# globbing in this file). No symbol versioning exists on Mach-O, matching the unversioned ELF
+# choice in exports.map.
+_curl_*
