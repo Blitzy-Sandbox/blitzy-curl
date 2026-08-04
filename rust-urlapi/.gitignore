@@ -1,0 +1,17 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# Cargo output directory
+/target/
+
+# Scratch directory used by the parity scripts: the reference libcurl build,
+# the symlink to tests/libtest/lib1560.c, and the harness/demo binaries.
+/build/
+
+# Shared library and package-config artifacts. The repository root .gitignore
+# already covers *.a, *.o and *.lo, but not these.
+*.so
+*.so.*
+*.dylib
+*.pc

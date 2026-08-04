@@ -1,0 +1,12 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+#
+# curl documents a Rust floor of 1.73+ (docs/RUSTLS.md); this crate declares
+# rust-version = "1.75" in Cargo.toml. The stable channel is pinned so the
+# crate is always built with a release toolchain rather than nightly.
+
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]
+targets = []

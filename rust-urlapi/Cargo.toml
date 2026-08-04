@@ -1,0 +1,109 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+#
+# Manifest for the Rust re-implementation of curl's URL API (lib/urlapi.c).
+# The crate is a binary-compatible, drop-in replacement for the object file
+# produced from lib/urlapi.c and exposes the identical C ABI declared in
+# include/curl/urlapi.h. Nothing outside this directory is modified.
+
+[package]
+name = "curl-urlapi-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "curl"
+description = "Binary-compatible Rust port of curl's URL API (lib/urlapi.c)"
+homepage = "https://curl.se/"
+repository = "https://github.com/curl/curl"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "curl_urlapi_rs"
+# staticlib -> the drop-in archive that replaces lib/urlapi.o
+# cdylib    -> the shared library variant
+# rlib      -> required so the crate's own tests/ binaries can link it
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# The standalone configuration: the crate supplies everything the demo and
+# the lib1560 harness need when no real libcurl participates in the link.
+default = ["strerror", "cfree", "scheme-table", "idn-libidn2"]
+
+# Export curl_url_strerror() plus the 33 message strings. MUST be OFF in the
+# drop-in configuration: that symbol is defined in lib/strerror.c, which is
+# out of scope, and exporting it twice breaks the link.
+strerror = []
+
+# Export curl_free(). MUST be OFF in the drop-in configuration: that symbol
+# is defined in lib/escape.c.
+cfree = []
+
+# Compile a built-in scheme table (default ports, PROTOPT_URLOPTIONS, the
+# protocol-enabled marker). When OFF, Curl_get_scheme() is imported from
+# libcurl (lib/url.c) instead.
+scheme-table = []
+
+# Bind libidn2 directly, replicating the call sequence in lib/idn.c for
+# bit-for-bit internationalised-domain parity (including its locale
+# sensitivity). This is the parity-preserving backend.
+idn-libidn2 = []
+
+# Pure-Rust IDN alternative. NOT bit-for-bit: no transitional retry, locale
+# independent, different Unicode tables, and it raises the effective minimum
+# toolchain to 1.86 through its dependency tree. Opt-in only.
+idn-pure = ["dep:idna"]
+
+# Regenerate include/curl_urlapi_rs.h from the FFI facade at build time so
+# the mirror header cannot drift from the code.
+genheader = ["dep:cbindgen"]
+
+# Required by cargo-c: `cargo cbuild`/`cargo cinstall` enable this feature so
+# a build script can tell a C-ABI packaging build apart from a plain one.
+# Never enabled by a normal `cargo build`.
+capi = []
+
+[dependencies]
+# C allocator entry points (so every buffer handed to C is freeable with
+# curl_free()/free()), C scalar type aliases, and the libidn2 externs used by
+# the default IDN backend. Pinned: the 1.0.0-alpha line is a pre-release and
+# must never be selected.
+libc = { version = "0.2.189", default-features = false }
+
+# Optional, feature `idn-pure` only.
+idna = { version = "1.1.0", optional = true }
+
+[build-dependencies]
+# Optional, feature `genheader` only.
+cbindgen = { version = "0.29.4", optional = true }
+
+[profile.release]
+lto = true
+codegen-units = 1
+# A panic must never unwind across the C ABI boundary.
+panic = "abort"
+strip = false
+
+[profile.dev]
+panic = "abort"
+
+# cargo-c (cargo capi) metadata. The header is committed, not generated, so
+# cargo-c must not invoke cbindgen. Nothing here wires the crate into curl's
+# own build system.
+[package.metadata.capi]
+min_version = "0.10.0"
+
+[package.metadata.capi.header]
+name = "curl_urlapi_rs"
+subdirectory = false
+generation = false
+
+[package.metadata.capi.library]
+name = "curl_urlapi_rs"
+include_impl_deps = true
+
+[package.metadata.capi.pkg_config]
+name = "curl_urlapi_rs"
+filename = "curl_urlapi_rs"
+description = "Binary-compatible Rust port of curl's URL API"
