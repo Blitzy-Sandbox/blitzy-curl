@@ -1,0 +1,18 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# printf is banned by default; the demo uses it for all of its parity output
+allowfunc printf
+
+# Use of curl printf functions is discouraged: they resolve only in the
+# drop-in link against libcurl and are absent from the standalone link, where
+# the crate supplies no such shims
+banfunc curl_maprintf
+banfunc curl_mfprintf
+banfunc curl_mprintf
+banfunc curl_msnprintf
+banfunc curl_mvaprintf
+banfunc curl_mvfprintf
+banfunc curl_mvprintf
+banfunc curl_mvsnprintf

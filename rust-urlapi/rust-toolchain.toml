@@ -2,11 +2,75 @@
 #
 # SPDX-License-Identifier: curl
 #
-# curl documents a Rust floor of 1.73+ (docs/RUSTLS.md); this crate declares
-# rust-version = "1.75" in Cargo.toml. The stable channel is pinned so the
-# crate is always built with a release toolchain rather than nightly.
+# Toolchain pin for curl-urlapi-rs, the Rust re-implementation of curl's URL
+# API. It is what lets GNUmakefile and scripts/build-rust.sh invoke a bare
+# `cargo build` and still get a reproducible toolchain without either of
+# them naming a version: this file replaces the compiler version checks a
+# configure script would otherwise carry. rustup applies it to every command
+# run anywhere under rust-urlapi/ and to nothing outside it, so curl's own
+# autotools and CMake builds are unaffected by its presence.
+#
+# Three different minimum versions are in play, and they are easy to
+# confuse. All three are recorded here so nobody has to derive them again:
+#
+#   1.75  This crate's declared minimum supported Rust version, from the
+#         technical specification. Every line of the crate and every
+#         dependency of the default feature set must compile on it. It is
+#         declared where Cargo can act on it, as rust-version = "1.75" in
+#         Cargo.toml, and edition 2021 goes with it.
+#
+#   1.73  curl's own documented Rust floor: docs/RUSTLS.md:59 tells
+#         contributors to install "the 1.73+ or newer toolchain". A port
+#         living inside this repository must not ask more of a contributor
+#         than the project already does, which is why the default
+#         dependency set is deliberately one crate wide.
+#
+#   1.65  The minimum declared by libc 0.2.189, the only dependency the
+#         default configuration has. The default build therefore clears
+#         both of the floors above with room to spare.
+#
+# The optional idn-pure feature is the one exception, and the numbers below
+# are precisely why it is not a default. It replaces libidn2 with the
+# pure-Rust idna crate, and the adapter plus the internationalisation
+# components behind it each declare a far newer minimum: in the committed
+# Cargo.lock that is eight packages at 1.86 -- idna_adapter and the seven
+# icu_* crates -- with six more at 1.82. The effective floor for that
+# configuration is therefore 1.86, above both 1.75 and curl's 1.73, so
+# idn-pure stays opt-in. Bit-for-bit parity with the libidn2 call sequence
+# in lib/idn.c is claimed for the default backend only; see Cargo.toml and
+# docs/KNOWN-DIVERGENCES.md.
+#
+# Note the division of labour between the two files: this one selects which
+# toolchain builds the crate, while rust-version in Cargo.toml declares the
+# oldest toolchain the sources support. They are independent, and the
+# toolchain in use is normally far newer than the declared minimum.
 
 [toolchain]
+# The stable channel, never a point release. Pinning the exact stable this
+# port was developed against, 1.97.1, would stop the crate building on
+# every newer stable for no benefit. Nor is a nightly or beta channel
+# wanted: the crate is held to stable language and Cargo features, which is
+# what makes this pin sufficient.
 channel = "stable"
-components = ["clippy", "rustfmt"]
-targets = []
+
+# Install the compiler, cargo and the standard library, and no more. The
+# profile governs what rustup materialises when it first installs the
+# channel; the components below are then requested explicitly, so they are
+# present whichever profile a contributor already had configured.
+profile = "minimal"
+
+# clippy             `cargo clippy -- -D warnings` has to pass clean, so the
+#                    lint driver belongs to the pinned toolchain rather than
+#                    being something a build script hopes to find.
+# rustfmt            .editorconfig carries no [*.rs] section, so Rust
+#                    sources fall back to rustfmt's own defaults; the
+#                    formatter has to be present to apply and to check them.
+# llvm-tools-preview the LLVM binary utilities, llvm-profdata and llvm-cov,
+#                    that the coverage tooling drives.
+components = ["clippy", "rustfmt", "llvm-tools-preview"]
+
+# There is deliberately no `targets` key. The crate is built for the host
+# only: the parity demonstration runs on one platform, and the Windows-only
+# paths ported from lib/urlapi.c are compiled conditionally but are not
+# validated here. Naming a target would ask rustup to fetch a standard
+# library that nothing in this directory links against.

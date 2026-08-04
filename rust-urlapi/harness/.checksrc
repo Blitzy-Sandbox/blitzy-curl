@@ -1,0 +1,11 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+
+# The standalone (Mode B) shims in shims.c call the C library directly: that
+# link has no libcurl in it, so libcurl's own allocator and formatted-print
+# layers are absent. The drop-in (Mode A) link does not compile shims.c.
+allowfunc free
+allowfunc vfprintf
+allowfunc vprintf
+allowfunc vsnprintf

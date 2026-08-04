@@ -2,16 +2,62 @@
 #
 # SPDX-License-Identifier: curl
 
-# Cargo output directory
-/target/
+# Ignore rules scoped to the curl-urlapi-rs crate.
+#
+# Purpose: after a full crate build and a parity run, "git status --porcelain"
+# must report nothing at all for this directory. Only the artifact classes the
+# repository root .gitignore does not already reach are listed below. The root
+# file is out of scope for this work and is not modified.
+#
+# Every pattern here, and every omission recorded at the end of this file, was
+# established by running "git check-ignore -v" against the root file rather
+# than by reading it. Anchoring is what makes that necessary: a root entry
+# spelled with a leading slash never reaches a subdirectory, while one spelled
+# without a slash matches at every depth. Both cases occur below.
 
-# Scratch directory used by the parity scripts: the reference libcurl build,
-# the symlink to tests/libtest/lib1560.c, and the harness/demo binaries.
-/build/
+# Cargo's output directory. Holds libcurl_urlapi_rs.a, libcurl_urlapi_rs.so,
+# the rlib, the crate's test binaries and every build intermediate. The root
+# file ignores archives and object files by extension, but neither the
+# directory itself nor the many extensionless intermediates inside it, so this
+# pattern is required. The trailing slash keeps it to directories.
+target/
 
-# Shared library and package-config artifacts. The repository root .gitignore
-# already covers *.a, *.o and *.lo, but not these.
+# Scratch directory for the parity workflow driven from scripts/. Holds the
+# reference libcurl archive with urlapi.c.o deleted, the symlink to
+# tests/libtest/lib1560.c, the harness shim header, and the harness and demo
+# binaries for both link modes.
+#
+# The root file does carry a build entry, but it is spelled "/build/" with a
+# leading slash, which anchors it to the repository root and therefore never
+# reaches this subdirectory. Dropping the pattern below on the strength of
+# that root entry would leave the entire scratch tree reported as untracked.
+# The trailing slash keeps this from matching the build.rs script.
+build/
+
+# Shared libraries produced by the cdylib crate type, including the versioned
+# names that cargo-c emits. The root file ignores *.dll for Windows but has no
+# rule for ELF or Mach-O shared objects anywhere.
 *.so
 *.so.*
 *.dylib
+
+# The pkg-config file cargo-c emits alongside them. The root file ignores the
+# literal name libcurl.pc only, not this crate's.
 *.pc
+
+# Deliberately NOT listed above, so that each omission reads as a decision
+# rather than an oversight. Line numbers refer to the root .gitignore.
+#
+# *.a         already ignored, root line 11.
+# *.o         already ignored, root line 14.
+# Makefile    already ignored, root line 35. That entry carries no slash, so
+#             unlike "/build/" it matches at every depth: a file named
+#             Makefile in this directory would be silently untracked. That is
+#             precisely why the build driver here is named GNUmakefile, a name
+#             GNU make prefers anyway, so a bare "make" still works. The entry
+#             is deliberately not re-enabled with a "!Makefile" negation,
+#             which would change repository-wide behavior to suit one
+#             directory.
+# Cargo.lock  intentionally tracked, never ignored. Library crates often
+#             ignore their lockfile; this one commits it so the resolved
+#             dependency versions stay pinned and reproducible.
