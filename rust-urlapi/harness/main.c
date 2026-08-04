@@ -1,0 +1,149 @@
+/***************************************************************************
+ *                                  _   _ ____  _
+ *  Project                     ___| | | |  _ \| |
+ *                             / __| | | | |_) | |
+ *                            | (__| |_| |  _ <| |___
+ *                             \___|\___/|_| \_\_____|
+ *
+ * Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+ *
+ * This software is licensed as described in the file COPYING, which
+ * you should have received as part of this distribution. The terms
+ * are also available at https://curl.se/docs/copyright.html.
+ *
+ * You may opt to use, copy, modify, merge, publish, distribute and/or sell
+ * copies of the Software, and permit persons to whom the Software is
+ * furnished to do so, under the terms of the COPYING file.
+ *
+ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
+ * KIND, either express or implied.
+ *
+ * SPDX-License-Identifier: curl
+ *
+ ***************************************************************************/
+
+/* main() for the standalone harness: what tests/libtest/first.c is to
+   curl's libtest bundle, this file is to one test compiled on its own.
+   Only two of that file's 290 lines are load-bearing here, and both are
+   below; the four things left behind are listed next, with why.
+
+   The load-bearing pair, each expanded at its own site: setlocale(LC_ALL,
+   "") from tests/libtest/first.c:L231, one of three settings that gate the
+   test's IDN assertions and the only one this file owns; and the shell
+   clamp from its L289, which carries the per-sub-test exit code of
+   tests/libtest/lib1560.c:L2040-L2071 out intact.
+
+   Standard output is not this file's to write. Acceptance rests on a
+   byte-for-byte diff of it, and tests/libtest/lib1560.c owns every byte:
+   the success line at its L2073 that tests/data/test1560:L37 expects, and
+   the failure detail at L1952, L1960 and L2013. Its other report sites go
+   to stderr, several of them carrying __FILE__ and __LINE__, which differ
+   between the two builds and are why stderr is not diffed. The one line
+   printed here goes to stderr too, as tests/libtest/first.c:L280 does. */
+
+/* Deliberately absent, every one of them present in
+   tests/libtest/first.c:
+
+   - the s_entries[] dispatcher and all that serves it: test_argc and
+     test_argv (L234-L235), the argv[1] test-name lookup (L237-L255),
+     libtest_arg2, arg3 and arg4 (L262-L269) and the CURL_TESTNUM read
+     (L271-L277). A single compiled-in test needs none of it, and
+     tests/libtest/lib1560.c reads none of it.
+   - memory_tracking_init() (L220), which belongs to the memory-debug
+     machinery that reported constraint R3, below, rules out.
+   - curlx_now_init() (L222), a libcurl-private helper that neither
+     harness link mode has any claim on.
+   - CURL_BINMODE(stdout) (L218) and _flushall() (L284), Windows
+     stdout-mode handling. Windows code paths in this port are compiled
+     conditionally and are not validated here, so neither is carried over
+     under a guard that nothing would exercise. */
+
+/* Reported constraint R3, recorded here and deliberately not worked around.
+   curl_free() forwards to curlx_free() at lib/escape.c:L189-L192, which
+   resolves at compile time three ways: to the tracking curl_dbg_free()
+   under memory debugging (lib/curl_setup.h:L1461), whose free validates
+   the pointer against its own table (lib/memdebug.c:L383); to the mutable
+   global hook Curl_cfree when libcurl itself is being built (L1478); or to
+   plain free() (L1484). The crate takes the buffers it hands back to C
+   from the C allocator, so only the last of the three suits them, and this
+   harness therefore defines none of CURLDEBUG, DEBUGBUILD, CURL_MEMDEBUG
+   or BUILDING_LIBCURL -- which is also why memory_tracking_init() is gone.
+   The consequence is stated rather than papered over: the ceiling of
+   Allocations: 3000 at tests/data/test1560:L40 is honored in spirit, the
+   port not being materially more allocation-hungry, and is not counted by
+   curl's own accounting. The whole chain is in
+   ../docs/MEMORY-OWNERSHIP.md. */
+
+#include "first.h"
+
+/* setlocale() and LC_ALL. tests/libtest/first.c reaches them at its L27,
+   behind HAVE_LOCALE_H, because curl_config.h can tell it whether the
+   header is there. This harness has no curl_config.h and wants none: the
+   header and the function are both Standard C, so no feature test is
+   needed and none is used. That is deliberate. A guard the build forgot to
+   define would skip the call in silence, and a silently skipped setlocale
+   is the one failure this file exists to make impossible. */
+#include <locale.h>
+
+int main(int argc, const char **argv)
+{
+  /* Defaulted as tests/libtest/first.c:L211 defaults it, so that no
+     argument is ever required of this binary. Safe to leave empty: the
+     test discards it at tests/libtest/lib1560.c:L2038 with (void)URL,
+     being driven entirely by its own tables. */
+  const char *URL = "";
+  CURLcode result;
+
+  /* Setup proper locale from environment, as tests/libtest/first.c:L231
+     does it, and for the reason its L225-L229 gives: locale-specific
+     behavior in the C library is what makes undesired side effects it
+     could cause in libcurl testable.
+
+     Here it does more. libidn2 is reached through the lookup macro at
+     lib/idn.c:L35-L41, which off Windows expands to the locale-aware
+     idn2_lookup_ul, so a non-ASCII host converts only while the process
+     codeset is UTF-8 -- and a C program sits in the "C" locale until
+     something asks for the environment's, whatever LC_ALL holds. This is
+     one of three settings, and the other two are environment and belong
+     to ../scripts/run-parity.sh: LC_ALL=C.UTF-8, which
+     tests/data/test1560:L14 sets, and CURL_TEST_HAVE_CODESET_UTF8, which
+     tests/runtests.pl:L836-L839 exports and
+     tests/libtest/lib1560.c:L2036 reads into has_utf8 to gate the
+     punycode rows at its L1446, L1548 and L1591. Drop any one of the
+     three and those rows stop running while the harness still prints
+     success -- a false green, which is worse than a failure, because the
+     expectation at tests/libtest/lib1560.c:L629-L631, that
+     r\xc3\xa4ksm\xc3\xb6rg\xc3\xa5s.se comes back as
+     xn--rksmrgs-5wao1o.se, is exactly where a porting mistake shows.
+
+     Unconditional, unlike the HAVE_SETLOCALE guard at
+     tests/libtest/first.c:L230, for the reason above the include. */
+  setlocale(LC_ALL, "");
+
+  /* One optional argument, so this binary can be driven the way a libtest
+     program is. tests/libtest/first.c:L237-L241 requires argv[1] to name a
+     test and reads the URL from argv[2]; there is one test here, so the
+     URL moves up to argv[1] and nothing is mandatory -- both
+     ../scripts/run-parity.sh and ../GNUmakefile invoke it bare. Written
+     across two lines because scripts/checksrc.pl reports a conditional
+     body on the if() line as ONELINECONDITION. */
+  if(argc > 1)
+    URL = argv[1];
+
+  result = harness_run_test(URL);
+
+  /* The only output this file produces, and on stderr for the reason
+     given above. Mirrors tests/libtest/first.c:L280. */
+  curl_mfprintf(stderr, "Test ended with result %d\n", result);
+
+  /* Regular program status codes are limited to 0..127, and 126 and 127
+     have special meanings by the shell, so limit a normal return code to
+     125. Reasoning and expression both from
+     tests/libtest/first.c:L287-L289. The clamp cannot fire here, every
+     code tests/libtest/lib1560.c:L2040-L2071 returns being 1 through 11,
+     and it is carried over anyway because those codes are this harness's
+     per-sub-test report: ../scripts/run-parity.sh reads the status back
+     and names the sub-test that failed, so nothing on this path is
+     remapped, collapsed into 0 and 1, or swallowed. */
+  return (int)result <= 125 ? (int)result : 125;
+}
