@@ -1,0 +1,658 @@
+# Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# SPDX-License-Identifier: curl
+#
+# Header-generation configuration for curl-urlapi-rs, the Rust
+# re-implementation of curl's URL API.
+#
+#
+# WHAT THIS PRODUCES
+#
+# include/curl_urlapi_rs.h: a one-for-one mirror of the public declarations
+# in include/curl/urlapi.h:34-149, and nothing else. That is the 33-value
+# CURLUcode enumeration (urlapi.h:34-68), the 11-value CURLUPart
+# enumeration (70-82), the 16 CURLU_* flag bits (84-105), the opaque CURLU
+# handle (107) and the six public functions (113, 120, 126, 133-134,
+# 141-142, 149), inside an include guard and an extern "C" wrapper.
+#
+#
+# WHO READS IT
+#
+# build.rs, and only when the optional genheader feature is enabled. That
+# feature is off by default because the header is committed and an ordinary
+# build must not depend on a code generator. The same output is reachable by
+# hand with the version Cargo.toml pins, run from this directory:
+#
+#   cbindgen --config cbindgen.toml --lang c \
+#     --output include/curl_urlapi_rs.h
+#
+#
+# WHY IT EXISTS
+#
+# The artifact matters less than the check. include/curl_urlapi_rs.h is
+# hand-authored and stays authoritative; regenerating it and diffing is what
+# catches the Rust surface in src/ffi.rs and the C ABI contract in
+# include/curl/urlapi.h drifting apart. Reconcile any difference by changing
+# this configuration or the Rust items -- never by changing
+# include/curl/urlapi.h, which is read-only and is never modified, moved or
+# shadowed.
+#
+#
+# WHICH LINK MODE USES THE MIRROR
+#
+# Mode B, standalone, and only that one. There no libcurl takes part in the
+# link, so the mirror is the only header in play. In Mode A, the drop-in
+# configuration, the real include/curl/urlapi.h is the header in play and
+# this mirror stays out of its way entirely: a different file name, a
+# different directory and a different include guard, so the two can never
+# collide and neither can shadow the other.
+#
+#
+# TWO LICENCE BLOCKS, BOTH NEEDED
+#
+# The "#" block at the top of this file licenses this configuration file, so
+# that `reuse lint` passes for it. TOML takes comments, so it is annotated
+# directly rather than through an entry in REUSE.toml, which is out of
+# scope. The `header` key below carries the /* */ box that licenses the
+# GENERATED header, which cbindgen would otherwise emit with no annotation
+# at all. Drop either block and one of the two files fails the licence gate.
+#
+#
+# KEY NAMES ARE NOT NEGOTIABLE
+#
+# Cargo.toml pins cbindgen 0.29.4, and every configuration struct in that
+# version carries serde(deny_unknown_fields). An unknown or misspelled key
+# is therefore a hard parse error rather than a warning, and a key a later
+# cbindgen renames would break the genheader build outright. Every key below
+# was checked against that version's own config.rs, and every string value
+# against the FromStr implementation that parses it.
+#
+#
+# WHAT THE GENERATOR CANNOT BE MADE TO DO
+#
+# Five differences from include/curl/urlapi.h are imposed by cbindgen 0.29.4
+# itself and cannot be configured away. They are why the committed header is
+# hand-authored, and why the diff has to be read modulo them;
+# docs/KNOWN-DIVERGENCES.md records them.
+#
+#   1. A trailing comma after every enumerator, the last one included,
+#      because clike.rs writes it unconditionally. urlapi.h has none, and
+#      `cc -std=c89 -pedantic` reports "comma at end of enumerator list".
+#   2. `#endif // __cplusplus` and `}  // extern "C"` around the extern "C"
+#      block, hard-coded with // comments. Under C89 those are not comments
+#      at all, so the compiler reports "extra tokens at end of #endif
+#      directive" twice, and checksrc reports CPPCOMMENTS three times, which
+#      are its only findings on the generated header. The wrapper is still
+#      wanted, so cpp_compat stays on below.
+#   3. The opaque tag is `struct CURLU`, taken from the Rust item name,
+#      where urlapi.h:107 writes `typedef struct Curl_URL CURLU;`. ABI
+#      irrelevant: the type is incomplete either way and is only ever used
+#      through a pointer, which is exactly what makes the port tractable.
+#   4. The licence box precedes the include guard, where urlapi.h opens the
+#      guard at 1-2 above the box at 3-25.
+#   5. Conditional rather than unavoidable, and listed because no key here
+#      can repair it: curl_url_dup's parameter is spelled `in` at
+#      urlapi.h:126, which is a Rust keyword, and rename_args cannot turn a
+#      name back into a reserved word. Writing it as `r#in` in src/ffi.rs
+#      does reproduce it exactly, verified by generating from a surface that
+#      does so; spelling it anything else is a divergence created there
+#      rather than here.
+#
+# Nothing else diverges. Measured rather than assumed: on a generated header
+# whose declarations are all exercised, `cc -std=c89 -Wall -Wextra -pedantic`
+# reports exactly four warnings, two from item 1 and two from item 2, and
+# `scripts/checksrc.pl` reports exactly three warnings and zero errors, all
+# three from item 2. There is no over-length line, no tab, no trailing
+# whitespace, no non-ASCII byte and no consecutive blank line, so the output
+# also satisfies scripts/spacecheck.pl unaided.
+
+# Bare keys come first, before the very first [table] header, because in
+# TOML a key written after one belongs to that table. Everything from here
+# to [export] is therefore top-level configuration.
+
+# C, not C++ and not Cython. urlapi.h is a C header, consumed by C and,
+# through the extern "C" wrapper, by C++.
+language = "C"
+
+# "type" emits `typedef enum { ... } CURLUcode;`, which is urlapi.h:34-68 and
+# 70-82 exactly. The choice reaches further than the two enumerations,
+# though, and both alternatives were generated to be sure of it:
+#
+#   - "tag" emits `enum CURLUcode { ... };` and then spells every use with
+#     the keyword, so the declarations come out as
+#     `enum CURLUcode curl_url_get(const struct CURLU *handle, ...)`.
+#   - "both" emits `typedef enum CURLUcode { ... } CURLUcode;`, adding a tag
+#     name urlapi.h does not have, and still spells the uses with the
+#     keyword exactly as "tag" does.
+#
+# So "type" is the only one of the three that produces
+# `CURLUcode curl_url_get(const CURLU *handle, ...)` as urlapi.h:133 writes
+# it. Under either alternative every existing caller would have to be
+# rewritten, which for a drop-in replacement is not a style preference.
+style = "type"
+
+# Follows the repository convention CURLINC_<NAME>_H, as urlapi.h:1-2 opens
+# CURLINC_URLAPI_H and 155 closes it. A deliberately distinct name: were
+# both headers ever reachable from one translation unit, a shared guard
+# would silently suppress whichever came second.
+include_guard = "CURLINC_URLAPI_RS_H"
+
+# #pragma once is not a standard directive and urlapi.h does not use it. The
+# include guard above is the whole mechanism.
+pragma_once = false
+
+# Emit the #ifdef __cplusplus / extern "C" { ... } wrapper that urlapi.h
+# carries at 29-31 and 151-153, so a C++ translation unit including the
+# mirror links against the crate's C symbols rather than looking for mangled
+# ones. Divergence 2 above is the price, and it is worth paying.
+cpp_compat = true
+
+# The mirror is the only header in play in Mode B, so it has to stand alone.
+# Two reasons this is switched on rather than left to the default:
+#
+#   - urlapi.h:27 includes "curl.h" to pick up CURL_EXTERN. That machinery
+#     is not wanted here. There is no libcurl in a standalone link, and the
+#     mirror declares the same functions without any visibility decoration.
+#   - cbindgen's default include block names stdbool.h, which is C99. The
+#     output has to be C89, so the block cannot be allowed through.
+#
+# This is safe only because the public surface uses nothing beyond char,
+# unsigned int, void and the crate's own three types. Should a future
+# signature need a fixed-width or size type, no_includes has to give way to
+# a specific sys_includes entry rather than being worked around.
+no_includes = true
+
+# Both lists are empty and both are stated rather than omitted, so that the
+# absence of an include reads as a decision. no_includes above overrides
+# them in any case.
+includes = []
+sys_includes = []
+
+# Carry the Rust doc comments through. This is what reproduces urlapi.h's
+# own commentary, and in particular the two memory-ownership notes that the
+# header states and the manual pages repeat: that curl_url_cleanup() does
+# not free strings previously returned by the URL API (116-118), and that
+# the pointer curl_url_get() hands back MUST be freed with curl_free()
+# afterwards (130-131). Those two sentences are the highest-risk part of the
+# whole port, so they belong in front of every C caller, not just in
+# docs/MEMORY-OWNERSHIP.md.
+documentation = true
+
+# "doxy" writes /** then " * text" then " */". That is one character from
+# urlapi.h's own /* then " * text" then " */", and it is the closest of the
+# four available styles. The two remaining choices are ruled out rather than
+# merely not preferred: "c99" writes // and "cxx" writes ///, neither of
+# which is a comment in C89. "auto" happens to resolve to "doxy" for C
+# today, but naming the style outright means a change to that mapping cannot
+# quietly turn the output into something a C89 compiler rejects.
+documentation_style = "doxy"
+
+# "full", not "short". "short" keeps only the first line of each comment,
+# which would truncate every multi-line note in urlapi.h -- including both
+# ownership notes, whose operative sentence is not the first one.
+documentation_length = "full"
+
+# curl style: the open brace stays on the line that introduces the block,
+# as in `typedef enum {` at urlapi.h:34.
+braces = "SameLine"
+
+# 79 columns, which is what .editorconfig sets for *.{c,h} and what
+# scripts/checksrc.pl enforces as max_column. The generated header is a
+# tracked C header, so it is subject to both. Together with the [fn] args
+# setting below this is what breaks curl_url_get() and curl_url_set() across
+# lines instead of emitting a 90-column declaration.
+line_length = 79
+
+# Two spaces, matching .editorconfig indent_size for *.{c,h} and the
+# enumerator indentation in urlapi.h:35-67. Nothing emits a tab: the value
+# is a width in spaces, and scripts/spacecheck.pl rejects tabs outright.
+tab_width = 2
+
+# LF, explicitly, and never the platform default. scripts/spacecheck.pl
+# requires LF line endings for this path, so generating on a CRLF host must
+# not produce a header that fails the gate.
+line_endings = "LF"
+
+# Keep source order for every category. Sorting is refused, not overlooked,
+# and for two separate reasons:
+#
+#   - Alphabetical order would scramble the 16 CURLU_* flags out of bit
+#     order, so CURLU_ALLOW_SPACE (1 << 11) would print above
+#     CURLU_DEFAULT_PORT (1 << 0). urlapi.h:84-105 lists them by bit, and
+#     that ordering is the only thing that makes the sequence readable.
+#   - src/ffi.rs declares the six functions in urlapi.h's own order, which
+#     is also alphabetical, so sorting buys nothing there. What it would
+#     cost is the drift check: a future reordering would be silently
+#     normalised away instead of showing up in the diff.
+#
+# [fn] and [const] below restate this so that neither can inherit a
+# different default later.
+sort_by = "None"
+
+# Map Rust usize to size_t rather than uintptr_t. The six public functions
+# use neither, so this changes nothing in the emitted header; it is set
+# because it is the correct correspondence for this port, and the three
+# internal entry points that do take size_t (lib/urlapi-int.h:28-33) would
+# otherwise be described wrongly if they were ever exposed. Note the
+# coupling with no_includes above: size_t needs stddef.h, so a signature
+# that starts using it forces that decision to be revisited.
+usize_is_size_t = true
+
+# No version comment from either source. Both are off deliberately, and for
+# the same reason as autogen_warning below: the crate version and the
+# cbindgen version both move, and either one printed into the output would
+# make the generated file differ from the committed one on every bump. The
+# diff has to mean something.
+package_version = false
+include_version = false
+
+# The verbatim 23-line curl licence box, copied byte for byte from
+# docs/examples/urlapi.c:1-23, which is itself identical to
+# include/curl/urlapi.h:3-25. Its last annotation line carries the SPDX
+# identifier for the curl licence, and that is what satisfies `reuse lint`
+# for the generated header. Note that the tag is deliberately not spelled out
+# anywhere in this comment block: `reuse` scans the whole file for it and
+# reads the remainder of the line as a licence expression, so a mention in
+# running prose is reported as an invalid expression.
+#
+# Three mechanical details, the first two established by running the
+# generator rather than by reading about it:
+#
+#   - This is a TOML literal string, ''' rather than """. A basic string
+#     would try to interpret the backslashes in the box art -- \___ and
+#     \_\_____ -- as escape sequences, and \_ is not a valid one, so the
+#     whole file would fail to parse.
+#   - The closing ''' sits on the last line of the box, not on a line of its
+#     own, which is why that one line runs past 79 columns. A trailing
+#     newline inside this value makes cbindgen emit two blank lines before
+#     the include guard, and scripts/spacecheck.pl rejects consecutive blank
+#     lines in the tracked header. The long line is the lesser cost, and
+#     .editorconfig sets no line length for TOML.
+#   - Every byte below is ASCII, which scripts/spacecheck.pl requires both of
+#     this file and of the generated header. The box art is drawn from
+#     _ | / \ ( ) < > and spaces alone, so it survives that rule despite
+#     looking like exactly the sort of thing that would not.
+header = '''
+/***************************************************************************
+ *                                  _   _ ____  _
+ *  Project                     ___| | | |  _ \| |
+ *                             / __| | | | |_) | |
+ *                            | (__| |_| |  _ <| |___
+ *                             \___|\___/|_| \_\_____|
+ *
+ * Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+ *
+ * This software is licensed as described in the file COPYING, which
+ * you should have received as part of this distribution. The terms
+ * are also available at https://curl.se/docs/copyright.html.
+ *
+ * You may opt to use, copy, modify, merge, publish, distribute and/or sell
+ * copies of the Software, and permit persons to whom the Software is
+ * furnished to do so, under the terms of the COPYING file.
+ *
+ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
+ * KIND, either express or implied.
+ *
+ * SPDX-License-Identifier: curl
+ *
+ ***************************************************************************/'''
+
+# Which items reach the header at all. The mirror must expose exactly what
+# include/curl/urlapi.h exposes, so this section is a filter first and a
+# convenience second.
+[export]
+# Additive only. cbindgen already pulls in every type an exported function
+# mentions, so all three of these arrive anyway; naming them states which
+# types the public contract consists of, and keeps them in the header even
+# if a future refactor stopped mentioning one of them in a signature. It is
+# emphatically not a whitelist -- library.rs adds these to the dependency
+# set and filters nothing -- so adding a name here can never remove
+# anything, and item_types below is where the real restriction lives.
+include = ["CURLU", "CURLUcode", "CURLUPart"]
+
+# Removed by item name, across functions, enums, structs, unions, opaque
+# items, typedefs, globals and constants alike.
+#
+# The first three are real exports of the crate: src/ffi.rs defines them
+# because the object file this crate replaces defines them, and lib/http1.c,
+# lib/url.c, lib/http.c, lib/doh.c and lib/http2.c call them. They are
+# declared for C consumers in lib/urlapi-int.h:28-33, an internal header,
+# and they are no part of the public contract. A drop-in has to export them;
+# a mirror of urlapi.h must not declare them.
+#
+# Curl_parse_port is listed for completeness rather than necessity. It
+# exists only in unit-test builds, behind lib/urlapi-int.h:36-37, and it is
+# out of scope for this port because it takes curl's own struct dynbuf
+# across the boundary. Naming it means that if it were ever added to
+# src/ffi.rs it still could not leak into the public header by accident.
+#
+# curl_free is the entry that deserves the explanation. The crate really
+# does export it under the cfree feature, because in a standalone link
+# nothing else supplies it and the documented contract that a buffer from
+# curl_url_get() is released with curl_free() still has to hold. But it
+# belongs to include/curl/curl.h's surface, not urlapi.h's, so a one-for-one
+# mirror of urlapi.h:34-149 cannot declare it. The consequence is worth
+# stating plainly for whoever writes the standalone consumers: in Mode B the
+# declaration has to come from the caller's own prototype or from the
+# harness shim header, not from this file's output.
+exclude = [
+  "Curl_is_absolute_url",
+  "Curl_junkscan",
+  "Curl_url_set_authority",
+  "Curl_parse_port",
+  "curl_free",
+]
+
+# The real restriction, and the reason no struct body can ever appear in a
+# header that mirrors one containing no structs at all. Each entry earns its
+# place, and each omission is deliberate:
+#
+#   constants   the 16 CURLU_* flag bits. cbindgen preserves the shift
+#               expression rather than folding it, so `1 << 14` in Rust
+#               emits `#define CURLU_GET_EMPTY (1 << 14)`, matching
+#               urlapi.h:84-105 including the parentheses. Because that
+#               works, the flags are generated from the code and the
+#               trailer fallback is not used -- see the note at the end of
+#               this file.
+#   enums       CURLUcode and CURLUPart.
+#   opaque      the CURLU handle. The Rust handle is an ordinary Rust struct
+#               and so is not repr(C), which is precisely what makes
+#               cbindgen classify it as opaque and emit a forward
+#               declaration with no body, exactly as urlapi.h:107 does.
+#   typedefs    any Rust type alias in the public surface.
+#   functions   the six declarations.
+#
+#   structs     omitted, and this is the structural guarantee that the
+#               opaque handle can never acquire a body. If a future change
+#               made the handle repr(C), cbindgen would reclassify it as a
+#               struct and want to print its fields; with "structs" absent
+#               it simply is not generated, and the missing declaration
+#               shows up in the diff instead of the field list leaking into
+#               the ABI contract.
+#   unions      omitted for the same reason. urlapi.h declares none.
+#   globals     omitted. The crate exports no mutable global, and a header
+#               that declared one would be describing a surface the C
+#               original does not have.
+#
+# One coupling with the Rust side follows from listing "constants", and it is
+# worth stating because it is silent when it goes wrong: cbindgen only sees
+# an item declared `pub` at its definition site. A flag written as
+# `pub(crate) const` simply does not appear -- generating with one of the
+# sixteen changed that way produced fifteen #define lines rather than sixteen
+# -- and a `pub use` re-export of a `pub(crate)` constant does not rescue it
+# either. Both were tried. So the 16 CURLU_* constants have to be `pub` where
+# they are defined. If a diff against the committed header ever shows flags
+# missing, that is the first thing to check, and the fix belongs in the Rust
+# source rather than here.
+item_types = ["constants", "enums", "opaque", "typedefs", "functions"]
+
+# Moot while both the rename table and the prefix are empty, and set
+# explicitly so the interaction between them is on the record rather than
+# left to be rediscovered: with this false a rename would still have the
+# prefix applied on top of it.
+renaming_overrides_prefixing = false
+
+# There is deliberately no `prefix` key in this section. A prefix would turn
+# CURLUcode into something else and every symbol with it, which is an ABI
+# break of the plainest kind. The absence is the setting.
+
+# Empty, and present so that the emptiness is legible. Every name has to
+# arrive in C exactly as the Rust item spells it: curl_url,
+# curl_url_cleanup, curl_url_dup, curl_url_get, curl_url_set,
+# curl_url_strerror, and the types CURLU, CURLUcode and CURLUPart. Callers
+# link against those names and switch on those types numerically, so any
+# entry added below would be an ABI break rather than a cosmetic change.
+[export.rename]
+
+# No mangling of any kind. Note the narrow reach of this section, which its
+# name does not advertise: both keys govern only the names cbindgen invents
+# for itself, that is the names it synthesises when monomorphising a generic
+# type (mangle.rs) and the separator it uses when building the union members
+# of a tagged enum (enumeration.rs). Neither touches an ordinary item name --
+# CURLUcode and CURLU_DEFAULT_PORT are safe from them regardless, and the
+# keys that could rewrite those are [export.rename] and the absent `prefix`
+# above. Nothing in this crate's public surface is generic and neither
+# enumeration carries data, so both settings are inert today. They are pinned
+# to their neutral values so that a generic entering the surface later cannot
+# have a name invented for it in a shape the published contract does not use.
+[export.mangle]
+# No case conversion on a synthesised type name.
+rename_types = "None"
+# Keep the underscore separator in a synthesised name rather than dropping
+# it, which is what cbindgen's own internal defaults do.
+remove_underscores = false
+
+# Parity for the two enumerations is positional. The numbers are not written
+# in urlapi.h at all -- CURLUE_OK has no `= 0` and the values emerge purely
+# from declaration order, with the trailing /* n */ comments as commentary
+# rather than as definitions. Every setting here exists to stop cbindgen
+# adding to, renaming or renumbering that sequence.
+[enum]
+# No case conversion on variant names. CURLUE_BAD_PARTPOINTER and
+# CURLUPART_ZONEID are spelled the way callers spell them.
+rename_variants = "None"
+
+# Applies only to the union fields cbindgen synthesises for Rust enums that
+# carry data. Both enumerations here are fieldless, so nothing is affected;
+# pinned to "None" so that the default, SnakeCase, cannot start renaming
+# something if the shape of these types ever changes.
+rename_variant_name_fields = "None"
+
+# The single most important line in this section, and the one setting here
+# whose wrong value silently changes the ABI in C as well as in C++. Turning
+# it on appends a variant literally named `Sentinel` to both enumerations,
+# after CURLUE_LAST and after CURLUPART_ZONEID, so it takes the values 33 and
+# 11 -- confirmed by generating with it on. Both are unassigned in the C
+# original, CURLUE_LAST is itself the sentinel at 32, and a value in the ABI
+# that no caller and no version of libcurl knows about is exactly the kind of
+# addition this port must not make.
+add_sentinel = false
+
+# Would emit CURLUcode_CURLUE_OK instead of CURLUE_OK, and
+# CURLUPart_CURLUPART_URL instead of CURLUPART_URL. Every existing caller
+# would stop compiling.
+prefix_with_name = false
+
+# The whole derive family is off. These generate constructors, IsX() and
+# AsX() accessors, destructors, copy constructors, copy assignment and an
+# ostream serialiser for tagged enums. Two things make them inert here:
+# enumeration.rs returns early on `language != Language::Cxx`, so they only
+# ever fire for C++, and both enumerations are plain C enumerations carrying
+# no payload in any case. They are all stated because their combined effect,
+# if one ever did fire, is to add members and symbols to a contract that must
+# gain neither -- and because a reader who finds only some of them listed
+# would reasonably wonder about the rest.
+derive_helper_methods = false
+derive_const_casts = false
+derive_mut_casts = false
+derive_tagged_enum_destructor = false
+derive_tagged_enum_copy_constructor = false
+derive_tagged_enum_copy_assignment = false
+derive_ostream = false
+private_default_tagged_enum_constructor = false
+
+# The one cbindgen default that is true rather than false, pinned here for
+# defence in depth rather than for effect. It is honoured only when language
+# is C++ -- enumeration.rs writes `enum class` under Language::Cxx alone, and
+# bindings.rs gates it on the same test -- so with language = "C" above it
+# changes nothing in today's output, which was confirmed by generating with
+# it both ways. What pinning it buys is that switching the language could not
+# quietly produce `enum class CURLUcode`, which would make an unqualified
+# CURLUE_OK an error and would refuse the implicit conversion to int that
+# every C caller of this API performs. Note that the mirror is still consumed
+# from C++, through the cpp_compat wrapper, which is why the C++ side is
+# worth defending even though the emitted language is C.
+enum_class = false
+
+# There are no must_use, deprecated, deprecated_with_note,
+# deprecated_variant, deprecated_variant_with_note or cast_assert_name keys
+# in this section. Each would decorate the output with an attribute or a
+# macro that urlapi.h does not carry, and the mirror carries nothing extra.
+
+[fn]
+# "auto" keeps a declaration on one line when it fits inside line_length and
+# breaks it one argument per line when it does not. So curl_url(),
+# curl_url_cleanup(), curl_url_dup() and curl_url_strerror() stay on one
+# line as at urlapi.h:113, 120, 126 and 149, while curl_url_get() and
+# curl_url_set() wrap. The original wraps those two at two arguments per
+# line (133-134, 141-142) and cbindgen cannot reproduce that shape, but
+# "auto" is what keeps every line inside 79 columns, which is the part that
+# matters to checksrc.
+args = "auto"
+
+# Keep the parameter names exactly as src/ffi.rs writes them, so `handle`,
+# `what`, `part` and `flags` arrive as urlapi.h spells them. This is also
+# what preserves the one cosmetic defect the port is required to reproduce
+# rather than improve: urlapi.h:149 declares curl_url_strerror with no
+# parameter name at all, while its manual page names one, and an unnamed
+# Rust parameter comes through here as an unnamed C parameter.
+rename_args = "None"
+
+# Restates the top-level choice so functions cannot inherit a different
+# default. See the sort_by note above for why sorting is refused.
+sort_by = "None"
+
+# There are no prefix, postfix, must_use, deprecated, deprecated_with_note,
+# swift_name_macro or no_return keys here. A prefix or postfix is how a
+# project injects its own CURL_EXTERN-style visibility macro; the mirror
+# deliberately injects none, because there is no libcurl in a standalone
+# link to define one and an undefined macro in front of six declarations
+# would not compile.
+
+[const]
+# Both of these only bite in C++ mode, and both are turned off so that a
+# constant is always a #define. That is what urlapi.h:84-105 uses, and it is
+# also the only form in which the (1 << n) spelling survives: a static const
+# or a constexpr would have to name a type, and the flags are passed as an
+# unsigned int bit mask rather than as values of a type.
+allow_static_const = false
+allow_constexpr = false
+
+# Restates the top-level choice. Sorting here is what would put the 16 flags
+# in alphabetical rather than bit order.
+sort_by = "None"
+
+[parse]
+# Do not follow dependencies. The crate depends on libc, and on idna when
+# the idn-pure feature is selected; neither contributes anything to this
+# header, and parsing them could only add declarations the C original does
+# not have. It is also what keeps generation fast and offline.
+parse_deps = false
+
+# Both empty, and both stated so the emptiness reads as a decision rather
+# than an omission. With parse_deps off there is nothing to exclude, and no
+# dependency is permitted to contribute a constant, a static item or a
+# function of its own.
+exclude = []
+extra_bindings = []
+
+# Do not use a fresh temporary target directory. There is nothing to expand,
+# so there is no build to isolate.
+clean = false
+
+# There is deliberately no [parse.expand] section and no `include` key. The
+# expansion path shells out to `rustc -Zunpretty=expanded`, which needs a
+# nightly toolchain, and rust-toolchain.toml pins the stable channel on
+# purpose. Nothing in this crate hides a C-visible item inside a macro, so
+# there is nothing to expand. The `include` key is omitted rather than set
+# to an empty list because an empty list is a different thing from no list:
+# it would be an empty crate whitelist rather than the absence of one.
+
+[macro_expansion]
+# Do not expand the bitflags macro. The 16 CURLU_* values are plain
+# constants in src/abi.rs, not a bitflags! type, and expansion would emit a
+# struct with a value field instead of the 16 #define lines that
+# urlapi.h:84-105 declares.
+bitflags = false
+
+# Empty, deliberately, and this key does not mean what its name suggests.
+#
+# In cbindgen a [defines] entry maps a Rust #[cfg] predicate onto a C
+# preprocessor macro name, so that a cfg-gated item comes out wrapped in
+# `#if defined(THAT_MACRO)`. It is not a way to emit a #define; the 16
+# CURLU_* flag bits are generated from the constants in src/abi.rs, as the
+# item_types note above explains.
+#
+# Two cfg predicates exist in src/ffi.rs, for the strerror and cfree
+# features, and neither gets an entry:
+#
+#   - curl_free is excluded from the header outright, so its cfg never
+#     reaches the writer at all.
+#   - curl_url_strerror must appear, because urlapi.h:149 declares it, and
+#     urlapi.h declares it unconditionally. An entry here would wrap it in
+#     `#if defined(...)` and hide it from every standalone consumer that did
+#     not happen to define the macro. Leaving the entry out is what makes
+#     the mirror declare all six public functions unconditionally, in every
+#     build configuration, exactly as the original does -- which is right
+#     even in Mode A, where the crate does not export curl_url_strerror at
+#     all because lib/strerror.c:420-531 already does.
+#
+# The cost is one line of noise, and only from the command-line tool:
+# cbindgen logs "Missing `[defines]` entry for `feature = ...`" at warning
+# level. cbindgen installs its logger in its own binary and nowhere else, so
+# used as a library from build.rs -- the genheader path, and the one that
+# actually runs -- the message is a no-op. The output is identical either
+# way.
+[defines]
+
+# SECTIONS AND KEYS DELIBERATELY ABSENT
+#
+# Absence is a setting in a file whose whole purpose is to reproduce a
+# header exactly, so the omissions are recorded here rather than left to be
+# inferred. Everything below is comment only. Note that [defines] above is
+# the last table header in the file, so a key appended past this point would
+# join that table rather than the top level; anything new belongs beside the
+# bare keys near the top.
+#
+#   after_includes  and  trailer
+#     Neither is used, because the 16 CURLU_* flag bits are generated from
+#     the Rust constants with their (1 << n) spelling intact, which is the
+#     outcome the fallback existed to approximate. Emitting them verbatim
+#     through either mechanism as well would produce a second set of
+#     #define lines; identical redefinition is legal C, but it would mean
+#     two places to keep in step, and the drift check would then be checking
+#     this file against itself rather than against the code. There is also a
+#     placement trap worth recording, established by running the generator:
+#     `trailer` is written after the guard's #endif, outside it, so a
+#     #define placed there would be re-emitted on every inclusion.
+#     `after_includes` is the slot inside the guard.
+#
+#   autogen_warning
+#     A do-not-edit banner would be correct for a file that is only ever
+#     generated. This one is committed and hand-maintained, so a banner
+#     would appear in the generated copy, be absent from the committed one,
+#     and turn every diff into noise. The same reasoning drives
+#     package_version and include_version above.
+#
+#   namespace,  namespaces,  using_namespaces
+#     C++ only. The mirror declares C, and the extern "C" wrapper is the
+#     entire extent of its C++ awareness.
+#
+#   [struct]
+#     Dead configuration, given that "structs" is absent from item_types
+#     above: no struct is generated, so nothing here could apply. Left out
+#     rather than filled in with defaults, so that item_types remains the
+#     single place the decision is expressed.
+#
+#   [layout]
+#     Supplies the annotations cbindgen needs to represent #[repr(packed)]
+#     and #[repr(align(N))] types. Nothing in the public surface has either
+#     representation. Were one ever added, cbindgen would refuse to generate
+#     it rather than emit something subtly wrong, which is the behaviour to
+#     want.
+#
+#   [ptr]
+#     Attaches non-null and nullable attributes to pointer parameters.
+#     urlapi.h attaches none, and the API's null handling is behaviour
+#     rather than annotation: a null handle returns CURLUE_BAD_HANDLE and a
+#     null part pointer returns CURLUE_BAD_PARTPOINTER. Annotating the
+#     parameters would describe a stricter contract than the one the port
+#     implements.
+#
+#   [cython]
+#     Irrelevant. language is "C".
+#
+#   only_target_dependencies
+#     Governs whether cbindgen fetches dependency sources for other target
+#     platforms. With parse_deps off no dependency source is read at all, so
+#     the key has nothing to act on.
