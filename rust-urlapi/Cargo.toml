@@ -2,106 +2,280 @@
 #
 # SPDX-License-Identifier: curl
 #
-# Manifest for the Rust re-implementation of curl's URL API (lib/urlapi.c).
+# Manifest for curl-urlapi-rs: the Rust re-implementation of curl's URL API.
+#
 # The crate is a binary-compatible, drop-in replacement for the object file
-# produced from lib/urlapi.c and exposes the identical C ABI declared in
-# include/curl/urlapi.h. Nothing outside this directory is modified.
+# produced from lib/urlapi.c. It exports the identical C ABI declared in
+# include/curl/urlapi.h, so the surrounding C code and curl's own URL API
+# test program, tests/libtest/lib1560.c, link against it unchanged.
+#
+# The crate is build-self-contained on purpose, because curl's build system
+# is not modified. The two build references the C module has today,
+# lib/Makefile.inc:267 for urlapi.c and lib/Makefile.inc:394 for
+# urlapi-int.h, stay exactly as they are: this manifest stands beside them,
+# it does not replace them. Nothing outside this directory is created,
+# edited, moved or deleted.
+#
+# The two build configurations, used verbatim by GNUmakefile and scripts/:
+#
+#   Mode A, the drop-in and authoritative configuration
+#     cargo build --release --no-default-features --features idn-libidn2
+#     Links beside a real libcurl, so the crate must not define a single
+#     symbol that libcurl already defines: strerror, cfree and scheme-table
+#     are all off.
+#
+#   Mode B, standalone
+#     cargo build --release
+#     Links with no libcurl at all, so the crate supplies curl_url_strerror,
+#     curl_free and a built-in scheme table itself, alongside the small C
+#     shims for the curl_mprintf family in harness/shims.c.
 
 [package]
 name = "curl-urlapi-rs"
 version = "0.1.0"
+# Edition 2021 is mandated, and it must not be raised: under this edition
+# the export attribute in src/ffi.rs is the plain #[no_mangle], not the
+# #[unsafe(no_mangle)] form that later editions require.
 edition = "2021"
+# The declared minimum supported Rust version. curl's own documented floor
+# is 1.73 (docs/RUSTLS.md:59) and libc's own minimum is 1.65, so the default
+# configuration clears both with room to spare. One exception is worth
+# knowing about: enabling the optional idn-pure feature raises the effective
+# minimum to 1.86 through its dependency tree, which is precisely why that
+# backend is not a default.
 rust-version = "1.75"
 license = "curl"
 description = "Binary-compatible Rust port of curl's URL API (lib/urlapi.c)"
 homepage = "https://curl.se/"
 repository = "https://github.com/curl/curl"
 readme = "README.md"
+# Declared explicitly rather than left to auto-detection, so the
+# relationship with the build script is legible. build.rs emits the link
+# directives, maps the selected features onto cfg flags, and rejects a
+# contradictory pair of IDN backends.
+build = "build.rs"
+# This crate is a drop-in artifact for one specific object file, not a
+# registry package. No ABI-versioning work is in scope either: there is no
+# SONAME design, and docs/libcurl/symbols-in-versions gains no entry,
+# because the port introduces no new public symbol. It re-implements
+# existing ones.
 publish = false
 
+# Deliberately empty, and deliberately present. It makes this directory its
+# own workspace root, which buys two things. Cargo stops walking up the tree
+# in search of a parent workspace, which it would otherwise do and fail at
+# as soon as anything above this directory grew a manifest; and Cargo.lock
+# is written here, inside the crate, rather than somewhere outside it. No
+# member, path or inheritance clause points outside this directory, because
+# the crate has to build with no help from curl's build system.
+[workspace]
+
 [lib]
+# Underscores here. This is the library name and it is distinct from the
+# hyphenated package name above; the link lines in GNUmakefile and
+# scripts/ refer to libcurl_urlapi_rs.a and libcurl_urlapi_rs.so.
 name = "curl_urlapi_rs"
-# staticlib -> the drop-in archive that replaces lib/urlapi.o
-# cdylib    -> the shared library variant
-# rlib      -> required so the crate's own tests/ binaries can link it
+# All three types earn their place.
+#
+# staticlib is the deliverable: the archive linked in place of
+# lib/urlapi.o. It contains this crate's code together with all upstream
+# Rust dependencies. Two consequences the link lines have to respect are
+# that exactly one Rust staticlib may take part in a link, since several are
+# likely to conflict, and that the archive's own dynamic dependencies have
+# to be named by hand on the link line because nothing else knows they are
+# needed.
+#
+# cdylib proves the crate is independently linkable. It exposes symbols the
+# way an executable does: a plain `pub fn` is not exported, only an
+# annotated `#[no_mangle] pub extern "C" fn` is. Since src/ffi.rs is the
+# only module carrying those attributes, nothing leaks by accident and the
+# export set stays auditable against the C object file.
+#
+# rlib is what makes `cargo test` possible at all: the integration tests
+# under tests/ link the crate as an ordinary Rust library.
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# Cargo features stand in for the C preprocessor switches, which is the
+# mapping the technical specification prescribes for C's #ifdef
+# CURL_DISABLE_* and USE_* macros expressed in the target language.
+#
+# The first three are not conveniences. They exist so the archive stays free
+# of duplicate symbols: curl already defines curl_url_strerror in
+# lib/strerror.c, curl_free in lib/escape.c and Curl_get_scheme in
+# lib/url.c, and all three of those files are out of scope and cannot be
+# touched. Getting these defaults backwards is what makes Mode A
+# unlinkable.
 [features]
-# The standalone configuration: the crate supplies everything the demo and
-# the lib1560 harness need when no real libcurl participates in the link.
+# Mode B, the standalone configuration: the crate supplies everything the
+# demo program and the lib1560 harness need when no libcurl takes part in
+# the link.
 default = ["strerror", "cfree", "scheme-table", "idn-libidn2"]
 
-# Export curl_url_strerror() plus the 33 message strings. MUST be OFF in the
-# drop-in configuration: that symbol is defined in lib/strerror.c, which is
-# out of scope, and exporting it twice breaks the link.
+# Export curl_url_strerror() and its 33 message strings. Must be off in
+# Mode A: that function is not implemented in lib/urlapi.c at all, it lives
+# in lib/strerror.c:420-531, so exporting it here as well would define the
+# symbol twice. Dropping it unconditionally is not an option either, because
+# the standalone demo is required to call it. Hence a feature rather than a
+# fixed choice.
 strerror = []
 
-# Export curl_free(). MUST be OFF in the drop-in configuration: that symbol
-# is defined in lib/escape.c.
+# Export curl_free(). Must be off in Mode A, where lib/escape.c:189 already
+# defines it. In Mode B nothing else supplies it, yet the documented
+# contract that a buffer from curl_url_get() is released with curl_free()
+# still has to hold, so the crate provides it.
 cfree = []
 
-# Compile a built-in scheme table (default ports, PROTOPT_URLOPTIONS, the
-# protocol-enabled marker). When OFF, Curl_get_scheme() is imported from
-# libcurl (lib/url.c) instead.
+# Compile a built-in scheme table: the default ports, the URL-options
+# capability bit and the protocol-enabled marker that the parser consults.
+# When off, Curl_get_scheme() is imported from libcurl instead
+# (lib/url.c:1469-1471), so the real and complete table is used and this
+# crate contributes none of its own.
 scheme-table = []
 
-# Bind libidn2 directly, replicating the call sequence in lib/idn.c for
-# bit-for-bit internationalised-domain parity (including its locale
-# sensitivity). This is the parity-preserving backend.
+# The default IDN backend: bind libidn2 directly and replicate the call
+# sequence of lib/idn.c function for function, including the version check,
+# the exact flag set, the transitional retry after a failure and the
+# rejection of a zero-length result. That is what makes bit-for-bit parity
+# attainable, libidn2's locale sensitivity included, and several lib1560
+# assertions depend on it. Parity is claimed for this backend only.
 idn-libidn2 = []
 
-# Pure-Rust IDN alternative. NOT bit-for-bit: no transitional retry, locale
-# independent, different Unicode tables, and it raises the effective minimum
-# toolchain to 1.86 through its dependency tree. Opt-in only.
+# The alternative IDN backend: the pure-Rust idna crate, so a build needs no
+# C IDN library. Opt-in only, and not bit-for-bit. It has no transitional
+# retry; it is locale-independent, where libidn2 fails outright on a
+# non-UTF-8 codeset; and it uses different Unicode tables. It also pulls in
+# thirty further crates and raises the effective minimum toolchain to 1.86,
+# above both this crate's declared 1.75 and curl's documented 1.73. The
+# divergences are recorded in docs/KNOWN-DIVERGENCES.md.
 idn-pure = ["dep:idna"]
 
-# Regenerate include/curl_urlapi_rs.h from the FFI facade at build time so
-# the mirror header cannot drift from the code.
+# Regenerate include/curl_urlapi_rs.h from the FFI facade during the build,
+# so the mirror header cannot drift away from the code it describes. Off by
+# default, because the header is committed and an ordinary build must not
+# depend on a code generator.
 genheader = ["dep:cbindgen"]
 
-# Required by cargo-c: `cargo cbuild`/`cargo cinstall` enable this feature so
-# a build script can tell a C-ABI packaging build apart from a plain one.
-# Never enabled by a normal `cargo build`.
+# Enabled by cargo-c, that is `cargo cbuild` and `cargo cinstall`, and by
+# nothing else, so build.rs can tell a C-ABI packaging build apart from an
+# ordinary one. A plain `cargo build` never switches it on.
 capi = []
 
-[dependencies]
-# C allocator entry points (so every buffer handed to C is freeable with
-# curl_free()/free()), C scalar type aliases, and the libidn2 externs used by
-# the default IDN backend. Pinned: the 1.0.0-alpha line is a pre-release and
-# must never be selected.
-libc = { version = "0.2.189", default-features = false }
+# The two IDN backends are mutually exclusive in intent, mirroring the
+# #error at lib/curl_setup.h:726-728. Cargo features are additive by
+# design, so that cannot be expressed in TOML: build.rs fails the build when
+# both are requested, and src/idn.rs rejects the combination at compile time
+# as well.
 
-# Optional, feature `idn-pure` only.
+# Provenance: every dependency comes from the public crates.io registry at an
+# exact pinned version, with the resolved set recorded in the committed
+# Cargo.lock. There is no git, path or vendored source anywhere in this file,
+# and no [patch] or [replace] section. The specification allows a vendoring
+# exception only with a documented reason, and this crate needs none.
+[dependencies]
+# The C allocator entry points, the C scalar and pointer type aliases, and
+# the libidn2 externs used by the default IDN backend. Required, and central
+# to the memory-ownership design: every buffer this crate hands to C is
+# allocated with the C allocator, so the caller's curl_free() is always the
+# correct deallocator. That rules out the idiomatic CString::into_raw route,
+# whose pointer has to come back to Rust to be released. libc's own minimum
+# toolchain is 1.65.
+#
+# Pinned to the 0.2 line on purpose. The registry also lists 1.0.0-alpha.4,
+# but that is a pre-release: Cargo will not select it for a "0.2"
+# requirement, nor even for a bare "1" one, without an explicit pre-release
+# opt-in. The version that actually resolves here is 0.2.189. Reading the
+# registry as "take the newest number shown" produces a manifest that does
+# not build, so do not "upgrade" this to the 1.0.0-alpha line.
+libc = "0.2.189"
+
+# Optional, and reachable only through the idn-pure feature. That feature
+# refers to it as dep:idna so that enabling the dependency does not also
+# create an implicit feature named after it, which keeps the feature surface
+# exactly the set declared above.
 idna = { version = "1.1.0", optional = true }
 
 [build-dependencies]
-# Optional, feature `genheader` only.
+# Optional, and reachable only through the genheader feature, which likewise
+# refers to it as dep:cbindgen.
 cbindgen = { version = "0.29.4", optional = true }
 
+# Evaluated and rejected, recorded here so they are not added later.
+# punycode implements the raw encoding algorithm only, with no case mapping
+# and no normalisation, so it cannot reproduce the standard curl actually
+# applies. idna_adapter is pulled in transitively by idna and is never a
+# direct dependency. cargo-c is a developer tool invoked from scripts/, not a
+# dependency, and must not appear under [dependencies] or
+# [build-dependencies]. Nothing to do with networking, async runtimes or
+# parser combinators belongs here either, because this module performs no
+# input or output at all.
+
 [profile.release]
+# Link-time optimisation across the crate graph, and a single code-generation
+# unit. The archive is consumed by a C link line, so there is no reason to
+# leave cross-crate inlining unused.
+#
+# One interaction is worth knowing about before concluding the setting is
+# broken: an rlib cannot be produced with full link-time optimisation, so
+# where Cargo builds all three crate types as one unit, as a plain
+# `cargo build --release` does, it quietly leaves -Clto off. The cargo-c
+# path, which is the one a C consumer actually uses, builds the archive and
+# the shared object without the rlib and does apply it.
 lto = true
 codegen-units = 1
-# A panic must never unwind across the C ABI boundary.
+# Belt and braces rather than the primary defence. Every exported function is
+# extern "C", and a panic that would escape an extern "C" function already
+# aborts instead of causing undefined behaviour, so this setting mainly makes
+# the intent explicit. The real defence is in src/lib.rs, which denies the
+# panicking constructs, that is unwrap, expect, direct indexing, an explicit
+# panic! and unchecked arithmetic, so that panics are designed out rather
+# than handled. Quietly substituting an error code for a panic would hide
+# exactly the class of bug the parity diff exists to expose.
 panic = "abort"
+# Keep the symbol table. scripts/check-abi.sh compares
+# `nm -g --defined-only` on this archive against the symbol set of the C
+# object file it replaces, and stripping would make that comparison vacuous.
 strip = false
 
-[profile.dev]
-panic = "abort"
+# The dev and test profiles are left at their defaults, panic = "unwind"
+# included. That is a decision, not an oversight: the test harness needs
+# unwinding to report a failing assertion, so panic = "abort" belongs on the
+# release profile alone. The C-ABI posture is unaffected, because aborting on
+# a panic that reaches an extern "C" boundary does not depend on the profile.
 
-# cargo-c (cargo capi) metadata. The header is committed, not generated, so
-# cargo-c must not invoke cbindgen. Nothing here wires the crate into curl's
-# own build system.
+# cargo-c metadata, for the optional `cargo cbuild` and `cargo cinstall`
+# path. It produces the archive, the shared object, the pkg-config files and
+# the header a C consumer expects, which is the same mechanism curl's own
+# documentation already points at for consuming Rust as a C library
+# (docs/RUSTLS.md:56, 61-62, 68).
+#
+# This is packaging support and nothing more. All of it lives inside this
+# directory: none of it wires the crate into curl's build system, and none of
+# it needs a change to lib/Makefile.inc, CMakeLists.txt or any other build
+# file.
 [package.metadata.capi]
 min_version = "0.10.0"
 
 [package.metadata.capi.header]
-name = "curl_urlapi_rs"
-subdirectory = false
+# The mirror header is committed under include/, so cargo-c must not run its
+# own generator and emit a second, competing header. Regeneration is the
+# genheader feature's job instead.
 generation = false
+# Install as include/curl_urlapi_rs.h rather than into a per-crate
+# subdirectory. That keeps the pkg-config Cflags at -I${includedir} and lets
+# the demo include "curl_urlapi_rs.h" unqualified.
+subdirectory = false
+
+[package.metadata.capi.install.include]
+# With generation switched off there is nothing for cargo-c to emit, so the
+# committed header is installed explicitly. Without this the cargo-c path
+# would ship a library with no header at all.
+asset = [{ from = "include/curl_urlapi_rs.h" }]
 
 [package.metadata.capi.library]
 name = "curl_urlapi_rs"
-include_impl_deps = true
+# No ABI-versioning work is in scope, so no versioned SONAME chain is
+# produced and the shared object stays plain libcurl_urlapi_rs.so.
+versioning = false
 
 [package.metadata.capi.pkg_config]
 name = "curl_urlapi_rs"
