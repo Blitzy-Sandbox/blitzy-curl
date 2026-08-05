@@ -38,7 +38,7 @@
 //!
 //! | Section | Contents | Consumer |
 //! |---------|----------|----------|
-//! | 1 | The C allocator and [`CBlock`], the owned block every C-visible buffer is built on | `src/alloc.rs`, `src/dynbuf.rs` |
+//! | 1 | The C allocator and `CBlock`, the owned block every C-visible buffer is built on | `src/alloc.rs`, `src/dynbuf.rs` |
 //! | 2 | `inet_sys`, the platform `inet_pton` and `inet_ntop` | `src/inet.rs` |
 //! | 3 | `idn2`, the libidn2 binding | `src/idn.rs` |
 //! | 4 | `scheme_import`, libcurl's own `Curl_get_scheme` | `src/scheme.rs` |
@@ -119,7 +119,7 @@
 //!
 //! The allocator primitives are as thread-safe as the C allocator beneath
 //! them, which is to say fully so on every target this crate builds for.
-//! [`CBlock`] holds a raw pointer and is therefore neither `Send` nor
+//! `CBlock` holds a raw pointer and is therefore neither `Send` nor
 //! `Sync`, matching the URL API's own posture: a `CURLU` handle and the
 //! strings it owns are not safe to share across threads either.
 
