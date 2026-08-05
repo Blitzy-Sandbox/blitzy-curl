@@ -165,8 +165,8 @@ int curl_msnprintf(char *buffer, size_t maxlength, const char *format, ...)
    L1478, or to the C library's own deallocator at L1484. first.h defines
    neither CURL_MEMDEBUG nor BUILDING_LIBCURL, so the third arm is the one
    in force, and it is also the only arm that suits buffers the crate took
-   straight from the C allocator: the tracking arm would reject or
-   mis-account them, and the hook arm would mean importing a
+   straight from the C allocator: the tracking arm would reject them or
+   account for them wrongly, and the hook arm would mean importing a
    libcurl-private symbol and still not satisfying the tracking table.
    That is constraint R3, reported here and deliberately not worked
    around; the full ownership chain is in ../docs/MEMORY-OWNERSHIP.md. */

@@ -74,7 +74,7 @@
    symlink lib1560.c -> tests/libtest/lib1560.c beside a copy of ./first.h,
    then compiles this file with
 
-     -DHARNESS_TEST_SOURCE='"lib1560.c"' -I<stage> -Iinclude
+     -DHARNESS_TEST_SOURCE='"lib1560.c"' -I <stage> -I include
 
    A quoted include is searched in the directory of the file holding the
    directive before any -I path, so HARNESS_TEST_SOURCE misses here -- the

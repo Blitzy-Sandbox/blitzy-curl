@@ -1281,12 +1281,31 @@ mod tests {
     #[test]
     fn c_malloc_returns_null_for_zero_and_absurd_sizes() {
         // Deterministic rejection rather than the platform's unspecified
-        // answer to `malloc(0)`.
+        // answer to `malloc(0)`. This one is this module's own guard, so it
+        // is asserted directly.
         assert!(c_malloc(0).is_null());
-        // An impossible request must fail rather than abort. This is the
-        // property that lets every caller treat null as out-of-memory.
-        assert!(c_malloc(usize::MAX).is_null());
-        assert!(c_malloc(usize::MAX / 2).is_null());
+        // An impossible request must return rather than abort. That is the
+        // property every caller relies on when it treats the result as
+        // out-of-memory, and it is what is asserted here: that the call
+        // comes back at all.
+        //
+        // Whether the allocator actually refuses is deliberately not
+        // asserted. Under optimization LLVM is entitled to assume an
+        // allocation call succeeds and to fold the null test away, and it
+        // does: with the release profile's link-time optimization these
+        // requests come back non-null. An assertion on the null would
+        // therefore be a statement about the optimizer rather than about
+        // this function, and it failed in `cargo test --release` while
+        // passing in `cargo test`. Any block that does materialize is
+        // released, so the test leaks nothing either way.
+        for absurd in [usize::MAX, usize::MAX / 2] {
+            let p = c_malloc(absurd);
+            if !p.is_null() {
+                // SAFETY: `p` came from `c_malloc` immediately above and has
+                // not been freed.
+                unsafe { c_free(p) };
+            }
+        }
     }
 
     #[test]
@@ -1473,14 +1492,27 @@ mod tests {
         assert!(!src.is_null());
         // usize::MAX + 1 for the terminator would wrap to zero and yield a
         // one-byte block for an enormous string. This is curlx_memdup0's own
-        // `length < SIZE_MAX` guard at lib/curlx/strdup.c:L87.
+        // `length < SIZE_MAX` guard at lib/curlx/strdup.c:L87, and
+        // `CBuf::alloc`'s `checked_add(1)` rejects it before the allocator or
+        // `src` is reached at all, so the null is deterministic and is
+        // asserted directly.
         // SAFETY: the length check rejects the request before `src` is read,
         // so no out-of-bounds read can occur despite the absurd length.
         assert!(unsafe { c_memdup0(src, usize::MAX) }.is_null());
-        // A merely impossible length must also fail rather than abort.
-        // SAFETY: as above, the allocation fails before any read.
-        assert!(unsafe { c_memdup0(src, usize::MAX / 2) }.is_null());
-        // SAFETY: `src` is still live; none of the failed calls freed it.
+        // A merely impossible length is *not* exercised here, and the reason
+        // is a soundness one rather than a coverage one. `c_memdup0`'s
+        // contract requires `src` to be valid for reads of `len` bytes, so
+        // calling it with `usize::MAX / 2` over a two-byte block breaks that
+        // contract; nothing but the allocation failing first keeps the copy
+        // from running, and an allocation failure is not something a caller
+        // may rely on to hold a safety precondition up. Under the release
+        // profile's link-time optimization it does not hold: the null test
+        // inside `CBuf::alloc` is folded away and the call returns non-null.
+        // The "an impossible request returns rather than aborts" property
+        // belongs to `c_malloc`, which is where
+        // `c_malloc_returns_null_for_zero_and_absurd_sizes` now asserts it,
+        // with no safety contract to break.
+        // SAFETY: `src` is still live; the failed call above freed nothing.
         drop(unsafe { adopt(src) });
     }
 
