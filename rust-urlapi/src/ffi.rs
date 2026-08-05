@@ -43,24 +43,31 @@
 //! | 3 | `idn2`, the libidn2 binding | `src/idn.rs` |
 //! | 4 | `scheme_import`, libcurl's own `Curl_get_scheme` | `src/scheme.rs` |
 //! | 5 | `test_locale`, the locale and codeset probes | `src/idn.rs` tests |
+//! | 6 | `exports`, the ten exported C-linkage symbols | the C side |
 //!
 //! Sections 2 through 5 are each selected by a configuration switch, so which
 //! of them a given build contains depends on the target and the feature set;
 //! they are named in plain text above rather than linked for that reason.
 //! Section 1 is unconditional.
 //!
-//! # What is not here yet
+//! # What the archive exports
 //!
-//! The eight exported C-linkage symbols this file will also hold --
-//! `curl_url`, `curl_url_cleanup`, `curl_url_dup`, `curl_url_get`,
-//! `curl_url_set`, `Curl_is_absolute_url`, `Curl_junkscan` and
-//! `Curl_url_set_authority` -- together with the two feature-gated exports
-//! `curl_url_strerror` and `curl_free`, are added when the layers they
-//! delegate to exist: `src/handle.rs` is in place, `src/getset.rs` and
-//! `src/parse/` are not. Nothing in the crate carries `#[no_mangle]` until
-//! then, which is exactly what `scripts/check-abi.sh` expects of an
-//! incomplete tree: an archive that exports nothing rather than one that
-//! exports a subset.
+//! Section 6 holds the eight symbols an archive must export to stand in for
+//! the object file `lib/urlapi.c` produces -- `curl_url`,
+//! `curl_url_cleanup`, `curl_url_dup`, `curl_url_get`, `curl_url_set`,
+//! `Curl_is_absolute_url`, `Curl_junkscan` and `Curl_url_set_authority` --
+//! together with the two feature-gated ones, `curl_url_strerror` and
+//! `curl_free`, which exist for the standalone link and **must be off in
+//! drop-in mode** because `strerror.c.o` and `escape.c.o` already define
+//! them. That is the whole set: `scripts/check-abi.sh` compares it against
+//! the C object's, and nothing else in the crate carries `#[no_mangle]`
+//! outside `#[cfg(test)]`, which is what keeps the archive collision-free.
+//!
+//! Every one of the ten is a thin skin: it validates the pointers, converts
+//! the representations, and delegates. `src/getset.rs` owns the get and set
+//! logic, `src/parse/` the parser stages and the authority setter, and
+//! `src/handle.rs` the handle itself. No parsing decision is made in this
+//! file.
 //!
 //! # Memory ownership, in one place
 //!
@@ -2122,6 +2129,553 @@ pub(crate) mod scheme_import {
 
 // ==========================================================================
 // Section 5 -- the locale and codeset probes
+// ==========================================================================
+// SECTION 6: THE EXPORTED C-LINKAGE SYMBOLS
+// ==========================================================================
+
+/// The ten exported symbols: the crate's whole public face.
+///
+/// Eight of them are unconditional and are exactly the eight globals
+/// `nm -g --defined-only` reports for the object file `lib/urlapi.c` produces:
+/// the five public functions of `include/curl/urlapi.h` L113-L145 and the
+/// three internal entry points of `lib/urlapi-int.h` L28-L33. Replacing that
+/// object file in a libcurl archive needs all eight, because the three
+/// internal ones have real consumers -- `lib/http1.c` L220, `lib/url.c` L1661
+/// and `lib/http.c` L1177 for `Curl_is_absolute_url`, `lib/doh.c` L1127 for
+/// `Curl_junkscan`, and `lib/http2.c` L739 for `Curl_url_set_authority`.
+///
+/// The other two are feature-gated and **must be off in drop-in mode**:
+/// `curl_url_strerror` is defined in `lib/strerror.c` L420-L531 and
+/// `curl_free` in `lib/escape.c` L189-L192, both of which stay in the archive,
+/// so exporting either unconditionally would be a duplicate definition. They
+/// exist for the standalone link, where no libcurl participates and the demo
+/// still has to be able to call them.
+///
+/// # Why this is a submodule rather than ten items at file scope
+///
+/// One name: section 1 already has a `curl_free`, the crate-internal release
+/// path every owned buffer ends at, and the export of the same name is a
+/// different function with a different job. A submodule keeps both, which is
+/// better than renaming a helper that a dozen call sites and several documents
+/// already refer to. `#[no_mangle]` ignores module nesting entirely, so the
+/// symbol table is the same either way.
+///
+/// # The preconditions, and the three places the C would fault
+///
+/// `curl_url_get` and `curl_url_set` have documented answers for a null
+/// handle and a null part pointer, `CURLUE_BAD_HANDLE` and
+/// `CURLUE_BAD_PARTPOINTER`, and those are reproduced exactly at L1548-L1552
+/// and L1817-L1818.
+///
+/// Three entry points have no such answer because the C never asks the
+/// question: `curl_url_dup` dereferences its argument at L1314 without
+/// testing it, and `Curl_is_absolute_url` and `Curl_url_set_authority` both
+/// call `strlen` on theirs. A null there is undefined behaviour in the C and
+/// cannot be "reproduced"; each one below returns instead the answer its
+/// caller already has to handle -- a null handle from the duplicator, which is
+/// what an allocation failure gives, zero from the absolute-URL test, and
+/// `CURLUE_MALFORMED_INPUT` from the authority setter. Every real caller in
+/// the tree passes a non-null pointer, so no behaviour visible to libcurl
+/// changes.
+///
+/// # `bool` across the boundary
+///
+/// Two of the internal entry points take a `bool`. `lib/curl_setup.h` L849
+/// includes `<stdbool.h>` on every platform this crate is built for, so C's
+/// `bool` is `_Bool`: one byte holding 0 or 1, which is exactly Rust's `bool`.
+/// Assignment to a `_Bool` normalises any nonzero value to 1, so a caller
+/// cannot hand over a bit pattern Rust would consider invalid. The pre-C99
+/// fallback at L1008, `typedef int bool`, would make the two disagree, and no
+/// supported target selects it.
+pub(crate) mod exports {
+    use core::ffi::{c_char, c_uint, c_void, CStr};
+    use core::{mem, ptr, slice};
+    use libc::size_t;
+
+    use crate::abi::{
+        CURLUPart, CURLUcode, CURLUE_BAD_HANDLE, CURLUE_BAD_PARTPOINTER, CURLUE_MALFORMED_INPUT,
+        CURLUE_OK,
+    };
+    use crate::getset::{url_get, url_set};
+    use crate::handle::CurlUrl;
+    use crate::parse::junk::junkscan;
+    use crate::parse::scheme::is_absolute_url;
+
+    /// The handle `include/curl/urlapi.h` L107 declares as an incomplete type.
+    ///
+    /// `typedef struct Curl_URL CURLU;` never gains a definition in any public
+    /// header, so C can only ever hold a pointer to it and this crate is free
+    /// to choose the layout -- which is what makes the port tractable at all
+    /// (plan 0.3.3, "layout freedom follows from opacity"). The Rust type is
+    /// [`CurlUrl`], and the signatures below name it directly: from C's side a
+    /// pointer is a pointer, and naming the real type keeps the ownership
+    /// documentation on each function honest.
+    ///
+    /// The one property the layout must have is that `malloc` alignment is
+    /// enough for it, since [`curl_url`] allocates the block with the C
+    /// allocator exactly as L1290 does. The assertion below is that check,
+    /// made at compile time: `malloc` guarantees alignment suitable for any
+    /// fundamental type, which is sixteen bytes on every target this crate
+    /// builds for, and the handle is a group of pointers and small integers.
+    const HANDLE_FITS_MALLOC_ALIGNMENT: () = {
+        assert!(
+            mem::align_of::<CurlUrl>() <= 16,
+            "the handle needs stricter alignment than malloc guarantees; \
+             curl_url() would have to allocate differently"
+        );
+    };
+
+    /// Allocates a zeroed handle block and constructs a handle in it.
+    ///
+    /// `curlx_calloc(1, sizeof(struct Curl_URL))` at `lib/urlapi.c` L1290 and
+    /// L1312, plus the one thing C does not need: an initialised value. A
+    /// zeroed block is a valid `struct Curl_URL` in C and is *not* necessarily
+    /// a valid `CurlUrl` in Rust, because nothing promises that all-zero bits
+    /// spell `None` for an owned buffer. So the constructor is written into
+    /// the block before any reference to it exists, and the calloc's zeroing
+    /// is immediately overwritten -- kept anyway, because using `malloc` here
+    /// would change which allocator call the port makes and
+    /// `tests/data/test1560` counts those.
+    ///
+    /// # Ownership
+    ///
+    /// **The caller owns the returned block** and must release it with
+    /// [`curl_url_cleanup`], which is the obligation
+    /// `include/curl/urlapi.h` L109-L110 places on the C caller.
+    ///
+    /// # Returns
+    ///
+    /// Null when the allocation fails, which is what C returns and what every
+    /// caller of `curl_url()` already tests for.
+    fn new_handle() -> *mut CurlUrl {
+        // The compile-time alignment proof has to be reachable to be
+        // evaluated; referencing it here costs nothing at run time.
+        let () = HANDLE_FITS_MALLOC_ALIGNMENT;
+
+        let block = super::c_calloc(1, mem::size_of::<CurlUrl>());
+        if block.is_null() {
+            return ptr::null_mut();
+        }
+        let handle = block.cast::<CurlUrl>();
+        // SAFETY: `c_calloc` returned a non-null block of exactly
+        // `size_of::<CurlUrl>()` bytes, aligned by `malloc` to at least
+        // sixteen and so to at least `align_of::<CurlUrl>()` by the assertion
+        // above. The block is uninitialised as far as Rust is concerned, which
+        // is precisely what `write` requires: it initialises without dropping
+        // whatever bits were there. No reference to the block exists yet, so
+        // there is nothing this write could alias.
+        unsafe { ptr::write(handle, CurlUrl::new()) };
+        handle
+    }
+
+    /// `curl_url()`, `lib/urlapi.c` L1288-L1291.
+    ///
+    /// # Ownership
+    ///
+    /// As [`new_handle`]: the caller owns the result and owes it a
+    /// `curl_url_cleanup()`.
+    #[no_mangle]
+    pub extern "C" fn curl_url() -> *mut CurlUrl {
+        new_handle()
+    }
+
+    /// `curl_url_cleanup()`, `lib/urlapi.c` L1293-L1299.
+    ///
+    /// # Ownership
+    ///
+    /// **Takes ownership of the handle** and of the ten buffers it holds, and
+    /// releases all eleven blocks. It does *not* release strings handed out
+    /// earlier by `curl_url_get()`, which `include/curl/urlapi.h` L116-L118
+    /// states explicitly and which falls out of the design here: those buffers
+    /// stopped being the handle's the moment `CBuf::into_raw` was called on
+    /// them.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be null or a pointer this crate's `curl_url()` or
+    /// `curl_url_dup()` returned and that has not already been cleaned up.
+    /// Calling this twice on the same pointer frees it twice.
+    #[no_mangle]
+    pub unsafe extern "C" fn curl_url_cleanup(handle: *mut CurlUrl) {
+        // L1295, `if(u)`.
+        if handle.is_null() {
+            return;
+        }
+        // SAFETY: the caller's precondition says this is a live handle from
+        // `curl_url()` or `curl_url_dup()`, so it is properly aligned,
+        // initialised, and uniquely ours to consume. `drop_in_place` runs the
+        // handle's `Drop`, which releases the ten strings -- that is
+        // `free_urlhandle(u)` at L1296 -- and leaves the block itself
+        // uninitialised but still allocated, which is exactly the state
+        // `curlx_free(u)` at L1297 expects. Nothing reads the block
+        // afterwards.
+        unsafe {
+            ptr::drop_in_place(handle);
+            super::c_free(handle.cast::<c_void>());
+        }
+    }
+
+    /// `curl_url_dup()`, `lib/urlapi.c` L1310-L1332.
+    ///
+    /// Reproduces the duplication `src/handle.rs` implements, **including the
+    /// member it does not copy**: `guessed_scheme` is absent from L1314-L1326,
+    /// so a duplicate answers differently from its original under
+    /// `CURLU_NO_GUESS_SCHEME`. That is `FB1`, recorded in
+    /// `docs/KNOWN-DIVERGENCES.md` and pinned by tests in both `src/handle.rs`
+    /// and `src/getset.rs`.
+    ///
+    /// # Ownership
+    ///
+    /// As [`curl_url`]: the caller owns the copy and owes it its own
+    /// `curl_url_cleanup()`, per `include/curl/urlapi.h` L121-L123. The
+    /// original is untouched.
+    ///
+    /// # Safety
+    ///
+    /// `input` must be null or a live handle. It is read, never written, which
+    /// is what `const CURLU *` at `include/curl/urlapi.h` L126 promises.
+    ///
+    /// # Returns
+    ///
+    /// Null if any of the ten copies cannot be allocated, which is L1306's
+    /// `goto fail` reaching L1330-L1331 -- and also null for a null input,
+    /// which the C would instead fault on; see the module documentation.
+    #[no_mangle]
+    pub unsafe extern "C" fn curl_url_dup(input: *const CurlUrl) -> *mut CurlUrl {
+        // SAFETY: the caller's precondition says `input` is null or a live
+        // handle, and `as_ref` distinguishes those two cases without
+        // dereferencing a null. The shared reference it yields never becomes a
+        // mutable one, which `const CURLU *` requires.
+        let Some(source) = (unsafe { input.as_ref() }) else {
+            return ptr::null_mut();
+        };
+
+        // L1311-L1329 in one step: `dup` performs the calloc-free part of the
+        // work and reports a failed copy as `None`, which is the `goto fail`.
+        let Some(copy) = source.dup() else {
+            return ptr::null_mut();
+        };
+
+        // L1312's allocation, moved after the copying so that a failure needs
+        // no cleanup at all. The C has to reach `curl_url_cleanup(u)` at L1330
+        // on the failure path; here the copy is simply dropped.
+        let handle = new_handle();
+        if handle.is_null() {
+            return ptr::null_mut();
+        }
+        // SAFETY: `new_handle` returned a block holding a valid, empty handle
+        // that nothing else references. Writing the copy over it initialises
+        // it a second time, which would leak the empty handle's contents if it
+        // had any -- it has none by construction, ten absent strings. `write`
+        // rather than an assignment through a reference because there is no
+        // reference to make.
+        unsafe { ptr::write(handle, copy) };
+        handle
+    }
+
+    /// `curl_url_get()`, `lib/urlapi.c` L1541-L1634.
+    ///
+    /// This function is the three preconditions and the pointer transfer; all
+    /// of the logic is `crate::getset::url_get`.
+    ///
+    /// # Ownership
+    ///
+    /// On success `*part` becomes **the caller's**, and the caller must
+    /// release it with `curl_free()` -- `docs/libcurl/curl_url_get.md` L45 and
+    /// `include/curl/urlapi.h` L130-L131. That call is correct because the
+    /// block came from the C allocator; `src/alloc.rs` documents the whole
+    /// resolution chain and the two configurations it does not support.
+    /// `curl_url_cleanup()` will not release it.
+    ///
+    /// `*part` is set to null before anything can fail, L1552, so a caller who
+    /// ignores the code cannot read a stale pointer.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be null or a live handle, and `part` must be null or
+    /// point to a writable `char *`. The handle is read, never written.
+    ///
+    /// # Returns
+    ///
+    /// `CURLUE_OK` with `*part` set, or `CURLUE_OK` with `*part` still null --
+    /// the case `crate::getset::url_get` documents, where the C stores the null
+    /// `curlx_dyn_ptr` gave it at L1399 and reports success -- or the failing
+    /// part's code.
+    #[no_mangle]
+    pub unsafe extern "C" fn curl_url_get(
+        handle: *const CurlUrl,
+        what: CURLUPart,
+        part: *mut *mut c_char,
+        flags: c_uint,
+    ) -> CURLUcode {
+        // SAFETY: as `curl_url_dup`. L1548-L1549.
+        let Some(u) = (unsafe { handle.as_ref() }) else {
+            return CURLUE_BAD_HANDLE;
+        };
+        // L1550-L1551.
+        if part.is_null() {
+            return CURLUE_BAD_PARTPOINTER;
+        }
+        // SAFETY: `part` is non-null by the test above and points to a
+        // writable `char *` by the caller's precondition. L1552.
+        unsafe { ptr::write(part, ptr::null_mut()) };
+
+        match url_get(u, what, flags) {
+            Ok(Some(buffer)) => {
+                // L1537 and L1421. OWNERSHIP CHANGES HANDS HERE: `into_raw`
+                // consumes the buffer, so this crate stops tracking the block
+                // and no `Drop` will run for it. The obligation to call
+                // `curl_free()` is now the caller's, and it is discharged
+                // correctly because the block came from the C allocator.
+                //
+                // SAFETY: `part` is writable, as above.
+                unsafe { ptr::write(part, buffer.into_raw()) };
+                CURLUE_OK
+            }
+            // Success with nothing to hand over. `*part` keeps the null
+            // written above, which is the pointer the C would have stored.
+            Ok(None) => CURLUE_OK,
+            Err(code) => code,
+        }
+    }
+
+    /// `curl_url_set()`, `lib/urlapi.c` L1805-L1998.
+    ///
+    /// As with the getter, this function is the preconditions and the string
+    /// conversion; the logic is `crate::getset::url_set`.
+    ///
+    /// # Ownership
+    ///
+    /// Nothing changes hands. `part` is **copied**, which
+    /// `include/curl/urlapi.h` L138-L140 promises, so the caller may free or
+    /// reuse it immediately. A null `part` clears the part instead, L1819-L1821.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be null or a live handle, and `part` must be null or a
+    /// pointer to a NUL-terminated string that stays valid and unmodified for
+    /// the duration of the call.
+    #[no_mangle]
+    pub unsafe extern "C" fn curl_url_set(
+        handle: *mut CurlUrl,
+        what: CURLUPart,
+        part: *const c_char,
+        flags: c_uint,
+    ) -> CURLUcode {
+        // SAFETY: the caller's precondition says `handle` is null or a live
+        // handle. `as_mut` distinguishes those without dereferencing a null,
+        // and the unique reference is sound because `curl_url_set` takes a
+        // non-const `CURLU *` at `include/curl/urlapi.h` L145 and no other
+        // reference to the handle exists during this call. L1817-L1818.
+        let Some(u) = (unsafe { handle.as_mut() }) else {
+            return CURLUE_BAD_HANDLE;
+        };
+
+        if part.is_null() {
+            // L1819-L1821: "setting a part to NULL clears it".
+            return url_set(u, what, None, flags);
+        }
+
+        // L1823's `strlen(part)`, as a borrow rather than a length.
+        //
+        // SAFETY: `part` is non-null and, by the caller's precondition, points
+        // to a NUL-terminated string valid for this call. The borrow does not
+        // outlive the statement it is used in, and nothing in `url_set`
+        // retains it: every byte that reaches the handle is copied into a
+        // freshly allocated buffer.
+        let bytes = unsafe { CStr::from_ptr(part) }.to_bytes();
+        url_set(u, what, Some(bytes), flags)
+    }
+
+    /// `Curl_is_absolute_url()`, `lib/urlapi.c` L182-L220, declared at
+    /// `lib/urlapi-int.h` L28-L29.
+    ///
+    /// # Ownership
+    ///
+    /// Nothing changes hands. `url` is read and `buf`, if given, is written in
+    /// place by the caller's own allocation.
+    ///
+    /// # Safety
+    ///
+    /// `url` must be null or a NUL-terminated string. `buf` must be null or
+    /// writable for `buflen` bytes, and the C's own precondition -- asserted at
+    /// L186 -- is that `buflen` exceeds `MAX_SCHEME_LEN` whenever `buf` is
+    /// given.
+    ///
+    /// # Returns
+    ///
+    /// The length of the scheme, or zero for a relative URL -- and zero for a
+    /// null `url`, which the C would instead fault on.
+    #[no_mangle]
+    #[allow(non_snake_case)]
+    pub unsafe extern "C" fn Curl_is_absolute_url(
+        url: *const c_char,
+        buf: *mut c_char,
+        buflen: size_t,
+        guess_scheme: bool,
+    ) -> size_t {
+        if url.is_null() {
+            return 0;
+        }
+        // SAFETY: `url` is non-null and NUL-terminated by the precondition.
+        // The borrow lives only for this call. Taking the length here is what
+        // bounds the scan at L195, which in C runs off the end only because
+        // the terminator stops it.
+        let bytes = unsafe { CStr::from_ptr(url) }.to_bytes();
+
+        if buf.is_null() {
+            // L188: the C tolerates a null buffer and every in-tree caller but
+            // one passes exactly that.
+            return is_absolute_url(bytes, None, guess_scheme);
+        }
+        // SAFETY: `buf` is non-null and writable for `buflen` bytes by the
+        // caller's precondition, and `c_char` and `u8` have the same size and
+        // alignment on every target, so the cast changes only signedness.
+        // Nothing else references those bytes during the call.
+        let out = unsafe { slice::from_raw_parts_mut(buf.cast::<u8>(), buflen) };
+        is_absolute_url(bytes, Some(out), guess_scheme)
+    }
+
+    /// `Curl_junkscan()`, `lib/urlapi.c` L223-L239, declared at
+    /// `lib/urlapi-int.h` L33.
+    ///
+    /// # Ownership
+    ///
+    /// Nothing changes hands.
+    ///
+    /// # Safety
+    ///
+    /// `url` must be null or a NUL-terminated string, and `urllen` must be
+    /// null or point to a writable `size_t`.
+    ///
+    /// # Returns
+    ///
+    /// `CURLUE_OK` with `*urllen` set to the length, L237, or
+    /// `CURLUE_MALFORMED_INPUT` -- including for a null `url`, which the C
+    /// would instead fault on. `*urllen` is written only on success, as at
+    /// L237.
+    #[no_mangle]
+    #[allow(non_snake_case)]
+    pub unsafe extern "C" fn Curl_junkscan(
+        url: *const c_char,
+        urllen: *mut size_t,
+        allowspace: bool,
+    ) -> CURLUcode {
+        if url.is_null() {
+            return CURLUE_MALFORMED_INPUT;
+        }
+        // SAFETY: as `Curl_is_absolute_url`. The `strlen` at L225 is the
+        // borrow's own length.
+        let bytes = unsafe { CStr::from_ptr(url) }.to_bytes();
+
+        match junkscan(bytes, allowspace) {
+            Ok(length) => {
+                if !urllen.is_null() {
+                    // SAFETY: `urllen` is non-null by the test and writable by
+                    // the caller's precondition. L237.
+                    unsafe { ptr::write(urllen, length) };
+                }
+                CURLUE_OK
+            }
+            Err(code) => code,
+        }
+    }
+
+    /// `Curl_url_set_authority()`, `lib/urlapi.c` L658-L675, declared at
+    /// `lib/urlapi-int.h` L31.
+    ///
+    /// Its only consumer is `lib/http2.c` L739, and it is the one entry point
+    /// that operates on a **live** handle rather than a parse temporary --
+    /// which is what makes the `FB2` finding observable at all.
+    /// `src/parse/authority.rs` owns that reproduction.
+    ///
+    /// # Ownership
+    ///
+    /// Nothing changes hands. `authority` is copied.
+    ///
+    /// # Safety
+    ///
+    /// `u` must be null or a live handle, and `authority` must be null or a
+    /// NUL-terminated string valid for the call.
+    ///
+    /// # Returns
+    ///
+    /// Whatever the authority parse reported, or `CURLUE_BAD_HANDLE` for a
+    /// null handle, or `CURLUE_MALFORMED_INPUT` for a null authority -- the
+    /// second and third being answers the C does not have, since it tests
+    /// neither pointer.
+    #[no_mangle]
+    #[allow(non_snake_case)]
+    pub unsafe extern "C" fn Curl_url_set_authority(
+        u: *mut CurlUrl,
+        authority: *const c_char,
+    ) -> CURLUcode {
+        // SAFETY: as `curl_url_set`.
+        let Some(handle) = (unsafe { u.as_mut() }) else {
+            return CURLUE_BAD_HANDLE;
+        };
+        if authority.is_null() {
+            return CURLUE_MALFORMED_INPUT;
+        }
+        // SAFETY: as `Curl_is_absolute_url`. L672's `strlen(authority)` is the
+        // borrow's own length.
+        let bytes = unsafe { CStr::from_ptr(authority) }.to_bytes();
+        crate::parse::authority::url_set_authority(handle, bytes)
+    }
+
+    /// `curl_url_strerror()`, `lib/strerror.c` L420-L531.
+    ///
+    /// **Feature-gated, and the gate is not optional.** The function is not in
+    /// `lib/urlapi.c` at all: it lives in `lib/strerror.c`, which stays in the
+    /// archive in drop-in mode, so exporting this unconditionally would define
+    /// the symbol twice. The `strerror` feature is on by default for the
+    /// standalone link, where the demo calls it and no libcurl supplies it,
+    /// and must be off for the drop-in link.
+    ///
+    /// # Ownership
+    ///
+    /// **Nothing changes hands.** The returned pointer addresses a `'static`
+    /// string literal in this object's read-only data, exactly as the C's
+    /// strings live in `strerror.c.o`. The caller must not free it, and
+    /// `docs/libcurl/curl_url_strerror.md` imposes no obligation -- unlike
+    /// `curl_url_get`, this is the one string-returning entry point of the API
+    /// whose result did not come from an allocator.
+    #[cfg(feature = "strerror")]
+    #[no_mangle]
+    pub extern "C" fn curl_url_strerror(code: CURLUcode) -> *const c_char {
+        crate::error::strerror(code)
+    }
+
+    /// `curl_free()`, `lib/escape.c` L189-L192.
+    ///
+    /// **Feature-gated for the same reason as [`curl_url_strerror`]**: the
+    /// symbol is defined in `escape.c.o`, which stays in the archive in
+    /// drop-in mode. The `cfree` feature exists so that the standalone link
+    /// can release the buffers `curl_url_get` hands out, which
+    /// `include/curl/urlapi.h` L130-L131 requires be released with exactly
+    /// this function.
+    ///
+    /// # Ownership
+    ///
+    /// **Takes ownership of the pointer and releases it.** Correct for every
+    /// pointer this crate hands out, because every one of them is a block from
+    /// the C allocator; `src/alloc.rs` documents the chain and the two
+    /// configurations reported as unsupported rather than worked around,
+    /// memory-debug builds and applications that install their own allocators.
+    ///
+    /// # Safety
+    ///
+    /// `p` must be null, or a pointer this crate handed out that has not
+    /// already been released.
+    #[cfg(feature = "cfree")]
+    #[no_mangle]
+    pub unsafe extern "C" fn curl_free(p: *mut c_void) {
+        // SAFETY: the caller's precondition is exactly `free`'s. The forward
+        // is `lib/escape.c` L191, one line.
+        unsafe { super::curl_free(p) };
+    }
+}
+
 // ==========================================================================
 
 /// The locale and codeset probes the crate's own tests need.
