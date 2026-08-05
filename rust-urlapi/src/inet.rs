@@ -13,7 +13,7 @@
 //!
 //! # The finding that shapes this module
 //!
-//! The Agent Action Plan maps this module onto `curlx_inet_pton` at
+//! This module corresponds to `curlx_inet_pton` at
 //! `lib/curlx/inet_pton.c` L207 and `curlx_inet_ntop` at
 //! `lib/curlx/inet_ntop.c` L210, and a port that translated those two
 //! functions and stopped would be **less** faithful than what is written
@@ -66,25 +66,31 @@
 //!
 //! # What this module therefore does
 //!
-//! - **Primary path**, `mod system`: delegate to the platform's
-//!   `inet_pton`/`inet_ntop`. This is the Rust spelling of the macro the
-//!   reference build expands, so agreement is structural rather than
-//!   tested-for.
-//! - **Secondary path**, `mod fallback`: curl's Vixie-derived code, ported
-//!   to safe Rust, in exactly the role it plays in curl. It is selected
-//!   where the platform pair is unavailable.
-//! - The selection is a target-based `#[cfg]`, per transformation rule T5,
-//!   compile-time capability switches replacing preprocessor switches. It
-//!   is deliberately **not** a Cargo feature: `Cargo.toml` fixes the
-//!   feature set, and inventing a seventh flag to express a platform
-//!   property would be the wrong instrument anyway.
+//! - **Primary path**, on `cfg(have_inet_pton)` / `cfg(have_inet_ntop)`:
+//!   delegate to the platform's
+//!   `inet_pton`/`inet_ntop`, declared in `crate::ffi::inet_sys`. This is
+//!   the Rust spelling of the macro the reference build expands, so
+//!   agreement with the oracle is structural rather than tested-for.
+//! - **Secondary path**, when a probe finds nothing, `mod fallback`: curl's
+//!   Vixie-derived code, ported to safe Rust, in exactly the role it plays
+//!   in curl.
+//! - The selection is two independent `cfg` pairs, one per conversion, and
+//!   each is established by a real probe rather than by an OS family.
+//!   `build.rs` compiles and links a program naming each symbol, which is
+//!   what curl's `check_symbol_exists` does for `HAVE_INET_PTON` at
+//!   `CMakeLists.txt`:1654 and `HAVE_INET_NTOP` at :1655, and it emits
+//!   `cfg(have_inet_pton)` and `cfg(have_inet_ntop)` separately. Nothing ties
+//!   the two answers together in curl, so nothing ties them together here: a
+//!   platform may provide either, both or neither. They are not Cargo
+//!   features, because `Cargo.toml` fixes the feature set and a platform
+//!   property is not a feature.
 //! - The fallback is additionally compiled under `cfg(test)` on every
 //!   target, so the two paths can be compared directly and the two known
 //!   disagreements are pinned by name rather than left to be discovered.
 //!
 //! `libc` does not declare `inet_pton` or `inet_ntop`, so the prototypes
-//! are declared in an `extern "C"` block in `mod system`. That block is the
-//! direct equivalent of the `#include <arpa/inet.h>` at
+//! are declared in an `extern "C"` block in `crate::ffi::inet_sys`. That
+//! block is the direct equivalent of the `#include <arpa/inet.h>` at
 //! `lib/curlx/inet_pton.h` L36, and it adds no dependency: `libc` still
 //! supplies the types and the address-family numbers.
 //!
@@ -101,20 +107,38 @@
 //! `#define AF_INET6 (AF_INET + 1)`. That invented number exists so that
 //! IPv6 addresses still parse where the platform offers no name for the
 //! family, and it is safe there precisely because nothing hands it to the
-//! platform. The same condition and the same invented number are
-//! reproduced below for the fallback targets, where `libc` carries no
-//! address-family constants and nothing crosses into C.
+//! platform. The same numbers are reproduced below for the fallback
+//! targets, where they are purely internal tags: the fallback selects a
+//! conversion by them and nothing crosses into C, so their values need only
+//! be distinct.
 //!
 //! # Unsafe posture
 //!
-//! Calling the platform pair is FFI, which is the one context in which
-//! specification section 1.3.2.1 permits `unsafe` outside `src/ffi.rs`.
-//! Every block is as narrow as the call it wraps and carries a `// SAFETY:`
-//! comment, per section 3.2.1.2. `mod fallback` contains no `unsafe` at
-//! all, and the surface this module presents is entirely safe: slices and
-//! arrays in, slices and integers out, so `parse/ipv6.rs` and
-//! `parse/host.rs` need no `unsafe` of their own. Concentrating it here is
-//! the point of the module.
+//! **There is none here.** Calling the platform pair is a foreign call, and
+//! every foreign call in the crate lives in `src/ffi.rs`, so the two calls
+//! sit in `crate::ffi::inet_sys` and this module holds
+//! `#![forbid(unsafe_code)]`. The interface it presents is slices and arrays
+//! in, slices and integers out, so `parse/ipv6.rs` and `parse/host.rs` need
+//! no `unsafe` of their own either. `mod fallback` below needs none by
+//! nature: every operation in it is arithmetic over `u32` and `u8` or a
+//! checked slice access.
+
+// `unsafe` belongs to `src/ffi.rs` alone; the lint keeps a future edit from
+// reintroducing one here without deleting this line first.
+#![forbid(unsafe_code)]
+// Reachability here is decided by one consumer that does not exist yet.
+// `lib/urlapi.c` L433-L435 is the only caller of this pair, and it belongs to
+// `src/parse/ipv6.rs`; until that module lands, both entry points and every
+// constant they share are unreached.
+//
+// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
+// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
+// checkpoint that creates src/getset.rs, and replaced there by one crate-level
+// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
+// src/getset.rs exist, most of this crate has no consumer, and a crate held to
+// zero warnings cannot build clean without this. Scoped to this module and to
+// this lint alone.
+#![allow(dead_code)]
 
 use libc::c_int;
 
@@ -130,31 +154,39 @@ pub(crate) const ADDRSZ_IPV6: usize = 16;
 
 /// `AF_INET`, from the platform, so that it can be passed to the
 /// platform's `inet_pton` and `inet_ntop`.
-#[cfg(unix)]
+#[cfg(any(have_inet_pton, have_inet_ntop))]
 pub(crate) const AF_INET: c_int = libc::AF_INET;
 
-/// `AF_INET` where `libc` carries no address-family constants, which is
-/// also where `mod fallback` is selected and nothing crosses into C. The
-/// number is the one every platform that names the family uses, and here
-/// it serves only to tag which of the two conversions to run.
-#[cfg(not(unix))]
+/// `AF_INET` on the non-Unix targets, where `mod fallback` is selected and
+/// nothing crosses into C.
+///
+/// This is an **internal tag**, not a platform value: the fallback selects
+/// which of the two conversions to run by comparing against it, so all that
+/// is required of the number is that it differ from `AF_INET6` below. The
+/// familiar 2 is used because it is what the C world conventionally assigns
+/// to this family, which makes a debugger session read the way a reader
+/// expects, and nothing here depends on that.
+#[cfg(not(any(have_inet_pton, have_inet_ntop)))]
 pub(crate) const AF_INET: c_int = 2;
 
 /// `AF_INET6`, from the platform, for the same reason as `AF_INET`.
-#[cfg(unix)]
+#[cfg(any(have_inet_pton, have_inet_ntop))]
 pub(crate) const AF_INET6: c_int = libc::AF_INET6;
 
-/// `AF_INET6` where the platform offers no value for it, reproducing
-/// `#define AF_INET6 (AF_INET + 1)` from `lib/urlapi.c` L63 under the same
-/// condition the C code guards it with: no platform name available. Safe
-/// for the same reason it is safe there, that this number never reaches the
-/// platform.
+/// `AF_INET6` on the non-Unix targets, the companion tag to `AF_INET`.
+///
+/// Reproduces `#define AF_INET6 (AF_INET + 1)` from `lib/urlapi.c` L63,
+/// which the C code guards with
+/// `#if !defined(USE_IPV6) && !defined(AF_INET6)` -- an invented number for
+/// the case where the platform names no value. It is safe here for the same
+/// reason it is safe there: the number never reaches the platform, and only
+/// its distinctness from `AF_INET` matters.
 ///
 /// The C expression is `AF_INET + 1`; it is spelled here as a saturating
 /// addition, which is exact at this value, because the crate root denies the
 /// bare operators and this module holds to that everywhere rather than
 /// making an exception for a constant.
-#[cfg(not(unix))]
+#[cfg(not(any(have_inet_pton, have_inet_ntop)))]
 pub(crate) const AF_INET6: c_int = AF_INET.saturating_add(1);
 
 /// `inet_pton` succeeded and the destination was written.
@@ -210,10 +242,7 @@ const _: () = {
 /// is thirty-nine, or at most six such groups followed by a dotted quad of
 /// at most fifteen bytes, which is forty-five. A seventh group before the
 /// quad fails the `(tp + INADDRSZ) <= endp` test at
-/// `lib/curlx/inet_pton.c` L156. The bound was also checked empirically:
-/// seven million random strings of length forty-six through eighty, drawn
-/// from the only byte set either parser accepts, were rejected by the
-/// system implementation and by curl's alike.
+/// `lib/curlx/inet_pton.c` L156.
 ///
 /// What is *produced* is shorter still, at most thirty-nine bytes, because
 /// the dotted-quad output at `lib/curlx/inet_ntop.c` L155-L162 is reserved
@@ -225,18 +254,41 @@ const _: () = {
 /// Both backends assert against this bound rather than merely mentioning
 /// it, so that a future edit to either scratch size cannot quietly break
 /// the reasoning that depends on it.
-const TEXT_MAX: usize = 45;
+pub(crate) const TEXT_MAX: usize = 45;
 
-/// The implementation the platform selects, standing in for the
-/// preprocessor switch at `lib/curlx/inet_pton.h` L28 and
-/// `lib/curlx/inet_ntop.h` L28.
-#[cfg(unix)]
-use self::system as backend;
+/// The parsing backend: the platform's own `inet_pton`, declared in
+/// `crate::ffi::inet_sys` because it is a foreign call and the crate keeps
+/// every one of those in one module. The selection itself stays here, next to
+/// the interface it selects for.
+///
+/// `cfg(have_inet_pton)` is `HAVE_INET_PTON` at `lib/curlx/inet_pton.h` L28,
+/// established the same way curl establishes it: `build.rs` compiles and links
+/// a probe naming the symbol, as `check_symbol_exists` does at
+/// `CMakeLists.txt`:1654. It is a probe rather than a proxy for one, so a
+/// target that is Unix without the symbol, or is not Unix and has it, is
+/// served correctly.
+#[cfg(have_inet_pton)]
+use crate::ffi::inet_sys as pton_backend;
 
-/// The implementation used where the platform pair is unavailable, which
-/// is the `#else` arm of those two switches.
-#[cfg(not(unix))]
-use self::fallback as backend;
+/// The parsing backend where the platform has no `inet_pton`: curl's own
+/// Vixie-derived code, which is the `#else` arm of that switch.
+#[cfg(not(have_inet_pton))]
+use self::fallback as pton_backend;
+
+/// The formatting backend, selected **independently** of the parsing one.
+///
+/// The independence is behaviour rather than style. Curl gates the two
+/// conversions on two macros, and decides them with one probe each --
+/// `CMakeLists.txt`:1654 for `inet_pton` and :1655 for `inet_ntop` -- with
+/// nothing tying the answers together. A platform may offer either, both or
+/// neither, so collapsing the pair into one condition would be a third policy
+/// that is neither of curl's.
+#[cfg(have_inet_ntop)]
+use crate::ffi::inet_sys as ntop_backend;
+
+/// The formatting backend where the platform has no `inet_ntop`.
+#[cfg(not(have_inet_ntop))]
+use self::fallback as ntop_backend;
 
 /// Convert a presentation-form address to its binary form.
 ///
@@ -254,7 +306,7 @@ use self::fallback as backend;
 /// Returns `PTON_SUCCESS`, `PTON_INVALID` or `PTON_ERROR`. The caller at
 /// `lib/urlapi.c` L433 accepts only the first.
 pub(crate) fn inet_pton(af: c_int, src: &[u8], dst: &mut [u8; ADDRSZ_IPV6]) -> c_int {
-    backend::pton(af, src, dst)
+    pton_backend::pton(af, src, dst)
 }
 
 /// Convert a binary address to its presentation form, in place.
@@ -284,227 +336,16 @@ pub(crate) fn inet_pton(af: c_int, src: &[u8], dst: &mut [u8; ADDRSZ_IPV6]) -> c
 /// reference libcurl round-trips `https://[1::2:3:4:5:6:7]/` unchanged for
 /// exactly that reason, and this function reproduces it.
 pub(crate) fn inet_ntop(af: c_int, src: &[u8], dst: &mut [u8]) -> Option<usize> {
-    backend::ntop(af, src, dst)
+    ntop_backend::ntop(af, src, dst)
 }
 
-/// The platform's `inet_pton` and `inet_ntop`, which is what the reference
-/// build's `curlx_inet_pton` and `curlx_inet_ntop` macros expand to.
-///
-/// This module is the crate's second FFI island after `src/ffi.rs`. It
-/// exists so that the conversion pair can be reached without `unsafe`
-/// anywhere else: the two functions below take slices and arrays, validate
-/// every precondition the C prototypes impose, and confine each `unsafe`
-/// block to the call itself.
-#[cfg(unix)]
-mod system {
-    use libc::{c_char, c_int, c_void, socklen_t};
-
-    use super::{ADDRSZ_IPV4, ADDRSZ_IPV6, AF_INET, AF_INET6, PTON_ERROR, PTON_INVALID, TEXT_MAX};
-
-    // The prototypes from `<arpa/inet.h>`, which `lib/curlx/inet_pton.h`
-    // L36 and `lib/curlx/inet_ntop.h` L36 include for exactly these two
-    // declarations. `libc` does not carry them, so they are declared here;
-    // that is the whole content of the dependency on the platform, and no
-    // additional crate is involved.
-    //
-    // The signatures are POSIX verbatim. `inet_ntop` returns `const char *`
-    // and yields the buffer it was given on success, so the returned
-    // pointer carries no information beyond null versus non-null, and the
-    // code below reads only that.
-    extern "C" {
-        fn inet_pton(af: c_int, src: *const c_char, dst: *mut c_void) -> c_int;
-        fn inet_ntop(
-            af: c_int,
-            src: *const c_void,
-            dst: *mut c_char,
-            size: socklen_t,
-        ) -> *const c_char;
-    }
-
-    /// The largest text either scratch buffer needs to hold, and so the
-    /// largest `size` worth handing to `inet_ntop`: the longest address plus
-    /// its terminator.
-    ///
-    /// Deriving it from `TEXT_MAX` rather than writing a number is what ties
-    /// the two use sites to the bound they depend on. In `ntop` it is the
-    /// cap on the size argument, which cannot change the call's outcome
-    /// because every size at or above it succeeds. In `CText` it is the text
-    /// capacity, and a text that overruns it cannot be a valid address for
-    /// either family.
-    const SIZE_CAP: usize = TEXT_MAX.saturating_add(1);
-
-    /// Bytes of scratch used to bridge between Rust slices and the
-    /// null-terminated, caller-sized buffers the C prototypes expect.
-    ///
-    /// One byte more than `SIZE_CAP`, so that an `inet_ntop` which writes
-    /// one byte beyond the size it was handed, as some have, still lands
-    /// inside the array.
-    const SCRATCH: usize = SIZE_CAP.saturating_add(1);
-
-    // Both derivations are asserted rather than left to the reader. The
-    // saturating forms above cannot saturate at these values, and the strict
-    // inequalities are what the two use sites actually rely on. The crate
-    // root denies the bare operators, which is why the derivations are
-    // spelled as method calls. The allow is the same 1.75 compatibility
-    // allow explained at the crate-level assertions.
-    #[allow(clippy::assertions_on_constants)]
-    const _: () = {
-        assert!(SIZE_CAP > TEXT_MAX);
-        assert!(SCRATCH > SIZE_CAP);
-    };
-
-    /// A null-terminated copy of an address text, on the stack.
-    ///
-    /// The C code is handed a `const char *` and scans to the terminator.
-    /// Rust hands this module a slice with no terminator, so one has to be
-    /// added, and doing it in a named type keeps the guarantee the safety
-    /// comment on the `inet_pton` call depends upon in one place: `bytes`
-    /// always contains a zero byte at or before index `SIZE_CAP`, which
-    /// `SCRATCH` exceeds.
-    struct CText {
-        bytes: [u8; SCRATCH],
-    }
-
-    impl CText {
-        /// Copy `src` up to its first zero byte, terminating the result.
-        ///
-        /// Returns `None` when the text does not fit, which is the caller's
-        /// signal to report the address invalid. That is not a shortcut:
-        /// `SIZE_CAP` exceeds `TEXT_MAX`, so no input that fails to fit can
-        /// be a valid address for either family, and the platform returns 0
-        /// for every one of them.
-        fn new(src: &[u8]) -> Option<Self> {
-            let mut text = Self {
-                bytes: [0; SCRATCH],
-            };
-            let mut len = 0usize;
-            for byte in src {
-                // A zero byte ends the address, exactly as it ends the C
-                // string at `lib/curlx/inet_pton.c` L73 and L132.
-                if *byte == 0 {
-                    break;
-                }
-                if len >= SIZE_CAP {
-                    return None;
-                }
-                *text.bytes.get_mut(len)? = *byte;
-                len = len.wrapping_add(1);
-            }
-            // The array was zero-filled and `len <= SIZE_CAP`, which is
-            // below `SCRATCH`, so the byte at `len` is still zero and the
-            // text is terminated.
-            Some(text)
-        }
-
-        /// The text as a `const char *` for the duration of the borrow.
-        fn as_ptr(&self) -> *const c_char {
-            self.bytes.as_ptr().cast()
-        }
-    }
-
-    /// `curlx_inet_pton` at `lib/curlx/inet_pton.c` L207-L219, resolved to
-    /// the platform's `inet_pton`.
-    pub(super) fn pton(af: c_int, src: &[u8], dst: &mut [u8; ADDRSZ_IPV6]) -> c_int {
-        // The switch at L209-L217, kept here rather than delegated. The
-        // platform rejects an unknown family identically, with -1 and
-        // `EAFNOSUPPORT`, so this costs no fidelity, and it buys the safety
-        // argument below its second half: the destination is known to be
-        // wide enough for whichever of the two families is in play, and no
-        // third family can reach the call.
-        if af != AF_INET && af != AF_INET6 {
-            return PTON_ERROR;
-        }
-        let Some(text) = CText::new(src) else {
-            return PTON_INVALID;
-        };
-        // SAFETY: `src` is a pointer to `text.bytes`, which `CText::new`
-        // guarantees holds a zero byte at or before index `SIZE_CAP`, an
-        // index inside the array, so the callee's scan terminates inside
-        // memory it may read in full; `text` outlives the call. `dst` is
-        // `ADDRSZ_IPV6` bytes,
-        // which is the width `AF_INET6` writes and more than the
-        // `ADDRSZ_IPV4` bytes `AF_INET` writes, and the guard above admits
-        // no other family. The two pointers cannot alias, being a shared
-        // borrow of a local and a unique borrow of the caller's array.
-        unsafe { inet_pton(af, text.as_ptr(), dst.as_mut_ptr().cast()) }
-    }
-
-    /// `curlx_inet_ntop` at `lib/curlx/inet_ntop.c` L210-L221, resolved to
-    /// the platform's `inet_ntop`.
-    pub(super) fn ntop(af: c_int, src: &[u8], dst: &mut [u8]) -> Option<usize> {
-        // The switch at L212-L220, and with it the length the family reads
-        // from `src`. An unknown family yields null there and `None` here.
-        let need = match af {
-            AF_INET => ADDRSZ_IPV4,
-            AF_INET6 => ADDRSZ_IPV6,
-            _ => return None,
-        };
-        let binary = src.get(..need)?;
-
-        // The formatting is directed into scratch rather than into `dst`.
-        // That is not a detour, it is what both C implementations do: each
-        // formats into its own `tmp` and copies to the destination only
-        // after the overflow check, at `lib/curlx/inet_ntop.c` L186-L195,
-        // which is why a failed call leaves the destination untouched. Two
-        // further properties follow from it, and the safety comment below
-        // rests on both. Nothing the callee writes can land outside a local
-        // array, whatever it does with the size it is given. And no
-        // partially formatted address can ever be observed by the caller.
-        //
-        // The size handed to the callee is `dst.len()` capped at
-        // `SIZE_CAP`. The cap cannot change the outcome: the callee fails
-        // exactly when the text plus its terminator does not fit in the
-        // size, the text is at most `TEXT_MAX` bytes, and `SIZE_CAP` is
-        // `TEXT_MAX` plus one, so every size at or above the cap succeeds
-        // and the cap picks one of them. Below the cap the size passes
-        // through unchanged.
-        let capped = if dst.len() < SIZE_CAP {
-            dst.len()
-        } else {
-            SIZE_CAP
-        };
-        // Infallible, since `capped` is at most `SIZE_CAP`. Written as a
-        // conversion rather than a cast so that the bound is enforced by the
-        // type system instead of asserted in a comment.
-        let size = socklen_t::try_from(capped).ok()?;
-        let mut scratch = [0u8; SCRATCH];
-        // SAFETY: `src` points at `binary`, which is exactly the `need`
-        // bytes the family reads, and the `get` above returned `None`
-        // rather than a short slice. `dst` points at `scratch`, a live
-        // local array of `SCRATCH` bytes, and `size` is at most `SIZE_CAP`,
-        // which the assertion above puts strictly below `SCRATCH`; so even
-        // an implementation that writes one byte beyond the size it was
-        // handed, as some have, stays inside the array. The
-        // two pointers cannot alias, being a shared borrow of the caller's
-        // slice and a unique borrow of a local.
-        let written = unsafe {
-            inet_ntop(
-                af,
-                binary.as_ptr().cast(),
-                scratch.as_mut_ptr().cast(),
-                size,
-            )
-        };
-        if written.is_null() {
-            // The C null return at L192 and L219, which `lib/urlapi.c`
-            // L435 turns into "leave the host as it was".
-            return None;
-        }
-        // The callee terminated the text, so its length is the offset of
-        // the first zero byte. `None` here would mean a null-returning
-        // contract violation, and is handled rather than assumed away.
-        let len = scratch.iter().position(|byte| *byte == 0)?;
-        // `len` bytes of text plus the terminator, which is what
-        // `curlx_strcopy` writes at `lib/curlx/strcopy.c` L45-L46. The
-        // `get_mut` is what keeps this sound if a platform ever succeeds
-        // with a text that does not fit the caller's slice: the copy is
-        // declined and the call reports failure, rather than overrunning.
-        let total = len.wrapping_add(1);
-        let target = dst.get_mut(..total)?;
-        target.copy_from_slice(scratch.get(..total)?);
-        Some(len)
-    }
-}
+// The platform pair, `inet_pton` and `inet_ntop`, is a foreign call, so it
+// lives in the crate's single unsafe module: `crate::ffi::inet_sys` holds
+// the two calls and the scratch buffer they need. This module owns the
+// interface -- the two functions above, the constants they speak in, and the
+// backend selection below -- and `crate::ffi::inet_sys` presents that
+// interface's shape back to it: slices and arrays in, slices and integers
+// out, so neither this module nor `src/parse/` needs any `unsafe`.
 
 /// Curl's own conversion pair, ported to safe Rust.
 ///
@@ -535,7 +376,7 @@ mod system {
 /// This module is compiled under `cfg(test)` on every target as well, so
 /// that the test module can hold it against the platform's implementation
 /// and pin the two places they disagree.
-#[cfg(any(not(unix), test))]
+#[cfg(any(not(have_inet_pton), not(have_inet_ntop), test))]
 mod fallback {
     use libc::c_int;
 
@@ -783,8 +624,8 @@ mod fallback {
     /// The cause is here: the colon arm at L140-L154 stores the group it
     /// has accumulated and continues, and nothing afterwards notices that
     /// the colon was the final byte, so `1::2:` and `1:2:3:4:5:6:7:8:` both
-    /// come out valid. That is reproduced faithfully, per transformation
-    /// rule T6, and pinned by a test that names both inputs.
+    /// come out valid. That is reproduced faithfully and pinned by a test
+    /// that names both inputs.
     ///
     /// [RFC 1884 2.2]: https://www.rfc-editor.org/rfc/rfc1884#section-2.2
     fn pton6(src: &[u8], dst: &mut [u8; ADDRSZ_IPV6]) -> c_int {
@@ -1172,9 +1013,10 @@ mod tests {
     const OWN: (PtonFn, NtopFn) = (fallback::pton, fallback::ntop);
 
     /// The platform's conversion pair, which is the reference build's
-    /// behavioral oracle.
-    #[cfg(unix)]
-    const SYS: (PtonFn, NtopFn) = (super::system::pton, super::system::ntop);
+    /// behavioral oracle. It lives in `crate::ffi::inet_sys`, the crate's
+    /// unsafe island, and is driven here through its safe surface.
+    #[cfg(all(have_inet_pton, have_inet_ntop))]
+    const SYS: (PtonFn, NtopFn) = (crate::ffi::inet_sys::pton, crate::ffi::inet_sys::ntop);
 
     /// A formatted address, held without an allocator so that these tests
     /// impose no requirement the crate does not already meet.
@@ -1565,7 +1407,7 @@ mod tests {
     /// Together with the test above, this is what turns the divergence
     /// table into an assertion: an `Own::Agrees` row that stopped agreeing,
     /// or an `Own::Accepts` row that started agreeing, fails here or there.
-    #[cfg(unix)]
+    #[cfg(all(have_inet_pton, have_inet_ntop))]
     #[test]
     fn the_platform_pair_matches_the_recorded_table() {
         for vector in VECTORS {
@@ -1587,7 +1429,7 @@ mod tests {
 
     /// The two backends produce byte-identical binary forms wherever both
     /// accept the input, which is the property the parity claim rests on.
-    #[cfg(unix)]
+    #[cfg(all(have_inet_pton, have_inet_ntop))]
     #[test]
     fn the_two_backends_produce_the_same_bytes() {
         let mut agreed = 0usize;
@@ -1617,7 +1459,7 @@ mod tests {
 
     /// Formatting the same bytes with either backend gives the same text,
     /// which is the half of the pair that never disagreed.
-    #[cfg(unix)]
+    #[cfg(all(have_inet_pton, have_inet_ntop))]
     #[test]
     fn the_two_backends_format_identically() {
         for vector in VECTORS {
@@ -1645,7 +1487,7 @@ mod tests {
     fn the_parse_return_value_is_a_tri_state() {
         let backends: &[(&str, (PtonFn, NtopFn))] = &[
             ("own", OWN),
-            #[cfg(unix)]
+            #[cfg(all(have_inet_pton, have_inet_ntop))]
             ("system", SYS),
         ];
         for (name, backend) in backends {
@@ -1703,7 +1545,7 @@ mod tests {
         const CANARY: u8 = 0x5A;
         let backends: &[(&str, (PtonFn, NtopFn))] = &[
             ("own", OWN),
-            #[cfg(unix)]
+            #[cfg(all(have_inet_pton, have_inet_ntop))]
             ("system", SYS),
         ];
         let cases: &[&str] = &[
@@ -1806,7 +1648,7 @@ mod tests {
     fn formatting_fails_when_the_canonical_form_grows() {
         let backends: &[(&str, (PtonFn, NtopFn))] = &[
             ("own", OWN),
-            #[cfg(unix)]
+            #[cfg(all(have_inet_pton, have_inet_ntop))]
             ("system", SYS),
         ];
         // Input, its length, and the longer canonical form it wants.
@@ -1862,7 +1704,7 @@ mod tests {
     fn formatting_is_idempotent() {
         let backends: &[(&str, (PtonFn, NtopFn))] = &[
             ("own", OWN),
-            #[cfg(unix)]
+            #[cfg(all(have_inet_pton, have_inet_ntop))]
             ("system", SYS),
         ];
         for (name, backend) in backends {
@@ -1900,7 +1742,7 @@ mod tests {
     fn over_long_input_is_rejected() {
         let backends: &[(&str, (PtonFn, NtopFn))] = &[
             ("own", OWN),
-            #[cfg(unix)]
+            #[cfg(all(have_inet_pton, have_inet_ntop))]
             ("system", SYS),
         ];
         // A run of the only bytes either parser accepts, at lengths that
@@ -1940,7 +1782,7 @@ mod tests {
     fn an_interior_terminator_ends_the_address() {
         let backends: &[(&str, (PtonFn, NtopFn))] = &[
             ("own", OWN),
-            #[cfg(unix)]
+            #[cfg(all(have_inet_pton, have_inet_ntop))]
             ("system", SYS),
         ];
         for (name, backend) in backends {
@@ -1965,7 +1807,7 @@ mod tests {
     fn the_ipv4_family_round_trips() {
         let backends: &[(&str, (PtonFn, NtopFn))] = &[
             ("own", OWN),
-            #[cfg(unix)]
+            #[cfg(all(have_inet_pton, have_inet_ntop))]
             ("system", SYS),
         ];
         let valid: &[&str] = &["0.0.0.0", "1.2.3.4", "255.255.255.255", "192.0.2.1"];
@@ -2049,7 +1891,7 @@ mod tests {
         ];
         let backends: &[(&str, (PtonFn, NtopFn))] = &[
             ("own", OWN),
-            #[cfg(unix)]
+            #[cfg(all(have_inet_pton, have_inet_ntop))]
             ("system", SYS),
         ];
         for (name, backend) in backends {
@@ -2118,7 +1960,7 @@ mod tests {
     #[test]
     fn the_address_family_constants_are_the_platforms() {
         assert_ne!(AF_INET, AF_INET6);
-        #[cfg(unix)]
+        #[cfg(all(have_inet_pton, have_inet_ntop))]
         {
             assert_eq!(AF_INET, libc::AF_INET);
             assert_eq!(AF_INET6, libc::AF_INET6);

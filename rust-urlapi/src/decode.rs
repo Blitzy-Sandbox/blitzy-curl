@@ -9,7 +9,8 @@
 //! and an object file standing in for `lib/urlapi.o` cannot borrow it back,
 //! so this module re-implements it. Nothing else from `lib/escape.c` lands
 //! here: `curl_easy_escape` at L50 goes to `src/encode.rs`, `curl_free` at
-//! L189-L192 to `src/alloc.rs`, and `Curl_hexbyte` at L222 to
+//! L189-L192 to `src/ffi.rs`, which is where the exported symbol and the
+//! `libc::free` behind it live, and `Curl_hexbyte` at L222 to
 //! `src/ctype.rs`.
 //!
 //! # The three call sites, and what each does with the result
@@ -145,9 +146,10 @@
 //!
 //! # Memory ownership
 //!
-//! The buffer comes from `src/alloc.rs` and therefore from the **C
-//! allocator**, which is what makes the caller's `curl_free()` correct.
-//! That is not a preference. Call site 1 above ends with this module's
+//! The buffer is a [`CBuf`] from `src/alloc.rs`, backed by a block
+//! `src/ffi.rs` took from the **C allocator**, which is what makes the
+//! caller's `curl_free()` correct. That is not a preference. Call site 1
+//! above ends with this module's
 //! buffer being returned from `curl_url_get()`, and both
 //! `docs/libcurl/curl_url_get.md` L45 and `include/curl/urlapi.h`
 //! L130-L131 require the caller to release it with `curl_free()`.
@@ -169,36 +171,39 @@
 //! halves of `Curl_safefree` are reproduced by construction rather than by
 //! a call.
 //!
-//! # Error precedence, and why the port scans twice
+//! # Error precedence, and the allocation shape that fixes it
 //!
 //! The C allocates at L116 and returns `CURLE_OUT_OF_MEMORY` at L119
 //! *before* it looks at a single byte of content, so on an input that is
 //! both unallocatable and full of control bytes, out-of-memory wins. This
-//! port keeps that order: the first pass only measures, the allocation
-//! happens next, and the reject test runs in the second pass, over the
-//! bytes as they are written.
+//! port keeps that order, and it keeps it the same way rather than by
+//! argument: `alloc = length + 1` is computed from the **input window**, the
+//! block is allocated, and only then does the single decode pass at
+//! L124-L146 look at anything.
 //!
-//! Two passes are not a stylistic choice. `src/alloc.rs` exposes exactly
-//! one constructor that allocates an exact size, [`CBuf::from_slice`], and
-//! the type deliberately offers no public way to shrink a buffer
-//! afterwards, so the decoded length has to be known before the block is
-//! allocated. Sizing to the window instead and reporting a shorter length
-//! separately was rejected: the buffer's own length would then disagree
-//! with its contents, and every later consumer would have to be told which
-//! of the two to trust.
+//! Sizing the block from the decoded length instead would be smaller and
+//! would still terminate correctly, and it is the one thing this file must
+//! not do. It moves the allocation after the inspection, so an input too
+//! large to allocate for that also carries a rejected byte would answer
+//! `CURLE_URL_MALFORMAT` where the C answers `CURLE_OUT_OF_MEMORY`. All
+//! three call sites happen to collapse both codes into a single `CURLUcode`,
+//! so the difference is not observable through the public API today; the
+//! order is reproduced so that no question of faithfulness arises at all.
 //!
-//! The cost is one extra walk of the window and one `memcpy` of the seed
-//! bytes, which is negligible next to what it buys: exactly one allocation
-//! per call, the same as the C, with no Rust-side heap use at all. Note
-//! that the seed is not arbitrary filler. It is the first `decoded_len`
-//! bytes of the window, so when the input holds no escape at all the copy
-//! is already the answer and the second pass rewrites each byte with
-//! itself.
+//! The decoded length is shorter than the block whenever the input held an
+//! escape, which is exactly the state the C is left in -- `lib/escape.c`
+//! never shrinks its allocation either, and reports the shorter length
+//! through `*olen` at L149-L151. Here [`CBuf::truncate`] writes the
+//! terminator at that shorter end and makes it the buffer's own length, so
+//! the length and the contents cannot disagree and no consumer has to be
+//! told which to trust. The spare capacity is what invariant 2 of [`CBuf`]
+//! exists to permit.
 //!
 //! # No `unsafe`, no panic
 //!
-//! There is no `unsafe` in this file. Every operation is over byte slices;
-//! the allocator's `unsafe` stays in `src/alloc.rs`, where it is justified.
+//! There is no `unsafe` in this file. Every operation is over byte slices,
+//! and the allocator's `unsafe` lives in `src/ffi.rs`, the crate's only
+//! unsafe module, reached from here through [`CBuf`]'s safe surface.
 //!
 //! Nothing here can panic either. The crate root denies `unwrap`, `expect`,
 //! `panic!`, direct indexing and unchecked arithmetic, so the two lookahead
@@ -212,13 +217,14 @@
 //!
 //! # Verification
 //!
-//! The tests at the end of this file are the unit-level complement to
-//! `rust-urlapi/tests/encode_decode.rs`, which drives the same behavior
-//! through the exported C entry points. They cover each rule above, the
-//! threshold trap directly and in both directions, and a sweep of all 256
-//! byte values through a `%XX` escape built with `crate::ctype::hexbyte`,
-//! which is the encoder's own primitive and so gives a round-trip check
-//! without reaching outside this module's dependencies.
+//! The tests at the end of this file are this module's own coverage. They
+//! exercise each rule above, the threshold trap directly and in both
+//! directions, and a sweep of all 256 byte values through a `%XX` escape
+//! built with `crate::ctype::hexbyte`, which is the encoder's own primitive
+//! and so gives a round-trip check without reaching outside this module's
+//! dependencies. The same behavior is also driven through the exported C
+//! entry points by the crate's integration test
+//! `rust-urlapi/tests/encode_decode.rs`.
 
 // Which of the two entry points below a given build reaches depends on which
 // sibling module is compiled: `urldecode_bytes` serves the two call sites
@@ -231,6 +237,12 @@
 // allowance is stated once here with its reason. It is scoped to this module
 // and to this lint alone.
 #![allow(dead_code)]
+// Every `unsafe` block in this crate lives in `src/ffi.rs`, and this module
+// needs nothing from C directly: the allocator it uses reaches the foreign
+// calls through `crate::alloc`'s safe surface. `forbid` rather than `deny`
+// because an inner `allow` here would be a design change and should have to be
+// argued for rather than slipped in.
+#![forbid(unsafe_code)]
 
 use crate::alloc::CBuf;
 use crate::ctype::hexval;
@@ -482,68 +494,62 @@ fn advance(window: &[u8], count: usize) -> &[u8] {
 pub(crate) fn urldecode(input: &[u8], length: usize, reject: UrlReject) -> Result<CBuf, CURLcode> {
     let window = measure(input, length);
 
-    // Pass one, the measuring pass. It answers one question -- how many
-    // bytes the decode produces -- and deliberately does not apply the
-    // reject test, so that the allocation below keeps the C's precedence.
+    // The allocation, and its shape is the C's rather than the answer's.
+    // `lib/escape.c` L116 computes `alloc = length + 1` from the *input* and
+    // calls `malloc(alloc)` before it inspects a single byte, then reports the
+    // shorter decoded length through `*olen` at L149-L151. Sizing from the
+    // decoded length instead would be smaller and would still terminate
+    // correctly, but it would move the allocation after the inspection: an
+    // input that is too large to allocate for and also carries a rejected byte
+    // is out of memory in the C, and would have been a malformed URL here.
+    // L118-L119 is the out-of-memory return.
     //
-    // `saturating_add` because the crate root denies arithmetic that could
-    // panic. It is exact here: the counter is incremented once per iteration
-    // and every iteration consumes at least one byte of a window that is a
-    // slice, so it cannot exceed `window.len()` and cannot approach the
-    // saturation point.
+    // The block underneath comes from the C allocator, by way of
+    // `src/alloc.rs` over `src/ffi.rs`, which is what makes the caller's
+    // `curl_free()` correct on the buffer this function eventually yields. It
+    // arrives zeroed, so the terminator invariant holds before anything is
+    // written, and `CBuf` releases it on every early return below.
+    let mut buf = CBuf::alloc(window.len()).ok_or(CURLcode::CURLE_OUT_OF_MEMORY)?;
+
+    // One pass, `lib/escape.c` L124-L146, exactly as the C walks it. The
+    // destination drives the loop, so no write can land outside the block: the
+    // decode produces at most one byte per input byte, and the destination is
+    // as wide as the input.
     let mut decoded_len: usize = 0;
-    let mut rest = window;
-    while let Some((_, consumed)) = decode_step(rest) {
-        decoded_len = decoded_len.saturating_add(1);
-        rest = advance(rest, consumed);
-    }
-
-    // The allocation, `lib/escape.c` L116, and the out-of-memory return at
-    // L118-L119. This is the crate's single point of C-allocated memory, per
-    // `src/alloc.rs`, and it is what makes the caller's `curl_free()`
-    // correct on the buffer this function eventually yields.
-    //
-    // `from_slice` is the one exact-size constructor `src/alloc.rs` exposes,
-    // and it wants a slice of that size. The seed is the window's own first
-    // `decoded_len` bytes, which is not arbitrary filler: pass two overwrites
-    // every one of them, and when the input holds no escape the seed already
-    // is the answer. `decoded_len <= window.len()` holds because each
-    // iteration above consumed at least one byte per byte produced, so the
-    // `get` cannot fail; the fallback exists only so that no unwrap appears.
-    let seed = window.get(..decoded_len).unwrap_or(window);
-    let mut buf = CBuf::from_slice(seed).ok_or(CURLcode::CURLE_OUT_OF_MEMORY)?;
-
-    // Pass two, the decoding pass: `lib/escape.c` L124-L146. The destination
-    // drives the loop, so no write can land outside the block, and the
-    // window is walked with the identical rule pass one used, so the two
-    // agree on the count by construction rather than by argument.
-    let mut rest = window;
-    for slot in buf.as_mut_bytes() {
-        let Some((byte, consumed)) = decode_step(rest) else {
-            // Unreachable: pass one counted exactly this many bytes with
-            // this same rule. Ending the loop rather than asserting keeps
-            // the file free of any panicking construct, and it is the safe
-            // direction, because the buffer is already terminated.
-            break;
-        };
-        // lib/escape.c L139-L143, applied to the decoded byte. Returning
-        // here drops `buf`, and `Drop` releases the block: that is the
-        // `Curl_safefree(*ostring)` at L141. The nulling half of
-        // `Curl_safefree` needs no counterpart, because an `Err` carries no
-        // pointer for the caller to hold.
-        if reject.rejects(byte) {
-            return Err(CURLcode::CURLE_URL_MALFORMAT);
+    {
+        let mut rest = window;
+        for slot in buf.as_mut_bytes() {
+            let Some((byte, consumed)) = decode_step(rest) else {
+                // The window is exhausted, which is the C's loop condition
+                // `while(alloc)` falling false at L124.
+                break;
+            };
+            // lib/escape.c L139-L143, applied to the decoded byte. Returning
+            // here drops `buf`, and `Drop` releases the block: that is the
+            // `Curl_safefree(*ostring)` at L141. The nulling half of
+            // `Curl_safefree` needs no counterpart, because an `Err` carries
+            // no pointer for the caller to hold.
+            if reject.rejects(byte) {
+                return Err(CURLcode::CURLE_URL_MALFORMAT);
+            }
+            // lib/escape.c L145: `*ns++ = (char)in`. The iterator supplies the
+            // post-increment.
+            *slot = byte;
+            // `saturating_add` because the crate root denies arithmetic that
+            // could panic. It is exact: the counter rises once per slot and
+            // the slots are a slice, so it cannot exceed `window.len()`.
+            decoded_len = decoded_len.saturating_add(1);
+            rest = advance(rest, consumed);
         }
-        // lib/escape.c L145: `*ns++ = (char)in`. The iterator supplies the
-        // post-increment.
-        *slot = byte;
-        rest = advance(rest, consumed);
     }
 
-    // lib/escape.c L147 wrote the terminator here; `src/alloc.rs` wrote it
-    // when the block was allocated and `as_mut_bytes` cannot reach it, so
-    // invariant 3 of `CBuf` already holds. L149-L151 reported the length
-    // through `*olen`; `CBuf::len` carries it. L153 returns success.
+    // lib/escape.c L147 wrote the terminator at the decoded end and L149-L151
+    // reported the decoded length through `*olen`. Both happen here: the
+    // truncation re-terminates at `decoded_len` and makes `CBuf::len` that
+    // same number. The block keeps the input-sized capacity, which invariant 2
+    // of `CBuf` permits and which is what the C is left holding too --
+    // `lib/escape.c` never shrinks its allocation either. L153 returns success.
+    buf.truncate(decoded_len);
     Ok(buf)
 }
 
@@ -589,6 +595,38 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::indexing_slicing)]
     #![allow(clippy::arithmetic_side_effects)]
+
+    /// The block is sized from the input window, not from the answer.
+    ///
+    /// `lib/escape.c:L116` allocates `length + 1` before it inspects anything,
+    /// and L149-L151 reports the shorter decoded length. Reading the length
+    /// alone cannot tell that apart from allocating the decoded size, so this
+    /// reads the capacity too: `%41%42` is six input bytes, so the block is
+    /// seven, while the decoded string `AB` is two.
+    #[test]
+    fn the_block_is_sized_from_the_input_and_the_length_from_the_decode() {
+        let decoded = urldecode_bytes(b"%41%42", UrlReject::Nada).ok();
+        let Some(buf) = decoded else {
+            return;
+        };
+        assert_eq!(buf.as_bytes(), b"AB");
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf.capacity(), 7);
+        assert_eq!(buf.as_bytes_with_nul(), b"AB\0");
+    }
+
+    /// An input with no escape allocates exactly what the C allocates and
+    /// needs no truncation at all.
+    #[test]
+    fn an_unescaped_input_fills_the_block_it_was_given() {
+        let decoded = urldecode_bytes(b"plain", UrlReject::Nada).ok();
+        let Some(buf) = decoded else {
+            return;
+        };
+        assert_eq!(buf.as_bytes(), b"plain");
+        assert_eq!(buf.len(), 5);
+        assert_eq!(buf.capacity(), 6);
+    }
 
     // The comparisons below need somewhere to put a decoded copy, and they
     // reach the heap through the `alloc` crate rather than through `std` so
@@ -815,10 +853,9 @@ mod tests {
     ///
     /// The escape is built with the encoder's own `hexbyte`, and
     /// `UrlReject::Nada` is used so that the rejection rule does not mask
-    /// the conversion being tested. This is the check the plan asks for
-    /// against `src/encode.rs`, expressed with the primitive that module is
-    /// built on, so that it lives here rather than waiting on a module this
-    /// one does not depend on.
+    /// the conversion being tested. Written against `crate::ctype::hexbyte`,
+    /// the primitive `src/encode.rs` is built on, so the round trip is
+    /// checked here without depending on a module this one does not need.
     #[test]
     fn every_byte_survives_an_escape_round_trip() {
         for byte in 0..=u8::MAX {
@@ -984,9 +1021,9 @@ mod tests {
 
     /// The buffer is a valid C string as well as a Rust slice.
     ///
-    /// `lib/escape.c` L147 is `*ns = 0`. The port gets the terminator from
-    /// `src/alloc.rs`, which writes it when the block is allocated, so the
-    /// property is asserted here rather than taken on trust.
+    /// `lib/escape.c` L147 is `*ns = 0`. The port gets the terminator for
+    /// free, because the block arrives zeroed, so the property is asserted
+    /// here rather than taken on trust.
     #[test]
     fn the_buffer_is_nul_terminated_at_the_decoded_length() {
         let out = urldecode_bytes(b"%41%42c", UrlReject::Ctrl).unwrap();
@@ -1059,11 +1096,11 @@ mod tests {
         assert_eq!(measure(b"", 5), b"");
     }
 
-    /// `decode_step` is the recognition rule, and both passes share it.
+    /// `decode_step` is the recognition rule the single pass walks with.
     ///
     /// Asserting the consumed count directly is what pins the invariant the
-    /// two passes rest on: the count is 1 or 3, never 0, so the window
-    /// always shrinks and the loop always ends.
+    /// loop rests on: the count is 1 or 3, never 0, so the window always
+    /// shrinks and the loop always ends.
     #[test]
     fn decode_step_reports_the_byte_and_the_consumption() {
         assert_eq!(decode_step(b""), None);
@@ -1094,12 +1131,12 @@ mod tests {
         assert_eq!(advance(b"", 1), b"");
     }
 
-    /// A long input exercises the two passes over something bigger than the
+    /// A long input exercises the decode over something bigger than the
     /// three-byte window the other tests use.
     ///
-    /// The point is agreement between the measuring pass and the decoding
-    /// pass at scale: a mismatch of one would either truncate the output or
-    /// leave a byte of the seed unwritten, and both show up here.
+    /// The point is agreement between the destination the input sized and the
+    /// length the decode reports at scale: an error of one either truncates
+    /// the output or leaves the reported length short, and both show up here.
     #[test]
     fn a_long_mixed_input_decodes_completely() {
         let mut input: Vec<u8> = Vec::new();
@@ -1147,9 +1184,9 @@ mod tests {
     /// because it fails to compile the moment either one starts returning
     /// something other than a buffer this crate owns and C can free.
     ///
-    /// `src/alloc.rs` owns the run-time proof that such a buffer is
-    /// allocated and released correctly; there is no reason to repeat it
-    /// here.
+    /// The run-time proof that such a buffer is allocated and released
+    /// correctly belongs to the `CBuf` and `CBlock` tests in `src/alloc.rs`
+    /// and `src/ffi.rs`; there is no reason to repeat it here.
     #[test]
     fn the_result_is_a_c_allocator_buffer() {
         let measured: fn(&[u8], usize, UrlReject) -> Result<CBuf, CURLcode> = urldecode;

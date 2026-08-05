@@ -107,6 +107,31 @@
 //! Reproducing curl's acceptance set exactly is the whole job of this
 //! module, so the scanning loop is written out rather than delegated.
 
+// Reachability here is decided by the consumers. The three public scanners
+// mirror `curlx_str_number`, `curlx_str_hex` and `curlx_str_octal`, and
+// `lib/urlapi.c` reaches them from the port parser and the IPv4 normaliser in
+// `src/parse/port.rs` and `src/parse/host.rs`; a build with neither reaches
+// none of them. The base table and its compile-time proof exist to keep the
+// three radices checkable in one place, so they are deliberately not folded
+// into the callers.
+//
+// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
+// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
+// checkpoint that creates src/getset.rs, and replaced there by one crate-level
+// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
+// src/getset.rs exist, most of this crate has no consumer, and a crate held to
+// zero warnings cannot build clean without this. Scoped to this module and to
+// this lint alone.
+#![allow(dead_code)]
+// The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
+// technical specification forbids `unsafe` outside FFI code (1.3.2.1).
+// `forbid` rather than `deny` because an inner `allow` here would be a
+// design change and should have to be argued for, not slipped in. This
+// module needs nothing from C, so the attribute costs it nothing and turns
+// the crate's single-unsafe-island property into a compiler guarantee
+// instead of a convention.
+#![forbid(unsafe_code)]
+
 use crate::ctype::{hexval, is_digit, is_odigit, is_xdigit};
 
 /// Why a scan produced no number.

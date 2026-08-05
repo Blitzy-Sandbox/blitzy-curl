@@ -54,16 +54,15 @@
 //! past the length it tracks, at `lib/urlapi.c:L422` and again at L437, and
 //! in the case where normalization shortens nothing that second write lands
 //! exactly on index `leng` of this buffer. Trimming the view to `leng`
-//! bytes would make the write impossible to express, which would either
-//! change behavior for input at the maximum length, forbidden by
-//! transformation rule T6, or force `unsafe` into a parser module, which
-//! the specification forbids outside the FFI facade. So the mutable view
-//! this module hands out, [`DynBuf::as_mut_bytes_with_nul`], deliberately
-//! covers `leng + 1` bytes.
+//! bytes would make the write impossible to express, and the two ways out
+//! of that are both unacceptable: changing behavior for input at the
+//! maximum length, or forcing `unsafe` into a parser module. So the mutable
+//! view this module hands out, [`DynBuf::content_mut`],
+//! deliberately covers `leng + 1` bytes.
 //!
 //! # What is ported and what is not
 //!
-//! Nine operations, the exact set `lib/urlapi.c` uses:
+//! Ten operations, the exact set `lib/urlapi.c` uses:
 //!
 //! | C entry point | Line | Ported as |
 //! |---|---|---|
@@ -99,7 +98,7 @@
 //! - [`DynBuf::as_bytes`] and [`DynBuf::as_bytes_with_nul`] **borrow**. The
 //!   buffer keeps ownership. These serve the read-only uses at
 //!   `lib/urlapi.c:L339`, L487, L581, L783 and L986.
-//! - [`DynBuf::as_mut_bytes_with_nul`] **borrows mutably**, for the
+//! - [`DynBuf::content_mut`] **borrows mutably**, for the
 //!   in-place rewrites at `lib/urlapi.c:L1921-L1932` and inside
 //!   `ipv6_parse()`. See contract 2 for why it is one byte wider than the
 //!   content.
@@ -114,10 +113,15 @@
 //!
 //! # Memory provenance
 //!
-//! Every byte comes from `src/alloc.rs` and therefore from the C allocator.
-//! That is not a stylistic choice: the pointer this buffer yields is handed
-//! to C at the ten sites above, and the C side releases it with
-//! `curl_free()`, which `docs/libcurl/curl_url_get.md:L45` and
+//! Every byte comes from the C allocator. This buffer is built on
+//! [`CBlock`], the owned-block type `src/ffi.rs` defines and `src/alloc.rs`
+//! re-exports; `src/ffi.rs` makes the `libc::calloc`, `libc::realloc` and
+//! `libc::free` calls, and this module reaches them only through
+//! [`CBlock`]'s safe surface.
+//!
+//! That provenance is not a stylistic choice: the pointer this buffer
+//! yields is handed to C at the ten sites above, and the C side releases it
+//! with `curl_free()`, which `docs/libcurl/curl_url_get.md:L45` and
 //! `include/curl/urlapi.h:L130-L131` document as the required call. A
 //! Rust-allocated block would make that call wrong. `CString::into_raw` is
 //! banned crate-wide for the same reason and appears nowhere here.
@@ -128,7 +132,7 @@
 //! the C original is no different: `struct dynbuf` carries no lock and
 //! `lib/urlapi.c` only ever uses one on the stack of the calling thread.
 
-// This module is a complete port of the nine operations the URL API uses,
+// This module is a complete port of the ten operations the URL API uses,
 // and which of them are reachable depends on which sibling modules a given
 // feature configuration compiles. `add` in particular exists for the
 // literal appends and is not needed by every configuration. Warnings are
@@ -137,14 +141,17 @@
 // `src/alloc.rs` and `src/error.rs` do. It is scoped to this module and to
 // this one lint.
 #![allow(dead_code)]
+// `unsafe` belongs to `src/ffi.rs` alone. This module goes further and
+// presents an API of slices, so that `src/encode.rs`, `src/getset.rs` and all
+// of `src/parse/` need none either; the lint keeps a future edit from
+// reintroducing one here without deleting this line first.
+#![forbid(unsafe_code)]
 
 use core::fmt;
-use core::mem;
 use core::ptr;
-use core::slice;
-use libc::{c_char, c_void};
+use libc::c_char;
 
-use crate::alloc::{c_free, c_realloc, CBuf};
+use crate::alloc::{CBlock, CBuf};
 use crate::error::CURLcode;
 
 /// The size of a buffer's first allocation, unless the ceiling is smaller.
@@ -197,40 +204,41 @@ const MAX_DYNBUF_SIZE: usize = usize::MAX / 2;
 /// Every live value satisfies all four of the following, and every method
 /// below both assumes and re-establishes them:
 ///
-/// 1. `bufr` is either null, in which case `leng` and `allc` are both zero,
-///    or a live block from `src/alloc.rs` that this value alone owns.
-/// 2. `allc` is the exact size of that block, and `leng < allc`. The strict
+/// 1. `block` is either `None`, in which case `leng` is zero, or a live
+///    [`CBlock`] this value alone owns, which carries that type's own four
+///    invariants.
+/// 2. `leng < block.capacity()` whenever there is a block. The strict
 ///    inequality is contract 2 in the module documentation: there is always
 ///    room for the terminator at `[leng]`.
-/// 3. When `bufr` is non-null, bytes `[0, leng)` are initialized and byte
-///    `[leng]` is zero. Bytes above `[leng]` may be uninitialized, which is
-///    why no method ever forms a reference wider than `leng + 1`.
+/// 3. When there is a block, byte `[leng]` is zero, so the content is a
+///    valid C string of exactly `leng` bytes. Bytes above `[leng]` are
+///    initialized -- `CBlock` guarantees that over its whole capacity -- but
+///    they are not content, and no read-only face ever exposes them.
 /// 4. `toobig` never changes after construction, not even across
 ///    [`DynBuf::free`], which is what makes a freed buffer reusable.
 ///
 /// # Ownership
 ///
-/// Rust owns the block. `Drop` releases it, which is what removes the
-/// failure-path leak class the C original carries: `lib/urlapi.c` has to
-/// reach `curlx_dyn_free()` on every path out of every function that
-/// declares a buffer, and `docs/KNOWN-DIVERGENCES.md` records where it does
-/// not. [`DynBuf::into_cbuf`] and [`DynBuf::into_raw`] are the only ways
-/// out of that ownership.
+/// Rust owns the block, and the block releases itself: there is no `Drop`
+/// implementation here to forget, because the `CBlock` in the field below has
+/// one. That is what removes the failure-path leak class the C original
+/// carries: `lib/urlapi.c` has to reach `curlx_dyn_free()` on every path out
+/// of every function that declares a buffer, and `docs/KNOWN-DIVERGENCES.md`
+/// records where it does not. [`DynBuf::into_cbuf`] and [`DynBuf::into_raw`]
+/// are the only ways out of that ownership.
 pub(crate) struct DynBuf {
-    /// The allocation, or null before the first append and after a free.
+    /// The allocation, or `None` before the first append and after a free.
     ///
-    /// C's `bufr`. Null is a normal state rather than an error: the pointer
-    /// taken at `lib/urlapi.c:L1934` may belong to a buffer that was never
-    /// appended to, and L1936 and L1995 both handle that null.
-    bufr: *mut c_char,
+    /// C's `bufr` together with its `allc`, which is
+    /// [`CBlock::capacity`] here rather than a second field that could
+    /// disagree with it. `None` is a normal state rather than an error: the
+    /// pointer taken at `lib/urlapi.c:L1934` may belong to a buffer that was
+    /// never appended to, and L1936 and L1995 both handle that null.
+    block: Option<CBlock>,
     /// Content length in bytes, excluding the terminator at `[leng]`.
     ///
     /// C's `leng`.
     leng: usize,
-    /// Size of the whole allocation, including the terminator slot.
-    ///
-    /// C's `allc`. Zero exactly when `bufr` is null.
-    allc: usize,
     /// The ceiling on `leng + 1`, fixed at construction.
     ///
     /// C's `toobig`. A request that would push `leng + 1` above it fails
@@ -269,9 +277,8 @@ impl DynBuf {
     #[must_use]
     pub(crate) const fn new(toobig: usize) -> Self {
         Self {
-            bufr: ptr::null_mut(),
+            block: None,
             leng: 0,
-            allc: 0,
             toobig,
         }
     }
@@ -321,16 +328,13 @@ impl DynBuf {
     /// them borrows `self`. A pointer handed over by [`DynBuf::into_raw`]
     /// cannot be affected, because that call consumed the value.
     pub(crate) fn free(&mut self) {
-        // SAFETY: invariant 1 says `bufr` is either null, which `c_free`
-        // treats as a no-op, or a live block from `src/alloc.rs` that this
-        // value alone owns, which is exactly `c_free`'s precondition. The
-        // three field writes below run unconditionally, so the pointer
-        // cannot be reached again and this cannot free twice; that is also
-        // what makes a second `free()` and a later `Drop` safe.
-        unsafe { c_free(self.bufr.cast::<c_void>()) };
-        self.bufr = ptr::null_mut();
+        // Assigning `None` drops whatever block was there, and dropping a
+        // `CBlock` is what releases it. A buffer that had no block simply
+        // drops a `None`, which is why a second `free()` is harmless -- the
+        // `Curl_safefree` property, obtained from the type rather than from a
+        // macro that nulls the variable afterwards.
+        self.block = None;
         self.leng = 0;
-        self.allc = 0;
     }
 
     /// Clears the content and keeps the allocation.
@@ -446,7 +450,10 @@ impl DynBuf {
     /// The buffer is released in both failure cases.
     fn grow(&mut self, len: usize) -> CURLcode {
         let idx = self.leng;
-        let mut a = self.allc;
+        // C's `s->allc`, which is the block's own size here rather than a
+        // second field that could drift out of step with it. No block means
+        // zero, which is the `allc == 0` first-invoke case at L86.
+        let mut a = self.capacity();
 
         // `fit = len + idx + 1`, L72. See the note on arithmetic above for
         // why an unrepresentable total is reported as too large.
@@ -480,24 +487,28 @@ impl DynBuf {
             }
         }
 
-        if a != self.allc {
-            // SAFETY: `c_realloc` requires a pointer that is null or a live
-            // block from `src/alloc.rs` owned by the caller, which is
-            // invariant 1, and a nonzero size, which holds because `a` is at
-            // least `fit` and `fit` is at least 1. On success ownership
-            // moves to the new pointer and the old one is not touched
-            // again; on failure `c_realloc` leaves the old block owned by
-            // this value, which is why the `free()` below is correct and not
-            // a double free.
-            let fresh = unsafe { c_realloc(self.bufr.cast::<c_void>(), a) };
-            if fresh.is_null() {
+        if a != self.capacity() {
+            // L104-L112. `a` is at least `fit`, and `fit` is at least 1, so
+            // the size is never zero. Either arm leaves ownership exactly
+            // where C leaves it: a successful growth moves it to the new
+            // block, and a failure leaves the old block owned here, which is
+            // why the `free()` below is correct and not a double free.
+            let grown = match self.block.as_mut() {
+                Some(block) => block.resize(a),
+                None => match CBlock::zeroed(a) {
+                    Some(block) => {
+                        self.block = Some(block);
+                        true
+                    }
+                    None => false,
+                },
+            };
+            if !grown {
                 // L106-L109. Contract 1 again: the buffer goes away before
                 // the error is reported.
                 self.free();
                 return CURLcode::CURLE_OUT_OF_MEMORY;
             }
-            self.bufr = fresh.cast::<c_char>();
-            self.allc = a;
         }
 
         CURLcode::CURLE_OK
@@ -509,14 +520,14 @@ impl DynBuf {
     /// The `memcpy` at `lib/curlx/dynbuf.c:L115`, expressed so that it
     /// cannot write outside the block. Returns `false` and writes nothing
     /// when the destination range would reach the terminator slot at
-    /// `[allc - 1]` or run past the end, which keeps invariant 2 true no
+    /// `[capacity - 1]` or run past the end, which keeps invariant 2 true no
     /// matter what a caller asks for.
     ///
-    /// A raw copy rather than a slice assignment is deliberate. Bytes above
-    /// `[leng]` are uninitialized, and forming a `&mut [u8]` over them to
-    /// use `copy_from_slice` would be a reference to uninitialized memory.
-    /// `src/alloc.rs` fills its own buffers the same way, for the same
-    /// reason.
+    /// An ordinary slice assignment, because [`CBlock`] guarantees its whole
+    /// capacity is initialized. That is the property that lets this module
+    /// hold to `#![forbid(unsafe_code)]`: the C original leaves everything
+    /// above the content uninitialized, so forming a `&mut [u8]` over it
+    /// would have been undefined behavior and a raw copy the only option.
     fn write_at(&mut self, offset: usize, src: &[u8]) -> bool {
         if src.is_empty() {
             // C skips the copy entirely when the length is zero, L114, and
@@ -526,28 +537,31 @@ impl DynBuf {
         let Some(end) = offset.checked_add(src.len()) else {
             return false;
         };
-        // `end < allc` rather than `end <= allc`: the last byte of the
-        // allocation belongs to the terminator.
-        if self.bufr.is_null() || end >= self.allc {
+        // `end < capacity` rather than `end <= capacity`: the last byte of
+        // the allocation belongs to the terminator.
+        if end >= self.capacity() {
             return false;
         }
-        let dst = self.bufr.cast::<u8>();
-        // SAFETY: the guard above establishes `offset + src.len() < allc`
-        // with `allc` the exact size of a live block, invariant 2, so the
-        // whole destination range lies inside the allocation and the offset
-        // computation stays in bounds. The destination came from the C
-        // allocator and `src` is a live Rust slice, so they cannot overlap.
-        // `u8` has an alignment of one, which any pointer satisfies.
-        unsafe { ptr::copy_nonoverlapping(src.as_ptr(), dst.add(offset), src.len()) };
-        true
+        let Some(block) = self.block.as_mut() else {
+            return false;
+        };
+        match block.bytes_mut().get_mut(offset..end) {
+            Some(target) => {
+                target.copy_from_slice(src);
+                true
+            }
+            // Unreachable: `end < capacity` was just established. Reported
+            // rather than asserted, because this crate has no panic path.
+            None => false,
+        }
     }
 
     /// Writes the terminator at `[leng]`.
     ///
     /// The `s->bufr[s->leng] = 0` that closes every successful append at
     /// `lib/curlx/dynbuf.c:L117`, and that `curlx_dyn_setlen()` repeats at
-    /// L290. Invariant 2 guarantees `leng < allc`, so the byte is always
-    /// inside the allocation.
+    /// L290. Invariant 2 guarantees `leng` is below the block's capacity, so
+    /// the byte is always inside the allocation.
     ///
     /// A null pointer is skipped. C would dereference it, and the only way
     /// to reach that in C is `curlx_dyn_setlen(s, 0)` on a buffer that was
@@ -556,14 +570,16 @@ impl DynBuf {
     /// behind is unreachable: with no allocation the length is already zero
     /// and invariant 3 has nothing to maintain.
     fn terminate(&mut self) {
-        if self.bufr.is_null() {
-            return;
+        let leng = self.leng;
+        // Invariant 2 gives `leng < capacity`, so the `get_mut` cannot fail
+        // when there is a block; it is used anyway so that the bound is
+        // checked by the compiler. The write is what establishes invariant 3
+        // for the current length.
+        if let Some(block) = self.block.as_mut() {
+            if let Some(slot) = block.bytes_mut().get_mut(leng) {
+                *slot = 0;
+            }
         }
-        // SAFETY: invariant 1 gives a live block of exactly `allc` bytes and
-        // invariant 2 gives `leng < allc`, so byte `[leng]` is inside it.
-        // `u8` needs no alignment beyond one byte. The write is what
-        // establishes invariant 3 for the current length.
-        unsafe { self.bufr.cast::<u8>().add(self.leng).write(0) };
     }
 
     /// Appends a counted run of bytes.
@@ -786,7 +802,8 @@ impl DynBuf {
             return false;
         }
         self.leng = set;
-        // L290. Shortening keeps `leng < allc`, so invariant 2 survives.
+        // L290. Shortening keeps `leng` below the capacity, so invariant 2
+        // survives.
         self.terminate();
         true
     }
@@ -827,8 +844,11 @@ impl DynBuf {
     /// Zero exactly when there is no allocation. Otherwise strictly greater
     /// than [`DynBuf::len`], by invariant 2.
     #[must_use]
-    pub(crate) const fn capacity(&self) -> usize {
-        self.allc
+    pub(crate) fn capacity(&self) -> usize {
+        match self.block.as_ref() {
+            Some(block) => block.capacity(),
+            None => 0,
+        }
     }
 
     /// The ceiling this buffer was built with.
@@ -860,17 +880,15 @@ impl DynBuf {
     /// An empty slice when there is no allocation, which is C's null return.
     #[must_use]
     pub(crate) fn as_bytes(&self) -> &[u8] {
-        if self.bufr.is_null() {
+        let Some(block) = self.block.as_ref() else {
             return &[];
-        }
-        // SAFETY: invariant 1 gives a non-null pointer to a live block,
-        // invariant 2 gives it at least `leng + 1` bytes and invariant 3
-        // says the first `leng` are initialized, so the slice lies inside the
-        // allocation and reads only initialized memory. `u8` has an
-        // alignment of one. The lifetime is tied to `&self`, so the slice
-        // cannot outlive the block and no mutation can happen while it
-        // lives.
-        unsafe { slice::from_raw_parts(self.bufr.cast::<u8>(), self.leng) }
+        };
+        // Invariant 2 makes the capacity at least `leng + 1`, so the range is
+        // always in bounds and the fallback is unreachable. The `get` is used
+        // anyway so the bound is checked by the compiler rather than argued in
+        // a comment, and the lifetime is tied to `&self`, so the slice cannot
+        // outlive the block.
+        block.bytes().get(..self.leng).unwrap_or(&[])
     }
 
     /// The content together with its terminator, borrowed.
@@ -904,18 +922,17 @@ impl DynBuf {
     /// byte `[0]`.
     #[must_use]
     pub(crate) fn as_bytes_with_nul(&self) -> &[u8] {
-        if self.bufr.is_null() {
+        let Some(block) = self.block.as_ref() else {
             return &[];
-        }
+        };
         // `saturating_add` because the crate denies arithmetic that could
         // wrap. It is exact here: invariant 2 required `leng + 1` to be a
         // real allocation size, so `leng` cannot be `usize::MAX`.
         let with_nul = self.leng.saturating_add(1);
-        // SAFETY: invariant 2 gives the block at least `with_nul` bytes and
-        // invariant 3 says the last of them is the terminator, so every byte
-        // of the slice is inside the allocation and initialized. Alignment
-        // and lifetime reasoning is as in `as_bytes`.
-        unsafe { slice::from_raw_parts(self.bufr.cast::<u8>(), with_nul) }
+        // Invariant 2 makes the capacity at least `with_nul` and invariant 3
+        // makes the last byte of the range the terminator, so the range is in
+        // bounds and the fallback is unreachable.
+        block.bytes().get(..with_nul).unwrap_or(&[])
     }
 
     /// The content **plus its terminator byte**, borrowed mutably.
@@ -963,25 +980,55 @@ impl DynBuf {
     /// before L1921 reads the pointer, because even an empty append
     /// allocates.
     #[must_use]
-    pub(crate) fn as_mut_bytes_with_nul(&mut self) -> &mut [u8] {
-        if self.bufr.is_null() {
-            return &mut [];
-        }
+    fn mut_bytes_with_nul(&mut self) -> &mut [u8] {
         // Exact for the same reason as in `as_bytes_with_nul`.
         let with_nul = self.leng.saturating_add(1);
-        // SAFETY: the reasoning of `as_bytes_with_nul`, with a unique
-        // borrow. `&mut self` guarantees no other reference to these bytes
-        // exists, so handing out a `&mut [u8]` over them creates no
-        // aliasing. Every byte in range is initialized, invariant 3, so the
-        // caller may read as well as write.
-        unsafe { slice::from_raw_parts_mut(self.bufr.cast::<u8>(), with_nul) }
+        let Some(block) = self.block.as_mut() else {
+            return &mut [];
+        };
+        // The reasoning of `as_bytes_with_nul`, with a unique borrow. `&mut
+        // self` rules out any other reference to these bytes, and `CBlock`
+        // guarantees every byte of the capacity is initialized, so the caller
+        // may read as well as write every byte of the range.
+        block.bytes_mut().get_mut(..with_nul).unwrap_or(&mut [])
+    }
+
+    /// Borrows the content **and its terminator slot** for writing, behind a
+    /// guard that restores the terminator when the borrow ends.
+    ///
+    /// The two consumers in the C both write the byte at `[len]`:
+    /// `ipv6_parse()` at `lib/urlapi.c:L422` and `L437` writes a terminator one
+    /// past the logical length, which is `FB6` in
+    /// `docs/KNOWN-DIVERGENCES.md`, and the escape lower-casing pass at
+    /// `L1921-L1932` walks from the pointer's start. Both need the slot to be
+    /// writable, so it is handed over rather than withheld.
+    ///
+    /// What the guard adds is that no caller can *leave* the buffer
+    /// unterminated. Invariant 3 -- a zero at `[len()]` -- is what makes
+    /// [`DynBuf::as_bytes_with_nul`] and [`DynBuf::into_cbuf`] correct, and a
+    /// caller that returned early having overwritten the slot would break it
+    /// silently. `Drop` re-establishes it on every path out of the borrow,
+    /// including an early return, so the invariant is enforced by the type
+    /// rather than by a contract in a comment.
+    ///
+    /// Writing a zero *inside* the content still makes [`DynBuf::len`] and a C
+    /// `strlen()` of the pointer disagree, exactly as it would in C. That is
+    /// the C's behaviour and is not corrected here.
+    ///
+    /// # Ownership
+    ///
+    /// **Nothing changes hands.** The guard holds a unique borrow, so no other
+    /// reference to these bytes can exist while it lives, and the obligation to
+    /// release the block stays with this value.
+    pub(crate) fn content_mut(&mut self) -> MutContent<'_> {
+        MutContent { buf: self }
     }
 
     /// Hands the block over as an owned [`CBuf`], relinquishing ownership.
     ///
     /// The handover face of `curlx_dyn_ptr()`, and the one
-    /// `crate::alloc::CBuf::from_raw_parts` documents itself as existing
-    /// for. `lib/urlapi.c` performs this transfer ten times, at L672, L813,
+    /// `crate::alloc::CBuf::from_block` documents itself as existing for.
+    /// `lib/urlapi.c` performs this transfer ten times, at L672, L813,
     /// L1025, L1049, L1077, L1185, L1399, L1489, L1934 and L1957, and in
     /// every case the buffer is simply never freed again. `MEMORY-OWNERSHIP.md`
     /// lists each site with the field that takes the pointer.
@@ -993,10 +1040,14 @@ impl DynBuf {
     ///
     /// # Ownership
     ///
-    /// **Ownership moves out of this value.** It is consumed, its `Drop` is
-    /// suppressed, and the returned `CBuf` becomes the sole owner. The block
-    /// keeps whatever spare capacity the growth policy gave it, which the
-    /// `CBuf` invariant explicitly permits.
+    /// **Ownership moves out of this value.** It is consumed and the returned
+    /// `CBuf` becomes the sole owner of the block. The block keeps whatever
+    /// spare capacity the growth policy gave it, which the `CBuf` invariant
+    /// explicitly permits.
+    ///
+    /// The move is a plain move of the `CBlock` field, so there is no pointer
+    /// in flight at any point and nothing to suppress: exactly one owner
+    /// exists before the call and exactly one after it.
     ///
     /// # Returns
     ///
@@ -1004,16 +1055,13 @@ impl DynBuf {
     /// case is not an error: `lib/urlapi.c:L1934` takes a pointer that may
     /// be null and L1936 and L1995 both handle it.
     #[must_use = "ownership moves to the caller; discarding this leaks"]
-    pub(crate) fn into_cbuf(self) -> Option<CBuf> {
+    pub(crate) fn into_cbuf(mut self) -> Option<CBuf> {
         let len = self.leng;
-        let raw = self.into_raw();
-        // SAFETY: `from_raw_parts` needs a null pointer or a block this
-        // crate may free, of at least `len + 1` bytes, whose first `len`
-        // bytes are initialized and which no other owner will release.
-        // Invariant 1 gives the provenance, invariant 2 the size, invariant
-        // 3 the initialization, and `into_raw` above suppressed this value's
-        // `Drop`, so this crate has exactly one owner again.
-        unsafe { CBuf::from_raw_parts(raw, len) }
+        let block = self.block.take()?;
+        // Invariant 2 guarantees `len < block.capacity()`, which is exactly
+        // what `CBuf::from_block` requires, so the `None` arm is unreachable;
+        // on it the block would be released here rather than leaked.
+        CBuf::from_block(block, len)
     }
 
     /// Hands the block over as a bare pointer, relinquishing ownership.
@@ -1038,41 +1086,34 @@ impl DynBuf {
     /// * `curl_url_cleanup()` will not release it, per
     ///   `include/curl/urlapi.h:L116-L118`.
     /// * Rust code that wants the obligation back must call
-    ///   `crate::alloc::CBuf::from_raw` or `from_raw_parts`. Keeping the
-    ///   pointer around leaks it; building two owners over it frees it
-    ///   twice.
+    ///   `crate::ffi::adopt_c_string` or `adopt_c_bytes`. Keeping the pointer
+    ///   around leaks it; building two owners over it frees it twice.
     ///
-    /// The value's `Drop` is suppressed with `ManuallyDrop` rather than
-    /// merely skipped, so the suppression is visible at the type level.
+    /// The block is taken out of the value before it is dropped, so the
+    /// release is suppressed by the move itself rather than by a wrapper: what
+    /// remains is a buffer with no block, which drops to nothing.
     ///
     /// # Returns
     ///
     /// Null when there was no allocation, which is what C returns and what
     /// `lib/urlapi.c:L1936` tests for.
-    #[must_use = "ownership moves to the caller; discarding this leaks"]
-    pub(crate) fn into_raw(self) -> *mut c_char {
-        let kept = mem::ManuallyDrop::new(self);
-        kept.bufr
-    }
-}
-
-impl Drop for DynBuf {
-    /// Releases the block unless it was handed over.
     ///
-    /// This is what removes the failure-path leak class the C original
-    /// carries. `lib/urlapi.c` has to reach `curlx_dyn_free()` on every path
+    /// # Where the release went
+    ///
+    /// There is no `Drop` implementation on this type, and it needs none.
+    /// `CBlock` has one, so a buffer that is simply dropped releases its
+    /// block, which is what removes the failure-path leak class the C original
+    /// carries: `lib/urlapi.c` has to reach `curlx_dyn_free()` on every path
     /// out of every function that declares a buffer, which it manages at
     /// L669, L1189, L1282, L1955, L1960 and L1988 but which
-    /// `docs/KNOWN-DIVERGENCES.md` records it missing elsewhere. Here there
-    /// is no path to miss.
-    fn drop(&mut self) {
-        // SAFETY: invariant 1 says `bufr` is null, which `c_free` ignores, or
-        // a live block from `src/alloc.rs` that this value alone owns.
-        // `Drop` runs at most once per value, and the only other way out of
-        // the type is `into_raw`, which wraps the value in `ManuallyDrop`
-        // and so suppresses this call, therefore the block is released
-        // exactly once and never after being given away.
-        unsafe { c_free(self.bufr.cast::<c_void>()) };
+    /// `docs/KNOWN-DIVERGENCES.md` records it missing elsewhere. Here there is
+    /// no path to miss and no hand-written `drop` to get wrong.
+    #[must_use = "ownership moves to the caller; discarding this leaks"]
+    pub(crate) fn into_raw(mut self) -> *mut c_char {
+        match self.block.take() {
+            Some(block) => block.into_raw(),
+            None => ptr::null_mut(),
+        }
     }
 }
 
@@ -1085,6 +1126,42 @@ impl Drop for DynBuf {
 struct FormatCounter {
     /// Bytes seen so far.
     len: usize,
+}
+
+/// A unique borrow of a [`DynBuf`]'s content and terminator slot that restores
+/// the terminator when it is dropped.
+///
+/// Returned by [`DynBuf::content_mut`]. It derefs to the bytes `[0..=len()]`,
+/// so the terminator slot is writable, which the two C consumers require, and
+/// its `Drop` writes the zero back at `[len()]`, so invariant 3 holds again on
+/// every path out of the borrow.
+pub(crate) struct MutContent<'a> {
+    buf: &'a mut DynBuf,
+}
+
+impl core::ops::Deref for MutContent<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.buf.as_bytes_with_nul()
+    }
+}
+
+impl core::ops::DerefMut for MutContent<'_> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.buf.mut_bytes_with_nul()
+    }
+}
+
+impl Drop for MutContent<'_> {
+    /// Re-establishes invariant 3 for the current length.
+    ///
+    /// Idempotent, and a no-op for both consumers in the C: the lower-casing
+    /// pass never touches the slot, and `ipv6_parse()` leaves it zero already.
+    /// It exists for the third caller nobody has written yet.
+    fn drop(&mut self) {
+        self.buf.terminate();
+    }
 }
 
 impl fmt::Write for FormatCounter {
@@ -1133,10 +1210,9 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
     #![allow(clippy::arithmetic_side_effects)]
 
-    // Imported by name rather than through a glob, which is the rule the
-    // plan sets for the whole crate at AAP 0.4.3.
+    // Imported by name rather than through a glob, as everywhere else in
+    // the crate, so each use site names its source.
     use super::{DynBuf, MAX_DYNBUF_SIZE, MIN_FIRST_ALLOC};
-    use crate::alloc::CBuf;
     use crate::error::CURLcode;
 
     /// The ceiling `lib/urlapi.c` passes at nine of its twelve init sites.
@@ -1148,8 +1224,8 @@ mod tests {
 
     /// Asserts the structural invariants after every state change.
     ///
-    /// Invariant 2 is the interesting one, `leng < allc` whenever there is
-    /// an allocation, because it is contract 2 from the module
+    /// Invariant 2 is the interesting one, `leng` below the capacity whenever
+    /// there is an allocation, because it is contract 2 from the module
     /// documentation: the terminator slot always exists.
     fn check_invariants(buf: &DynBuf) {
         if buf.capacity() == 0 {
@@ -1487,20 +1563,23 @@ mod tests {
         // writes hostname[hlen + 1] at lib/urlapi.c:L437; after the
         // hostname++ at L397 and the hlen -= 2 at L398, that index is
         // exactly `len()` of this buffer when normalization shortens
-        // nothing. The write must be expressible without unsafe in
-        // src/parse/ipv6.rs.
+        // nothing. The write has to be expressible in safe code, because
+        // src/parse/ipv6.rs is `#![forbid(unsafe_code)]` like every module
+        // outside src/ffi.rs.
         let mut buf = DynBuf::new(CEILING);
         assert_eq!(buf.addn(b"[2001:db8::1]"), CURLcode::CURLE_OK);
         let leng = buf.len();
         assert_eq!(leng, 13);
 
-        let view = buf.as_mut_bytes_with_nul();
-        assert_eq!(view.len(), leng + 1, "the spare byte is reachable");
-        // L437: terminate one past the closing bracket.
-        view[leng] = 0;
-        // L439: restore the ending bracket.
-        view[leng - 1] = b']';
-        assert_eq!(&view[..leng], b"[2001:db8::1]");
+        {
+            let mut view = buf.content_mut();
+            assert_eq!(view.len(), leng + 1, "the spare byte is reachable");
+            // L437: terminate one past the closing bracket.
+            view[leng] = 0;
+            // L439: restore the ending bracket.
+            view[leng - 1] = b']';
+            assert_eq!(&view[..leng], b"[2001:db8::1]");
+        }
 
         check_invariants(&buf);
         assert_eq!(buf.as_bytes(), b"[2001:db8::1]");
@@ -1517,7 +1596,7 @@ mod tests {
         for len in 0..source.len() {
             let mut buf = DynBuf::new(CEILING);
             assert_eq!(buf.addn(&source[..len]), CURLcode::CURLE_OK);
-            assert_eq!(buf.as_mut_bytes_with_nul().len(), len + 1);
+            assert_eq!(buf.content_mut().len(), len + 1);
             check_invariants(&buf);
         }
 
@@ -1526,10 +1605,33 @@ mod tests {
         let mut tight = DynBuf::new(8);
         assert_eq!(tight.addn(b"1234567"), CURLcode::CURLE_OK);
         assert_eq!(tight.capacity(), 8);
-        let view = tight.as_mut_bytes_with_nul();
-        assert_eq!(view.len(), 8);
-        view[7] = 0;
+        {
+            let mut view = tight.content_mut();
+            assert_eq!(view.len(), 8);
+            view[7] = 0;
+        }
         check_invariants(&tight);
+    }
+
+    #[test]
+    fn the_view_guard_restores_the_terminator_on_an_early_return() {
+        // The property the guard exists for: a caller that overwrites the
+        // terminator slot and then returns leaves the buffer terminated
+        // anyway, so invariant 3 cannot be broken from outside this module.
+        let mut buf = DynBuf::new(CEILING);
+        assert_eq!(buf.addn(b"host"), CURLcode::CURLE_OK);
+        let leng = buf.len();
+
+        fn clobber_and_return(buf: &mut DynBuf, leng: usize) {
+            let mut view = buf.content_mut();
+            // Deliberately hostile: destroy the terminator and leave.
+            view[leng] = b'X';
+        }
+        clobber_and_return(&mut buf, leng);
+
+        check_invariants(&buf);
+        assert_eq!(buf.as_bytes_with_nul(), b"host\0");
+        assert_eq!(buf.len(), leng);
     }
 
     #[test]
@@ -1540,7 +1642,7 @@ mod tests {
         let mut buf = DynBuf::new(CEILING);
         assert_eq!(buf.add("/a%2Fb%3Fc%FF"), CURLcode::CURLE_OK);
         {
-            let view = buf.as_mut_bytes_with_nul();
+            let mut view = buf.content_mut();
             let mut i = 0;
             while i < view.len() && view[i] != 0 {
                 let escape = view[i] == b'%' && i + 2 < view.len();
@@ -1617,27 +1719,11 @@ mod tests {
         check_invariants(&buf);
     }
 
-    #[test]
-    fn into_raw_suppresses_drop_and_hands_the_block_over() {
-        // The handover at lib/urlapi.c:L672, L813, L1025, L1049, L1077,
-        // L1185, L1399, L1489, L1934 and L1957. If Drop still ran, the
-        // adoption below would be a use after free, and a run under
-        // valgrind would say so.
-        let mut buf = DynBuf::new(CEILING);
-        assert_eq!(buf.addn(b"example.com/path"), CURLcode::CURLE_OK);
-        let len = buf.len();
-        let raw = buf.into_raw();
-        assert!(!raw.is_null());
-
-        // SAFETY: `raw` came from this module's C-allocator block, it is at
-        // least `len + 1` bytes with its first `len` initialized, `into_raw`
-        // suppressed the buffer's Drop, and no other owner exists. Adopting
-        // it here is what keeps the test leak-free.
-        let adopted = unsafe { CBuf::from_raw_parts(raw, len) };
-        let adopted = adopted.unwrap();
-        assert_eq!(adopted.as_bytes(), b"example.com/path");
-        assert_eq!(adopted.len(), len);
-    }
+    // The raw handover, `into_raw`, is tested in `src/ffi.rs`, because
+    // reclaiming the `*mut c_char` it returns means reading a pointer the
+    // compiler cannot vouch for and this module is `#![forbid(unsafe_code)]`.
+    // The owned handover below covers the same transfer for every consumer
+    // inside the crate, and it is the one `lib/urlapi.c`'s ten sites map onto.
 
     #[test]
     fn into_cbuf_transfers_ownership_and_keeps_the_content() {
@@ -1671,7 +1757,7 @@ mod tests {
         assert_eq!(buf.addn(b"borrowed"), CURLcode::CURLE_OK);
         assert_eq!(buf.as_bytes().len(), 8);
         assert_eq!(buf.as_bytes_with_nul().len(), 9);
-        assert_eq!(buf.as_mut_bytes_with_nul().len(), 9);
+        assert_eq!(buf.content_mut().len(), 9);
         assert_eq!(buf.addn(b" twice"), CURLcode::CURLE_OK);
         assert_eq!(buf.as_bytes(), b"borrowed twice");
         check_invariants(&buf);

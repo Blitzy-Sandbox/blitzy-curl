@@ -16,9 +16,9 @@
 //!
 //! # The two modes
 //!
-//! | Feature `scheme-table` | Source of truth        | `unsafe` |
+//! | Feature `scheme-table` | Source of truth        | Foreign call |
 //! |------------------------|------------------------|----------|
-//! | off, the drop-in mode  | the real `Curl_get_scheme()`, imported | three blocks |
+//! | off, the drop-in mode  | the real `Curl_get_scheme()`, imported | yes, in `crate::ffi::scheme_import` |
 //! | on, standalone default | a table compiled into this file        | none |
 //!
 //! This is the "capability provider selected at compile time" pattern, and it
@@ -94,8 +94,6 @@
 //!
 //! # Two transcription findings, reproduced rather than corrected
 //!
-//! Transformation rule T6, faithful over correct, governs both.
-//!
 //! First, four descriptors spell their name in upper case -- `"SCP"` at
 //! `lib/vssh/vssh.c` L353, `"SFTP"` at L339, `"WS"` at `lib/ws.c` L1985 and
 //! `"WSS"` at L2000 -- although `lib/urldata.h` L516 describes the field as
@@ -131,6 +129,11 @@
 // the allowance is stated once here with its reason. It is scoped to this
 // module and to this lint alone.
 #![allow(dead_code)]
+// `unsafe` belongs to `src/ffi.rs` alone, and the lint matters more here than
+// in most modules: in drop-in mode the lookup really does cross into libcurl,
+// and keeping that crossing in `crate::ffi::scheme_import` is what lets this
+// module state that it holds no `unsafe` of its own.
+#![forbid(unsafe_code)]
 
 use crate::abi::PROTOPT_URLOPTIONS;
 use core::ffi::CStr;
@@ -140,8 +143,11 @@ use core::ffi::CStr;
 /// An owned copy rather than a borrow of the descriptor, which is what keeps
 /// the raw pointer of drop-in mode from escaping this module: in either mode a
 /// caller receives plain values it can copy freely, and in standalone mode the
-/// same values are produced with no `unsafe` at all. Eight bytes, so copying
-/// is cheaper than borrowing would be.
+/// same values are produced with no `unsafe` at all. It is a small `Copy`
+/// snapshot of three scalars -- a `u32`, a `u16` and a `bool` -- so passing it
+/// by value costs no more than passing a reference would. No size or layout is
+/// promised: the type is `repr(Rust)` because nothing outside the crate sees
+/// it.
 ///
 /// The C reads the descriptor through a `const struct Curl_scheme *` that
 /// points into libcurl's `.rodata` and lives for the whole program, so nothing
@@ -159,7 +165,7 @@ pub(crate) struct SchemeInfo {
     flags: u32,
     /// `defport` at `lib/urldata.h` L523, a `uint16_t`.
     ///
-    /// Compared against `struct Curl_URL::portnum` at `lib/urlapi.c` L79,
+    /// Compared against `struct Curl_URL::portnum` at `lib/urlapi.c` L78,
     /// which is an `unsigned short`, so the widths already agree and no cast
     /// is needed at the comparison sites.
     defport: u16,
@@ -177,6 +183,28 @@ pub(crate) struct SchemeInfo {
 }
 
 impl SchemeInfo {
+    /// Builds a snapshot from the three values the C reads.
+    ///
+    /// The one constructor, so that both backends produce this type the same
+    /// way and the fields can stay private. The standalone table calls it from
+    /// its own rows; the drop-in backend calls it from
+    /// `crate::ffi::scheme_import`, after reading libcurl's descriptor through
+    /// the mirror there. Keeping the fields private is what stops a raw
+    /// pointer from ever reaching this module: the drop-in path has no way to
+    /// hand one over, because there is no field that would hold it.
+    ///
+    /// Arguments in the order `lib/urldata.h` L515-L524 declares them among
+    /// the fields that are read: `flags` at L522, `defport` at L523, and
+    /// whether `run` at L517 is non-null.
+    #[must_use]
+    pub(crate) const fn new(flags: u32, defport: u16, implemented: bool) -> Self {
+        Self {
+            flags,
+            defport,
+            implemented,
+        }
+    }
+
     /// The whole `PROTOPT_*` word.
     ///
     /// Prefer [`SchemeInfo::has_url_options`] for the one bit the URL API
@@ -268,8 +296,10 @@ pub(crate) fn getn_scheme(name: &[u8]) -> Option<SchemeInfo> {
 
 /// The standalone backend: a scheme table compiled into this crate.
 ///
-/// Selected by the `scheme-table` feature, which is on by default. Nothing in
-/// here is `unsafe`, and no C structure is described, because none is read.
+/// Selected by the `scheme-table` feature, which is on by default. Nothing
+/// crosses into C from here and no C structure is described, because none is
+/// read: the answers come from a table transcribed from `lib/urldata.h` and
+/// the protocol modules.
 #[cfg(feature = "scheme-table")]
 mod backend {
     use super::SchemeInfo;
@@ -370,27 +400,107 @@ mod backend {
         pub(super) const CONN_REUSE: u32 = 1 << 16;
     }
 
+    /// The capability macros the descriptors' `#ifdef`s test, resolved the way
+    /// the build this crate is validated against resolves them.
+    ///
+    /// Every descriptor writes its `run` member inside a preprocessor
+    /// conditional, so "is this protocol implemented" is not a property of the
+    /// scheme, it is a property of *a build*. `lib/dict.c` L305-L309 is the
+    /// shape:
+    ///
+    /// ```c
+    /// #ifdef CURL_DISABLE_DICT
+    ///   ZERO_NULL,
+    /// #else
+    ///   &Curl_protocol_dict,
+    /// #endif
+    /// ```
+    ///
+    /// Drop-in mode never consults this module: it reads the real pointer, so
+    /// it answers for whatever libcurl it was linked against. Standalone mode
+    /// has no libcurl and therefore has to *model* a build, and the build it
+    /// models is the reference build, because that is what the parity harness
+    /// compares against -- `scripts/build-reference.sh` configures OpenSSL,
+    /// libidn2, OpenLDAP and nghttp2, and disables nothing.
+    ///
+    /// The values below are that configuration, and they are checkable rather
+    /// than asserted: the reference build's own `curl --version` reports
+    ///
+    /// ```text
+    /// Protocols: dict file ftp ftps gopher gophers http https imap imaps
+    ///            ipfs ipns ldap ldaps mqtt mqtts pop3 pop3s rtsp smb smbs
+    ///            smtp smtps telnet tftp ws wss
+    /// Features:  ... IDN ... NTLM ... SSL ...
+    /// ```
+    ///
+    /// Every TLS scheme is present, so `USE_SSL` holds; `ldaps` is present, so
+    /// `HAVE_LDAP_SSL` holds; `smb` is present and NTLM is among the features,
+    /// so `USE_CURL_NTLM_CORE` holds; nothing is missing that a
+    /// `CURL_DISABLE_*` would remove. And the two absences are the two
+    /// capabilities the build has no library for: no `rtmp` family, because
+    /// librtmp is not installed, and no `scp` or `sftp`, because no SSH
+    /// backend is. `ipfs` and `ipns` are the command-line tool's own schemes
+    /// and have no descriptor in `lib/` at all.
+    ///
+    /// To model a different build, change these constants; each row below
+    /// spells out its own C condition in terms of them, so no row has to be
+    /// touched.
+    mod capability {
+        /// `USE_SSL`, from an OpenSSL-enabled configuration.
+        pub(super) const USE_SSL: bool = true;
+        /// `HAVE_LDAP_SSL`, from OpenLDAP.
+        pub(super) const HAVE_LDAP_SSL: bool = true;
+        /// `USE_CURL_NTLM_CORE`, which the NTLM feature reports.
+        pub(super) const USE_CURL_NTLM_CORE: bool = true;
+        /// `USE_LIBRTMP`. librtmp is not installed, so the six `rtmp*`
+        /// descriptors carry `ZERO_NULL` at `lib/curl_rtmp.c` L252-L256 and
+        /// their five siblings.
+        pub(super) const USE_LIBRTMP: bool = false;
+        /// `USE_SSH`. No SSH backend is built, so `scp` and `sftp` carry
+        /// `ZERO_NULL` at `lib/vssh/vssh.c` L340-L343 and L354-L357.
+        pub(super) const USE_SSH: bool = false;
+        /// Every `CURL_DISABLE_<protocol>`, none of which the reference build
+        /// defines. Named individually rather than folded into one constant so
+        /// that each row's condition reads as its own `#ifdef` does.
+        pub(super) const DISABLE_DICT: bool = false;
+        pub(super) const DISABLE_FILE: bool = false;
+        pub(super) const DISABLE_FTP: bool = false;
+        pub(super) const DISABLE_GOPHER: bool = false;
+        pub(super) const DISABLE_HTTP: bool = false;
+        pub(super) const DISABLE_IMAP: bool = false;
+        pub(super) const DISABLE_LDAP: bool = false;
+        pub(super) const DISABLE_MQTT: bool = false;
+        pub(super) const DISABLE_POP3: bool = false;
+        pub(super) const DISABLE_RTSP: bool = false;
+        pub(super) const DISABLE_SMB: bool = false;
+        pub(super) const DISABLE_SMTP: bool = false;
+        pub(super) const DISABLE_TELNET: bool = false;
+        pub(super) const DISABLE_TFTP: bool = false;
+        pub(super) const DISABLE_WEBSOCKETS: bool = false;
+    }
+
     /// One row of the built-in table: the three values a lookup can yield,
     /// plus the name it is found by.
     struct SchemeEntry {
         /// Transcribed verbatim from the descriptor, upper case included. See
-        /// the module documentation: four of the 33 are spelled in upper case
-        /// in the C and are left that way here on purpose.
+        /// the module documentation: four rows are spelled in upper case in the
+        /// C and are left that way here on purpose.
         name: &'static [u8],
         /// The descriptor's `defport` initialiser.
         defport: u16,
         /// The descriptor's `flags` initialiser, in full.
         flags: u32,
+        /// Whether the descriptor's `run` member is non-null, written as the
+        /// negation of the `#ifdef` condition that would make it `ZERO_NULL`,
+        /// in terms of [`capability`].
+        ///
+        /// This is the third value `lib/urlapi.c` reads, at L1646, and it is
+        /// the only one that is a property of the build rather than of the
+        /// scheme. Writing the condition out per row rather than storing a
+        /// single answer is what lets a reviewer check it against the
+        /// descriptor's own `#if` line, which is cited on the row.
+        implemented: bool,
     }
-
-    /// How many schemes the table holds.
-    ///
-    /// 33, from the authoritative list at `scripts/schemetable.c` L33-L65,
-    /// corroborated by there being exactly 33 `Curl_scheme_*` definitions in
-    /// `lib/`. Naming it and using it as the array's length pins the count at
-    /// compile time: adding or losing a row without updating this constant
-    /// fails the build rather than the parity diff.
-    const SCHEME_COUNT: usize = 33;
 
     /// The longest name any table row may have, from `lib/url.c` L1524.
     ///
@@ -400,31 +510,11 @@ mod backend {
     /// exceeds this, which is the drift check the guard itself cannot perform.
     const MAX_TABLE_NAME_LEN: usize = 7;
 
-    /// What this backend reports for `h->run != NULL`.
+    /// The table, in the order of the name list at `scripts/schemetable.c`
+    /// L33-L65, one row per `Curl_scheme_*` definition in `lib/`.
     ///
-    /// In the C, `run` is `ZERO_NULL` when the protocol was compiled out --
-    /// `lib/file.c` L628-L632 is the pattern, an `#ifdef CURL_DISABLE_FILE`
-    /// around the initialiser -- and `lib/urlapi.c` L1646 turns that into
-    /// `CURLUE_UNSUPPORTED_SCHEME`.
-    ///
-    /// Standalone mode has no libcurl, so there is no protocol implementation
-    /// to be present or absent and nothing for a `#ifdef` to have removed. The
-    /// honest answer is therefore "yes" for every row, and the
-    /// disabled-protocol path is simply unreachable in this mode rather than
-    /// missing from it. Drop-in mode, which is the authoritative
-    /// configuration, reads the real pointer and reaches that path exactly
-    /// when the linked libcurl does.
-    ///
-    /// The consequence is worth stating plainly: in standalone mode
-    /// `curl_url_set(u, CURLUPART_SCHEME, "rtmp", 0)` succeeds, where a
-    /// libcurl built without librtmp would return
-    /// `CURLUE_UNSUPPORTED_SCHEME`. No assertion in
-    /// `tests/libtest/lib1560.c` depends on that difference: the only scheme
-    /// it sets is `imaps`, at L1085, and the only ones it rejects are names no
-    /// table holds at all.
-    const IMPLEMENTED: bool = true;
-
-    /// The 33 schemes, in the order of `scripts/schemetable.c` L33-L65.
+    /// A slice rather than an array, so that the number of rows is the
+    /// transcription's own answer and appears nowhere as a separate claim.
     ///
     /// Each row's `defport` and `flags` are transcribed from that protocol
     /// module's own `const struct Curl_scheme` literal, with the file and line
@@ -434,18 +524,20 @@ mod backend {
     /// `gophers` shares `gopher`'s port rather than having one of its own, and
     /// `rtmpe` takes `PORT_RTMP` while `rtmpt` takes `PORT_HTTP`. Every one of
     /// those would have been guessed wrong.
-    static TABLE: [SchemeEntry; SCHEME_COUNT] = [
+    static TABLE: &[SchemeEntry] = &[
         // lib/dict.c L303-L314
         SchemeEntry {
             name: b"dict",
             defport: port::DICT,
             flags: protopt::NONE | protopt::NOURLQUERY,
+            implemented: !capability::DISABLE_DICT,
         },
         // lib/file.c L626-L637. The only row with no default port.
         SchemeEntry {
             name: b"file",
             defport: port::NONE,
             flags: protopt::NONETWORK | protopt::NOURLQUERY,
+            implemented: !capability::DISABLE_FILE,
         },
         // lib/ftp.c L4348-L4362
         SchemeEntry {
@@ -459,6 +551,7 @@ mod backend {
                 | protopt::WILDCARD
                 | protopt::SSL_REUSE
                 | protopt::CONN_REUSE,
+            implemented: !capability::DISABLE_FTP,
         },
         // lib/ftp.c L4367-L4380
         SchemeEntry {
@@ -471,24 +564,28 @@ mod backend {
                 | protopt::NOURLQUERY
                 | protopt::WILDCARD
                 | protopt::CONN_REUSE,
+            implemented: !capability::DISABLE_FTP && capability::USE_SSL,
         },
         // lib/gopher.c L219-L230
         SchemeEntry {
             name: b"gopher",
             defport: port::GOPHER,
             flags: protopt::NONE,
+            implemented: !capability::DISABLE_GOPHER,
         },
         // lib/gopher.c L232-L243. Shares gopher's port.
         SchemeEntry {
             name: b"gophers",
             defport: port::GOPHER,
             flags: protopt::SSL,
+            implemented: !capability::DISABLE_GOPHER && capability::USE_SSL,
         },
         // lib/http.c L5011-L5023
         SchemeEntry {
             name: b"http",
             defport: port::HTTP,
             flags: protopt::CREDSPERREQUEST | protopt::USERPWDCTRL | protopt::CONN_REUSE,
+            implemented: !capability::DISABLE_HTTP,
         },
         // lib/http.c L5028-L5040
         SchemeEntry {
@@ -499,6 +596,7 @@ mod backend {
                 | protopt::ALPN
                 | protopt::USERPWDCTRL
                 | protopt::CONN_REUSE,
+            implemented: !capability::DISABLE_HTTP && capability::USE_SSL,
         },
         // lib/imap.c L2331-L2344
         SchemeEntry {
@@ -508,36 +606,42 @@ mod backend {
                 | protopt::URLOPTIONS
                 | protopt::SSL_REUSE
                 | protopt::CONN_REUSE,
+            implemented: !capability::DISABLE_IMAP,
         },
         // lib/imap.c L2349-L2361
         SchemeEntry {
             name: b"imaps",
             defport: port::IMAPS,
             flags: protopt::CLOSEACTION | protopt::SSL | protopt::URLOPTIONS | protopt::CONN_REUSE,
+            implemented: !capability::DISABLE_IMAP && capability::USE_SSL,
         },
         // lib/ldap.c L1008-L1018
         SchemeEntry {
             name: b"ldap",
             defport: port::LDAP,
             flags: protopt::SSL_REUSE,
+            implemented: !capability::DISABLE_LDAP,
         },
         // lib/ldap.c L1024-L1034
         SchemeEntry {
             name: b"ldaps",
             defport: port::LDAPS,
             flags: protopt::SSL,
+            implemented: !capability::DISABLE_LDAP && capability::HAVE_LDAP_SSL,
         },
         // lib/mqtt.c L1032-L1043
         SchemeEntry {
             name: b"mqtt",
             defport: port::MQTT,
             flags: protopt::NONE,
+            implemented: !capability::DISABLE_MQTT,
         },
         // lib/mqtt.c L1015-L1026
         SchemeEntry {
             name: b"mqtts",
             defport: port::MQTTS,
             flags: protopt::SSL,
+            implemented: !capability::DISABLE_MQTT && capability::USE_SSL,
         },
         // lib/pop3.c L1720-L1732
         SchemeEntry {
@@ -548,6 +652,7 @@ mod backend {
                 | protopt::URLOPTIONS
                 | protopt::SSL_REUSE
                 | protopt::CONN_REUSE,
+            implemented: !capability::DISABLE_POP3,
         },
         // lib/pop3.c L1737-L1749
         SchemeEntry {
@@ -558,48 +663,56 @@ mod backend {
                 | protopt::NOURLQUERY
                 | protopt::URLOPTIONS
                 | protopt::CONN_REUSE,
+            implemented: !capability::DISABLE_POP3 && capability::USE_SSL,
         },
         // lib/curl_rtmp.c L250-L261
         SchemeEntry {
             name: b"rtmp",
             defport: port::RTMP,
             flags: protopt::NONE,
+            implemented: capability::USE_LIBRTMP,
         },
         // lib/curl_rtmp.c L263-L274
         SchemeEntry {
             name: b"rtmpt",
             defport: port::RTMPT,
             flags: protopt::NONE,
+            implemented: capability::USE_LIBRTMP,
         },
         // lib/curl_rtmp.c L276-L287. Takes PORT_RTMP, not PORT_RTMPT.
         SchemeEntry {
             name: b"rtmpe",
             defport: port::RTMP,
             flags: protopt::NONE,
+            implemented: capability::USE_LIBRTMP,
         },
         // lib/curl_rtmp.c L289-L300
         SchemeEntry {
             name: b"rtmpte",
             defport: port::RTMPT,
             flags: protopt::NONE,
+            implemented: capability::USE_LIBRTMP,
         },
         // lib/curl_rtmp.c L302-L313
         SchemeEntry {
             name: b"rtmps",
             defport: port::RTMPS,
             flags: protopt::NONE,
+            implemented: capability::USE_LIBRTMP,
         },
         // lib/curl_rtmp.c L315-L326
         SchemeEntry {
             name: b"rtmpts",
             defport: port::RTMPS,
             flags: protopt::NONE,
+            implemented: capability::USE_LIBRTMP,
         },
         // lib/rtsp.c L1073-L1084
         SchemeEntry {
             name: b"rtsp",
             defport: port::RTSP,
             flags: protopt::CONN_REUSE,
+            implemented: !capability::DISABLE_RTSP,
         },
         // lib/vssh/vssh.c L352-L364. Upper case in the C.
         SchemeEntry {
@@ -609,6 +722,7 @@ mod backend {
                 | protopt::CLOSEACTION
                 | protopt::NOURLQUERY
                 | protopt::CONN_REUSE,
+            implemented: capability::USE_SSH,
         },
         // lib/vssh/vssh.c L338-L350. Upper case in the C.
         SchemeEntry {
@@ -618,18 +732,23 @@ mod backend {
                 | protopt::CLOSEACTION
                 | protopt::NOURLQUERY
                 | protopt::CONN_REUSE,
+            implemented: capability::USE_SSH,
         },
         // lib/smb.c L1234-L1245
         SchemeEntry {
             name: b"smb",
             defport: port::SMB,
             flags: protopt::CONN_REUSE,
+            implemented: !capability::DISABLE_SMB && capability::USE_CURL_NTLM_CORE,
         },
         // lib/smb.c L1250-L1262
         SchemeEntry {
             name: b"smbs",
             defport: port::SMBS,
             flags: protopt::SSL | protopt::CONN_REUSE,
+            implemented: !capability::DISABLE_SMB
+                && capability::USE_CURL_NTLM_CORE
+                && capability::USE_SSL,
         },
         // lib/smtp.c L2012-L2024
         SchemeEntry {
@@ -640,6 +759,7 @@ mod backend {
                 | protopt::URLOPTIONS
                 | protopt::SSL_REUSE
                 | protopt::CONN_REUSE,
+            implemented: !capability::DISABLE_SMTP,
         },
         // lib/smtp.c L2029-L2041
         SchemeEntry {
@@ -650,18 +770,21 @@ mod backend {
                 | protopt::NOURLQUERY
                 | protopt::URLOPTIONS
                 | protopt::CONN_REUSE,
+            implemented: !capability::DISABLE_SMTP && capability::USE_SSL,
         },
         // lib/telnet.c L1597-L1608
         SchemeEntry {
             name: b"telnet",
             defport: port::TELNET,
             flags: protopt::NONE | protopt::NOURLQUERY,
+            implemented: !capability::DISABLE_TELNET,
         },
         // lib/tftp.c L1360-L1371
         SchemeEntry {
             name: b"tftp",
             defport: port::TFTP,
             flags: protopt::NOTCPPROXY | protopt::NOURLQUERY,
+            implemented: !capability::DISABLE_TFTP,
         },
         // lib/ws.c L1984-L1996. Upper case in the C, and it borrows
         // PORT_HTTP rather than declaring a port of its own.
@@ -669,12 +792,14 @@ mod backend {
             name: b"WS",
             defport: port::HTTP,
             flags: protopt::CREDSPERREQUEST | protopt::USERPWDCTRL,
+            implemented: !capability::DISABLE_WEBSOCKETS,
         },
         // lib/ws.c L1999-L2011. Upper case in the C.
         SchemeEntry {
             name: b"WSS",
             defport: port::HTTPS,
             flags: protopt::SSL | protopt::CREDSPERREQUEST | protopt::USERPWDCTRL,
+            implemented: !capability::DISABLE_WEBSOCKETS && capability::USE_SSL,
         },
     ];
 
@@ -717,13 +842,20 @@ mod backend {
             .map(|entry| SchemeInfo {
                 flags: entry.flags,
                 defport: entry.defport,
-                implemented: IMPLEMENTED,
+                implemented: entry.implemented,
             })
     }
 
     #[cfg(test)]
     mod tests {
-        use super::{MAX_TABLE_NAME_LEN, SCHEME_COUNT, TABLE};
+        // The crate root denies the panicking constructs so that no panic can
+        // ever reach the C boundary. A test's entire job is to panic when an
+        // assertion fails, and a test never crosses that boundary, so the
+        // denial is relaxed here and only here, for the one construct this
+        // module needs.
+        #![allow(clippy::unwrap_used)]
+
+        use super::{capability, MAX_TABLE_NAME_LEN, TABLE};
         use crate::abi::{MAX_SCHEME_LEN, PROTOPT_URLOPTIONS};
         use crate::ctype::eq_ignore_case;
         use crate::scheme::{get_scheme, getn_scheme, SchemeInfo};
@@ -738,7 +870,7 @@ mod backend {
         /// lower-case names, where the table is written as macro names against
         /// verbatim -- sometimes upper-case -- names. A transcription slip has
         /// to be made twice, in two different notations, to survive.
-        const NAMES_AND_PORTS: [(&[u8], u16); SCHEME_COUNT] = [
+        const NAMES_AND_PORTS: &[(&[u8], u16)] = &[
             (b"dict", 2628),
             (b"file", 0),
             (b"ftp", 21),
@@ -791,19 +923,17 @@ mod backend {
 
         /// Builds a `&CStr` from a byte literal that ends in NUL.
         ///
-        /// `CStr::from_bytes_with_nul` returns a `Result`, and the crate root
-        /// denies both `unwrap` and `expect`, so the assertion below stands in
-        /// for them: it is the checked constructor's own test, reported as a
-        /// test failure rather than swallowed.
+        /// The checked constructor is used rather than the unchecked one: this
+        /// module is `#![forbid(unsafe_code)]` like every module outside
+        /// `src/ffi.rs`, and a literal that does not end in exactly one NUL is
+        /// a defect in the test rather than a case to handle, so the `Err` arm
+        /// fails the test with a message naming the offender.
         fn cstr(terminated: &[u8]) -> &CStr {
             assert!(
                 CStr::from_bytes_with_nul(terminated).is_ok(),
                 "test literal must end in exactly one NUL and hold no other"
             );
-            // SAFETY: the assertion above is precisely
-            // `from_bytes_with_nul`'s precondition -- one terminating NUL and
-            // no interior one -- so reaching this line means it holds.
-            unsafe { CStr::from_bytes_with_nul_unchecked(terminated) }
+            CStr::from_bytes_with_nul(terminated).unwrap()
         }
 
         /// Renders a scheme name for an assertion message.
@@ -822,7 +952,7 @@ mod backend {
         /// crate's lint policy forbids.
         #[test]
         fn no_table_name_exceeds_the_c_length_bound() {
-            for entry in &TABLE {
+            for entry in TABLE {
                 assert!(
                     !entry.name.is_empty(),
                     "a table row has an empty name, which no lookup could ever find"
@@ -858,7 +988,41 @@ mod backend {
                     "row {position} shares its name with another row, ignoring case"
                 );
             }
-            assert_eq!(TABLE.len(), SCHEME_COUNT);
+            assert_eq!(TABLE.len(), NAMES_AND_PORTS.len());
+        }
+
+        /// The `run` marker is per row and per build, not a blanket answer.
+        ///
+        /// Every descriptor writes `run` inside a preprocessor conditional, so
+        /// `lib/urlapi.c` L1646's `CURLUE_UNSUPPORTED_SCHEME` path is reachable
+        /// exactly when the modelled build compiled the protocol out. The
+        /// reference build has no librtmp and no SSH backend, so those rows
+        /// answer false while the TLS rows answer true; a blanket `true` would
+        /// make that path unreachable and silently accept `rtmp`.
+        #[test]
+        fn the_run_marker_follows_the_modelled_build_per_scheme() {
+            let implemented = |name: &[u8]| {
+                TABLE
+                    .iter()
+                    .find(|entry| entry.name.eq_ignore_ascii_case(name))
+                    .map(|entry| entry.implemented)
+            };
+            assert_eq!(implemented(b"https"), Some(true));
+            assert_eq!(implemented(b"imaps"), Some(true));
+            assert_eq!(implemented(b"rtmp"), Some(false));
+            assert_eq!(implemented(b"sftp"), Some(false));
+            // The modelled build these expectations rest on, restated so a
+            // reader does not have to trust the rows: no librtmp, no SSH
+            // backend, TLS present. Compared as a tuple because the three are
+            // compile-time constants, and both a bare `assert!` and an
+            // `assert_eq!` against a literal `bool` are lints rather than
+            // tests.
+            let modelled = (
+                capability::USE_LIBRTMP,
+                capability::USE_SSH,
+                capability::USE_SSL,
+            );
+            assert_eq!(modelled, (false, false, true));
         }
 
         /// All 33 names resolve, through both entry points, and report the
@@ -874,7 +1038,7 @@ mod backend {
                 );
                 assert_eq!(
                     found.map(SchemeInfo::defport),
-                    Some(port),
+                    Some(*port),
                     "wrong default port for {}",
                     shown(name)
                 );
@@ -1084,20 +1248,37 @@ mod backend {
             assert_eq!(getn_scheme(&middling), None);
         }
 
-        /// Standalone mode has no libcurl to have compiled a protocol out, so
-        /// every row reports an implementation. `lib/urlapi.c` L1646 is
-        /// therefore unreachable in this mode; drop-in mode reaches it exactly
-        /// when the linked libcurl does.
+        /// The lookup reports each row's own marker, so the disabled-protocol
+        /// path stays reachable.
+        ///
+        /// `lib/urlapi.c` L1646 turns a null `run` member into
+        /// `CURLUE_UNSUPPORTED_SCHEME`, and every descriptor decides that member
+        /// inside a preprocessor conditional. This mode models the reference
+        /// build, which has no librtmp and no SSH backend, so the six `rtmp*`
+        /// rows and `scp`/`sftp` answer false while everything the build does
+        /// carry answers true. A blanket answer either way would make one of the
+        /// two outcomes unreachable.
         #[test]
-        fn every_scheme_reports_an_implementation() {
-            for (name, _) in NAMES_AND_PORTS {
+        fn the_lookup_reports_each_row_s_own_implementation_marker() {
+            for name in [b"http".as_slice(), b"https", b"ftp", b"imaps", b"smtp"] {
                 assert_eq!(
                     getn_scheme(name).map(SchemeInfo::implemented),
                     Some(true),
-                    "{} must report an implementation in standalone mode",
+                    "{} is in the modelled build and must report an implementation",
                     shown(name)
                 );
             }
+            for name in [b"rtmp".as_slice(), b"rtmps", b"rtmpt", b"scp", b"sftp"] {
+                assert_eq!(
+                    getn_scheme(name).map(SchemeInfo::implemented),
+                    Some(false),
+                    "{} is absent from the modelled build and must not report one",
+                    shown(name)
+                );
+            }
+            // The row is found either way: an unimplemented protocol still has a
+            // descriptor, which is why the C reaches L1646 rather than L1645.
+            assert!(getn_scheme(b"sftp").is_some());
         }
 
         /// `Curl_get_scheme` is `Curl_getn_scheme(scheme, strlen(scheme))` and
@@ -1122,516 +1303,23 @@ mod backend {
     }
 }
 
-/// The drop-in backend: libcurl's own `Curl_get_scheme` is imported.
+/// The drop-in backend: libcurl's own `Curl_get_scheme`, imported.
 ///
 /// Selected when the `scheme-table` feature is off, which is the drop-in and
-/// authoritative configuration. This is the only module in the crate outside
-/// `src/ffi.rs`, `src/alloc.rs`, `src/inet.rs` and `src/idn.rs` that contains
-/// `unsafe`, and every block carries a safety comment.
+/// authoritative configuration. The import itself lives in
+/// `crate::ffi::scheme_import`, because it is a foreign call and a read
+/// through a pointer libcurl returned, and the crate keeps every one of those
+/// in one module. What comes back is a [`SchemeInfo`], an owned copy of the
+/// three fields the URL API reads, so no raw pointer reaches this module in
+/// either mode -- the type has no field that could hold one.
 ///
-/// Note what is *not* here: no definition of `Curl_get_scheme`. The crate
-/// imports it, so the archive must show the symbol as undefined rather than
-/// defined, or the drop-in link acquires a duplicate of a symbol `lib/url.c`
-/// already provides and `scripts/check-abi.sh` reports an export the C object
-/// file does not have.
+/// Note what is *not* imported anywhere: a definition of `Curl_get_scheme`.
+/// The crate declares it and libcurl defines it, so the archive must show the
+/// symbol as undefined rather than defined, or the drop-in link acquires a
+/// duplicate of a symbol `lib/url.c` already provides and
+/// `scripts/check-abi.sh` reports an export the C object file does not have.
 #[cfg(not(feature = "scheme-table"))]
-mod backend {
-    use super::SchemeInfo;
-    use core::ffi::CStr;
-    use core::mem;
-    use libc::{c_char, c_void, size_t};
-
-    /// Mirror of `struct Curl_scheme` at `lib/urldata.h` L515-L524.
-    ///
-    /// The field order is the C's, and it is not negotiable: this structure is
-    /// never constructed here, only read through a pointer libcurl handed
-    /// back, so the offsets are the whole contract. `name`, `protocol` and
-    /// `family` are described even though nothing reads them, because the
-    /// three fields that *are* read sit after them and cannot be located
-    /// otherwise.
-    ///
-    /// # THE LAYOUT HAZARD
-    ///
-    /// `protocol` and `family` are `curl_prot_t`, and `curl_prot_t` is
-    /// **conditional**:
-    ///
-    /// ```text
-    /// lib/urldata.h:81   /* This should be undefined once we need bit 32 or higher */
-    /// lib/urldata.h:82   #define PROTO_TYPE_SMALL
-    /// lib/urldata.h:84   #ifndef PROTO_TYPE_SMALL
-    /// lib/urldata.h:85   typedef curl_off_t curl_prot_t;
-    /// lib/urldata.h:87   typedef uint32_t curl_prot_t;
-    /// ```
-    ///
-    /// So `u32` above is correct only while `PROTO_TYPE_SMALL` is defined in
-    /// the libcurl being linked against. If it is ever undefined the two
-    /// fields become 64-bit and **every field after them shifts**, which is
-    /// exactly the pair of fields this module reads. A reviewer who notices
-    /// that `protocol` and `family` are never read may conclude their width
-    /// does not matter. It matters more than any other line in this file:
-    /// `flags` and `defport` are located by it, and getting it wrong does not
-    /// fail to compile, it silently returns another field's bytes as a default
-    /// port.
-    ///
-    /// This is not a hypothetical. `lib/urldata.h` L71 already defines
-    /// `CURLPROTO_WSS` as `((curl_prot_t)1 << 31)`, so bit 31 is taken and the
-    /// header is one protocol away from the condition its own comment
-    /// describes.
-    ///
-    /// Two things guard the assumption, and it is worth being precise about
-    /// what each one can do.
-    ///
-    /// [`LAYOUT_PROOF`] pins *this* structure to the shape the port assumes,
-    /// at compile time. It catches an edit here -- a reordered field, a
-    /// widened integer, a `#[repr(C)]` accidentally dropped. It cannot observe
-    /// the C side at all: no assertion written in Rust can read
-    /// `lib/urldata.h`. The 32-bit `curl_prot_t` is therefore a documented
-    /// *precondition* of drop-in mode rather than a checked one, and belongs
-    /// with the other documented limitations of that mode in
-    /// `docs/KNOWN-DIVERGENCES.md`.
-    ///
-    /// The live cross-check is the parity run. `tests/libtest/lib1560.c`
-    /// asserts default ports directly -- `https://127.0.0.1` with
-    /// `CURLU_DEFAULT_PORT` must yield `443` at L592-L594, and
-    /// `http://example.com:80` with `CURLU_NO_DEFAULT_PORT` must serialise
-    /// without the port at L786-L788 -- and both readings come through
-    /// `defport`. A shifted mirror fails them on the first sub-test rather
-    /// than subtly, which is the outcome to want.
-    #[repr(C)]
-    struct CurlScheme {
-        /// L516, "URL scheme name in lowercase" -- which four descriptors
-        /// disregard, as the module documentation records. Never read: the
-        /// lookup is by name and libcurl has already done the comparing.
-        name: *const c_char,
-        /// L517, `const struct Curl_protocol *`, the implementation.
-        ///
-        /// Modelled as an opaque pointer because it is only ever tested for
-        /// null. `struct Curl_protocol` is a 30-odd member function table at
-        /// `lib/urldata.h` L400-L513 and describing it would add a large
-        /// second ABI contract for no gain.
-        run: *const c_void,
-        /// L518-L519, `curl_prot_t`. Never read. See the layout hazard above:
-        /// its width is load-bearing regardless.
-        protocol: u32,
-        /// L520-L521, `curl_prot_t`. Never read, same caveat.
-        family: u32,
-        /// L522, `uint32_t` of `PROTOPT_*` bits. Read, for
-        /// `PROTOPT_URLOPTIONS`.
-        flags: u32,
-        /// L523, `uint16_t`. Read, as the scheme's default port.
-        defport: u16,
-    }
-
-    // The names below are C identifiers and must stay exactly as libcurl
-    // spells them, so the Rust naming convention cannot apply. Scoped to the
-    // extern block, so nothing else in the module inherits the allowance.
-    #[allow(non_snake_case)]
-    extern "C" {
-        /// `lib/url.c` L1469-L1472, declared at `lib/url.h` L76.
-        ///
-        /// Returns null for a name the table does not hold.
-        fn Curl_get_scheme(scheme: *const c_char) -> *const CurlScheme;
-
-        /// `lib/url.c` L1477-L1541, declared at `lib/url.h` L77.
-        ///
-        /// The length-delimited form `Curl_get_scheme` forwards to. `size_t`
-        /// is `usize` on every platform this crate targets, which is what
-        /// `libc::size_t` states.
-        fn Curl_getn_scheme(scheme: *const c_char, len: size_t) -> *const CurlScheme;
-    }
-
-    /// The size [`CurlScheme`] must have, given a 32-bit `curl_prot_t`.
-    ///
-    /// Written as a table rather than as arithmetic, so that the padding
-    /// reasoning is visible instead of encoded, and so that no arithmetic
-    /// operator appears in a file the crate's lint policy holds to checked
-    /// arithmetic.
-    ///
-    /// - 64-bit pointers: `name` 8 at 0, `run` 8 at 8, `protocol` 4 at 16,
-    ///   `family` 4 at 20, `flags` 4 at 24, `defport` 2 at 28, then 2 bytes of
-    ///   tail padding to the 8-byte alignment. 32 in total. A 64-bit
-    ///   `curl_prot_t` would make it 40, so the check discriminates.
-    /// - 32-bit pointers: `name` 4 at 0, `run` 4 at 4, `protocol` 4 at 8,
-    ///   `family` 4 at 12, `flags` 4 at 16, `defport` 2 at 20, then 2 bytes of
-    ///   tail padding to the 4-byte alignment. 24 in total, against 32 for the
-    ///   wide variant.
-    ///
-    /// Any other pointer width is a platform this port has not reasoned about.
-    /// Returning zero for it fails [`LAYOUT_PROOF`] outright, because no
-    /// structure containing a pointer can be zero bytes, which is the intended
-    /// outcome: refuse rather than guess.
-    const fn expected_mirror_size() -> usize {
-        match mem::size_of::<*const c_void>() {
-            8 => 32,
-            4 => 24,
-            _ => 0,
-        }
-    }
-
-    /// Compile-time proof that the mirror still has the layout the port
-    /// assumes. See the hazard note on [`CurlScheme`] for what this does and
-    /// does not establish.
-    const LAYOUT_PROOF: () = {
-        assert!(
-            mem::size_of::<CurlScheme>() == expected_mirror_size(),
-            "src/scheme.rs: the struct Curl_scheme mirror is not the size \
-             lib/urldata.h:515-524 implies with a 32-bit curl_prot_t. Either \
-             a field here was reordered, widened or narrowed, or the target \
-             has an unexpected pointer width."
-        );
-        assert!(
-            mem::align_of::<CurlScheme>() == mem::align_of::<*const c_void>(),
-            "src/scheme.rs: the struct Curl_scheme mirror is not \
-             pointer-aligned, so its first member is no longer a pointer and \
-             every offset after it has moved."
-        );
-        assert!(
-            mem::size_of::<u32>() == 4 && mem::size_of::<u16>() == 2,
-            "src/scheme.rs: uint32_t and uint16_t are not 4 and 2 bytes, so \
-             the flags and defport fields cannot be where lib/urldata.h puts \
-             them."
-        );
-    };
-
-    /// `Curl_get_scheme`, drop-in.
-    pub(super) fn get_scheme(scheme: &CStr) -> Option<SchemeInfo> {
-        // SAFETY: `Curl_get_scheme` reads its argument as a NUL-terminated C
-        // string and does not retain it. `CStr::as_ptr` yields a non-null,
-        // readable pointer to bytes that are NUL terminated by the type's own
-        // invariant, and the borrow keeps them alive for the whole call, which
-        // is longer than libcurl needs them: `lib/url.c` L1471 passes the
-        // pointer to `strlen` and to `Curl_getn_scheme`, which compares it and
-        // returns. Nothing is written through the pointer, matching the C's
-        // `const char *`.
-        let descriptor = unsafe { Curl_get_scheme(scheme.as_ptr()) };
-        describe(descriptor)
-    }
-
-    /// `Curl_getn_scheme`, drop-in.
-    pub(super) fn getn_scheme(name: &[u8]) -> Option<SchemeInfo> {
-        // Reproduces the `len &&` half of the guard at `lib/url.c` L1524
-        // before the call rather than after it, for a reason that is about
-        // Rust and not about C: `<[u8]>::as_ptr` on an empty slice yields a
-        // dangling pointer, which the C would never dereference -- it tests
-        // `len` first -- but which has no business crossing the boundary at
-        // all. The outcome is identical either way.
-        if name.is_empty() {
-            return None;
-        }
-        // SAFETY: the slice is non-empty, so `as_ptr` yields a pointer to
-        // `name.len()` readable, initialised bytes, and the borrow keeps them
-        // alive for the whole call. `len` is that same count, so libcurl reads
-        // exactly the slice and never past it: `lib/url.c` L1529-L1534 walks
-        // `len` bytes and L1537 compares `len` bytes. No terminator is needed
-        // or assumed on this path, which is why the length-delimited entry
-        // point exists. `u8` and `c_char` have the same size and alignment, so
-        // the cast changes only the sign the compiler ascribes to the bytes,
-        // and libcurl folds them through a 256-entry table that is total over
-        // all byte values.
-        let descriptor = unsafe { Curl_getn_scheme(name.as_ptr().cast::<c_char>(), name.len()) };
-        describe(descriptor)
-    }
-
-    /// Turns the descriptor pointer libcurl returned into the safe, owned
-    /// answer, so no raw pointer leaves this module.
-    fn describe(descriptor: *const CurlScheme) -> Option<SchemeInfo> {
-        // Forces the layout proof to be evaluated in every build. It emits no
-        // code, and `describe` is on every path out of this backend, so the
-        // proof cannot be compiled out of a configuration that uses the
-        // mirror.
-        let () = LAYOUT_PROOF;
-        // The C's own test, at `lib/urlapi.c` L284 followed by L290, L951,
-        // L1460 followed by L1465, L1589, L1598 and L1645: every one of the
-        // six call sites checks the pointer before reading through it.
-        if descriptor.is_null() {
-            return None;
-        }
-        // SAFETY: the pointer is non-null, checked immediately above. libcurl
-        // only ever returns `&Curl_scheme_<name>`, one of the 33 `const struct
-        // Curl_scheme` objects with static storage duration listed in
-        // `lib/url.c` L1488-L1522, so the referent outlives this call by the
-        // whole program and is never written to by libcurl or by this crate --
-        // which makes a shared reference sound and rules out any aliasing
-        // conflict. The referent's layout matches `CurlScheme` under the
-        // precondition documented on that type and pinned as far as Rust can
-        // pin it by `LAYOUT_PROOF`. The reference is dropped before this
-        // function returns; only copies of three scalar fields escape.
-        let scheme = unsafe { &*descriptor };
-        Some(SchemeInfo {
-            flags: scheme.flags,
-            defport: scheme.defport,
-            // `!h->run` at `lib/urlapi.c` L1646, inverted: the C tests for
-            // absence, this records presence.
-            implemented: !scheme.run.is_null(),
-        })
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::{expected_mirror_size, CurlScheme, LAYOUT_PROOF};
-        use crate::abi::PROTOPT_URLOPTIONS;
-        use crate::scheme::{get_scheme, getn_scheme, SchemeInfo};
-        use core::ffi::CStr;
-        use core::mem;
-        use core::ptr;
-        use libc::{c_char, c_void, size_t};
-
-        /// A `static const struct Curl_scheme` stand-in for libcurl's table.
-        ///
-        /// Drop-in mode imports `Curl_get_scheme` rather than defining it, so a
-        /// test binary in this configuration has no libcurl to link against and
-        /// the symbol would be undefined. The double below supplies it, which
-        /// buys more than a working link: it exercises the real code path --
-        /// the call, the null check and the dereference through the mirror --
-        /// including the disabled-protocol case, which a real libcurl only
-        /// produces for a protocol its build switched off.
-        ///
-        /// It is defined under `cfg(test)` and can therefore never reach the
-        /// shipped archive, so `scripts/check-abi.sh` still sees
-        /// `Curl_get_scheme` as an undefined symbol there.
-        struct Descriptors([CurlScheme; 4]);
-
-        // SAFETY: the array is immutable for the whole program and the only
-        // pointers it holds are into `static` byte literals, so no thread can
-        // observe it changing and none of its contents can be freed. That is
-        // the same posture as libcurl's own table, whose entries are
-        // `const struct Curl_scheme` objects with static storage duration.
-        unsafe impl Sync for Descriptors {}
-
-        /// One byte with static storage, used as a non-null `run` that is never
-        /// dereferenced. `lib/urlapi.c` L1646 only tests the pointer, so any
-        /// non-null value models an implemented protocol faithfully.
-        static RUN_MARKER: u8 = 0;
-
-        /// Four rows: two ordinary schemes, one with `PROTOPT_URLOPTIONS`, and
-        /// one whose `run` is null the way `ZERO_NULL` leaves it at
-        /// `lib/file.c` L629.
-        static DESCRIPTORS: Descriptors = Descriptors([
-            CurlScheme {
-                name: b"https\0".as_ptr().cast::<c_char>(),
-                run: (&RUN_MARKER as *const u8).cast::<c_void>(),
-                protocol: 1 << 1,
-                family: 1 << 0,
-                // PROTOPT_SSL | PROTOPT_CREDSPERREQUEST | PROTOPT_ALPN |
-                // PROTOPT_USERPWDCTRL | PROTOPT_CONN_REUSE, lib/http.c:5037.
-                flags: 0x0001_2181,
-                defport: 443,
-            },
-            CurlScheme {
-                name: b"imap\0".as_ptr().cast::<c_char>(),
-                run: (&RUN_MARKER as *const u8).cast::<c_void>(),
-                protocol: 1 << 10,
-                family: 1 << 10,
-                // PROTOPT_CLOSEACTION | PROTOPT_URLOPTIONS |
-                // PROTOPT_SSL_REUSE | PROTOPT_CONN_REUSE, lib/imap.c:2339.
-                flags: 0x0001_8404,
-                defport: 143,
-            },
-            CurlScheme {
-                name: b"file\0".as_ptr().cast::<c_char>(),
-                run: (&RUN_MARKER as *const u8).cast::<c_void>(),
-                protocol: 1 << 9,
-                family: 1 << 9,
-                // PROTOPT_NONETWORK | PROTOPT_NOURLQUERY, lib/file.c:635.
-                flags: 0x0050,
-                defport: 0,
-            },
-            CurlScheme {
-                // A protocol whose module compiled its implementation out.
-                name: b"rtmp\0".as_ptr().cast::<c_char>(),
-                run: ptr::null(),
-                protocol: 1 << 19,
-                family: 1 << 19,
-                flags: 0,
-                defport: 1935,
-            },
-        ]);
-
-        /// Case-insensitive lookup over the double, matching `Curl_getn_scheme`
-        /// at `lib/url.c` L1524-L1540 in rule if not in mechanism.
-        fn find(name: &[u8]) -> *const CurlScheme {
-            if name.is_empty() || name.len() > 7 {
-                return ptr::null();
-            }
-            for descriptor in &DESCRIPTORS.0 {
-                // SAFETY: every `name` above is a byte literal ending in
-                // exactly one NUL, so the pointer stored in the row is a valid
-                // NUL-terminated C string with static lifetime.
-                let stored = unsafe { CStr::from_ptr(descriptor.name) };
-                if crate::ctype::eq_ignore_case(name, stored.to_bytes()) {
-                    return descriptor;
-                }
-            }
-            ptr::null()
-        }
-
-        /// Stands in for `lib/url.c` L1469-L1472 while the crate's own tests
-        /// run.
-        #[no_mangle]
-        extern "C" fn Curl_get_scheme(scheme: *const c_char) -> *const CurlScheme {
-            if scheme.is_null() {
-                return ptr::null();
-            }
-            // SAFETY: the only caller is `super::get_scheme`, which passes
-            // `CStr::as_ptr`, so the pointer is non-null -- rechecked above in
-            // any case -- and NUL terminated for the duration of the call.
-            let name = unsafe { CStr::from_ptr(scheme) };
-            find(name.to_bytes())
-        }
-
-        /// Stands in for `lib/url.c` L1477-L1541.
-        #[no_mangle]
-        extern "C" fn Curl_getn_scheme(scheme: *const c_char, len: size_t) -> *const CurlScheme {
-            if scheme.is_null() || len == 0 {
-                return ptr::null();
-            }
-            // SAFETY: the only caller is `super::getn_scheme`, which rejects an
-            // empty slice and then passes that slice's pointer together with
-            // its own length, so exactly `len` initialised bytes are readable
-            // and they stay borrowed for the whole call. `c_char` and `u8`
-            // share size and alignment.
-            let name = unsafe { core::slice::from_raw_parts(scheme.cast::<u8>(), len) };
-            find(name)
-        }
-
-        /// The compile-time proof has to actually be evaluated, and a test that
-        /// references it says so out loud rather than relying on a reader
-        /// spotting the binding inside `describe`.
-        #[test]
-        fn the_layout_proof_is_evaluated() {
-            let () = LAYOUT_PROOF;
-            assert_eq!(mem::size_of::<CurlScheme>(), expected_mirror_size());
-            assert_eq!(
-                mem::align_of::<CurlScheme>(),
-                mem::align_of::<*const c_void>()
-            );
-        }
-
-        /// The offsets the compile-time proof cannot express at this crate's
-        /// minimum supported Rust version, `mem::offset_of!` having arrived in
-        /// 1.77. Measured on a live value instead, which is exactly as
-        /// authoritative and costs one stack slot in a test.
-        ///
-        /// These four numbers are the ABI contract. If `curl_prot_t` ever
-        /// widens, `flags` and `defport` move and this test still passes --
-        /// because it measures the Rust mirror, not the C original -- which is
-        /// why the hazard is documented on [`CurlScheme`] as a precondition and
-        /// cross-checked by the parity run rather than pretended to be checked
-        /// here.
-        #[test]
-        fn mirror_field_offsets_are_where_the_c_layout_puts_them() {
-            let probe = CurlScheme {
-                name: ptr::null(),
-                run: ptr::null(),
-                protocol: 0,
-                family: 0,
-                flags: 0,
-                defport: 0,
-            };
-            let base = (&probe as *const CurlScheme).cast::<u8>() as usize;
-            let offset_of = |field: usize| field.wrapping_sub(base);
-            let pointer = mem::size_of::<*const c_void>();
-
-            assert_eq!(offset_of((&probe.name as *const *const c_char) as usize), 0);
-            assert_eq!(
-                offset_of((&probe.run as *const *const c_void) as usize),
-                pointer,
-                "run must follow name immediately"
-            );
-            assert_eq!(
-                offset_of((&probe.protocol as *const u32) as usize),
-                pointer.saturating_mul(2),
-                "protocol must follow the two pointers"
-            );
-            assert_eq!(
-                offset_of((&probe.family as *const u32) as usize),
-                pointer.saturating_mul(2).saturating_add(4)
-            );
-            assert_eq!(
-                offset_of((&probe.flags as *const u32) as usize),
-                pointer.saturating_mul(2).saturating_add(8),
-                "flags is read, so its offset is part of the ABI contract"
-            );
-            assert_eq!(
-                offset_of((&probe.defport as *const u16) as usize),
-                pointer.saturating_mul(2).saturating_add(12),
-                "defport is read, so its offset is part of the ABI contract"
-            );
-        }
-
-        /// The whole drop-in path: call, null check, dereference, and the three
-        /// fields arriving in the right places rather than merely arriving.
-        #[test]
-        fn the_three_fields_are_read_through_the_mirror() {
-            let https = getn_scheme(b"https");
-            assert_eq!(https.map(SchemeInfo::defport), Some(443));
-            assert_eq!(https.map(SchemeInfo::flags), Some(0x0001_2181));
-            assert_eq!(https.map(SchemeInfo::implemented), Some(true));
-            assert_eq!(https.map(SchemeInfo::has_url_options), Some(false));
-
-            let imap = getn_scheme(b"imap");
-            assert_eq!(imap.map(SchemeInfo::defport), Some(143));
-            assert_eq!(imap.map(SchemeInfo::has_url_options), Some(true));
-            assert_eq!(
-                imap.map(|info| info.flags() & PROTOPT_URLOPTIONS),
-                Some(PROTOPT_URLOPTIONS)
-            );
-
-            // The zero default port has to survive the trip as a zero and not
-            // be confused with "not found".
-            let file = getn_scheme(b"file");
-            assert_eq!(file.map(SchemeInfo::defport), Some(0));
-            assert!(file.is_some());
-        }
-
-        /// `!h->run` at `lib/urlapi.c` L1646. A protocol whose module compiled
-        /// its implementation out is still found, and still reports that it
-        /// cannot be driven.
-        #[test]
-        fn a_null_run_pointer_reports_a_disabled_protocol() {
-            let rtmp = getn_scheme(b"rtmp");
-            assert!(rtmp.is_some(), "a disabled protocol is still in the table");
-            assert_eq!(rtmp.map(SchemeInfo::implemented), Some(false));
-            assert_eq!(rtmp.map(SchemeInfo::defport), Some(1935));
-        }
-
-        /// A null descriptor is the C's "not a known scheme", and must never be
-        /// dereferenced.
-        #[test]
-        fn a_null_descriptor_is_reported_as_not_found() {
-            assert_eq!(getn_scheme(b"nope"), None);
-            assert_eq!(super::describe(ptr::null()), None);
-        }
-
-        /// The empty slice is turned away before its pointer can cross the
-        /// boundary, and the terminated entry point agrees.
-        #[test]
-        fn an_empty_name_never_reaches_the_c_lookup() {
-            assert_eq!(getn_scheme(b""), None);
-            // SAFETY: the literal is a single NUL byte, so it is a valid empty
-            // C string with no interior NUL.
-            let empty = unsafe { CStr::from_bytes_with_nul_unchecked(b"\0") };
-            assert_eq!(get_scheme(empty), None);
-        }
-
-        /// Both entry points reach the same descriptor, as `Curl_get_scheme`
-        /// forwarding to `Curl_getn_scheme` guarantees on the C side.
-        #[test]
-        fn the_two_entry_points_agree() {
-            for (terminated, name) in [
-                (b"https\0".as_slice(), b"https".as_slice()),
-                (b"file\0".as_slice(), b"file".as_slice()),
-                (b"rtmp\0".as_slice(), b"rtmp".as_slice()),
-                (b"nope\0".as_slice(), b"nope".as_slice()),
-            ] {
-                // SAFETY: each literal above ends in exactly one NUL and holds
-                // no interior NUL, by inspection.
-                let scheme = unsafe { CStr::from_bytes_with_nul_unchecked(terminated) };
-                assert_eq!(get_scheme(scheme), getn_scheme(name));
-            }
-        }
-    }
-}
+use crate::ffi::scheme_import as backend;
 
 /// Tests of the mode-independent surface, which needs no backend at all.
 #[cfg(test)]

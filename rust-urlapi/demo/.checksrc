@@ -8,11 +8,25 @@ allowfunc printf
 # Use of curl printf functions is discouraged: they resolve only in the
 # drop-in link against libcurl and are absent from the standalone link, where
 # the crate supplies no such shims
+#
+# All ten names include/curl/mprintf.h declares are listed, so that the lint
+# catches a demo reaching for any of them before the linker does. Six are
+# defined by ../harness/shims.c and would resolve in a Mode B link that also
+# compiled the harness, which the demo link does not; the remaining four,
+# curl_msprintf at include/curl/mprintf.h:L60-L61, curl_mvsprintf at
+# :L69-L70, curl_maprintf at :L74-L75 and curl_mvaprintf at :L76-L77, are
+# deliberately left undefined even there, for the reasons ../harness/shims.c
+# gives below its definitions. A demo calling one of those four would fail the
+# Mode B link with no prior warning, which is precisely what these lines
+# prevent. Verified: none of the ten is in checksrc.pl's own default banfunc
+# set, so every one of them has to be named here to be caught.
 banfunc curl_maprintf
 banfunc curl_mfprintf
 banfunc curl_mprintf
 banfunc curl_msnprintf
+banfunc curl_msprintf
 banfunc curl_mvaprintf
 banfunc curl_mvfprintf
 banfunc curl_mvprintf
 banfunc curl_mvsnprintf
+banfunc curl_mvsprintf

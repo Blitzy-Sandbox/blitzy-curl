@@ -36,8 +36,8 @@
 //!
 //! # Three configurations, selected at compile time
 //!
-//! This is the plan's "capability provider selected at compile time" pattern,
-//! the Rust expression of `#ifdef USE_IDN` under transformation rule T5.
+//! The backend is chosen by `#[cfg]`, which is this crate's expression of
+//! the C's `#ifdef USE_IDN`.
 //! `rust-urlapi/build.rs` reproduces the C's two gates as two separate
 //! questions rather than deriving one from the other: `have_idn` stands for
 //! `USE_IDN` at `lib/idn.h` L29-L30, and `idn_backend_libidn2` or
@@ -88,14 +88,20 @@
 //!
 //! `lib/idn.c` L39-L40 reaches the library through `idn2_lookup_ul`, the
 //! entry point that interprets its input **in the encoding of the process
-//! locale**. Conversion of a non-ASCII name therefore succeeds only where the
-//! locale's codeset is UTF-8; under any other codeset libidn2 converts
-//! nothing, reporting `IDN2_ICONV_FAIL`, and the module turns that into
-//! `CURLUE_BAD_HOSTNAME`. Binding the C library directly is what makes this
-//! crate inherit that sensitivity for free, which is the desired outcome, so
-//! this module adds no `setlocale` call, no locale normalisation and no UTF-8
-//! pre-validation. Any of the three would hide a difference the parity diff
-//! exists to expose.
+//! locale**. The result for a non-ASCII name is therefore locale-dependent:
+//! the bytes are decoded according to the locale's codeset before any IDN
+//! processing happens, so a locale whose codeset cannot represent them fails
+//! and a locale that decodes them differently produces a different name.
+//! Measured in the `C` locale, whose codeset is ASCII, every non-ASCII name
+//! tested fails with `IDN2_ICONV_FAIL`, which the module turns into
+//! `CURLUE_BAD_HOSTNAME`; under `C.UTF-8` the same names convert. Locales
+//! other than those two were not measured, and no claim is made about them
+//! beyond the general dependence.
+//!
+//! Binding the C library directly is what makes this crate inherit that
+//! sensitivity for free, which is the desired outcome, so this module adds no
+//! `setlocale` call, no locale normalisation and no UTF-8 pre-validation. Any
+//! of the three would hide a difference the parity diff exists to expose.
 //!
 //! Three separate things in curl's own harness exist because of this, and all
 //! three have to be present together or the internationalised-domain
@@ -177,6 +183,11 @@
 // clean, the allowance is stated once here with its reason. It is scoped to
 // this module and to this lint alone.
 #![allow(dead_code)]
+// `unsafe` belongs to `src/ffi.rs` alone, and the lint matters more here than
+// in most modules: the default backend really does call into libidn2, and
+// keeping that call in `crate::ffi::idn2` is what lets this module state that
+// it makes none itself.
+#![forbid(unsafe_code)]
 
 use crate::abi::CURLUcode;
 use crate::alloc::CBuf;
@@ -187,14 +198,16 @@ use crate::error::{idn2cu, CURLcode};
 #[cfg(not(have_idn))]
 use crate::abi::CURLUE_LACKS_IDN;
 
-// The two aliases below also make the contradictory pair a compile error, and
-// they do it without restating the check `rust-urlapi/build.rs` already
-// performs. Naming both backends `backend` means a build that somehow arrived
-// with both cfgs set stops at `error[E0252]: the name backend is defined
-// multiple times` rather than silently picking one, so the guarantee survives a
-// build that bypassed the script. That is a property of the aliasing rather
-// than a check written on purpose, and it is recorded here so that nobody
-// "fixes" it by giving the two aliases different names.
+// Exactly one backend. `rust-urlapi/build.rs` already refuses a request for
+// both, mirroring the `#error` at `lib/curl_setup.h` L726-L728; stating it
+// again here means a compilation that reached rustc with both cfgs set stops
+// with this message instead of silently taking whichever arm comes first.
+#[cfg(all(idn_backend_libidn2, idn_backend_pure))]
+compile_error!(
+    "curl-urlapi-rs: the \"idn-libidn2\" and \"idn-pure\" backends are \
+     mutually exclusive; select exactly one. Only \"idn-libidn2\" carries \
+     the bit-for-bit parity claim; see docs/KNOWN-DIVERGENCES.md."
+);
 
 /// The backend `lib/curl_setup.h` L720-L724 would have selected.
 ///
@@ -202,7 +215,7 @@ use crate::abi::CURLUE_LACKS_IDN;
 /// attainable, the locale sensitivity included, which is why this is the
 /// default.
 #[cfg(idn_backend_libidn2)]
-use self::libidn2 as backend;
+use crate::ffi::idn2 as backend;
 
 /// The pure-Rust alternative, which has no C equivalent at all.
 ///
@@ -357,7 +370,7 @@ pub(crate) fn idn_decode(input: &CBuf) -> Result<CBuf, CURLcode> {
 /// rejected there. Adding one for symmetry would change observable behaviour:
 /// against libidn2 2.3.8 an empty input converts to an empty output with
 /// `IDNA_SUCCESS`, so `idn_encode(b"")` succeeds and yields an empty buffer.
-/// Transformation rule T6, faithful over correct, governs this.
+/// The asymmetry is the C's, and it is reproduced rather than smoothed over.
 ///
 /// # Ownership
 ///
@@ -490,493 +503,16 @@ pub(crate) fn host_encode(host: &CBuf) -> Result<CBuf, CURLUcode> {
     Err(CURLUE_LACKS_IDN)
 }
 
-/// The default backend: libidn2, bound directly.
-///
-/// This module stands in for the `USE_LIBIDN2` arms of `lib/idn.c`, which are
-/// the `#include <idn2.h>` at L33, the `IDN2_LOOKUP` macro at L35-L41, the
-/// `USE_LIBIDN2` body of `idn_decode` at L251-L271, the whole of `idn_encode`
-/// at L285-L288, and the re-duplication blocks at L306-L315 and L331-L340.
-///
-/// It is the crate's third FFI island, after `src/ffi.rs` and the platform
-/// address conversion in `src/inet.rs`. Every `unsafe` block below is a call
-/// into libidn2 or a read of memory libidn2 returned, and each carries the
-/// invariant it relies on. What leaves the module is a [`CBuf`] and a
-/// `CURLcode`, so the layer above contains no `unsafe` at all and
-/// `src/getset.rs` never sees a raw pointer.
-///
-/// `rust-urlapi/build.rs` emits `cargo:rustc-link-lib=idn2` for this
-/// configuration, so nothing here has to arrange the link.
-#[cfg(idn_backend_libidn2)]
-mod libidn2 {
-    use core::ptr;
-    use core::slice;
-    use libc::{c_char, c_int, c_void};
-
-    use super::{CBuf, CURLcode};
-
-    /// `IDN2_OK`, `idn2.h`. The success value of every entry point here.
-    const IDN2_OK: c_int = 0;
-
-    /// `IDN2_MALLOC`, `idn2.h`. libidn2 could not allocate.
-    const IDN2_MALLOC: c_int = -100;
-
-    /// `IDN2_NFC_INPUT`, `idn2.h`: normalise the input to normalisation form
-    /// C. Requested at `lib/idn.c` L253.
-    const IDN2_NFC_INPUT: c_int = 1;
-
-    /// `IDN2_TRANSITIONAL`, `idn2.h`: Unicode TR46 transitional processing.
-    /// The retry at `lib/idn.c` L265 passes this **alone**, dropping
-    /// `IDN2_NFC_INPUT` along with everything else.
-    const IDN2_TRANSITIONAL: c_int = 4;
-
-    /// `IDN2_NONTRANSITIONAL`, `idn2.h`: Unicode TR46 non-transitional
-    /// processing. Added at `lib/idn.c` L258.
-    const IDN2_NONTRANSITIONAL: c_int = 8;
-
-    /// `IDNA_SUCCESS`, `idn2.h`, which that header defines as `IDN2_OK`.
-    ///
-    /// `idn_encode` at `lib/idn.c` L287 tests the `IDNA_*` compatibility names
-    /// where `idn_decode` tests the `IDN2_*` ones, for the same two values.
-    /// Both spellings are kept here, aliased exactly as `idn2.h` aliases them,
-    /// so that each call site can be read against the C line it came from.
-    const IDNA_SUCCESS: c_int = IDN2_OK;
-
-    /// `IDNA_MALLOC_ERROR`, `idn2.h`, which that header defines as
-    /// `IDN2_MALLOC`. Tested at `lib/idn.c` L288.
-    const IDNA_MALLOC_ERROR: c_int = IDN2_MALLOC;
-
-    /// The version handed to `idn2_check_version`, NUL terminated.
-    ///
-    /// `lib/idn.c` L252 passes `IDN2_VERSION`, the version string of the
-    /// **header** the C was compiled against, so the guard asks "is the
-    /// library at least as new as the header I was built from". A Rust binding
-    /// has no header and therefore no such string, so the closest faithful
-    /// question is "is the library at least as new as the version these
-    /// declarations were written against", and the answer here is the same
-    /// floor `rust-urlapi/build.rs` checks with pkg-config, 2.0.0.
-    ///
-    /// One consequence is worth stating rather than leaving to be discovered.
-    /// Where a C build has newer headers than its runtime library, its guard
-    /// fails and ours does not, so the C reports `CURLE_NOT_BUILT_IN` and this
-    /// port converts the name. That is a mismatched installation, which
-    /// `build.rs` already warns about at configure time, and it is the only
-    /// input on which the two disagree. Everything the guard is actually for,
-    /// namely a libidn2 too old to honour these declarations, behaves
-    /// identically.
-    const IDN2_VERSION: &[u8] = b"2.0.0\0";
-
-    /// The same floor in the packed form `IDN2_VERSION_NUMBER` uses, which is
-    /// what the preprocessor test at `lib/idn.c` L254 compares.
-    ///
-    /// libidn2 encodes 2.0.0 as `0x02000000`; the installed 2.3.8 reports
-    /// `0x02030008`.
-    const IDN2_VERSION_NUMBER: u32 = 0x0200_0000;
-
-    /// The release that introduced `IDN2_NONTRANSITIONAL`, 0.20.0, encoded the
-    /// same way. This is the literal the C compares against at `lib/idn.c`
-    /// L254.
-    const NONTRANSITIONAL_SINCE: u32 = 0x0014_0000;
-
-    /// The flag word of the first lookup, built exactly as `lib/idn.c`
-    /// L253-L260 builds it:
-    ///
-    /// ```c
-    /// int flags = IDN2_NFC_INPUT
-    /// #if IDN2_VERSION_NUMBER >= 0x00140000
-    ///   | IDN2_NONTRANSITIONAL
-    /// #endif
-    ///   ;
-    /// ```
-    ///
-    /// The conditional is reproduced rather than collapsed into its answer.
-    /// With the floor above it selects the two-flag arm, which is what a build
-    /// against any libidn2 2.x header also selects, but writing the structure
-    /// out keeps the reason visible and keeps a lowered floor honest.
-    const LOOKUP_FLAGS: c_int = if IDN2_VERSION_NUMBER >= NONTRANSITIONAL_SINCE {
-        IDN2_NFC_INPUT | IDN2_NONTRANSITIONAL
-    } else {
-        IDN2_NFC_INPUT
-    };
-
-    // The declarations from `<idn2.h>`, which `lib/idn.c` L33 includes for
-    // exactly these entry points. `libc` does not carry them, so they are
-    // written out here; that is the whole of the binding, and no additional
-    // crate is involved.
-    //
-    // The signatures are `idn2.h` verbatim. `idn2_check_version` returns the
-    // library's own version string, or null when the requested version is
-    // newer than the library, and the C reads only which of the two it got.
-    // Both lookup entry points are declared because the C header declares
-    // both and the macro at L35-L41 chooses between them per platform.
-    extern "C" {
-        /// `const char *idn2_check_version(const char *req_version)`.
-        fn idn2_check_version(req_version: *const c_char) -> *const c_char;
-
-        /// `int idn2_lookup_ul(const char *src, char **lookupname, int flags)`.
-        ///
-        /// The **locale-aware** entry point, and so the origin of the locale
-        /// trap the module documentation describes. Selected by `lib/idn.c`
-        /// L39-L40 on every platform except Windows with wide characters.
-        fn idn2_lookup_ul(src: *const c_char, lookupname: *mut *mut c_char, flags: c_int) -> c_int;
-
-        /// `int idn2_lookup_u8(const uint8_t *src, uint8_t **lookupname,
-        /// int flags)`.
-        ///
-        /// The byte-oriented entry point, which reads its input as UTF-8 and
-        /// is therefore indifferent to the locale. Selected by `lib/idn.c`
-        /// L36-L37 for Windows with wide characters.
-        fn idn2_lookup_u8(src: *const u8, lookupname: *mut *mut u8, flags: c_int) -> c_int;
-
-        /// `int idn2_to_unicode_8z8z(const char *input, char **output,
-        /// int flags)`.
-        ///
-        /// UTF-8 in, UTF-8 out, with no locale involvement. Called at
-        /// `lib/idn.c` L286.
-        fn idn2_to_unicode_8z8z(
-            input: *const c_char,
-            output: *mut *mut c_char,
-            flags: c_int,
-        ) -> c_int;
-
-        /// `void idn2_free(void *ptr)`.
-        ///
-        /// The only correct release for a buffer libidn2 allocated, because
-        /// libidn2 may have been built against a different allocator than the
-        /// caller. `Idn2Buf` exists so that nothing else can be called on one.
-        fn idn2_free(ptr: *mut c_void);
-    }
-
-    /// A NUL-terminated string **libidn2 owns**, released with `idn2_free`.
-    ///
-    /// This is one half of the two-allocator handoff the module documentation
-    /// describes, and the type exists to make the halves impossible to
-    /// confuse. [`CBuf`] owns C-allocator memory and is released with `free`;
-    /// this owns libidn2 memory and is released with `idn2_free`. The C keeps
-    /// both in a variable of the same type, `char *d`, and relies on the
-    /// programmer to remember which release each one needs.
-    ///
-    /// It is private to this module and never escapes it: the only way out is
-    /// [`reduplicate`], which copies the bytes into a `CBuf` and releases this
-    /// one. That is what `lib/idn.c` L306-L315 does, and confining it to one
-    /// function means the ordering cannot be got wrong at a second site.
-    ///
-    /// # Invariants
-    ///
-    /// 1. `ptr` is non-null and was returned by libidn2.
-    /// 2. `len` is the index of its terminator, so `len + 1` bytes are
-    ///    readable from `ptr`.
-    /// 3. No other owner exists, so `Drop` is the one and only release.
-    struct Idn2Buf {
-        /// Start of the libidn2-allocated string.
-        ptr: *mut c_char,
-        /// Length in bytes, excluding the terminator.
-        len: usize,
-    }
-
-    impl Idn2Buf {
-        /// Adopts a pointer libidn2 produced, measuring it.
-        ///
-        /// Returning `None` for null is what lets a caller adopt the
-        /// out-parameter unconditionally and then decide what the return code
-        /// meant, which is the order the C works in: it inspects `rc` and
-        /// leaves `decoded` alone.
-        ///
-        /// # Ownership
-        ///
-        /// Ownership moves *into* the returned value. The caller must not free
-        /// `p` afterwards, and must not keep the pointer: `Drop` is now the
-        /// only release.
-        ///
-        /// # Safety
-        ///
-        /// `p` must be null, or a NUL-terminated string returned by libidn2
-        /// and not yet freed, with no other owner. A pointer from any other
-        /// allocator must never be passed here, because `idn2_free` is the
-        /// only release this type will ever perform.
-        #[must_use = "discarding the value frees the string immediately"]
-        unsafe fn from_raw(p: *mut c_char) -> Option<Self> {
-            if p.is_null() {
-                return None;
-            }
-            // SAFETY: the caller guarantees `p` points at a live,
-            // NUL-terminated string, which is `strlen`'s precondition. Its
-            // result is the index of that terminator, establishing invariant
-            // 2; invariant 1 holds because the null case already returned, and
-            // invariant 3 is the caller's guarantee.
-            let len = unsafe { libc::strlen(p) };
-            Some(Self { ptr: p, len })
-        }
-
-        /// The string's bytes, without the terminator.
-        ///
-        /// # Ownership
-        ///
-        /// Nothing changes hands. The lifetime of the result is tied to the
-        /// borrow, so it cannot outlive the string, and the obligation to
-        /// release stays with this value.
-        fn as_bytes(&self) -> &[u8] {
-            // SAFETY: invariant 1 gives a non-null pointer into a live
-            // allocation and invariant 2 makes `self.len` bytes from its start
-            // readable and initialised, since libidn2 wrote the string there.
-            // `u8` has an alignment of one, which any pointer satisfies. The
-            // returned lifetime is tied to `&self`, so the slice cannot
-            // outlive the allocation, and `&self` rules out concurrent
-            // mutation.
-            unsafe { slice::from_raw_parts(self.ptr.cast::<u8>(), self.len) }
-        }
-    }
-
-    impl Drop for Idn2Buf {
-        /// `idn2_free(d)` at `lib/idn.c` L309 and L334.
-        fn drop(&mut self) {
-            // SAFETY: invariant 1 says `self.ptr` came from libidn2 and
-            // invariant 3 says this value is its only owner, which together
-            // are `idn2_free`'s precondition. `Drop` runs at most once per
-            // value and there is no other way out of this type, so the string
-            // is released exactly once.
-            unsafe { idn2_free(self.ptr.cast::<c_void>()) };
-        }
-    }
-
-    /// `IDN2_LOOKUP` at `lib/idn.c` L39-L40, the arm every platform except
-    /// Windows with wide characters takes.
-    ///
-    /// # Safety
-    ///
-    /// `name` must be a valid pointer to a NUL-terminated string, readable for
-    /// the duration of the call. `host` must be a valid, writable location for
-    /// one pointer. On success libidn2 writes a string it owns there, which
-    /// the caller must release with `idn2_free` exactly once.
-    #[cfg(not(windows))]
-    unsafe fn lookup(name: *const c_char, host: *mut *mut c_char, flags: c_int) -> c_int {
-        // SAFETY: the preconditions are exactly this call's own and are
-        // forwarded from the caller unchanged.
-        unsafe { idn2_lookup_ul(name, host, flags) }
-    }
-
-    /// `IDN2_LOOKUP` at `lib/idn.c` L36-L37, the Windows arm.
-    ///
-    /// The two casts are the macro's own. They are a reinterpretation of
-    /// `char` as `uint8_t`, which have the same size and alignment on every
-    /// platform this crate targets, and no conversion of the bytes.
-    ///
-    /// The plan states that Windows-only paths are ported as conditional code
-    /// and validated on that platform rather than here, and this is one of
-    /// them. Selecting the byte-oriented entry point means the Windows build
-    /// has no locale trap at all.
-    ///
-    /// # Safety
-    ///
-    /// As for the other arm.
-    #[cfg(windows)]
-    unsafe fn lookup(name: *const c_char, host: *mut *mut c_char, flags: c_int) -> c_int {
-        // SAFETY: the preconditions are forwarded from the caller, and the
-        // casts change only how the same bytes are named, exactly as the C
-        // macro's casts do.
-        unsafe { idn2_lookup_u8(name.cast::<u8>(), host.cast::<*mut u8>(), flags) }
-    }
-
-    /// The version guard at `lib/idn.c` L252.
-    ///
-    /// `if(idn2_check_version(IDN2_VERSION))` reads the returned pointer as a
-    /// truth value and nothing more, so this returns a `bool` and the string
-    /// libidn2 reports is deliberately not examined. That string points into
-    /// libidn2's own static data and must not be freed.
-    fn version_ok() -> bool {
-        // SAFETY: `IDN2_VERSION` is a NUL-terminated ASCII literal with static
-        // lifetime, so the pointer is valid for reads for the whole call, and
-        // `idn2_check_version` only reads it. Its result is either null or a
-        // pointer to libidn2's own static version string; only its nullness is
-        // read here, so nothing is dereferenced and nothing is freed.
-        let reported = unsafe { idn2_check_version(IDN2_VERSION.as_ptr().cast::<c_char>()) };
-        !reported.is_null()
-    }
-
-    /// Copy a libidn2 string into C-allocator memory and release the original.
-    ///
-    /// `lib/idn.c` L306-L315 and L331-L340, which are the same five lines
-    /// written twice:
-    ///
-    /// ```c
-    /// char *c = curlx_strdup(d);
-    /// idn2_free(d);
-    /// if(c)
-    ///   d = c;
-    /// else
-    ///   result = CURLE_OUT_OF_MEMORY;
-    /// ```
-    ///
-    /// # Why this exists at all
-    ///
-    /// Because two allocators are live at once. libidn2 allocated the string
-    /// with its own allocator, so it must go back to `idn2_free`; and the
-    /// value curl keeps has to come from curl's allocator, because whoever
-    /// called `curl_url_get` releases it with `curl_free`
-    /// (`docs/libcurl/curl_url_get.md` L45, repeated at
-    /// `include/curl/urlapi.h` L130-L131). Handing libidn2's pointer straight
-    /// to C would mean a buffer freed by an allocator that never allocated it.
-    ///
-    /// # Ownership
-    ///
-    /// `original` is consumed, and it is released here rather than at the end
-    /// of the caller: the C frees it *before* testing whether the duplication
-    /// worked, and the explicit `drop` below preserves that order. On failure
-    /// the original is therefore already gone, which is why the C's own
-    /// out-of-memory report at L313 does not free anything. The returned
-    /// [`CBuf`] owns C-allocator memory and is what may cross into C.
-    ///
-    /// # Errors
-    ///
-    /// `CURLcode::CURLE_OUT_OF_MEMORY` if the copy could not be allocated.
-    fn reduplicate(original: Idn2Buf) -> Result<CBuf, CURLcode> {
-        // L308. `CBuf::from_slice` is `curlx_strdup` for bytes already in
-        // hand: it allocates from the C allocator and appends a terminator.
-        let duplicate = CBuf::from_slice(original.as_bytes());
-        // L309. Releasing the libidn2 string here, and not one line later,
-        // is deliberate: it is the order the C uses, and it keeps the two
-        // allocators from both owning a copy of the same name for any longer
-        // than the C does.
-        drop(original);
-        // L310-L313.
-        match duplicate {
-            Some(buf) => Ok(buf),
-            None => Err(CURLcode::CURLE_OUT_OF_MEMORY),
-        }
-    }
-
-    /// The `USE_LIBIDN2` body of `static idn_decode` at `lib/idn.c`
-    /// L247-L280, followed by the re-duplication at L306-L315.
-    ///
-    /// The re-duplication belongs here rather than one layer up because the C
-    /// guards it with `#ifdef USE_LIBIDN2`, which makes it a property of this
-    /// backend and not of `Curl_idn_decode`. The other backends in `lib/idn.c`
-    /// allocate with curl's allocator to begin with and skip the block
-    /// entirely, and `super::pure` does the same.
-    ///
-    /// # Errors
-    ///
-    /// `CURLcode::CURLE_NOT_BUILT_IN` when the library is too old (L271),
-    /// `CURLcode::CURLE_URL_MALFORMAT` when both lookups failed (L267), and
-    /// `CURLcode::CURLE_OUT_OF_MEMORY` when the duplication failed (L313).
-    pub(super) fn idn_decode(input: &CBuf) -> Result<CBuf, CURLcode> {
-        // L252 and L269-L271. The guard is the first thing the C does and the
-        // first thing done here; a library too old to trust is not asked.
-        if !version_ok() {
-            return Err(CURLcode::CURLE_NOT_BUILT_IN);
-        }
-
-        // The borrow is bound rather than used inline so that it is plainly
-        // live for every call below. `as_bytes_with_nul` is documented as the
-        // way to lend a C-string pointer without giving up ownership: the
-        // slice is NUL terminated, `input` keeps owning the block, and libidn2
-        // only reads it.
-        let source = input.as_bytes_with_nul();
-        let name: *const c_char = source.as_ptr().cast::<c_char>();
-
-        let mut decoded: *mut c_char = ptr::null_mut();
-        // SAFETY: `name` points at the NUL-terminated `source` slice, which is
-        // borrowed from `input` for the whole function, so it is readable for
-        // the call. `decoded` is a live local, so `&mut decoded` is a valid
-        // writable location for one pointer.
-        let mut rc = unsafe { lookup(name, &mut decoded, LOOKUP_FLAGS) };
-        // SAFETY: `decoded` is null unless libidn2 wrote a string it owns
-        // there, which is exactly this function's precondition, and nothing
-        // else has taken ownership of it.
-        let mut owned = unsafe { Idn2Buf::from_raw(decoded) };
-
-        if rc != IDN2_OK {
-            // L262-L265, the retry. The comment there calls it a fallback to
-            // TR46 transitional mode for better IDNA2003 compatibility, and it
-            // is not decoration: against libidn2 2.3.8 the first call rejects
-            // `\u{2603}.de` with IDN2_DISALLOWED and the retry converts it to
-            // `xn--n3h.de`. Note that the flag word is replaced rather than
-            // extended, so IDN2_NFC_INPUT is not passed the second time.
-            //
-            // Dropping `owned` first releases anything a failed call left
-            // behind. The C reuses `&decoded` and would abandon such a buffer,
-            // but no libidn2 allocates on failure -- measured across the
-            // failing codes this port can provoke, the out-parameter is always
-            // null -- so `owned` is `None` here in practice and this is
-            // insurance rather than a behavioural difference.
-            drop(owned);
-            decoded = ptr::null_mut();
-            // SAFETY: as for the first call. `name` still points at the same
-            // live borrow and `decoded` has been reset to null.
-            rc = unsafe { lookup(name, &mut decoded, IDN2_TRANSITIONAL) };
-            // SAFETY: as for the first adoption.
-            owned = unsafe { Idn2Buf::from_raw(decoded) };
-        }
-
-        if rc != IDN2_OK {
-            // L266-L267. Dropping `owned` on the way out releases anything
-            // libidn2 left behind, which in practice is nothing.
-            return Err(CURLcode::CURLE_URL_MALFORMAT);
-        }
-
-        match owned {
-            // L277-L278 hands the string up, and L306-L315 immediately
-            // re-owns it through curl's allocator.
-            Some(buf) => reduplicate(buf),
-            // Unreachable against any libidn2 that honours its own contract:
-            // IDN2_OK with a null out-parameter. The C would pass that null to
-            // `curlx_strdup` at L308 and then read `d[0]` at L317, both of
-            // which are undefined, so there is no behaviour to be faithful to.
-            // Reporting a malformed name is the one defined answer.
-            None => Err(CURLcode::CURLE_URL_MALFORMAT),
-        }
-    }
-
-    /// The `USE_LIBIDN2` body of `static idn_encode` at `lib/idn.c`
-    /// L282-L300, followed by the re-duplication at L331-L340.
-    ///
-    /// Three differences from [`idn_decode`] are all deliberate. There is no
-    /// version guard, because L282-L300 has none. The flag argument is `0`,
-    /// spelled out at L286, rather than a computed word. And there is no
-    /// retry: one call, and its verdict stands.
-    ///
-    /// # Errors
-    ///
-    /// `CURLcode::CURLE_OUT_OF_MEMORY` when libidn2 reported
-    /// `IDNA_MALLOC_ERROR` or the duplication failed, and
-    /// `CURLcode::CURLE_URL_MALFORMAT` for every other libidn2 failure
-    /// (L287-L288).
-    pub(super) fn idn_encode(puny: &CBuf) -> Result<CBuf, CURLcode> {
-        // Bound for the same reason as in `idn_decode`.
-        let source = puny.as_bytes_with_nul();
-        let input: *const c_char = source.as_ptr().cast::<c_char>();
-
-        let mut enc: *mut c_char = ptr::null_mut();
-        // SAFETY: `input` points at the NUL-terminated `source` slice, which
-        // is borrowed from `puny` for the whole function, so it is readable
-        // for the call. `enc` is a live local, so `&mut enc` is a valid
-        // writable location for one pointer. The third argument is the literal
-        // flag word the C passes.
-        let rc = unsafe { idn2_to_unicode_8z8z(input, &mut enc, 0) };
-        // SAFETY: `enc` is null unless libidn2 wrote a string it owns there,
-        // and nothing else has taken ownership of it.
-        let owned = unsafe { Idn2Buf::from_raw(enc) };
-
-        if rc != IDNA_SUCCESS {
-            // L287-L288. The C returns here without freeing, because a failed
-            // conversion allocates nothing; dropping `owned` on the way out
-            // covers the case where one somehow did.
-            return Err(if rc == IDNA_MALLOC_ERROR {
-                CURLcode::CURLE_OUT_OF_MEMORY
-            } else {
-                CURLcode::CURLE_URL_MALFORMAT
-            });
-        }
-
-        match owned {
-            // L298 hands the string up, and L331-L340 re-owns it through
-            // curl's allocator.
-            Some(buf) => reduplicate(buf),
-            // Unreachable, for the reason given in `idn_decode`. An empty
-            // input converts to an empty *allocated* string, not to null.
-            None => Err(CURLcode::CURLE_URL_MALFORMAT),
-        }
-    }
-}
+// The libidn2 binding is a foreign call, so it lives in the crate's single
+// unsafe island: `crate::ffi::idn2`. What moved is the binding -- the flag
+// constants, the four `extern` declarations, the libidn2-owned buffer type,
+// the two lookup arms, the version guard, the re-duplication through curl's
+// allocator, and the two entry points that sequence them. What stayed is this
+// module's whole interface: `Curl_idn_decode` and `Curl_idn_encode` above,
+// the two `host_*` folds, the ASCII gate, the pure-Rust alternative below,
+// and the backend selection. The relocated module presents the same safe
+// surface it always did -- a `CBuf` in, a `CBuf` or a `CURLcode` out -- so
+// nothing here or in `src/getset.rs` changes.
 
 /// The alternative backend: the pure-Rust `idna` crate, and no C library.
 ///
@@ -992,16 +528,16 @@ mod libidn2 {
 /// 1. **No transitional retry.** The `idna` crate offers no second attempt, so
 ///    a name that the C converts only on the retry at `lib/idn.c` L262-L265
 ///    fails here. `\u{2603}.de` is such a name.
-/// 2. **Locale-independence.** `idn2_lookup_ul` reads its input in the
-///    encoding of the process locale and fails outright where that encoding is
-///    not UTF-8; this backend reads Rust text, which is UTF-8 by definition,
-///    and converts the same name under any locale. It therefore **succeeds
-///    where the C fails**, which is the more surprising direction for a
-///    divergence to run.
+/// 2. **Locale-independence.** `idn2_lookup_ul` decodes its input according to
+///    the process locale's codeset, so its result depends on the locale; in
+///    the `C` locale it fails. This backend reads Rust text, which is UTF-8 by
+///    definition, and converts the same name under any locale. It therefore
+///    **succeeds where the C fails in the `C` locale**, which is the more
+///    surprising direction for a divergence to run.
 /// 3. **Different Unicode tables.** Each backend carries its own copy of the
 ///    data that case mapping and normalisation consult, versioned
 ///    independently.
-/// 4. **Thirty further crates**, against the one the default configuration
+/// 4. **Twenty-nine further crates**, against the one the default configuration
 ///    needs.
 /// 5. **A minimum toolchain of 1.86**, above this crate's declared 1.75 and
 ///    above curl's own documented floor, contributed by the dependency tree
@@ -1021,77 +557,291 @@ mod libidn2 {
 /// into C is made by [`CBuf`], which owns its own safety argument.
 #[cfg(idn_backend_pure)]
 mod pure {
-    use core::str;
+    use core::fmt::{self, Write};
 
     use super::{CBuf, CURLcode};
+    use crate::abi::CURL_MAX_INPUT_LENGTH;
+    use crate::dynbuf::DynBuf;
+    use idna::uts46::Uts46;
+    use idna::uts46::{AsciiDenyList, ErrorPolicy, Hyphens, ProcessingError, ProcessingSuccess};
+
+    /// A [`Write`] sink that accumulates into C-allocator memory and **can
+    /// fail**.
+    ///
+    /// This exists for one reason: an allocation failure has to be reportable.
+    /// The convenience entry points of the `idna` crate build a `String`, and a
+    /// `String` that cannot grow aborts the process, which would turn an
+    /// out-of-memory condition into a crash at a point where the C returns
+    /// `CURLE_OUT_OF_MEMORY` (`lib/idn.c` L313 and L338). `Uts46::process` is
+    /// the crate's fallible entry point -- it writes into a caller-supplied
+    /// sink and reports [`ProcessingError::SinkError`] when the sink refuses --
+    /// so the fallible allocator can be put underneath it.
+    ///
+    /// The buffer is a [`DynBuf`], which is curl's own growable buffer over the
+    /// C allocator, so the bytes are in the right allocator from the first
+    /// write rather than being copied into it at the end. The ceiling is
+    /// `CURL_MAX_INPUT_LENGTH` (`lib/urldata.h` L131), which is the ceiling the
+    /// whole URL is already held to by `Curl_junkscan()` at `lib/urlapi.c`
+    /// L229-L230, and a host name is part of a URL.
+    struct CSink {
+        /// The accumulated text.
+        buf: DynBuf,
+        /// Whether a write has failed. Set once and never cleared: after a
+        /// refusal the content is incomplete, and the crate's contract is that
+        /// partial sink output must not be used.
+        failed: bool,
+    }
+
+    impl CSink {
+        /// An empty sink. Nothing is allocated until the first write, which is
+        /// [`DynBuf`]'s own behaviour and C's.
+        fn new() -> Self {
+            Self::with_ceiling(CURL_MAX_INPUT_LENGTH)
+        }
+
+        /// The same, with the ceiling named.
+        ///
+        /// [`CSink::new`] is the only production caller and it passes the one
+        /// ceiling this backend uses. The parameter exists so that the tests
+        /// below can reach the refusal path with a handful of bytes instead of
+        /// eight million, which is the only way to exercise it without making
+        /// the allocator fail for real.
+        fn with_ceiling(toobig: usize) -> Self {
+            Self {
+                buf: DynBuf::new(toobig),
+                failed: false,
+            }
+        }
+
+        /// Hand the accumulated text over as a [`CBuf`], terminator included.
+        ///
+        /// # Errors
+        ///
+        /// `CURLcode::CURLE_OUT_OF_MEMORY` if any write failed, or if the
+        /// handover itself cannot produce a terminated buffer.
+        fn finish(self) -> Result<CBuf, CURLcode> {
+            if self.failed {
+                return Err(CURLcode::CURLE_OUT_OF_MEMORY);
+            }
+            match self.buf.into_cbuf() {
+                Some(buf) => Ok(buf),
+                // `into_cbuf` reports `None` for a buffer that never allocated,
+                // which is a sink that received nothing. An empty name is not
+                // an error in either implementation -- libidn2 converts it to
+                // an empty *allocated* string -- so an empty allocation is what
+                // is produced, and only its failure is an error.
+                None => CBuf::from_slice(&[]).ok_or(CURLcode::CURLE_OUT_OF_MEMORY),
+            }
+        }
+    }
+
+    impl Write for CSink {
+        /// Append UTF-8 text, reporting a refusal rather than aborting.
+        ///
+        /// The error type carries no payload, which is why `failed` is recorded
+        /// here as well: `Uts46::process` returns `SinkError` and the reason has
+        /// to survive to [`CSink::finish`].
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            if self.buf.addn(text.as_bytes()) == CURLcode::CURLE_OK {
+                return Ok(());
+            }
+            self.failed = true;
+            Err(fmt::Error)
+        }
+    }
+
+    /// The UTS46 processor, with the data compiled into the binary.
+    ///
+    /// Constructing it is free -- `Uts46::new` is a `const fn` over compiled
+    /// tables -- so it is built per call rather than kept in a static, which
+    /// keeps the module free of any shared mutable state.
+    fn processor() -> Uts46 {
+        Uts46::new()
+    }
+
+    /// Run one UTS46 operation into a fallible C-allocator sink.
+    ///
+    /// `output_as_unicode` is the crate's own way of selecting the operation:
+    /// `false` for every label is _ToASCII_, `true` for every label is
+    /// _ToUnicode_, which is exactly how `Uts46::to_ascii` and
+    /// `Uts46::to_unicode` are built.
+    ///
+    /// The option set is the one the crate's own convenience entry points use
+    /// for these two operations -- an empty ASCII deny list, hyphens allowed,
+    /// no DNS-length verification -- so the conversion itself is unchanged and
+    /// only the allocation path is different. `ErrorPolicy::FailFast` is used
+    /// for both, because the error text the alternative produces is discarded
+    /// unread: the C has no equivalent of it, and this port must not hand a
+    /// name containing U+FFFD to anything.
+    ///
+    /// # Errors
+    ///
+    /// `CURLcode::CURLE_URL_MALFORMAT` if the input is not well-formed UTF-8 or
+    /// the crate rejected the name, and `CURLcode::CURLE_OUT_OF_MEMORY` if the
+    /// sink could not allocate.
+    fn convert(name: &[u8], output_as_unicode: bool) -> Result<CBuf, CURLcode> {
+        let mut sink = CSink::new();
+        let outcome = processor().process(
+            name,
+            AsciiDenyList::EMPTY,
+            Hyphens::Allow,
+            ErrorPolicy::FailFast,
+            |_, _, _| output_as_unicode,
+            &mut sink,
+            None,
+        );
+        match outcome {
+            // The input is already the answer, and the crate guarantees it is
+            // ASCII in this case. Copying it into the C allocator is the same
+            // single copy the sink path performs.
+            Ok(ProcessingSuccess::Passthrough) => {
+                CBuf::from_slice(name).ok_or(CURLcode::CURLE_OUT_OF_MEMORY)
+            }
+            Ok(ProcessingSuccess::WroteToSink) => sink.finish(),
+            // The name is invalid, which is what `lib/idn.c` L267 and L288
+            // report as CURLE_URL_MALFORMAT.
+            Err(ProcessingError::ValidityError) => Err(CURLcode::CURLE_URL_MALFORMAT),
+            // The sink refused, which here means the C allocator refused. This
+            // is the whole point of using the fallible entry point: the C
+            // reports CURLE_OUT_OF_MEMORY at L313 and L338 rather than
+            // aborting, and so does this.
+            Err(ProcessingError::SinkError) => Err(CURLcode::CURLE_OUT_OF_MEMORY),
+        }
+    }
 
     /// The `USE_*` body of `static idn_decode` at `lib/idn.c` L247-L280,
     /// expressed through the `idna` crate.
     ///
-    /// `idna::domain_to_ascii` performs the UTS46 `ToASCII` operation, which
-    /// is the same operation `idn2_lookup_ul` performs, with the differences
-    /// the module documentation lists.
+    /// The operation is UTS46 _ToASCII_, which is the operation
+    /// `idn2_lookup_ul` performs, with the differences the module documentation
+    /// lists.
     ///
-    /// There is no re-duplication step, and none is needed: the result is a
-    /// Rust `String` and the bytes are copied into C-allocator memory exactly
-    /// once, by [`CBuf::from_slice`]. That mirrors the C, where the
-    /// re-duplication block at L306-L315 is `#ifdef USE_LIBIDN2` and the
-    /// Windows and Apple backends allocate through curl's allocator to begin
-    /// with.
+    /// There is no re-duplication step, and none is needed: the bytes are
+    /// written into C-allocator memory as they are produced. That mirrors the
+    /// C, where the re-duplication block at L306-L315 is `#ifdef USE_LIBIDN2`
+    /// and the Windows and Apple backends allocate through curl's allocator to
+    /// begin with.
     ///
     /// # Errors
     ///
     /// `CURLcode::CURLE_URL_MALFORMAT` if the name is not valid UTF-8 or the
-    /// crate rejected it, and `CURLcode::CURLE_OUT_OF_MEMORY` if the copy could
-    /// not be allocated.
+    /// crate rejected it, and `CURLcode::CURLE_OUT_OF_MEMORY` if the buffer
+    /// could not be allocated.
     pub(super) fn idn_decode(input: &CBuf) -> Result<CBuf, CURLcode> {
-        // The C hands libidn2 a byte string and lets it decide; this crate
-        // takes `&str`, so invalid UTF-8 has to be rejected here. The C
-        // rejects it too, one layer further in: `idn2_lookup_ul` reports
-        // IDN2_ICONV_FAIL or IDN2_ENCODING_ERROR, both of which become
-        // CURLE_URL_MALFORMAT at L267, which is the code used here.
-        let name = str::from_utf8(input.as_bytes()).map_err(|_| CURLcode::CURLE_URL_MALFORMAT)?;
-        let ascii = idna::domain_to_ascii(name).map_err(|_| CURLcode::CURLE_URL_MALFORMAT)?;
-        own(&ascii)
+        // The C hands libidn2 a byte string and lets it decide; `process`
+        // checks the UTF-8 itself and treats ill-formed input as an error,
+        // which is the same verdict one layer further in: `idn2_lookup_ul`
+        // reports IDN2_ICONV_FAIL or IDN2_ENCODING_ERROR, both of which become
+        // CURLE_URL_MALFORMAT at L267.
+        convert(input.as_bytes(), false)
     }
 
     /// The `USE_*` body of `static idn_encode` at `lib/idn.c` L282-L300,
     /// expressed through the `idna` crate.
     ///
-    /// `idna::domain_to_unicode` performs UTS46 `ToUnicode`, the operation
-    /// `idn2_to_unicode_8z8z` performs. It reports its verdict beside the
-    /// converted text rather than instead of it, so the verdict is consulted
-    /// first and the text used only when it is clean, which is how the C reads
-    /// its own return code at L287.
+    /// The operation is UTS46 _ToUnicode_, the operation
+    /// `idn2_to_unicode_8z8z` performs.
     ///
     /// # Errors
     ///
     /// `CURLcode::CURLE_URL_MALFORMAT` if the input is not valid UTF-8 or the
-    /// crate rejected it, and `CURLcode::CURLE_OUT_OF_MEMORY` if the copy could
-    /// not be allocated. There is no equivalent of libidn2's
-    /// `IDNA_MALLOC_ERROR`, because a Rust allocation failure aborts rather
-    /// than returning.
+    /// crate rejected it, and `CURLcode::CURLE_OUT_OF_MEMORY` if the buffer
+    /// could not be allocated. Unlike the libidn2 backend there is no
+    /// `IDNA_MALLOC_ERROR` to translate, because the failure arrives as the
+    /// sink's own refusal instead.
     pub(super) fn idn_encode(puny: &CBuf) -> Result<CBuf, CURLcode> {
-        let name = str::from_utf8(puny.as_bytes()).map_err(|_| CURLcode::CURLE_URL_MALFORMAT)?;
-        let (unicode, verdict) = idna::domain_to_unicode(name);
-        verdict.map_err(|_| CURLcode::CURLE_URL_MALFORMAT)?;
-        own(&unicode)
+        convert(puny.as_bytes(), true)
     }
 
-    /// Copy converted text into C-allocator memory.
-    ///
-    /// The single point at which this backend produces something that may
-    /// cross into C, which is what keeps the ownership rule in
-    /// `rust-urlapi/docs/MEMORY-OWNERSHIP.md` true of this configuration as
-    /// well: every buffer handed to C comes from `src/alloc.rs`.
-    ///
-    /// # Errors
-    ///
-    /// `CURLcode::CURLE_OUT_OF_MEMORY` if the allocation failed.
-    fn own(text: &str) -> Result<CBuf, CURLcode> {
-        match CBuf::from_slice(text.as_bytes()) {
-            Some(buf) => Ok(buf),
-            None => Err(CURLcode::CURLE_OUT_OF_MEMORY),
+    /// The sink's own behaviour, which is what makes the out-of-memory report
+    /// reachable rather than merely written down.
+    #[cfg(test)]
+    mod tests {
+        // As in every test module of this crate: a test's job is to panic when
+        // an assertion fails, and a test never crosses the C boundary.
+        #![allow(clippy::unwrap_used)]
+        #![allow(clippy::arithmetic_side_effects)]
+
+        use super::{convert, CBuf, CSink, CURLcode, Write};
+
+        /// A sink that received nothing still yields a terminated buffer, which
+        /// is what libidn2 does with an empty name: an empty *allocated*
+        /// string, not a null.
+        #[test]
+        fn an_empty_sink_yields_an_empty_terminated_buffer() {
+            let sink = CSink::with_ceiling(16);
+            let buf = sink.finish().unwrap();
+            assert_eq!(buf.as_bytes(), b"");
+            assert_eq!(buf.as_bytes_with_nul(), b"\0");
+        }
+
+        /// Writes accumulate in order, and the handover carries the terminator.
+        #[test]
+        fn writes_accumulate_in_order() {
+            let mut sink = CSink::with_ceiling(64);
+            sink.write_str("xn--").unwrap();
+            sink.write_str("n3h").unwrap();
+            sink.write_str(".de").unwrap();
+            let buf = sink.finish().unwrap();
+            assert_eq!(buf.as_bytes(), b"xn--n3h.de");
+            assert_eq!(buf.as_bytes_with_nul(), b"xn--n3h.de\0");
+        }
+
+        /// A refused write is reported as `CURLE_OUT_OF_MEMORY`, and the
+        /// refusal is sticky.
+        ///
+        /// This is the whole reason the sink exists, in one assertion. The
+        /// convenience entry points of the `idna` crate build a `String`, whose
+        /// growth cannot fail without aborting the process; the sink refuses
+        /// instead, `Uts46::process` turns the refusal into
+        /// `ProcessingError::SinkError`, and [`convert`] maps that to the code
+        /// the C reports at `lib/idn.c` L313 and L338.
+        #[test]
+        fn a_refused_write_is_reported_as_out_of_memory() {
+            // The ceiling is `dyn_nappend`'s: a write fails when
+            // `len + idx + 1` exceeds it, so eight bytes fit in a ceiling of
+            // nine and a ninth does not.
+            let mut sink = CSink::with_ceiling(9);
+            assert!(sink.write_str("12345678").is_ok());
+            assert!(sink.write_str("9").is_err());
+            // Sticky: even a write that would now fit cannot clear it.
+            assert!(sink.failed);
+            assert_eq!(
+                sink.finish().err(),
+                Some(CURLcode::CURLE_OUT_OF_MEMORY),
+                "a refused write must surface as the C's own report"
+            );
+        }
+
+        /// The passthrough and sink paths agree on the answer.
+        ///
+        /// An already-canonical ASCII name is returned as itself, without the
+        /// sink being written at all, while the same name in upper case has to
+        /// be folded and therefore travels through the sink. Both must produce
+        /// the same bytes, which is what makes the passthrough arm of
+        /// [`convert`] safe to take.
+        #[test]
+        fn the_passthrough_and_sink_paths_agree() {
+            let lower = CBuf::from_slice(b"example.com").unwrap();
+            let upper = CBuf::from_slice(b"EXAMPLE.COM").unwrap();
+            let from_passthrough = convert(lower.as_bytes(), false).unwrap();
+            let from_sink = convert(upper.as_bytes(), false).unwrap();
+            assert_eq!(from_passthrough.as_bytes(), b"example.com");
+            assert_eq!(from_sink.as_bytes(), b"example.com");
+        }
+
+        /// Ill-formed UTF-8 is a malformed name, not a panic.
+        ///
+        /// `Uts46::process` checks the encoding itself, which is why this
+        /// backend needs no `str::from_utf8` of its own; the verdict is the one
+        /// `lib/idn.c` L267 reports for libidn2's `IDN2_ICONV_FAIL`.
+        #[test]
+        fn ill_formed_utf8_is_a_malformed_name() {
+            let bad = CBuf::from_slice(&[0xC3, 0x28]).unwrap();
+            assert_eq!(
+                convert(bad.as_bytes(), false).err(),
+                Some(CURLcode::CURLE_URL_MALFORMAT)
+            );
         }
     }
 }
@@ -1342,75 +1092,20 @@ mod tests {
         assert_eq!(CURLUE_BAD_HOSTNAME, 21);
     }
 
-    /// Put the process in the locale its environment names, exactly once.
-    ///
-    /// A Rust program never calls `setlocale`, so it starts in the `C` locale
-    /// whatever the environment says, and `idn2_lookup_ul` then fails on every
-    /// non-ASCII name with `IDN2_ICONV_FAIL`. `tests/libtest/first.c` L231
-    /// makes the same call for the same reason, and a harness that omits it
-    /// passes while exercising none of the conversion path.
-    ///
-    /// Once, and before any lookup. `Once::call_once` blocks its other callers
-    /// until the initialiser has returned, and every test here that reaches
-    /// libidn2 calls this first, so no lookup can observe the locale while it
-    /// is being changed.
+    // The locale and codeset probes these tests need, `ensure_locale` and
+    // `utf8_codeset`, call `setlocale` and `nl_langinfo` and so live with
+    // every other foreign call, in `crate::ffi::test_locale`. They are
+    // imported by name below and used exactly as they were here.
     #[cfg(all(idn_backend_libidn2, unix))]
-    fn ensure_locale() {
-        // Reached through `std` rather than assumed to be in the prelude, so
-        // that this module compiles the same way whichever the crate root
-        // turns out to declare. Every non-test module of this crate imports
-        // from `core` and `libc` alone.
-        extern crate std;
-        use libc::c_char;
-        use std::sync::Once;
+    use crate::ffi::test_locale::{ensure_locale, utf8_codeset};
 
-        static SELECTED: Once = Once::new();
-
-        SELECTED.call_once(|| {
-            // The empty string is what asks for the environment's own locale,
-            // and it is exactly what `tests/libtest/first.c` L231 passes.
-            const FROM_ENVIRONMENT: &[u8] = b"\0";
-            // SAFETY: the pointer is to a NUL-terminated static literal, which
-            // `setlocale` only reads. The returned pointer is to libc's own
-            // storage and is deliberately not read or freed. `Once` guarantees
-            // this runs on one thread with every other caller blocked, which
-            // is what makes a call that mutates process-wide state safe here.
-            unsafe { libc::setlocale(libc::LC_ALL, FROM_ENVIRONMENT.as_ptr().cast::<c_char>()) };
-        });
-    }
-
-    /// Nothing to do where the locale entry points are not bound.
+    /// Nothing to arrange where the locale entry points are not bound.
     ///
     /// The Windows arm of `IDN2_LOOKUP` at `lib/idn.c` L36-L37 selects
     /// `idn2_lookup_u8`, which reads UTF-8 directly, so there is no locale to
     /// arrange on that platform and nothing for the codeset to change.
     #[cfg(all(have_idn, not(all(idn_backend_libidn2, unix))))]
     fn ensure_locale() {}
-
-    /// Whether the process locale's codeset is UTF-8.
-    ///
-    /// This is the same question `tests/runtests.pl` answers with
-    /// `is_utf8_supported()` at L836 and exports as
-    /// `CURL_TEST_HAVE_CODESET_UTF8` at L837-L839 for
-    /// `tests/libtest/lib1560.c` to read at L2036 and gate three sub-tests on.
-    /// Asking the C library directly is better than reading the variable,
-    /// because the variable can be right about the environment and wrong about
-    /// the machine: on this container `LC_ALL=en_US.UTF-8` names a locale that
-    /// is not generated and yields the codeset `ANSI_X3.4-1968`, where a check
-    /// of the variable's spelling would have concluded UTF-8.
-    #[cfg(all(idn_backend_libidn2, unix))]
-    fn utf8_codeset() -> bool {
-        use core::ffi::CStr;
-
-        ensure_locale();
-        // SAFETY: `nl_langinfo` returns a pointer to libc's own static,
-        // NUL-terminated storage for the current locale, never null for a
-        // valid item, and `CODESET` is a valid item. The locale is fixed by
-        // `ensure_locale` before this runs and is never changed again, so the
-        // string cannot be rewritten while it is borrowed here.
-        let codeset = unsafe { CStr::from_ptr(libc::nl_langinfo(libc::CODESET)) };
-        codeset.to_bytes() == b"UTF-8"
-    }
 
     /// The three reference vectors convert to punycode where the codeset is
     /// UTF-8, which is the direction `CURLU_PUNYCODE` asks for.

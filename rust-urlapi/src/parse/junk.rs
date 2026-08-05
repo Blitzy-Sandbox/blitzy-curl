@@ -31,13 +31,10 @@
 //! raw pointer, no allocation and no `unsafe`, which is what makes it
 //! testable on its own.
 //!
-//! Those two modules, `src/parse/mod.rs` and `src/ffi.rs`, are also the only
-//! in-crate consumers, and there is no feature setting under which either
-//! stops calling this one. That is why this module carries no blanket
-//! allowance for dead code, unlike `src/alloc.rs`, whose reachable surface
-//! genuinely varies with the feature matrix: a dead-code warning pointing
-//! here would mean the pipeline had come unwired, which is a finding to act
-//! on rather than one to silence.
+//! Those two modules are also the only in-crate consumers, and no feature
+//! setting stops either from calling this one, which is why this module
+//! carries no dead-code allowance: a dead-code warning here would mean the
+//! pipeline had come unwired.
 //!
 //! # The rule, byte for byte
 //!
@@ -62,81 +59,82 @@
 //! through `0xff` would fail the parity diff and would also make every
 //! internationalized domain name unparsable.
 //!
+//! The single threshold at step 3 is how the flag works: allowing spaces
+//! moves it down to `0x1f`, so `0x20` survives for being strictly greater;
+//! rejecting them leaves it at `0x20`, so `0x20` falls to the `<=`. `0x7f`
+//! sits in a comparison of its own, so no value of `allowspace` can admit
+//! it. `u8::is_ascii_control` is not used, because it covers `0x00`-`0x1f`
+//! plus `0x7f` and so differs from this rule by exactly the space -- the one
+//! byte the flag exists to decide.
+//!
 //! # It is `CURLUE_MALFORMED_INPUT`, never `CURLUE_TOO_LARGE`
 //!
 //! Both rejections here return `CURLUE_MALFORMED_INPUT`, the length ceiling
-//! included. That reads like the wrong code, and the crate really does
-//! define `CURLUE_TOO_LARGE`, so the temptation to correct it is genuine.
-//! `lib/urlapi.c` L230 is unambiguous. The other consumer of the same
-//! constant is the one that fits the intuition: the ceiling `curl_url_set`
-//! applies at `lib/urlapi.c` L1824 does yield `CURLUE_TOO_LARGE`, which is
-//! the behavior the documentation of `CURL_MAX_INPUT_LENGTH` in
-//! `src/abi.rs` describes. Two ceilings, two codes, one constant, and
-//! transformation rule T6 governs: faithful over correct.
+//! included, per `lib/urlapi.c` L230 -- even though the crate does define
+//! `CURLUE_TOO_LARGE`. The other ceiling over the same constant is the one
+//! that fits the intuition: `curl_url_set` at `lib/urlapi.c` L1824 does
+//! yield `CURLUE_TOO_LARGE`. Two ceilings, two codes, one constant.
 //!
-//! # One threshold, not two predicates
+//! # This threshold is not the decoder's threshold
 //!
-//! The flag selects a number and nothing else, exactly as at L232. Spaces
-//! are allowed by moving the threshold down to `0x1f`, so `0x20` survives
-//! for being strictly greater than it; spaces are rejected by leaving the
-//! threshold at `0x20`, so `0x20` falls to the `<=`. Written instead as two
-//! predicates behind an `if`, the same behavior would state the boundary
-//! twice and could drift on one future edit. `0x7f` sits outside that
-//! mechanism altogether, in a comparison of its own, which is why no value
-//! of `allowspace` can ever admit it.
+//! `src/decode.rs` carries a second, similar-looking control-byte test, and
+//! folding the two into one helper would be a silent behavior change:
 //!
-//! # Two rejection sets, and why they must not be unified
+//! - Here, from `lib/urlapi.c` L232-L234: reject a byte `<= 0x1f`, or
+//!   `<= 0x20` when spaces are not allowed, plus `0x7f`. Applied to the raw
+//!   input, before any decoding.
+//! - In `src/decode.rs`, from `lib/escape.c` L139: reject a byte `< 0x20`
+//!   and nothing else. Applied to each byte after percent-decoding, and
+//!   documented at `lib/escape.c` L97 as rejecting byte codes lower than 32.
 //!
-//! This crate contains a second, similar-looking control-byte test. They are
-//! different predicates, run at different times on different data, and
-//! folding them into one shared helper would be a silent behavior change:
+//! The decoder's set is strictly narrower: it admits `0x20` unconditionally
+//! and admits `0x7f`. So a `%7f` escape in a path decodes to a byte the
+//! decoder passes and this scan would have rejected -- and both outcomes are
+//! correct, because this scan never saw that byte, only the three characters
+//! `%`, `7` and `f`.
 //!
-//! - Set A, owned by this module, from `lib/urlapi.c` L232-L234. Rejects a
-//!   byte `<= 0x1f`, or `<= 0x20` when spaces are not allowed, plus `0x7f`.
-//!   It inspects the raw input, before any decoding has happened.
-//! - Set B, owned by `src/decode.rs`, from `lib/escape.c` L139. Rejects a
-//!   byte `< 0x20` and nothing else. It inspects each byte after
-//!   percent-decoding.
+//! # Two invariants a caller depends on
 //!
-//! Set B is strictly narrower. It admits `0x20` unconditionally and it
-//! admits `0x7f`, so a `%7f` escape in a path decodes to a byte set B passes
-//! and set A would have rejected -- and both outcomes are correct, because
-//! set A never sees that byte: it inspected the three characters `%`, `7`
-//! and `f` instead. `lib/escape.c` L97 documents set B as rejecting byte
-//! codes lower than 32, and that is the whole of it.
+//! A NUL byte is rejected. The C measures a NUL-terminated string with
+//! `strlen`, so the range it scans cannot contain one; a slice can, and
+//! `0x00` falls below either threshold. That is the safe direction, and it is
+//! unreachable from `src/ffi.rs`, which hands over the bytes up to the
+//! terminator and no further.
 //!
-//! For the same reason `u8::is_ascii_control` is not used below. It covers
-//! `0x00` through `0x1f` plus `0x7f`, which happens to equal set A when
-//! spaces are allowed and to differ from it by exactly the space when they
-//! are not. Naming the standard-library predicate would hide that the space
-//! is the entire point of the flag.
-//!
-//! # What a byte slice means here
-//!
-//! The C takes a NUL-terminated string and measures it itself, so the range
-//! it scans can never contain a NUL: `strlen` stopped at the first one. A
-//! slice carries its own length and can contain one, and this module rejects
-//! it, because `0x00` is less than or equal to either threshold. That is the
-//! safe direction, and it is unreachable from `src/ffi.rs`, which hands over
-//! the bytes up to the terminator and no further.
-//!
-//! # The length is load-bearing
-//!
-//! Every later stage of `parseurl` works from the length this stage reports
-//! rather than measuring the string again, so an off-by-one here corrupts
-//! the whole pipeline instead of one part of one URL. Returning it inside a
-//! `Result` reproduces the C's own discipline of writing `*urllen` at L237
-//! only, after both rejections have been passed.
-//!
-//! # Verification
-//!
-//! The tests at the end of this file are spot checks against the C
-//! semantics, one per rule above plus a sweep of all 256 byte values.
-//! Coverage through the exported C entry points lives in
-//! `rust-urlapi/tests/`, and the authoritative oracle,
-//! `tests/libtest/lib1560.c`, cannot be run against a single module at all:
-//! end-to-end verification happens through
-//! `rust-urlapi/scripts/run-parity.sh`.
+//! The reported length is load-bearing. Every later stage of `parseurl`
+//! works from it rather than measuring the string again, so an off-by-one
+//! here corrupts the whole pipeline rather than one part of one URL.
+//! Returning it inside a `Result` reproduces the C's own discipline of
+//! writing `*urllen` at L237 only, after both rejections have been passed.
+
+// Reachability here is decided by two modules that do not exist yet.
+// `Curl_junkscan` is called from the parse pipeline at `lib/urlapi.c` L1120
+// and re-exported to C for `lib/doh.c` L1127, so its consumers are
+// `src/parse/mod.rs` and `src/ffi.rs`.
+//
+// This file is currently unreachable from any module tree, which is a
+// consequence of the delivery order and not a defect: `src/parse/` holds only
+// this file, there is no `src/parse/mod.rs` and no `src/parse.rs`, and under
+// edition 2021 no `mod` declaration can reach it without one of those. THE
+// CHECKPOINT THAT CREATES src/parse/mod.rs MUST DECLARE `mod junk;` THERE, or
+// this module is compiled by nothing and its tests never run.
+//
+// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
+// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
+// checkpoint that creates src/getset.rs, and replaced there by one crate-level
+// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
+// src/getset.rs exist, most of this crate has no consumer, and a crate held to
+// zero warnings cannot build clean without this. Scoped to this module and to
+// this lint alone.
+#![allow(dead_code)]
+// The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
+// technical specification forbids `unsafe` outside FFI code (1.3.2.1).
+// `forbid` rather than `deny` because an inner `allow` here would be a
+// design change and should have to be argued for, not slipped in. This
+// module needs nothing from C, so the attribute costs it nothing and turns
+// the crate's single-unsafe-island property into a compiler guarantee
+// instead of a convention.
+#![forbid(unsafe_code)]
 
 use crate::abi::{CURLUcode, CURLUE_MALFORMED_INPUT, CURL_MAX_INPUT_LENGTH};
 

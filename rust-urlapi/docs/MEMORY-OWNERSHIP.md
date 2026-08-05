@@ -9,15 +9,22 @@ SPDX-License-Identifier: curl
 This document records the C-side memory-ownership assumptions that the
 `curl-urlapi-rs` port inherits from `lib/urlapi.c`, and the rules the crate
 follows to honor them. Memory ownership is the highest-risk area of this
-port, so the record exists at two levels: a safety comment at every site in
-`src/alloc.rs` and `src/ffi.rs`, and this file. A comment explains one line.
-This file explains the whole chain. Neither one replaces the other.
+port, so the record is kept at two levels: a safety comment at every site
+that touches the boundary, and this file. A comment explains one line. This
+file explains the whole chain. Neither one replaces the other.
 
-Every claim below cites a path and a line number so that a reader can open
-the source and confirm it rather than take it on trust. Build steps, feature
-tables, prerequisites and script ordering are deliberately absent; they
-belong to `../README.md`, which is the short entry point to the same
-material.
+Two statements about state, so that nothing below is read as a completion
+claim. `rust-urlapi/src/alloc.rs` exists and carries those comments today.
+`rust-urlapi/src/ffi.rs` does not exist yet; every claim in this file about
+what it contains or enforces is a requirement on the module still to be
+written, and is worded as one. The same holds for `rust-urlapi/README.md`,
+which is named below as the intended home of the build material this file
+deliberately leaves out and which is likewise not yet written.
+
+Every claim below about existing code cites a path and a line number so that
+a reader can open the source and confirm it rather than take it on trust.
+Build steps, feature tables, prerequisites and script ordering are
+deliberately absent; they belong to `rust-urlapi/README.md`.
 
 ## The documented contract
 
@@ -89,9 +96,9 @@ limitation recorded further down traces back to that single mutable pointer.
 
 ## Allocation sites in `lib/urlapi.c`
 
-The inventory below was re-derived from the source rather than copied from
-the plan, because the value of an ownership record rests on the inventory
-being complete. The command was:
+The value of an ownership record rests on its inventory being complete, so
+the inventory below is derived from the source and the command that derives
+it is given, allowing it to be re-checked at any time:
 
     grep -nE 'curlx_(calloc|strdup|memdup0|dyn_ptr)|curl_maprintf' \
       lib/urlapi.c
@@ -126,11 +133,11 @@ These five mechanisms are the complete set of direct allocation in the
 module. A search for `curlx_malloc`, `curlx_realloc`, or a bare `malloc`,
 `calloc`, `realloc` or `strdup` in `lib/urlapi.c` returns nothing at all.
 
-### The four sites the plan omits
+### Four sites that are easy to miss
 
-The table in the Agent Action Plan (`AAP`) at 0.6.4 lists 23 sites.
-Re-deriving it produced 27. The four extra ones are named individually so
-that a reviewer can confirm each.
+Each of the four below is reached from an inner branch or a shared exit
+label rather than from a function's main path, so they are named
+individually and each can be confirmed against the source.
 
 - `lib/urlapi.c:L672`, `u->host = curlx_dyn_ptr(&host);` in
   `Curl_url_set_authority()`, which begins at L658. L671 frees the previous
@@ -182,17 +189,61 @@ on it twice. The `nomem:` label at L1959-L1961 releases `enc` and never
 touches `qbuf`, because the failed append on `qbuf` at L1946, L1950 or L1953
 released it already. The same reasoning holds at L1486-L1488, where a failed
 `curlx_dyn_addf()` returns `CURLUE_OUT_OF_MEMORY` with no free of its own.
-`src/dynbuf.rs` reproduces this, and it is a statement about ownership
-rather than about error codes.
+`rust-urlapi/src/dynbuf.rs` reproduces this, and it is a statement about
+ownership rather than about error codes.
+
+### Every buffer carries a ceiling, and the ceiling is not decoration
+
+`dyn_nappend()` computes `fit = len + idx + 1` at `lib/curlx/dynbuf.c:L72`,
+which is the new bytes, the bytes already there, and the terminator. It
+releases the buffer and returns `CURLE_TOO_LARGE` at L82-L84 when `fit`
+exceeds the ceiling the buffer was initialized with. The `+ 1` is the reason
+a ceiling is a limit on content and not on capacity, and the port reproduces
+the arithmetic rather than approximating it.
+
+Three ceilings reach this module, and they are different numbers for
+different reasons:
+
+| Ceiling | Value | C locator | Where it applies |
+|---|---:|---|---|
+| `DYN_APRINTF` | 8,000,000 | `lib/curlx/dynbuf.h:L70`, used at `lib/mprintf.c:L1144` | anything built by `curl_maprintf()`, so the formatting and concatenating helpers of `src/alloc.rs` |
+| `CURL_MAX_INPUT_LENGTH` | 8,000,000 | `lib/urldata.h:L131` | the input a caller hands to `curl_url_set`, and the junk scan |
+| `length * 3 + 1` | derived | `lib/escape.c:L66` | one call of the escape helper, sized from its own input |
+
+The first of these is the one most easily lost in a port, because in C it
+arrives implicitly: a caller writes `curl_maprintf()` and inherits the
+ceiling without naming it. `src/alloc.rs` names it, so its formatting and
+concatenating helpers refuse an oversize result exactly where
+`curl_maprintf()` would rather than allocating past it.
+
+The third is worth contrasting with the other two. It is not a policy limit
+at all but a computed exact size, and `lib/escape.c:L63` guards the
+multiply that produces it with `length > SIZE_MAX / 16`. `src/encode.rs`
+reproduces both the guard and the size, and computes the product with
+checked arithmetic besides, because the crate root denies arithmetic that
+could panic.
+
+Independently of all three, `src/ffi.rs` refuses any allocation above
+`isize::MAX` before it reaches the C allocator. That is not a curl rule but
+a language one: a slice or a pointer offset beyond `isize::MAX` is
+undefined behavior regardless of whether the allocator would have obliged.
 
 ### One owner, four sources
 
-`get_url()` declares `allochost` at `lib/urlapi.c:L1431` and fills it from
-four different allocation paths: the dynamic-buffer handover at L1489, the
-escape helper at L1493, `host_decode()` at L1499 and `host_encode()` at
-L1506. A single `curlx_free(allochost)` at L1533 releases whichever one ran.
-All four therefore have to agree on the free function. The port keeps that
-property by giving all four the same owned-buffer type from `src/alloc.rs`.
+`urlget_url()`, defined at `lib/urlapi.c:L1425`, declares `allochost` at
+L1431 and fills it from four different allocation paths: the dynamic-buffer
+handover at L1489, the escape helper at L1493, `host_decode()` at L1499 and
+`host_encode()` at L1506. A single `curlx_free(allochost)` at L1533 releases
+whichever one ran. All four therefore have to agree on the free function.
+The port keeps that property by giving all four the same owned-buffer type
+from `rust-urlapi/src/alloc.rs`.
+
+In the port the four sit in three modules. `src/getset.rs` performs the
+handover, `src/encode.rs` owns the escape helper, and `src/idn.rs` owns both
+internationalized-domain paths, and the shared type is what makes the single
+release at L1533 portable across all three. The escape helper is the
+one of the four that returns its buffer rather than writing into a caller's,
+so it is also the one whose signature carries the transfer.
 
 ### Buffers the module owns without allocating them
 
@@ -234,16 +285,19 @@ the null check at L1535-L1536.
 These bind every module of the crate, and downstream work implements against
 them.
 
-1. **Every buffer that crosses into C originates in `src/alloc.rs`**, which
-   allocates through the C allocator by way of the `libc` crate. That is
-   what makes a caller's `curl_free()` correct by construction rather than
-   correct by discipline at each of the 27 sites listed above.
+1. **Every buffer whose ownership transfers to C originates in
+   `src/alloc.rs`**, which allocates through the C allocator: it asks
+   `src/ffi.rs` for an owned block, and that module makes the `libc` call. The
+   split keeps every foreign call in one module open to audit without moving
+   the memory adapter, and the property it buys is the same either way -- a
+   caller's `curl_free()` is correct by construction rather than correct by
+   discipline at each of the 27 sites listed above.
 2. **`CString::into_raw` is banned crate-wide.** A pointer produced that way
    has to come back to Rust to be released, because the allocator behind it
    belongs to Rust rather than to C. Published guidance is explicit that the
    C free function must not be called on such a pointer, and the documented
    contract requires exactly that call, so the conversion cannot appear
-   anywhere in the crate. `AAP` 0.3.2 and 0.6.4 record the decision.
+   anywhere in the crate.
 3. **Allocating C-visible buffers with the C allocator is the accepted
    remedy, and it carries one caveat.** An allocator mismatch across a
    library boundary stays possible depending on how the pieces are linked.
@@ -253,10 +307,11 @@ them.
    `src/ffi.rs`. This file is the companion record, not a replacement: a
    reader at one line needs the comment, and a reviewer checking the whole
    chain needs the record.
-5. **`src/ffi.rs` is the only module that contains `unsafe`**, per `AAP`
-   0.3.3 and specification 1.3.2.1, and every block in it carries a safety
-   comment, per specification 3.2.1.2. Ownership crosses the boundary in
-   that one file, so the reasoning stays in one place.
+5. **`src/ffi.rs` is the only module that contains `unsafe`**, and every
+   block in it carries a safety comment. Every other module of the crate
+   carries `#![forbid(unsafe_code)]`, which makes that mechanical rather
+   than a convention. Ownership crosses the boundary in that one file, so
+   the reasoning stays in one place.
 
 ## Reported limitation R3: memory-debug builds
 
@@ -282,13 +337,17 @@ would still leave the accounting wrong, because the matching allocation was
 never logged.
 
 The parity harness is therefore built without the memory-debug
-configuration, as `AAP` 0.2.4.3 reports. The visible cost is the ceiling
-that `tests/data/test1560:L40` asserts, `Allocations: 3000`. That ceiling is
-honored in spirit, in that the port does not allocate materially more than
-the C original, rather than counted by curl's own counter. An independent
-count through the platform's own tooling is the available substitute.
-`tests/data/test1560` is read-only for this work; it is cited here and never
-edited.
+configuration. The visible cost is the ceiling that
+`tests/data/test1560:L40` asserts, `Allocations: 3000`: curl's own
+allocation counter belongs to the memory-debug build, so it does not run
+here, and **that ceiling is consequently not validated in this
+configuration**. No substitute measurement is claimed for it, and none
+should be inferred from the port's structure. Validating it needs an
+independent count -- the platform's own allocation tooling over the harness
+binary, or a harness rebuilt against a memory-debug libcurl once the
+allocator mismatch above is solved -- and until such a count exists the
+ceiling is simply unmeasured. `tests/data/test1560` is read-only for this
+work; it is cited here and never edited.
 
 ## Reported limitation R4: alternative memory functions
 
@@ -302,9 +361,10 @@ application installed.
 A buffer this crate allocated through the C allocator is then released by a
 function that never allocated it. Nothing in the crate detects the
 substitution, because the pointer carries no record of its origin. The
-configuration is unsupported. It is reported here rather than worked around,
-per `AAP` 0.2.4.4, and it is the same gap that the technical specification
-records in 1.3.2.5.
+configuration is unsupported. It is reported here rather than worked
+around, because working around it would mean either importing a
+libcurl-private symbol or tracking the origin of every returned buffer,
+and neither is available to a drop-in replacement for one object file.
 
 ## Conflict C3: the free function lives outside this scope
 
@@ -314,10 +374,10 @@ function, and that function is defined outside the boundary of this work.
 `curl_url_strerror()` is the same shape of problem one file over, in
 `lib/strerror.c`. In a standalone link neither one is present at all.
 
-The resolution recorded in `AAP` 0.8.3 has two halves. Every buffer the
-crate returns is allocated with the C allocator, so a plain `free()` on it
-is correct, and a plain `free` is what `curlx_free` resolves to outside a
-libcurl build, per `lib/curl_setup.h:L1484`. In addition the crate exports
+The resolution has two halves. Every buffer the crate returns is allocated
+with the C allocator, so a plain `free()` on it is correct, and a plain
+`free` is what `curlx_free` resolves to outside a libcurl build, per
+`lib/curl_setup.h:L1484`. In addition the crate exports
 its own `curl_free()` under the `cfree` feature, for the standalone
 configuration where no libcurl supplies one.
 
@@ -338,7 +398,9 @@ The same reasoning applies to the `strerror` feature and
 
 - [KNOWN-DIVERGENCES.md][divergences] records the reproduced findings,
   among them the two leaks `FB2` and `FB3` whose ownership context this
-  file supplies.
+  file supplies. It also records the residual divergence this file points
+  at -- that the port does not leak where `FB2` does -- and, marked closed,
+  the confinement of `unsafe` to one module that rule 5 above now states.
 - [PORTING-NOTES.md][porting] maps the C functions onto the Rust modules.
 
 [divergences]: KNOWN-DIVERGENCES.md

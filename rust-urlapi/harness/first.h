@@ -52,10 +52,11 @@
    curl_dbg_free() under memory debugging (lib/curl_setup.h:L1461), to the
    mutable global hook Curl_cfree under BUILDING_LIBCURL (L1478), or to
    plain free() (L1484). The crate takes its C-visible buffers from the C
-   allocator, so only the last of the three suits them. Reported constraint
-   R3: no memory debugging here, so the ceiling at tests/data/test1560:L40
-   is honored in spirit, not counted by curl's own accounting. The whole
-   chain is in ../docs/MEMORY-OWNERSHIP.md. */
+   allocator, so only the last of the three suits them. Because memory
+   debugging is therefore off, curl's own allocation counter does not run
+   and the ceiling at tests/data/test1560:L40 is not measured here. The
+   whole chain, and this consequence, are recorded under "Reported
+   limitation R3" in ../docs/MEMORY-OWNERSHIP.md. */
 
 /* curl.h alone covers the curl side: it reaches the URL API at its L3316
    and the curl_m*printf family at L3320. urlapi.h is named anyway, as the
@@ -67,10 +68,13 @@
 #include <curl/curl.h>    /* CURLcode, CURLE_OK, curl_free, curl_mfprintf */
 #include <curl/urlapi.h>  /* CURLU, CURLUcode, CURLUPart, curl_url_get */
 
-/* What the real harness inherits from lib/curl_setup.h:L1047-L1052 and
-   L1287. tests/libtest/lib1560.c names none of the three at this revision;
-   the porting plan calls for them, and each guard defers to a genuine
-   curl_setup.h wherever one is visible. */
+/* Part of the compatibility surface this shim owes a libtest source. The
+   real tests/libtest/first.h inherits all three from lib/curl_setup.h,
+   TRUE and FALSE at L1047-L1052 and CURL_ARRAYSIZE at L1287, so a source
+   written against that harness may use them freely. Defining them here is
+   what keeps such a source compilable without editing it, whether or not
+   the particular source compiled in happens to reach for them. Each
+   definition is guarded so that a genuine curl_setup.h in scope wins. */
 #ifndef TRUE
 #define TRUE true
 #endif

@@ -66,30 +66,47 @@
 //! `a<b` with `CURLU_URLENCODE` stores `a%3Cb`, while setting it to `a%3Cb`
 //! with no flags stores `a%3cb`.
 //!
-//! That looks like an inconsistency, and it is not a bug to be corrected
-//! here: transformation rule T6, faithful over correct, governs. Both
+//! That looks like an inconsistency and it is not corrected here. Both
 //! behaviors are reachable through the public API, both are asserted by
-//! `tests/libtest/lib1560.c`, and "fixing" either one fails the parity
-//! diff. This module therefore emits uppercase unconditionally and supplies
-//! `raw_tolower` for the other side of the asymmetry to use.
+//! `tests/libtest/lib1560.c`, and changing either one fails the parity diff.
+//! This module therefore emits uppercase unconditionally, from
+//! `Curl_udigits` at `lib/mprintf.c` L39, and supplies `raw_tolower` for the
+//! in-place pass at `lib/urlapi.c` L1922-L1932 to use.
+
+// Reachability here is decided by the consumers, not by this file. The module
+// re-implements a set of C macros as a whole, and which of them a given build
+// reaches depends on which sibling modules exist: the classification
+// predicates are spread across the parser stages, `hexbyte` and `raw_tolower`
+// belong to `src/encode.rs`, and `hexval` to `src/decode.rs` and
+// `src/parse/host.rs`. Porting the set and not its individual members is what
+// keeps it checkable against `lib/curl_ctype.h` line for line.
+//
+// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
+// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
+// checkpoint that creates src/getset.rs, and replaced there by one crate-level
+// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
+// src/getset.rs exist, most of this crate has no consumer, and a crate held to
+// zero warnings cannot build clean without this. Scoped to this module and to
+// this lint alone.
+#![allow(dead_code)]
+// The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
+// technical specification forbids `unsafe` outside FFI code (1.3.2.1).
+// `forbid` rather than `deny` because an inner `allow` here would be a
+// design change and should have to be argued for, not slipped in. This
+// module needs nothing from C, so the attribute costs it nothing and turns
+// the crate's single-unsafe-island property into a compiler guarantee
+// instead of a convention.
+#![forbid(unsafe_code)]
 
 /// `ISDIGIT` at `lib/curl_ctype.h` L44: `'0'` through `'9'`.
 ///
 /// Called from `lib/urlapi.c` L1670, where the port setter rejects a value
 /// whose first byte is not a decimal digit.
-// This and the two predicates after it carry a targeted allow for
-// clippy::manual_is_ascii_check, which would rewrite each as the matching
-// u8::is_ascii_* method. That suggestion is behaviorally correct, and it is
-// not taken. Those methods are documented as exactly these ranges, and the
-// test module pins the agreement over all 256 byte values, so nothing is
-// being worked around; what is being kept is the bound itself. This module
-// exists to reproduce a set of C macros, and a reviewer diffing it against
-// lib/curl_ctype.h has to read the same two literals the macro states, at
-// the same place, in order to confirm the port. Replacing the range with a
-// method name hides the one detail most worth checking and turns an
-// off-by-one from a visible edit into an invisible one. The allow is placed
-// per function rather than at module scope so that any future range check
-// has to argue its own case instead of inheriting this one.
+// This and the two predicates after it keep the explicit range rather than
+// the equivalent u8::is_ascii_* method clippy suggests, so that the two
+// literals a reviewer must diff against lib/curl_ctype.h are visible at the
+// point of comparison. The allow is per function, not module-wide, so a
+// future range check has to argue its own case.
 #[allow(clippy::manual_is_ascii_check)]
 pub(crate) const fn is_digit(byte: u8) -> bool {
     matches!(byte, b'0'..=b'9')
@@ -154,13 +171,12 @@ pub(crate) const fn is_xdigit(byte: u8) -> bool {
 
 /// `ISODIGIT` at `lib/curl_ctype.h` L40: `'0'` through `'7'`.
 ///
-/// The C tree defines this macro and, as of this port, calls it nowhere:
-/// the octal scanner reached through `curlx_str_octal` at
-/// `lib/curlx/strparse.c` L209 tests its digits with the local
-/// `valid_digit` at L142-L143 instead, bounded by `'7'`. The predicate is
-/// provided here because `strparse.rs` needs exactly that bound for the
-/// octal scanner, and having one named home for it keeps the range from
-/// being written out a second time.
+/// The C tree defines this macro but has no caller for it: the octal scanner
+/// reached through `curlx_str_octal` at `lib/curlx/strparse.c` L209 tests its
+/// digits with the local `valid_digit` at L142-L143 instead, bounded by
+/// `'7'`. The predicate is provided here because `strparse.rs` needs exactly
+/// that bound for the octal scanner, and one named home for it keeps the
+/// range from being written out a second time.
 pub(crate) const fn is_odigit(byte: u8) -> bool {
     matches!(byte, b'0'..=b'7')
 }

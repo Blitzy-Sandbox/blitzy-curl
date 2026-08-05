@@ -45,6 +45,20 @@ build/
 # literal name libcurl.pc only, not this crate's.
 *.pc
 
+# Source-based coverage artifacts. rust-toolchain.toml provisions
+# llvm-tools-preview, so a coverage run is expected here, and these two
+# patterns are required rather than precautionary: measured, a
+# RUSTFLAGS="-C instrument-coverage" cargo test writes its raw profiles into
+# the PACKAGE ROOT -- this directory -- and not into target/, because that is
+# the working directory Cargo gives a test binary. Verified with
+# "git check-ignore -v": before these lines, a default_*.profraw here was
+# reported by "git status --porcelain" as untracked, which is exactly the state
+# the purpose note at the top of this file rules out. .profdata is listed with
+# it because llvm-profdata merge writes wherever it is told, and the same
+# directory is the obvious place.
+*.profraw
+*.profdata
+
 # Deliberately NOT listed above, so that each omission reads as a decision
 # rather than an oversight. Line numbers refer to the root .gitignore.
 #

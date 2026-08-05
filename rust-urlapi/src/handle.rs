@@ -24,8 +24,7 @@
 //! nothing outside that one translation unit can take its size, read a
 //! field, or copy it by value. Every caller holds only a `CURLU *`.
 //!
-//! The consequence is the single property that makes this port feasible,
-//! and it is transformation rule `T3` of the Agent Action Plan at 0.1.2.3:
+//! The consequence is the single property that makes this port feasible:
 //! the Rust structure below chooses **its own field order, its own field
 //! types and its own padding**. There is deliberately no `#[repr(C)]`, no
 //! size assertion and no attempt to mimic the C layout, because there is
@@ -39,19 +38,18 @@
 //! a `struct dynbuf *` the test constructed itself. Satisfying that test
 //! from Rust would require bit-compatible interoperation with C's dynamic
 //! buffer structure, a materially harder contract than anything the public
-//! API demands. It is reportable constraint `R2` in the plan at 0.2.4.2 and
-//! it is out of scope, which is precisely why no layout constraint reaches
-//! this file.
+//! API demands. That test is out of scope, and `docs/PORTING-NOTES.md`
+//! records it as a documented limitation of the drop-in, which is precisely
+//! why no layout constraint reaches this file.
 //!
 //! # Fourteen fields, not ten
 //!
 //! A reader who knows the API expects ten heap strings. The structure has
 //! four more members, at `lib/urlapi.c:L78-L81`: `portnum`, and the three
 //! one-bit fields `query_present`, `fragment_present` and `guessed_scheme`.
-//! They are not incidental. Without them `CURLU_GET_EMPTY`,
+//! They are not incidental: without them `CURLU_GET_EMPTY`,
 //! `CURLU_NO_GUESS_SCHEME` and `CURLU_NO_DEFAULT_PORT` cannot behave
-//! correctly, which is implicit requirement `I4` of the plan at 0.1.1.2.
-//! Each field below records which flag depends on it.
+//! correctly. Each field below records which flag depends on it.
 //!
 //! # Ownership, stated once here and again at every field
 //!
@@ -64,47 +62,48 @@
 //! The boundary of that ownership is exactly where the header puts it.
 //! `include/curl/urlapi.h:L116-L118` says `curl_url_cleanup()` frees the
 //! handle and the resources it used, and that it "will not free strings
-//! previously returned with the URL API". So this type releases only what
-//! it still owns. A buffer handed to C left through `CBuf::into_raw`, at
-//! which point it stopped being a field of this structure and became the
-//! caller's obligation to `curl_free()`.
+//! previously returned with the URL API". This type releases only what it
+//! still owns, and the strings `curl_url_get()` hands back are not among
+//! them: each one is a **separate buffer**, formatted or copied for that
+//! one call, whose `curl_free()` obligation is the caller's from the moment
+//! `CBuf::into_raw` returns the pointer. A handle field is never given
+//! away, so cleanup here cannot reach a returned buffer -- not because it
+//! carefully avoids one, but because it never held it.
+//!
+//! [`CurlUrl::take`] is the one operation that does move a field's buffer
+//! out. It is used where the C module hands a field's block onward instead
+//! of copying it, and it leaves the field absent, so the handle has
+//! nothing left to release either way.
 //!
 //! # No raw pointers and no `unsafe`
 //!
-//! `#![forbid(unsafe_code)]` below is a mechanical statement of the plan's
-//! design at 0.3.3: `src/ffi.rs` is the crate's only unsafe island. This
-//! module never sees a raw pointer, so the borrow checker alone is enough
-//! to keep it sound, and a reviewer auditing memory safety can skip it.
+//! Raw-pointer operations are confined to `src/ffi.rs`, and
+//! `#![forbid(unsafe_code)]` below makes that mechanical for this module.
+//! Every ownership transition here is expressed in the type system --
+//! `Option<CBuf>` fields, moves, and `Drop` -- so the borrow checker
+//! enforces them rather than a convention.
 //!
 //! That split leaves `src/ffi.rs` one obligation this module cannot
 //! discharge for it. `curl_url()` at `lib/urlapi.c:L1288-L1291` returns a
 //! block from the C allocator, and `curl_url_cleanup()` at `L1293-L1299`
 //! releases it with the C allocator, so the handle block itself has to come
-//! from `crate::alloc` rather than from a Rust `Box`. The facade therefore
-//! allocates `core::mem::size_of::<CurlUrl>()` bytes and moves a value in:
+//! from the C allocator rather than from a Rust `Box`. `src/ffi.rs`
+//! therefore allocates `core::mem::size_of::<CurlUrl>()` bytes with its own
+//! `c_malloc` and writes a [`CurlUrl::new`] value into the block; the
+//! allocation, the null check and the write all live there, next to the
+//! `unsafe` the write needs and the safety comment that justifies it.
 //!
-//! ```ignore
-//! let raw = crate::alloc::c_malloc(core::mem::size_of::<CurlUrl>());
-//! if raw.is_null() {
-//!     return core::ptr::null_mut();      // curl_url() reports failure
-//! }                                      // with a null return
-//! let handle = raw.cast::<CurlUrl>();
-//! // SAFETY: fresh, suitably sized, uninitialized block; nothing reads it
-//! // before this write initializes it.
-//! unsafe { handle.write(CurlUrl::new()) };
-//! handle
-//! ```
-//!
-//! One trap in that recipe deserves spelling out, because it is invisible
-//! and it would corrupt the first handle a caller ever obtains. `curl_url()`
-//! uses `curlx_calloc()`, and it is tempting to translate that as
-//! `c_calloc()` and then treat the zeroed block as a valid handle with no
-//! write at all. That is unsound. The ten fields are `Option<CBuf>`, and
-//! [`CBuf`] wraps a plain `*mut c_char` rather than a `NonNull`, so
-//! `Option<CBuf>` has no null niche and the language guarantees nothing
-//! about the bit pattern of its `None`. An all-zero block is therefore not
-//! necessarily ten `None`s. [`CurlUrl::new`] is the only way to obtain a
-//! valid empty handle, and it must be written into the block.
+//! One trap in that arrangement deserves spelling out here, because it is
+//! invisible from the facade side and it would corrupt the first handle a
+//! caller ever obtains. `curl_url()` uses `curlx_calloc()`, and it is
+//! tempting to translate that as `c_calloc()` and then treat the zeroed
+//! block as a valid handle with no write at all. That is unsound. The ten
+//! fields are `Option<CBuf>`, and [`CBuf`] wraps a plain `*mut c_char`
+//! rather than a `NonNull`, so `Option<CBuf>` has no null niche and the
+//! language guarantees nothing about the bit pattern of its `None`. An
+//! all-zero block is therefore not necessarily ten `None`s.
+//! [`CurlUrl::new`] is the only way to obtain a valid empty handle, and it
+//! must be written into the block.
 //!
 //! # Two behaviors here are faithful reproductions, not mistakes
 //!
@@ -270,7 +269,6 @@ impl StringField {
 /// to C behind a pointer, and `src/ffi.rs` keeps it that way; making it
 /// `Copy` would invite passing it by value across an FFI signature, which
 /// would expose a layout this crate is free to change.
-#[derive(Debug)]
 pub(crate) struct CurlUrl {
     /// `u->scheme` at `lib/urlapi.c:L68`.
     ///
@@ -337,25 +335,24 @@ pub(crate) struct CurlUrl {
     fragment: Option<CBuf>,
     /// `u->portnum` at `lib/urlapi.c:L78`, "the numerical version".
     ///
-    /// `unsigned short` in C, so `u16` here, and the width is load-bearing
-    /// rather than cosmetic. It is assigned from a `curl_off_t` through an
-    /// explicit `(unsigned short)` cast at `L378` and `L1681`, after the
-    /// value has been range-checked to `0xffff` at `L375`, and it is
-    /// compared against a scheme's `defport`, itself 16 bits wide, at
-    /// `L1472` and `L1599`. A wider Rust type would make those comparisons
-    /// behave differently for a value that overflowed the cast.
+    /// `unsigned short` in C, so `u16` here, and the width mirrors the
+    /// domain the C validates rather than being an arbitrary choice. The
+    /// value is range-checked to `0xffff` at `L375` before being assigned
+    /// from a `curl_off_t` through an explicit `(unsigned short)` cast at
+    /// `L378` and `L1681`, and it is compared against a scheme's `defport`,
+    /// itself 16 bits wide, at `L1472` and `L1599`. `u16` is therefore the
+    /// exact type of the values that can arrive here.
     portnum: u16,
     /// `u->query_present` at `lib/urlapi.c:L79`, "to support blank".
     ///
     /// `BIT(x)` expands to `curl_bit x:1` at `lib/curl_setup.h:L1039`, a
     /// one-bit bitfield in an `unsigned int`. A plain `bool` is the correct
-    /// equivalent here precisely because layout is free: three `bool`s
-    /// occupy three bytes in a `#[repr(Rust)]` structure rather than three
-    /// bits, and since no C code can observe the size of this structure,
-    /// that costs nothing anybody can measure. Reaching for a bit-flags
-    /// crate to recover two bytes would add a dependency the plan's fixed
-    /// set does not contain, `libc` plus an optional `idna` and nothing
-    /// else, in exchange for nothing at all.
+    /// equivalent here precisely because layout is free: `CURLU` is an
+    /// incomplete type at `include/curl/urlapi.h:L107`, so no C caller can
+    /// take this structure's size or read a field, and whether the three
+    /// flags occupy three bytes or three bits is invisible across the ABI.
+    /// Packing them into a bit-flags type would add a dependency for no
+    /// observable difference.
     ///
     /// Set at `L1039` when a `?` was seen and at `L1865` when the query is
     /// assigned, cleared at `L1767` when the query is cleared. Read at
@@ -454,12 +451,12 @@ impl CurlUrl {
     /// [`CBuf`]'s `Drop`, which is the `curlx_free()` each of those ten
     /// lines performs.
     ///
-    /// It releases only what the handle still owns. A buffer handed to C
-    /// left through `CBuf::into_raw` and is no longer a field here, so this
-    /// cannot touch it; that is the header's promise at
-    /// `include/curl/urlapi.h:L116-L118` that cleanup does not free strings
-    /// previously returned with the URL API, and it holds by construction
-    /// rather than by care.
+    /// It releases only what the handle still owns. A string returned by
+    /// `curl_url_get()` is a separate buffer built for that call, never a
+    /// field of this structure, so this cannot reach one: that is the
+    /// header's promise at `include/curl/urlapi.h:L116-L118` that cleanup
+    /// does not free strings previously returned with the URL API, and it
+    /// holds because the handle never owned them.
     ///
     /// Private because the two callers are the only two in C as well:
     /// `curl_url_cleanup()` at `L1296`, which is this type's `Drop`, and
@@ -556,10 +553,9 @@ impl CurlUrl {
     /// The port of `lib/urlapi.c:L1310-L1332`. Takes `&self` and never
     /// `&mut self`, because `curl_url_dup()` is declared
     /// `CURLU *curl_url_dup(const CURLU *in)` at
-    /// `include/curl/urlapi.h:L126`. Implicit requirement `I8` of the plan
-    /// at 0.1.1.2 makes that a soundness matter rather than a style
-    /// preference: `src/ffi.rs` receives a `*const CURLU` and must never
-    /// form a mutable reference from it, so every read path, this one
+    /// `include/curl/urlapi.h:L126`. That is a soundness matter rather than
+    /// a style preference: `src/ffi.rs` receives a `*const CURLU` and must
+    /// never form a mutable reference from it, so every read path, this one
     /// included, has to be expressible against a shared reference.
     ///
     /// # Returns
@@ -579,13 +575,9 @@ impl CurlUrl {
     /// `lib/urlapi.c:L1324`, `L1325` and `L1326`, and they are all the
     /// scalar copies the C function performs. `guessed_scheme` at `L81` is
     /// a real member of the structure, set by `guess_scheme()` at `L1008`,
-    /// and `curl_url_dup()` simply does not copy it. This port does not
-    /// copy it either, which is transformation rule `T6` of the Agent
-    /// Action Plan, faithful over correct, and the user's explicit
-    /// direction at 0.8.1 to reproduce apparent bugs and record them rather
-    /// than silently fix them. It is catalogued as `FB1` in
-    /// `docs/KNOWN-DIVERGENCES.md`, which carries measurements from the
-    /// reference build.
+    /// and `curl_url_dup()` simply does not copy it, so neither does this.
+    /// `docs/KNOWN-DIVERGENCES.md` catalogues it as `FB1` with measurements
+    /// from the reference build.
     ///
     /// Two consequences are observable on the copy, and both need
     /// `CURLU_NO_GUESS_SCHEME` to appear at all:
@@ -599,22 +591,19 @@ impl CurlUrl {
     ///   `L1512-L1515`.
     ///
     /// curl's own test suite cannot catch it, by construction rather than
-    /// by luck. `urldup()` at `tests/libtest/lib1560.c:L1970-L2031` does
-    /// walk a table that includes the scheme-less `"example.com:1234"` at
-    /// `L1985`, and it does parse every entry with `CURLU_GUESS_SCHEME` at
-    /// `L1998-L1999`, so the original really does have the bit set. But it
-    /// then reads the whole URL back from both handles with a literal flag
-    /// argument of `0`, at `L2004` and `L2008`, and compares the two
-    /// strings at `L2012`. With no flags the condition at `L1512` takes its
-    /// first branch on both handles, both strings carry the prefix, and
-    /// they match. The one flag that would expose the difference is the one
-    /// the test never passes, which is exactly why the divergence survives
-    /// upstream.
+    /// by luck. `urldup()` at `tests/libtest/lib1560.c:L1970-L2031` walks a
+    /// table that includes the scheme-less `"example.com:1234"` at `L1985`
+    /// and parses every entry with `CURLU_GUESS_SCHEME` at `L1998-L1999`,
+    /// so the original really does have the bit set -- but it reads the
+    /// whole URL back from both handles with a literal flag argument of `0`,
+    /// at `L2004` and `L2008`, and compares the strings at `L2012`. With no
+    /// flags the condition at `L1512` takes its first branch on both
+    /// handles, both strings carry the prefix, and they match. The one flag
+    /// that would expose the difference is the one the test never passes.
     ///
     /// A regression test in this module asserts the omission directly, and
     /// `rust-urlapi/tests/ffi_surface.rs` asserts it through the C entry
-    /// points, which is acceptance criterion `A10` of the plan. Anyone who
-    /// "corrects" the line below will see both fail and be led back here.
+    /// points, so "correcting" the line below fails both.
     #[must_use]
     pub(crate) fn dup(&self) -> Option<Self> {
         // curlx_calloc(1, sizeof(struct Curl_URL)) at L1312. The C code
@@ -798,57 +787,68 @@ impl CurlUrl {
     ///
     /// The handle stops owning the buffer and the caller starts, which is
     /// the shape the C module uses when it hands a field's block onward
-    /// rather than copying it. Nothing is released, so a caller that drops
-    /// the result releases it and a caller that hands it to C through
-    /// `CBuf::into_raw` transfers the `curl_free()` obligation across the
-    /// boundary.
+    /// rather than copying it. Nothing is released here: a caller that
+    /// drops the result releases it then, and a caller that hands it to C
+    /// through `CBuf::into_raw` transfers the `curl_free()` obligation
+    /// across the boundary instead.
     ///
-    /// Distinct from [`CurlUrl::clear`], which releases. Reaching for this
-    /// where `clear` was meant leaks the buffer; the `#[must_use]` makes
-    /// that mistake a compile-time warning rather than a silent one.
-    #[must_use = "this removes the buffer from the handle; dropping the \
-                  result releases it and ignoring it leaks it"]
+    /// This is destructive to the handle whatever the caller then does with
+    /// the result, which is what the `#[must_use]` is for. Discarding the
+    /// return value does not leak -- the `Option<CBuf>` is dropped and the
+    /// buffer freed -- but the field is gone either way, so a call made
+    /// where [`CurlUrl::clear`] was meant is silently the same thing and a
+    /// call made where a borrow was meant silently empties the handle.
+    #[must_use = "this removes the buffer from the handle even if the \
+                  result is discarded; use clear() to release in place or \
+                  an accessor to borrow"]
     pub(crate) fn take(&mut self, which: StringField) -> Option<CBuf> {
         self.field_mut(which).take()
     }
 
-    /// Borrows `u->scheme`, `lib/urlapi.c:L68`.
+    // The ten named accessors below all borrow: each returns the bytes of
+    // one field, in the declaration order of `lib/urlapi.c:L68-L77`, and
+    // none of them transfers ownership. `None` means the field is absent,
+    // which is a different state from an empty buffer. Only `port` and
+    // `path` say more than the field they name, because for those two the
+    // absent case has a consequence elsewhere.
+
+    /// `u->scheme`, `lib/urlapi.c:L68`.
     #[must_use]
     pub(crate) fn scheme(&self) -> Option<&[u8]> {
         self.field_bytes(StringField::Scheme)
     }
 
-    /// Borrows `u->user`, `lib/urlapi.c:L69`.
+    /// `u->user`, `lib/urlapi.c:L69`.
     #[must_use]
     pub(crate) fn user(&self) -> Option<&[u8]> {
         self.field_bytes(StringField::User)
     }
 
-    /// Borrows `u->password`, `lib/urlapi.c:L70`.
+    /// `u->password`, `lib/urlapi.c:L70`.
     #[must_use]
     pub(crate) fn password(&self) -> Option<&[u8]> {
         self.field_bytes(StringField::Password)
     }
 
-    /// Borrows `u->options`, `lib/urlapi.c:L71`.
+    /// `u->options`, `lib/urlapi.c:L71`.
     #[must_use]
     pub(crate) fn options(&self) -> Option<&[u8]> {
         self.field_bytes(StringField::Options)
     }
 
-    /// Borrows `u->host`, `lib/urlapi.c:L72`.
+    /// `u->host`, `lib/urlapi.c:L72`.
     #[must_use]
     pub(crate) fn host(&self) -> Option<&[u8]> {
         self.field_bytes(StringField::Host)
     }
 
-    /// Borrows `u->zoneid`, `lib/urlapi.c:L73`.
+    /// `u->zoneid`, `lib/urlapi.c:L73`.
     #[must_use]
     pub(crate) fn zoneid(&self) -> Option<&[u8]> {
         self.field_bytes(StringField::ZoneId)
     }
 
-    /// Borrows `u->port`, `lib/urlapi.c:L74`.
+    /// `u->port`, `lib/urlapi.c:L74`.
     ///
     /// The textual port. [`CurlUrl::portnum`] is the numeric one, and the
     /// two are set together at `L378-L381` and `L1679-L1681`.
@@ -857,7 +857,7 @@ impl CurlUrl {
         self.field_bytes(StringField::Port)
     }
 
-    /// Borrows `u->path`, `lib/urlapi.c:L75`.
+    /// `u->path`, `lib/urlapi.c:L75`.
     ///
     /// `None` means the handle has no path. Substituting `"/"` for it is
     /// the getter's job at `L1606-L1607` and the whole-URL template's job
@@ -867,13 +867,13 @@ impl CurlUrl {
         self.field_bytes(StringField::Path)
     }
 
-    /// Borrows `u->query`, `lib/urlapi.c:L76`.
+    /// `u->query`, `lib/urlapi.c:L76`.
     #[must_use]
     pub(crate) fn query(&self) -> Option<&[u8]> {
         self.field_bytes(StringField::Query)
     }
 
-    /// Borrows `u->fragment`, `lib/urlapi.c:L77`.
+    /// `u->fragment`, `lib/urlapi.c:L77`.
     #[must_use]
     pub(crate) fn fragment(&self) -> Option<&[u8]> {
         self.field_bytes(StringField::Fragment)
@@ -968,6 +968,68 @@ impl Default for CurlUrl {
     }
 }
 
+impl fmt::Debug for CurlUrl {
+    /// Reports the handle's shape without disclosing any of its content.
+    ///
+    /// Written by hand rather than derived, for the reason given on the
+    /// structure: `user`, `password`, `options` and `query` hold secrets,
+    /// and a derived formatter would print all ten strings verbatim into
+    /// whatever log, panic message or assertion failure asked for them.
+    /// That is CWE-532, cleartext storage of sensitive information in a log
+    /// file, and it is not a hypothetical for this type: a handle is the
+    /// natural thing to format when a parse result surprises someone.
+    ///
+    /// What is emitted is the presence of each of the ten strings and the
+    /// four non-string members verbatim. Presence is the diagnostic that
+    /// actually gets used when porting this module -- *which parts did the
+    /// parse populate* -- and it is also all that can be emitted safely.
+    /// Length is deliberately withheld even for the parts that are not
+    /// credentials: a password's length is an attribute of the password,
+    /// and offering it here for `scheme` but not for `password` would put
+    /// a per-field judgment call in the formatter, where the next member
+    /// added would silently inherit whichever branch it landed in. One
+    /// rule for all ten leaves nothing to decide.
+    ///
+    /// The four remaining members disclose nothing. `portnum` is the parsed
+    /// form of a port that is already public in the URL, and the three
+    /// flags are parser state: `lib/urlapi.c:L79-L81`.
+    ///
+    /// [`CBuf`]'s own `Debug` reports a length and no bytes, so formatting
+    /// one buffer on purpose still says something useful; this implementation
+    /// does not reach it, because a count of ten `Option`s formatted as
+    /// `"set"` or `"unset"` is smaller and says exactly as much.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        /// Maps one owned string to a fixed word.
+        ///
+        /// A closure would be equivalent; a named helper keeps the ten call
+        /// sites below narrow enough to read as a table.
+        fn present(field: &Option<CBuf>) -> &'static str {
+            if field.is_some() {
+                "set"
+            } else {
+                "unset"
+            }
+        }
+
+        f.debug_struct("CurlUrl")
+            .field("scheme", &present(&self.scheme))
+            .field("user", &present(&self.user))
+            .field("password", &present(&self.password))
+            .field("options", &present(&self.options))
+            .field("host", &present(&self.host))
+            .field("zoneid", &present(&self.zoneid))
+            .field("port", &present(&self.port))
+            .field("path", &present(&self.path))
+            .field("query", &present(&self.query))
+            .field("fragment", &present(&self.fragment))
+            .field("portnum", &self.portnum)
+            .field("query_present", &self.query_present)
+            .field("fragment_present", &self.fragment_present)
+            .field("guessed_scheme", &self.guessed_scheme)
+            .finish()
+    }
+}
+
 impl Drop for CurlUrl {
     /// Releases the ten strings, as `curl_url_cleanup()` does.
     ///
@@ -980,9 +1042,10 @@ impl Drop for CurlUrl {
     /// matching recipe. The null guard at `L1295` also lives there, where
     /// the null can actually arrive.
     ///
-    /// Strings previously returned to C are not touched, because they are
-    /// no longer fields of this structure. `include/curl/urlapi.h:L116-L118`
-    /// promises exactly that.
+    /// Strings previously returned to C are not touched, because they were
+    /// never fields of this structure: `curl_url_get()` builds each one as
+    /// its own buffer and hands ownership straight to the caller.
+    /// `include/curl/urlapi.h:L116-L118` promises exactly that.
     fn drop(&mut self) {
         self.release_strings();
     }
@@ -1007,6 +1070,59 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::indexing_slicing)]
     #![allow(clippy::arithmetic_side_effects)]
+
+    /// Formatting a populated handle discloses no part content.
+    ///
+    /// The regression guard for the redacted [`CurlUrl`] formatter. A
+    /// derived `Debug` would print all ten strings, and `user`, `password`,
+    /// `options` and `query` are secrets: `lib/urlapi.c:L69-L71` and `L76`.
+    /// The assertion is deliberately over all ten rather than only the four,
+    /// because the formatter's rule is one rule for every string, and a
+    /// later member added to the structure has to inherit it.
+    #[test]
+    fn formatting_a_handle_discloses_no_part_content() {
+        let url = populated();
+        let text = format!("{url:?}");
+
+        for which in StringField::ALL {
+            let secret = core::str::from_utf8(sample(which)).unwrap();
+            assert!(!text.contains(secret), "{which} content leaked into {text}");
+        }
+        // The distinguishing tail of every sample value, checked once more
+        // on its own so that a formatter printing bytes without the
+        // "sample-" prefix could not slip past the loop above.
+        for tail in [
+            "scheme", "user", "password", "options", "host", "zoneid", "port", "path", "query",
+            "fragment",
+        ] {
+            assert!(
+                !text.contains(&format!("sample-{tail}")),
+                "{tail} content leaked into {text}"
+            );
+        }
+
+        // What it does say: the shape. Ten names, each answered with a
+        // fixed word, and the four non-string members verbatim.
+        for which in StringField::ALL {
+            assert!(text.contains(which.name()), "{which} name missing");
+        }
+        assert!(text.contains("set"), "presence missing");
+        assert!(text.contains("8080"), "portnum missing");
+        assert!(text.contains("query_present"), "query_present missing");
+        assert!(
+            text.contains("fragment_present"),
+            "fragment_present missing"
+        );
+        assert!(text.contains("guessed_scheme"), "guessed_scheme missing");
+
+        // A fresh handle reports the same fourteen members, all absent.
+        let fresh = format!("{:?}", CurlUrl::new());
+        assert!(fresh.contains("unset"), "absence missing");
+        assert!(!fresh.contains("sample-"), "fresh handle leaked");
+        for which in StringField::ALL {
+            assert!(fresh.contains(which.name()), "{which} name missing");
+        }
+    }
 
     // Imported by name rather than through a glob, which is the rule the
     // plan sets for the whole crate at 0.4.3.
@@ -1263,17 +1379,11 @@ mod tests {
     /// `lib/urlapi.c:L1310-L1332` copies the ten strings and exactly three
     /// scalars, `portnum` at `L1324`, `fragment_present` at `L1325` and
     /// `query_present` at `L1326`, and it does not copy the member declared
-    /// at `L81`. This port reproduces that, because the parity strategy
-    /// rests on the Rust build behaving identically to the C build, bugs
-    /// included: transformation rule `T6`, the user's direction at Agent
-    /// Action Plan 0.8.1, and catalogue entry `FB1` in
-    /// `docs/KNOWN-DIVERGENCES.md`, which carries the measurements from the
-    /// reference build.
-    ///
-    /// Read that catalogue entry before changing anything here. Removing
-    /// the divergence breaks acceptance criterion `A10` and makes the
-    /// parity diff disagree with the C implementation for any caller
-    /// passing `CURLU_NO_GUESS_SCHEME` to a duplicated handle.
+    /// at `L81`. Removing the divergence makes the parity diff disagree
+    /// with the C implementation for any caller passing
+    /// `CURLU_NO_GUESS_SCHEME` to a duplicated handle. Read the `FB1` entry
+    /// in `docs/KNOWN-DIVERGENCES.md`, which carries the measurements from
+    /// the reference build, before changing anything here.
     #[test]
     fn fb1_duplication_does_not_copy_the_guessed_scheme_flag() {
         let mut original = CurlUrl::new();

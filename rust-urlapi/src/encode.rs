@@ -636,7 +636,7 @@ pub(crate) fn encode_part(
 ///
 /// # What to pass
 ///
-/// `DynBuf::as_mut_bytes_with_nul()`, and the whole buffer rather than just
+/// `DynBuf::content_mut()`, and the whole buffer rather than just
 /// the value that was appended. C takes the pointer from the start of the
 /// buffer at L1921, so the walk covers a leading `/` the path setter added at
 /// L1883 as well as the value itself. Passing a narrower slice would be a
@@ -762,7 +762,12 @@ pub(crate) fn add_preencoded(enc: &mut DynBuf, part: &[u8]) -> CURLUcode {
 
     // L1921-L1932. The terminator-inclusive view, and the whole buffer rather
     // than the appended tail, because L1921 takes the pointer from the start.
-    lowercase_escapes(enc.as_mut_bytes_with_nul());
+    // The view is a guard: whatever this pass does, the buffer is terminated
+    // again when the borrow ends.
+    {
+        let mut content = enc.content_mut();
+        lowercase_escapes(&mut content);
+    }
 
     CURLUE_OK
 }

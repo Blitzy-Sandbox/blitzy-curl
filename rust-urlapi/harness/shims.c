@@ -33,13 +33,46 @@
    %s, %d and %u, measured at 34, 28 and 16 uses with no length modifiers
    and no positional arguments, which is what makes forwarding to the C
    library byte-exact here. The single divergence is curl_msnprintf's
-   return value, described where it is defined. Reported constraint R3:
-   this harness carries no memory debugging, so the allocation ceiling at
-   tests/data/test1560:L40 is honored in spirit and not counted by curl's
-   own accounting. The whole chain is in ../docs/MEMORY-OWNERSHIP.md. */
+   return value, described where it is defined. This harness also carries no
+   memory debugging, so curl's allocation counter does not run and the
+   ceiling at tests/data/test1560:L40 is not measured in this
+   configuration; the whole chain is recorded under "Reported limitation
+   R3" in ../docs/MEMORY-OWNERSHIP.md. */
 
+/* first.h reaches <stdio.h> at its L64 and <stdlib.h> at L65, but this file
+   names vprintf, vfprintf, vsnprintf and free directly, so it asks for
+   their headers directly too rather than relying on a transitive include
+   that a later edit to first.h could take away. scripts/checksrc.pl
+   reports a repeated include as INCLUDEDUP only within one file, so
+   restating them here costs nothing. */
 #include "first.h"
 #include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* vsnprintf, used below, is not in C90 at all: C90 declares only vsprintf
+   and vfprintf, and it was C99 that added both the function and the
+   truncation rule this file relies on for byte-exact agreement with
+   lib/mprintf.c. Compiled as C90 the call would therefore reach an
+   implicit declaration -- assumed to return int, taking unchecked
+   arguments -- which on a platform where the symbol happens to exist would
+   link and silently misbehave, and which C99 made a constraint violation
+   anyway. So the requirement is stated and checked instead of assumed.
+
+   Two spellings satisfy it. __STDC_VERSION__ >= 199901L is the portable
+   one. MSVC is the documented exception: it gained a conforming vsnprintf
+   in Visual Studio 2015, _MSC_VER 1900, yet defines __STDC_VERSION__ only
+   when /std:c11 or later is passed, so testing the standard macro alone
+   would reject a compiler that is in fact fine. Windows is not validated
+   here, per the porting plan, which is exactly why the arm is written to
+   admit it rather than to exclude it silently. */
+#if !(defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)) && \
+    !(defined(_MSC_VER) && (_MSC_VER >= 1900))
+#error "shims.c requires C99 or later: vsnprintf and its truncation rule \
+are C99 features, and a C90 compilation would reach an implicit \
+declaration instead. Compile this harness with -std=c99 or later (or, on \
+MSVC, with Visual Studio 2015 or newer)."
+#endif
 
 /* Guard the translation unit so a mistaken link fails loudly here, at
    compile time, rather than quietly duplicating symbols at link time or
@@ -55,6 +88,45 @@ drop-in (Mode A) link resolves curl_m*printf from libcurl's own \
 mprintf.c object, so compiling this file there duplicates those \
 symbols. Either define HARNESS_MODE_B or drop this file from the Mode A \
 source list."
+#endif
+
+/* THE REQUIRED C STANDARD FOR THIS FILE IS C99, AND ONLY FOR THIS FILE.
+   docs/INTERNALS.md:15 states that curl and libcurl are written to compile
+   with C89 compilers, and this harness holds to that everywhere it can:
+   first.h, runner.c and main.c compile with zero diagnostics at both
+   -std=c89 and -std=c99 with -Wall -Wextra -pedantic. This file is the one
+   exception, and the reason is one function. curl_mvsnprintf below forwards
+   to vsnprintf, which C99 added to <stdio.h> and C89 does not declare at
+   all, so under strict C89 the call gets an implicit int declaration and the
+   behavior is undefined -- a silent miscompile of the one shim whose whole
+   job is to be bound-correct.
+
+   Declared as a hard error rather than left to prose, because prose in a
+   comment cannot stop a build. The test is narrow on purpose and accepts
+   every configuration that actually works:
+
+     -std=c89     __STRICT_ANSI__ defined, __STDC_VERSION__ undefined
+                  => rejected here, which is the case that would otherwise
+                  be undefined behavior.
+     -std=gnu89   __STRICT_ANSI__ NOT defined, so glibc still declares
+                  vsnprintf through _DEFAULT_SOURCE => accepted, and it
+                  compiles clean. Measured, not assumed.
+     -std=c99 and later, and the compiler default => accepted.
+
+   The requirement also belongs on the command line that compiles this file,
+   which is ../GNUmakefile's and ../scripts/'s to state; the guard is what
+   makes a build file that forgets it fail here instead of silently.
+
+   No C89 fallback is offered, and that is a decision. Bounded formatting
+   without vsnprintf means formatting into an oversized buffer with vsprintf
+   and hoping, which is precisely the unbounded-sprintf hazard the note below
+   the definitions declines to supply. A loud error beats a quiet overflow. */
+#if defined(__STRICT_ANSI__) && \
+  (!defined(__STDC_VERSION__) || (__STDC_VERSION__ < 199901L))
+#error "shims.c requires C99 or later, or a GNU dialect that still declares \
+vsnprintf. Compile this file with -std=c99 (or newer, or -std=gnu89): C89 \
+does not declare vsnprintf, and curl_mvsnprintf below would silently get an \
+implicit int declaration."
 #endif
 
 /* curl_mprintf writes to stdout and curl_mfprintf honors whatever FILE *
@@ -112,7 +184,10 @@ int curl_mfprintf(FILE *fd, const char *format, ...)
    enough. The two answers agree unless the output was truncated. No call
    site in tests/libtest/lib1560.c can observe the difference: L71 and L74
    measure the result with strlen at L76, and L1940 discards the value
-   outright. Also carried in ../docs/KNOWN-DIVERGENCES.md. */
+   outright. Recorded in ../docs/KNOWN-DIVERGENCES.md under "the harness
+   shim's `snprintf` return value", which also states that this applies to
+   the standalone link alone: the drop-in link brings its own
+   lib/mprintf.c. */
 
 int curl_mvsnprintf(char *buffer, size_t maxlength, const char *format,
                     va_list args)
@@ -168,8 +243,9 @@ int curl_msnprintf(char *buffer, size_t maxlength, const char *format, ...)
    straight from the C allocator: the tracking arm would reject them or
    account for them wrongly, and the hook arm would mean importing a
    libcurl-private symbol and still not satisfying the tracking table.
-   That is constraint R3, reported here and deliberately not worked
-   around; the full ownership chain is in ../docs/MEMORY-OWNERSHIP.md. */
+   That limitation is reported here and deliberately not worked around; the
+   full ownership chain is recorded under "Reported limitation R3" in
+   ../docs/MEMORY-OWNERSHIP.md. */
 #ifdef HARNESS_SHIM_CURL_FREE
 void curl_free(void *p)
 {

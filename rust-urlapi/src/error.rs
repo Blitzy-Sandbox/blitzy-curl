@@ -15,7 +15,7 @@
 //! - the identical conversion written twice, inside `host_decode` at
 //!   `lib/urlapi.c:L1338-L1344` and inside `host_encode` at L1349-L1355,
 //!   folds a `CURLcode` returned by the IDN helpers. Ported as [`idn2cu`],
-//!   which the Agent Action Plan assigns to this module in 0.3.3.
+//!   gathered here rather than duplicated at its two call sites.
 //! - `curl_url_strerror`, `lib/strerror.c:L420-L531`, turns a `CURLUcode`
 //!   into a human readable string. Ported as [`strerror_bytes`] with the two
 //!   views [`strerror_cstr`] and [`strerror`], and the alternative arm as
@@ -41,22 +41,22 @@
 //!
 //! In C this costs nothing, because a `switch` selects by label rather than
 //! by position. A port that transcribes the strings into an array and then
-//! indexes it by the code silently mis-maps eleven of them, and eleven wrong
-//! error messages is exactly the kind of defect that survives a test suite
-//! which only checks return codes. The mapping below is therefore an
-//! explicit `match` keyed on the code, with every arm carrying the ordinal
-//! and the `lib/strerror.c` line it came from, written in the C file's own
-//! order so that the two can be read side by side.
+//! indexes it by the code silently maps eleven of them to the wrong string,
+//! and eleven wrong error messages is exactly the kind of defect that
+//! survives a test suite which only checks return codes. The mapping below
+//! is therefore an explicit `match` keyed on the code, with every arm
+//! carrying the ordinal and the `lib/strerror.c` line it came from, written
+//! in the C file's own order so that the two can be read side by side.
 //!
 //! # The strings are quoted, not written
 //!
 //! Every message is copied byte for byte from `lib/strerror.c`, including
 //! the subject-verb disagreement in the message for `CURLUE_USER_NOT_ALLOWED`
-//! at L449. Transformation rule T6 of the Agent Action Plan, faithful over
-//! correct, applies to observable output as much as to behaviour: the demo
-//! program's standard output is compared byte for byte against the same
-//! program linked against the C implementation, so a grammatical improvement
-//! here is a parity failure. Nothing in this file may be paraphrased.
+//! at L449. Faithful beats correct for observable output as much as for
+//! behaviour: the demo program's standard output is compared byte for byte
+//! against the same program linked against the C implementation, so a
+//! grammatical improvement here is a parity failure. Nothing in this file
+//! may be paraphrased.
 //!
 //! # Nothing here allocates
 //!
@@ -73,10 +73,9 @@
 //!
 //! That is also why the literals are `&'static [u8]` ending in an explicit
 //! NUL rather than `CStr` constants: the crate targets Rust 1.75 per
-//! `rust-urlapi/Cargo.toml`, C string literals arrived in 1.77, and the
-//! const constructor for `CStr` yields a `Result` that could only be
-//! unwrapped, which the crate's lint policy forbids. `src/abi.rs` resolves
-//! the same problem the same way for `DEFAULT_SCHEME_CSTR`.
+//! `rust-urlapi/Cargo.toml`, and C string literals, `c"No error"`, arrived
+//! in 1.77. `src/abi.rs` resolves the same problem the same way for
+//! `DEFAULT_SCHEME_CSTR`.
 //!
 //! # Which arm is exported, and why that is a feature and not a `#cfg`
 //!
@@ -89,7 +88,7 @@
 //! [`strerror`], the verbose form, because that is what an ordinary libcurl
 //! build produces and what the parity oracles compare against. The
 //! non-verbose form exists so that the `#else` branch is ported rather than
-//! dropped, and is available to any consumer that wants the small form.
+//! dropped; it is `pub(crate)`, so only this crate reaches it.
 //!
 //! The `strerror` feature is a different question again. It governs whether
 //! `src/ffi.rs` *exports* the symbol, because `curl_url_strerror` is not
@@ -102,8 +101,11 @@
 //!
 //! # No `unsafe`, no panic, no dependency
 //!
-//! All `unsafe` in this crate is confined to `src/ffi.rs`; there is none
-//! here. Nothing below can panic: there is no indexing, no arithmetic, no
+//! This module contains no `unsafe`. The crate confines every `unsafe` block
+//! to `src/ffi.rs`, and every other module carries `#![forbid(unsafe_code)]`,
+//! so the boundary is a compiler guarantee rather than a convention;
+//! `docs/MEMORY-OWNERSHIP.md` holds the inventory.
+//! Nothing below can panic: there is no indexing, no arithmetic, no
 //! `unwrap` and no `expect`, and the one fallible call, the `CStr`
 //! validation in [`as_cstr`], handles its error arm by returning the empty C
 //! string. The module needs neither `libc` nor `src/alloc.rs`, and depends
@@ -119,7 +121,23 @@
 // its reason. It is scoped to this module and to this lint alone, and it is
 // preferred over mirroring `#[cfg(feature = "strerror")]` here because the
 // table has to remain visible to `cargo test` in every configuration.
+//
+// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
+// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
+// checkpoint that creates src/getset.rs, and replaced there by one crate-level
+// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
+// src/getset.rs exist, most of this crate has no consumer, and a crate held to
+// zero warnings cannot build clean without this. Scoped to this module and to
+// this lint alone.
 #![allow(dead_code)]
+// The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
+// technical specification forbids `unsafe` outside FFI code (1.3.2.1).
+// `forbid` rather than `deny` because an inner `allow` here would be a
+// design change and should have to be argued for, not slipped in. This
+// module needs nothing from C, so the attribute costs it nothing and turns
+// the crate's single-unsafe-island property into a compiler guarantee
+// instead of a convention.
+#![forbid(unsafe_code)]
 
 use core::ffi::{c_char, c_int, CStr};
 
@@ -236,9 +254,8 @@ impl CURLcode {
 /// out-of-memory report. So does `CURLcode::CURLE_NOT_BUILT_IN`. So, and
 /// this is the one worth stating out loud, does `CURLcode::CURLE_OK`.
 ///
-/// That is not a defect in the port and it must not be repaired. The C macro
-/// behaves this way and transformation rule T6 of the Agent Action Plan,
-/// faithful over correct, requires reproducing it. Anyone tempted to add
+/// That is not a defect in the port and it must not be repaired: the C macro
+/// behaves this way, and reproducing it is the point. Anyone tempted to add
 /// arms should look at the call sites first, because they explain why the
 /// original gets away with it: all eight of them, `lib/urlapi.c:L170`, L598,
 /// L623, L893, L1885, L1905, L1912 and L1920, fold the result of a
@@ -288,9 +305,9 @@ pub(crate) const fn cc2cu(code: CURLcode) -> CURLUcode {
 /// ```
 ///
 /// and `host_encode` at L1349-L1355, which differs only in calling
-/// `Curl_idn_encode`. The Agent Action Plan places the mapping here, in
-/// 0.3.3, so that all numeric translation is auditable in one file; the
-/// libidn2 call sequence it applies to stays in `src/idn.rs`.
+/// `Curl_idn_encode`. The mapping lives here so that all numeric
+/// translation is auditable in one file; the libidn2 call sequence it
+/// applies to stays in `src/idn.rs`.
 ///
 /// # Why this one is total where [`cc2cu`] is lossy
 ///
@@ -367,7 +384,7 @@ pub(crate) const fn strerror_bytes(code: CURLUcode) -> &'static [u8] {
         // 7, lib/strerror.c:L446.
         CURLUE_OUT_OF_MEMORY => b"A memory function failed\0",
         // 8, lib/strerror.c:L449. The subject-verb disagreement is the
-        // original's. Rule T6: this is compared byte for byte.
+        // original's and is kept: this string is compared byte for byte.
         CURLUE_USER_NOT_ALLOWED => b"Credentials was passed in the URL when prohibited\0",
         // 9, lib/strerror.c:L452.
         CURLUE_UNKNOWN_PART => b"An unknown part ID was passed to a URL API function\0",
@@ -457,21 +474,6 @@ pub(crate) fn strerror_cstr(code: CURLUcode) -> &'static CStr {
 /// `curl_free()`. This is the one string-returning path of the whole API
 /// that does not come from `src/alloc.rs`; see this module's documentation
 /// for why that exception is the correct behaviour rather than an oversight.
-///
-/// # Known divergence FB5
-///
-/// The declaration this backs, `include/curl/urlapi.h:L149`, is
-/// `CURL_EXTERN const char *curl_url_strerror(CURLUcode);` with **no name on
-/// the parameter**, while its manual page names one,
-/// `docs/libcurl/curl_url_strerror.md:L28`, and every other declaration in
-/// that header names its parameters. The mismatch is cosmetic and changes no
-/// behaviour, but it constrains a deliverable: the generated mirror header
-/// `rust-urlapi/include/curl_urlapi_rs.h` has to leave the parameter unnamed
-/// as well rather than improve on the original, and a generator left to
-/// itself emits a name. Nothing in this file changes because of FB5; the
-/// note is here so that the constraint is visible from the code side too.
-/// It is catalogued with the other five findings in
-/// `rust-urlapi/docs/KNOWN-DIVERGENCES.md`.
 #[must_use]
 pub(crate) const fn strerror(code: CURLUcode) -> *const c_char {
     // No cast of provenance and no allocation: the pointer is the address of
@@ -504,10 +506,10 @@ pub(crate) const fn strerror(code: CURLUcode) -> *const c_char {
 /// in this crate selects it: `src/ffi.rs` exports [`strerror`], the verbose
 /// form, because that is what an ordinary libcurl build produces and what
 /// the parity oracles compare against, and a `verbose` Cargo feature may not
-/// be invented because `rust-urlapi/Cargo.toml` fixes the feature set. A
-/// consumer that wants the small form can call this instead; a consumer that
-/// wants it *exported* would have to say so, and that is a decision outside
-/// this crate.
+/// be invented because `rust-urlapi/Cargo.toml` fixes the feature set. Being
+/// `pub(crate)`, this form is reachable only from inside the crate -- the
+/// tests below drive it. Exporting it would need a new entry point in
+/// `src/ffi.rs`, which is a decision outside this crate.
 #[must_use]
 pub(crate) const fn strerror_nonverbose_bytes(code: CURLUcode) -> &'static [u8] {
     if code == CURLUE_OK {

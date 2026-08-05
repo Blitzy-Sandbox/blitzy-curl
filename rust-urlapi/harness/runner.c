@@ -41,11 +41,13 @@
 
 #include "first.h"
 
-/* Preprocessor parity, implicit requirement I10 of the porting plan. The
-   test source compiles a different set of assertions depending on three
-   macros, so the reference compilation and the Rust compilation have to be
-   handed an identical set; otherwise the byte-for-byte diff of their output
-   compares two different suites and proves nothing.
+/* Preprocessor parity. tests/libtest/lib1560.c compiles a different set of
+   assertions depending on three macros -- USE_LIBIDN2 at its L34-L36,
+   CURL_DISABLE_WEBSOCKETS at L295 and _WIN32 at L361 -- so the reference
+   compilation and the Rust compilation have to be handed an identical set;
+   otherwise the byte-for-byte diff of their output compares two different
+   suites and proves nothing. The build owns all three, and each is spelled
+   out below.
 
    USE_LIBIDN2: tests/libtest/lib1560.c:L34-L36 folds it, USE_WIN32_IDN and
    USE_APPLE_IDN into USE_IDN, the same disjunction libcurl itself uses at
@@ -64,10 +66,11 @@
    touched here; the platform decides it.
 
    Not defined here either, and not by ./first.h: CURLDEBUG, DEBUGBUILD,
-   CURL_MEMDEBUG, BUILDING_LIBCURL. Reported constraint R3 -- the crate takes
-   the buffers it hands to C from the C allocator, which curl's tracking free
-   would reject, so curl_free() has to resolve to plain free(). The whole
-   resolution chain is in ../docs/MEMORY-OWNERSHIP.md. */
+   CURL_MEMDEBUG, BUILDING_LIBCURL. The crate takes the buffers it hands to
+   C from the C allocator, which curl's tracking free would reject, so
+   curl_free() has to resolve to plain free(). The whole resolution chain,
+   and the consequence that curl's allocation counter does not run here, are
+   recorded under "Reported limitation R3" in ../docs/MEMORY-OWNERSHIP.md. */
 
 /* The build also names the staged test source. run-parity.sh materialises a
    staging directory under the ignored rust-urlapi/build/ tree holding a

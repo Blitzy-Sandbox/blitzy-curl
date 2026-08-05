@@ -56,6 +56,30 @@
 //! defines exactly 33 plus 11 plus 16 ABI constants, the four supporting
 //! constants, one companion spelling of `DEFAULT_SCHEME`, and no more.
 
+// Reachability here is decided entirely by the consumers. This module is the
+// crate's foundation and depends on nothing, so every constant in it is dead
+// until a sibling reads it; the 33 result codes and the 11 part identifiers
+// are read by `src/ffi.rs` and `src/getset.rs` in particular. Measured: with
+// `src/lib.rs` declaring `mod abi;` privately, as the plan's module tree at
+// AAP 0.4.3 does, this module alone accounts for 32 dead-code warnings.
+//
+// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
+// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
+// checkpoint that creates src/getset.rs, and replaced there by one crate-level
+// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
+// src/getset.rs exist, most of this crate has no consumer, and a crate held to
+// zero warnings cannot build clean without this. Scoped to this module and to
+// this lint alone.
+#![allow(dead_code)]
+// The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
+// technical specification forbids `unsafe` outside FFI code (1.3.2.1).
+// `forbid` rather than `deny` because an inner `allow` here would be a
+// design change and should have to be argued for, not slipped in. This
+// module needs nothing from C, so the attribute costs it nothing and turns
+// the crate's single-unsafe-island property into a compiler guarantee
+// instead of a convention.
+#![forbid(unsafe_code)]
+
 /// Result type of the URL API, `CURLUcode`.
 ///
 /// Declared at `include/curl/urlapi.h`:L34-L68 as an anonymous
@@ -347,9 +371,14 @@ pub const CURLU_ALLOW_SPACE: ::core::ffi::c_uint = 1 << 11;
 
 /// Get the host name in punycode.
 ///
-/// `include/curl/urlapi.h`:L100. Mutually exclusive with `CURLU_PUNY2IDN`
-/// and with `CURLU_URLENCODE`, which share one conditional chain at
-/// `lib/urlapi.c`:L1392-L1420.
+/// `include/curl/urlapi.h`:L100. This bit, `CURLU_PUNY2IDN` and
+/// `CURLU_URLENCODE` share one `if` / `else if` chain at
+/// `lib/urlapi.c`:L1392-L1420, so combining them is accepted rather than
+/// rejected and the chain decides by precedence: `CURLU_URLENCODE` first at
+/// L1392, then this bit at L1401, then `CURLU_PUNY2IDN` at L1411. Passing
+/// both punycode bits therefore converts one way only, and passing
+/// `CURLU_URLENCODE` alongside either suppresses both conversions with no
+/// error reported.
 pub const CURLU_PUNYCODE: ::core::ffi::c_uint = 1 << 12;
 
 /// Convert a punycode host name back to its internationalised form.
@@ -381,6 +410,27 @@ pub const CURLU_NO_GUESS_SCHEME: ::core::ffi::c_uint = 1 << 15;
 // include/curl/urlapi.h. The fifth, DEFAULT_SCHEME_CSTR, is not a separate
 // value at all: it is a second spelling of DEFAULT_SCHEME for the one caller
 // that needs the terminated form.
+//
+// NONE OF THESE FIVE BELONGS IN THE PUBLIC MIRROR HEADER, and the mechanism
+// that keeps them out is not in this file. include/curl/urlapi.h declares no
+// such constant, so a header that mirrors it must not either. But cbindgen
+// sees any item declared `pub` at its definition site, and rust-urlapi/
+// cbindgen.toml lists "constants" in item_types for the sake of the sixteen
+// CURLU_* flag bits, so MAX_SCHEME_LEN, CURL_MAX_INPUT_LENGTH and
+// PROTOPT_URLOPTIONS would otherwise be emitted -- MAX_SCHEME_LEN
+// unprefixed, occupying a global macro name in every consumer. They are
+// therefore named in that file's [export] exclude list, which is where the
+// header's surface is decided. DEFAULT_SCHEME and DEFAULT_SCHEME_CSTR need
+// no entry: a &str and a &[u8] have no C representation and cbindgen skips
+// them of its own accord.
+//
+// Narrowing the three to pub(crate) would also keep them out, and is
+// deliberately NOT what was done. src/ffi.rs and src/getset.rs are
+// cross-module consumers of all three, so "what may the crate reach" and
+// "what may the header declare" are different questions; answering the
+// second by constraining the first would couple them for no gain and would
+// have to be undone the moment a fourth consumer appeared. The visibility
+// below is the one the crate needs; cbindgen.toml is the export contract.
 // ---------------------------------------------------------------------------
 
 /// Longest scheme the implementation accepts, in bytes.
@@ -417,10 +467,9 @@ pub const DEFAULT_SCHEME: &str = "https";
 /// this one exists so that no caller has to build the terminated form by
 /// hand and risk the two drifting apart.
 ///
-/// A byte string rather than a `CStr` because the crate targets Rust 1.75:
-/// C string literals arrived in 1.77, and the const constructor for `CStr`
-/// returns a `Result` that could only be unwrapped, which the crate's lint
-/// policy forbids. `as_ptr` on this slice yields the required pointer.
+/// A byte string rather than a `CStr` because the crate targets Rust 1.75
+/// and C string literals, `c"https"`, arrived in 1.77. `as_ptr` on this
+/// slice yields the required pointer with no conversion at all.
 pub const DEFAULT_SCHEME_CSTR: &[u8] = b"https\0";
 
 /// Ceiling on any string accepted by the URL API, in bytes.
