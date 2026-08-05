@@ -1660,6 +1660,15 @@ mod tests {
     /// arrives through a public entry point of the URL API can reach it,
     /// because `Curl_junkscan()` has already capped the input at
     /// `CURL_MAX_INPUT_LENGTH`.
+    ///
+    /// Clippy releases up to and including 1.75, the crate's declared minimum,
+    /// report a constant assertion as optimized out even in a `const` item,
+    /// where it is the opposite of what happens: the expression is evaluated at
+    /// compile time and nothing survives to optimize. Later releases exempt
+    /// const contexts. The allow is therefore a compatibility allow with the
+    /// declared floor, spelled the same way `src/inet.rs`, `src/ffi.rs` and
+    /// `src/parse/ipv6.rs` spell theirs, and not a suppressed finding.
+    #[allow(clippy::assertions_on_constants)]
     const CEILING_IS_ABOVE_THE_URL_API_LIMIT: () =
         assert!(MAX_ESCAPE_INPUT > CURL_MAX_INPUT_LENGTH);
 
