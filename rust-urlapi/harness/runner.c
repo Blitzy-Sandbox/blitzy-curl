@@ -67,15 +67,21 @@
 
    Not defined here either, and not by ./first.h: CURLDEBUG, DEBUGBUILD,
    CURL_MEMDEBUG, BUILDING_LIBCURL. The crate takes the buffers it hands to
-   C from the C allocator, which curl's tracking free would reject, so
-   curl_free() has to resolve to plain free(). The whole resolution chain,
-   and the consequence that curl's allocation counter does not run here, are
-   recorded under "Reported limitation R3" in ../docs/MEMORY-OWNERSHIP.md. */
+   C from the C allocator, and curl_free() releases them correctly in both
+   supported link modes -- through plain free() standalone, and through
+   Curl_cfree at its default free callback (lib/easy.c:L107) in a drop-in
+   link. What must be avoided is curl's tracking free, which validates
+   pointers against its own table and would reject them; leaving
+   CURL_MEMDEBUG and its companions undefined is what avoids it. The whole
+   resolution chain, the one other unsupported case -- an application that
+   substitutes its own allocators -- and the consequence that curl's
+   allocation counter does not run here are recorded under "Reported
+   limitation R3" in ../docs/MEMORY-OWNERSHIP.md. */
 
-/* The build also names the staged test source. run-parity.sh materialises a
-   staging directory under the ignored rust-urlapi/build/ tree holding a
-   symlink lib1560.c -> tests/libtest/lib1560.c beside a copy of ./first.h,
-   then compiles this file with
+/* The build also names the staged test source. The arrangement it is built
+   for is a staging directory under the ignored rust-urlapi/build/ tree
+   holding a symlink lib1560.c -> tests/libtest/lib1560.c beside a copy of
+   ./first.h, with this file then compiled as
 
      -DHARNESS_TEST_SOURCE='"lib1560.c"' -I <stage> -I include
 
@@ -87,6 +93,12 @@
    against <stage>/ and finds the shim, never the real 574-line
    tests/libtest/first.h, which would pull in libcurl's private build
    environment at its L33 and L46. Nothing under tests/ is edited.
+
+   rust-urlapi/scripts/run-parity.sh is the deliverable that is to create
+   that staging directory and issue those compilations. It does not exist
+   yet, so for now the directory is staged and the compiler invoked by hand,
+   and nothing here should be read as a claim that the script has run. The
+   mechanics above are what either caller relies on.
 
    Naming the source from the build instead of hard-coding a relative path
    lets one file serve the reference staging directory and the Rust one, and
@@ -110,9 +122,12 @@
 
    The result is passed back untouched. tests/libtest/lib1560.c:L2040-L2071
    short-circuits at the first failing sub-test and returns a code naming it,
-   in an order that is not the numeric one, so run-parity.sh can map the code
-   back to the sub-test and iterate until clean. Clamping it into the range a
-   shell can carry belongs to main.c, mirroring tests/libtest/first.c:L289. */
+   in an order that is not the numeric one. Passing it through unaltered is
+   what lets a caller map the code back to the sub-test and iterate until
+   clean; rust-urlapi/scripts/run-parity.sh is to be that caller and does not
+   exist yet, so today the mapping is read off the table in
+   ../docs/PORTING-NOTES.md by hand. Clamping the code into the range a shell
+   can carry belongs to main.c, mirroring tests/libtest/first.c:L289. */
 CURLcode harness_run_test(const char *URL)
 {
   return test_lib1560(URL);

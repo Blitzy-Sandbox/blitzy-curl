@@ -67,9 +67,24 @@
 //! | `scheme-table` | on | Compile a scheme table into the crate |
 //! | `idn-libidn2` | on | Bind libidn2 directly, as `lib/idn.c` does |
 //! | `idn-pure` | off | Use the `idna` crate instead, outside the parity claim |
-//! | `genheader` | off | Generate the mirror header from `build.rs` |
+//! | `genheader` | off | Check the mirror header against the crate's ABI |
 //!
-//! Exactly two configurations are built and validated.
+//! `genheader` is a check, which its name understates. It never rewrites
+//! `include/curl_urlapi_rs.h`. `build.rs` generates a second mirror with
+//! cbindgen's library API into `OUT_DIR`, reduces both that file and the
+//! committed one to an ABI projection -- constant name and value pairs,
+//! function signatures with parameter names dropped, typedef names -- and
+//! warns on any difference between the two. The projection is blind to
+//! comments, layout, declaration order, parameter names and the
+//! enum-versus-macro spelling of a constant, which is what makes it an ABI
+//! check rather than a diff: the two files are never byte-equal and are not
+//! meant to be, and `cbindgen.toml` records the shape differences that
+//! account for it.
+//!
+//! Exactly two configurations are intended to be built and validated, and the
+//! validation half is the parity workflow that `rust-urlapi/scripts/` is to
+//! carry. Those scripts are a later deliverable and do not exist yet, so what
+//! follows describes the two link modes rather than reporting a run of them.
 //!
 //! ```text
 //! cargo build --release --no-default-features --features idn-libidn2
@@ -193,10 +208,12 @@
 //!
 //! [`abi`] therefore writes all 60 values out as explicit integer constants
 //! rather than as a Rust `enum`, whose discriminants would be exactly as
-//! implicit as C's, and the values are then checked twice. The assertion block
-//! at the bottom of this file re-checks every one at compile time;
-//! `rust-urlapi/tests/abi_constants.rs` re-checks the same set at run time. An
-//! edit that reorders a constant fails the build rather than the parity run.
+//! implicit as C's. The assertion block at the bottom of this file re-checks
+//! every one of them at compile time, so an edit that reorders a constant
+//! fails the build rather than the parity run. A second, run-time check of the
+//! same set is to live in `rust-urlapi/tests/abi_constants.rs`; that file is a
+//! later deliverable and does not exist yet, so the compile-time block is the
+//! whole of the verification today.
 //!
 //! # Faithfully reproduced findings
 //!
@@ -205,14 +222,42 @@
 //! divergence. `docs/KNOWN-DIVERGENCES.md` gives each in full, with the C lines
 //! and the observable consequence.
 //!
-//! | Finding | What it is | Reproduced in |
-//! |---------|------------|---------------|
-//! | `FB1` | Handle duplication drops the guessed-scheme flag | `src/handle.rs` |
-//! | `FB2` | The credential exit path nulls three fields without freeing them | `src/parse/authority.rs` |
-//! | `FB3` | The zone identifier is stored over an existing value and never cleared | `src/parse/ipv6.rs` |
-//! | `FB4` | A colon with no digits after it is accepted, if a scheme is present | `src/parse/port.rs` |
-//! | `FB5` | One declaration in the public header names no parameter | `include/curl_urlapi_rs.h` |
-//! | `FB6` | Two writes land one byte past the logical length | `src/parse/ipv6.rs` over `src/dynbuf.rs` |
+//! "Reproduced" below means *reproduced in the behaviour the API can observe*.
+//! Two of the six findings are leaks as well as behaviours, and a leak is not
+//! API-visible: no sequence of `curl_url_get()` and `curl_url_dup()` calls can
+//! tell a leaked buffer from a released one. The `Effect` column therefore
+//! separates the two.
+//!
+//! | Finding | What it is | Effect | Carried by |
+//! |---------|------------|--------|------------|
+//! | `FB1` | Handle duplication drops the guessed-scheme flag | Reproduced entire | `src/handle.rs` |
+//! | `FB2` | The credential exit path nulls three fields without freeing them | The three parts read back absent; the leak is **not** reproduced | `src/parse/authority.rs` |
+//! | `FB3` | The zone identifier is stored over an existing value and never cleared | The stale zone stays readable; the leak is **not** reproduced | `src/parse/ipv6.rs` |
+//! | `FB4` | A colon with no digits after it is accepted, if a scheme is present | Reproduced entire | `src/parse/port.rs` |
+//! | `FB5` | One declaration in the public header names no parameter | Reproduced entire | `include/curl_urlapi_rs.h` |
+//! | `FB6` | Two writes land one byte past the logical length | Reproduced entire | `src/parse/ipv6.rs` over `src/dynbuf.rs` |
+//!
+//! The two leaks are omitted rather than overlooked. `Drop` on the owned
+//! buffer releases the displaced value on the path where the C abandons it,
+//! and reinstating the leak would mean suppressing `Drop` deliberately. The
+//! divergence document records both omissions under `FB2` and `FB3`.
+//!
+//! `FB2` and `FB3` need one qualification, because in the C each is a leak as
+//! well as a behaviour and only the behaviour is reproduced here. The C
+//! overwrites a pointer it still owns: `parse_hostname_login`'s shared exit
+//! label nulls `user`, `password` and `options` at `lib/urlapi.c` L328-L330
+//! without releasing them, and the bracketed-address stage assigns `zoneid` at
+//! L418 over whatever was there. What a caller can observe through the public
+//! API -- three parts reading as absent, and a stale zone identifier that
+//! survives a host replacement -- is reproduced exactly.
+//!
+//! The leaks are not, and cannot be without writing worse Rust than the port
+//! needs: `CurlUrl::clear` assigns `None` and `CurlUrl::store` assigns
+//! `Some(..)` over the field, and either way the displaced `CBuf` is dropped
+//! and its block released. A leak is invisible to the URL API, so this does
+//! not move any answer the parity diff compares; it is a real difference all
+//! the same and is recorded as such in `docs/KNOWN-DIVERGENCES.md` rather than
+//! filed under "reproduced".
 //!
 //! `FB1` is worth singling out, because it is observable through the public API
 //! and the upstream suite cannot catch it: the duplication sub-test of
@@ -240,9 +285,10 @@
 //! parity claim. This crate is not `no_std`: it allocates C-visible memory
 //! through `libc` but is an ordinary `std` crate otherwise.
 
-// DEAD-CODE POLICY. Stated once, here, for the whole crate.
+// DEAD-CODE POLICY. This crate-level allowance is the only one; no module
+// carries a copy.
 //
-// Which items this crate reaches depends on its feature set and its target.
+// Which items the crate reaches depends on its feature set and its target.
 // `src/scheme.rs` and `src/idn.rs` each compile one of several backends,
 // `src/error.rs` holds a message table that only the `strerror`-gated export
 // consults, `src/alloc.rs` and `src/dynbuf.rs` are deliberately complete
@@ -253,8 +299,9 @@
 // make every one of those tables invisible to `cargo test` in some
 // configuration.
 //
-// So the allowance is stated once, with its reason, rather than repeated per
-// module or decided by the feature matrix. It is scoped to this one lint.
+// One allowance here rather than one per module, because a per-module copy
+// says nothing the matrix above does not and drifts out of step with it. It
+// is scoped to this one lint.
 #![allow(dead_code)]
 // The panic denials the "Panic posture" section above explains. `deny` rather
 // than `forbid` so that a test module can relax one for its own assertions,
@@ -308,20 +355,24 @@
 //
 // `abi` is public because the ABI constants are not cross-module helpers.
 // They mirror the public C header and are part of what this crate promises,
-// and `rust-urlapi/tests/abi_constants.rs` is a Cargo integration test, which
-// links this crate as an external crate and can therefore name only `pub`
-// items. Its run-time half of the double verification is only reachable this
-// way. `ffi` is public because it is the facade.
+// and the planned `rust-urlapi/tests/abi_constants.rs` is a Cargo integration
+// test, which links this crate as an external crate and can therefore name
+// only `pub` items. That file does not exist yet, so the `pub` is currently
+// there for the run-time half of the verification to become possible rather
+// than because something already uses it. `ffi` is public because it is the
+// facade.
 //
 // Neither widens the C ABI, which is the reasonable first worry about a `pub
 // mod` in a crate whose export set is audited. A cdylib exposes symbols the
 // way an executable does: a plain `pub fn foo() {}` is not an exported symbol,
 // and only an annotated `#[no_mangle] pub extern "C" fn foo() {}` is. Rust
 // visibility and C linkage are separate mechanisms, so making a module `pub`
-// adds nothing to the symbol table and `rust-urlapi/scripts/check-abi.sh`
-// stays satisfied. `src/ffi.rs` demonstrates the same point from the other
-// side: every item it declares is `pub(crate)`, its exports included, and they
-// reach the symbol table purely by attribute.
+// adds nothing to the symbol table, which is a property any symbol-set check
+// over the archive will see -- `nm -g --defined-only` today, and
+// `rust-urlapi/scripts/check-abi.sh` once that script lands. `src/ffi.rs`
+// demonstrates the same point from the other side: every item it declares is
+// `pub(crate)`, its exports included, and they reach the symbol table purely
+// by attribute.
 pub mod abi;
 mod alloc;
 mod ctype;
@@ -401,6 +452,23 @@ const fn all_single_bit(flags: &[c_uint]) -> bool {
 /// assertions that follow them catch a systematic error a per-constant list
 /// cannot see: an entry deleted along with its assertion, an entry inserted, or
 /// a whole block shifted by one.
+///
+/// Clippy releases up to and including 1.75, the crate's declared minimum,
+/// report a constant assertion as `assert!(true)` that "will be optimized out
+/// by the compiler" even inside a `const` item, where it is the opposite of
+/// what happens: the expression is evaluated at compile time and nothing
+/// survives to optimize. Later releases exempt const contexts. Measured on the
+/// declared floor, every one of the assertions below is reported, so
+/// `cargo +1.75.0 clippy --locked --all-targets -- -D warnings` fails with 64
+/// errors for the lib target and 65 for the lib-test target without this
+/// allowance. It is therefore a compatibility allowance with the declared
+/// floor, spelled the same way `src/inet.rs`, `src/ffi.rs`, `src/encode.rs`
+/// and `src/parse/{file,ipv6}.rs` spell theirs, and not a suppressed finding:
+/// removing the assertions to satisfy the lint would delete the compile-time
+/// half of the ABI parity check that the crate documentation's "ABI parity is
+/// positional" section requires, and `rust-urlapi/tests/abi_constants.rs` is
+/// the run-time half rather than a substitute for it.
+#[allow(clippy::assertions_on_constants)]
 const _ABI_PARITY: () = {
     // The 33 `CURLUcode` values, `include/curl/urlapi.h` L34-L68. The header
     // carries the ordinal as a trailing comment for 1 through 31 but not for

@@ -5,7 +5,7 @@
 //! Part retrieval and part assignment: the module the observable behaviour
 //! lives in.
 //!
-//! The port of seven functions of `lib/urlapi.c`, in the order the C file
+//! The port of eight functions of `lib/urlapi.c`, in the order the C file
 //! declares them:
 //!
 //! | C function | C lines | Here |
@@ -47,9 +47,16 @@
 //!   depunyfication. Rewriting them as three independent tests changes the
 //!   answer for a caller that passes two of the flags at once.
 //! * **The default-port pair is an `if / else if`**, L1461-L1475 and again at
-//!   L1586-L1602, so injecting a default and suppressing a matching one are
-//!   alternatives. A caller passing both `CURLU_DEFAULT_PORT` and
-//!   `CURLU_NO_DEFAULT_PORT` sees the first branch only.
+//!   L1586-L1602, and what selects between the two arms is *whether a port is
+//!   stored*, not which flag the caller passed. The first arm is
+//!   `!port && CURLU_DEFAULT_PORT` and the second is `else if(port)` with the
+//!   `CURLU_NO_DEFAULT_PORT` test inside it, so for a caller passing **both**
+//!   flags the answer depends on the handle: with no stored port the default
+//!   is injected, with a stored port equal to the scheme's default it is
+//!   suppressed, and with a stored port that differs it is kept. Neither flag
+//!   has blanket precedence over the other. Collapsing the pair into two
+//!   independent tests, or reading it as "the first flag wins", gets two of
+//!   those three cases wrong.
 //! * **Host validation in [`url_set`] is an `else if` chained to the
 //!   append-query `if`**, L1936 and L1965, so a value that took the append
 //!   path is never host-checked. Unreachable in practice, because
@@ -384,8 +391,10 @@ fn schemebuf_render(buf: &mut [u8; SCHEMEBUF_LEN], scheme: &[u8]) -> usize {
 /// dereferences the pointer faults. Reachable through
 /// `curl_url_get(u, CURLUPART_QUERY, &p, CURLU_GET_EMPTY | CURLU_URLENCODE)`
 /// on a handle whose query is blank. `src/ffi.rs` reproduces it by leaving
-/// `*part` at the null it wrote at L1552 and returning success;
-/// `rust-urlapi/docs/KNOWN-DIVERGENCES.md` records it.
+/// `*part` at the null it wrote at L1552 and returning success, and its
+/// `curl_url_get` documents the same pair of successes from the C caller's
+/// side; `tests::an_empty_part_under_url_encoding_succeeds_with_no_buffer`
+/// pins it.
 ///
 /// # Errors
 ///
@@ -473,7 +482,6 @@ fn urlget_format(
         // needs no free of its own.
         drop(part);
         if uc != CURLUE_OK {
-            // L1397-L1398.
             return Err(uc);
         }
         // L1399. `into_cbuf` is `curlx_dyn_ptr`, null and all: see the Returns
@@ -489,7 +497,6 @@ fn urlget_format(
             let punyversion = host_decode(&part);
             // L1405, again before the code is inspected.
             drop(part);
-            // L1406-L1408.
             Some(punyversion?)
         }
     } else if depunyfy {
@@ -497,9 +504,7 @@ fn urlget_format(
         // punycode arm's.
         if is_ascii_name(u.host()) {
             let unpunified = host_encode(&part);
-            // L1415.
             drop(part);
-            // L1416-L1418.
             Some(unpunified?)
         } else {
             Some(part)
@@ -508,7 +513,6 @@ fn urlget_format(
         Some(part)
     };
 
-    // L1421-L1422.
     Ok(converted)
 }
 
@@ -555,7 +559,6 @@ fn urlget_url(u: &CurlUrl, flags: c_uint) -> Result<CBuf, CURLUcode> {
     // below; everything else here is read once.
     let mut options = u.options();
     let mut port = u.port();
-    // L1432-L1433.
     let show_fragment =
         u.fragment().is_some() || (u.fragment_present() && (flags & CURLU_GET_EMPTY) != 0);
     // L1434-L1435. Not the same shape as `show_fragment`: the query half
@@ -609,7 +612,6 @@ fn urlget_url(u: &CurlUrl, flags: c_uint) -> Result<CBuf, CURLUcode> {
         None => return Err(CURLUE_NO_SCHEME),
     };
 
-    // L1460.
     let h = scheme_lookup(scheme_terminated);
 
     // L1461-L1475. An `if / else if`, so injecting a default port and
@@ -684,12 +686,10 @@ fn urlget_url(u: &CurlUrl, flags: c_uint) -> Result<CBuf, CURLUcode> {
         // one only.
         Some(escaped.into_cbuf().ok_or(CURLUE_OUT_OF_MEMORY)?)
     } else if punycode {
-        // L1497-L1503.
         if is_ascii_name(u.host()) {
             None
         } else {
             match u.field(StringField::Host) {
-                // L1499-L1501.
                 Some(buf) => Some(host_decode(buf)?),
                 // Unreachable: `host` above came from this very field.
                 None => None,
@@ -699,7 +699,6 @@ fn urlget_url(u: &CurlUrl, flags: c_uint) -> Result<CBuf, CURLUcode> {
         // L1504-L1509, with the gate the other way round.
         if is_ascii_name(u.host()) {
             match u.field(StringField::Host) {
-                // L1506-L1508.
                 Some(buf) => Some(host_encode(buf)?),
                 None => None,
             }
@@ -736,7 +735,6 @@ fn urlget_url(u: &CurlUrl, flags: c_uint) -> Result<CBuf, CURLUcode> {
     // list read top to bottom, and it is the observable output of the port --
     // reorder a line and the parity diff fails.
     let template: [&[u8]; 15] = [
-        // L1518.
         scheme_prefix,
         // L1519-L1524, the userinfo: user, then `:` and password, then `;`
         // and options, then the `@` that only appears if any of the three did.
@@ -749,17 +747,14 @@ fn urlget_url(u: &CurlUrl, flags: c_uint) -> Result<CBuf, CURLUcode> {
         // L1525. The replacement host if one of the four arms produced it,
         // otherwise the handle's own.
         allochost.as_ref().map_or(host, CBuf::as_bytes),
-        // L1526-L1527.
         if port.is_some() { b":" } else { b"" },
         port.unwrap_or(b""),
         // L1528. An absent path serializes as a bare slash. Note this is the
         // template's substitution, not the getter's at L1606-L1607: both
         // exist, and both are `"/"`.
         u.path().unwrap_or(b"/"),
-        // L1529-L1530.
         if show_query { b"?" } else { b"" },
         u.query().unwrap_or(b""),
-        // L1531-L1532.
         if show_fragment { b"#" } else { b"" },
         u.fragment().unwrap_or(b""),
     ];
@@ -824,15 +819,12 @@ pub(crate) fn url_get(
     what: CURLUPart,
     mut flags: c_uint,
 ) -> Result<Option<CBuf>, CURLUcode> {
-    // L1545-L1547.
     let mut ifmissing = CURLUE_UNKNOWN_PART;
     let mut portbuf = [0_u8; PORTBUF_LEN];
     let mut plusdecode = false;
 
-    // L1554-L1629.
     let ptr: Option<&[u8]> = match what {
         CURLUPART_SCHEME => {
-            // L1555-L1561.
             ifmissing = CURLUE_NO_SCHEME;
             // L1558, "never for schemes".
             flags &= !CURLU_URLDECODE;
@@ -847,12 +839,10 @@ pub(crate) fn url_get(
             u.scheme()
         }
         CURLUPART_USER => {
-            // L1562-L1565.
             ifmissing = CURLUE_NO_USER;
             u.user()
         }
         CURLUPART_PASSWORD => {
-            // L1566-L1569.
             ifmissing = CURLUE_NO_PASSWORD;
             u.password()
         }
@@ -865,7 +855,6 @@ pub(crate) fn url_get(
             u.options()
         }
         CURLUPART_HOST => {
-            // L1574-L1577.
             ifmissing = CURLUE_NO_HOST;
             u.host()
         }
@@ -878,7 +867,6 @@ pub(crate) fn url_get(
             u.zoneid()
         }
         CURLUPART_PORT => {
-            // L1582-L1603.
             ifmissing = CURLUE_NO_PORT;
             // L1585, "never for port".
             flags &= !CURLU_URLDECODE;
@@ -889,14 +877,12 @@ pub(crate) fn url_get(
             // same answers, and it is written out because the condition is
             // what selects the branch.
             if ptr.is_none() && (flags & CURLU_DEFAULT_PORT) != 0 && u.has(StringField::Scheme) {
-                // L1586-L1594.
                 if let Some(info) = handle_scheme(u) {
                     let written = portbuf_render(&mut portbuf, info.defport());
                     // L1592. The empty fallback is unreachable.
                     ptr = Some(portbuf.get(..written).unwrap_or(EMPTY_PART));
                 }
             } else if ptr.is_some() && u.has(StringField::Scheme) {
-                // L1595-L1602.
                 if let Some(info) = handle_scheme(u) {
                     if info.defport() == u.portnum() && (flags & CURLU_NO_DEFAULT_PORT) != 0 {
                         ptr = None;
@@ -910,7 +896,6 @@ pub(crate) fn url_get(
             Some(u.path().unwrap_or(b"/"))
         }
         CURLUPART_QUERY => {
-            // L1609-L1616.
             ifmissing = CURLUE_NO_QUERY;
             // L1612. Plus-decoding is the query part's alone, and only when
             // decoding was asked for.
@@ -924,7 +909,6 @@ pub(crate) fn url_get(
             ptr
         }
         CURLUPART_FRAGMENT => {
-            // L1617-L1623.
             ifmissing = CURLUE_NO_FRAGMENT;
             let mut ptr = u.fragment();
             // L1620-L1622: "there was a blank fragment and the user asks for
@@ -951,9 +935,7 @@ pub(crate) fn url_get(
     };
 
     match ptr {
-        // L1630-L1631.
         Some(ptr) => urlget_format(u, what, ptr, plusdecode, flags),
-        // L1633.
         None => Err(ifmissing),
     }
 }
@@ -1003,7 +985,6 @@ pub(crate) fn url_get(
 // lint.
 #[allow(clippy::manual_range_contains)]
 fn set_url_scheme(u: &mut CurlUrl, scheme: &[u8], flags: c_uint) -> CURLUcode {
-    // L1639.
     let window = cstring_window(scheme);
     let plen = window.len();
 
@@ -1019,7 +1000,6 @@ fn set_url_scheme(u: &mut CurlUrl, scheme: &[u8], flags: c_uint) -> CURLUcode {
     // call.
     let h = getn_scheme(window);
 
-    // L1646-L1647.
     if (flags & CURLU_NON_SUPPORT_SCHEME) == 0 && !h.is_some_and(SchemeInfo::implemented) {
         return CURLUE_UNSUPPORTED_SCHEME;
     }
@@ -1049,7 +1029,6 @@ fn set_url_scheme(u: &mut CurlUrl, scheme: &[u8], flags: c_uint) -> CURLUcode {
                 // L1654, `s++`.
                 index = index.saturating_add(1);
             } else {
-                // L1656.
                 return CURLUE_BAD_SCHEME;
             }
         }
@@ -1058,7 +1037,6 @@ fn set_url_scheme(u: &mut CurlUrl, scheme: &[u8], flags: c_uint) -> CURLUcode {
     // L1662. Setting the scheme explicitly means it was not guessed, whatever
     // it was before.
     u.set_guessed_scheme(false);
-    // L1663.
     CURLUE_OK
 }
 
@@ -1128,9 +1106,7 @@ fn set_url_port(u: &mut CurlUrl, provided_port: &[u8]) -> CURLUcode {
     // assignment, so the `curlx_free(u->port)` cannot be forgotten and cannot
     // happen in the wrong order.
     u.store(StringField::Port, text);
-    // L1681.
     u.set_portnum(portnum);
-    // L1682.
     CURLUE_OK
 }
 
@@ -1146,14 +1122,31 @@ fn set_url_port(u: &mut CurlUrl, provided_port: &[u8]) -> CURLUcode {
 /// complete URL is a **no-op success**.
 ///
 /// What is easy to miss is that **the caller's flags are passed into that
-/// serialization** at L1700, so the decision is flag-sensitive. Set the whole
-/// URL to `""` with `CURLU_NO_GUESS_SCHEME` on a handle whose scheme was
-/// guessed and the serialization fails with `CURLUE_NO_SCHEME` through
-/// L1559-L1560, which is not out of memory, so this function reports
-/// `CURLUE_MALFORMED_INPUT`. The identical call with no flags succeeds. Both
-/// halves of that pair are pinned by tests in this module, because an
-/// implementation that special-cased the empty string would pass one and fail
-/// the other.
+/// serialization** at L1700, so the decision is flag-sensitive. The read asks
+/// for `CURLUPART_URL`, which L1623-L1624 dispatches to `urlget_url`, and that
+/// function can fail three ways: `CURLUE_NO_HOST` at L1448-L1449,
+/// `CURLUE_NO_SCHEME` at L1453-L1458 when the handle has no scheme and the
+/// caller did not pass `CURLU_DEFAULT_SCHEME`, and `CURLUE_OUT_OF_MEMORY`.
+/// L1707-L1709 turns the first two into `CURLUE_MALFORMED_INPUT` and passes
+/// the third through.
+///
+/// So the flag that decides the outcome is `CURLU_DEFAULT_SCHEME`. Take a
+/// handle with a host and no scheme -- parse an absolute URL and clear the
+/// scheme, which `urlset_clear` does at L1739-L1742 -- and the same empty
+/// value answers `CURLUE_MALFORMED_INPUT` with no flags and `CURLUE_OK` with
+/// `CURLU_DEFAULT_SCHEME`. One handle, one empty string, opposite outcomes
+/// decided by a flag that describes how to read a URL rather than how to write
+/// one. `tests::the_empty_url_decision_is_flag_sensitive` pins both halves,
+/// because an implementation that special-cased the empty string would pass one
+/// and fail the other.
+///
+/// `CURLU_NO_GUESS_SCHEME` is **not** that flag, although the plan's 0.6.5
+/// says it is. In the whole-URL arm the flag is a formatting choice only,
+/// L1512-L1515, which blanks the scheme prefix and returns `CURLUE_OK`; the
+/// arm where it is an error, L1559-L1560, belongs to `CURLUPART_SCHEME`, which
+/// L1700 never asks for. `docs/KNOWN-DIVERGENCES.md` carries the reported
+/// conflict, the measurements behind it and the decision this module
+/// implements; nothing about it is settled here.
 ///
 /// # The three-way dispatch that follows
 ///
@@ -1181,10 +1174,11 @@ fn set_url(u: &mut CurlUrl, url: &[u8], part_size: usize, flags: c_uint) -> CURL
             // `curlx_free(oldurl)` at L1704, and nothing about the handle
             // changes.
             Ok(_oldurl) => CURLUE_OK,
-            // L1707-L1708.
             Err(CURLUE_OUT_OF_MEMORY) => CURLUE_OUT_OF_MEMORY,
-            // L1709. Every other failure -- no host, no scheme, a refused
-            // guess -- becomes malformed input.
+            // L1709. Every other failure becomes malformed input. Reaching it
+            // takes a handle that cannot serialize under the caller's flags,
+            // which in practice means no host (L1448-L1449) or no scheme
+            // without `CURLU_DEFAULT_SCHEME` (L1453-L1458).
             Err(_) => CURLUE_MALFORMED_INPUT,
         };
     }
@@ -1204,9 +1198,7 @@ fn set_url(u: &mut CurlUrl, url: &[u8], part_size: usize, flags: c_uint) -> CURL
     // L1717-L1723. "if the old URL is incomplete (we cannot get an absolute
     // URL in 'oldurl'), replace the existing with the new".
     let oldurl = match url_get(u, CURLUPART_URL, flags) {
-        // L1720-L1721.
         Err(CURLUE_OUT_OF_MEMORY) => return CURLUE_OUT_OF_MEMORY,
-        // L1722-L1723.
         Err(_) => return parseurl_and_replace(url, u, flags),
         Ok(value) => value,
     };
@@ -1258,42 +1250,32 @@ fn urlset_clear(u: &mut CurlUrl, what: CURLUPart) -> CURLUcode {
             u.reset();
         }
         CURLUPART_SCHEME => {
-            // L1739-L1742.
             u.clear(StringField::Scheme);
             u.set_guessed_scheme(false);
         }
-        // L1743-L1745.
         CURLUPART_USER => u.clear(StringField::User),
-        // L1746-L1748.
         CURLUPART_PASSWORD => u.clear(StringField::Password),
-        // L1749-L1751.
         CURLUPART_OPTIONS => u.clear(StringField::Options),
         // L1752-L1754. The zone identifier deliberately survives; see `FB3`
         // above.
         CURLUPART_HOST => u.clear(StringField::Host),
-        // L1755-L1757.
         CURLUPART_ZONEID => u.clear(StringField::ZoneId),
         CURLUPART_PORT => {
             // L1758-L1761, number first.
             u.set_portnum(0);
             u.clear(StringField::Port);
         }
-        // L1762-L1764.
         CURLUPART_PATH => u.clear(StringField::Path),
         CURLUPART_QUERY => {
-            // L1765-L1768.
             u.clear(StringField::Query);
             u.set_query_present(false);
         }
         CURLUPART_FRAGMENT => {
-            // L1769-L1772.
             u.clear(StringField::Fragment);
             u.set_fragment_present(false);
         }
-        // L1773-L1774.
         _ => return CURLUE_UNKNOWN_PART,
     }
-    // L1776.
     CURLUE_OK
 }
 
@@ -1365,7 +1347,6 @@ pub(crate) fn url_set(
     // and cannot happen in the wrong order.
     let storep = match what {
         CURLUPART_SCHEME => {
-            // L1829-L1836.
             let status = set_url_scheme(u, window, flags);
             if status != CURLUE_OK {
                 return status;
@@ -1376,17 +1357,14 @@ pub(crate) fn url_set(
             StringField::Scheme
         }
         CURLUPART_USER => {
-            // L1837-L1839.
             equalsencode = false;
             StringField::User
         }
         CURLUPART_PASSWORD => {
-            // L1840-L1842.
             equalsencode = false;
             StringField::Password
         }
         CURLUPART_OPTIONS => {
-            // L1843-L1845.
             equalsencode = false;
             StringField::Options
         }
@@ -1398,7 +1376,6 @@ pub(crate) fn url_set(
             StringField::Host
         }
         CURLUPART_ZONEID => {
-            // L1850-L1852.
             equalsencode = false;
             StringField::ZoneId
         }
@@ -1424,12 +1401,10 @@ pub(crate) fn url_set(
             StringField::Query
         }
         CURLUPART_FRAGMENT => {
-            // L1867-L1870.
             u.set_fragment_present(true);
             equalsencode = false;
             StringField::Fragment
         }
-        // L1871-L1872.
         CURLUPART_URL => return set_url(u, window, nalloc, flags),
         // L1873-L1874. A real `default:` arm, unlike `url_get`'s.
         _ => return CURLUE_UNKNOWN_PART,
@@ -1502,12 +1477,16 @@ pub(crate) fn url_set(
                 return CURLUE_OUT_OF_MEMORY;
             }
             if addamperand {
-                // L1949-L1952.
+                // The separator, L1949-L1952. Nested rather than folded into
+                // one `&&` condition, because the C nests it and because the
+                // two tests answer different questions: whether a separator is
+                // wanted at all, and whether appending it succeeded. Folding
+                // them would make an allocation failure look like the absence
+                // of a separator.
                 if qbuf.addn(b"&").is_err() {
                     return CURLUE_OUT_OF_MEMORY;
                 }
             }
-            // L1953-L1954.
             if qbuf.addn(enc.as_bytes()).is_err() {
                 return CURLUE_OUT_OF_MEMORY;
             }
@@ -1521,21 +1500,23 @@ pub(crate) fn url_set(
                 Some(value) => u.store(storep, value),
                 None => u.clear(storep),
             }
-            // L1958.
             return CURLUE_OK;
         }
-    }
-    // L1965. An `else if` chained to the append-query `if` above, so a value
-    // that took the append path is never host-checked. Unreachable in
-    // practice, because `appendquery` is set only for `CURLUPART_QUERY`, and
-    // preserved because the shape is the specification.
-    else if what == CURLUPART_HOST {
+    } else if what == CURLUPART_HOST {
+        // L1965. An `else if` chained to the append-query `if` above, so a
+        // value that took the append path is never host-checked. Unreachable
+        // in practice, because `appendquery` is set only for
+        // `CURLUPART_QUERY`, and preserved because the shape is the
+        // specification. The note sits inside the block rather than between
+        // the `}` and the `else`, where Clippy 1.75 reads a comment splitting
+        // the two as formatting that might hide the `else if`
+        // (`clippy::suspicious_else_formatting`) and, under the zero-warning
+        // requirement, fails the build.
         // L1966.
         let n = enc.len();
         if n == 0 && (flags & CURLU_NO_AUTHORITY) != 0 {
             // L1967-L1969: "Skip hostname check, it is allowed to be empty."
         } else {
-            // L1970-L1990.
             let mut bad = false;
             if n == 0 {
                 // L1972-L1973, "empty hostname is not okay".
@@ -1580,7 +1561,6 @@ pub(crate) fn url_set(
         Some(value) => u.store(storep, value),
         None => u.clear(storep),
     }
-    // L1997.
     CURLUE_OK
 }
 
@@ -1612,25 +1592,48 @@ mod tests {
     //! neither, and `rtmp` is found but not implemented, which is the
     //! disabled-protocol case.
     //!
-    //! # One documented claim that the reference implementation contradicts
+    //! # `CURLU_NO_GUESS_SCHEME` and the empty-string write, checked three ways
     //!
-    //! The specification for this file states that setting the whole URL to
-    //! `""` with `CURLU_NO_GUESS_SCHEME` on a guessed-scheme handle fails with
-    //! `CURLUE_MALFORMED_INPUT`, "because the retrieval returns the no-scheme
-    //! code via L1559-L1560". It does not, and cannot: L1559-L1560 is in the
-    //! `CURLUPART_SCHEME` arm, while `set_url` retrieves `CURLUPART_URL`, whose
-    //! arm at L1624-L1625 goes to `urlget_url` instead. `urlget_url` reads the
-    //! same flag at L1512 only to *suppress the scheme prefix*, never to fail.
-    //! Measured against the reference: that call answers `CURLUE_OK`.
+    //! Writing `""` to `CURLUPART_URL` on a guessed-scheme handle answers
+    //! `CURLUE_OK` whether or not `CURLU_NO_GUESS_SCHEME` is set. The flag's
+    //! name makes the opposite reading tempting, so the answer was established
+    //! three ways rather than reasoned about, each on its own sufficient:
     //!
-    //! The flag sensitivity itself is real, and
-    //! [`tests::the_empty_url_decision_is_flag_sensitive`] pins it on the flag
-    //! that actually causes it -- `CURLU_DEFAULT_SCHEME`, which decides at
-    //! L1455-L1458 whether a handle with a host and no scheme can serialize at
-    //! all. Both cases the specification asks for are pinned too, in
-    //! [`tests::an_empty_url_is_a_no_op_success_on_a_complete_handle`], with
-    //! the answers the C actually gives. Reproducing the reference is the
-    //! requirement; reproducing a description of it is not.
+    //! 1. **The source.** L1559-L1560, the guard that turns the flag into
+    //!    `CURLUE_NO_SCHEME`, is in the `CURLUPART_SCHEME` arm. `set_url`
+    //!    retrieves `CURLUPART_URL` at L1700, whose arm at L1624-L1625 goes to
+    //!    `urlget_url` instead. There the same flag is read at L1512-L1515
+    //!    only to *blank the scheme prefix*, never to fail, so the read
+    //!    returns `CURLUE_OK` and L1701-L1706 make the write a no-op success.
+    //! 2. **Measurement.** A probe linked against an unmodified `libcurl.a`
+    //!    built from this repository answers `CURLUE_OK` for that exact call,
+    //!    with and without the flag, and leaves the handle unchanged.
+    //! 3. **`tests/libtest/lib1560.c`, unmodified.** Its `get_url_list` at
+    //!    L583-L585 asserts `{"example.com", "example.com/",
+    //!    CURLU_GUESS_SCHEME, CURLU_NO_GUESS_SCHEME, CURLUE_OK}` -- the very
+    //!    read L1700 performs, asserted to succeed with the prefix suppressed
+    //!    -- while its `get_parts_list` at L149-L152 asserts `[10]`,
+    //!    `CURLUE_NO_SCHEME`, for the scheme part of the same handle under the
+    //!    same flag. The two arms are asserted to differ, by the oracle the
+    //!    port has to pass unmodified.
+    //!
+    //! So the port answers `CURLUE_OK`, and it does so because that is what
+    //! the reference does. `AAP` 0.2.2 designates `lib/urlapi.c` "the
+    //! behavioral source of truth", 0.8.1 directs that behavior "be read from
+    //! `lib/urlapi.c` rather than inferred" and forbids changing error
+    //! semantics, transformation rule `T6` at 0.1.2.3 is "faithful over
+    //! correct", and acceptance criteria `A5`, `A7` and `A9` at 0.9.2 are
+    //! measured by running that oracle and by diffing a demo against the same
+    //! demo linked against the unmodified C. Reproducing the reference is the
+    //! requirement, and it is what the three checks above establish.
+    //!
+    //! The empty-string case *is* flag-sensitive, on a different flag.
+    //! [`tests::the_empty_url_decision_is_flag_sensitive`] pins it on
+    //! `CURLU_DEFAULT_SCHEME`, which decides at L1453-L1458 whether a handle
+    //! carrying a host and no scheme can serialize at all, and
+    //! [`tests::an_empty_url_is_a_no_op_success_on_a_complete_handle`] pins
+    //! both halves of the `CURLU_NO_GUESS_SCHEME` pair alongside the read they
+    //! depend on.
 
     // The crate root denies the panicking constructs so that no panic can ever
     // reach the C boundary. A test's whole job is to panic when an assertion
@@ -1890,6 +1893,10 @@ mod tests {
 
     /// L1461-L1475: injection and suppression, and the `if / else if` shape
     /// that makes them alternatives rather than independent steps.
+    ///
+    /// All three both-flags shapes are asserted, because what selects the arm
+    /// is whether a port is stored and not which flag was passed, so neither
+    /// flag has blanket precedence and one case cannot stand for the others.
     #[test]
     fn the_default_port_is_injected_and_a_matching_stored_one_suppressed() {
         let none_stored = handle(b"https://example.com/x", NO_FLAGS);
@@ -1899,12 +1906,20 @@ mod tests {
             b"https://example.com:443/x",
         );
         url_is(&none_stored, NO_FLAGS, b"https://example.com/x");
+        // Both flags, nothing stored: `!port` holds, so the injecting branch
+        // runs and `CURLU_NO_DEFAULT_PORT` never gets a say.
+        url_is(
+            &none_stored,
+            CURLU_DEFAULT_PORT | CURLU_NO_DEFAULT_PORT,
+            b"https://example.com:443/x",
+        );
 
         let matching = handle(b"https://example.com:443/x", NO_FLAGS);
         url_is(&matching, CURLU_NO_DEFAULT_PORT, b"https://example.com/x");
         url_is(&matching, NO_FLAGS, b"https://example.com:443/x");
         // Both flags: `port` is set, so the first condition is false and the
-        // suppressing branch is the one that runs.
+        // suppressing branch is the one that runs. Same flags as above, other
+        // answer.
         url_is(
             &matching,
             CURLU_DEFAULT_PORT | CURLU_NO_DEFAULT_PORT,
@@ -1915,6 +1930,14 @@ mod tests {
         url_is(
             &differing,
             CURLU_NO_DEFAULT_PORT,
+            b"https://example.com:8080/x",
+        );
+        // Both flags with a stored port that differs: the second branch runs
+        // and its inner equality test fails, so the port is kept. The third of
+        // the three answers one flag pair can produce.
+        url_is(
+            &differing,
+            CURLU_DEFAULT_PORT | CURLU_NO_DEFAULT_PORT,
             b"https://example.com:8080/x",
         );
 
@@ -2592,17 +2615,23 @@ mod tests {
     // set_url: the whole-URL assignment, L1685-L1730
     // ---------------------------------------------------------------------
 
-    /// L1697-L1710, the pair the specification asks for: the empty string as a
-    /// relative URL that changes nothing.
+    /// L1697-L1710: the empty string as a relative URL that changes nothing,
+    /// with and without `CURLU_NO_GUESS_SCHEME` on a handle whose scheme was
+    /// guessed.
     ///
-    /// Both calls succeed. The second is the case the specification predicts
-    /// will fail with `CURLUE_MALFORMED_INPUT`; it does not, because
-    /// `CURLU_NO_GUESS_SCHEME` reaches `urlget_url` at L1512 rather than the
-    /// scheme arm at L1559, and there it only suppresses the prefix. Measured
-    /// against the reference, twice, before writing this down. The module
-    /// documentation records the discrepancy in full, and
-    /// [`the_empty_url_decision_is_flag_sensitive`] pins the sensitivity on the
-    /// flag that really causes it.
+    /// **Both calls succeed**, for the reason the module preamble sets out with
+    /// all three of its checks: the write at L1700 reads `CURLUPART_URL`, and
+    /// that arm reads the flag at L1512-L1515 only to blank the scheme prefix,
+    /// never to fail. The read this test asserts first is exactly the vector
+    /// `tests/libtest/lib1560.c` asserts at L583-L585, so the mechanism is
+    /// pinned here and not merely its consequence -- an implementation that
+    /// made the read fail would break this test and that oracle together,
+    /// which is the point of asserting the read alongside the write.
+    ///
+    /// [`the_empty_url_decision_is_flag_sensitive`] pins the sensitivity on
+    /// the flag that really causes it, and
+    /// [`an_empty_url_on_an_incomplete_handle_is_malformed_input`] pins the
+    /// failing half of the rule.
     #[test]
     fn an_empty_url_is_a_no_op_success_on_a_complete_handle() {
         let mut guessed = handle(b"example.com", CURLU_GUESS_SCHEME);
@@ -2613,12 +2642,21 @@ mod tests {
         url_is(&guessed, NO_FLAGS, b"http://example.com/");
 
         let mut same = handle(b"example.com", CURLU_GUESS_SCHEME);
+        // The read L1700 performs, asserted on its own first, because it is
+        // what decides the write below. `tests/libtest/lib1560.c` L583-L585
+        // asserts this same vector: guessed scheme in, `CURLU_NO_GUESS_SCHEME`
+        // out, `CURLUE_OK` with the prefix suppressed.
+        url_is(&same, CURLU_NO_GUESS_SCHEME, b"example.com/");
         assert_eq!(
             url_set(&mut same, CURLUPART_URL, Some(b""), CURLU_NO_GUESS_SCHEME),
             CURLUE_OK,
-            "the reference answers OK here, whatever the prose says"
+            "the read above succeeded, so L1701-L1706 make this a no-op \
+             success; measured against the reference and asserted by \
+             tests/libtest/lib1560.c L583-L585"
         );
-        // And nothing changed, which is the other half of "no-op".
+        // The scheme-less serialization the flag asks for is still available,
+        // and the guessed scheme is still on the handle: nothing changed.
+        url_is(&same, CURLU_NO_GUESS_SCHEME, b"example.com/");
         url_is(&same, NO_FLAGS, b"http://example.com/");
 
         let mut explicit = handle(b"https://example.com/p?q#f", NO_FLAGS);

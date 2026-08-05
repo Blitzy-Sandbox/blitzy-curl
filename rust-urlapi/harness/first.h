@@ -28,10 +28,14 @@
    tests/libtest/lib1560.c compile unmodified against public headers alone.
    That source has one include, "first.h" at tests/libtest/lib1560.c:L33,
    and a quoted include resolves against the directory the compiler opened
-   the including file from. run-parity.sh stages a symlink to the test
-   source beside a copy of this header, so the name lands here, not on the
-   original, which pulls libcurl's private build environment in at
-   tests/libtest/first.h:L33 and L46. Nothing under tests/ is edited. */
+   the including file from. The intended arrangement is therefore a staging
+   directory holding a symlink to the test source beside a copy of this
+   header, so that the name lands here and not on the original, which pulls
+   libcurl's private build environment in at tests/libtest/first.h:L33 and
+   L46. rust-urlapi/scripts/run-parity.sh is to create that directory; it is
+   a later deliverable and does not exist yet, so for now the staging is set
+   up by hand and nothing here should be read as a claim that the script has
+   run. Either way, nothing under tests/ is edited. */
 
 /* CURL_EXTERN has to expand to nothing. include/curl/curl.h:L122-L136 makes
    it __declspec(dllimport) on Windows unless this macro or BUILDING_LIBCURL
@@ -48,15 +52,33 @@
 
 /* Never defined here: BUILDING_LIBCURL, CURLDEBUG, DEBUGBUILD,
    CURL_MEMDEBUG. curl_free() forwards to curlx_free() at
-   lib/escape.c:L189-L192, which resolves at compile time to the tracking
-   curl_dbg_free() under memory debugging (lib/curl_setup.h:L1461), to the
-   mutable global hook Curl_cfree under BUILDING_LIBCURL (L1478), or to
-   plain free() (L1484). The crate takes its C-visible buffers from the C
-   allocator, so only the last of the three suits them. Because memory
-   debugging is therefore off, curl's own allocation counter does not run
-   and the ceiling at tests/data/test1560:L40 is not measured here. The
-   whole chain, and this consequence, are recorded under "Reported
-   limitation R3" in ../docs/MEMORY-OWNERSHIP.md. */
+   lib/escape.c:L189-L192, which resolves at compile time three ways: to the
+   tracking curl_dbg_free() under memory debugging (lib/curl_setup.h:L1461),
+   to the mutable global hook Curl_cfree under BUILDING_LIBCURL (L1478), or
+   to plain free() (L1484).
+
+   The crate takes its C-visible buffers from the C allocator, and TWO of
+   those three release them correctly. Plain free() does, obviously. So does
+   Curl_cfree while it still holds the callback lib/easy.c:L107 initialises
+   it to, which is free itself -- and that is the path a drop-in link takes,
+   because escape.c is compiled as part of libcurl and therefore with
+   BUILDING_LIBCURL defined. Both supported link modes are covered: drop-in
+   reaches libcurl's own curl_free() through the default hook, standalone
+   reaches the crate's cfree-gated export.
+
+   Exactly two configurations are incompatible, and neither is reachable
+   from here. A memory-debug build, where curl_dbg_free() validates the
+   pointer against its own table (lib/memdebug.c:L383) -- which is why
+   CURL_MEMDEBUG and its companions are left undefined above. And an
+   application that substitutes its own allocators through
+   curl_global_init_mem() (lib/easy.c:L237), which replaces the hook with a
+   deallocator that never saw the block.
+
+   One consequence of leaving memory debugging off is worth stating rather
+   than discovering: curl's own allocation counter belongs to that build, so
+   it does not run here and the ceiling at tests/data/test1560:L40 is not
+   measured. The whole chain is recorded under "Reported limitation R3" in
+   ../docs/MEMORY-OWNERSHIP.md. */
 
 /* curl.h alone covers the curl side: it reaches the URL API at its L3316
    and the curl_m*printf family at L3320. urlapi.h is named anyway, as the

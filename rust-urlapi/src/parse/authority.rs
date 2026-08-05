@@ -205,32 +205,29 @@
 //! Two of them
 //! exist to guard `FB2` specifically, one for its success exit and one for
 //! its `CURLU_DISALLOW_USER` exit, because a suite that only checked result
-//! codes could not see either. End-to-end verification is the parity run,
-//! `rust-urlapi/scripts/run-parity.sh`, which builds the unmodified
-//! `tests/libtest/lib1560.c` against the reference C library and against
-//! this crate and diffs the two outputs byte for byte.
+//! codes could not see either.
+//!
+//! End-to-end verification is to be the parity run: the unmodified
+//! `tests/libtest/lib1560.c` built against the reference C library and against
+//! this crate, with the two outputs diffed byte for byte.
+//! `rust-urlapi/scripts/run-parity.sh` is the script that is to drive it and is
+//! a later deliverable, so it does not exist yet and the tests below are the
+//! oracle currently in force.
 
-// Reachability here is decided by two modules that do not exist yet.
+// Reachability here is decided by two consumers, both of which exist.
 // `parse_authority` is called from the parse pipeline at `lib/urlapi.c`
 // L1149, and `Curl_url_set_authority` is re-exported to C for
 // `lib/http2.c` L739, so its consumers are `src/parse/mod.rs` and
 // `src/ffi.rs`.
 //
-// This file is currently unreachable from any module tree, which is a
-// consequence of the delivery order and not a defect: `src/parse/` holds no
-// `mod.rs` and there is no `src/parse.rs`, so under edition 2021 no `mod`
-// declaration can reach it. THE CHECKPOINT THAT CREATES src/parse/mod.rs
-// MUST DECLARE `mod authority;` THERE, or this module is compiled by nothing
-// and its tests never run.
+// `src/parse/mod.rs` declares `mod authority;` and calls `parse_authority` from
+// the pipeline, and `src/ffi.rs` reaches the authority setter through it as
+// `Curl_url_set_authority`. Both consumers are compiled unconditionally.
 //
-// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
-// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
-// checkpoint that creates src/getset.rs, and replaced there by one crate-level
-// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
-// src/getset.rs exist, most of this crate has no consumer, and a crate held to
-// zero warnings cannot build clean without this. Scoped to this module and to
-// this lint alone.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a
@@ -328,11 +325,8 @@ fn portion(bytes: &[u8], from: usize, len: usize) -> &[u8] {
 /// parts read back absent -- and the difference is recorded as a residual
 /// divergence in `docs/KNOWN-DIVERGENCES.md`.
 fn clear_credentials(u: &mut CurlUrl) {
-    // L328.
     u.clear(StringField::User);
-    // L329.
     u.clear(StringField::Password);
-    // L330.
     u.clear(StringField::Options);
 }
 
@@ -491,8 +485,9 @@ pub(crate) fn parse_login_details(
     let options = match osep {
         Some(o) if olen != 0 => {
             let Some(buf) = CBuf::from_slice(portion(login, o.saturating_add(1), olen)) else {
-                // L2516-L2517. Both locals are released on the way out,
-                // L2525-L2526.
+                // L2516-L2517. Both locals are released on the way out, at
+                // L2525-L2526; here `Drop` on the user and password buffers
+                // does it as the `Err` unwinds the bindings.
                 return Err(CURLcode::CURLE_OUT_OF_MEMORY);
             };
             Some(buf)
@@ -500,7 +495,6 @@ pub(crate) fn parse_login_details(
         _ => None,
     };
 
-    // L2521-L2523.
     Ok(LoginDetails {
         user,
         password,
@@ -826,10 +820,29 @@ pub(crate) fn parse_authority(
 ///
 /// # Errors
 ///
-/// Whatever [`parse_authority`] reported, unchanged, L674. The host buffer
-/// is released on every one of those paths, L668-L669, and the handle's own
-/// host is left exactly as it was -- but the credentials may not be, which
-/// is `FB2`.
+/// Whatever [`parse_authority`] reported, unchanged, L674. The host buffer is
+/// released on every one of those paths, L668-L669, so `u->host` alone is left
+/// exactly as it was.
+///
+/// **This entry point is not atomic, and the host is the only field it
+/// protects.** The parse-then-swap of L1197-L1209 belongs to
+/// `parseurl_and_replace`, which builds into a zeroed temporary; here
+/// [`parse_authority`] writes straight into a live handle, so every field a
+/// stage touched before the failing stage keeps its new value. In the order
+/// the stages run, and naming every field each one can leave changed:
+///
+/// | Stage | May leave changed on a later failure |
+/// |-------|-------------------------------------|
+/// | `parse_hostname_login`, L617 | user, password and options -- set from the credentials, or all three cleared by the shared exit at L328-L330, which is `FB2` |
+/// | `Curl_parse_port`, L627 | `portnum` and the port string, replaced at L378-L381 -- and left absent if the formatted allocation at L381 fails |
+/// | `ipv6_parse`, L638 | the zone identifier, stored at L418 before the address is validated at L434, which is `FB3` |
+///
+/// Reproducing that is the requirement rather than an oversight: `lib/http2.c`
+/// L739 is the one in-tree caller, it passes a live handle, and both `FB2` and
+/// `FB3` are observable only through this path. What the port does *not*
+/// reproduce is the leak inside `FB2` and `FB3` -- the displaced buffers are
+/// released rather than abandoned, which no sequence of API calls can tell
+/// apart from the C.
 ///
 /// `CURLUE_USER_NOT_ALLOWED` deserves singling out: this is the only caller
 /// that passes `CURLU_DISALLOW_USER`, at L667, and because the user portion

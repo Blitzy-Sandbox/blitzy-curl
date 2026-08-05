@@ -176,31 +176,25 @@
 //! The unit tests below cover this stage in isolation, and their vectors
 //! come from `tests/unit/unit1653.c` and from the port-bearing rows of
 //! `tests/libtest/lib1560.c`. Neither file is modified; both are read-only
-//! references. End-to-end verification is the parity run,
-//! `rust-urlapi/scripts/run-parity.sh`, which builds the unmodified
-//! `tests/libtest/lib1560.c` against the reference C library and against
-//! this crate and diffs the two outputs byte for byte.
+//! references.
+//!
+//! End-to-end verification is to be the parity run: the unmodified
+//! `tests/libtest/lib1560.c` built against the reference C library and
+//! against this crate, with the two outputs diffed byte for byte.
+//! `rust-urlapi/scripts/run-parity.sh` is the script that is to drive it and
+//! is a later deliverable, so it does not exist yet and no claim here rests
+//! on its having run.
 
-// Reachability here is decided by a module that does not exist yet.
-// `Curl_parse_port` has exactly one caller in the C tree, `parse_authority`
-// at `lib/urlapi.c` L627, so the sole in-crate consumer of `parse_port` is
-// `src/parse/authority.rs`.
+// Reachability here matches the C exactly. `Curl_parse_port` has one caller in
+// the C tree, `parse_authority` at `lib/urlapi.c` L627, so the sole in-crate
+// consumer of `parse_port` is `src/parse/authority.rs`, which calls it at its
+// own L726. `src/parse/mod.rs` declares `mod port;`, and both modules are
+// compiled unconditionally, so nothing here is unreached.
 //
-// This file is currently unreachable from any module tree, which is a
-// consequence of the delivery order and not a defect: `src/parse/` holds no
-// `mod.rs` and there is no `src/parse.rs`, so under edition 2021 no `mod`
-// declaration can reach it. THE CHECKPOINT THAT CREATES src/parse/mod.rs
-// MUST DECLARE `mod port;` THERE, or this module is compiled by nothing and
-// its tests never run.
-//
-// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
-// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
-// checkpoint that creates src/getset.rs, and replaced there by one crate-level
-// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
-// src/getset.rs exist, most of this crate has no consumer, and a crate held to
-// zero warnings cannot build clean without this. Scoped to this module and to
-// this lint alone.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a
@@ -353,7 +347,6 @@ fn plan(hostname: &[u8]) -> Plan {
     // would not be. An empty buffer therefore takes the `else` branch below
     // and finds no colon, which is what C does with an empty string too.
     if hostname.first() == Some(&b'[') {
-        // L344.
         let Some(bracket) = hostname.iter().position(|&byte| byte == b']') else {
             // L345-L346. An address error, not a port error, and it returns
             // before the truncation at L370.
@@ -517,9 +510,7 @@ pub(crate) fn parse_port(u: &mut CurlUrl, host: &mut DynBuf, has_scheme: bool) -
                 CURLUE_BAD_PORT_NUMBER
             }
         }
-        // L375-L376.
         PortText::Rejected => CURLUE_BAD_PORT_NUMBER,
-        // L378-L383.
         PortText::Number(port) => store_port(u, port),
     }
 }

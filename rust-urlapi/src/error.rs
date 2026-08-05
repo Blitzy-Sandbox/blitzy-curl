@@ -111,25 +111,18 @@
 //! string. The module needs neither `libc` nor `src/alloc.rs`, and depends
 //! on `src/abi.rs` alone.
 
-// Which of the items below is reachable depends on the selected features and
-// on which sibling module is compiled: the message table is reached from the
-// `strerror`-gated export in `src/ffi.rs` and from the crate's own tests,
-// the non-verbose form mirrors an arm of the C file that no configuration of
-// this crate selects, and `idn2cu` is reached only from the IDN paths.
-// Warnings are errors for this crate, so rather than let the feature matrix
-// decide whether the build is clean, the allowance is stated once here with
-// its reason. It is scoped to this module and to this lint alone, and it is
-// preferred over mirroring `#[cfg(feature = "strerror")]` here because the
-// table has to remain visible to `cargo test` in every configuration.
+// Which of the items below is reachable depends on the selected features: the
+// message table is reached from the `strerror`-gated export in `src/ffi.rs`
+// and from the crate's own tests, the non-verbose form mirrors an arm of the C
+// file that no configuration of this crate selects, and `idn2cu` is reached
+// only from the IDN paths. Mirroring `#[cfg(feature = "strerror")]` on the
+// table here would be worse than leaving it unconditional, because the table
+// has to remain visible to `cargo test` in every configuration.
 //
-// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
-// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
-// checkpoint that creates src/getset.rs, and replaced there by one crate-level
-// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
-// src/getset.rs exist, most of this crate has no consumer, and a crate held to
-// zero warnings cannot build clean without this. Scoped to this module and to
-// this lint alone.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a

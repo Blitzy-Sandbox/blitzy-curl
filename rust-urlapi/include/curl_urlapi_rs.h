@@ -65,10 +65,23 @@
  * mirror therefore does not declare it, and a standalone consumer needing
  * it must obtain that prototype elsewhere.
  *
- * The three entry points declared at lib/urlapi-int.h:28-33, and the
- * unit-test-only one at lines 36-37, are exported by the object file this
- * crate replaces, yet they form no part of the public contract, so they are
- * absent here as well.
+ * The three entry points declared at lib/urlapi-int.h:28-33 --
+ * Curl_is_absolute_url, Curl_url_set_authority and Curl_junkscan -- are
+ * exported by the production object file this crate replaces, and the crate
+ * exports all three so that a drop-in link keeps working. They form no part
+ * of the public contract, so they are absent here.
+ *
+ * Curl_parse_port is a different case and must not be lumped in with them.
+ * Its declaration at lib/urlapi-int.h:36-37 sits inside the #ifdef UNITTESTS
+ * block that spans lines 35 to 38, so it is a global only in a unit-test
+ * build of libcurl and is NOT among the eight globals the production object
+ * file defines. The crate therefore does
+ * not export it either, deliberately: adding it would make the archive's
+ * exported set larger than the object file's, which is the one property the
+ * drop-in has to preserve. The consequence -- that tests/unit/unit1653.c
+ * stays out of reach -- is recorded as constraint R2 rather than worked
+ * around. dedotdotify, marked the same way at lib/urlapi.c:715, is in the
+ * same position.
  *
  * curl_url_strerror() is declared below with an unnamed parameter, exactly
  * as at include/curl/urlapi.h:149, even though its manual page names one.

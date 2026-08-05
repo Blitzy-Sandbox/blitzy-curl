@@ -5,9 +5,9 @@
 //! The fragment and query stages: two functions that only look like one.
 //!
 //! Port of `handle_fragment`, `lib/urlapi.c` L1012-L1034, and of
-//! `handle_query`, L1036-L1064. `parseurl` runs them as the sixth and
-//! seventh stages of the pipeline, calling them at L1168 and L1177, after
-//! the authority is settled and before the path is handled.
+//! `handle_query`, L1036-L1064. `parseurl` runs them as the fifth and sixth
+//! stages of its seven, calling them at L1168 and L1177, after the authority
+//! is settled and before the path is handled.
 //! `src/parse/mod.rs` owns that ordering and computes the two lengths; this
 //! module only consumes them.
 //!
@@ -147,25 +147,25 @@
 //!
 //! # Verification
 //!
-//! The unit tests below cover each difference on its own. End to end, the
-//! parity run driven by `rust-urlapi/scripts/run-parity.sh` is what settles
-//! this file: the `get_parts`, `append` and `get_nothing` sub-tests of
-//! `tests/libtest/lib1560.c` -- exit codes 4, 5 and 7 in the mapping the
-//! Agent Action Plan gives at 0.6.8 -- all exercise it, and `set_parts`,
-//! exit code 2, reaches it through every whole-URL assignment.
+//! The unit tests below cover each difference on its own, and they are the
+//! oracle currently in force for this file.
+//!
+//! End to end, the parity run over the unmodified `tests/libtest/lib1560.c` is
+//! what is to settle it: the `get_parts`, `append` and `get_nothing` sub-tests
+//! -- exit codes 4, 5 and 7 in the mapping the Agent Action Plan gives at
+//! 0.6.8 -- all exercise this file, and `set_parts`, exit code 2, reaches it
+//! through every whole-URL assignment. `rust-urlapi/scripts/run-parity.sh` is
+//! the script that is to drive that run; it is a later deliverable and does
+//! not exist yet.
 
-// The only consumer is `src/parse/mod.rs`, which does not exist yet: under
-// edition 2021 nothing can reach this file until that module declares
-// `mod query;`. THE CHECKPOINT THAT CREATES src/parse/mod.rs MUST DECLARE IT
-// THERE, or this module is compiled by nothing and its tests never run.
+// The only consumer is `src/parse/mod.rs`, which declares `mod query;` and runs
+// the fragment and query stages in the order `parseurl` runs them. It is
+// compiled unconditionally.
 //
-// DEAD-CODE POLICY, TIME-BOXED. Identical in intent in every module of this
-// crate; grep for "DEAD-CODE POLICY" to find them all. They are removed
-// together, by the checkpoint that creates src/getset.rs, and replaced there
-// by one crate-level allowance in src/lib.rs. Until the pipeline is wired, a
-// crate held to zero warnings cannot build clean without this. Scoped to this
-// module and to this one lint.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` (AAP 0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1). This
 // module needs none: it inspects slices and stores owned buffers, and both
@@ -239,8 +239,6 @@ pub(crate) fn handle_fragment(
         let bodylen = fraglen.saturating_sub(1);
 
         if (flags & CURLU_URLENCODE) != 0 {
-            // L1019-L1026.
-            //
             // L1021: the ceiling is `CURL_MAX_INPUT_LENGTH`, not the length
             // of this fragment. Encoding can treble a byte, so sizing the
             // buffer to the input would reject inputs the C accepts.
@@ -272,7 +270,6 @@ pub(crate) fn handle_fragment(
             // clamp is where a slice longer than `fraglen` is cut back to it.
             let body = tail.get(..bodylen).unwrap_or(tail);
             let Some(copy) = CBuf::from_slice(body) else {
-                // L1029-L1030.
                 return CURLUE_OUT_OF_MEMORY;
             };
             u.store(StringField::Fragment, copy);
@@ -315,7 +312,6 @@ pub(crate) fn handle_query(u: &mut CurlUrl, query: &[u8], qlen: usize, flags: c_
     // reads it at L1435 and `urlset_clear` clears it at L1767.
     u.set_query_present(true);
 
-    // L1040.
     if qlen > 1 {
         // L1045 in the C: "skip the leading question mark". Same two
         // expressions as L1018's, and exact for the same reason.
@@ -343,7 +339,6 @@ pub(crate) fn handle_query(u: &mut CurlUrl, query: &[u8], qlen: usize, flags: c_
             // continues into the fragment and `qlen` does not.
             let body = tail.get(..bodylen).unwrap_or(tail);
             let Some(copy) = CBuf::from_slice(body) else {
-                // L1053-L1054.
                 return CURLUE_OUT_OF_MEMORY;
             };
             u.store(StringField::Query, copy);
@@ -368,7 +363,6 @@ pub(crate) fn handle_query(u: &mut CurlUrl, query: &[u8], qlen: usize, flags: c_
         u.store(StringField::Query, empty);
     }
 
-    // L1063.
     CURLUE_OK
 }
 

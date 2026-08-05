@@ -31,7 +31,8 @@
 //!   `file:` URL gets no port parsing, no IPv4 normalization and no host
 //!   validation at all;
 //! - the comparison at L1133 is against `schemebuf`, which
-//!   `Curl_is_absolute_url` has already lower-cased at L1204, so `FILE://`
+//!   `Curl_is_absolute_url` has already lower-cased at L214, its
+//!   `Curl_strntolower(buf, url, i)` call, so `FILE://`
 //!   and `File://` reach this stage exactly as `file://` does. The URL
 //!   itself keeps its original case, and this stage never inspects those
 //!   five bytes: it skips them and stores the lower-case literal `"file"`.
@@ -118,13 +119,15 @@
 //! `target_os = "cygwin"` is a value the compiler knows and accepts.
 //!
 //! Per the plan's non-functional constraints, the Windows arms are ported as
-//! conditional code and are **not validated** by the parity workflow: the
-//! run driven by `rust-urlapi/scripts/run-parity.sh` builds for the parity
-//! platform, where every `cfg(windows)` arm is compiled out, and the four
-//! Windows-only rows of `tests/libtest/lib1560.c` L362-L371 sit inside
-//! `#ifdef _WIN32` and so are not compiled there either. Nobody should read
-//! a green parity run as evidence about the UNC path or the drive-letter
-//! strip.
+//! conditional code and will **not be validated** by the parity workflow: that
+//! workflow builds for the parity platform, where every `cfg(windows)` arm is
+//! compiled out, and the four Windows-only rows of
+//! `tests/libtest/lib1560.c` L362-L371 sit inside `#ifdef _WIN32` and so are
+//! not compiled there either. Nobody should read a green parity run as
+//! evidence about the UNC path or the drive-letter strip.
+//!
+//! `rust-urlapi/scripts/run-parity.sh` is the script that is to drive that
+//! workflow. It is a later deliverable and does not exist yet.
 //!
 //! # Memory ownership
 //!
@@ -149,25 +152,16 @@
 //! oracle prints `[14]`, an unset host, for every non-UNC `file:` URL, and
 //! why `localhost` is discarded rather than stored.
 
-// Reachability here is decided by a module that does not exist yet.
-// `parse_file` has exactly one caller in the C, `parseurl` at
-// `lib/urlapi.c` L1134, so this module's consumer is `src/parse/mod.rs`.
+// Reachability here matches the C exactly. `parse_file` has one caller in the
+// C, `parseurl` at `lib/urlapi.c` L1134, so this module's consumer is
+// `src/parse/mod.rs`, which declares `mod file;` and calls the stage from the
+// same position in the pipeline. It is compiled unconditionally, so nothing
+// here is unreached.
 //
-// This file is currently unreachable from any module tree, which is a
-// consequence of the delivery order and not a defect: `src/parse/` holds no
-// `mod.rs` and no `src/parse.rs` exists, and under edition 2021 no `mod`
-// declaration can reach it without one of those. THE CHECKPOINT THAT CREATES
-// src/parse/mod.rs MUST DECLARE `mod file;` THERE, or this module is compiled
-// by nothing and its tests never run.
-//
-// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
-// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
-// checkpoint that creates src/getset.rs, and replaced there by one crate-level
-// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
-// src/getset.rs exist, most of this crate has no consumer, and a crate held to
-// zero warnings cannot build clean without this. Scoped to this module and to
-// this lint alone.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` and the technical
 // specification forbids `unsafe` outside FFI code. `forbid` rather than
 // `deny` because an inner `allow` here would be a design change and should
@@ -257,12 +251,11 @@ const _: () = {
 // leaves available, with each side stated as a literal.
 //
 // The assertions are gathered into one block so that a single allow covers
-// them, following `src/inet.rs`. Clippy releases up to and including 1.75
-// report every constant assertion as optimized-out, which for a `const`
-// block is the opposite of what happens: it is evaluated at compile time and
-// nothing survives to be optimized. Later clippy exempts const contexts, so
-// this is a compatibility allow with the crate's declared minimum toolchain
-// rather than a suppressed finding.
+// them, following `src/inet.rs`, whose own block carries the measured account
+// of why the allow is kept: on the pinned toolchain the lint does not fire for
+// comparisons of named numeric constants at all, and the attribute is retained
+// as a deliberate scoped exception for the declared 1.75 floor rather than to
+// silence a finding.
 #[allow(clippy::assertions_on_constants)]
 const _: () = {
     assert!(FILE_PREFIX_LEN == 5);
@@ -327,7 +320,6 @@ pub(crate) fn starts_with_url_drive_prefix(bytes: &[u8]) -> bool {
     // `ISALPHA` at `lib/curl_ctype.h` L38, and reusing it keeps one
     // definition of "a letter" in the crate.
     is_alpha(letter)
-        // L51.
         && (separator == b':' || separator == b'|')
         // L52. Zero is the terminating NUL, per [`byte_at`].
         && (follower == b'/' || follower == b'\\' || follower == 0)
@@ -351,7 +343,6 @@ pub(crate) fn starts_with_url_drive_prefix(bytes: &[u8]) -> bool {
 #[cfg(windows)]
 #[must_use]
 pub(crate) fn starts_with_drive_prefix(bytes: &[u8]) -> bool {
-    // L41-L43.
     is_alpha(byte_at(bytes, 0)) && byte_at(bytes, 1) == b':'
 }
 
@@ -461,7 +452,6 @@ fn apply_drive_letter_rule(path: &[u8]) -> Result<&[u8], CURLUcode> {
     if (byte_at(path, 0) == b'/' && starts_with_url_drive_prefix(tail(path, 1)))
         || starts_with_url_drive_prefix(path)
     {
-        // L920.
         return Err(CURLUE_BAD_FILE_URL);
     }
     Ok(path)
@@ -486,9 +476,7 @@ fn apply_drive_letter_rule(path: &[u8]) -> Result<&[u8], CURLUcode> {
 // smaller cost than a `cfg` in the parse flow.
 #[allow(clippy::unnecessary_wraps)]
 fn apply_drive_letter_rule(path: &[u8]) -> Result<&[u8], CURLUcode> {
-    // L924.
     if byte_at(path, 0) == b'/' && starts_with_url_drive_prefix(tail(path, 1)) {
-        // L926-L927.
         return Ok(tail(path, 1));
     }
     Ok(path)

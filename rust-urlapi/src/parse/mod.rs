@@ -31,7 +31,7 @@
 //! |---|---|---|
 //! | [`junk`] | L223-L239 | reject junk bytes, measure the input |
 //! | [`scheme`] | L182-L221, L935-L1010 | detect, parse and guess the scheme |
-//! | [`file`] | L823-L933 | the whole `file:` branch |
+//! | [`self::file`] | L823-L933 | the whole `file:` branch |
 //! | [`authority`] | L248-L333, L604-L680 | credentials, host, port |
 //! | [`host`] | L444-L602 | host validation, IPv4, host decoding |
 //! | [`ipv6`] | L390-L442 | bracketed addresses and zone identifiers |
@@ -168,14 +168,17 @@
 //! # End-to-end verification
 //!
 //! The tests at the end of this file cover the ordering and the
-//! short-circuit shape; each stage is tested in its own file. The
-//! end-to-end oracle is the unmodified `tests/libtest/lib1560.c`, run
-//! through `rust-urlapi/scripts/run-parity.sh`, whose success condition is
-//! the literal single line `success` on stdout -- which is exactly what
-//! `tests/data/test1560` asserts. That entry point returns a distinct exit
-//! code per failing sub-test and short-circuits at the first failure, so the
-//! script maps the code back to the name and iterates rather than reporting
-//! only the first one it meets:
+//! short-circuit shape; each stage is tested in its own file. Those are the
+//! oracle currently in force.
+//!
+//! The end-to-end oracle is to be the unmodified `tests/libtest/lib1560.c`,
+//! whose success condition is the literal single line `success` on stdout --
+//! which is exactly what `tests/data/test1560` asserts.
+//! `rust-urlapi/scripts/run-parity.sh` is the script that is to run it and is
+//! a later deliverable, so it does not exist yet. That entry point returns a
+//! distinct exit code per failing sub-test and short-circuits at the first
+//! failure, so the script is to map the code back to the name and iterate
+//! rather than report only the first one it meets:
 //!
 //! | Code | Sub-test | Code | Sub-test |
 //! |---|---|---|---|
@@ -186,18 +189,16 @@
 //! | 5 | `append` | 11 | `urldup` |
 //! | 6 | `scopeid` | | |
 
-// Reachability here is decided by a module that does not exist yet.
+// Reachability here is decided by two consumers, matching the C exactly.
 // `parseurl_and_replace` has two callers in the C -- `set_url` at L1715 and
 // L1723, and `redirect_url` at L1277 -- which are `src/getset.rs` and
-// `src/parse/redirect.rs` in this crate.
+// `src/parse/redirect.rs` in this crate. Both exist and are compiled
+// unconditionally.
 //
-// DEAD-CODE POLICY, TIME-BOXED. Identical in intent in every module of this
-// crate; grep for "DEAD-CODE POLICY" to find them all. They are removed
-// together, by the checkpoint that creates src/getset.rs, and replaced there
-// by one crate-level allowance in src/lib.rs. Until the pipeline is wired,
-// a crate held to zero warnings cannot build clean without this. Scoped to
-// this module and to this one lint.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` (AAP 0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // Orchestration needs none of it: this module inspects slices, calls the
@@ -336,7 +337,6 @@ fn parseurl(url: &[u8], u: &mut CurlUrl, flags: c_uint) -> CURLUcode {
     // L1184 or the label at L1188, and `break 'stages` is the `goto fail` of
     // L1126 and L1140. One handler, reached the same three ways.
     let result: CURLUcode = 'stages: {
-        // L1117.
         let mut result: CURLUcode = CURLUE_OK;
 
         // L1124-L1126. The C's `!!` narrows the masked flag to a boolean;
@@ -465,7 +465,6 @@ fn parseurl(url: &[u8], u: &mut CurlUrl, flags: c_uint) -> CURLUcode {
                     result = CURLUE_OUT_OF_MEMORY;
                 }
             } else {
-                // L1159-L1160.
                 result = CURLUE_NO_HOST;
             }
         }
@@ -480,7 +479,6 @@ fn parseurl(url: &[u8], u: &mut CurlUrl, flags: c_uint) -> CURLUcode {
             // and it covers the same span here for the reason the module
             // documentation gives.
             if let Some(fragoff) = path.iter().position(|&byte| byte == b'#') {
-                // L1167.
                 let fraglen = pathlen.saturating_sub(fragoff);
                 // L1168. The slice runs to the end of the input while
                 // `fraglen` stops at the end of the fragment;
@@ -493,20 +491,17 @@ fn parseurl(url: &[u8], u: &mut CurlUrl, flags: c_uint) -> CURLUcode {
                 pathlen = pathlen.saturating_sub(fraglen);
             }
         }
-        // L1173-L1180.
         if result == CURLUE_OK {
             // L1174, `memchr(path, '?', pathlen)`: bounded by the length the
             // fragment stage has already reduced, which is precisely what
             // keeps a `?` sitting after the `#` out of the query.
             let searchable = path.get(..pathlen).unwrap_or(path);
             if let Some(queryoff) = searchable.iter().position(|&byte| byte == b'?') {
-                // L1176.
                 let qlen = pathlen.saturating_sub(queryoff);
                 // L1177. The slice again runs past the part and `qlen` stops
                 // at its end, so `handle_query` does the clamping.
                 let query = path.get(queryoff..).unwrap_or_default();
                 result = handle_query(u, query, qlen, flags);
-                // L1178.
                 pathlen = pathlen.saturating_sub(qlen);
             }
         }
@@ -522,7 +517,6 @@ fn parseurl(url: &[u8], u: &mut CurlUrl, flags: c_uint) -> CURLUcode {
         result
     };
 
-    // L1184-L1186.
     if result == CURLUE_OK {
         // L1185, `u->host = curlx_dyn_ptr(&host)`. Ownership of the
         // allocation moves from the buffer to the handle in one step, so
@@ -551,7 +545,6 @@ fn parseurl(url: &[u8], u: &mut CurlUrl, flags: c_uint) -> CURLUcode {
             Some(hostname) => u.store(StringField::Host, hostname),
             None => u.clear(StringField::Host),
         }
-        // L1186.
         return CURLUE_OK;
     }
 
@@ -630,7 +623,6 @@ pub(crate) fn parseurl_and_replace(url: &[u8], u: &mut CurlUrl, flags: c_uint) -
     // three clear flags, which is what every stage assumes on entry.
     let mut tmpurl = CurlUrl::new();
 
-    // L1203.
     let result = parseurl(url, &mut tmpurl, flags);
 
     // L1204-L1207. `replace` is L1205 and L1206 together: dropping the value

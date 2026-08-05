@@ -13,18 +13,31 @@ port, so the record is kept at two levels: a safety comment at every site
 that touches the boundary, and this file. A comment explains one line. This
 file explains the whole chain. Neither one replaces the other.
 
-Two statements about state, so that nothing below is read as a completion
-claim. `rust-urlapi/src/alloc.rs` exists and carries those comments today.
-`rust-urlapi/src/ffi.rs` does not exist yet; every claim in this file about
-what it contains or enforces is a requirement on the module still to be
-written, and is worded as one. The same holds for `rust-urlapi/README.md`,
-which is named below as the intended home of the build material this file
-deliberately leaves out and which is likewise not yet written.
+Two statements about state, so that nothing below is read as more, or less,
+than it is. `rust-urlapi/src/alloc.rs` and `rust-urlapi/src/ffi.rs` both
+exist and both carry the safety comments described here, so every claim in
+this file about what they contain or enforce is a claim about code in the
+tree and is citable by path and line. `rust-urlapi/README.md` is the
+exception: it is named below as the intended home of the build material this
+file deliberately leaves out, and it is not written yet, so the one sentence
+that points at it points at a later deliverable.
 
-Every claim below about existing code cites a path and a line number so that
-a reader can open the source and confirm it rather than take it on trust.
-Build steps, feature tables, prerequisites and script ordering are
-deliberately absent; they belong to `rust-urlapi/README.md`.
+Every path in this file is relative to the repository root, with no
+exceptions, so a file belonging to this crate is written out in full --
+`rust-urlapi/src/alloc.rs`, never a bare `src/alloc.rs`, which at the
+repository root is the command-line tool's directory instead.
+
+Every claim below about existing code cites a path so that a reader can open
+the source and confirm it rather than take it on trust. **Every path is
+relative to the repository root, with no exceptions**, so a file of this
+crate's is written out in full as `rust-urlapi/src/alloc.rs` and never as a
+bare `src/alloc.rs`: the crate and the repository both have a `src/`, a
+`tests/`, an `include/`, a `docs/` and a `scripts/`, and a bare one would be
+ambiguous rather than merely terse. `rust-urlapi/docs/KNOWN-DIVERGENCES.md`
+follows the same rule; `rust-urlapi/docs/PORTING-NOTES.md` states a narrower
+one at its top, because its tables have to be narrower. Build steps, feature
+tables, prerequisites and script ordering are deliberately absent; they belong
+to `rust-urlapi/README.md`.
 
 ## The documented contract
 
@@ -206,26 +219,26 @@ different reasons:
 
 | Ceiling | Value | C locator | Where it applies |
 |---|---:|---|---|
-| `DYN_APRINTF` | 8,000,000 | `lib/curlx/dynbuf.h:L70`, used at `lib/mprintf.c:L1144` | anything built by `curl_maprintf()`, so the formatting and concatenating helpers of `src/alloc.rs` |
+| `DYN_APRINTF` | 8,000,000 | `lib/curlx/dynbuf.h:L70`, used at `lib/mprintf.c:L1144` | anything built by `curl_maprintf()`, so the formatting and concatenating helpers of `rust-urlapi/src/alloc.rs` |
 | `CURL_MAX_INPUT_LENGTH` | 8,000,000 | `lib/urldata.h:L131` | the input a caller hands to `curl_url_set`, and the junk scan |
 | `length * 3 + 1` | derived | `lib/escape.c:L66` | one call of the escape helper, sized from its own input |
 
 The first of these is the one most easily lost in a port, because in C it
 arrives implicitly: a caller writes `curl_maprintf()` and inherits the
-ceiling without naming it. `src/alloc.rs` names it, so its formatting and
-concatenating helpers refuse an oversize result exactly where
+ceiling without naming it. `rust-urlapi/src/alloc.rs` names it, so its
+formatting and concatenating helpers refuse an oversize result exactly where
 `curl_maprintf()` would rather than allocating past it.
 
 The third is worth contrasting with the other two. It is not a policy limit
 at all but a computed exact size, and `lib/escape.c:L63` guards the
-multiply that produces it with `length > SIZE_MAX / 16`. `src/encode.rs`
-reproduces both the guard and the size, and computes the product with
-checked arithmetic besides, because the crate root denies arithmetic that
-could panic.
+multiply that produces it with `length > SIZE_MAX / 16`.
+`rust-urlapi/src/encode.rs` reproduces both the guard and the size, and
+computes the product with checked arithmetic besides, because the crate root
+denies arithmetic that could panic.
 
-Independently of all three, `src/ffi.rs` refuses any allocation above
-`isize::MAX` before it reaches the C allocator. That is not a curl rule but
-a language one: a slice or a pointer offset beyond `isize::MAX` is
+Independently of all three, `rust-urlapi/src/ffi.rs` refuses any allocation
+above `isize::MAX` before it reaches the C allocator. That is not a curl
+rule but a language one: a slice or a pointer offset beyond `isize::MAX` is
 undefined behavior regardless of whether the allocator would have obliged.
 
 ### One owner, four sources
@@ -238,12 +251,13 @@ whichever one ran. All four therefore have to agree on the free function.
 The port keeps that property by giving all four the same owned-buffer type
 from `rust-urlapi/src/alloc.rs`.
 
-In the port the four sit in three modules. `src/getset.rs` performs the
-handover, `src/encode.rs` owns the escape helper, and `src/idn.rs` owns both
-internationalized-domain paths, and the shared type is what makes the single
-release at L1533 portable across all three. The escape helper is the
-one of the four that returns its buffer rather than writing into a caller's,
-so it is also the one whose signature carries the transfer.
+In the port the four sit in three modules. `rust-urlapi/src/getset.rs`
+performs the handover, `rust-urlapi/src/encode.rs` owns the escape helper,
+and `rust-urlapi/src/idn.rs` owns both internationalized-domain paths, and
+the shared type is what makes the single release at L1533 portable across
+all three. The escape helper is the one of the four that returns its buffer
+rather than writing into a caller's, so it is also the one whose signature
+carries the transfer.
 
 ### Buffers the module owns without allocating them
 
@@ -282,16 +296,17 @@ the null check at L1535-L1536.
 
 ## Rules the crate follows
 
-These bind every module of the crate, and downstream work implements against
-them.
+These bind every module of the crate, and every module in the tree is
+written against them today. Each rule names the file that realizes it, so a
+reader can check the rule rather than trust it.
 
 1. **Every buffer whose ownership transfers to C originates in
-   `src/alloc.rs`**, which allocates through the C allocator: it asks
-   `src/ffi.rs` for an owned block, and that module makes the `libc` call. The
-   split keeps every foreign call in one module open to audit without moving
-   the memory adapter, and the property it buys is the same either way -- a
-   caller's `curl_free()` is correct by construction rather than correct by
-   discipline at each of the 27 sites listed above.
+   `rust-urlapi/src/alloc.rs`**, which allocates through the C allocator: it
+   asks `rust-urlapi/src/ffi.rs` for an owned block, and that module makes
+   the `libc` call. The split keeps every foreign call in one module open to
+   audit without moving the memory adapter, and the property it buys is the
+   same either way -- a caller's `curl_free()` is correct by construction
+   rather than correct by discipline at each of the 27 sites listed above.
 2. **`CString::into_raw` is banned crate-wide.** A pointer produced that way
    has to come back to Rust to be released, because the allocator behind it
    belongs to Rust rather than to C. Published guidance is explicit that the
@@ -303,15 +318,30 @@ them.
    library boundary stays possible depending on how the pieces are linked.
    The parity harness therefore links exactly one C library, which removes
    the configuration in which such a mismatch could arise.
-4. **Every assumption above is commented at its site** in `src/alloc.rs` and
-   `src/ffi.rs`. This file is the companion record, not a replacement: a
-   reader at one line needs the comment, and a reviewer checking the whole
-   chain needs the record.
-5. **`src/ffi.rs` is the only module that contains `unsafe`**, and every
-   block in it carries a safety comment. Every other module of the crate
-   carries `#![forbid(unsafe_code)]`, which makes that mechanical rather
-   than a convention. Ownership crosses the boundary in that one file, so
-   the reasoning stays in one place.
+4. **Every assumption above is commented at its site** in
+   `rust-urlapi/src/alloc.rs` and
+   `rust-urlapi/src/ffi.rs`. This file is the companion record, not a
+   replacement: a reader at one line needs the comment, and a reviewer
+   checking the whole chain needs the record.
+5. **`rust-urlapi/src/ffi.rs` is the only module that contains `unsafe`**,
+   and every
+   block in it carries a safety comment. What makes that mechanical rather
+   than a convention is a count that is worth stating exactly: of the 26
+   files under `rust-urlapi/src/`, the 24 that are neither the crate root
+   nor the facade each open with `#![forbid(unsafe_code)]`, so an `unsafe`
+   block added to any of them is a compile error rather than a review
+   finding. The two exceptions are deliberate. `rust-urlapi/src/ffi.rs`
+   cannot forbid what it exists to contain. `rust-urlapi/src/lib.rs` cannot
+   either, because an inner attribute on the crate root reaches every module
+   including the facade; the crate root carries a different policy instead --
+   `deny(clippy::missing_safety_doc)` and
+   `deny(clippy::undocumented_unsafe_blocks)` at
+   `rust-urlapi/src/lib.rs:L331-L332`, and `deny(unsafe_op_in_unsafe_fn)` at
+   its L334 -- which does not ban `unsafe` but does require every
+   block and every `unsafe fn` in the facade to justify itself, and stops
+   an `unsafe fn` body from being implicitly unsafe throughout. Ownership
+   crosses the boundary in that one file, so the reasoning stays in one
+   place.
 
 ## Reported limitation R3: memory-debug builds
 
@@ -397,10 +427,18 @@ The same reasoning applies to the `strerror` feature and
 ## See also
 
 - [KNOWN-DIVERGENCES.md][divergences] records the reproduced findings,
-  among them the two leaks `FB2` and `FB3` whose ownership context this
-  file supplies. It also records the residual divergence this file points
-  at -- that the port does not leak where `FB2` does -- and, marked closed,
-  the confinement of `unsafe` to one module that rule 5 above now states.
+  among them `FB2` and `FB3`, whose ownership context this file supplies.
+  Both are a leak as well as a behavior in the C, and the split matters
+  here: the behavior is reproduced exactly -- three credential parts reading
+  as absent, and a zone identifier that survives a host replacement -- while
+  neither leak is. `CurlUrl::clear` assigns `None` and `CurlUrl::store`
+  assigns `Some(..)`, so in both cases the displaced owned buffer is dropped
+  and its block released through the C allocator it came from. That is
+  invisible to the URL API and moves no answer the parity diff compares, and
+  it is still a real difference, recorded there as a residual divergence
+  rather than filed under "reproduced". The same document records, marked
+  closed, the confinement of `unsafe` to one module that rule 5 above
+  states.
 - [PORTING-NOTES.md][porting] maps the C functions onto the Rust modules.
 
 [divergences]: KNOWN-DIVERGENCES.md

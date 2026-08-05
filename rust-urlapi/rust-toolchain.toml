@@ -43,18 +43,30 @@
 # Cargo.toml and docs/KNOWN-DIVERGENCES.md.
 #
 # The genheader feature is deliberately *not* a second exception, and keeping
-# it that way took two decisions that are easy to undo by accident. cbindgen
-# is depended on with default-features = false, because its only default
-# feature exists for its command-line binary and drags in clap 4.6, which is
-# published as edition 2024 and cannot even be parsed by Cargo 1.75. And the
-# generator's remaining graph is pinned in Cargo.lock to its newest
+# it that way took three decisions that are easy to undo by accident.
+#
+# cbindgen is depended on with default-features = false, because its only
+# default feature exists for its command-line binary and drags in clap 4.6,
+# which is published as edition 2024 and cannot even be parsed by Cargo 1.75.
+#
+# The generator's remaining graph is pinned in Cargo.lock to its newest
 # 1.75-compatible releases -- indexmap 2.11.4, toml 0.9.6 and the toml_*
 # family, serde_spanned 1.0.1, hashbrown 0.16.1, getrandom 0.3.3 -- which is
 # what `cargo update` produces only with
 # CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback set. A plain
 # `cargo update` re-selects 1.85-only versions of exactly those packages and
-# silently breaks the floor. With both in place, every package the host
-# builds under --features genheader compiles on 1.75.
+# silently breaks the floor.
+#
+# And build.rs drives cbindgen in source mode, `Builder::with_src` on
+# src/lib.rs, rather than crate mode. Compiling every package on 1.75 is
+# necessary but not sufficient: crate mode also shells out to
+# `cargo metadata`, which resolves and parses the entire graph -- optional
+# dependencies included -- so a 1.75 Cargo aborts on idna_adapter's edition
+# 2024 manifest even though --features genheader compiles none of the idna
+# line. Source mode never invokes Cargo and emits byte-identical bytes; the
+# generate() documentation in build.rs records the measurement. With all
+# three in place, `cargo +1.75.0 check --locked --features genheader`
+# completes, generation included.
 #
 # Two lockfile entries above 1.75 belong to neither story and are recorded
 # here so they are not mistaken for drift: wasi and wit-bindgen, at 1.82,

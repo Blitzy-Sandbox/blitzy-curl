@@ -121,14 +121,15 @@
 // Reachability here is decided by the feature set and by the consumers, not by
 // this file. `getn_scheme` is the length-delimited entry point that mirrors
 // `Curl_getn_scheme`, and a build whose parser only ever holds NUL-terminated
-// schemes reaches `get_scheme` alone; the drop-in mirror deliberately
-// describes all six fields of `struct Curl_scheme` while reading three, since
-// the three that are read sit *after* the three that are not and cannot be
-// located without them. Warnings are errors for this crate, so rather than let
-// the feature matrix or a sibling module decide whether the build is clean,
-// the allowance is stated once here with its reason. It is scoped to this
-// module and to this lint alone.
-#![allow(dead_code)]
+// schemes reaches `get_scheme` alone; the drop-in mirror deliberately describes
+// all six fields of `struct Curl_scheme` while reading three, since the three
+// that are read sit *after* the three that are not and cannot be located
+// without them.
+//
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // `unsafe` belongs to `src/ffi.rs` alone, and the lint matters more here than
 // in most modules: in drop-in mode the lookup really does cross into libcurl,
 // and keeping that crossing in `crate::ffi::scheme_import` is what lets this
@@ -420,8 +421,11 @@ mod backend {
     /// it answers for whatever libcurl it was linked against. Standalone mode
     /// has no libcurl and therefore has to *model* a build, and the build it
     /// models is the reference build, because that is what the parity harness
-    /// compares against -- `scripts/build-reference.sh` configures OpenSSL,
-    /// libidn2, OpenLDAP and nghttp2, and disables nothing.
+    /// is to compare against: a libcurl configured with OpenSSL, libidn2,
+    /// OpenLDAP and nghttp2 and with nothing disabled.
+    /// `scripts/build-reference.sh` is to produce exactly that configuration
+    /// and is a later deliverable, so the table below is written against those
+    /// options rather than against a script that can yet be read.
     ///
     /// The values below are that configuration, and they are checkable rather
     /// than asserted: the reference build's own `curl --version` reports
@@ -1316,8 +1320,10 @@ mod backend {
 /// Note what is *not* imported anywhere: a definition of `Curl_get_scheme`.
 /// The crate declares it and libcurl defines it, so the archive must show the
 /// symbol as undefined rather than defined, or the drop-in link acquires a
-/// duplicate of a symbol `lib/url.c` already provides and
-/// `scripts/check-abi.sh` reports an export the C object file does not have.
+/// duplicate of a symbol `lib/url.c` already provides and the archive exports
+/// something the C object file does not. `nm -u` over the archive is what
+/// confirms that today; `scripts/check-abi.sh` is to automate it and is a
+/// later deliverable.
 #[cfg(not(feature = "scheme-table"))]
 use crate::ffi::scheme_import as backend;
 

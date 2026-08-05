@@ -163,27 +163,26 @@
 //! # Verification
 //!
 //! The tests at the foot of this file pin every boundary named above against
-//! `lib/urlapi.c` and against the rows of `tests/libtest/lib1560.c` they
-//! come from. They are not the last word: end-to-end verification is the
-//! parity run, which compiles the unmodified `tests/libtest/lib1560.c`
-//! against this crate and diffs its output against the same test linked with
-//! the C implementation, driven by `rust-urlapi/scripts/run-parity.sh`.
+//! `lib/urlapi.c` and against the rows of `tests/libtest/lib1560.c` they come
+//! from, and they are what this file can check on its own.
+//!
+//! They are not intended to be the last word. The end-to-end oracle is the
+//! unmodified `tests/libtest/lib1560.c` compiled against the reference C
+//! library and against this crate, with the two outputs diffed byte for byte.
+//! The script that is to drive that comparison,
+//! `rust-urlapi/scripts/run-parity.sh`, is a later deliverable and does not
+//! exist yet, so nothing here should be read as a claim that it has run.
 
-// Reachability here is decided by two modules, in both cases through the
-// pipeline rather than directly: `src/ffi.rs` re-exports `is_absolute_url` to
-// C as `Curl_is_absolute_url`, and `src/parse/mod.rs` calls all three
-// functions in the order `parseurl` calls them. Both consumers are
-// unconditional -- no feature setting removes either -- so once the module
-// tree reaches this file, nothing here is dead.
+// Reachability here is decided by two modules: `src/ffi.rs` re-exports
+// `is_absolute_url` to C as `Curl_is_absolute_url`, and `src/parse/mod.rs`
+// calls all three functions in the order `parseurl` calls them. Both consumers
+// exist and are unconditional -- no feature setting removes either -- so
+// nothing in this file is unreached.
 //
-// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
-// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
-// checkpoint that creates src/getset.rs, and replaced there by one crate-level
-// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
-// src/getset.rs exist, most of this crate has no consumer, and a crate held to
-// zero warnings cannot build clean without this. Scoped to this module and to
-// this lint alone.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a
@@ -230,9 +229,11 @@ const MAX_ACCEPTED_SLASHES: usize = 3;
 ///
 /// `lib/urlapi.c` L989-L1000, one row per `checkprefix` arm. The order is
 /// preserved because the C chain is `else if` throughout, so the first match
-/// wins; as it happens no two prefixes here can both match one host name, so
-/// the order is not currently observable, and it is kept anyway rather than
-/// sorted, so the table can be diffed against the C line for line.
+/// wins. The six prefixes differ in their first byte, so no host name can
+/// match two of them and the first-match rule decides nothing here; the C's
+/// order is kept rather than sorted so that the table can be diffed against
+/// L989-L1000 line for line, and so that adding a seventh row cannot change
+/// what the existing six answer.
 ///
 /// The trailing dot belongs to the prefix. Without it `smtp/path/html` would
 /// guess `smtp`, and `tests/libtest/lib1560.c` L740-L742 requires `http`.
@@ -318,8 +319,14 @@ fn starts_with_drive_prefix(url: &[u8]) -> bool {
 ///   `lib/urlapi.c` L1713 asks only whether the input is absolute and has
 ///   nowhere to put a scheme. `parseurl` at L1128 passes a 41-byte buffer.
 ///   When present, the buffer must hold more than `MAX_SCHEME_LEN` bytes,
-///   which is the release-build content of the `DEBUGASSERT` at L186 and is
-///   `src/ffi.rs`'s obligation to honor.
+///   which is the release-build content of the `DEBUGASSERT` at L186. Both
+///   callers that supply one owe that: `src/parse/mod.rs`'s port of `parseurl`
+///   sizes its `SCHEMEBUF_LEN` array to `MAX_SCHEME_LEN + 1` to satisfy it,
+///   and `src/ffi.rs` carries it as a documented precondition on
+///   `Curl_is_absolute_url`, whose `buflen` comes from a C caller this crate
+///   cannot see. A shorter buffer is never unsound here -- every write below
+///   is bounds-checked -- but it truncates the scheme and skips the
+///   terminator, so honoring the contract remains the caller's job.
 /// - `guess_scheme`: whether the caller might be looking at an input with no
 ///   scheme at all. `parseurl` derives it at L1128-L1130 as
 ///   `flags & (CURLU_GUESS_SCHEME | CURLU_DEFAULT_SCHEME)`, a masked flag
@@ -428,10 +435,8 @@ pub(crate) fn is_absolute_url(url: &[u8], mut buf: Option<&mut [u8]>, guess_sche
                 *slot = 0;
             }
         }
-        // L217.
         return i;
     }
-    // L219.
     0
 }
 
@@ -594,7 +599,6 @@ pub(crate) fn parse_scheme(
         let stored = CBuf::from_slice(bytes).ok_or(CURLUE_OUT_OF_MEMORY)?;
         handle.store(StringField::Scheme, stored);
     }
-    // L981.
     Ok(hostp)
 }
 
@@ -654,7 +658,6 @@ pub(crate) fn guess_scheme(handle: &mut CurlUrl, hostname: &[u8]) -> Result<(), 
     // has succeeded, so the two never disagree.
     handle.set_guessed_scheme(true);
 
-    // L1009.
     Ok(())
 }
 

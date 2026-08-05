@@ -35,11 +35,13 @@
 //! and change 33 numbers at once without producing a single compiler error.
 //! An explicit constant cannot drift, and a wrong one is visible in a diff.
 //!
-//! Second, the values are asserted twice rather than merely written once.
-//! `src/lib.rs` asserts them at compile time and
-//! `rust-urlapi/tests/abi_constants.rs` asserts every one of them again at
-//! run time. The small `tests` module at the end of this file is the fast
-//! local check, not a substitute for either.
+//! Second, the values are asserted rather than merely written once.
+//! `src/lib.rs` asserts every one of them at compile time, which is the check
+//! in force, and the small `tests` module at the end of this file is the fast
+//! local one. A second, run-time pass over the same set is to live in
+//! `rust-urlapi/tests/abi_constants.rs`; that file is a later deliverable and
+//! does not exist yet, so nothing here should be read as saying it already
+//! rechecks these values.
 //!
 //! # The header is the only authority
 //!
@@ -57,20 +59,16 @@
 //! constants, one companion spelling of `DEFAULT_SCHEME`, and no more.
 
 // Reachability here is decided entirely by the consumers. This module is the
-// crate's foundation and depends on nothing, so every constant in it is dead
-// until a sibling reads it; the 33 result codes and the 11 part identifiers
-// are read by `src/ffi.rs` and `src/getset.rs` in particular. Measured: with
-// `src/lib.rs` declaring `mod abi;` privately, as the plan's module tree at
-// AAP 0.4.3 does, this module alone accounts for 32 dead-code warnings.
+// crate's foundation and depends on nothing: `src/ffi.rs` and `src/getset.rs`
+// read the 33 result codes and the 11 part identifiers, `src/getset.rs` and
+// the stages under `src/parse/` read the flag bits, and `src/lib.rs` re-checks
+// every value at compile time. `src/lib.rs` declares this module `pub mod abi;`
+// so that an integration test can name the constants as well.
 //
-// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
-// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
-// checkpoint that creates src/getset.rs, and replaced there by one crate-level
-// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
-// src/getset.rs exist, most of this crate has no consumer, and a crate held to
-// zero warnings cannot build clean without this. Scoped to this module and to
-// this lint alone.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a

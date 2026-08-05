@@ -102,32 +102,43 @@ source list."
    job is to be bound-correct.
 
    Declared as a hard error rather than left to prose, because prose in a
-   comment cannot stop a build. The test is narrow on purpose and accepts
-   every configuration that actually works:
+   comment cannot stop a build. The __STDC_VERSION__ guard higher up this
+   file is the whole test, and what it admits was measured with gcc 15.2.0
+   rather than reasoned about:
 
-     -std=c89     __STRICT_ANSI__ defined, __STDC_VERSION__ undefined
-                  => rejected here, which is the case that would otherwise
-                  be undefined behavior.
-     -std=gnu89   __STRICT_ANSI__ NOT defined, so glibc still declares
-                  vsnprintf through _DEFAULT_SOURCE => accepted, and it
-                  compiles clean. Measured, not assumed.
+     -std=c89     __STDC_VERSION__ undefined => rejected, which is the one
+                  case that would otherwise be undefined behavior: the same
+                  call compiled as C89 draws "implicit declaration of
+                  function vsnprintf", measured.
+     -std=gnu89   __STDC_VERSION__ undefined => rejected as well. glibc
+                  does declare vsnprintf in that dialect, and the call
+                  compiles clean there, measured -- so this rejection is a
+                  decision rather than a necessity. A bound-correctness
+                  guarantee resting on which C library happens to be in
+                  front of the compiler, instead of on the language
+                  standard, is not one this file is willing to make.
      -std=c99 and later, and the compiler default => accepted.
+     MSVC 2015 and newer => accepted through that guard's _MSC_VER arm,
+                  for the reason given above it.
 
-   The requirement also belongs on the command line that compiles this file,
-   which is ../GNUmakefile's and ../scripts/'s to state; the guard is what
-   makes a build file that forgets it fail here instead of silently.
+   The requirement also belongs on the command line that compiles this file.
+   ../GNUmakefile and ../scripts/ are the deliverables that are to state it,
+   and neither exists yet, so today it is stated by the hand-written compile
+   line; the guard is what makes any caller that forgets it -- a build file
+   or a person -- fail here instead of silently.
 
    No C89 fallback is offered, and that is a decision. Bounded formatting
    without vsnprintf means formatting into an oversized buffer with vsprintf
    and hoping, which is precisely the unbounded-sprintf hazard the note below
-   the definitions declines to supply. A loud error beats a quiet overflow. */
-#if defined(__STRICT_ANSI__) && \
-  (!defined(__STDC_VERSION__) || (__STDC_VERSION__ < 199901L))
-#error "shims.c requires C99 or later, or a GNU dialect that still declares \
-vsnprintf. Compile this file with -std=c99 (or newer, or -std=gnu89): C89 \
-does not declare vsnprintf, and curl_mvsnprintf below would silently get an \
-implicit int declaration."
-#endif
+   the definitions declines to supply. A loud error beats a quiet overflow.
+
+   One guard, not two. An earlier revision of this file added a second
+   #error keyed on __STRICT_ANSI__ here, described as a narrower test that
+   let -std=gnu89 through. It never could: the guard above already rejects
+   every dialect that leaves __STDC_VERSION__ below 199901L, gnu89 included,
+   and a c89 compilation was measured to stop at that first guard's message.
+   The second test was therefore unreachable and its description wrong, so
+   it is gone rather than explained. */
 
 /* curl_mprintf writes to stdout and curl_mfprintf honors whatever FILE *
    it is handed, exactly as lib/mprintf.c:L1194-L1202 and L1204-L1212 do.
@@ -210,9 +221,13 @@ int curl_msnprintf(char *buffer, size_t maxlength, const char *format, ...)
    curl_mvsprintf at L69-L70 write into a buffer with no bound at all, and
    the allocating pair, curl_maprintf at L74-L75 and curl_mvaprintf at
    L76-L77, hands back memory the caller must release. Nothing in this
-   harness reaches for any of the four: tests/libtest/lib1560.c uses only
-   the six defined above, and rust-urlapi/demo/urlapi_demo.c follows
-   docs/examples/urlapi.c, which formats with the C library directly.
+   harness reaches for any of the four: tests/libtest/lib1560.c calls only
+   curl_mprintf, curl_mfprintf and curl_msnprintf, all three defined above,
+   and rust-urlapi/demo/urlapi_demo.c calls no curl_m* name at all -- it
+   formats with printf from the C library, as docs/examples/urlapi.c does,
+   and ../demo/.checksrc bans all ten names include/curl/mprintf.h declares
+   so that a later edit reaching for one is caught by the lint before the
+   linker. Both statements were checked against those files, not assumed.
    Leaving them out turns any unmet need into a loud undefined-symbol link
    error instead of a quiet change in behavior, and declining to supply an
    unbounded sprintf wrapper is a deliberate hygiene choice rather than an

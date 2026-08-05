@@ -126,19 +126,13 @@
 // `unsafe` belongs to `src/ffi.rs` alone; the lint keeps a future edit from
 // reintroducing one here without deleting this line first.
 #![forbid(unsafe_code)]
-// Reachability here is decided by one consumer that does not exist yet.
-// `lib/urlapi.c` L433-L435 is the only caller of this pair, and it belongs to
-// `src/parse/ipv6.rs`; until that module lands, both entry points and every
-// constant they share are unreached.
+// Reachability here is decided by one consumer. `lib/urlapi.c` L433-L435 is the
+// only caller of this pair, and it belongs to `src/parse/ipv6.rs`, which calls
+// both entry points from its bracketed-address normalisation.
 //
-// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
-// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
-// checkpoint that creates src/getset.rs, and replaced there by one crate-level
-// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
-// src/getset.rs exist, most of this crate has no consumer, and a crate held to
-// zero warnings cannot build clean without this. Scoped to this module and to
-// this lint alone.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
 
 use libc::c_int;
 
@@ -218,12 +212,19 @@ pub(crate) const PTON_ERROR: c_int = -1;
 // build.
 //
 // The assertions are gathered into one block so that a single allow covers
-// them. Clippy releases up to and including 1.75 report every constant
-// assertion as optimized-out, which for a `const` block is the opposite of
-// what happens: it is evaluated at compile time and nothing survives to be
-// optimized. Later clippy exempts const contexts, so this is a
-// compatibility allow with the crate's declared minimum toolchain rather
-// than a suppressed finding.
+// them.
+//
+// About the allow, measured on the pinned toolchain rather than assumed:
+// clippy 1.97 fires this lint only when the asserted condition is a literal or
+// a named `bool` constant, so a comparison of two named numeric constants is
+// not reported and removing the attribute here is currently silent -- checked,
+// by removing it. It is kept deliberately all the same, for two reasons. The
+// crate declares a 1.75 minimum that cannot be exercised from this toolchain,
+// and this lint's handling of `const` contexts has moved across releases; and
+// the lint's own advice, "remove the assertion", is the opposite of what a
+// compile-time check like this exists for. So it is a deliberate, scoped
+// exception, not a finding silenced to keep a build quiet. The other six sites
+// in this crate carry the same allow for the same reason and point here.
 #[allow(clippy::assertions_on_constants)]
 const _: () = {
     assert!(PTON_SUCCESS == 1);
@@ -503,7 +504,6 @@ mod fallback {
             // through what C types as `void *`, so a wider destination is
             // exactly as acceptable here as it is there.
             AF_INET => pton4(src, dst),
-            // L212-L213.
             AF_INET6 => pton6(src, dst),
             // L214-L216, which sets `EAFNOSUPPORT` and returns -1. The
             // errno write is not reproduced: nothing in the URL API reads
@@ -566,7 +566,6 @@ mod fallback {
                 if saw_digit && current == 0 {
                     return PTON_INVALID;
                 }
-                // L79-L80.
                 let Some(value) = value else {
                     return PTON_INVALID;
                 };
@@ -593,7 +592,6 @@ mod fallback {
                 *slot = 0;
                 saw_digit = false;
             } else {
-                // L94-L95.
                 return PTON_INVALID;
             }
         }
@@ -630,7 +628,6 @@ mod fallback {
     /// [RFC 1884 2.2]: https://www.rfc-editor.org/rfc/rfc1884#section-2.2
     fn pton6(src: &[u8], dst: &mut [u8; ADDRSZ_IPV6]) -> c_int {
         // The address ends at the first zero byte, as the C string does at
-        // L132.
         let text = match src.iter().position(|byte| *byte == 0) {
             Some(nul) => src.get(..nul),
             None => Some(src),
@@ -656,7 +653,6 @@ mod fallback {
             }
         }
 
-        // L129-L131.
         let mut curtok = pos;
         let mut saw_xdigit = 0u32;
         let mut value = 0u32;
@@ -683,7 +679,6 @@ mod fallback {
                 continue;
             }
             if ch == b':' {
-                // L140-L154.
                 curtok = pos;
                 if saw_xdigit == 0 {
                     // A second `::` is not allowed; the first one records
@@ -694,7 +689,6 @@ mod fallback {
                     colonp = Some(tp);
                     continue;
                 }
-                // L148-L149.
                 if tp.wrapping_add(GROUPSZ) > endp {
                     return PTON_INVALID;
                 }
@@ -727,7 +721,6 @@ mod fallback {
                     }
                 }
             }
-            // L162.
             return PTON_INVALID;
         }
 
@@ -926,7 +919,6 @@ mod fallback {
                     continue;
                 }
             }
-            // L148-L151.
             if index != 0 {
                 len = push_byte(&mut tmp, len, b':')?;
             }

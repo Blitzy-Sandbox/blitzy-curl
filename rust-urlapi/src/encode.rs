@@ -137,12 +137,14 @@
 //! ownership chain.
 
 // The consumers of this module are `src/getset.rs`, `src/parse/path.rs`,
-// `src/parse/query.rs` and `src/parse/redirect.rs`, and which of them a
-// given build compiles depends on the selected feature set. Warnings are
-// errors for this crate, so the allowance is stated once, here, with its
-// reason, exactly as `src/alloc.rs` does at its own line 226 and
-// `src/dynbuf.rs` at 139. It is scoped to this module and to this one lint.
-#![allow(dead_code)]
+// `src/parse/query.rs` and `src/parse/redirect.rs`, all of which exist and all
+// of which are compiled unconditionally. Which individual helpers a given build
+// reaches still depends on the selected feature set.
+//
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` (AAP 0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1). This
 // module needs none: the `DynBuf` API is shaped so that an encoder can be
@@ -377,7 +379,6 @@ pub(crate) fn urlencode_str(
     let mut remaining = len;
 
     if !relative {
-        // L142.
         let sep = find_host_sep(url);
         // L145-L146: `n = host_sep - url` and then one append of the whole
         // prefix, unexamined. `find_host_sep` cannot exceed the slice, so the
@@ -407,7 +408,6 @@ pub(crate) fn urlencode_str(
         // order matters: a space is `0x20`, which is not below `' '`, so the
         // first arm is the only thing that keeps a space out of the second.
         let result = if byte == b' ' {
-            // L151-L156.
             if left {
                 o.addn(b"%20")
             } else {
@@ -444,7 +444,6 @@ pub(crate) fn urlencode_str(
         }
     }
 
-    // L171.
     CURLUE_OK
 }
 
@@ -579,7 +578,6 @@ pub(crate) fn encode_part(
     // L1890: `for(i = (const unsigned char *)part; *i; i++)`.
     for &byte in cstring_window(part) {
         if byte == b' ' && plusencode {
-            // L1892-L1896.
             let result = enc.addn(b"+");
             if result.is_err() {
                 // L1895, verbatim: this one branch does not fold through
@@ -590,7 +588,6 @@ pub(crate) fn encode_part(
             || (pathmode && allowed_in_path(byte))
             || (byte == b'=' && equalsencode)
         {
-            // L1897-L1906.
             if byte == b'=' && equalsencode {
                 // L1900-L1902: only skip the first equals sign.
                 equalsencode = false;
@@ -710,7 +707,6 @@ pub(crate) fn lowercase_escapes(buf: &mut [u8]) {
                 }
                 idx = idx.saturating_add(3);
             }
-            // L1930-L1931.
             None => idx = idx.saturating_add(1),
         }
     }
@@ -847,7 +843,6 @@ fn escape_all(window: &[u8]) -> Option<DynBuf> {
     // is for.
     for &byte in window {
         let result = if is_unreserved(byte) {
-            // L72-L76.
             escaped.addn(&[byte])
         } else {
             // L77-L83. Upper-case hexadecimal, destructured rather than
@@ -1661,13 +1656,16 @@ mod tests {
     /// because `Curl_junkscan()` has already capped the input at
     /// `CURL_MAX_INPUT_LENGTH`.
     ///
-    /// Clippy releases up to and including 1.75, the crate's declared minimum,
-    /// report a constant assertion as optimized out even in a `const` item,
-    /// where it is the opposite of what happens: the expression is evaluated at
-    /// compile time and nothing survives to optimize. Later releases exempt
-    /// const contexts. The allow is therefore a compatibility allow with the
-    /// declared floor, spelled the same way `src/inet.rs`, `src/ffi.rs` and
-    /// `src/parse/ipv6.rs` spell theirs, and not a suppressed finding.
+    /// The allow is spelled the same way `src/inet.rs`, `src/ffi.rs` and
+    /// `src/parse/ipv6.rs` spell theirs, and `src/inet.rs` carries the measured
+    /// account of it. In short: on the pinned toolchain, clippy 1.97, the lint
+    /// fires only for a literal or a named `bool` condition, so the comparison
+    /// below is not reported and dropping the attribute would currently be
+    /// silent. It is retained deliberately -- the crate declares a 1.75 minimum
+    /// this toolchain cannot exercise, and the lint's own advice, "remove the
+    /// assertion", is the opposite of what a compile-time check is for. A
+    /// scoped exception, then, not a suppressed finding, and not a claim about
+    /// what later releases do.
     #[allow(clippy::assertions_on_constants)]
     const CEILING_IS_ABOVE_THE_URL_API_LIMIT: () =
         assert!(MAX_ESCAPE_INPUT > CURL_MAX_INPUT_LENGTH);

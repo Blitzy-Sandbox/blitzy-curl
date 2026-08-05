@@ -43,7 +43,7 @@
 //! | 3 | `idn2`, the libidn2 binding | `src/idn.rs` |
 //! | 4 | `scheme_import`, libcurl's own `Curl_get_scheme` | `src/scheme.rs` |
 //! | 5 | `test_locale`, the locale and codeset probes | `src/idn.rs` tests |
-//! | 6 | `exports`, the ten exported C-linkage symbols | the C side |
+//! | 6 | `exports`, the C-linkage symbols: eight unconditional plus two feature-gated | the C side |
 //!
 //! Sections 2 through 5 are each selected by a configuration switch, so which
 //! of them a given build contains depends on the target and the feature set;
@@ -59,9 +59,13 @@
 //! together with the two feature-gated ones, `curl_url_strerror` and
 //! `curl_free`, which exist for the standalone link and **must be off in
 //! drop-in mode** because `strerror.c.o` and `escape.c.o` already define
-//! them. That is the whole set: `scripts/check-abi.sh` compares it against
-//! the C object's, and nothing else in the crate carries `#[no_mangle]`
-//! outside `#[cfg(test)]`, which is what keeps the archive collision-free.
+//! them. That is the whole set, and nothing else in the crate carries
+//! `#[no_mangle]` outside `#[cfg(test)]`, which is what keeps the archive
+//! collision-free. `scripts/check-abi.sh` is to compare the archive's set
+//! against the C object's; it is a later deliverable and does not exist yet,
+//! so for now `nm -g --defined-only` over both artifacts is the check, and it
+//! has to disregard the compiler-builtins and Rust-runtime symbols the
+//! staticlib carries alongside this crate's own.
 //!
 //! Every one of the ten is a thin skin: it validates the pointers, converts
 //! the representations, and delegates. `src/getset.rs` owns the get and set
@@ -70,12 +74,14 @@
 //! file.
 //!
 //! Because the skin is all this file contributes, the skin is what its own
-//! tests exercise: the `c_surface` module at the bottom calls all ten symbols
-//! through their C signatures, raw pointers and integer codes only, including
-//! every null precondition and the two error paths that deliberately leave the
-//! caller's out-parameter untouched. `rust-urlapi/tests/ffi_surface.rs` drives
-//! the same symbols from outside the crate, and `tests/libtest/lib1560.c`,
-//! compiled unmodified and linked in both modes, is the authority over both.
+//! tests exercise: the `c_surface` module at the bottom calls every symbol
+//! this file defines through its C signature, raw pointers and integer codes
+//! only, including every null precondition and the two error paths that
+//! deliberately leave the caller's out-parameter untouched. Over that,
+//! `tests/libtest/lib1560.c`, compiled unmodified and linked in both modes, is
+//! the authority: it drives the same symbols as an ordinary C caller does,
+//! which is the only oracle that exercises the real ABI rather than a Rust
+//! call to the same function.
 //!
 //! # Memory ownership, in one place
 //!
@@ -126,13 +132,12 @@
 // Section 1 is a deliberately complete allocator adapter, so that no other
 // module ever has a reason to reach past `src/alloc.rs` to the C allocator
 // directly. Completeness and use are different things: which primitives are
-// reachable depends on the selected feature set and on how much of the crate
-// exists yet, and `curl_free` in particular is called only from the
-// `cfree`-gated export. Warnings are errors for this crate, so rather than
-// let the feature matrix decide whether the build is clean, the allowance is
-// stated once here with its reason. It is scoped to this module and to this
-// lint alone.
-#![allow(dead_code)]
+// reachable depends on the selected feature set, and `curl_free` in particular
+// is called only from the `cfree`-gated export.
+//
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
 
 use core::fmt;
 use core::mem;
@@ -177,8 +182,8 @@ pub(crate) const MAX_ALLOC: usize = isize::MAX as usize;
 /// The caller owns the returned block and must release it with [`c_free`], or
 /// hand it to C, which then owes a `curl_free()` on it. Nothing else tracks
 /// it. The block is uninitialized: read it only after writing it. Prefer
-/// [`CBlock::zeroed`], whose block is initialized and whose release cannot be
-/// forgotten.
+/// [`CBlock::alloc`], which tracks how much of the block has been written and
+/// whose release cannot be forgotten.
 ///
 /// # Returns
 ///
@@ -273,12 +278,20 @@ pub(crate) fn c_calloc(nmemb: usize, size: usize) -> *mut c_void {
 ///
 /// # Returns
 ///
-/// A null pointer if the reallocation fails, or if `size` is zero. The zero
-/// case is rejected rather than forwarded because C's answer to
-/// `realloc(p, 0)` is implementation-defined, and in the reading where it
-/// frees `p` and returns null the caller cannot distinguish that from a
-/// failure that left `p` alive. Rejecting it keeps the failure contract above
-/// unambiguous: a null return always means `p` is untouched.
+/// A null pointer if the reallocation fails, if `size` is zero, or if `size`
+/// exceeds [`MAX_ALLOC`]. The zero case is rejected rather than forwarded
+/// because C's answer to `realloc(p, 0)` is implementation-defined, and in the
+/// reading where it frees `p` and returns null the caller cannot distinguish
+/// that from a failure that left `p` alive. Rejecting it keeps the failure
+/// contract above unambiguous: a null return always means `p` is untouched.
+///
+/// The [`MAX_ALLOC`] ceiling is the same one [`c_malloc`] and [`c_calloc`]
+/// apply, and it is applied here for the same reason and so that every raw
+/// entry point in this module agrees on what a representable block is: a block
+/// larger than `isize::MAX` can never be viewed as a Rust slice, so accepting
+/// one would only defer the failure to the first use of the result. Refusing it
+/// here also leaves the old block intact, which is the outcome the caller can
+/// actually recover from.
 ///
 /// # Safety
 ///
@@ -289,7 +302,7 @@ pub(crate) fn c_calloc(nmemb: usize, size: usize) -> *mut c_void {
 /// when the two sides do not share an allocator, is undefined behavior.
 #[must_use = "discarding this leaks the new block and loses the old"]
 pub(crate) unsafe fn c_realloc(p: *mut c_void, size: usize) -> *mut c_void {
-    if size == 0 {
+    if size == 0 || size > MAX_ALLOC {
         return ptr::null_mut();
     }
     // SAFETY: the caller guarantees, per the contract above, that `p` is null
@@ -394,34 +407,46 @@ pub(crate) unsafe fn curl_free(p: *mut c_void) {
 ///
 /// # Invariants
 ///
-/// Every live value satisfies all four of the following, and every method
+/// Every live value satisfies all five of the following, and every method
 /// below both assumes and re-establishes them:
 ///
 /// 1. `ptr` is non-null and points at a block from this module's allocator
 ///    that this value alone owns.
 /// 2. `cap` is at least 1 and is exactly the size of that block.
-/// 3. **All `cap` bytes are initialized.** This is the invariant that makes
-///    [`CBlock::bytes`] and [`CBlock::bytes_mut`] sound, and it is why
-///    creation goes through `calloc` rather than `malloc` and why
-///    [`CBlock::resize`] zeroes whatever it newly exposes.
-/// 4. `Drop` is the only release, unless [`CBlock::into_raw`] moved the
+/// 3. `init` is at most `cap`.
+/// 4. **The `init` bytes `[0, init)` are initialized.** Nothing is promised
+///    about `[init, cap)`. This is the invariant that makes
+///    [`CBlock::bytes`] and [`CBlock::bytes_mut`] sound, and it is why those
+///    two return a slice of `init` bytes rather than of `cap` bytes.
+/// 5. `Drop` is the only release, unless [`CBlock::into_raw`] moved the
 ///    obligation to C first.
 ///
-/// # Why zeroed rather than uninitialized
+/// # Why an initialized prefix rather than a zeroed block
 ///
 /// Forming a `&[u8]` or `&mut [u8]` over uninitialized memory is undefined
-/// behavior, whether or not the reference is read. A block whose whole
-/// capacity is initialized has no such problem, so the slice faces below need
-/// no `MaybeUninit` ceremony and no caller has to track a separate
-/// initialized-prefix length. The cost is one pass of zeroing per allocation
-/// and per growth, which is the same order as the copy `realloc` already
-/// performs, and the plan is explicit at 0.8.5 that correctness comes before
-/// performance here: there is no throughput target.
+/// behavior, whether or not the reference is read. There are two ways to
+/// avoid it: zero the whole capacity up front, or track how much of it has
+/// been written and hand out only that much. This type does the second,
+/// because the first is not what the C does.
 ///
-/// The C original has the opposite bias and it shows: `dyn_nappend()` leaves
-/// everything above the content uninitialized, and `lib/urlapi.c` relies on
-/// the terminator slot alone being written. Nothing observable depends on the
-/// bytes above the terminator, so zeroing them changes no behavior.
+/// `curlx_memdup0` at `lib/curlx/strdup.c:L85-L96` calls `malloc`, copies the
+/// live bytes and writes one terminator. `dyn_nappend()` at
+/// `lib/curlx/dynbuf.c:L104-L117` calls `realloc`, copies the appended bytes
+/// and writes one terminator; everything above the content stays
+/// uninitialized. Zeroing the capacity instead would add a write of every
+/// byte of every allocation and of every newly exposed byte of every growth
+/// -- writes the original never performs, on memory no reader can observe.
+/// The plan puts correctness before performance at 0.8.5, and this
+/// arrangement gives up neither: the prefix is tracked in one field, the two
+/// slice faces are bounded by it, and the only way to extend it is
+/// [`CBlock::put`], [`CBlock::put_byte`] or [`CBlock::push`], each of which
+/// writes the bytes it accounts for.
+///
+/// The one place C does zero is the handle allocation, `calloc` at
+/// `lib/urlapi.c:L1290` and `L1312`, and that path does not go through this
+/// type at all: it is [`c_calloc`] in `new_handle`, which is where the port
+/// keeps it so the allocator calls `tests/data/test1560` counts stay the
+/// same.
 ///
 /// # Ownership
 ///
@@ -436,10 +461,18 @@ pub(crate) struct CBlock {
     ptr: *mut c_char,
     /// Size of the whole block in bytes. At least 1.
     cap: usize,
+    /// Length of the initialized prefix. Bytes `[0, init)` are initialized;
+    /// bytes `[init, cap)` may not be. At most `cap`.
+    init: usize,
 }
 
 impl CBlock {
-    /// Allocates `cap` zeroed bytes.
+    /// Allocates `cap` bytes, none of them initialized.
+    ///
+    /// `malloc`, which is what `curlx_memdup0` and `dyn_nappend()` use. The
+    /// block starts with an empty initialized prefix, so
+    /// [`CBlock::bytes`] returns an empty slice until something is written
+    /// through [`CBlock::put`], [`CBlock::put_byte`] or [`CBlock::push`].
     ///
     /// # Returns
     ///
@@ -448,28 +481,38 @@ impl CBlock {
     /// would then be a lie about what the caller asked for; callers that want
     /// room for a terminator ask for it explicitly.
     #[must_use]
-    pub(crate) fn zeroed(cap: usize) -> Option<Self> {
+    pub(crate) fn alloc(cap: usize) -> Option<Self> {
+        // `c_malloc` already refuses zero and anything above `MAX_ALLOC`; the
+        // test is repeated here so the guarantee is local to this function
+        // rather than inherited from a helper a reader has to go and check.
         if cap == 0 || cap > MAX_ALLOC {
             return None;
         }
-        let raw = c_calloc(cap, 1);
+        let raw = c_malloc(cap);
         if raw.is_null() {
             return None;
         }
         Some(Self {
             ptr: raw.cast::<c_char>(),
             cap,
+            init: 0,
         })
     }
 
-    /// The size of the block in bytes, which is also the length of the slices
-    /// [`CBlock::bytes`] and [`CBlock::bytes_mut`] return.
+    /// The size of the block in bytes, terminator slot and spare included.
     #[must_use]
     pub(crate) const fn capacity(&self) -> usize {
         self.cap
     }
 
-    /// The whole block, borrowed immutably.
+    /// The length of the initialized prefix, which is also the length of the
+    /// slices [`CBlock::bytes`] and [`CBlock::bytes_mut`] return.
+    #[must_use]
+    pub(crate) const fn initialized(&self) -> usize {
+        self.init
+    }
+
+    /// The initialized prefix, borrowed immutably.
     ///
     /// # Ownership
     ///
@@ -479,16 +522,21 @@ impl CBlock {
     #[must_use]
     pub(crate) fn bytes(&self) -> &[u8] {
         // SAFETY: invariant 1 gives a non-null pointer to a live block,
-        // invariant 2 makes that block exactly `self.cap` bytes, and invariant
-        // 3 says every one of them is initialized, so the slice lies inside
-        // the allocation and reads only initialized memory. `u8` has an
-        // alignment of one, which any pointer satisfies. The lifetime is tied
-        // to `&self`, so the slice cannot outlive the block and the borrow
-        // checker rules out a concurrent mutable view.
-        unsafe { slice::from_raw_parts(self.ptr.cast::<u8>(), self.cap) }
+        // invariants 2 and 3 put `self.init` bytes inside that block, and
+        // invariant 4 says every one of them is initialized, so the slice
+        // lies inside the allocation and reads only initialized memory. `u8`
+        // has an alignment of one, which any pointer satisfies. The lifetime
+        // is tied to `&self`, so the slice cannot outlive the block and the
+        // borrow checker rules out a concurrent mutable view.
+        unsafe { slice::from_raw_parts(self.ptr.cast::<u8>(), self.init) }
     }
 
-    /// The whole block, borrowed mutably.
+    /// The initialized prefix, borrowed mutably.
+    ///
+    /// Editing in place is all this permits; it cannot grow the prefix, which
+    /// is what keeps invariant 4 true no matter what a caller does with the
+    /// slice. Use [`CBlock::put`], [`CBlock::put_byte`] or [`CBlock::push`]
+    /// to write bytes above it.
     ///
     /// # Ownership
     ///
@@ -499,16 +547,121 @@ impl CBlock {
     pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: the reasoning of `bytes`, with a unique borrow. `&mut self`
         // guarantees no other reference to these bytes exists, so handing out
-        // a `&mut [u8]` over them creates no aliasing, and invariant 3 lets
+        // a `&mut [u8]` over them creates no aliasing, and invariant 4 lets
         // the caller read as well as write every byte in range.
-        unsafe { slice::from_raw_parts_mut(self.ptr.cast::<u8>(), self.cap) }
+        unsafe { slice::from_raw_parts_mut(self.ptr.cast::<u8>(), self.init) }
     }
 
-    /// Resizes the block, zeroing anything newly exposed.
+    /// Copies `src` into the block at `offset`, extending the initialized
+    /// prefix to cover it.
+    ///
+    /// The `memcpy` of `curlx_memdup0` at `lib/curlx/strdup.c:L93` and of
+    /// `dyn_nappend()` at `lib/curlx/dynbuf.c:L115`, with the two conditions
+    /// that keep this type's invariants explicit rather than assumed.
+    ///
+    /// # Returns
+    ///
+    /// `true` when the bytes were written. `false`, with **nothing written at
+    /// all**, when either condition fails:
+    ///
+    /// * `offset` is above the initialized prefix. Writing there would leave
+    ///   a gap of uninitialized bytes below the new content, and no single
+    ///   length could then describe what is initialized. Every caller in this
+    ///   crate appends at the prefix or overwrites inside it, so this is a
+    ///   bug check rather than a case to handle.
+    /// * the copy would run past the capacity, or its end is not
+    ///   representable.
+    ///
+    /// Reported rather than asserted, because this crate has no panic path.
+    pub(crate) fn put(&mut self, offset: usize, src: &[u8]) -> bool {
+        if offset > self.init {
+            return false;
+        }
+        let Some(end) = offset.checked_add(src.len()) else {
+            return false;
+        };
+        if end > self.cap {
+            return false;
+        }
+        if src.is_empty() {
+            // C skips a zero-length copy too, `lib/curlx/dynbuf.c:L114`.
+            // Nothing is written, so the prefix does not move.
+            return true;
+        }
+        // SAFETY: `src` is a live slice of `src.len()` bytes, so it is valid
+        // for that many reads. The destination is `self.ptr` advanced by
+        // `offset`, and `end <= self.cap` puts the whole written range inside
+        // the block invariants 1 and 2 describe, so it is valid for that many
+        // writes. The two cannot overlap: `src` is a Rust slice the caller
+        // holds and this block is owned exclusively through `&mut self`, and
+        // any borrow of it would have to come from `bytes`/`bytes_mut`, whose
+        // lifetimes the borrow checker ties to that same `&mut self`. `u8`
+        // has an alignment of one, so both pointers are aligned. The offset
+        // arithmetic stays in bounds by the same `end <= self.cap` test.
+        unsafe {
+            ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.cast::<u8>().add(offset), src.len());
+        }
+        if end > self.init {
+            // The copy initialized `[offset, end)` and `offset <= self.init`,
+            // so `[0, end)` is now contiguous and invariant 4 holds for the
+            // wider prefix.
+            self.init = end;
+        }
+        true
+    }
+
+    /// Writes one byte at `offset`, extending the initialized prefix to cover
+    /// it.
+    ///
+    /// The terminator write: `s->bufr[s->leng] = 0` at
+    /// `lib/curlx/dynbuf.c:L117` and `L290`, and `dest[length] = 0` at
+    /// `lib/curlx/strdup.c:L94`.
+    ///
+    /// # Returns
+    ///
+    /// As [`CBlock::put`]: `false`, with nothing written, when `offset` is
+    /// above the initialized prefix or at or past the capacity.
+    pub(crate) fn put_byte(&mut self, offset: usize, byte: u8) -> bool {
+        self.put(offset, &[byte])
+    }
+
+    /// Appends one byte at the end of the initialized prefix.
+    ///
+    /// The `*ns++ = (char)in` of `Curl_urldecode` at `lib/escape.c:L145`,
+    /// where the destination is written straight through with no separate
+    /// index to keep in step. Exactly one byte is written per call and
+    /// nothing else is touched.
+    ///
+    /// # Returns
+    ///
+    /// `false`, with nothing written, when the block is full.
+    pub(crate) fn push(&mut self, byte: u8) -> bool {
+        self.put(self.init, &[byte])
+    }
+
+    /// Resizes the block, without initializing anything new.
     ///
     /// The growth step of `dyn_nappend()` at `lib/curlx/dynbuf.c:L104-L112`,
-    /// with invariant 3 maintained: bytes from the old capacity up to the new
-    /// one are set to zero, which `realloc` does not do.
+    /// which is a bare `realloc`: the bytes above the old capacity are
+    /// uninitialized afterwards, and this type says so by leaving `init`
+    /// where it was. A shrink below the prefix truncates the prefix, because
+    /// bytes outside the block cannot be initialized.
+    ///
+    /// # Why the new tail is neither zeroed nor reachable
+    ///
+    /// `realloc` grows a block by handing back memory whose new tail holds
+    /// *uninitialized* bytes, and a `&[u8]` or `&mut [u8]` may never be formed
+    /// over uninitialized memory: the slice contract requires every element to
+    /// be initialized, and `MaybeUninit`'s own documentation spells out that
+    /// constructing an ordinary reference to an uninitialized value is
+    /// undefined behavior on its own, before anything reads or writes through
+    /// it. That hazard is answered by the `init` prefix rather than by a fill.
+    /// [`CBlock::bytes`] and [`CBlock::bytes_mut`] expose `[0, init)` and
+    /// nothing beyond it, and only [`CBlock::put`] -- which writes through a
+    /// raw pointer and then extends `init` by exactly the bytes it copied --
+    /// can move that boundary. So no slice over this block can reach the tail
+    /// `realloc` just produced, and clearing it would be both unnecessary and
+    /// a departure from `dyn_nappend()`, which writes each byte exactly once.
     ///
     /// # Ownership
     ///
@@ -531,27 +684,30 @@ impl CBlock {
         if new_cap == self.cap {
             return true;
         }
-        let old_cap = self.cap;
         // SAFETY: `c_realloc` requires a pointer that is null or a live block
         // from this module's allocator owned by the caller, which is invariant
         // 1, and a nonzero size, which the guard above establishes. On success
         // ownership moves to the new pointer and the old one is not touched
         // again; on failure the old block stays owned by this value, so the
         // early return below leaves every invariant as it found them.
+        // `realloc` preserves the bytes up to the smaller of the two sizes,
+        // which is what lets the prefix survive a growth untouched.
         let fresh = unsafe { c_realloc(self.ptr.cast::<c_void>(), new_cap) };
         if fresh.is_null() {
             return false;
         }
+        // The new extent is deliberately left as `realloc` returned it. `init`
+        // stays where it was, so `bytes()` and `bytes_mut()` continue to end at
+        // the old prefix and no reference can be formed over the uninitialized
+        // tail; the bytes above it become reachable only as `put` writes them.
         self.ptr = fresh.cast::<c_char>();
         self.cap = new_cap;
-        if new_cap > old_cap {
-            // Invariant 3 for the bytes `realloc` left uninitialized. The
-            // slice face is used rather than a raw write so that the bound is
-            // checked: `get_mut` cannot reach past the new capacity even if
-            // the arithmetic above were wrong.
-            if let Some(tail) = self.bytes_mut().get_mut(old_cap..) {
-                tail.fill(0);
-            }
+        if self.init > new_cap {
+            // Invariant 3 after a shrink: the bytes that are gone cannot be
+            // described as initialized. No call site in this crate shrinks
+            // below its own content -- `crate::alloc` shrinks a block to
+            // exactly `len + 1` -- so this is a bound rather than a case.
+            self.init = new_cap;
         }
         true
     }
@@ -585,9 +741,10 @@ impl CBlock {
 
     /// Takes ownership of a NUL-terminated C string, measuring it.
     ///
-    /// The capacity of the result is the measured length plus one, so the
-    /// terminator is inside the block and invariant 3 holds over exactly the
-    /// bytes the string occupies.
+    /// The capacity of the result is the measured length plus one, and the
+    /// initialized prefix is the whole of it: the string's bytes plus its
+    /// terminator are exactly what the measurement proves initialized, so
+    /// invariant 4 holds over the entire block.
     ///
     /// # Ownership
     ///
@@ -598,7 +755,14 @@ impl CBlock {
     /// # Returns
     ///
     /// `None` if `p` is null, which lets an allocation failure from C be
-    /// forwarded without a separate check at the call site.
+    /// forwarded without a separate check at the call site. `None` also if the
+    /// measured length plus its terminator would exceed [`MAX_ALLOC`], the same
+    /// bound [`CBlock::alloc`] and [`CBlock::from_raw_parts`] enforce; as
+    /// there, the block then stays the caller's, which is what the `Option`
+    /// says. That outcome is unreachable for a string that really lives in one
+    /// allocation, and the check is present so that every entry point into this
+    /// type agrees on what a representable capacity is rather than one of them
+    /// recording a capacity its own accessors could never view as a slice.
     ///
     /// # Safety
     ///
@@ -622,7 +786,21 @@ impl CBlock {
         // cannot be `usize::MAX`. Written as a checked addition because the
         // crate denies the bare operators.
         let cap = len.checked_add(1)?;
-        Some((Self { ptr: p, cap }, len))
+        // `MAX_ALLOC` bounds every other raw entry point of this type, so it
+        // bounds adoption too: a block this crate would refuse to allocate is a
+        // block it refuses to take ownership of, which keeps the ceiling a
+        // property of the type rather than of one constructor.
+        if cap > MAX_ALLOC {
+            return None;
+        }
+        Some((
+            Self {
+                ptr: p,
+                cap,
+                init: cap,
+            },
+            len,
+        ))
     }
 
     /// Takes ownership of a C-allocator block of a known size.
@@ -655,9 +833,15 @@ impl CBlock {
         }
         // The caller's guarantee is the whole of the safety argument here;
         // there is no operation to perform, only a claim to record. Invariant
-        // 1 is the provenance, invariant 2 the size, invariant 3 the
-        // initialization, invariant 4 the sole ownership.
-        Some(Self { ptr: p, cap })
+        // 1 is the provenance, invariant 2 the size, invariant 4 the
+        // initialization -- which is why the prefix is recorded as the whole
+        // capacity, the caller having promised exactly that -- and invariant 5
+        // the sole ownership.
+        Some(Self {
+            ptr: p,
+            cap,
+            init: cap,
+        })
     }
 }
 
@@ -679,14 +863,14 @@ impl Drop for CBlock {
 }
 
 impl fmt::Debug for CBlock {
-    /// Prints the capacity only.
+    /// Prints the capacity and the initialized prefix length only.
     ///
     /// The contents are deliberately not shown. A `CBlock` is a raw extent
     /// whose meaningful prefix only its owner knows, and
     /// `crate::alloc::CBuf`'s own `Debug` prints that prefix with
     /// non-printable bytes escaped.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CBlock(cap {})", self.cap)
+        write!(f, "CBlock(cap {}, init {})", self.cap, self.init)
     }
 }
 
@@ -754,7 +938,10 @@ pub(crate) unsafe fn c_memdup0(src: *const c_char, len: usize) -> *mut c_char {
     let Some(total) = len.checked_add(1) else {
         return ptr::null_mut();
     };
-    let Some(mut block) = CBlock::zeroed(total) else {
+    // `malloc`, as `curlx_memdup0` uses at `lib/curlx/strdup.c:L89`. The
+    // block is uninitialized here and the two writes below initialize exactly
+    // the bytes the C writes: `len` copied bytes and one terminator.
+    let Some(mut block) = CBlock::alloc(total) else {
         return ptr::null_mut();
     };
     if len != 0 {
@@ -764,15 +951,22 @@ pub(crate) unsafe fn c_memdup0(src: *const c_char, len: usize) -> *mut c_char {
         // nothing else references, so the two regions cannot overlap, and
         // `u8` has an alignment of one.
         let source = unsafe { slice::from_raw_parts(src.cast::<u8>(), len) };
-        // Infallible: the block is `len + 1` bytes, so `..len` is in range.
-        // Reported rather than asserted, because this crate has no panic path.
-        match block.bytes_mut().get_mut(..len) {
-            Some(target) => target.copy_from_slice(source),
-            None => return ptr::null_mut(),
+        // The `memcpy` at `lib/curlx/strdup.c:L93`. Infallible: the block is
+        // `len + 1` bytes and the prefix starts empty, so the offset of zero
+        // is at the prefix and the end is inside the capacity. Reported rather
+        // than asserted, because this crate has no panic path.
+        if !block.put(0, source) {
+            return ptr::null_mut();
         }
     }
-    // The terminator at `[len]` is already zero: the block came from
-    // `CBlock::zeroed`, and only `[0, len)` was overwritten.
+    // The terminator at `[len]`, which is `dest[length] = 0` at
+    // `lib/curlx/strdup.c:L94`. It is written rather than inherited from a
+    // zeroed allocation, so the block above the terminator stays untouched,
+    // exactly as the C leaves it. Infallible for the same reason as the copy:
+    // `len` is now the prefix length and `len < total`.
+    if !block.put_byte(len, 0) {
+        return ptr::null_mut();
+    }
     block.into_raw()
 }
 
@@ -897,8 +1091,8 @@ pub(crate) mod inet_sys {
     // saturating forms above cannot saturate at these values, and the strict
     // inequalities are what the two use sites actually rely on. The crate
     // root denies the bare operators, which is why the derivations are
-    // spelled as method calls. The allow is the same 1.75 compatibility
-    // allow explained at the crate-level assertions.
+    // spelled as method calls. The allow is the same deliberate, scoped
+    // exception `src/inet.rs` explains and measures at its own constant block.
     #[allow(clippy::assertions_on_constants)]
     const _: () = {
         assert!(SIZE_CAP > TEXT_MAX);
@@ -1463,7 +1657,6 @@ pub(crate) mod idn2 {
         // allocators from both owning a copy of the same name for any longer
         // than the C does.
         drop(original);
-        // L310-L313.
         match duplicate {
             Some(buf) => Ok(buf),
             None => Err(CURLcode::CURLE_OUT_OF_MEMORY),
@@ -1622,8 +1815,10 @@ pub(crate) mod idn2 {
 /// Note what is *not* here: no definition of `Curl_get_scheme`. The crate
 /// imports it, so the archive must show the symbol as undefined rather than
 /// defined, or the drop-in link acquires a duplicate of a symbol `lib/url.c`
-/// already provides and `scripts/check-abi.sh` reports an export the C object
-/// file does not have.
+/// already provides and the archive exports something the C object file does
+/// not. `scripts/check-abi.sh` is to be the automated check for that property
+/// and is a later deliverable; until it lands, `nm -u` over the archive is the
+/// way to confirm the symbol is still undefined.
 #[cfg(not(feature = "scheme-table"))]
 pub(crate) mod scheme_import {
     use core::ffi::CStr;
@@ -1900,8 +2095,10 @@ pub(crate) mod scheme_import {
         /// produces for a protocol its build switched off.
         ///
         /// It is defined under `cfg(test)` and can therefore never reach the
-        /// shipped archive, so `scripts/check-abi.sh` still sees
-        /// `Curl_get_scheme` as an undefined symbol there.
+        /// shipped archive, so `Curl_get_scheme` remains an undefined symbol
+        /// there -- which is what a symbol-set check over the archive, whether
+        /// `nm -u` by hand or `scripts/check-abi.sh` once that script lands,
+        /// has to see.
         struct Descriptors([CurlScheme; 4]);
 
         // SAFETY: the array is immutable for the whole program and the only
@@ -2224,11 +2421,16 @@ pub(crate) mod test_locale {
 // Section 6 -- the exported C-linkage symbols
 // ==========================================================================
 
-/// The ten exported symbols: the crate's whole public face.
+/// The exported symbols: the crate's whole public face.
 ///
-/// Eight of them are unconditional and are exactly the eight globals
+/// Up to ten definitions live here -- **eight unconditional plus two
+/// feature-gated** -- so the set an archive actually exports depends on the
+/// feature selection. Authoritative drop-in mode exports the eight; the
+/// default standalone configuration exports all ten.
+///
+/// The eight unconditional ones are exactly the eight globals
 /// `nm -g --defined-only` reports for the object file `lib/urlapi.c` produces:
-/// the five public functions of `include/curl/urlapi.h` L113-L145 and the
+/// the five public functions of `include/curl/urlapi.h` L113-L142 and the
 /// three internal entry points of `lib/urlapi-int.h` L28-L33. Replacing that
 /// object file in a libcurl archive needs all eight, because the three
 /// internal ones have real consumers -- `lib/http1.c` L220, `lib/url.c` L1661
@@ -2239,8 +2441,11 @@ pub(crate) mod test_locale {
 /// `curl_url_strerror` is defined in `lib/strerror.c` L420-L531 and
 /// `curl_free` in `lib/escape.c` L189-L192, both of which stay in the archive,
 /// so exporting either unconditionally would be a duplicate definition. They
-/// exist for the standalone link, where no libcurl participates and the demo
-/// still has to be able to call them.
+/// exist for the standalone link, where no libcurl participates and a consumer
+/// still has to be able to call them: `rust-urlapi/demo/urlapi_demo.c` calls
+/// `curl_url_strerror` for every result code it reports and `curl_free` for
+/// every buffer a getter hands it, and links against this crate alone when
+/// compiled with `-DURLAPI_DEMO_STANDALONE`.
 ///
 /// # The two symbols deliberately not here
 ///
@@ -2259,10 +2464,11 @@ pub(crate) mod test_locale {
 /// buffer -- a materially stronger contract than anything the public API asks
 /// for, and one the plan records as constraint R2. The user's success criteria
 /// name `lib1560`/`test1560` only. Adding the symbol anyway would break the
-/// property `scripts/check-abi.sh` checks, that this archive's exported set
+/// property `scripts/check-abi.sh` is to check once it lands, that this
+/// archive's exported set
 /// equals the C object's exactly.
 ///
-/// # Why this is a submodule rather than ten items at file scope
+/// # Why this is a submodule rather than items at file scope
 ///
 /// One name: section 1 already has a `curl_free`, the crate-internal release
 /// path every owned buffer ends at, and the export of the same name is a
@@ -2283,10 +2489,17 @@ pub(crate) mod test_locale {
 /// paths may refer to an item within the language, and nothing else -- an
 /// ordinary `pub fn` is compiled with an internal, mangled name and is
 /// invisible to a C linker, while `#[no_mangle] pub extern "C" fn` is the
-/// combination that produces a C symbol. That is why `src/lib.rs` can leave
-/// `mod ffi` and `mod abi` private at no cost to the ABI, and equally why
-/// making them public would add nothing to it: what the archive exports is
-/// decided entirely by the attributes, not by the module tree.
+/// combination that produces a C symbol.
+///
+/// `src/lib.rs` in fact declares both `pub mod abi;` and `pub mod ffi;`, and
+/// that costs the ABI nothing, which is the point: what the archive exports is
+/// decided entirely by the attributes, not by the module tree. The two are
+/// public for reasons internal to Rust, given at their declarations --
+/// `#[deny(missing_docs)]` reaches the items of a public module, and a Cargo
+/// integration test links this crate as an external crate and can therefore
+/// name only `pub` paths. Making them private again would not remove a single
+/// symbol from the archive, and making the other thirteen public would not add
+/// one.
 ///
 /// The spelling is the plain `#[no_mangle]`, not the `#[unsafe(no_mangle)]`
 /// form. The latter belongs to later editions, where the attribute is treated
@@ -2303,9 +2516,14 @@ pub(crate) mod test_locale {
 /// and L1817-L1818.
 ///
 /// Three entry points have no such answer because the C never asks the
-/// question: `curl_url_dup` dereferences its argument at L1314 without
-/// testing it, and `Curl_is_absolute_url` and `Curl_url_set_authority` both
-/// call `strlen` on theirs. A null there is undefined behaviour in the C and
+/// question, each in its own way. `curl_url_dup` dereferences its argument at
+/// L1314 without testing it. `Curl_url_set_authority` calls
+/// `strlen(authority)` at L666, having only `DEBUGASSERT(authority)` at L662,
+/// which compiles to nothing in a release build. `Curl_is_absolute_url` calls
+/// no `strlen` at all -- it reads `url[0]` at L195 and then indexes `url[i]`
+/// directly in the bounded loop at L196-L205, so a null argument is
+/// dereferenced by the very first test rather than by a library call.
+/// A null in any of the three is undefined behaviour in the C and
 /// cannot be "reproduced"; each one below returns instead the answer its
 /// caller already has to handle -- a null handle from the duplicator, which is
 /// what an allocation failure gives, zero from the absolute-URL test, and
@@ -2313,52 +2531,222 @@ pub(crate) mod test_locale {
 /// the tree passes a non-null pointer, so no behaviour visible to libcurl
 /// changes.
 ///
-/// # `bool` across the boundary
+/// # `bool` across the boundary, and the configurations this holds for
 ///
-/// Two of the internal entry points take a `bool`. `lib/curl_setup.h` L849
-/// includes `<stdbool.h>` on every platform this crate is built for, so C's
-/// `bool` is `_Bool`: one byte holding 0 or 1, which is exactly Rust's `bool`.
-/// Assignment to a `_Bool` normalises any nonzero value to 1, so a caller
-/// cannot hand over a bit pattern Rust would consider invalid. The pre-C99
-/// fallback at L1008, `typedef int bool`, would make the two disagree, and no
-/// supported target selects it.
+/// Two of the internal entry points take a `bool`, and C's `bool` is not one
+/// type. `lib/curl_setup.h` makes it one of three, and which one is a property
+/// of the libcurl this archive is linked beside rather than of this crate:
+///
+/// * `_Bool`, when `HAVE_STDBOOL_H` and `HAVE_BOOL_T` are both defined and
+///   L848-L850 includes `<stdbool.h>`. One byte holding 0 or 1.
+/// * `int`, from `typedef int bool` at L1007-L1012, on HP-UX without
+///   `HAVE_BOOL_T`.
+/// * an int-width enumeration, from `typedef enum { bool_false, bool_true }
+///   bool` at L1020-L1024, on any other pre-C99 platform.
+///
+/// Rust's `bool` is ABI-compatible with the first and with neither of the
+/// others, and the disagreement is not a link error: it is a silent argument
+/// width mismatch, so the callee reads whatever bits lie beyond the byte it
+/// expected. Writing `bool` in the two signatures would therefore be correct
+/// on the common platform and wrong on the two curl still supports.
+///
+/// So the two signatures name [`exports::CurlBool`] instead, which is the C
+/// scalar rather than a Rust type: `u8` by default, `c_int` under the
+/// `curl_bool_int` cfg, `c_uint` under `curl_bool_enum`. `build.rs` emits
+/// those from `CURL_URLAPI_CURL_BOOL`, and nothing else in the crate sees
+/// them -- [`exports::curl_bool_is_true`] converts once, immediately, and
+/// every function below the facade keeps a plain Rust `bool`. The conversion
+/// is `value != 0`, which is what C's own coercion to a truth value is, so no
+/// bit pattern a caller can produce is invalid on any of the three.
 pub(crate) mod exports {
     use core::ffi::{c_char, c_uint, c_void, CStr};
-    use core::{mem, ptr, slice};
+    use core::{mem, ptr};
     use libc::size_t;
 
     use crate::abi::{
         CURLUPart, CURLUcode, CURLUE_BAD_HANDLE, CURLUE_BAD_PARTPOINTER, CURLUE_MALFORMED_INPUT,
-        CURLUE_OK,
+        CURLUE_OK, MAX_SCHEME_LEN,
     };
+    use crate::alloc::CBuf;
     use crate::getset::{url_get, url_set};
     use crate::handle::CurlUrl;
     use crate::parse::junk::junkscan;
     use crate::parse::scheme::is_absolute_url;
 
-    /// The handle `include/curl/urlapi.h` L107 declares as an incomplete type.
+    /// The C scalar that carries curl's `bool` across this boundary.
     ///
-    /// `typedef struct Curl_URL CURLU;` never gains a definition in any public
-    /// header, so C can only ever hold a pointer to it and this crate is free
-    /// to choose the layout -- which is what makes the port tractable at all
-    /// (plan 0.3.3, "layout freedom follows from opacity"). The Rust type is
-    /// [`CurlUrl`], and the signatures below name it directly: from C's side a
-    /// pointer is a pointer, and naming the real type keeps the ownership
-    /// documentation on each function honest.
+    /// See the module documentation's "`bool` across the boundary" section for
+    /// the three representations `lib/curl_setup.h` can give `bool` and why the
+    /// choice cannot be made once and for all in the source. This alias is the
+    /// `_Bool` arm of that choice, `lib/curl_setup.h` L848-L850: one byte
+    /// holding 0 or 1, which is what Rust's own `bool` is ABI-compatible with
+    /// and what every platform with a C99 library selects.
     ///
-    /// The one property the layout must have is that `malloc` alignment is
-    /// enough for it, since [`curl_url`] allocates the block with the C
-    /// allocator exactly as L1290 does. The assertion below is that check,
-    /// made at compile time: `malloc` guarantees alignment suitable for any
-    /// fundamental type, which is sixteen bytes on every target this crate
-    /// builds for, and the handle is a group of pointers and small integers.
+    /// Deliberately not `bool`. `bool` would make the *value* validity a
+    /// language-level obligation -- a `bool` holding 2 is instant undefined
+    /// behaviour -- and this side of the boundary cannot enforce what a C
+    /// caller passes. `u8` accepts every bit pattern and
+    /// [`curl_bool_is_true`] gives it C's own meaning.
+    #[cfg(not(any(curl_bool_int, curl_bool_enum)))]
+    pub type CurlBool = u8;
+
+    /// The C scalar that carries curl's `bool` across this boundary.
+    ///
+    /// The `typedef int bool` arm, `lib/curl_setup.h` L1007-L1012, selected by
+    /// building with `CURL_URLAPI_CURL_BOOL=int`.
+    #[cfg(curl_bool_int)]
+    pub type CurlBool = core::ffi::c_int;
+
+    /// The C scalar that carries curl's `bool` across this boundary.
+    ///
+    /// The `typedef enum { bool_false, bool_true } bool` arm,
+    /// `lib/curl_setup.h` L1020-L1024, selected by building with
+    /// `CURL_URLAPI_CURL_BOOL=enum`. An enumeration whose enumerators are all
+    /// non-negative is `unsigned int` on the System V ABI and `int` under
+    /// MSVC; the calling convention acts on the width, which both share, and
+    /// the only two values that ever travel here are 0 and 1.
+    #[cfg(curl_bool_enum)]
+    pub type CurlBool = c_uint;
+
+    /// The most bytes `Curl_is_absolute_url` can write into its buffer.
+    ///
+    /// Forty-one: `lib/urlapi.c` L195 stops the scan index below
+    /// `MAX_SCHEME_LEN`, or leaves it exactly at `MAX_SCHEME_LEN` when every
+    /// byte of a forty-byte run could continue a scheme, and L215 then writes
+    /// the terminator *at* that index. One byte more than the bound, therefore,
+    /// which is also what the C's `DEBUGASSERT(!buf || (buflen >
+    /// MAX_SCHEME_LEN))` at L186 demands of its caller and what its own caller
+    /// at L1114 declares. `tests/libtest/lib1560.c` L677-L681 requires the
+    /// forty-byte scheme to parse, so the extra byte is reachable rather than
+    /// theoretical.
+    const SCHEME_SCRATCH_LEN: usize = MAX_SCHEME_LEN.saturating_add(1);
+
+    /// C's truth test, applied to a [`CurlBool`] the moment it arrives.
+    ///
+    /// `value != 0` is what C means by the value being true, for all three
+    /// representations: `_Bool` normalises on assignment so it only ever holds
+    /// 0 or 1, and the other two are int-width scalars a caller sets from
+    /// `TRUE`/`FALSE` at `lib/curl_setup.h` L1046-L1052. Every function below
+    /// the facade takes a Rust `bool`, so this is the single point of
+    /// conversion and there is nowhere else for the width to leak to.
+    pub(crate) fn curl_bool_is_true(value: CurlBool) -> bool {
+        value != 0
+    }
+
+    // The handle include/curl/urlapi.h L107 declares as an incomplete type.
+    //
+    // `typedef struct Curl_URL CURLU;` never gains a definition in any public
+    // header, so C can only ever hold a pointer to it and this crate is free
+    // to choose the layout -- which is what makes the port tractable at all
+    // (plan 0.3.3, "layout freedom follows from opacity"). The Rust type is
+    // CurlUrl, and the signatures below name it directly: from C's side a
+    // pointer is a pointer, and naming the real type keeps the ownership
+    // documentation on each function honest.
+    //
+    // The one property the layout must have is that malloc alignment is
+    // enough for it, since curl_url() allocates the block with the C
+    // allocator exactly as L1290 does. The items below are that check: the
+    // types whose alignment C actually promises, and the two compile-time
+    // assertions against them.
+
+    /// A union of the fundamental C types, which is how C defines
+    /// `max_align_t` itself.
+    ///
+    /// Compiled on every target even where nothing selects it, so that the one
+    /// arm of [`MallocAlignment`] that uses it is never the only thing holding
+    /// it to a compiler. Its alignment is the strictest of its members', which
+    /// is what "suitable for any fundamental type" means.
+    ///
+    /// The one fundamental type absent from it is `long double`, because Rust
+    /// has no name for an 80-bit extended float. That makes the union's
+    /// alignment a possible *under*-estimate of the platform's, never an
+    /// over-estimate, and under-estimating is the safe direction: it makes the
+    /// assertion below stricter than the truth, so a build it accepts is
+    /// certainly sound. `libc`'s own model has the same gap -- on
+    /// `x86_64-unknown-linux-gnu` it describes `max_align_t` as `[f64; 4]`,
+    /// alignment eight, where glibc's real one is sixteen.
+    #[repr(C)]
+    union FundamentalAlign {
+        /// The widest integer C guarantees.
+        integral: libc::c_longlong,
+        /// The widest floating type Rust can name.
+        floating: f64,
+        /// Every object pointer has the same alignment on every supported
+        /// target, so one stands for all of them.
+        pointer: *mut c_void,
+    }
+
+    /// The type whose alignment `malloc` promises to satisfy on this target.
+    ///
+    /// C requires an allocation to be "suitably aligned so that it may be
+    /// assigned to a pointer to any type of object with a fundamental
+    /// alignment requirement", which is `_Alignof(max_align_t)` -- not any
+    /// particular number. `libc::max_align_t` is that type, described per
+    /// target by the `libc` crate.
+    #[cfg(not(all(windows, target_env = "msvc")))]
+    type MallocAlignment = libc::max_align_t;
+
+    /// The type whose alignment `malloc` promises to satisfy on this target.
+    ///
+    /// `libc` 0.2 describes `max_align_t` for Unix, WASI and Windows/GNU but
+    /// not for Windows/MSVC, so that one target uses
+    /// [`FundamentalAlign`] instead. MSVC's own guarantee is stricter than the
+    /// union's -- `MEMORY_ALLOCATION_ALIGNMENT` is sixteen on 64-bit and eight
+    /// on 32-bit -- so the substitution keeps the assertion below on the
+    /// conservative side there too.
+    #[cfg(all(windows, target_env = "msvc"))]
+    type MallocAlignment = FundamentalAlign;
+
+    /// The handle's alignment is no stricter than the C allocator guarantees.
+    ///
+    /// Checked at compile time against [`MallocAlignment`], which names the
+    /// platform's actual promise rather than a literal. An earlier version
+    /// compared against a hard-coded sixteen, which was true of the targets
+    /// then in view but proved nothing: C promises `_Alignof(max_align_t)`, and
+    /// a field added to [`CurlUrl`] on a target whose promise is weaker would
+    /// have slipped past.
+    ///
+    /// The handle is a group of pointers, one `u16` and three flags, so this
+    /// holds with room to spare and is expected to keep holding. If it ever
+    /// fails, the fix is not to relax it: it is for [`new_handle`] to obtain
+    /// the block from an allocator that takes an alignment and whose result
+    /// `free` still accepts -- `posix_memalign` or C11 `aligned_alloc` -- and
+    /// for `docs/MEMORY-OWNERSHIP.md` to record the new call, because
+    /// `tests/data/test1560` counts allocator calls.
     const HANDLE_FITS_MALLOC_ALIGNMENT: () = {
         assert!(
-            mem::align_of::<CurlUrl>() <= 16,
-            "the handle needs stricter alignment than malloc guarantees; \
-             curl_url() would have to allocate differently"
+            mem::align_of::<CurlUrl>() <= mem::align_of::<MallocAlignment>(),
+            "the handle needs stricter alignment than the C allocator \
+             guarantees on this target; curl_url() would have to allocate \
+             differently"
         );
     };
+
+    /// The handle also fits the fundamental-alignment bound, on every target.
+    ///
+    /// [`HANDLE_FITS_MALLOC_ALIGNMENT`] checks whichever [`MallocAlignment`]
+    /// this target selected, so on all but one target the
+    /// [`FundamentalAlign`] bound is never checked at all. This second
+    /// assertion checks it everywhere, so that a field added to [`CurlUrl`]
+    /// cannot pass on the target it was added on and fail only on Windows with
+    /// MSVC, where nobody would see it until a cross build ran.
+    const HANDLE_FITS_FUNDAMENTAL_ALIGNMENT: () = {
+        assert!(
+            mem::align_of::<CurlUrl>() <= mem::align_of::<FundamentalAlign>(),
+            "the handle needs stricter alignment than the fundamental C types; \
+             the Windows/MSVC arm of MallocAlignment would reject it"
+        );
+    };
+
+    /// The alignment the C allocator promises on this target.
+    ///
+    /// The same number [`HANDLE_FITS_MALLOC_ALIGNMENT`] asserts against, made
+    /// readable so that the run-time half of the check can report it instead of
+    /// only comparing it.
+    pub(crate) fn malloc_alignment() -> usize {
+        let () = HANDLE_FITS_FUNDAMENTAL_ALIGNMENT;
+        mem::align_of::<MallocAlignment>()
+    }
 
     /// Allocates a zeroed handle block and constructs a handle in it.
     ///
@@ -2427,9 +2815,14 @@ pub(crate) mod exports {
     ///
     /// # Safety
     ///
-    /// `handle` must be null or a pointer this crate's `curl_url()` or
-    /// `curl_url_dup()` returned and that has not already been cleaned up.
-    /// Calling this twice on the same pointer frees it twice.
+    /// The caller must guarantee all of the following.
+    ///
+    /// * `handle` is null, or a pointer this crate's `curl_url()` or
+    ///   `curl_url_dup()` returned, properly aligned and not already cleaned
+    ///   up. Calling this twice on the same pointer frees it twice.
+    /// * No other pointer to the handle is used again afterwards, and no other
+    ///   reference to it -- shared or unique -- exists during the call. The
+    ///   handle is *consumed*, not merely written.
     #[no_mangle]
     pub unsafe extern "C" fn curl_url_cleanup(handle: *mut CurlUrl) {
         // L1295, `if(u)`.
@@ -2467,8 +2860,12 @@ pub(crate) mod exports {
     ///
     /// # Safety
     ///
-    /// `input` must be null or a live handle. It is read, never written, which
-    /// is what `const CURLU *` at `include/curl/urlapi.h` L126 promises.
+    /// * `input` must be null, or point to a live, initialised handle from
+    ///   [`curl_url`] or [`curl_url_dup`], properly aligned, that stays valid
+    ///   for the duration of the call. It is read, never written, which is what
+    ///   `const CURLU *` at `include/curl/urlapi.h` L126 promises.
+    /// * No other thread may write the handle while the call runs. There is no
+    ///   second pointer to be disjoint from: this function takes only one.
     ///
     /// # Returns
     ///
@@ -2477,10 +2874,12 @@ pub(crate) mod exports {
     /// which the C would instead fault on; see the module documentation.
     #[no_mangle]
     pub unsafe extern "C" fn curl_url_dup(input: *const CurlUrl) -> *mut CurlUrl {
-        // SAFETY: the caller's precondition says `input` is null or a live
-        // handle, and `as_ref` distinguishes those two cases without
-        // dereferencing a null. The shared reference it yields never becomes a
-        // mutable one, which `const CURLU *` requires.
+        // SAFETY: by the caller's precondition `input` is null or an aligned,
+        // live, readable handle that nothing else is writing for the duration
+        // of the call, so a shared reference to it is sound; `as_ref`
+        // distinguishes the two cases without dereferencing a null. The
+        // reference never becomes a mutable one, which is what `const CURLU *`
+        // asks of this function.
         let Some(source) = (unsafe { input.as_ref() }) else {
             return ptr::null_mut();
         };
@@ -2525,10 +2924,33 @@ pub(crate) mod exports {
     /// `*part` is set to null before anything can fail, L1552, so a caller who
     /// ignores the code cannot read a stale pointer.
     ///
+    /// # Why the borrow is scoped
+    ///
+    /// Both writes through `part` happen while no reference to the handle
+    /// exists: the L1552 null before the borrow is taken, and the result
+    /// pointer after it has ended. That ordering is what makes the two pointers
+    /// independent of each other, and it costs nothing -- `url_get` returns an
+    /// owned buffer, so there is no borrow left to keep alive across the
+    /// second write.
+    ///
+    /// It is not, however, licence to point `part` into the handle. The
+    /// requirement below stands: writing a null over the middle of a live
+    /// handle would leave it holding values its own type forbids, and the read
+    /// that follows would then be reading a handle the caller has broken. The
+    /// C has the same hazard in a different currency -- it would read a
+    /// half-nulled `struct Curl_URL` -- and no caller in the tree does it.
+    ///
     /// # Safety
     ///
-    /// `handle` must be null or a live handle, and `part` must be null or
-    /// point to a writable `char *`. The handle is read, never written.
+    /// * `handle` must be null, or point to a live, initialised handle from
+    ///   [`curl_url`] or [`curl_url_dup`], properly aligned, that stays valid
+    ///   for the duration of the call. It is read, never written, which is what
+    ///   `const CURLU *` at `include/curl/urlapi.h` L126 promises.
+    /// * `part` must be null, or point to one properly aligned, writable
+    ///   `char *` that stays valid for the duration of the call.
+    /// * `part` must not point into the handle's own storage, and must not
+    ///   alias anything else the call reaches.
+    /// * No other thread may access the handle or `*part` while the call runs.
     ///
     /// # Returns
     ///
@@ -2543,19 +2965,36 @@ pub(crate) mod exports {
         part: *mut *mut c_char,
         flags: c_uint,
     ) -> CURLUcode {
-        // SAFETY: as `curl_url_dup`. L1548-L1549.
-        let Some(u) = (unsafe { handle.as_ref() }) else {
+        // L1548-L1549, answered from the raw pointer so that no reference to
+        // the handle exists yet when `*part` is written below.
+        if handle.is_null() {
             return CURLUE_BAD_HANDLE;
-        };
+        }
         // L1550-L1551.
         if part.is_null() {
             return CURLUE_BAD_PARTPOINTER;
         }
         // SAFETY: `part` is non-null by the test above and points to a
-        // writable `char *` by the caller's precondition. L1552.
+        // writable, aligned `char *` by the caller's precondition. Nothing
+        // borrows the handle at this point, so this write cannot conflict with
+        // a reference however the two pointers are related. L1552.
         unsafe { ptr::write(part, ptr::null_mut()) };
 
-        match url_get(u, what, flags) {
+        // The borrow lives for this statement only. `url_get` hands back an
+        // owned `CBuf` or a code, neither of which holds any part of it, so the
+        // reference is gone before `*part` is written again.
+        let result = {
+            // SAFETY: `handle` is non-null by the test above and, by the
+            // caller's precondition, points to a live, aligned, initialised
+            // handle that stays valid for the call. The shared reference never
+            // becomes a mutable one, which `const CURLU *` requires, and the
+            // caller's requirement that `part` stay outside the handle means
+            // the write above cannot have disturbed what it refers to.
+            let u = unsafe { &*handle };
+            url_get(u, what, flags)
+        };
+
+        match result {
             Ok(Some(buffer)) => {
                 // L1537 and L1421. OWNERSHIP CHANGES HANDS HERE: `into_raw`
                 // consumes the buffer, so this crate stops tracking the block
@@ -2563,7 +3002,9 @@ pub(crate) mod exports {
                 // `curl_free()` is now the caller's, and it is discharged
                 // correctly because the block came from the C allocator.
                 //
-                // SAFETY: `part` is writable, as above.
+                // SAFETY: `part` is writable and aligned, as above, and the
+                // borrow of the handle has ended, so this write conflicts with
+                // no reference.
                 unsafe { ptr::write(part, buffer.into_raw()) };
                 CURLUE_OK
             }
@@ -2582,14 +3023,39 @@ pub(crate) mod exports {
     /// # Ownership
     ///
     /// Nothing changes hands. `part` is **copied**, which
-    /// `include/curl/urlapi.h` L138-L140 promises, so the caller may free or
+    /// `include/curl/urlapi.h` L137-L139 promises, so the caller may free or
     /// reuse it immediately. A null `part` clears the part instead, L1819-L1821.
+    ///
+    /// # `part` may point into the handle
+    ///
+    /// The C requires no separation here either, and its setters are written
+    /// so that overlap works: each one duplicates the incoming bytes before it
+    /// frees what it is replacing, so `curl_url_set(u, CURLUPART_HOST, p, 0)`
+    /// with `p` addressing something the handle owns is a supported C call.
+    ///
+    /// Rust cannot hold `&mut CurlUrl` and a `&[u8]` over the same bytes, so
+    /// [`disjoint_from_handle`] decides the question before the unique
+    /// reference is formed. Disjoint -- which is every real call -- borrows the
+    /// input directly and costs nothing. Overlapping copies the input into an
+    /// owned buffer first, which is behaviour-preserving for exactly the reason
+    /// the C is safe: the bytes are read before anything is replaced either
+    /// way. An allocation failure on that copy is reported as
+    /// `CURLUE_OUT_OF_MEMORY`, which is the code every other failed allocation
+    /// on this path already returns.
     ///
     /// # Safety
     ///
-    /// `handle` must be null or a live handle, and `part` must be null or a
-    /// pointer to a NUL-terminated string that stays valid and unmodified for
-    /// the duration of the call.
+    /// * `handle` must be null, or point to a live, initialised handle from
+    ///   [`curl_url`] or [`curl_url_dup`], properly aligned, that stays valid
+    ///   for the duration of the call. `curl_url_set` takes a non-const
+    ///   `CURLU *` at `include/curl/urlapi.h` L141-L142 and does write it.
+    /// * The caller must have exclusive access to the handle for the duration
+    ///   of the call: no other pointer may read or write it, and no other
+    ///   thread may touch it. That is the same requirement the C has -- a
+    ///   `CURLU` carries no lock -- stated rather than assumed.
+    /// * `part` must be null, or point to a NUL-terminated byte string that
+    ///   stays valid, readable and unmodified for the duration of the call.
+    ///   Alignment is unconstrained. It **may** overlap the handle's storage.
     #[no_mangle]
     pub unsafe extern "C" fn curl_url_set(
         handle: *mut CurlUrl,
@@ -2597,77 +3063,287 @@ pub(crate) mod exports {
         part: *const c_char,
         flags: c_uint,
     ) -> CURLUcode {
-        // SAFETY: the caller's precondition says `handle` is null or a live
-        // handle. `as_mut` distinguishes those without dereferencing a null,
-        // and the unique reference is sound because `curl_url_set` takes a
-        // non-const `CURLU *` at `include/curl/urlapi.h` L145 and no other
-        // reference to the handle exists during this call. L1817-L1818.
-        let Some(u) = (unsafe { handle.as_mut() }) else {
+        // L1817-L1818, answered from the raw pointer so that the input can be
+        // measured before any reference to the handle exists.
+        if handle.is_null() {
             return CURLUE_BAD_HANDLE;
-        };
+        }
 
         if part.is_null() {
+            // SAFETY: `handle` is non-null by the test above and, by the
+            // caller's precondition, points to a live, aligned, initialised
+            // handle the caller has exclusive access to for this call, so the
+            // unique reference is the only one there is. There is no second
+            // pointer on this path at all.
+            let u = unsafe { &mut *handle };
             // L1819-L1821: "setting a part to NULL clears it".
             return url_set(u, what, None, flags);
         }
 
-        // L1823's `strlen(part)`, as a borrow rather than a length.
+        // L1823's `strlen(part)`. Taken here, through the raw pointer, so that
+        // the extent is known before the decision below.
         //
         // SAFETY: `part` is non-null and, by the caller's precondition, points
-        // to a NUL-terminated string valid for this call. The borrow does not
-        // outlive the statement it is used in, and nothing in `url_set`
-        // retains it: every byte that reaches the handle is copied into a
-        // freshly allocated buffer.
+        // to a NUL-terminated string that stays valid and unmodified for the
+        // call. The borrow is used only to measure and, on the disjoint path,
+        // to copy from; nothing in `url_set` retains it, because every byte
+        // that reaches the handle is copied into a freshly allocated buffer.
         let bytes = unsafe { CStr::from_ptr(part) }.to_bytes();
-        url_set(u, what, Some(bytes), flags)
+
+        if disjoint_from_handle(part, bytes.len(), handle) {
+            // SAFETY: as the null-`part` arm above for the handle. The unique
+            // reference and `bytes` address provably disjoint ranges, which is
+            // what `disjoint_from_handle` just established.
+            let u = unsafe { &mut *handle };
+            return url_set(u, what, Some(bytes), flags);
+        }
+
+        // Overlapping. Copy first, then borrow the handle uniquely, so the two
+        // never describe the same bytes. `CBuf` is the crate's C-allocator
+        // buffer, so this temporary is accounted for exactly like every other
+        // allocation the port makes and is released by its own `Drop`.
+        let Some(copy) = CBuf::from_slice(bytes) else {
+            return crate::abi::CURLUE_OUT_OF_MEMORY;
+        };
+        // SAFETY: as above. `copy` owns its bytes and cannot overlap the
+        // handle, and the borrow of `part` is not used past this point.
+        let u = unsafe { &mut *handle };
+        url_set(u, what, Some(copy.as_bytes()), flags)
+    }
+
+    /// Whether `[start, start + len]` and the handle's own storage are
+    /// disjoint.
+    ///
+    /// The half-open input range is widened by one byte to take in the NUL that
+    /// [`CStr::from_ptr`] read, so a terminator sitting inside the handle counts
+    /// as overlap.
+    ///
+    /// Two ranges in different allocations can never overlap, and comparing
+    /// their addresses answers that case correctly too, so no provenance
+    /// question arises: the comparison is arithmetic on `usize`, not a pointer
+    /// dereference, and a false "overlapping" verdict would only take the
+    /// copying path, which is correct for every input.
+    pub(crate) fn disjoint_from_handle(
+        start: *const c_char,
+        len: usize,
+        handle: *const CurlUrl,
+    ) -> bool {
+        let input_start = start as usize;
+        let input_end = input_start.saturating_add(len).saturating_add(1);
+        let handle_start = handle as usize;
+        let handle_end = handle_start.saturating_add(mem::size_of::<CurlUrl>());
+
+        input_end <= handle_start || handle_end <= input_start
     }
 
     /// `Curl_is_absolute_url()`, `lib/urlapi.c` L182-L220, declared at
     /// `lib/urlapi-int.h` L28-L29.
     ///
+    /// # Why `buf` is never borrowed as a slice
+    ///
+    /// `buf` is a plain C output buffer, and the C signature asks nothing of
+    /// its contents. A caller is entitled to hand over a bare
+    /// `char scheme[MAX_SCHEME_LEN + 1];` local it has never written to, and
+    /// nothing in the declaration forbids that storage from overlapping `url`
+    /// either. Both of those are ordinary C, and both are outside what a
+    /// `&mut [u8]` may describe: the slice contract requires every element to
+    /// be initialized and requires the borrow to be exclusive for its whole
+    /// lifetime. Forming one over the caller's buffer would therefore have
+    /// added two preconditions that the ABI being replaced does not have --
+    /// silently, since a C caller has no way to learn of them.
+    ///
+    /// So the scheme is measured into storage this function owns, and the
+    /// caller's buffer is then written through raw pointers alone, exactly the
+    /// bytes the C writes and no others:
+    ///
+    /// * `buf[0] = 0`, L189's "always leave a defined value in buf", which the
+    ///   C performs before it knows the answer and this does too;
+    /// * on a non-zero result, the lower-cased scheme from L214 followed by the
+    ///   terminator at L215.
+    ///
+    /// Bytes past that terminator are left untouched, as in the C. Because the
+    /// source of the copy is a local array it can never overlap the caller's
+    /// buffer, so a `buf` that aliases `url` is written correctly rather than
+    /// being undefined behaviour, and `url` has in any case been fully read by
+    /// then.
+    ///
     /// # Ownership
     ///
     /// Nothing changes hands. `url` is read and `buf`, if given, is written in
-    /// place by the caller's own allocation.
+    /// place in the caller's own allocation.
+    ///
+    /// # `buf` may be `url`
+    ///
+    /// The C requires no separation between its two pointers, and a caller
+    /// that scans a buffer into itself -- `Curl_is_absolute_url(b, b, sizeof(b),
+    /// FALSE)` -- is a perfectly ordinary C call. This function therefore
+    /// never holds a shared borrow of `url` and a mutable borrow of `buf` at
+    /// the same time: the scan writes into [`SCHEME_SCRATCH_LEN`] bytes of local
+    /// scratch, and only once that borrow has ended are the bytes the C would
+    /// have written copied out through the raw pointer. Overlap is supported,
+    /// not merely tolerated, and needs no test.
+    ///
+    /// Two properties of the C are reproduced deliberately, and getting either
+    /// wrong changes the answer rather than merely the tidiness.
+    ///
+    /// The first is ORDER. L188-L189 writes `buf[0] = 0` before L194 reads the
+    /// input, so an aliased call has already truncated its own input by the
+    /// time the scan starts. Measured against the reference build, scanning a
+    /// buffer holding `HTTPS://example.com/` into itself answers zero and
+    /// leaves the buffer empty. This function writes that byte first for
+    /// exactly that reason.
+    ///
+    /// The second is EXTENT. The copy reproduces what the C writes and no more,
+    /// because the C leaves everything past the scheme untouched: L188-L189
+    /// writes one byte on every path, L214-L215 then writes the lowercased
+    /// scheme and its terminator, and nothing else in L182-L220 writes at all.
+    /// So the extent is one byte when the answer is zero and `n + 1` when it is
+    /// `n`, clamped to `buflen`.
     ///
     /// # Safety
     ///
-    /// `url` must be null or a NUL-terminated string. `buf` must be null or
-    /// writable for `buflen` bytes, and the C's own precondition -- asserted at
-    /// L186 -- is that `buflen` exceeds `MAX_SCHEME_LEN` whenever `buf` is
-    /// given.
+    /// * `url` must be null, or point to a NUL-terminated byte string that
+    ///   stays valid, readable and unmodified for the duration of the call.
+    /// * `buf` must be null, or point to `buflen` bytes that stay valid and
+    ///   writable for the duration of the call. Alignment is unconstrained:
+    ///   `c_char` has an alignment of one. `buf` may overlap `url`, wholly or
+    ///   partly.
+    /// * The C's own precondition, asserted at L186, is that `buflen` exceeds
+    ///   `MAX_SCHEME_LEN` whenever `buf` is given. This function does not rely
+    ///   on it: a shorter buffer is filled as far as it goes and left
+    ///   unterminated, and a `buflen` of zero gets nothing written at all,
+    ///   where the C would write one byte past the end. That is the bounded
+    ///   direction and the only one Rust can take.
+    /// * No other thread may write `url` or `buf` while the call runs.
     ///
     /// # Returns
     ///
     /// The length of the scheme, or zero for a relative URL -- and zero for a
-    /// null `url`, which the C would instead fault on.
+    /// null `url`, which the C would instead fault on. The result reports what
+    /// was *measured*, never how much of `buf` a short `buflen` allowed to be
+    /// written, which is again what the C returns.
     #[no_mangle]
     #[allow(non_snake_case)]
     pub unsafe extern "C" fn Curl_is_absolute_url(
         url: *const c_char,
         buf: *mut c_char,
         buflen: size_t,
-        guess_scheme: bool,
+        guess_scheme: CurlBool,
     ) -> size_t {
         if url.is_null() {
             return 0;
         }
-        // SAFETY: `url` is non-null and NUL-terminated by the precondition.
-        // The borrow lives only for this call. Taking the length here is what
-        // bounds the scan at L195, which in C runs off the end only because
-        // the terminator stops it.
-        let bytes = unsafe { CStr::from_ptr(url) }.to_bytes();
+        let guess_scheme = curl_bool_is_true(guess_scheme);
 
         if buf.is_null() {
             // L188: the C tolerates a null buffer and every in-tree caller but
-            // one passes exactly that.
+            // one passes exactly that. With no buffer there is no second
+            // pointer, so the input can be borrowed directly.
+            //
+            // SAFETY: `url` is non-null and NUL-terminated by the
+            // precondition, and stays valid and unmodified for the call. The
+            // borrow does not outlive this statement. Taking the length here
+            // is what bounds the scan at L195, which in C runs off the end
+            // only because the terminator stops it.
+            let bytes = unsafe { CStr::from_ptr(url) }.to_bytes();
             return is_absolute_url(bytes, None, guess_scheme);
         }
-        // SAFETY: `buf` is non-null and writable for `buflen` bytes by the
-        // caller's precondition, and `c_char` and `u8` have the same size and
-        // alignment on every target, so the cast changes only signedness.
-        // Nothing else references those bytes during the call.
-        let out = unsafe { slice::from_raw_parts_mut(buf.cast::<u8>(), buflen) };
+
+        // L188-L189, "always leave a defined value in buf", AND IT HAPPENS
+        // FIRST. Ordering is behaviour here, not tidiness: when `buf` overlaps
+        // `url` this write lands in the input, so the scan below sees the
+        // truncated string the C's scan would have seen. Measured against the
+        // reference build, `Curl_is_absolute_url(b, b, sizeof(b), FALSE)` on a
+        // buffer holding "HTTPS://example.com/" answers 0 with an emptied
+        // buffer, because L189 turned the first byte into the terminator before
+        // L194 looked at it. Reading the input into scratch before this write
+        // would answer 5 instead, which is a different function.
+        //
+        // The C writes unconditionally on `if(buf)` and relies on its L186
+        // precondition for the room; a zero length gets nothing written here
+        // rather than a byte out of bounds.
+        if buflen != 0 {
+            // SAFETY: `buf` is non-null by the test above and, by the caller's
+            // precondition, writable for `buflen` bytes, which is at least one.
+            // `c_char`'s alignment is one, so any address satisfies it. No Rust
+            // reference to these bytes exists.
+            unsafe { ptr::write(buf.cast::<u8>(), 0) };
+        }
+
+        // The scan's whole output, on the C's own bound: L195 stops the index
+        // below `MAX_SCHEME_LEN`, or leaves it exactly at `MAX_SCHEME_LEN` when
+        // every byte could continue a scheme, and L215 then writes the
+        // terminator at that index. One byte more than the bound, therefore,
+        // and never more than that -- which is also why the C asserts
+        // `buflen > MAX_SCHEME_LEN` at L186.
+        let mut scratch = [0u8; SCHEME_SCRATCH_LEN];
+
+        // Clamped so that a caller who ignores the C's precondition gets the
+        // same truncation from the scratch buffer that it would have got from
+        // its own: `is_absolute_url` decides what it can write from the length
+        // of the slice it is handed.
+        let window = buflen.min(SCHEME_SCRATCH_LEN);
+
+        let found = match scratch.get_mut(..window) {
+            // SAFETY: `url` is non-null and, by the caller's precondition,
+            // NUL-terminated and valid and unmodified for this call, which is
+            // the whole of the callee's contract. `slot` is this function's own
+            // stack, so it cannot alias `url`.
+            Some(slot) => unsafe { is_absolute_url_into(url, slot, guess_scheme) },
+            // Unreachable: `window` is at most `scratch.len()`. Written as a
+            // fallible lookup because the crate root denies direct indexing,
+            // and answered with the value a zero-length buffer produces.
+            None => 0,
+        };
+
+        // The C's write extent, from L188-L189 and L214-L215. `saturating_add`
+        // because the crate root denies unchecked arithmetic; `found` is at
+        // most `MAX_SCHEME_LEN`, so it cannot saturate.
+        let extent = if found == 0 {
+            1
+        } else {
+            found.saturating_add(1)
+        }
+        .min(window);
+
+        if let Some(written) = scratch.get(..extent) {
+            // SAFETY: `buf` is non-null and writable for `buflen` bytes by the
+            // caller's precondition, and `extent` is at most `window`, which is
+            // at most `buflen`. `c_char` and `u8` have the same size and
+            // alignment on every target, so the cast changes only signedness,
+            // and `c_char`'s alignment of one is satisfied by any address. The
+            // source is this function's own stack, so it cannot overlap the
+            // caller's buffer however `buf` and `url` are related. No Rust
+            // reference to `buf`'s bytes exists here or anywhere in this
+            // function, and the borrow of `url` ended with the call above.
+            unsafe { ptr::copy_nonoverlapping(written.as_ptr(), buf.cast::<u8>(), extent) };
+        }
+        found
+    }
+
+    /// Runs the scheme scan over a C string, writing into a Rust buffer.
+    ///
+    /// Split out so that the borrow of `url` provably ends before
+    /// [`Curl_is_absolute_url`] writes through `buf`: a function body is the
+    /// clearest scope there is, and the borrow cannot escape it because
+    /// [`is_absolute_url`] returns a `usize`.
+    ///
+    /// # Safety
+    ///
+    /// `url` must be non-null and point to a NUL-terminated byte string that
+    /// stays valid, readable and unmodified for the duration of the call. `out`
+    /// is an ordinary Rust slice and carries its own guarantees; it must not
+    /// alias `url`, which holds by construction because every caller passes
+    /// local scratch.
+    unsafe fn is_absolute_url_into(
+        url: *const c_char,
+        out: &mut [u8],
+        guess_scheme: bool,
+    ) -> usize {
+        // SAFETY: forwarded verbatim from this function's own contract. The
+        // borrow does not outlive the statement below, and `is_absolute_url`
+        // keeps no part of it.
+        let bytes = unsafe { CStr::from_ptr(url) }.to_bytes();
         is_absolute_url(bytes, Some(out), guess_scheme)
     }
 
@@ -2678,10 +3354,22 @@ pub(crate) mod exports {
     ///
     /// Nothing changes hands.
     ///
+    /// # `urllen` may point into `url`
+    ///
+    /// As with [`Curl_is_absolute_url`], the C requires no separation between
+    /// the two. The scan therefore runs in its own scope and yields a `usize`,
+    /// so the borrow of `url` has ended before `*urllen` is written. Overlap is
+    /// supported and needs no test.
+    ///
     /// # Safety
     ///
-    /// `url` must be null or a NUL-terminated string, and `urllen` must be
-    /// null or point to a writable `size_t`.
+    /// * `url` must be null, or point to a NUL-terminated byte string that
+    ///   stays valid, readable and unmodified for the duration of the call.
+    ///   Alignment is unconstrained.
+    /// * `urllen` must be null, or point to one properly aligned, writable
+    ///   `size_t` that stays valid for the duration of the call. It may overlap
+    ///   `url`.
+    /// * No other thread may write `url` or `*urllen` while the call runs.
     ///
     /// # Returns
     ///
@@ -2694,20 +3382,29 @@ pub(crate) mod exports {
     pub unsafe extern "C" fn Curl_junkscan(
         url: *const c_char,
         urllen: *mut size_t,
-        allowspace: bool,
+        allowspace: CurlBool,
     ) -> CURLUcode {
         if url.is_null() {
             return CURLUE_MALFORMED_INPUT;
         }
-        // SAFETY: as `Curl_is_absolute_url`. The `strlen` at L225 is the
-        // borrow's own length.
-        let bytes = unsafe { CStr::from_ptr(url) }.to_bytes();
 
-        match junkscan(bytes, allowspace) {
+        // The borrow lives for this block only, so the write below cannot
+        // conflict with it however the two pointers are related.
+        let scanned = {
+            // SAFETY: `url` is non-null and, by the caller's precondition,
+            // NUL-terminated and valid and unmodified for this call. The
+            // `strlen` at L225 is the borrow's own length, and `junkscan`
+            // returns a `usize` that keeps no part of it.
+            let bytes = unsafe { CStr::from_ptr(url) }.to_bytes();
+            junkscan(bytes, curl_bool_is_true(allowspace))
+        };
+
+        match scanned {
             Ok(length) => {
                 if !urllen.is_null() {
-                    // SAFETY: `urllen` is non-null by the test and writable by
-                    // the caller's precondition. L237.
+                    // SAFETY: `urllen` is non-null by the test and points to a
+                    // writable, aligned `size_t` by the caller's precondition.
+                    // No borrow of `url` is live here. L237.
                     unsafe { ptr::write(urllen, length) };
                 }
                 CURLUE_OK
@@ -2728,10 +3425,26 @@ pub(crate) mod exports {
     ///
     /// Nothing changes hands. `authority` is copied.
     ///
+    /// # `authority` may point into the handle
+    ///
+    /// Handled exactly as in [`curl_url_set`], and it matters more here than
+    /// there: this is the one entry point that operates on a live handle, so a
+    /// caller passing a pointer the handle itself owns is the plausible case
+    /// rather than the contrived one. [`disjoint_from_handle`] decides before
+    /// the unique reference is formed; overlap takes an owned copy.
+    ///
     /// # Safety
     ///
-    /// `u` must be null or a live handle, and `authority` must be null or a
-    /// NUL-terminated string valid for the call.
+    /// * `u` must be null, or point to a live, initialised handle from
+    ///   [`curl_url`] or [`curl_url_dup`], properly aligned, that stays valid
+    ///   for the duration of the call. It is written.
+    /// * The caller must have exclusive access to the handle for the duration
+    ///   of the call: no other pointer may read or write it, and no other
+    ///   thread may touch it.
+    /// * `authority` must be null, or point to a NUL-terminated byte string
+    ///   that stays valid, readable and unmodified for the duration of the
+    ///   call. Alignment is unconstrained. It **may** overlap the handle's
+    ///   storage.
     ///
     /// # Returns
     ///
@@ -2745,17 +3458,38 @@ pub(crate) mod exports {
         u: *mut CurlUrl,
         authority: *const c_char,
     ) -> CURLUcode {
-        // SAFETY: as `curl_url_set`.
-        let Some(handle) = (unsafe { u.as_mut() }) else {
+        if u.is_null() {
             return CURLUE_BAD_HANDLE;
-        };
+        }
         if authority.is_null() {
             return CURLUE_MALFORMED_INPUT;
         }
-        // SAFETY: as `Curl_is_absolute_url`. L672's `strlen(authority)` is the
-        // borrow's own length.
+
+        // L672's `strlen(authority)`, taken through the raw pointer so that the
+        // extent is known before the handle is borrowed.
+        //
+        // SAFETY: `authority` is non-null and, by the caller's precondition,
+        // NUL-terminated and valid and unmodified for this call.
         let bytes = unsafe { CStr::from_ptr(authority) }.to_bytes();
-        crate::parse::authority::url_set_authority(handle, bytes)
+
+        if disjoint_from_handle(authority, bytes.len(), u) {
+            // SAFETY: `u` is non-null by the test above and, by the caller's
+            // precondition, a live, aligned, initialised handle the caller has
+            // exclusive access to for this call. The unique reference and
+            // `bytes` address provably disjoint ranges.
+            let handle = unsafe { &mut *u };
+            return crate::parse::authority::url_set_authority(handle, bytes);
+        }
+
+        // Overlapping: copy before borrowing, as `curl_url_set` does and for
+        // the same reason.
+        let Some(copy) = CBuf::from_slice(bytes) else {
+            return crate::abi::CURLUE_OUT_OF_MEMORY;
+        };
+        // SAFETY: as above. `copy` owns its bytes and cannot overlap the
+        // handle.
+        let handle = unsafe { &mut *u };
+        crate::parse::authority::url_set_authority(handle, copy.as_bytes())
     }
 
     /// `curl_url_strerror()`, `lib/strerror.c` L420-L531.
@@ -2800,8 +3534,17 @@ pub(crate) mod exports {
     ///
     /// # Safety
     ///
-    /// `p` must be null, or a pointer this crate handed out that has not
-    /// already been released.
+    /// The caller must guarantee all of the following.
+    ///
+    /// * `p` is null, or a pointer this crate handed out -- one that came from
+    ///   the C allocator through `src/alloc.rs` -- and that has not already
+    ///   been released.
+    /// * No other pointer to that block is used afterwards, and no reference
+    ///   into it exists during the call. The block is *consumed*.
+    /// * The C allocator that produced the block is the one `free` releases.
+    ///   This holds for the standalone link, which is the only one that
+    ///   compiles this export at all; the two configurations it does not hold
+    ///   for are recorded in `src/alloc.rs` and in `docs/MEMORY-OWNERSHIP.md`.
     #[cfg(feature = "cfree")]
     #[no_mangle]
     pub unsafe extern "C" fn curl_free(p: *mut c_void) {
@@ -2827,7 +3570,7 @@ mod tests {
     // sets for the whole crate at AAP 0.4.3, split across several statements
     // only so that no line grows unreadably long.
     use super::{adopt_c_bytes, adopt_c_string, c_calloc, c_free, c_malloc};
-    use super::{c_memdup0, c_realloc, c_strdup_raw, curl_free, CBlock};
+    use super::{c_memdup0, c_realloc, c_strdup_raw, curl_free, CBlock, MAX_ALLOC};
     use crate::alloc::{c_concat, c_maprintf, c_strdup, CBuf};
     use crate::dynbuf::DynBuf;
     use crate::error::CURLcode;
@@ -2858,11 +3601,18 @@ mod tests {
     fn c_malloc_round_trips_and_frees() {
         let p = c_malloc(32);
         assert!(!p.is_null(), "a 32-byte allocation should succeed");
-        // SAFETY: `c_malloc` returned a non-null block of exactly 32 bytes, so
-        // a 32-byte slice over it lies inside the allocation, and `u8` needs
-        // no alignment beyond one byte.
-        let bytes = unsafe { slice::from_raw_parts_mut(p.cast::<u8>(), 32) };
-        bytes.fill(0xa5);
+        // `c_malloc` is `malloc`, so these 32 bytes are uninitialized and no
+        // reference may be formed over them yet. They are initialized with a
+        // raw write first -- the same rule `CBlock::resize` follows for the
+        // extent `realloc` adds -- and only then read back through a slice.
+        // SAFETY: `p` is a live block of exactly 32 bytes, `write_bytes` writes
+        // 32 of them and reads none, and it forms no reference. `u8` needs no
+        // alignment beyond one byte.
+        unsafe { ptr::write_bytes(p.cast::<u8>(), 0xa5, 32) };
+        // SAFETY: all 32 bytes are now initialized by the write above, so a
+        // shared slice over the block reads only initialized memory and lies
+        // wholly inside the allocation.
+        let bytes = unsafe { slice::from_raw_parts(p.cast::<u8>(), 32) };
         assert!(bytes.iter().all(|&b| b == 0xa5));
         // SAFETY: `p` came from `c_malloc` above and has not been freed.
         unsafe { c_free(p) };
@@ -2926,9 +3676,12 @@ mod tests {
     fn c_realloc_grows_and_preserves_the_prefix() {
         let small = c_malloc(4);
         assert!(!small.is_null());
-        // SAFETY: `small` is a non-null 4-byte block from `c_malloc`.
-        let dst = unsafe { slice::from_raw_parts_mut(small.cast(), 4) };
-        dst.copy_from_slice(b"curl");
+        // Uninitialized on arrival, so the four bytes are stored with a raw
+        // copy rather than through a `&mut [u8]` that would claim they were
+        // already initialized.
+        // SAFETY: `small` is a non-null 4-byte block from `c_malloc`, the source
+        // is a four-byte literal, and a fresh allocation cannot overlap a static.
+        unsafe { ptr::copy_nonoverlapping(b"curl".as_ptr(), small.cast::<u8>(), 4) };
         // SAFETY: `small` is a live block from this module's allocator and has
         // not been freed, which is `c_realloc`'s precondition.
         let big = unsafe { c_realloc(small, 64) };
@@ -2953,10 +3706,31 @@ mod tests {
             "realloc(p, 0) is implementation-defined in C and is refused here"
         );
         // The contract says a null return leaves the original alive, so `p` is
-        // still this test's to write and to free.
+        // still this test's to write and to free. The write is raw because the
+        // block came from `malloc` and is therefore still uninitialized.
         // SAFETY: `p` was untouched by the refused call above, so it is still
-        // a live 8-byte block from this module's allocator.
-        unsafe { slice::from_raw_parts_mut(p.cast::<u8>(), 8) }.fill(b'z');
+        // a live 8-byte block from this module's allocator; `write_bytes`
+        // writes eight bytes, reads none and forms no reference.
+        unsafe { ptr::write_bytes(p.cast::<u8>(), b'z', 8) };
+        // SAFETY: as above, and this is its single release.
+        unsafe { c_free(p) };
+    }
+
+    #[test]
+    fn c_realloc_refuses_a_size_past_max_alloc_and_keeps_the_original() {
+        // The same ceiling `c_malloc` and `c_calloc` apply, applied here so that
+        // every raw entry point in this module agrees on what a representable
+        // block is. A refusal is a null return, which by this function's
+        // contract means the original block is untouched.
+        let p = c_malloc(8);
+        assert!(!p.is_null());
+        // SAFETY: `p` is a live eight-byte block from `c_malloc`.
+        let out = unsafe { c_realloc(p, MAX_ALLOC.saturating_add(1)) };
+        assert!(out.is_null(), "a size past MAX_ALLOC is refused");
+        // SAFETY: the refused call above allocated and freed nothing, so `p` is
+        // still a live eight-byte block owned here; the write is raw because a
+        // `malloc` block is uninitialized until something stores into it.
+        unsafe { ptr::write_bytes(p.cast::<u8>(), b'k', 8) };
         // SAFETY: as above, and this is its single release.
         unsafe { c_free(p) };
     }
@@ -3072,32 +3846,131 @@ mod tests {
     }
 
     #[test]
-    fn cblock_zeroed_initializes_the_whole_capacity() {
-        // Invariant 3, and the property that lets `src/alloc.rs` and
-        // `src/dynbuf.rs` hold to `#![forbid(unsafe_code)]`: a slice over the
-        // whole capacity reads only initialized memory.
-        let block = CBlock::zeroed(64).unwrap();
+    fn cblock_alloc_starts_with_an_empty_initialized_prefix() {
+        // Invariant 4, and the property that lets `src/alloc.rs` and
+        // `src/dynbuf.rs` hold to `#![forbid(unsafe_code)]` over a block that
+        // came from `malloc`: the slice faces are bounded by the prefix, so
+        // they can only ever read memory a write has reached. The block is
+        // `malloc`ed rather than `calloc`ed, which is what `curlx_memdup0` at
+        // lib/curlx/strdup.c:L89 and `dyn_nappend()` at
+        // lib/curlx/dynbuf.c:L105 do.
+        let block = CBlock::alloc(64).unwrap();
         assert_eq!(block.capacity(), 64);
-        assert_eq!(block.bytes().len(), 64);
-        assert!(block.bytes().iter().all(|&b| b == 0));
+        assert_eq!(block.initialized(), 0);
+        assert!(block.bytes().is_empty(), "nothing is readable yet");
     }
 
     #[test]
-    fn cblock_zeroed_refuses_a_zero_capacity() {
-        assert!(CBlock::zeroed(0).is_none());
+    fn cblock_alloc_refuses_a_zero_capacity() {
+        assert!(CBlock::alloc(0).is_none());
     }
 
     #[test]
-    fn cblock_resize_grows_preserves_and_zeroes_the_tail() {
-        let mut block = CBlock::zeroed(8).unwrap();
-        block.bytes_mut().fill(0xa5);
+    fn cblock_put_extends_the_prefix_by_exactly_what_it_writes() {
+        let mut block = CBlock::alloc(16).unwrap();
+        assert!(block.put(0, b"curl"));
+        assert_eq!(block.initialized(), 4);
+        assert_eq!(block.bytes(), b"curl".as_slice());
+        // Appending at the prefix extends it; the bytes above stay unreadable.
+        assert!(block.put(4, b"!"));
+        assert_eq!(block.bytes(), b"curl!".as_slice());
+        // Overwriting inside the prefix does not move it.
+        assert!(block.put(0, b"CURL"));
+        assert_eq!((block.initialized(), block.bytes()), (5, b"CURL!".as_ref()));
+        // A gap is refused: no single length could then describe what is
+        // initialized, so the write is rejected rather than performed.
+        assert!(!block.put(6, b"x"), "offset above the prefix is refused");
+        assert_eq!(block.initialized(), 5, "and nothing moved");
+        // Past the capacity is refused too.
+        assert!(!block.put(5, &[0; 12]));
+        assert_eq!(block.initialized(), 5);
+        // An empty copy is a no-op, as it is at lib/curlx/dynbuf.c:L114.
+        assert!(block.put(5, b""));
+        assert_eq!(block.initialized(), 5);
+    }
+
+    #[test]
+    fn cblock_put_byte_and_push_write_one_byte_each() {
+        let mut block = CBlock::alloc(4).unwrap();
+        assert!(block.push(b'a'));
+        assert!(block.push(b'b'));
+        assert_eq!(block.bytes(), b"ab".as_slice());
+        // The terminator write of curlx_memdup0, lib/curlx/strdup.c:L94.
+        assert!(block.put_byte(2, 0));
+        assert_eq!(block.bytes(), b"ab\0".as_slice());
+        assert!(block.push(b'c'));
+        assert_eq!(block.bytes(), b"ab\0c".as_slice());
+        // Full: the next append has nowhere to go.
+        assert!(!block.push(b'd'));
+        assert_eq!(block.initialized(), 4);
+    }
+
+    #[test]
+    fn cblock_resize_grows_and_leaves_the_new_space_uninitialized() {
+        let mut block = CBlock::alloc(8).unwrap();
+        assert!(block.put(0, &[0xa5; 8]));
         assert!(block.resize(32));
         assert_eq!(block.capacity(), 32);
         // The old contents survive, which is C's realloc contract.
-        assert!(block.bytes()[..8].iter().all(|&b| b == 0xa5));
-        // The newly exposed tail is zero, which realloc does not guarantee
-        // and invariant 3 requires.
-        assert!(block.bytes()[8..].iter().all(|&b| b == 0));
+        assert_eq!(block.bytes(), [0xa5; 8].as_slice());
+        // The newly exposed tail is not initialized and is not readable, which
+        // is exactly what `realloc` leaves behind: nothing zeroes it, because
+        // dyn_nappend() at lib/curlx/dynbuf.c:L104-L117 does not either.
+        assert_eq!(block.initialized(), 8);
+        assert!(block.put(8, b"more"));
+        assert_eq!(block.initialized(), 12);
+    }
+
+    #[test]
+    fn cblock_resize_never_exposes_the_new_tail_on_successive_growths() {
+        // The doubling `crate::dynbuf::DynBuf::ensure` performs at
+        // lib/curlx/dynbuf.c:L96-L102, which is how a plain URL encode reaches
+        // `resize` several times in a row. Each step must leave invariant 3
+        // true, not merely the first growth: the tail `realloc` hands back is
+        // uninitialized every time. It is neither cleared nor reachable -- the
+        // prefix does not move, so the slice faces still end where the written
+        // bytes end, and `dyn_nappend()` writes each byte exactly once.
+        let mut block = CBlock::alloc(4).unwrap();
+        assert!(block.put(0, &[0xa5; 4]));
+        let mut filled = 0_usize;
+        for cap in [8_usize, 16, 32, 64, 128, 4096] {
+            filled = block.initialized();
+            assert!(block.resize(cap), "growth to {cap} must succeed");
+            assert_eq!(block.capacity(), cap);
+            assert_eq!(
+                block.initialized(),
+                filled,
+                "growth to {cap} must not widen the initialized prefix"
+            );
+            let seen = block.bytes();
+            assert_eq!(
+                seen.len(),
+                filled,
+                "the slice face must stop at the prefix at {cap}"
+            );
+            assert!(
+                seen.iter().all(|&b| b == 0xa5),
+                "realloc preserves the old contents"
+            );
+            // One more written byte extends the prefix by exactly one, so the
+            // tail becomes reachable only as it is written.
+            assert!(block.put(filled, &[0xa5]));
+            assert_eq!(block.initialized(), filled.saturating_add(1));
+        }
+        assert_eq!(filled, 9, "the loop really grew six times");
+    }
+
+    #[test]
+    fn cblock_resize_refuses_a_capacity_past_max_alloc() {
+        // A block larger than `isize::MAX` could never be viewed as a slice, so
+        // the request is refused here rather than recorded and discovered
+        // later. The old block stays owned by the value, unchanged.
+        let mut block = CBlock::alloc(8).unwrap();
+        assert!(block.put(0, b"qqqqqqqq"));
+        assert!(!block.resize(MAX_ALLOC.saturating_add(1)));
+        assert_eq!(block.capacity(), 8);
+        assert_eq!(block.initialized(), 8);
+        assert!(block.bytes().iter().all(|&b| b == b'q'));
     }
 
     #[test]
@@ -3105,30 +3978,36 @@ mod tests {
         // The skip at lib/curlx/dynbuf.c:L104, which is what keeps the
         // byte-at-a-time loop at lib/urlapi.c:L806 to a logarithmic number of
         // reallocations.
-        let mut block = CBlock::zeroed(16).unwrap();
-        block.bytes_mut()[0] = b'x';
+        let mut block = CBlock::alloc(16).unwrap();
+        assert!(block.put(0, b"x"));
         assert!(block.resize(16));
         assert_eq!(block.capacity(), 16);
-        assert_eq!(block.bytes()[0], b'x');
+        assert_eq!(block.bytes(), b"x".as_slice());
         // A zero capacity is refused, leaving the block as it was.
         assert!(!block.resize(0));
         assert_eq!(block.capacity(), 16);
-        assert_eq!(block.bytes()[0], b'x');
+        assert_eq!(block.bytes(), b"x".as_slice());
     }
 
     #[test]
     fn cblock_resize_shrinks_and_keeps_the_prefix() {
-        let mut block = CBlock::zeroed(64).unwrap();
-        block.bytes_mut()[..5].copy_from_slice(b"curl!");
+        let mut block = CBlock::alloc(64).unwrap();
+        assert!(block.put(0, b"curl!"));
         assert!(block.resize(5));
         assert_eq!(block.capacity(), 5);
         assert_eq!(block.bytes(), b"curl!".as_slice());
+        // A shrink below the content truncates the prefix with it: bytes
+        // outside the block cannot be described as initialized.
+        assert!(block.resize(2));
+        assert_eq!((block.capacity(), block.initialized()), (2, 2));
+        assert_eq!(block.bytes(), b"cu".as_slice());
     }
 
     #[test]
     fn cblock_into_raw_hands_over_and_from_raw_takes_back() {
-        let mut block = CBlock::zeroed(12).unwrap();
-        block.bytes_mut()[..11].copy_from_slice(b"example.com");
+        let mut block = CBlock::alloc(12).unwrap();
+        assert!(block.put(0, b"example.com"));
+        assert!(block.put_byte(11, 0));
         let raw = block.into_raw();
         assert!(!raw.is_null(), "into_raw never yields null");
         // SAFETY: `raw` is the live 12-byte NUL-terminated block just
@@ -3152,7 +4031,7 @@ mod tests {
             assert!(adopt_c_string(ptr::null_mut()).is_none());
             assert!(adopt_c_bytes(ptr::null_mut(), 0).is_none());
         }
-        let block = CBlock::zeroed(4).unwrap();
+        let block = CBlock::alloc(4).unwrap();
         let raw = block.into_raw();
         // A zero capacity is refused, so the block has to be reclaimed
         // through the other door to keep the test leak-free.
@@ -3278,8 +4157,8 @@ mod tests {
     /// The exported symbols, driven through their C signatures.
     ///
     /// The tests above cover section 1, the allocator every other section is
-    /// built on. These cover section 6, the ten symbols the archive actually
-    /// exports, and they call them exactly as C does: raw pointers in, raw
+    /// built on. These cover section 6, and they call every symbol it defines
+    /// exactly as C does: raw pointers in, raw
     /// pointers and integer codes out, no Rust-side convenience path. That is
     /// the point. `crate::getset` and `crate::parse` already test the logic
     /// against `lib/urlapi.c` line by line, so what is left to check is the
@@ -3293,9 +4172,12 @@ mod tests {
     ///
     /// Every buffer a getter hands over is reclaimed before the test ends,
     /// either by adopting it back through [`adopt_c_string`] or by handing it
-    /// to the exported `curl_free`, so a run under
-    /// `valgrind --leak-check=full` stays clean and a double free would be
-    /// caught rather than tolerated.
+    /// to the exported `curl_free`. That is a property of the test bodies
+    /// below, checkable by reading them: each `get` is paired with exactly one
+    /// release, so the module leaks nothing it was given and frees nothing
+    /// twice. Whether a particular run is clean under a leak checker is a
+    /// measurement, not a property of this file, and no such measurement is
+    /// asserted here.
     mod c_surface {
         use crate::abi::{
             CURLUPart, CURLUE_BAD_HANDLE, CURLUE_BAD_PARTPOINTER, CURLUE_MALFORMED_INPUT,
@@ -3311,6 +4193,17 @@ mod tests {
         use crate::handle::CurlUrl;
         use core::ptr;
         use libc::{c_char, c_void, size_t};
+
+        /// C's `TRUE`, in whichever representation [`exports::CurlBool`] has.
+        ///
+        /// `lib/curl_setup.h` L1046-L1052 defines `TRUE` as 1 for every one of
+        /// the three, so the literal is right in all three configurations and
+        /// these two constants are what keeps the tests below from having to
+        /// know which one is selected.
+        const C_TRUE: exports::CurlBool = 1;
+
+        /// C's `FALSE`, in whichever representation [`exports::CurlBool`] has.
+        const C_FALSE: exports::CurlBool = 0;
 
         /// A live handle, or a failed test.
         ///
@@ -3557,8 +4450,9 @@ mod tests {
         #[test]
         fn the_whole_round_trip_creates_sets_gets_dups_and_cleans_up() {
             // Create, set the whole URL, read every part back, duplicate,
-            // confirm the copy agrees, release both. This is the sequence
-            // `rust-urlapi/demo/urlapi_demo.c` performs and the one every
+            // confirm the copy agrees, release both. That is the sequence
+            // `rust-urlapi/demo/urlapi_demo.c` performs across its first and
+            // sixth sections, and the one every
             // caller in `lib/` performs in pieces.
             //
             // The credential fields carry a self-describing placeholder rather
@@ -3761,13 +4655,23 @@ mod tests {
                         url.as_ptr().cast::<c_char>(),
                         buf.as_mut_ptr().cast::<c_char>(),
                         buf.len() as size_t,
-                        false,
+                        C_FALSE,
                     )
                 };
                 assert_eq!(len, expected, "length for {url:?}");
                 let written = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
                 assert_eq!(&buf[..written], scheme, "buffer for {url:?}");
                 assert_eq!(written, expected, "L215 puts the terminator at `i`");
+                // The write extent is exactly what the C writes and no more.
+                // L188-L189 writes one byte on every path and L214-L215 adds
+                // the scheme and its terminator; nothing else in L182-L220
+                // touches the buffer, so every byte past the terminator must
+                // still hold the fill. This is the assertion that would catch
+                // a copy-out length computed one byte too generously.
+                assert!(
+                    buf[written + 1..].iter().all(|&b| b == 0xa5),
+                    "nothing past the terminator is written for {url:?}"
+                );
             }
 
             // L206's third condition: in guessing mode a scheme needs a slash
@@ -3779,7 +4683,7 @@ mod tests {
                     b"data:text/plain\0".as_ptr().cast::<c_char>(),
                     ptr::null_mut(),
                     0,
-                    true,
+                    C_TRUE,
                 )
             };
             assert_eq!(len, 0, "guessing mode needs a slash after the colon");
@@ -3787,8 +4691,374 @@ mod tests {
             // SAFETY: `url` is null, which this crate's contract permits and
             // reports as zero; the C would fault instead.
             let len =
-                unsafe { exports::Curl_is_absolute_url(ptr::null(), ptr::null_mut(), 0, true) };
+                unsafe { exports::Curl_is_absolute_url(ptr::null(), ptr::null_mut(), 0, C_TRUE) };
             assert_eq!(len, 0);
+        }
+
+        /// The one call the C permits that a borrowed input and a borrowed
+        /// output could not both survive: scanning a buffer into itself.
+        ///
+        /// `Curl_is_absolute_url(b, b, sizeof(b), FALSE)` passes one address as
+        /// both arguments, which the C permits and this function's contract
+        /// permits too. The answer is always zero, and that is the C's answer
+        /// rather than a simplification: L188-L189 writes the terminator into
+        /// `buf[0]` before L194 reads `url[0]`, so an aliased call destroys the
+        /// first byte of its own input and then finds nothing there.
+        /// `ISALPHA(0)` is false, the scan is skipped, and the `i &&` guard at
+        /// L206 fails.
+        ///
+        /// Both expectations were measured against this same driver linked to
+        /// an unmodified `libcurl.a` rather than derived from reading. This is
+        /// the one place where an implementation that read the input before
+        /// writing the buffer would answer five for the first case, look more
+        /// reasonable, and be a different function.
+        #[test]
+        fn curl_is_absolute_url_accepts_a_buffer_that_is_its_own_input() {
+            for input in [
+                b"HTTPS://example.com/\0".as_slice(),
+                b"data:text/plain\0".as_slice(),
+                b"/just/a/path\0".as_slice(),
+                b"\0".as_slice(),
+            ] {
+                // Wide enough for the C's L186 precondition and for the
+                // longest input above, so the aliasing is the only thing under
+                // test.
+                let mut buf = [0u8; MAX_SCHEME_LEN + 24];
+                buf[..input.len()].copy_from_slice(input);
+
+                let p = buf.as_mut_ptr().cast::<c_char>();
+                // SAFETY: `p` is the same live local array for both arguments,
+                // which this function's contract explicitly permits, and the
+                // array holds a NUL-terminated copy of `input`. Its length
+                // exceeds `MAX_SCHEME_LEN`, satisfying L186.
+                let len =
+                    unsafe { exports::Curl_is_absolute_url(p, p, buf.len() as size_t, C_FALSE) };
+
+                assert_eq!(len, 0, "the aliased {input:?} loses its own first byte");
+                assert_eq!(buf[0], 0, "L189 left the terminator at the front");
+            }
+
+            // Aliasing at an offset truncates the input at that offset instead
+            // of at its front, which is the same mechanism seen from further
+            // along. Both offsets below were measured against the reference.
+            //
+            // At five the terminator lands exactly on the colon, so the scan
+            // finds `https` followed by a terminator rather than by a colon and
+            // L206's second condition fails: the answer is zero even though the
+            // scheme name is intact in the buffer.
+            let mut buf = [0u8; MAX_SCHEME_LEN + 24];
+            buf[..21].copy_from_slice(b"https://example.com/\0");
+            let start = buf.as_mut_ptr().cast::<c_char>();
+            // SAFETY: as above, and the offset stays inside the same live
+            // array, so both pointers are valid for the lengths given.
+            let len = unsafe {
+                let out = start.add(5);
+                exports::Curl_is_absolute_url(start, out, (buf.len() - 5) as size_t, C_FALSE)
+            };
+            assert_eq!(len, 0, "the terminator replaced the colon L206 needs");
+            assert_eq!(&buf[..5], b"https", "the scheme name itself is untouched");
+            assert_eq!(buf[5], 0, "L189 wrote the terminator at the offset");
+
+            // At six the colon survives, so the scan succeeds and the copy-out
+            // lands the lowercased scheme and its terminator at the offset --
+            // which is what proves the write extent is `n + 1` bytes placed
+            // where the caller asked, and not a buffer fill.
+            let mut buf = [0xa5_u8; MAX_SCHEME_LEN + 24];
+            buf[..21].copy_from_slice(b"https://example.com/\0");
+            let start = buf.as_mut_ptr().cast::<c_char>();
+            // SAFETY: as above.
+            let len = unsafe {
+                let out = start.add(6);
+                exports::Curl_is_absolute_url(start, out, (buf.len() - 6) as size_t, C_FALSE)
+            };
+            assert_eq!(len, 5, "the colon at index five ended the scheme");
+            assert_eq!(&buf[..6], b"https:", "the input up to the offset is intact");
+            assert_eq!(&buf[6..12], b"https\0", "exactly six bytes were written");
+            // Index twelve still holds the input byte the copy did not reach --
+            // `p` of `example` -- which is what "and no more" means here.
+            assert_eq!(buf[12], b'p', "and not one byte more");
+            assert!(
+                buf[21..].iter().all(|&b| b == 0xa5),
+                "nothing past the input was touched either"
+            );
+        }
+
+        /// `Curl_junkscan` with its length pointer inside its input.
+        ///
+        /// The C writes `*urllen` at L237 after it has finished reading, so
+        /// overlap is harmless there; the port has to be arranged the same way,
+        /// and the storage below makes the two pointers genuinely the same
+        /// address. `[size_t; 4]` rather than `[u8; 32]` because `urllen` must
+        /// be aligned for a `size_t` and this is the portable way to say so.
+        #[test]
+        fn curl_junkscan_accepts_a_length_pointer_inside_its_input() {
+            const TEXT: &[u8] = b"https://example.com/\0";
+            let mut store = [0_usize; 4];
+
+            // SAFETY: `store` is a live local of 4 * size_of::<usize>() bytes,
+            // which is at least `TEXT.len()` on every target this crate builds
+            // for, and the destination is a byte pointer into it, so alignment
+            // is satisfied trivially. The two ranges do not overlap: `TEXT` is
+            // a static literal.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    TEXT.as_ptr(),
+                    store.as_mut_ptr().cast::<u8>(),
+                    TEXT.len(),
+                );
+            }
+
+            let url = store.as_mut_ptr().cast::<c_char>();
+            let urllen = store.as_mut_ptr().cast::<size_t>();
+            // SAFETY: `url` and `urllen` address the same live local, which
+            // this function's contract explicitly permits. `url` is
+            // NUL-terminated by the copy above and `urllen` is aligned for a
+            // `size_t` because it is the array's own element pointer.
+            let code = unsafe { exports::Curl_junkscan(url, urllen, C_FALSE) };
+
+            assert_eq!(code, CURLUE_OK);
+            assert_eq!(
+                store[0],
+                TEXT.len() - 1,
+                "L237 wrote the length over the input"
+            );
+        }
+
+        /// A `CurlBool` holding something other than 0 or 1 means true, as it
+        /// does in C.
+        ///
+        /// The point of not spelling these two parameters `bool` is that a C
+        /// caller whose `bool` is an `int` or an enumeration can hand over any
+        /// int-width value, and 2 in a Rust `bool` would be instant undefined
+        /// behaviour. Here it is simply true, which is C's own coercion.
+        #[test]
+        fn a_noncanonical_curl_bool_reads_as_true() {
+            let odd: exports::CurlBool = 2;
+
+            // Guessing mode needs a slash after the colon, L206, so a true
+            // `guess_scheme` answers zero for `data:` where a false one
+            // answers four.
+            // SAFETY: both literals end in NUL and the buffer pointer is null,
+            // which L188 tolerates.
+            let guessing = unsafe {
+                exports::Curl_is_absolute_url(
+                    b"data:text/plain\0".as_ptr().cast::<c_char>(),
+                    ptr::null_mut(),
+                    0,
+                    odd,
+                )
+            };
+            assert_eq!(guessing, 0, "2 means true, as it does in C");
+
+            // And `allowspace`, L232: a space is junk when it is false and
+            // acceptable when it is true.
+            let mut len: size_t = 0;
+            // SAFETY: the literal ends in NUL and `len` is a local this frame
+            // owns, so it is aligned and writable, and disjoint from the
+            // static.
+            let code = unsafe {
+                exports::Curl_junkscan(
+                    b"https://exa mple.com/\0".as_ptr().cast::<c_char>(),
+                    &mut len,
+                    odd,
+                )
+            };
+            assert_eq!(code, CURLUE_OK);
+            assert_eq!(len, 21);
+        }
+
+        /// The overlap test that decides whether the setters copy.
+        ///
+        /// A pure function of two addresses and two lengths, so it is checked
+        /// directly and exhaustively at its boundaries rather than through a
+        /// handle whose layout is deliberately unspecified. No pointer here is
+        /// dereferenced; forming one from an integer is safe, and the function
+        /// only compares.
+        #[test]
+        fn the_handle_overlap_test_is_exact_at_its_boundaries() {
+            let size = core::mem::size_of::<CurlUrl>();
+            let base = 0x1_0000_usize;
+            let handle = base as *const CurlUrl;
+            let at = |address: usize| address as *const c_char;
+
+            // Wholly before, with the NUL landing on the byte just before the
+            // handle: disjoint.
+            assert!(exports::disjoint_from_handle(at(base - 4), 3, handle));
+            // Wholly after the last byte: disjoint.
+            assert!(exports::disjoint_from_handle(at(base + size), 3, handle));
+
+            // The NUL lands on the handle's first byte: overlapping, which is
+            // why the range is widened by one.
+            assert!(!exports::disjoint_from_handle(at(base - 3), 3, handle));
+            // The first byte of the string is the handle's last byte.
+            assert!(!exports::disjoint_from_handle(
+                at(base + size - 1),
+                3,
+                handle
+            ));
+            // Starts at the handle, and an empty string still reads its NUL.
+            assert!(!exports::disjoint_from_handle(at(base), 0, handle));
+            // Strictly inside.
+            assert!(!exports::disjoint_from_handle(at(base + 1), 1, handle));
+            // Contains the handle.
+            assert!(!exports::disjoint_from_handle(
+                at(base - 8),
+                size + 16,
+                handle
+            ));
+        }
+
+        /// The handle fits the alignment the C allocator actually promises.
+        ///
+        /// `HANDLE_FITS_MALLOC_ALIGNMENT` proves this at compile time; the
+        /// run-time half exists so that the bound is reported rather than
+        /// merely satisfied, and so that a target whose `max_align_t` model is
+        /// weaker than its `CurlUrl` is caught by a named test rather than by a
+        /// bare `assert!` inside a `const` block.
+        #[test]
+        fn the_handle_needs_no_more_alignment_than_malloc_gives() {
+            let needed = core::mem::align_of::<CurlUrl>();
+            let promised = exports::malloc_alignment();
+
+            assert!(
+                needed <= promised,
+                "the handle wants {needed}-byte alignment and the C allocator \
+                 promises {promised}"
+            );
+            assert!(
+                promised >= core::mem::align_of::<*mut c_void>(),
+                "any model of max_align_t must be at least pointer-aligned"
+            );
+        }
+
+        #[test]
+        fn curl_is_absolute_url_writes_only_the_bytes_the_c_writes() {
+            // lib/urlapi.c writes at most `buf[0]` at L189 and, on success, the
+            // name at L214 plus one terminator at L215. Everything past that is
+            // the caller's business and must survive untouched, which is what a
+            // sentinel fill measures. This also pins the reason the caller's
+            // buffer is never borrowed as a slice: the function only ever
+            // stores, so a buffer a C caller has not initialized is fine.
+            const GUARD: u8 = 0x5a;
+
+            let mut buf = [GUARD; MAX_SCHEME_LEN + 8];
+            // SAFETY: the URL is a static literal ending in NUL, and `buf` is a
+            // live local array longer than `MAX_SCHEME_LEN`, which satisfies the
+            // L186 contract.
+            let len = unsafe {
+                exports::Curl_is_absolute_url(
+                    b"HTTPS://example.com/\0".as_ptr().cast::<c_char>(),
+                    buf.as_mut_ptr().cast::<c_char>(),
+                    buf.len() as size_t,
+                    C_FALSE,
+                )
+            };
+            assert_eq!(len, 5);
+            assert_eq!(&buf[..5], b"https".as_slice(), "L214 lower-cases");
+            assert_eq!(buf[5], 0, "L215 terminates at `i`");
+            assert!(
+                buf[6..].iter().all(|&b| b == GUARD),
+                "nothing past the terminator may be written"
+            );
+
+            buf.fill(GUARD);
+            // SAFETY: as above, with a relative URL.
+            let len = unsafe {
+                exports::Curl_is_absolute_url(
+                    b"/just/a/path\0".as_ptr().cast::<c_char>(),
+                    buf.as_mut_ptr().cast::<c_char>(),
+                    buf.len() as size_t,
+                    C_FALSE,
+                )
+            };
+            assert_eq!(len, 0);
+            assert_eq!(buf[0], 0, "L189 always leaves a defined value");
+            assert!(
+                buf[1..].iter().all(|&b| b == GUARD),
+                "a relative URL writes exactly one byte"
+            );
+        }
+
+        #[test]
+        fn curl_is_absolute_url_accepts_an_output_buffer_overlapping_the_url() {
+            // Nothing in the C declaration forbids `buf` from overlapping `url`,
+            // so this port has to tolerate it without undefined behaviour: the
+            // caller's buffer is never borrowed as a slice, the scheme is
+            // measured into a local array, and the result is copied out through
+            // raw pointers. The extreme case is `buf == url`.
+            //
+            // The ANSWER for that case is not the answer for two separate
+            // buffers, and reproducing the difference is the point. L188-L189
+            // writes `buf[0] = 0` *before* L194 reads `url[0]`, so an aliased
+            // call has already truncated its own input and reports no scheme.
+            // Measured against the unmodified reference archive:
+            //
+            //     aliased  "HTTPS://example.com/"  rc=0  buf=[]
+            //     separate "HTTPS://example.com/"  rc=5  out=[https]
+            //
+            // A port that read the input into scratch before writing would
+            // answer 5 here, which is a different function.
+            let mut inout =
+                *b"HTTPS://example.com/\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+            let raw = inout.as_mut_ptr().cast::<c_char>();
+            assert!(
+                inout.len() > MAX_SCHEME_LEN,
+                "the L186 buffer precondition has to hold for the aliased call"
+            );
+            // SAFETY: `inout` is a live NUL-terminated local array longer than
+            // `MAX_SCHEME_LEN`, so it is a valid `url` and a valid `buf` at once.
+            // Passing it as both is exactly what this test exists to exercise,
+            // and this function's contract permits it.
+            let len = unsafe {
+                exports::Curl_is_absolute_url(raw.cast_const(), raw, inout.len() as size_t, C_FALSE)
+            };
+            assert_eq!(len, 0, "L189 emptied the input before L194 read it");
+            assert_eq!(inout[0], 0, "the defined value L189 leaves");
+        }
+
+        #[test]
+        fn curl_is_absolute_url_bounds_a_buffer_shorter_than_the_c_requires() {
+            // The C's L186 precondition is `buflen > MAX_SCHEME_LEN`, and the C
+            // has no bounded behaviour when it is broken -- L215 simply writes
+            // out of range. This port truncates instead, which is the only
+            // direction available and the safe one, and it still reports the
+            // measurement rather than the number of bytes it managed to store.
+            const GUARD: u8 = 0x5a;
+            let mut framed = [GUARD; 16];
+
+            // Three writable bytes, then untouchable guard bytes after them.
+            // SAFETY: the URL is a NUL-terminated literal and the pointer is
+            // writable for the three bytes named, which is what `buflen` claims.
+            let len = unsafe {
+                exports::Curl_is_absolute_url(
+                    b"https://example.com/\0".as_ptr().cast::<c_char>(),
+                    framed.as_mut_ptr().cast::<c_char>(),
+                    3,
+                    C_FALSE,
+                )
+            };
+            assert_eq!(len, 5, "the measurement is unaffected by the short buffer");
+            assert_eq!(&framed[..3], b"htt".as_slice());
+            assert!(
+                framed[3..].iter().all(|&b| b == GUARD),
+                "not one byte past `buflen` may be written"
+            );
+
+            // A zero-length buffer is writable for nothing at all, so not even
+            // L189's terminator can be placed.
+            framed.fill(GUARD);
+            // SAFETY: `buflen` is zero, so no byte of `framed` is claimed to be
+            // writable and none may be written; the pointer is live regardless.
+            let len = unsafe {
+                exports::Curl_is_absolute_url(
+                    b"https://example.com/\0".as_ptr().cast::<c_char>(),
+                    framed.as_mut_ptr().cast::<c_char>(),
+                    0,
+                    C_FALSE,
+                )
+            };
+            assert_eq!(len, 5);
+            assert!(framed.iter().all(|&b| b == GUARD));
         }
 
         #[test]
@@ -3805,7 +5075,7 @@ mod tests {
                 exports::Curl_junkscan(
                     b"https://example.com/\0".as_ptr().cast::<c_char>(),
                     &mut len,
-                    false,
+                    C_FALSE,
                 )
             };
             assert_eq!(code, CURLUE_OK);
@@ -3818,7 +5088,7 @@ mod tests {
                 exports::Curl_junkscan(
                     b"https://exa mple.com/\0".as_ptr().cast::<c_char>(),
                     &mut len,
-                    false,
+                    C_FALSE,
                 )
             };
             assert_eq!(code, CURLUE_MALFORMED_INPUT);
@@ -3829,7 +5099,7 @@ mod tests {
                 exports::Curl_junkscan(
                     b"https://exa mple.com/\0".as_ptr().cast::<c_char>(),
                     &mut len,
-                    true,
+                    C_TRUE,
                 )
             };
             assert_eq!(code, CURLUE_OK);
@@ -3842,7 +5112,7 @@ mod tests {
                 exports::Curl_junkscan(
                     b"http://a\x7fb/\0".as_ptr().cast::<c_char>(),
                     &mut len,
-                    true,
+                    C_TRUE,
                 )
             };
             assert_eq!(code, CURLUE_MALFORMED_INPUT);
@@ -3857,12 +5127,12 @@ mod tests {
                 exports::Curl_junkscan(
                     b"http://a/\0".as_ptr().cast::<c_char>(),
                     ptr::null_mut(),
-                    false,
+                    C_FALSE,
                 )
             };
             assert_eq!(code, CURLUE_OK);
             // SAFETY: as above.
-            let code = unsafe { exports::Curl_junkscan(ptr::null(), ptr::null_mut(), false) };
+            let code = unsafe { exports::Curl_junkscan(ptr::null(), ptr::null_mut(), C_FALSE) };
             assert_eq!(code, CURLUE_MALFORMED_INPUT);
         }
 

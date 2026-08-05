@@ -193,11 +193,12 @@
 //! The decoded length is shorter than the block whenever the input held an
 //! escape, which is exactly the state the C is left in -- `lib/escape.c`
 //! never shrinks its allocation either, and reports the shorter length
-//! through `*olen` at L149-L151. Here [`CBuf::truncate`] writes the
-//! terminator at that shorter end and makes it the buffer's own length, so
-//! the length and the contents cannot disagree and no consumer has to be
-//! told which to trust. The spare capacity is what invariant 2 of [`CBuf`]
-//! exists to permit.
+//! through `*olen` at L149-L151. Here the buffer is finished at the decoded
+//! length, which writes the terminator at that shorter end and makes it the
+//! buffer's own length, so the length and the contents cannot disagree and no
+//! consumer has to be told which to trust. The spare capacity is what
+//! invariant 2 of [`CBuf`] exists to permit, and it is left uninitialized
+//! rather than zeroed, exactly as the C's `malloc` leaves it.
 //!
 //! # No `unsafe`, no panic
 //!
@@ -222,21 +223,24 @@
 //! directions, and a sweep of all 256 byte values through a `%XX` escape
 //! built with `crate::ctype::hexbyte`, which is the encoder's own primitive
 //! and so gives a round-trip check without reaching outside this module's
-//! dependencies. The same behavior is also driven through the exported C
-//! entry points by the crate's integration test
-//! `rust-urlapi/tests/encode_decode.rs`.
+//! dependencies. That is the coverage in force.
+//!
+//! The same behavior is also to be driven through the exported C entry points
+//! by the crate's integration test `rust-urlapi/tests/encode_decode.rs`, which
+//! is a later deliverable and does not exist yet.
 
-// Which of the two entry points below a given build reaches depends on which
-// sibling module is compiled: `urldecode_bytes` serves the two call sites
-// that pass an explicit length, in `src/getset.rs` and in the host check of
-// the assignment dispatch, and `urldecode` serves `urldecode_host` in
+// Both entry points below have callers. `urldecode_bytes` serves the two call
+// sites that pass an explicit length, in `src/getset.rs` and in the host check
+// of the assignment dispatch, and `urldecode` serves `urldecode_host` in
 // `src/parse/host.rs`, which passes zero. `UrlReject::Nada` and
-// `UrlReject::Zero` have no caller in the ported module at all, for the
-// reason the module documentation gives. Warnings are errors for this crate,
-// so rather than let the module set decide whether the build is clean, the
-// allowance is stated once here with its reason. It is scoped to this module
-// and to this lint alone.
-#![allow(dead_code)]
+// `UrlReject::Zero` have no caller in the ported module at all, for the reason
+// the module documentation gives, and are kept so that the enumeration mirrors
+// the C parameter it stands for.
+//
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // Every `unsafe` block in this crate lives in `src/ffi.rs`, and this module
 // needs nothing from C directly: the allocator it uses reaches the foreign
 // calls through `crate::alloc`'s safe surface. `forbid` rather than `deny`
@@ -507,50 +511,52 @@ pub(crate) fn urldecode(input: &[u8], length: usize, reject: UrlReject) -> Resul
     // The block underneath comes from the C allocator, by way of
     // `src/alloc.rs` over `src/ffi.rs`, which is what makes the caller's
     // `curl_free()` correct on the buffer this function eventually yields. It
-    // arrives zeroed, so the terminator invariant holds before anything is
-    // written, and `CBuf` releases it on every early return below.
-    let mut buf = CBuf::alloc(window.len()).ok_or(CURLcode::CURLE_OUT_OF_MEMORY)?;
+    // arrives uninitialized, exactly as the C's `malloc(alloc)` does, and the
+    // loop below writes one byte per decoded character and nothing else. The
+    // writer owns the block, so it is released on every early return below --
+    // including the rejection path, which is the whole point of building
+    // through an owned value rather than a bare pointer.
+    let mut writer = CBuf::writer(window.len()).ok_or(CURLcode::CURLE_OUT_OF_MEMORY)?;
 
     // One pass, `lib/escape.c` L124-L146, exactly as the C walks it. The
     // destination drives the loop, so no write can land outside the block: the
     // decode produces at most one byte per input byte, and the destination is
-    // as wide as the input.
-    let mut decoded_len: usize = 0;
-    {
-        let mut rest = window;
-        for slot in buf.as_mut_bytes() {
-            let Some((byte, consumed)) = decode_step(rest) else {
-                // The window is exhausted, which is the C's loop condition
-                // `while(alloc)` falling false at L124.
-                break;
-            };
-            // lib/escape.c L139-L143, applied to the decoded byte. Returning
-            // here drops `buf`, and `Drop` releases the block: that is the
-            // `Curl_safefree(*ostring)` at L141. The nulling half of
-            // `Curl_safefree` needs no counterpart, because an `Err` carries
-            // no pointer for the caller to hold.
-            if reject.rejects(byte) {
-                return Err(CURLcode::CURLE_URL_MALFORMAT);
-            }
-            // lib/escape.c L145: `*ns++ = (char)in`. The iterator supplies the
-            // post-increment.
-            *slot = byte;
-            // `saturating_add` because the crate root denies arithmetic that
-            // could panic. It is exact: the counter rises once per slot and
-            // the slots are a slice, so it cannot exceed `window.len()`.
-            decoded_len = decoded_len.saturating_add(1);
-            rest = advance(rest, consumed);
+    // as wide as the input. `remaining()` standing in for the C's
+    // `while(alloc)` is the same bound expressed from the other end.
+    let mut rest = window;
+    while writer.remaining() != 0 {
+        let Some((byte, consumed)) = decode_step(rest) else {
+            // The window is exhausted, which is the C's loop condition
+            // `while(alloc)` falling false at L124.
+            break;
+        };
+        // lib/escape.c L139-L143, applied to the decoded byte. Returning here
+        // drops `writer`, and `Drop` releases the block: that is the
+        // `Curl_safefree(*ostring)` at L141. The nulling half of
+        // `Curl_safefree` needs no counterpart, because an `Err` carries no
+        // pointer for the caller to hold.
+        if reject.rejects(byte) {
+            return Err(CURLcode::CURLE_URL_MALFORMAT);
         }
+        // lib/escape.c L145: `*ns++ = (char)in`. The append supplies the
+        // post-increment, and it cannot fail: `remaining()` was just found
+        // nonzero. Reported rather than asserted all the same.
+        if !writer.push(byte) {
+            break;
+        }
+        rest = advance(rest, consumed);
     }
 
     // lib/escape.c L147 wrote the terminator at the decoded end and L149-L151
-    // reported the decoded length through `*olen`. Both happen here: the
-    // truncation re-terminates at `decoded_len` and makes `CBuf::len` that
-    // same number. The block keeps the input-sized capacity, which invariant 2
-    // of `CBuf` permits and which is what the C is left holding too --
-    // `lib/escape.c` never shrinks its allocation either. L153 returns success.
-    buf.truncate(decoded_len);
-    Ok(buf)
+    // reported the decoded length through `*olen`. Both happen here, in one
+    // call: the terminator lands at the decoded length and `CBuf::len` becomes
+    // that same number. The block keeps the input-sized capacity, which
+    // invariant 2 of `CBuf` permits and which is what the C is left holding
+    // too -- `lib/escape.c` never shrinks its allocation either. L153 returns
+    // success. The `None` arm is unreachable, `finish_written` being handed
+    // the count the writer itself keeps, and is reported as out of memory
+    // because that is the only failure this function has a code for.
+    writer.finish_written().ok_or(CURLcode::CURLE_OUT_OF_MEMORY)
 }
 
 /// URL-decodes exactly `input`, with no measure-it overload.
@@ -1021,9 +1027,10 @@ mod tests {
 
     /// The buffer is a valid C string as well as a Rust slice.
     ///
-    /// `lib/escape.c` L147 is `*ns = 0`. The port gets the terminator for
-    /// free, because the block arrives zeroed, so the property is asserted
-    /// here rather than taken on trust.
+    /// `lib/escape.c` L147 is `*ns = 0`, and the port writes exactly that one
+    /// byte, at the decoded end, when the writer is finished. The block itself
+    /// arrives uninitialized as the C's does, so this property rests on that
+    /// single write and is asserted here rather than taken on trust.
     #[test]
     fn the_buffer_is_nul_terminated_at_the_decoded_length() {
         let out = urldecode_bytes(b"%41%42c", UrlReject::Ctrl).unwrap();

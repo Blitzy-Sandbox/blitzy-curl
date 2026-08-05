@@ -175,14 +175,13 @@
 // for the four gates at L1402, L1412, L1498 and L1505. The `Curl_idn_*` layer
 // is crate-visible because it is not static in C and because it is the only
 // layer at which the three `CURLcode` values are still distinguishable; the
-// wrappers above it fold two of them together.
+// wrappers above it fold two of them together. Which of these a given build
+// reaches is therefore decided by the feature set.
 //
-// Which of these a given build reaches is therefore decided by the feature set
-// and by the consumers rather than by this file, and warnings are errors for
-// this crate. Rather than let the feature matrix decide whether the build is
-// clean, the allowance is stated once here with its reason. It is scoped to
-// this module and to this lint alone.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // `unsafe` belongs to `src/ffi.rs` alone, and the lint matters more here than
 // in most modules: the default backend really does call into libidn2, and
 // keeping that call in `crate::ffi::idn2` is what lets this module state that

@@ -25,9 +25,13 @@
 //! 1. **A zero-length value never gets here.** L1697-L1710 handles it, and
 //!    that branch is flag-sensitive in a way this function takes no part in:
 //!    it re-reads the whole URL through `curl_url_get` **with the caller's
-//!    flags**, so `""` is a successful no-op or a `CURLUE_MALFORMED_INPUT`
-//!    according to flags the getter reads. `src/getset.rs` owns that
-//!    behavior. No empty-string handling belongs here.
+//!    flags**, so `""` is a successful no-op when those flags let the handle
+//!    serialize itself and `CURLUE_MALFORMED_INPUT` when they do not --
+//!    `CURLU_DEFAULT_SCHEME` on a scheme-less handle being the flag that
+//!    actually moves the answer, and `CURLU_NO_GUESS_SCHEME` not being one,
+//!    for the reason `set_url` sets out at its own documentation.
+//!    `src/getset.rs` owns that behavior. No empty-string handling belongs
+//!    here.
 //! 2. **An absolute value never gets here.** L1713-L1715 replaces the handle
 //!    outright, passing the guess argument as the bitwise or of
 //!    `CURLU_GUESS_SCHEME` and `CURLU_DEFAULT_SCHEME`.
@@ -203,24 +207,24 @@
 //! # End-to-end verification
 //!
 //! The tests at the end of this file drive all four branches and each
-//! subtlety above. The end-to-end oracle is the unmodified
-//! `tests/libtest/lib1560.c`, whose `set_url_list` table at L1226-L1381 is
-//! forty-odd redirect cases, run through `rust-urlapi/scripts/run-parity.sh`.
-//! The sub-test this file drives is `set_url`, which reports failure as exit
-//! code 1. Expectations below were taken from that table rather than from a
+//! subtlety above, and they are the oracle currently in force.
+//!
+//! The end-to-end oracle is to be the unmodified `tests/libtest/lib1560.c`,
+//! whose `set_url_list` table at L1226-L1381 is forty-odd redirect cases. The
+//! sub-test this file drives is `set_url`, whose failure is reported as exit
+//! code 1 by that entry point. `rust-urlapi/scripts/run-parity.sh` is the
+//! script that is to run it and is a later deliverable, so it does not exist
+//! yet. Expectations below were taken from that table rather than from a
 //! reading of RFC 3986, and the ones that came from it name their line.
 
-// Reachability here is decided by a module that does not exist yet.
-// `redirect_url` has exactly one caller in the C, `set_url` at
-// `lib/urlapi.c` L1727, which is `src/getset.rs` in this crate.
+// Reachability here matches the C exactly: `redirect_url` has one caller,
+// `set_url` at `lib/urlapi.c` L1727, which is `src/getset.rs` in this crate.
+// It exists and is compiled unconditionally.
 //
-// DEAD-CODE POLICY, TIME-BOXED. Identical in intent in every module of this
-// crate; grep for "DEAD-CODE POLICY" to find them all. They are removed
-// together, by the checkpoint that creates src/getset.rs, and replaced there
-// by one crate-level allowance in src/lib.rs. Until the setter exists nothing
-// calls this function, and a crate held to zero warnings cannot build clean
-// without this. Scoped to this module and to this one lint.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` (AAP 0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1). This
 // module inspects two byte slices, appends to a buffer and calls back into
@@ -520,7 +524,6 @@ pub(crate) fn redirect_url(
     // defined, so the two paths converge here safely.
     urlbuf.free();
 
-    // L1283.
     uc
 }
 

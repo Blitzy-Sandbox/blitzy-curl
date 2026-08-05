@@ -74,15 +74,24 @@
    under memory debugging (lib/curl_setup.h:L1461), whose free validates
    the pointer against its own table (lib/memdebug.c:L383); to the mutable
    global hook Curl_cfree when libcurl itself is being built (L1478); or to
-   plain free() (L1484). The crate takes the buffers it hands back to C
-   from the C allocator, so only the last of the three suits them, and this
-   harness therefore defines none of CURLDEBUG, DEBUGBUILD, CURL_MEMDEBUG
-   or BUILDING_LIBCURL -- which is also why memory_tracking_init() is gone.
-   The consequence is stated rather than papered over: curl's allocation
-   counter belongs to the memory-debug build, so it does not run here and
-   the ceiling of Allocations: 3000 at tests/data/test1560:L40 is not
-   measured in this configuration. The whole chain is in
-   ../docs/MEMORY-OWNERSHIP.md. */
+   plain free() (L1484).
+
+   The crate takes the buffers it hands back to C from the C allocator, and
+   two of those three release them correctly: plain free(), and Curl_cfree
+   while it holds the callback lib/easy.c:L107 initialises it to, which is
+   free. That second path is the one a drop-in link takes, since escape.c is
+   compiled with BUILDING_LIBCURL as part of libcurl. Only the tracking free
+   is incompatible, and only one other configuration is -- an application
+   that substitutes its own allocators through curl_global_init_mem()
+   (lib/easy.c:L237), which this harness is not.
+
+   So this harness defines none of CURLDEBUG, DEBUGBUILD, CURL_MEMDEBUG or
+   BUILDING_LIBCURL, which is what keeps the tracking free out of the link
+   and is also why memory_tracking_init() is gone. The consequence is stated
+   rather than papered over: curl's allocation counter belongs to the
+   memory-debug build, so it does not run here and the ceiling of
+   Allocations: 3000 at tests/data/test1560:L40 is not measured in this
+   configuration. The whole chain is in ../docs/MEMORY-OWNERSHIP.md. */
 
 #include "first.h"
 
@@ -96,9 +105,11 @@
 #include <locale.h>
 
 /* The status this binary exits with when it could not put itself into the
-   locale the parity run depends on. Chosen so that
-   ../scripts/run-parity.sh can tell a harness that never started from a
-   sub-test that failed: every code test_lib1560() returns is 1 through 11
+   locale the parity run depends on. Chosen so that whatever drives the run
+   can tell a harness that never started from a sub-test that failed --
+   ../scripts/run-parity.sh is to be that driver and is not written yet, so
+   for now the status is read by hand: every code test_lib1560() returns is
+   1 through 11
    (tests/libtest/lib1560.c:L2040-L2071), every TEST_ERR_* value the real
    harness uses is a CURLE_OBSOLETE* below 57
    (tests/libtest/first.h:L106-L117), and 126 and 127 belong to the shell.
@@ -127,17 +138,21 @@ int main(int argc, const char **argv)
      idn2_lookup_ul, so a non-ASCII host converts only while the process
      codeset is UTF-8 -- and a C program sits in the "C" locale until
      something asks for the environment's, whatever LC_ALL holds. This is
-     one of three settings, and the other two are environment and belong
-     to ../scripts/run-parity.sh: LC_ALL=C.UTF-8, which
-     tests/data/test1560:L14 sets, and CURL_TEST_HAVE_CODESET_UTF8, which
-     tests/runtests.pl:L836-L839 exports and
-     tests/libtest/lib1560.c:L2036 reads into has_utf8 to gate the
-     punycode rows at its L1446, L1548 and L1591. Drop any one of the
+     one of three settings, and it is the only one this file can own. The
+     other two are environment variables the caller has to export:
+     LC_ALL=C.UTF-8, which tests/data/test1560:L14 sets, and
+     CURL_TEST_HAVE_CODESET_UTF8, which tests/runtests.pl:L836-L839
+     exports and tests/libtest/lib1560.c:L2036 reads into has_utf8 to gate
+     the punycode rows at its L1446, L1548 and L1591. Drop any one of the
      three and those rows stop running while the harness still prints
      success -- a false green, which is worse than a failure, because the
      expectation at tests/libtest/lib1560.c:L629-L631, that
      r\xc3\xa4ksm\xc3\xb6rg\xc3\xa5s.se comes back as
      xn--rksmrgs-5wao1o.se, is exactly where a porting mistake shows.
+     ../scripts/run-parity.sh is to export both variables and repeat the
+     run with the codeset one set and unset; that script is a later
+     deliverable and does not exist yet, so for now they are exported by
+     hand on the command line that starts this binary.
 
      Unconditional, unlike the HAVE_SETLOCALE guard at
      tests/libtest/first.c:L230, for the reason above the include.
@@ -159,9 +174,11 @@ int main(int argc, const char **argv)
 
      The status is deliberately outside the range the test itself returns.
      tests/libtest/lib1560.c:L2040-L2071 answers with a sub-test number, 1
-     through 11, and ../scripts/run-parity.sh maps the exit status back to a
-     sub-test name; 120 cannot be mistaken for one of those, so refusing to
-     start stays distinguishable from a sub-test failing.
+     through 11, and the exit status is what any caller maps back to a
+     sub-test name -- ../scripts/run-parity.sh is to do that mapping once it
+     lands, and by hand until then. 120 cannot be mistaken for one of those
+     numbers either way, so refusing to start stays distinguishable from a
+     sub-test failing.
 
      The format string is a literal, as every format string in this
      harness is, so nothing the environment supplies is ever interpreted
@@ -180,9 +197,11 @@ int main(int argc, const char **argv)
      program is. tests/libtest/first.c requires argv[1] to name a test, at
      its L237-L241, and reads the URL from argv[2] at its L257-L258; there
      is one test here, so the URL moves up to argv[1] and nothing is
-     mandatory -- both ../scripts/run-parity.sh and ../GNUmakefile invoke
-     it bare. Written across two lines because scripts/checksrc.pl reports
-     a conditional body on the if() line as ONELINECONDITION. */
+     mandatory -- the binary can be, and today is, invoked bare, and
+     ../scripts/run-parity.sh and ../GNUmakefile are to invoke it the same
+     way once they land. Written across two lines because
+     scripts/checksrc.pl reports a conditional body on the if() line as
+     ONELINECONDITION. */
   if(argc > 1)
     URL = argv[1];
 
@@ -198,8 +217,9 @@ int main(int argc, const char **argv)
      tests/libtest/first.c:L287-L289. The clamp cannot fire here, every
      code tests/libtest/lib1560.c:L2040-L2071 returns being 1 through 11,
      and it is carried over anyway because those codes are this harness's
-     per-sub-test report: ../scripts/run-parity.sh reads the status back
-     and names the sub-test that failed, so nothing on this path is
-     remapped, collapsed into 0 and 1, or swallowed. */
+     per-sub-test report: a caller reads the status back and names the
+     sub-test that failed, which ../scripts/run-parity.sh is to automate
+     once it lands. Nothing on this path is remapped, collapsed into 0 and
+     1, or swallowed. */
   return (int)result <= 125 ? (int)result : 125;
 }

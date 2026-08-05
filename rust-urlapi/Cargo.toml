@@ -16,7 +16,8 @@
 # it does not replace them. Nothing outside this directory is created,
 # edited, moved or deleted.
 #
-# The two build configurations, used verbatim by GNUmakefile and scripts/:
+# The two build configurations. GNUmakefile and scripts/ are to use them
+# verbatim once those deliverables land; until then they are invoked by hand:
 #
 #   Mode A, the drop-in and authoritative configuration
 #     cargo build --release --no-default-features --features idn-libidn2
@@ -41,43 +42,79 @@ edition = "2021"
 # is 1.73 (docs/RUSTLS.md:59) and libc's own minimum is 1.65, so the default
 # configuration clears both with room to spare.
 #
-# It holds for EVERY feature combination this crate offers, not only for the
-# default one, and that is a property of the committed Cargo.lock rather than
-# of this line: a single locked package declaring a higher floor, or carrying
-# a manifest edition a 1.75 Cargo cannot parse, would make the combination
-# that reaches it unbuildable. Two consequences worth knowing before touching
-# the lockfile. The icu line that idna reaches through idna_adapter has a 2.x
-# series declaring rust-version = "1.86", so the lock pins the 1.5 series
-# instead. And cbindgen's generator shells out to `cargo metadata`, which
-# parses every locked manifest whether the build needs it or not, so a
-# manifest using a newer edition breaks genheader even when the package
-# itself is never compiled.
+# It holds for every feature combination this crate offers EXCEPT the opt-in
+# idn-pure backend, and that is a property of the committed Cargo.lock rather
+# than of this line: a single locked package declaring a higher floor, or
+# carrying a manifest edition a 1.75 Cargo cannot parse, makes the
+# combination that reaches it unbuildable. Two facts about the committed
+# lockfile are worth knowing before touching it.
 #
-# The verification matrix, run against the committed lockfile. Regenerate the
-# lockfile with CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback so the
-# resolver prefers versions compatible with the floor above, then:
+# First, idna 1.1.0 resolves idna_adapter 1.2.2, which is published as
+# edition 2024 and pulls the icu 2.x line, and eight of those packages
+# declare rust-version = "1.86". That is why idn-pure is opt-in and is the
+# one documented exception to the floor above -- AAP 0.5.1 records the
+# resolution and 0.5.1.2 records the measurement -- and it is why the lock is
+# NOT re-pinned to an older IDNA line to make that configuration reach 1.75.
+#
+# Second, genheader is deliberately not a second exception, and it is not one
+# only because build.rs generates from src/lib.rs with cbindgen's
+# `Builder::with_src`. `Builder::with_crate` would shell out to
+# `cargo metadata`, which resolves and parses the whole graph including
+# optional dependencies, so a 1.75 Cargo would abort on idna_adapter's
+# edition while compiling none of it. The generate() documentation in
+# build.rs states the mechanism in full; source mode emits byte-identical
+# bytes and never invokes Cargo.
+#
+#   default                      libc 0.2.189                     -> 1.65
+#   --no-default-features
+#     --features idn-libidn2     libc 0.2.189                     -> 1.65
+#   --features genheader         + cbindgen 0.29.4 and its 32      -> 1.74
+#                                  build-closure packages, whose
+#                                  highest declared floor is
+#                                  cbindgen's own
+#   --features idn-pure          + idna 1.1.0, idna_adapter 1.2.2  -> 1.86
+#                                  and the icu 2.2.0 line
+#
+# So the 1.75 declared above holds for the default, drop-in and genheader
+# configurations, and does NOT hold for idn-pure: idna_adapter 1.2.2 and the
+# five icu_* 2.2.0 packages each declare rust-version = "1.86". That is stated
+# again at the idn-pure feature below and in docs/KNOWN-DIVERGENCES.md, and it
+# is one of the two reasons that backend is not the default. Nothing pins an
+# icu 1.5 series; the lock resolves icu 2.2.0.
+#
+# The verification matrix. The first four lines are expected to pass on the
+# declared floor. idn-pure is listed last and on a different channel, because
+# its graph needs 1.86 and that is the documented exception rather than a
+# regression:
 #
 #   cargo +1.75.0 check --locked
+#   cargo +1.75.0 check --locked --no-default-features
 #   cargo +1.75.0 check --locked --no-default-features --features idn-libidn2
-#   cargo +1.75.0 check --locked --no-default-features --features idn-pure
 #   cargo +1.75.0 check --locked --features genheader
+#   cargo         check --locked --no-default-features --features idn-pure
 #
-# The idn-pure line builds like any other. build.rs prints a cargo:warning on
-# every build that selects that backend, naming the four ways it diverges from
-# libidn2, because it is outside the parity claim; see
-# docs/KNOWN-DIVERGENCES.md for the detail.
+# All four 1.75 lines must pass; genheader is one of them only because
+# build.rs generates in source mode, and the note above says why. Regenerate
+# the lockfile only with CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback
+# set, so the resolver keeps the generator's own graph on releases the floor
+# above can compile; a plain `cargo update` re-selects 1.85-only versions of
+# exactly those packages and silently breaks it.
+#
+# build.rs prints a cargo:warning on every build that selects that backend,
+# naming the four ways it diverges from libidn2, because it is outside the
+# parity claim; see docs/KNOWN-DIVERGENCES.md for the detail.
 rust-version = "1.75"
 license = "curl"
 description = "Binary-compatible Rust port of curl's URL API (lib/urlapi.c)"
 homepage = "https://curl.se/"
 repository = "https://github.com/curl/curl"
-# Named ahead of the file. README.md is part of this crate's planned contents
-# but is delivered at a later checkpoint, so the path does not resolve yet.
-# Harmless for every command that matters here -- `cargo build`, `cargo
-# check`, `cargo test` and `cargo clippy` never read it, and publish = false
-# below rules out the registry -- but `cargo package` would fail on it. The
-# packaging checkpoint has to confirm the file exists; so does the cargo-c
-# install asset named further down.
+# The packaging contract for this key, stated because the two halves of it
+# behave very differently. Nothing in the ordinary workflow reads the file:
+# `cargo build`, `cargo check`, `cargo test` and `cargo clippy` ignore it, and
+# `publish = false` below rules out the registry entirely. `cargo package`
+# does read it and fails if the path does not resolve, so this key is a
+# requirement that README.md exist beside this manifest -- as is the cargo-c
+# install asset named further down for the mirror header.
 readme = "README.md"
 # Declared explicitly rather than left to auto-detection, so the
 # relationship with the build script is legible. build.rs emits the link
@@ -102,18 +139,45 @@ publish = false
 
 [lib]
 # Underscores here. This is the library name and it is distinct from the
-# hyphenated package name above; the link lines in GNUmakefile and
-# scripts/ refer to libcurl_urlapi_rs.a and libcurl_urlapi_rs.so.
+# hyphenated package name above, and it is what any link line has to name:
+# libcurl_urlapi_rs.a and libcurl_urlapi_rs.so.
 name = "curl_urlapi_rs"
 # All three types earn their place.
 #
-# staticlib is the deliverable: the archive linked in place of
-# lib/urlapi.o. It contains this crate's code together with all upstream
-# Rust dependencies. Two consequences the link lines have to respect are
-# that exactly one Rust staticlib may take part in a link, since several are
-# likely to conflict, and that the archive's own dynamic dependencies have
-# to be named by hand on the link line because nothing else knows they are
-# needed.
+# staticlib is what the deliverable is MADE FROM, and the distinction is
+# load-bearing rather than pedantic. The archive contains this crate's code
+# together with all upstream Rust dependencies, which means the whole of the
+# Rust standard library, the allocator and the unwinder, and every one of
+# those carries global symbols. Measured on the release build: 2413 distinct
+# defined globals, where lib/urlapi.c's object file defines 8. That is not a
+# defect -- it is what a staticlib is -- but it is not "exporting the complete
+# symbol set that lib/urlapi.o exports and no more" either, which is what the
+# Agent Action Plan requires at G1 and checks at A2.
+#
+# The drop-in artifact is therefore produced FROM this archive by a
+# localization pass, the technique the plan holds in reserve at 0.3.2:
+# `ld -r --whole-archive` combines every member into one relocatable object,
+# `objcopy --keep-global-symbol` localizes every global except the ABI set,
+# and `ar rcs` re-archives it. The result defines exactly 8 globals in the
+# drop-in configuration and exactly 10 in the standalone one, where
+# curl_url_strerror and curl_free are real exports. build.rs implements it and
+# verifies the complete set with `nm -g --defined-only`, failing on anything
+# missing and on anything extra; see `localize_dropin_archive` there for the
+# commands and for why it is a second invocation -- Cargo has no post-build
+# hook, so a build script cannot post-process an archive that does not exist
+# until after it has run:
+#
+#   cargo build --release --no-default-features --features idn-libidn2
+#   CURL_URLAPI_DROPIN_ARCHIVE=target/release/libcurl_urlapi_rs.a \
+#     cargo build --release --no-default-features --features idn-libidn2
+#
+# Two consequences the link lines have to respect either way: exactly one Rust
+# staticlib may take part in a link, since several are likely to conflict, and
+# the archive's own dynamic dependencies have to be named by hand on the link
+# line because nothing else knows they are needed. Verified end to end --
+# libcurl's own test1560 binary, linked against a libcurl archive with
+# urlapi.c.o deleted plus the localized drop-in archive, resolves all its
+# undefined references and prints `success`.
 #
 # cdylib proves the crate is independently linkable. It exposes symbols the
 # way an executable does: a plain `pub fn` is not exported, only an
@@ -213,18 +277,36 @@ idn-libidn2 = []
 # where the libidn2 path goes through idn2_lookup_ul and so interprets its
 # input in the encoding of the process locale, which may convert differently
 # or fail outside a UTF-8 locale. In the C locale it fails, which is the
-# behaviour the parity runs measure. It also pulls in twenty-nine further crates
-# and raises the effective minimum toolchain to 1.86, above both this
-# crate's declared 1.75 and curl's documented 1.73. The divergences are
-# recorded in docs/KNOWN-DIVERGENCES.md.
+# behaviour the parity runs are to measure.
+#
+# Its cost, counted out of the committed Cargo.lock rather than estimated: it
+# takes the dependency closure from one package to thirty-one, adding idna
+# 1.1.0, idna_adapter 1.2.2, the five icu_* 2.2.0 packages with their two data
+# crates, and the zerovec/yoke/zerofrom supporting line. idna_adapter 1.2.2 and
+# every icu_* 2.2.0 package declares rust-version = "1.86", so selecting this
+# backend raises the effective minimum toolchain to 1.86 -- above this crate's
+# declared 1.75 and above curl's documented 1.73. That, and the loss of the
+# bit-for-bit claim, are the two reasons it is not the default. The divergences
+# are recorded in docs/KNOWN-DIVERGENCES.md.
 idn-pure = ["dep:idna"]
 
-# Compare include/curl_urlapi_rs.h against what the generator would emit,
-# so the committed mirror header cannot drift away from the code it
-# describes without somebody being told. Off by default, because the header
-# is committed and an ordinary build must not depend on a code generator.
-# The generated bytes land in OUT_DIR and the committed header is never
-# rewritten; build.rs explains why at length.
+# Check include/curl_urlapi_rs.h against the ABI the crate actually declares,
+# so the committed mirror header cannot drift away from the code it describes
+# without somebody being told.
+#
+# What is compared is an ABI projection, not text: build.rs generates a mirror
+# with cbindgen's library API into OUT_DIR, reduces both that file and the
+# committed one to their constant name/value pairs, their function signatures
+# with parameter names dropped, and their typedef names, and reports any
+# difference between the two sets. The projection is blind to comments, layout,
+# declaration order, parameter names and the enum-versus-macro spelling, which
+# is what makes it an ABI check rather than a diff: the two files are never
+# byte-equal, and cbindgen.toml records the four shape differences that account
+# for it.
+#
+# Off by default, because the header is committed and an ordinary build must not
+# depend on a code generator. The committed header is never rewritten; build.rs
+# explains why at length.
 genheader = ["dep:cbindgen"]
 
 # The six features above are the complete set, and the count is part of the
@@ -303,31 +385,40 @@ idna = { version = "1.1.0", optional = true }
 # cbindgen::Builder, so none of that is reachable code here: it is twelve
 # packages of supply-chain surface and nothing else.
 #
-# It is also what put the genheader closure over the declared MSRV, so the
-# two reasons for dropping the defaults are the same reason. cbindgen itself
-# declares rust-version = "1.74" and was never the obstacle; the clap chain
-# was, by reaching the indexmap, hashbrown and toml releases that ask for a
-# newer compiler. The matrix beside rust-version above is what keeps that
-# from coming back.
+# Dropping them is also what keeps the genheader closure inside the declared
+# MSRV, so the two reasons are one reason. cbindgen itself declares
+# rust-version = "1.74" and was never the obstacle; the front-end chain was.
+# With the defaults off, the whole closure is 33 packages and 1.74 is the
+# highest floor any of them declares -- verified against the committed
+# Cargo.lock, where indexmap is 2.11.4 (1.63), hashbrown 0.16.1 (1.65), toml
+# 0.9.6 (1.66) and syn 2.0.119 (1.71). The matrix beside rust-version above is
+# what keeps a regression here visible.
 cbindgen = { version = "0.29.4", optional = true, default-features = false }
 
 # Evaluated and rejected, recorded here so they are not added later.
-# punycode implements the raw encoding algorithm only, with no case mapping
-# and no normalisation, so it cannot reproduce the standard curl actually
-# applies. idna_adapter is pulled in transitively by idna and is never a
-# direct dependency. cbindgen and cargo-c are developer tools invoked as
-# programs -- cbindgen from build.rs under genheader, cargo-c from
-# scripts/ -- and must not appear under [dependencies] or
-# [build-dependencies]: the cbindgen library's own closure needs a newer
-# toolchain than this crate declares, and an off-by-default generator must
-# not raise the crate's minimum. Nothing to do with networking, async
-# runtimes or parser combinators belongs here either, because this module
-# performs no input or output at all.
-
 #
-# cargo-c belongs to neither dependency table. It is a developer tool that
-# scripts/build-rust.sh invokes as `cargo cbuild`, never a dependency of this
-# crate; the constraint that tool imposes is recorded beside [features] above.
+# punycode implements the raw encoding algorithm only, with no case mapping and
+# no normalisation, so it cannot reproduce the standard curl actually applies.
+#
+# idna_adapter is pulled in transitively by idna under idn-pure and must never
+# become a direct dependency.
+#
+# Nothing to do with networking, async runtimes or parser combinators belongs
+# here either, because this module performs no input or output at all.
+#
+# cargo-c belongs to neither table, and unlike cbindgen it really is a program:
+# scripts/build-rust.sh is to invoke it as `cargo cbuild`. The constraint that
+# tool imposes is recorded beside [features] above.
+#
+# cbindgen is the one that reads as a contradiction if this note is skimmed, so
+# it is stated plainly: it IS a dependency, declared above under
+# [build-dependencies], and build.rs uses its library API rather than shelling
+# out to its binary. `default-features = false` is what makes that affordable --
+# it drops the clap and terminal-styling chain that the command-line front end
+# needs, leaving a 33-package closure whose highest declared rust-version is
+# cbindgen's own 1.74, below this crate's declared 1.75. Verified against the
+# committed Cargo.lock. An earlier revision of this file described cbindgen as
+# an external tool kept out of the graph; that was never what the code did.
 [profile.release]
 # Link-time optimisation across the crate graph, and a single code-generation
 # unit. The archive is consumed by a C link line, so there is no reason to
@@ -395,12 +486,12 @@ subdirectory = false
 # committed header is installed explicitly. Without this the cargo-c path
 # would ship a library with no header at all.
 #
-# Like `readme` above, this names a file delivered at a later checkpoint, so
-# `cargo cinstall` cannot succeed until it exists. That is the one thing the
-# packaging checkpoint must verify. It is now merely absent rather than
-# endangered: build.rs used to overwrite this same path from generated output
-# on any `cargo check --features genheader`, and no longer writes into the
-# source tree at all.
+# The file this names is committed under include/ and is hand-authored, which
+# is what makes `generation = false` above the right setting: cargo-c ships
+# the committed bytes rather than emitting a competing header of its own.
+# build.rs writes its regenerated copy into OUT_DIR and never into this path,
+# which is what keeps the install asset and the hand-authored source the same
+# file.
 asset = [{ from = "include/curl_urlapi_rs.h" }]
 
 [package.metadata.capi.library]

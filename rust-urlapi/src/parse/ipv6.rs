@@ -198,25 +198,25 @@
 //!   unnormalized and `https://[1::2:3:4:5:6:7]/` round-trips unchanged.
 //!   That is why L435 tests the return value at all.
 //!
-//! End to end, this module is verified by the parity run over the unmodified
-//! `tests/libtest/lib1560.c` driven by `rust-urlapi/scripts/run-parity.sh`.
-//! The sub-test that exercises it hardest is `scopeid` at L1681-L1809, whose
-//! failure shows up as exit code 6 in the mapping recorded in the plan; the
-//! bracketed hosts in `set_url`, `get_parts` and `urldup` cover the rest.
+//! End to end, this module is to be verified by the parity run over the
+//! unmodified `tests/libtest/lib1560.c`. The sub-test that exercises it
+//! hardest is `scopeid` at L1681-L1809, whose failure would show up as exit
+//! code 6 in the mapping recorded in the plan; the bracketed hosts in
+//! `set_url`, `get_parts` and `urldup` cover the rest.
+//!
+//! `rust-urlapi/scripts/run-parity.sh` is the script that is to drive that
+//! run. It is a later deliverable and does not exist yet, so the tests at the
+//! foot of this file are the only oracle this file can currently point at.
 
-// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
-// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
-// checkpoint that creates src/getset.rs, and replaced there by one crate-level
-// allowance in src/lib.rs carrying this same note. Until src/parse/mod.rs
-// exists, this module has no consumer -- its four C call sites land in
-// src/parse/host.rs, src/parse/authority.rs and src/getset.rs, as the module
-// documentation sets out -- and a crate held to zero warnings cannot build
-// clean without this. Scoped to this module and to this lint alone.
+// `src/parse/mod.rs` declares `mod ipv6;`, and this stage's four C call sites
+// land in `src/parse/host.rs`, `src/parse/authority.rs` and `src/getset.rs`, as
+// the module documentation sets out. All of them exist and are compiled
+// unconditionally.
 //
-// THE CHECKPOINT THAT CREATES src/parse/mod.rs MUST DECLARE `mod ipv6;` THERE.
-// Under edition 2021 no module declaration reaches this file without it, so
-// otherwise nothing compiles it and none of the tests below ever run.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the technical
 // specification forbids `unsafe` outside FFI code (1.3.2.1). `forbid` rather
 // than `deny` because an inner `allow` here would be a design change and
@@ -258,13 +258,11 @@ const ZONEID_CAP: usize = 15;
 // the cap must leave that index inside the array. Checked at compile time so
 // that raising one constant without the other cannot build.
 //
-// Clippy releases up to and including 1.75, the crate's declared minimum,
-// report a constant assertion as optimized out, which for a `const` block is
-// the opposite of what happens: it is evaluated at compile time and nothing
-// survives to optimize. Later releases exempt const contexts. The allow is
-// therefore a compatibility allow with the declared floor, spelled the same
-// way `src/inet.rs` and `src/ffi.rs` spell theirs, and not a suppressed
-// finding.
+// The allow is spelled the same way `src/inet.rs` and `src/ffi.rs` spell
+// theirs, and `src/inet.rs` carries the measured account: on the pinned
+// toolchain the lint does not fire for a comparison of named numeric constants,
+// so the attribute is retained as a deliberate scoped exception covering the
+// declared 1.75 floor rather than to suppress a finding.
 #[allow(clippy::assertions_on_constants)]
 const _: () = {
     assert!(ZONEID_CAP < ZONEID_SIZE);
@@ -447,10 +445,28 @@ fn scan_zoneid(tail: &[u8], zoneid: &mut [u8; ZONEID_SIZE]) -> Option<usize> {
 ///   duplicated, L420.
 ///
 /// A rejection can leave `hostname` partly rewritten, exactly as the C does,
-/// and can also leave a zone identifier stored on the handle when the failure
-/// comes later, from L434. Neither matters to any caller: `parse_authority`
-/// builds into a temporary handle that L1188-L1191 discards whole, and the
-/// two `set_url_part` paths keep the old value on any error.
+/// and can also leave a zone identifier stored on the handle, because L418
+/// stores it before the address itself is validated at L434. Which of those
+/// two survives the rejection depends on the caller, and the difference is
+/// worth stating because only one of the three paths is atomic:
+///
+/// - `parse_authority` on the ordinary parse path builds into a temporary
+///   handle that L1188-L1191 discards whole, so neither survives.
+/// - `parse_authority` reached from `Curl_url_set_authority` runs against a
+///   **live** handle. `u->host` is left untouched, because L668-L669 releases
+///   the host buffer instead of storing it, but a zone identifier written
+///   here stays on the handle after the error is returned. So does anything
+///   `parse_hostname_login` and `Curl_parse_port` changed earlier in the same
+///   call; `crate::parse::authority::url_set_authority` lists all of it.
+/// - The two `set_url_part` paths at L1981 and L1985 leave the **host** as it
+///   was, because L1987-L1990 returns before the store at L1994-L1995 -- but
+///   they do not restore a zone identifier either, so a rejected host
+///   assignment can still leave a new zone readable through
+///   `CURLUPART_ZONEID`.
+///
+/// None of that is a defect introduced here: it is `FB3`, and the asymmetry
+/// with the host setter's own `Curl_safefree(u->zoneid)` at L1848 is set out
+/// in the module documentation.
 #[must_use = "the accept-or-reject verdict is the return value and must be handled"]
 pub(crate) fn ipv6_parse(u: &mut CurlUrl, hostname: &mut [u8], hlen: usize) -> CURLUcode {
     // L394 is `DEBUGASSERT(*hostname == '[')`, restating the comment at L389.
@@ -463,7 +479,6 @@ pub(crate) fn ipv6_parse(u: &mut CurlUrl, hostname: &mut [u8], hlen: usize) -> C
     // this function without a leading bracket would have its second byte read
     // as the first address byte, which is what the C does too.
 
-    // L395-L396.
     if hlen < MIN_BRACKETED_LEN {
         return CURLUE_BAD_IPV6;
     }
@@ -485,7 +500,6 @@ pub(crate) fn ipv6_parse(u: &mut CurlUrl, hostname: &mut [u8], hlen: usize) -> C
     // against the same name as in the original.
     let mut hlen = hlen.saturating_sub(2);
 
-    // L400-L401.
     let len = address_span(inner);
 
     // L403: an illegal byte was found inside the span. In the ordinary case
@@ -501,7 +515,6 @@ pub(crate) fn ipv6_parse(u: &mut CurlUrl, hostname: &mut [u8], hlen: usize) -> C
         // expression: `inner[len]` is the terminator when the span ran to the
         // end of the string, and is out of range only for a caller that
         // passed no terminator at all. Both are "not a `%`" and both reach
-        // L424-L425.
         if inner.get(len).copied() != Some(b'%') {
             // L424-L425: the `else` arm. Anything but a `%` here is invalid.
             return CURLUE_BAD_IPV6;
@@ -514,7 +527,6 @@ pub(crate) fn ipv6_parse(u: &mut CurlUrl, hostname: &mut [u8], hlen: usize) -> C
         let start = len.saturating_add(1);
         let mut zoneid = [0u8; ZONEID_SIZE];
         let Some(zonelen) = scan_zoneid(inner.get(start..).unwrap_or(&[]), &mut zoneid) else {
-            // L415-L416.
             return CURLUE_BAD_IPV6;
         };
 
@@ -539,7 +551,6 @@ pub(crate) fn ipv6_parse(u: &mut CurlUrl, hostname: &mut [u8], hlen: usize) -> C
         // reported a length at or below the cap and stored no zero byte, so
         // the range is in bounds and holds exactly the zone.
         let Some(zone) = zoneid.get(..zonelen).and_then(CBuf::from_slice) else {
-            // L419-L420.
             return CURLUE_OUT_OF_MEMORY;
         };
         u.store(StringField::ZoneId, zone);
@@ -637,7 +648,6 @@ pub(crate) fn ipv6_parse(u: &mut CurlUrl, hostname: &mut [u8], hlen: usize) -> C
         }
     }
 
-    // L441.
     CURLUE_OK
 }
 

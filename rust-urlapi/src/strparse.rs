@@ -109,20 +109,15 @@
 
 // Reachability here is decided by the consumers. The three public scanners
 // mirror `curlx_str_number`, `curlx_str_hex` and `curlx_str_octal`, and
-// `lib/urlapi.c` reaches them from the port parser and the IPv4 normaliser in
-// `src/parse/port.rs` and `src/parse/host.rs`; a build with neither reaches
-// none of them. The base table and its compile-time proof exist to keep the
-// three radices checkable in one place, so they are deliberately not folded
-// into the callers.
+// `src/parse/port.rs` and `src/parse/host.rs` reach them from the port parser
+// and the IPv4 normaliser exactly where `lib/urlapi.c` does. The base table and
+// its compile-time proof exist to keep the three radices checkable in one
+// place, so they are deliberately not folded into the callers.
 //
-// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
-// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
-// checkpoint that creates src/getset.rs, and replaced there by one crate-level
-// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
-// src/getset.rs exist, most of this crate has no consumer, and a crate held to
-// zero warnings cannot build clean without this. Scoped to this module and to
-// this lint alone.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a

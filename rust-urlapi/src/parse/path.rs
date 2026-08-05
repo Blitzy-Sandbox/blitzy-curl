@@ -83,12 +83,14 @@
 //! a zero-length string, and the whole-URL template at L1528 substitutes `/`
 //! only for a null path.
 //!
-//! End to end, this module is exercised by the parity run in
-//! `rust-urlapi/scripts/run-parity.sh`. The two sub-tests that press hardest
+//! End to end, this module is to be exercised by the parity run over the
+//! unmodified `tests/libtest/lib1560.c`. The two sub-tests that press hardest
 //! on it are `set_url` and `get_url`, exit codes 1 and 3 in the table in
 //! `AAP` 0.6.8, and the dot-segment cases they carry are at
 //! `tests/libtest/lib1560.c` L779-L784, L1253-L1259, L1289-L1297 and
-//! L1336-L1339.
+//! L1336-L1339. `rust-urlapi/scripts/run-parity.sh` is the script that is to
+//! drive that run; it is a later deliverable and does not exist yet, so until
+//! it does the tests at the foot of this file are the oracle in force.
 //!
 //! # No allocation escapes by accident
 //!
@@ -98,28 +100,19 @@
 //! pointer, so the obligation stays typed until `src/ffi.rs` releases it into
 //! C. `rust-urlapi/docs/MEMORY-OWNERSHIP.md` records the chain.
 
-// Reachability here is decided by a module that does not exist yet.
-// `handle_path` is called from the parse pipeline at `lib/urlapi.c` L1183, so
-// its consumer is `src/parse/mod.rs`; `is_dot` and `dedotdotify` are reached
-// only from inside this file, and `dedotdotify` is additionally exported to C
-// in unit-test builds of the original, which this port does not reproduce.
+// Reachability here matches the C. `handle_path` is called from the parse
+// pipeline at `lib/urlapi.c` L1183, so its consumer is `src/parse/mod.rs`,
+// which declares `mod path;` and runs the stage from the same position;
+// `src/getset.rs` reaches the dot-segment removal through the path setter.
+// `is_dot` and `dedotdotify` are reached only from inside this file, and
+// `dedotdotify` is additionally exported to C in unit-test builds of the
+// original, which this port deliberately does not reproduce. Every consumer
+// named here exists and is compiled unconditionally.
 //
-// This file is currently unreachable from any module tree, which is a
-// consequence of the delivery order and not a defect: `src/parse/` holds only
-// this file and `junk.rs`, there is no `src/parse/mod.rs` and no
-// `src/parse.rs`, and under edition 2021 no `mod` declaration can reach it
-// without one of those. THE CHECKPOINT THAT CREATES src/parse/mod.rs MUST
-// DECLARE `mod path;` THERE, or this module is compiled by nothing and its
-// tests never run.
-//
-// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
-// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
-// checkpoint that creates src/getset.rs, and replaced there by one crate-level
-// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
-// src/getset.rs exist, most of this crate has no consumer, and a crate held to
-// zero warnings cannot build clean without this. Scoped to this module and to
-// this lint alone.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a
@@ -241,7 +234,6 @@ pub(crate) fn is_dot(cursor: &mut &[u8]) -> bool {
             *cursor = rest;
             true
         }
-        // L696.
         _ => false,
     }
 }
@@ -374,7 +366,6 @@ pub(crate) fn dedotdotify(input: &[u8]) -> Result<Option<CBuf>, DedotFailure> {
     // same place: the C falls through to L810 with a non-zero result, leaves
     // `*outp` null and answers 1.
     while !cursor.is_empty() {
-        // L758.
         if starts_with_slash(cursor) {
             // L759-L760: `p = &input[1]; blen = clen - 1`.
             let mut probe: &[u8] = drop_first(cursor);
@@ -533,9 +524,14 @@ fn finish(out: DynBuf) -> Result<Option<CBuf>, DedotFailure> {
 /// pins it: `/there/it/is/../../tes t case=/...` under
 /// `CURLU_URLENCODE|CURLU_ALLOW_SPACE` becomes `/there/tes%20t%20case=/...`.
 /// The spaces are escaped first and the dot segments are removed from the
-/// escaped bytes. Reversing the two would still remove the same segments here,
-/// but it would also let the encoder see the pre-removal length, and the
-/// encoded length is what every step after L1076 works from.
+/// escaped bytes.
+///
+/// In this order the encoder sees the whole path *before* any segment is
+/// removed, and L1076 then replaces `pathlen` with the encoded length, which
+/// is what every step after it works from -- the truncation at L1093 and the
+/// de-dot call at L1098 both. Reversing the two would hand the encoder the
+/// already-shortened path instead, so the length the later steps work from
+/// would no longer be the encoded length of the input.
 ///
 /// The encoder is called with `relative` true and `query` false, L1073. True
 /// means "this is not a whole URL", so no authority prefix is copied through
@@ -579,7 +575,6 @@ pub(crate) fn handle_path(
         // length: encoding can triple a byte, so the output may legitimately
         // be longer than the input.
         let mut enc = DynBuf::new(CURL_MAX_INPUT_LENGTH);
-        // L1073.
         let result = urlencode_str(&mut enc, path, pathlen, true, false);
         if result != CURLUE_OK {
             // L1074-L1075. The buffer has already been released by the
@@ -628,7 +623,6 @@ pub(crate) fn handle_path(
         // bytes plus a terminator. This is the ordinary path, taken whenever
         // CURLU_URLENCODE is clear.
         let Some(copy) = CBuf::from_slice(window) else {
-            // L1087-L1088.
             return CURLUE_OUT_OF_MEMORY;
         };
         u.store(StringField::Path, copy);
@@ -707,7 +701,6 @@ pub(crate) fn handle_path(
         }
     }
 
-    // L1107.
     CURLUE_OK
 }
 

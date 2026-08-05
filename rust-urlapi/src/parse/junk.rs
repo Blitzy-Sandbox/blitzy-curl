@@ -107,26 +107,19 @@
 //! Returning it inside a `Result` reproduces the C's own discipline of
 //! writing `*urllen` at L237 only, after both rejections have been passed.
 
-// Reachability here is decided by two modules that do not exist yet.
+// Reachability here is decided by two consumers, both of which exist.
 // `Curl_junkscan` is called from the parse pipeline at `lib/urlapi.c` L1120
 // and re-exported to C for `lib/doh.c` L1127, so its consumers are
 // `src/parse/mod.rs` and `src/ffi.rs`.
 //
-// This file is currently unreachable from any module tree, which is a
-// consequence of the delivery order and not a defect: `src/parse/` holds only
-// this file, there is no `src/parse/mod.rs` and no `src/parse.rs`, and under
-// edition 2021 no `mod` declaration can reach it without one of those. THE
-// CHECKPOINT THAT CREATES src/parse/mod.rs MUST DECLARE `mod junk;` THERE, or
-// this module is compiled by nothing and its tests never run.
+// `src/parse/mod.rs` declares `mod junk;` and runs this stage first in the
+// pipeline, and `src/ffi.rs` exports it to C as `Curl_junkscan`. Both consumers
+// are compiled unconditionally.
 //
-// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
-// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
-// checkpoint that creates src/getset.rs, and replaced there by one crate-level
-// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
-// src/getset.rs exist, most of this crate has no consumer, and a crate held to
-// zero warnings cannot build clean without this. Scoped to this module and to
-// this lint alone.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a

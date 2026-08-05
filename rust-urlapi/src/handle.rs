@@ -89,29 +89,29 @@
 //! releases it with the C allocator, so the handle block itself has to come
 //! from the C allocator rather than from a Rust `Box`. `src/ffi.rs`
 //! therefore allocates `core::mem::size_of::<CurlUrl>()` bytes with its own
-//! `c_malloc` and writes a [`CurlUrl::new`] value into the block; the
-//! allocation, the null check and the write all live there, next to the
-//! `unsafe` the write needs and the safety comment that justifies it.
+//! `c_calloc`, mirroring the `curlx_calloc()` the C uses, and writes a
+//! [`CurlUrl::new`] value into the block; the allocation, the null check and
+//! the write all live there, next to the `unsafe` the write needs and the
+//! safety comment that justifies it.
 //!
 //! One trap in that arrangement deserves spelling out here, because it is
 //! invisible from the facade side and it would corrupt the first handle a
-//! caller ever obtains. `curl_url()` uses `curlx_calloc()`, and it is
-//! tempting to translate that as `c_calloc()` and then treat the zeroed
-//! block as a valid handle with no write at all. That is unsound. The ten
-//! fields are `Option<CBuf>`, and [`CBuf`] wraps a plain `*mut c_char`
-//! rather than a `NonNull`, so `Option<CBuf>` has no null niche and the
-//! language guarantees nothing about the bit pattern of its `None`. An
-//! all-zero block is therefore not necessarily ten `None`s.
-//! [`CurlUrl::new`] is the only way to obtain a valid empty handle, and it
-//! must be written into the block.
+//! caller ever obtains. Zeroing the block is not the same as initialising
+//! it, so the write is not redundant with the `c_calloc`. The ten fields are
+//! `Option<CBuf>`, and [`CBuf`] wraps a plain `*mut c_char` rather than a
+//! `NonNull`, so `Option<CBuf>` has no null niche and the language
+//! guarantees nothing about the bit pattern of its `None`. An all-zero block
+//! is therefore not necessarily ten `None`s. [`CurlUrl::new`] is the only way
+//! to obtain a valid empty handle, and it must be written into the block.
 //!
 //! # Two behaviors here are faithful reproductions, not mistakes
 //!
 //! [`CurlUrl::dup`] does not copy `guessed_scheme`, because
 //! `curl_url_dup()` does not copy it. That is `FB1`, and the omission
 //! carries the longest comment in this file so that nobody removes it by
-//! accident. `rust-urlapi/tests/ffi_surface.rs` asserts the divergence
-//! survives, and so does this module's own test module.
+//! accident. This module's own test module asserts that the divergence
+//! survives, and `src/ffi.rs` asserts the same thing through the exported
+//! `curl_url_dup` signature.
 //!
 //! `FB2` is not reproduced here but is visible from here.
 //! `parse_hostname_login()` at `lib/urlapi.c:L328-L330` sets the handle's
@@ -122,7 +122,8 @@
 //! authority-setter path at `L658-L675`, which runs against a live handle
 //! and which `lib/http2.c:L739` calls with one. `src/parse/authority.rs`
 //! owns the finding; [`CurlUrl::replace`] carries the note from the
-//! handle's side, because the temporary is this type.
+//! handle's side, because the temporary is this type. [`CurlUrl::clear`]
+//! records which half of it this port reproduces.
 //!
 //! # A note on what this module does not import
 //!
@@ -150,14 +151,14 @@
 //! `docs/PORTING-NOTES.md` maps every C function to its Rust module.
 
 // The handle is a foundation type whose consumers are `src/ffi.rs`,
-// `src/getset.rs` and the modules under `src/parse/`. Which of the
-// accessors below any one build reaches depends on which of those modules a
-// given configuration compiles and on the selected feature set, exactly as
-// it does for `src/alloc.rs`, which carries this same allowance at its own
-// line 226 for the same reason. Warnings are errors for this crate, so the
-// allowance is stated once, with its reason, scoped to this module and to
-// this lint alone rather than left to the feature matrix to decide.
-#![allow(dead_code)]
+// `src/getset.rs` and the modules under `src/parse/`, all of which exist.
+// Which of the accessors below any one build reaches still depends on the
+// selected feature set.
+//
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a
@@ -602,8 +603,8 @@ impl CurlUrl {
     /// that would expose the difference is the one the test never passes.
     ///
     /// A regression test in this module asserts the omission directly, and
-    /// `rust-urlapi/tests/ffi_surface.rs` asserts it through the C entry
-    /// points, so "correcting" the line below fails both.
+    /// `src/ffi.rs` asserts it through the exported `curl_url_dup`, so
+    /// "correcting" the line below fails both.
     #[must_use]
     pub(crate) fn dup(&self) -> Option<Self> {
         // curlx_calloc(1, sizeof(struct Curl_URL)) at L1312. The C code
@@ -661,7 +662,6 @@ impl CurlUrl {
             None => Some(()),
             Some(source) => {
                 // curlx_strdup((src)->name) at L1304, then the null test at
-                // L1305-L1306.
                 let copied = CBuf::from_slice(source.as_bytes())?;
                 // Stores through the field selector so that the release of
                 // any previous value is not duplicated here. On a fresh

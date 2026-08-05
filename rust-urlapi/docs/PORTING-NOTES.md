@@ -7,12 +7,13 @@ SPDX-License-Identifier: curl
 # Porting notes
 
 `lib/urlapi.c` is a single C translation unit of 1,998 lines. The
-`curl-urlapi-rs` port is to spread the same behavior across 26 Rust
-modules. This document is the map between the two, and it is a map of the
-**target** state rather than a report on a finished one. A reviewer checking
-a Rust module against the C it came from finds the line numbers here instead
-of re-deriving the correspondence, and a reader asking which module owns a
-given piece of C behavior finds the answer here as well.
+`curl-urlapi-rs` port spreads the same behavior across 26 Rust modules, and
+all 26 are in the tree. This document is the map between the two. A reviewer
+checking a Rust module against the C it came from finds the line numbers here
+instead of re-deriving the correspondence, and a reader asking which module
+owns a given piece of C behavior finds the answer here as well. What is not
+in the tree yet is named exactly, in "What exists today" below, so that no
+sentence here has to be taken on trust in either direction.
 
 Completeness is the point. A map that leaves a region of the C file
 unattributed sends a reader hunting through the wrong module, so every
@@ -20,9 +21,8 @@ region is attributed below, and the two spans that need a word of
 explanation get one rather than being left to a reader to puzzle out.
 
 Build steps, the feature table, prerequisites and script ordering are
-deliberately absent. They belong to `rust-urlapi/README.md`, which is to be
-the short entry point to the same material and which is not written yet.
-This file is the long one.
+deliberately absent. They belong to `rust-urlapi/README.md`, the short entry
+point to the same material. This file is the long one.
 
 ## Reading this document
 
@@ -42,10 +42,13 @@ Two conventions keep the tables and the prose narrow.
   which file each span belongs to rather than relying on this rule.
 - **A path is relative to the repository root unless it takes one of the two
   crate-local forms below.** In particular `lib/`, `src/`, `tests/`,
-  `include/`, `docs/`, `scripts/` and `.github/` always mean the
-  repository's own directories, never this crate's. An earlier convention
-  here made a bare `src/`, `tests/`, `harness/`, `demo/` or
-  `include/` crate-relative, which collided with three of those and is gone.
+  `include/`, `docs/`, `scripts/` and `.github/` always mean the repository's
+  own directories, never this crate's. The crate has directories of five of
+  those names -- `src/`, `tests/`, `include/`, `docs/` and `scripts/` -- which
+  is exactly why a bare one is never crate-relative here. The two sibling
+  documents, `rust-urlapi/docs/KNOWN-DIVERGENCES.md` and
+  `rust-urlapi/docs/MEMORY-OWNERSHIP.md`, allow themselves no crate-local form
+  at all; this file needs one because its tables have to fit 79 columns.
 - **Crate-local form one: a Rust module is named by its file leaf.**
   `getset.rs` means `rust-urlapi/src/getset.rs`, and `parse/host.rs` means
   `rust-urlapi/src/parse/host.rs`. No repository-root path takes either
@@ -56,40 +59,49 @@ Two conventions keep the tables and the prose narrow.
   `rust-urlapi/include/curl_urlapi_rs.h`, `rust-urlapi/Cargo.toml`,
   `rust-urlapi/README.md`.
 
-### What exists today, and what this map anticipates
+### What exists today, and what remains
 
-The crate is under construction, so a reader must be able to tell a claim
-about code from a requirement on code. At the time of writing
-`rust-urlapi/src/` holds `abi.rs`, `alloc.rs`, `ctype.rs`, `decode.rs`,
-`dynbuf.rs`, `encode.rs`, `error.rs`, `ffi.rs`, `handle.rs`, `idn.rs`,
-`inet.rs`, `scheme.rs`, `strparse.rs` and `parse/junk.rs`, and nothing else.
-That is thirteen of the fifteen top-level modules and one of the eleven
-parser stages: what is missing is `lib.rs`, `getset.rs`, and the ten parser
-stages after the junk scan.
+A reader must be able to tell a claim about code from a requirement on code,
+so the inventory is stated rather than left to be inferred.
 
-`ffi.rs` is on that list but only half built, and the distinction matters
-enough to state plainly. It holds the crate's C-boundary primitives -- the
+`rust-urlapi/src/` holds all 26 modules this map describes. The fifteen
+top-level ones are `abi.rs`, `alloc.rs`, `ctype.rs`, `decode.rs`,
+`dynbuf.rs`, `encode.rs`, `error.rs`, `ffi.rs`, `getset.rs`, `handle.rs`,
+`idn.rs`, `inet.rs`, `lib.rs`, `scheme.rs` and `strparse.rs`; the eleven
+parser stages are `parse/mod.rs`, `parse/junk.rs`, `parse/scheme.rs`,
+`parse/authority.rs`, `parse/host.rs`, `parse/ipv6.rs`, `parse/port.rs`,
+`parse/path.rs`, `parse/query.rs`, `parse/file.rs` and
+`parse/redirect.rs`.
+
+`ffi.rs` is complete, including the half that once was not, and the
+distinction is worth stating because earlier revisions of this file recorded
+it as outstanding. It holds the crate's C-boundary primitives -- the
 allocator entry points and the raw block that owns their result, the address
 conversion pair, the drop-in scheme lookup and the libidn2 bindings -- which
 is what makes it the single unsafe island the Agent Action Plan requires at
-0.3.3. It does **not** yet hold the exported C-linkage surface, the eight
-`#[no_mangle] extern "C"` symbols of 0.4.2.3 -- the plain spelling, which is
-the one edition 2021 takes -- because those depend on `getset.rs`. Sentences
-below about the exported functions are therefore still requirements, not
-descriptions.
+0.3.3. It also holds the exported C-linkage surface: ten
+`#[no_mangle] extern "C"` functions, in the plain spelling that edition 2021
+takes. Eight are unconditional and are the drop-in set of 0.4.2.3 --
+`curl_url`, `curl_url_cleanup`, `curl_url_dup`, `curl_url_get`,
+`curl_url_set`, `Curl_is_absolute_url`, `Curl_junkscan` and
+`Curl_url_set_authority` -- and two are feature-gated, `curl_url_strerror`
+behind `strerror` and `curl_free` behind `cfree`, both of them off in the
+drop-in configuration where libcurl's own objects define them. Sentences
+below about the exported functions therefore describe code rather than
+requirements.
 
-Outside `src/`, `rust-urlapi/harness/` is complete: `first.h`, `runner.c`,
-`main.c`, `shims.c` and `.checksrc`. `rust-urlapi/demo/` exists, but holds
-only its `.checksrc`; neither `urlapi_demo.c` nor `expected-output.txt` is
-written. There is no `rust-urlapi/tests/`, no `rust-urlapi/scripts/`, no
-`rust-urlapi/include/curl_urlapi_rs.h`, no `rust-urlapi/README.md` and no
-`rust-urlapi/GNUmakefile`.
+Outside `rust-urlapi/src/`, `rust-urlapi/harness/` is complete: `first.h`,
+`runner.c`, `main.c`, `shims.c` and `.checksrc`.
+`rust-urlapi/include/curl_urlapi_rs.h` exists. `rust-urlapi/demo/` holds
+`.checksrc` and `urlapi_demo.c`; what it does not hold is
+`expected-output.txt`, the golden capture from the reference link. Nor is
+there a `rust-urlapi/tests/`, a `rust-urlapi/scripts/`, a
+`rust-urlapi/README.md` or a `rust-urlapi/GNUmakefile`.
 
-Wherever a module, test, script or generated file outside that list appears
-below, the sentence states a requirement on work still to be done and is
-worded as one. Present tense is reserved for what a reader can open today.
-The module map in particular is the correspondence the Agent Action Plan
-fixes, not an inventory of files on disk.
+Those five are the whole of what is outstanding, and wherever one of them
+appears below the sentence states a requirement on work still to be done and
+is worded as one. Present tense is reserved for what a reader can open
+today.
 
 ### The scope boundary this work does not cross
 
@@ -155,23 +167,21 @@ because every one of those needs an entry point in the facade as well as a
 body behind it. A dash means the function is crate-internal and has no
 exported entry point.
 
-The third column names fifteen distinct modules across the 38 rows. Four of
-them are written -- `encode.rs`, `handle.rs`, `idn.rs` and `parse/junk.rs` --
-and eleven are not: `getset.rs` and the ten parser stages after the junk scan,
-namely `parse/mod.rs`, `parse/scheme.rs`, `parse/authority.rs`,
-`parse/host.rs`, `parse/ipv6.rs`, `parse/port.rs`, `parse/path.rs`,
-`parse/query.rs`, `parse/file.rs` and `parse/redirect.rs`. Ten written modules
-appear in no third-column cell at all -- `abi.rs`, `alloc.rs`, `ctype.rs`,
-`decode.rs`, `dynbuf.rs`, `error.rs`, `ffi.rs`, `inet.rs`, `scheme.rs` and
-`strparse.rs` -- and their absence is by design rather than an omission: they
-carry the ABI constants and the helpers `lib/urlapi.c` borrows from sibling
-translation units, so there is no line of that file for a row to list them
-against. `ffi.rs` is named by the fourth column instead. The module map below
-is where all ten are accounted for.
+The third column names fifteen distinct modules across the 38 rows, and all
+fifteen are in the tree: `encode.rs`, `getset.rs`, `handle.rs`, `idn.rs` and
+the eleven parser stages `parse/mod.rs`, `parse/junk.rs`, `parse/scheme.rs`,
+`parse/authority.rs`, `parse/host.rs`, `parse/ipv6.rs`, `parse/port.rs`,
+`parse/path.rs`, `parse/query.rs`, `parse/file.rs` and `parse/redirect.rs`.
+Ten further modules appear in no third-column cell at all -- `abi.rs`,
+`alloc.rs`, `ctype.rs`, `decode.rs`, `dynbuf.rs`, `error.rs`, `ffi.rs`,
+`inet.rs`, `scheme.rs` and `strparse.rs` -- and their absence is by design
+rather than an omission: they carry the ABI constants and the helpers
+`lib/urlapi.c` borrows from sibling translation units, so there is no line of
+that file for a row to list them against. `ffi.rs` is named by the fourth
+column instead. The module map below is where all ten are accounted for.
 
-Every fourth-column entry is still a requirement rather than a description.
-`ffi.rs` exists, but the exported C-linkage symbols it names do not, for the
-reason given under *What exists today*.
+Every fourth-column entry describes code. `ffi.rs` holds each of the eight
+exported C-linkage symbols the column names, as *What exists today* records.
 
 Splitting the ownership into two columns is what makes the inventory
 open to checking against the module map without cross-referencing by hand, and
@@ -343,12 +353,12 @@ the body of `curl_url_get`. The plan anchors that line to `ffi.rs` and
 attributes nothing to the 94 lines behind it, which is the gap the function
 inventory above corrects and which the corrections section below explains.
 
-One row needs reading twice. `src/ffi.rs` is the crate's only `unsafe`
+One row needs reading twice. `ffi.rs` is the crate's only `unsafe`
 module, so besides the exported entry points it also holds the *call* at the
-bottom of four rows above it: the C allocator behind `src/alloc.rs`, the
-platform `inet_pton` and `inet_ntop` behind `src/inet.rs`, the libidn2
-binding behind `src/idn.rs`, and the imported `Curl_get_scheme` behind
-`src/scheme.rs`. The rows are attributed to the modules that own the
+bottom of four rows above it: the C allocator behind `alloc.rs`, the
+platform `inet_pton` and `inet_ntop` behind `inet.rs`, the libidn2
+binding behind `idn.rs`, and the imported `Curl_get_scheme` behind
+`scheme.rs`. The rows are attributed to the modules that own the
 *interface*, because that is where a reader looking for the behavior should
 go; the foreign call is one level below each of them and is documented at its
 own site.
@@ -357,7 +367,7 @@ own site.
 
 Every module named is under `rust-urlapi/src/parse/`, and every span is
 inside `lib/urlapi.c` except the one outside citation on `authority.rs`,
-which spells its own file out. Only `junk.rs` exists today.
+which spells its own file out. All eleven are in the tree.
 
 | Module | C source |
 |---|---|
@@ -404,7 +414,7 @@ resolution below was checked against the source.
 - `encode.rs` covers `find_host_sep` at L104-L118, the `cc2cu` macro
   at L121-L122, `urlencode_str` at L130-L172 and `allowed_in_path` at
   L1779-L1803. `cc2cu` appears inside this span for position only; its
-  implementation belongs to `src/error.rs`, which owns every numeric
+  implementation belongs to `error.rs`, which owns every numeric
   conversion. Two further spans reach it from elsewhere in the file, the
   assignment-side encoder at L1887-L1915 and the escape lower-casing pass at
   L1916-L1933, both of which the region table further down attributes to it,
@@ -423,7 +433,7 @@ resolution below was checked against the source.
   to a query. Neither of the first two is a bug and both are reachable, so
   the port carries both; merging them, or "fixing" the host exemption, would
   change behavior in one direction or the other.
-- `src/handle.rs` covers `struct Curl_URL` at L67-L82, the
+- `handle.rs` covers `struct Curl_URL` at L67-L82, the
   `DEFAULT_SCHEME` definition at L84, `free_urlhandle` at L86-L98, the
   `DUP` macro at L1301-L1308 and `curl_url_dup` at L1310-L1332. The
   structure holds ten heap strings at L68-L77 plus `portnum` at L78 and the
@@ -438,8 +448,8 @@ Two functions carry a second module because the C function is both an
 exported symbol and a body of logic. `curl_url_dup` at L1310 is exported
 from `ffi.rs` and implemented in `handle.rs`, which is where the
 `DUP` macro it invokes ten times at L1314-L1323 also lives.
-`curl_url_set` at L1805 is exported from `src/ffi.rs` and dispatched from
-`src/getset.rs`; the next heading takes its body apart in full, because a
+`curl_url_set` at L1805 is exported from `ffi.rs` and dispatched from
+`getset.rs`; the next heading takes its body apart in full, because a
 single row cannot express how it divides.
 
 ## Two spans that need stating exactly
@@ -455,12 +465,12 @@ at L222, the body opens at L224, the length ceiling test against
 chosen at L232 as `0x1f` when spaces are allowed and `0x20` otherwise, the
 rejecting loop runs L233-L236, and the closing brace is L239. L240 is blank
 and L241-L247 is the comment block introducing `parse_hostname_login`, whose
-definition begins at L248 and belongs to `src/parse/authority.rs`. A
+definition begins at L248 and belongs to `parse/authority.rs`. A
 reviewer reading L246 expecting junk-scan code is past the end of it.
 
 ### The body of `curl_url_set`, L1806-L1998, is split across four modules
 
-`src/ffi.rs` owns the exported entry point at L1805. The 193 lines of its
+`ffi.rs` owns the exported entry point at L1805. The 193 lines of its
 body that follow are behavior rather than boilerplate -- they hold the whole
 assignment-side encoder -- and no single module owns them.
 
@@ -551,11 +561,12 @@ query search runs against the full length, so the query swallows the
 fragment along with it. The comment at L1169 records the dependency in the
 source itself.
 
-`parse/mod.rs` is to preserve the order exactly; the module is not written
-yet, so this is a requirement on it rather than a property to be checked
-today. A later tidy-up that reorders the pipeline is a correctness regression
-rather than a refactor, which is the reason this record states the mechanism
-and not merely the instruction.
+`parse/mod.rs` preserves that order exactly, and it is checkable today: its
+pipeline runs the junk scan, the absolute-URL test, the scheme stage, the
+authority stage, then the fragment, query and path stages in that sequence,
+which is the sequence above. A later tidy-up that reorders the pipeline is a
+correctness regression rather than a refactor, which is the reason this
+record states the mechanism and not merely the instruction.
 
 ### Atomic replacement
 
@@ -693,28 +704,28 @@ loses. They are expanded here so that the inventory stays easy to scan.
   handover at `lib/urlapi.c`:L1185 is a convention the caller honors rather
   than something the buffer enforces. `MEMORY-OWNERSHIP.md` carries that in
   full.
-- `lib/curlx/strparse.c`, the numeric scanners, into `src/strparse.rs`.
+- `lib/curlx/strparse.c`, the numeric scanners, into `strparse.rs`.
   `curlx_str_number` at L195 is the decimal entry point, and the port keeps
   the exact overflow and trailing-junk semantics rather than substituting a
   Rust integer parser, whose acceptance set differs.
 - `lib/curlx/inet_pton.c` and `lib/curlx/inet_ntop.c`, address conversion,
-  into `src/inet.rs`. `curlx_inet_pton` at L207 and `curlx_inet_ntop` at
+  into `inet.rs`. `curlx_inet_pton` at L207 and `curlx_inet_ntop` at
   L210 are the pair used for the IPv6 normalization at
   `lib/urlapi.c`:L433-L435, where an address is parsed to bytes and
   formatted back so that the stored form is canonical.
 - `lib/escape.c`, four helpers into four modules. `curl_easy_escape` at L50
-  into `src/encode.rs`, `Curl_urldecode` at L105 into `src/decode.rs`,
-  `curl_free` at L189-L192 into `src/ffi.rs`, whose `cfree`-gated export
+  into `encode.rs`, `Curl_urldecode` at L105 into `decode.rs`,
+  `curl_free` at L189-L192 into `ffi.rs`, whose `cfree`-gated export
   is the only place it can live because it is both an exported symbol and a
   foreign call, and `Curl_hexbyte` at L222
-  into `src/ctype.rs`. `Curl_hexbyte` emits uppercase hexadecimal, which is
+  into `ctype.rs`. `Curl_hexbyte` emits uppercase hexadecimal, which is
   why the lower-casing pass at `lib/urlapi.c`:L1922-L1932 exists at all.
-- `lib/strcase.c`, `Curl_strntolower` at L106, into `src/ctype.rs`.
+- `lib/strcase.c`, `Curl_strntolower` at L106, into `ctype.rs`.
 - `lib/url.c`, two helpers into two modules. `Curl_get_scheme` at
-  L1469-L1471 into `src/scheme.rs`, and `Curl_parse_login_details` at
-  `lib/url.c`:L2466 into `src/parse/authority.rs`.
+  L1469-L1471 into `scheme.rs`, and `Curl_parse_login_details` at
+  `lib/url.c`:L2466 into `parse/authority.rs`.
 - `lib/idn.c`, the internationalized-domain conversions at L223-L344, into
-  `src/idn.rs`. `Curl_is_ASCII_name` at L223-L236 is the gate: a null input
+  `idn.rs`. `Curl_is_ASCII_name` at L223-L236 is the gate: a null input
   counts as ASCII at L228-L229 and the first byte with the high bit set
   ends the scan at L232-L233. The call sequence inside `idn_decode` at
   L247 is reproduced step for step, including the version check at L252,
@@ -722,7 +733,7 @@ loses. They are expanded here so that the inventory stays easy to scan.
   the version test at L254, and the retry with the transitional flag at
   L261-L265 that runs on any failure of the first attempt.
 - `lib/curl_ctype.h`, the unreserved-character predicate, into
-  `src/ctype.rs`. `ISURLPUNTCS` at L47-L48 accepts `-`, `.`, `_` and `~`,
+  `ctype.rs`. `ISURLPUNTCS` at L47-L48 accepts `-`, `.`, `_` and `~`,
   and `ISUNRESERVED` at L49 adds the alphanumeric characters.
 - `lib/mprintf.c`, formatted allocation, absorbed at each site where the C
   code calls into the family. `curl_maprintf` allocates at L381, L1441,
@@ -732,7 +743,7 @@ loses. They are expanded here so that the inventory stays easy to scan.
   concatenating piece by piece. In the standalone configuration the harness
   supplies C shims for the family instead, because no libcurl participates
   in that link.
-- `lib/strerror.c`, the message strings at L420-L531, into `src/error.rs`
+- `lib/strerror.c`, the message strings at L420-L531, into `error.rs`
   behind the `strerror` feature. The verbose arm carries a case label for
   every one of the 33 `CURLUcode` values and falls through to
   `"CURLUcode unknown"` at L524; the non-verbose arm at L525-L530 answers
@@ -743,15 +754,14 @@ loses. They are expanded here so that the inventory stays easy to scan.
 In the drop-in configuration the crate declares `Curl_get_scheme` as an
 external function rather than compiling a table, and reads three fields of
 the descriptor the function returns. The declaration and the read live in
-`crate::ffi::scheme_import`, since both are foreign work, and `src/scheme.rs`
+`crate::ffi::scheme_import`, since both are foreign work, and `scheme.rs`
 receives an owned copy of the three values. The fields are: the capability
 flags at `lib/urldata.h`:L522, the default port at L523 and the
 implementation marker at L517, tested against null to detect a protocol
 compiled out. A C-representation structure that names those fields has to
 reproduce the field order of `struct Curl_scheme` at
-`lib/urldata.h`:L515-L524 exactly, including the two fields the module never
-reads, because the offsets depend on them. That constraint applies in that
-configuration only. With the
+`lib/urldata.h`:L515-L524 exactly, including the fields the module never
+reads, because the offsets depend on them.
 
 `struct Curl_scheme` at `lib/urldata.h`:L515-L524 has six fields, in this
 order:
@@ -780,14 +790,43 @@ memory. The comment at L81 says the macro should be undefined "once we need
 bit 32 or higher", which is not hypothetical: L71 already defines
 `CURLPROTO_WSS` as bit 31.
 
-No assertion written in Rust can catch that, because no Rust code can read
-`lib/urldata.h`. The compile-time layout proof in `scheme.rs` pins the Rust
-side of the mirror only, as that module says at its own L1184-L1191. **A
-32-bit `curl_prot_t` is therefore a documented precondition of drop-in mode
-rather than a checked one**, and it is recorded as such in
-`KNOWN-DIVERGENCES.md`. The live cross-check is the parity run, which reads
-`defport` through the assertions at `tests/libtest/lib1560.c`:L592-L594 and
-L786-L788, so a shifted mirror fails the first sub-test rather than subtly.
+No single assertion catches that, because the compiled crate cannot read
+`lib/urldata.h` and the header cannot read the crate. Two checks divide the
+work, and both are worth naming exactly.
+
+- `ffi.rs` pins the Rust side. The `#[repr(C)]` mirror `CurlScheme` is
+  declared there, and the `LAYOUT_PROOF` block just below it asserts at
+  compile time that the mirror is the size a 32-bit `curl_prot_t` implies --
+  32 bytes where a pointer is 8, 24 where it is 4, and 0 for any other
+  pointer width, which fails the assertion deliberately rather than guessing
+  -- that it is pointer-aligned, and that `u32` and `u16` really are 4 and 2
+  bytes. Its test module re-derives every one of the six field offsets at run
+  time besides. What all of that establishes is that nobody edited the Rust
+  side out of shape; it cannot see the C side at all.
+- `build.rs` covers the C side, textually. `check_scheme_layout_precondition`
+  reads `../lib/urldata.h` and requires both a `#define PROTO_TYPE_SMALL`
+  line and a `typedef uint32_t curl_prot_t` line. Reading is not compiling,
+  and the difference is deliberate: compiling that header would need
+  libcurl's private build environment, `curl_config.h` included, which this
+  crate does not have and does not want. If either line is gone the build
+  panics with a message naming both remedies -- widen the mirrored fields, or
+  build with `scheme-table` and describe no C structure at all. If the header
+  cannot be found, which is the ordinary case outside a curl checkout, it
+  emits a note and continues, because refusing to build standalone would
+  trade a real capability for a check with nothing to check.
+
+A residual risk survives both, which is why the precondition is documented
+as well as checked. The text of a header is not the preprocessed header: the
+check requires the two lines to be present, not to be reached, so an edit
+that moved either inside a conditional that does not hold would still satisfy
+it. And it reads the header of the tree this crate sits in, which is the
+right tree for a drop-in link against a libcurl built from that tree and the
+wrong one for a link against an archive built somewhere else. **A 32-bit
+`curl_prot_t` therefore remains a documented precondition of drop-in mode**,
+recorded as such in `KNOWN-DIVERGENCES.md`. The live cross-check is the
+parity run, which reads `defport` through the assertions at
+`tests/libtest/lib1560.c`:L592-L594 and L786-L788, so a shifted mirror fails
+the first sub-test rather than subtly.
 
 The whole constraint applies in that configuration only. With the
 `scheme-table` feature on, the table is compiled in Rust from the port
@@ -818,7 +857,7 @@ reason, as the export surface records next.
 ## Three encoders, and no two of them agree
 
 `lib/urlapi.c` percent-encodes in three places, and each place uses a
-different rule. The map above attributes all three to `src/encode.rs`, so
+different rule. The map above attributes all three to `encode.rs`, so
 this section says what distinguishes them, because merging them would erase
 the differences and the differences are the behavior.
 
@@ -900,16 +939,22 @@ the object file in a full link. Their consumers are, source-verified:
 `lib/http.c`:L1177; `Curl_url_set_authority` at `lib/http2.c`:L739; and
 `Curl_junkscan` at `lib/doh.c`:L1127.
 
-`ffi.rs` is to be the only module carrying the export attributes, with every
-other module crate-internal, which is what keeps the archive free of
-collisions with the rest of libcurl. No module has those attributes today.
-`ffi.rs` exists, but only as the C-boundary primitive layer described under
-*What exists today*; the eight exported entry points depend on `getset.rs`
-and on the parser stages, so nothing is exported at all yet and the symbol
-comparison above cannot yet be run against the crate. What can already be
-run against it is the negative half of that comparison: the archive must not
-export anything else, and a crate whose every module but `ffi.rs` is
-crate-internal satisfies that by construction.
+`ffi.rs` is the only module carrying the export attributes, with every other
+module crate-internal, which is what keeps the archive free of collisions with
+the rest of libcurl. The symbol comparison above therefore runs against the
+crate today, and it does not run against the raw `staticlib`: that archive
+carries the whole Rust standard library, the allocator and the unwinder, so
+`nm -g --defined-only` reports 2413 distinct globals where `urlapi.c.o`
+reports 8. The drop-in artifact is produced from it by the localization pass
+`build.rs` implements -- `ld -r --whole-archive`, then
+`objcopy --keep-global-symbol` for the ABI set, then `ar rcs` -- and that pass
+ends by comparing the complete set `nm` reports against the expected one,
+failing on anything missing and on anything extra. Measured: exactly the eight
+names above in the drop-in configuration, and exactly ten in the standalone
+one, where `curl_url_strerror` and `curl_free` are real exports. The
+`cdylib` needs no such step, because it exposes symbols the way an executable
+does and only an annotated `#[no_mangle] pub extern "C" fn` is exported at
+all.
 
 ### Two symbols that stay behind a feature
 
@@ -997,33 +1042,42 @@ so the run short-circuits at the first failure and reports one code however
 many sub-tests are broken.
 
 The consequence for reporting is that a single exit code names one failing
-sub-test rather than summarizing the run. The parity script is to map the
-code back to the name in the table above and iterate, so that a report covers
-every sub-test instead of stopping at whichever failed first. That script,
-`rust-urlapi/scripts/run-parity.sh`, is not written yet.
+sub-test rather than summarizing the run. Whatever drives the comparison has
+to map the code back to the name in the table above and iterate, so that a
+report covers every sub-test instead of stopping at whichever failed first.
+`rust-urlapi/scripts/run-parity.sh` is to be that driver and is not written
+yet, so until it lands the mapping is done by reading the table.
 
 Three sub-tests take the codeset flag read at L2036 as a parameter and gate
 part of their table on it: `setget_parts` at L1446, `get_url` at L1548 and
 `get_parts` at L1591, each of which skips its `CURLU_PUNY2IDN` cases when
-the flag is clear. The parity run therefore has to repeat with the variable
+the flag is clear. A parity run therefore has to repeat with the variable
 both set and unset, since a run with it unset exercises none of those cases
 and still reports success.
 
 ## The unsafe boundary
 
-`src/ffi.rs` is the only module in the crate that contains `unsafe`, and
-every block in it carries a safety comment. Every other module carries
-`#![forbid(unsafe_code)]`, so the boundary is enforced by the compiler
-rather than by convention. The facade validates preconditions, converts
-representations and delegates, and it holds no parsing logic of its own.
+`ffi.rs` is the only module in the crate that contains `unsafe`, and every
+block in it carries a safety comment. The facade validates preconditions,
+converts representations and delegates, and it holds no parsing logic of its
+own.
 
-That is not a convention and it is not asserted by inspection. Each of those
-thirteen carries `#![forbid(unsafe_code)]` at the top of the file, so an
-`unsafe` block added to any of them is a compile error rather than a review
-finding, and `forbid` rather than `deny` means an inner `allow` cannot buy an
-exception back. The property the Agent Action Plan states at 0.3.3 and 0.7.2,
-and which specification 1.3.2.1 requires, is therefore enforced by the
-compiler on every build in every feature configuration.
+That is not a convention and it is not asserted by inspection. Of the 26
+files under `rust-urlapi/src/`, the 24 that are neither the crate root nor
+the facade each open with `#![forbid(unsafe_code)]`, so an `unsafe` block
+added to any of them is a compile error rather than a review finding, and
+`forbid` rather than `deny` means an inner `allow` cannot buy an exception
+back. The two that do not carry it are the two that cannot. `ffi.rs` cannot
+forbid what it exists to contain. `lib.rs` cannot either, because an inner
+attribute on the crate root reaches every module including the facade; what
+the crate root carries instead is `deny(clippy::missing_safety_doc)` and
+`deny(clippy::undocumented_unsafe_blocks)` at its L331-L332 and
+`deny(unsafe_op_in_unsafe_fn)` at its L334, which do not ban `unsafe`
+anywhere but do make an undocumented block, an undocumented `unsafe fn` or
+an implicitly unsafe `unsafe fn` body a build failure. The property the Agent
+Action Plan states at 0.3.3 and 0.7.2, and which specification 1.3.2.1
+requires, is therefore enforced by the compiler on every build in every
+feature configuration.
 
 Three provisions of the plan look at first like they put `unsafe` elsewhere,
 and reconciling them is what the design turns on. 0.4.1.3 assigns the
@@ -1039,8 +1093,8 @@ operations in Rust. The resolution is that *producing* C-visible memory and
   What it no longer contains is a raw pointer operation: `CBuf` is a thin
   wrapper over `ffi::cheap::CBlock`, and every method it needs on that block
   -- allocate, resize, write at an offset, borrow as a slice, hand the pointer
-  to C, release -- is a safe method whose preconditions are `CBlock`'s
-  a documented invariant rather than a caller's promise.
+  to C, release -- is a safe method whose preconditions are `CBlock`'s own
+  documented invariants rather than a caller's promise.
 - `idn.rs` still owns the libidn2 *behavior*: the version guard, the exact
   flag set, the transitional retry, the zero-length rejection and the
   re-duplication order, all of which are the parity-critical part. What moved
@@ -1092,8 +1146,10 @@ personality routine a C link would otherwise have to resolve.
 caught.** The crate root denies the panicking constructs -- `unwrap`,
 `expect`, explicit `panic!`, direct indexing and slicing, and arithmetic
 with side effects -- so a construct that could panic fails the build rather
-than reaching a caller. Every module written so far is clean under those
-denials. In practice that means `get` and `get_mut` in place of indexing,
+than reaching a caller. All 26 modules are clean under those denials, and
+`cargo clippy --all-targets -- -D warnings` is what keeps them so in every
+feature configuration. In practice that means `get` and `get_mut` in place of
+indexing,
 slice patterns in place of indexing, `checked_*` and `saturating_*` in
 place of bare operators, and an explicit fallback in place of every
 `unwrap`. Where a case is genuinely unreachable, the code takes the safe
@@ -1158,9 +1214,8 @@ the remedy deliberately not applied.
   module, and the rules the crate follows at each one.
 - [KNOWN-DIVERGENCES.md][divergences] records the six behaviors reproduced
   on purpose, `FB1` through `FB6`, and names the module that carries each.
-- `rust-urlapi/README.md` is to be the short entry point, with the feature
-  table, prerequisites, targets and script ordering this file leaves out. It
-  is not written yet.
+- `rust-urlapi/README.md` is the deliverable that carries the feature table,
+  prerequisites, targets and script ordering this file leaves out.
 
 [ownership]: MEMORY-OWNERSHIP.md
 [divergences]: KNOWN-DIVERGENCES.md

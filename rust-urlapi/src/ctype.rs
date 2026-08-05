@@ -75,20 +75,16 @@
 
 // Reachability here is decided by the consumers, not by this file. The module
 // re-implements a set of C macros as a whole, and which of them a given build
-// reaches depends on which sibling modules exist: the classification
-// predicates are spread across the parser stages, `hexbyte` and `raw_tolower`
-// belong to `src/encode.rs`, and `hexval` to `src/decode.rs` and
-// `src/parse/host.rs`. Porting the set and not its individual members is what
-// keeps it checkable against `lib/curl_ctype.h` line for line.
+// reaches depends on its feature set: the classification predicates are spread
+// across the parser stages, `hexbyte` and `raw_tolower` belong to
+// `src/encode.rs`, and `hexval` to `src/decode.rs` and `src/parse/host.rs`.
+// Porting the set and not its individual members is what keeps it checkable
+// against `lib/curl_ctype.h` line for line.
 //
-// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
-// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
-// checkpoint that creates src/getset.rs, and replaced there by one crate-level
-// allowance in src/lib.rs carrying this same note. Until src/ffi.rs and
-// src/getset.rs exist, most of this crate has no consumer, and a crate held to
-// zero warnings cannot build clean without this. Scoped to this module and to
-// this lint alone.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a
@@ -477,7 +473,6 @@ const fn letter_boundaries_hold() -> bool {
 /// hexadecimal conversion.
 const fn hex_boundaries_hold() -> bool {
     // ISXDIGIT at lib/curl_ctype.h L39, both letter cases, and ISODIGIT at
-    // L40.
     let hexadecimal = is_xdigit(b'0')
         && is_xdigit(b'9')
         && is_xdigit(b'A')

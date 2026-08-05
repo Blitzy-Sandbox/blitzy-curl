@@ -111,29 +111,27 @@
 //!
 //! # Where the parity oracle lives
 //!
-//! End-to-end verification is the parity run over the unmodified
-//! `tests/libtest/lib1560.c`, driven by
-//! `rust-urlapi/scripts/run-parity.sh`. The sub-tests that exercise this
-//! file hardest are `get_parts`, whose failure shows up as exit code 4, and
-//! `set_parts`, exit code 2, per the exit-code mapping in the plan; the
-//! host tables in `set_url` and `get_url` cover the rest. The unit tests at
-//! the foot of this file are a second, independent oracle: every vector in
-//! them was captured from a C program linked against an unmodified libcurl
-//! archive rather than derived by reading this code.
+//! End-to-end verification is to be the parity run over the unmodified
+//! `tests/libtest/lib1560.c`. The sub-tests that exercise this file hardest
+//! are `get_parts`, whose failure would show up as exit code 4, and
+//! `set_parts`, exit code 2, per the exit-code mapping in the plan; the host
+//! tables in `set_url` and `get_url` cover the rest.
+//! `rust-urlapi/scripts/run-parity.sh` is the script that is to drive it and
+//! is a later deliverable, so it does not exist yet.
+//!
+//! The unit tests at the foot of this file are therefore the oracle currently
+//! in force, and they are an independent one rather than a restatement of this
+//! code: every vector in them was captured from a C program linked against an
+//! unmodified libcurl archive rather than derived by reading this module.
 
-// DEAD-CODE POLICY, TIME-BOXED. Identical in every module of this crate; grep
-// for "DEAD-CODE POLICY" to find them all. They are removed together, by the
-// checkpoint that creates src/getset.rs, and replaced there by one crate-level
-// allowance in src/lib.rs carrying this same note. Until src/parse/mod.rs and
-// src/parse/authority.rs exist, this module has no consumer -- its three C
-// call sites land in src/parse/authority.rs and src/getset.rs -- and a crate
-// held to zero warnings cannot build clean without this. Scoped to this module
-// and to this lint alone.
+// `src/parse/mod.rs` declares `mod host;`, and this stage's three C call sites
+// land in `src/parse/authority.rs` and `src/getset.rs`. All three consumers
+// exist and are compiled unconditionally.
 //
-// THE CHECKPOINT THAT CREATES src/parse/mod.rs MUST DECLARE `mod host;` THERE.
-// Under edition 2021 no module declaration reaches this file without it, so
-// otherwise nothing compiles it and none of the tests below ever run.
-#![allow(dead_code)]
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the technical
 // specification forbids `unsafe` outside FFI code (1.3.2.1). `forbid` rather
 // than `deny` because an inner `allow` here would be a design change and
@@ -388,7 +386,6 @@ fn reject_span(hostname: &[u8]) -> usize {
 ///   from the bracketed branch.
 #[must_use = "the accept-or-reject verdict is the return value and must be handled"]
 pub(crate) fn hostname_check(u: &mut CurlUrl, hostname: &mut [u8], hlen: usize) -> CURLUcode {
-    // L450-L451.
     if hlen == 0 {
         return CURLUE_NO_HOST;
     }
@@ -412,7 +409,6 @@ pub(crate) fn hostname_check(u: &mut CurlUrl, hostname: &mut [u8], hlen: usize) 
         return CURLUE_BAD_HOSTNAME;
     }
 
-    // L461.
     CURLUE_OK
 }
 
@@ -533,7 +529,6 @@ fn classify(hostname: &[u8]) -> Option<Parts> {
                 str_octal(&mut cursor, UINT_MAX)
             }
         } else {
-            // L506.
             str_number(&mut cursor, UINT_MAX)
         };
 
@@ -566,7 +561,6 @@ fn classify(hostname: &[u8]) -> Option<Parts> {
         let slot = values.get_mut(dots)?;
         *slot = u32::try_from(value).unwrap_or(u32::MAX);
 
-        // L513-L527.
         match cursor.first() {
             // L514-L519. The order matters: the fifth part is refused
             // *before* the counter moves, so `dots` never leaves 0..=3.
@@ -675,7 +669,6 @@ pub(crate) fn ipv4_normalize(host: &mut DynBuf) -> HostKind {
             return HostKind::Ipv6;
         }
 
-        // L494-L528.
         match classify(hostname) {
             Some(parts) => parts,
             None => return HostKind::Name,
@@ -763,7 +756,6 @@ pub(crate) fn ipv4_normalize(host: &mut DynBuf) -> HostKind {
         return HostKind::Error;
     }
 
-    // L574.
     HostKind::Ipv4
 }
 
@@ -895,12 +887,10 @@ pub(crate) fn urldecode_host(host: &mut DynBuf) -> CURLUcode {
     // free.
     drop(decoded);
 
-    // L597-L598.
     if appended.is_err() {
         return cc2cu(appended);
     }
 
-    // L601.
     CURLUE_OK
 }
 
@@ -947,6 +937,17 @@ mod tests {
     /// which is precisely what [`HOST_REJECT`] already is. Collapsing the
     /// two spellings into one would delete the check rather than tidy it, so
     /// the lint is allowed here with that reason.
+    ///
+    /// `unknown_lints` is allowed alongside it, and the order matters: that
+    /// lint has to be relaxed before the name it complains about is read.
+    /// `clippy::byte_char_slices` did not exist in Clippy 1.75, the crate's
+    /// declared minimum, so naming it there is an unknown lint, and an unknown
+    /// lint is a warning, and a warning is a build failure under the
+    /// zero-warning requirement. Measured: without this line
+    /// `cargo +1.75.0 clippy --locked --all-targets -- -D warnings` fails
+    /// here. Dropping the inner allow instead is not an option, because the
+    /// lint really does fire on the stable toolchain.
+    #[allow(unknown_lints)]
     #[allow(clippy::byte_char_slices)]
     const REJECT_ONE_BY_ONE: [u8; 31] = [
         b' ', b'\r', b'\n', b'\t', b'/', b':', b'#', b'?', b'!', b'@', b'{', b'}', b'[', b']',
@@ -1055,13 +1056,11 @@ mod tests {
         match ipv4_normalize(&mut buf) {
             // L635-L636: a bare break, leaving `uc` at CURLUE_OK.
             HostKind::Ipv4 => {}
-            // L637-L639.
             HostKind::Ipv6 => {
                 let hlen = buf.len();
                 let mut view = buf.content_mut();
                 code = ipv6_parse(&mut u, &mut view, hlen);
             }
-            // L640-L644.
             HostKind::Name => {
                 code = urldecode_host(&mut buf);
                 if code == CURLUE_OK {
@@ -1070,7 +1069,6 @@ mod tests {
                     code = hostname_check(&mut u, &mut view, hlen);
                 }
             }
-            // L645-L646.
             HostKind::Error => code = CURLUE_OUT_OF_MEMORY,
         }
         (code, cstring_of(&buf))

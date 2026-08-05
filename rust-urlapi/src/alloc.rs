@@ -228,11 +228,14 @@
 //! `lib/urlapi.c`.
 
 // The adapter is deliberately complete, so that no other module has a reason
-// to reach past it to the C allocator directly. Which primitives are actually
-// reachable depends on the selected feature set, and warnings are errors for
-// this crate, so the allowance is stated once here rather than left to the
-// feature matrix. It is scoped to this module and to this lint alone.
-#![allow(dead_code)]
+// to reach past it to the C allocator directly. Completeness and use are
+// different things: which primitives a given build reaches depends on the
+// selected feature set, so some of them are unreached in some configuration.
+//
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // `unsafe` belongs to `src/ffi.rs` alone; the lint keeps a future edit from
 // reintroducing one here without deleting this line first.
 #![forbid(unsafe_code)]
@@ -275,14 +278,19 @@ pub(crate) use crate::ffi::CBlock;
 ///
 /// Every live `CBuf` satisfies all three of the following:
 ///
-/// 1. `block` is a live [`CBlock`], so it carries that type's four
+/// 1. `block` is a live [`CBlock`], so it carries that type's five
 ///    invariants: a non-null C-allocator pointer this value alone owns, an
-///    exact capacity of at least one byte, every byte of that capacity
-///    initialized, and `Drop` as the only release.
-/// 2. `block.capacity()` is **at least** `len + 1`. It may be more, and
-///    routinely is: `src/dynbuf.rs` grows geometrically and hands over a
-///    buffer with spare capacity, and [`CBuf::format`] can end up with a
-///    block wider than the string it holds.
+///    exact capacity of at least one byte, an initialized prefix no longer
+///    than that capacity, every byte of that prefix initialized, and `Drop`
+///    as the only release.
+/// 2. `block.capacity()` is **at least** `len + 1`, and
+///    `block.initialized()` is **at least** `len + 1` as well: the content
+///    and its terminator have all been written. The capacity may exceed that,
+///    and routinely does -- `src/dynbuf.rs` grows geometrically and hands
+///    over a buffer with spare capacity, and [`CBuf::format`] can end up with
+///    a block wider than the string it holds. The spare is neither
+///    initialized nor reachable, which is what keeps [`CBuf::as_bytes`] and
+///    the two `_with_nul` faces sound.
 /// 3. Byte `[len]` is zero, so the buffer is a valid C string of exactly
 ///    `len` bytes.
 ///
@@ -341,23 +349,42 @@ pub(crate) struct CBuf {
 pub(crate) const DYN_MAX_LENGTH: usize = 8_000_000;
 
 impl CBuf {
-    /// Allocates a block of `len + 1` zeroed bytes.
+    /// Reserves room for `cap` content bytes plus the terminator, writing
+    /// nothing.
     ///
-    /// The `len.checked_add(1)` below is this port's spelling of the guard
-    /// in `curlx_memdup0`, `lib/curlx/strdup.c:L87`, which allocates only
-    /// when `length < SIZE_MAX` so that `length + 1` cannot wrap to zero
-    /// and yield a one-byte block for an enormous string.
+    /// This is the only way to build a buffer whose content is assembled
+    /// rather than copied in one go, and it is deliberately not a `CBuf`
+    /// itself: a `CBuf` always satisfies invariant 3, a zero at `[len]`, and a
+    /// half-filled allocation does not. [`CBufWriter`] is that intermediate
+    /// state, and [`CBufWriter::finish`] is the single point where it becomes
+    /// a `CBuf`.
     ///
-    /// The terminator at `[len]` needs no separate write: [`CBlock::zeroed`]
-    /// hands back a block whose every byte is already zero, which is what
-    /// establishes invariant 3 before any `CBuf` exists. Should a caller
-    /// return early without filling the content, the block releases itself;
-    /// that is the whole reason this returns a `CBuf` rather than a bare
-    /// pointer.
-    pub(crate) fn alloc(len: usize) -> Option<Self> {
-        let total = len.checked_add(1)?;
-        let block = CBlock::zeroed(total)?;
-        Some(Self { block, len })
+    /// The `cap.checked_add(1)` below is this port's spelling of the guard in
+    /// `curlx_memdup0`, `lib/curlx/strdup.c:L87`, which allocates only when
+    /// `length < SIZE_MAX` so that `length + 1` cannot wrap to zero and yield
+    /// a one-byte block for an enormous string.
+    ///
+    /// The block comes from `malloc` and is not zeroed, which is what
+    /// `curlx_memdup0` does at `L89` and what `dyn_nappend()` does at
+    /// `lib/curlx/dynbuf.c:L105`. The writer then writes exactly the content
+    /// bytes and exactly one terminator, so no byte of the allocation is
+    /// written that the C would not write. Nothing can read an unwritten byte:
+    /// [`CBlock`] hands out slices bounded by its initialized prefix, and the
+    /// prefix only ever advances through a write.
+    ///
+    /// # Ownership
+    ///
+    /// The returned writer owns the block. Dropping it releases the block, so
+    /// an early return between here and `finish` cannot leak.
+    ///
+    /// # Returns
+    ///
+    /// `None` if the allocation fails or `cap + 1` overflows.
+    #[must_use]
+    pub(crate) fn writer(cap: usize) -> Option<CBufWriter> {
+        let total = cap.checked_add(1)?;
+        let block = CBlock::alloc(total)?;
+        Some(CBufWriter { block, cap })
     }
 
     /// Builds a buffer over a block the caller already owns.
@@ -376,67 +403,42 @@ impl CBuf {
     /// # Returns
     ///
     /// `None` when the block has no room for the terminator at `[len]`, that
-    /// is when its capacity is not at least `len + 1`. Reported rather than
-    /// asserted, because this crate has no panic path.
+    /// is when its capacity is not at least `len + 1`, or when the block's
+    /// initialized prefix does not already cover the `len` content bytes --
+    /// which would mean the caller was claiming content that was never
+    /// written. Reported rather than asserted, because this crate has no panic
+    /// path.
     #[must_use]
     pub(crate) fn from_block(mut block: CBlock, len: usize) -> Option<Self> {
         let need = len.checked_add(1)?;
-        if block.capacity() < need {
+        if block.capacity() < need || block.initialized() < len {
             return None;
         }
         // Invariant 3, established rather than assumed. A block coming from
         // `src/dynbuf.rs` already carries a zero here, but a caller that
         // trimmed the length would not, and the write costs one byte.
-        *block.bytes_mut().get_mut(len)? = 0;
+        if !block.put_byte(len, 0) {
+            return None;
+        }
         Some(Self { block, len })
-    }
-
-    /// Copies `src` into the buffer starting at `offset`.
-    ///
-    /// Returns `false`, and writes nothing at all, when the copy would not
-    /// fit inside the logical length. Reporting rather than asserting is
-    /// deliberate: an assertion would be a panic path, and this crate has
-    /// none.
-    ///
-    /// The bound is the logical length rather than the capacity, so this can
-    /// never overwrite the terminator at `[len]` and invariant 3 survives
-    /// every call.
-    fn fill(&mut self, offset: usize, src: &[u8]) -> bool {
-        let Some(end) = offset.checked_add(src.len()) else {
-            return false;
-        };
-        if end > self.len {
-            return false;
-        }
-        match self.block.bytes_mut().get_mut(offset..end) {
-            Some(target) => {
-                target.copy_from_slice(src);
-                true
-            }
-            // Unreachable: `end <= self.len` and invariant 2 makes the
-            // capacity at least `self.len + 1`. Handled rather than asserted.
-            None => false,
-        }
     }
 
     /// Shortens the logical length and re-terminates at the new end.
     ///
-    /// The block itself is not shrunk, which invariant 2 permits. Two callers
-    /// need it: [`CBuf::format`], where the second formatting pass can emit
-    /// fewer bytes than the first measured, and `crate::decode`, which sizes
-    /// its buffer from the input the way `lib/escape.c:L116` does and then
-    /// reports the shorter decoded length, which is the C's `*olen` at
-    /// `L149-L151`.
+    /// The block itself is not shrunk, which invariant 2 permits. The caller
+    /// that needs it is `crate::parse::path`, which trims a path buffer to the
+    /// length the dot-segment pass produced, mirroring the way
+    /// `lib/urlapi.c:L812-L816` hands on only the front of its output.
     pub(crate) fn truncate(&mut self, new_len: usize) {
         if new_len >= self.len {
             return;
         }
         // The write re-establishes invariant 3 for the new length before
-        // `self.len` is updated to match. `new_len < self.len` and invariant 2
-        // put the index inside the capacity, so the `get_mut` cannot fail;
-        // it is used anyway so that the bound is checked rather than argued.
-        if let Some(slot) = self.block.bytes_mut().get_mut(new_len) {
-            *slot = 0;
+        // `self.len` is updated to match. `new_len < self.len`, so the index
+        // is inside both the capacity and the block's initialized prefix, and
+        // `put_byte` therefore cannot refuse it; its answer is checked anyway
+        // so that the bound is enforced rather than argued.
+        if self.block.put_byte(new_len, 0) {
             self.len = new_len;
         }
     }
@@ -471,15 +473,14 @@ impl CBuf {
     /// `None` if the allocation fails.
     #[must_use]
     pub(crate) fn from_slice(bytes: &[u8]) -> Option<Self> {
-        let mut buf = Self::alloc(bytes.len())?;
-        if buf.fill(0, bytes) {
-            Some(buf)
-        } else {
-            // Unreachable: `alloc` sized the buffer from this very slice, so
+        let mut writer = Self::writer(bytes.len())?;
+        if !writer.put(0, bytes) {
+            // Unreachable: `writer` sized the block from this very slice, so
             // the copy fits by construction. Handled rather than asserted so
             // that no panic path exists even in principle.
-            None
+            return None;
         }
+        writer.finish(bytes.len())
     }
 
     /// Concatenates byte slices into one NUL-terminated C string.
@@ -520,10 +521,10 @@ impl CBuf {
         if total.checked_add(1)? > DYN_MAX_LENGTH {
             return None;
         }
-        let mut buf = Self::alloc(total)?;
+        let mut writer = Self::writer(total)?;
         let mut offset: usize = 0;
         for part in parts {
-            if !buf.fill(offset, part) {
+            if !writer.put(offset, part) {
                 // Unreachable, for the same reason as in `from_slice`: the
                 // total was summed from these very slices. Reported rather
                 // than asserted.
@@ -531,7 +532,7 @@ impl CBuf {
             }
             offset = offset.checked_add(part.len())?;
         }
-        Some(buf)
+        writer.finish(total)
     }
 
     /// Renders formatted output into a NUL-terminated C string.
@@ -557,7 +558,7 @@ impl CBuf {
     /// A second pass that emits *fewer* bytes than the first measured
     /// leaves the block wider than the string, which invariant 2 allows and
     /// [`CBuf::truncate`] tidies. A second pass that tries to emit *more*
-    /// is refused by the bounds check in [`CBuf::fill`] and surfaces as
+    /// is refused by the bounds check in [`CBufWriter::put`] and surfaces as
     /// `None`. Neither case can write outside the allocation, so a
     /// misbehaving `Display` implementation is a failed call rather than a
     /// memory-safety problem.
@@ -581,19 +582,22 @@ impl CBuf {
         if counter.len.checked_add(1)? > DYN_MAX_LENGTH {
             return None;
         }
-        let mut buf = Self::alloc(counter.len)?;
+        let mut writer = Self::writer(counter.len)?;
         let written = {
             let mut sink = FillSink {
-                buf: &mut buf,
+                writer: &mut writer,
                 offset: 0,
             };
-            // On an error here `sink` and then `buf` are dropped, and the
+            // On an error here `sink` and then `writer` are dropped, and the
             // block is released. Nothing leaks on this path.
             fmt::write(&mut sink, args).ok()?;
             sink.offset
         };
-        buf.truncate(written);
-        Some(buf)
+        // A second pass that emitted fewer bytes than the first measured is
+        // finished at what it actually wrote, so the terminator lands at the
+        // end of the string rather than at the end of the measurement. The
+        // block keeps the wider capacity, which invariant 2 allows.
+        writer.finish(written)
     }
 
     // The inverse of `into_raw` below lives in `src/ffi.rs`, as
@@ -687,9 +691,10 @@ impl CBuf {
         // already required `self.len + 1` to be a real allocation size, so
         // `self.len` cannot be `usize::MAX`.
         let with_nul = self.len.saturating_add(1);
-        // Invariant 2 makes the capacity at least `with_nul` and invariant 3
-        // makes the last byte of the range the terminator, so the range is in
-        // bounds and the fallback is unreachable.
+        // Invariant 2 makes both the capacity and the initialized prefix at
+        // least `with_nul`, and invariant 3 makes the last byte of the range
+        // the terminator, so the range is in bounds and the fallback is
+        // unreachable.
         self.block.bytes().get(..with_nul).unwrap_or(&[])
     }
 
@@ -711,7 +716,8 @@ impl CBuf {
     pub(crate) fn as_mut_bytes(&mut self) -> &mut [u8] {
         // The same reasoning as `as_bytes`, with a unique borrow. The length
         // excludes the terminator, so invariant 3 survives whatever the
-        // caller writes, and the range is in bounds by invariant 2.
+        // caller writes, and the range is inside the initialized prefix by
+        // invariant 2.
         let len = self.len;
         self.block.bytes_mut().get_mut(..len).unwrap_or(&mut [])
     }
@@ -753,6 +759,161 @@ impl CBuf {
     #[must_use = "ownership moves to the caller; discarding this leaks"]
     pub(crate) fn into_raw(self) -> *mut c_char {
         self.block.into_raw()
+    }
+}
+
+/// A [`CBuf`] under construction: an owned block plus a reserved content
+/// capacity, with nothing written yet.
+///
+/// # Why this type exists
+///
+/// Because the C writes each byte of a string exactly once. `curlx_memdup0`
+/// at `lib/curlx/strdup.c:L89-L94` calls `malloc`, copies the content and
+/// writes one terminator; `Curl_urldecode` at `lib/escape.c:L116-L147` calls
+/// `malloc`, writes one byte per decoded character and one terminator at the
+/// end. Neither zeroes the allocation first, and neither rewrites the
+/// terminator as it goes.
+///
+/// A [`CBuf`] cannot represent that intermediate state, and should not: its
+/// invariant 3 is a zero at `[len]`, which is what makes
+/// [`CBuf::as_bytes_with_nul`] and [`CBuf::into_raw`] correct for a C
+/// consumer. So the partially written state gets its own type, with no
+/// C-string face at all, and [`CBufWriter::finish`] is the single place where
+/// the terminator is written and a `CBuf` comes into existence.
+///
+/// # Invariants
+///
+/// 1. The block's capacity is exactly `cap + 1`, so `[cap]` is the terminator
+///    slot and content may occupy `[0, cap)`.
+/// 2. The block's initialized prefix is at most `cap`; the terminator slot is
+///    written only by `finish`.
+///
+/// # Ownership
+///
+/// This value owns the block. Dropping it releases the block, which is what
+/// makes every early return between [`CBuf::writer`] and
+/// [`CBufWriter::finish`] leak-free -- including the mid-loop `Err` return in
+/// `crate::decode`, which is the port of the `Curl_safefree(*ostring)` at
+/// `lib/escape.c:L141`.
+pub(crate) struct CBufWriter {
+    /// The block, `cap + 1` bytes of it.
+    block: CBlock,
+    /// Reserved content capacity, excluding the terminator slot.
+    cap: usize,
+}
+
+impl CBufWriter {
+    /// Copies `src` into the content at `offset`.
+    ///
+    /// # Returns
+    ///
+    /// `false`, with nothing written, when the copy would reach the terminator
+    /// slot or run past it, or when `offset` is above what has been written so
+    /// far -- the contiguity condition [`CBlock::put`] documents. Reported
+    /// rather than asserted, because this crate has no panic path.
+    pub(crate) fn put(&mut self, offset: usize, src: &[u8]) -> bool {
+        let Some(end) = offset.checked_add(src.len()) else {
+            return false;
+        };
+        // `> self.cap`, not `>= self.cap`: content may fill `[0, cap)`
+        // exactly, and `[cap]` stays for the terminator.
+        if end > self.cap {
+            return false;
+        }
+        self.block.put(offset, src)
+    }
+
+    /// Appends one byte to the content.
+    ///
+    /// The `*ns++ = (char)in` of `Curl_urldecode` at `lib/escape.c:L145`. No
+    /// terminator is written here; `finish` writes it once, exactly as the C
+    /// does at `L147`.
+    ///
+    /// # Returns
+    ///
+    /// `false`, with nothing written, when the content is already `cap` bytes
+    /// long.
+    pub(crate) fn push(&mut self, byte: u8) -> bool {
+        if self.written() >= self.cap {
+            return false;
+        }
+        self.block.push(byte)
+    }
+
+    /// How many content bytes have been written.
+    #[must_use]
+    pub(crate) const fn written(&self) -> usize {
+        self.block.initialized()
+    }
+
+    /// How much content capacity is left.
+    ///
+    /// The loop bound `crate::decode` uses in place of the C's `while(alloc)`
+    /// at `lib/escape.c:L124`: the destination drives the walk, so no write
+    /// can land outside the block.
+    #[must_use]
+    pub(crate) fn remaining(&self) -> usize {
+        // Saturating because the crate root denies the operators that could
+        // panic. Exact: invariant 2 keeps `written()` at or below `cap`.
+        self.cap.saturating_sub(self.written())
+    }
+
+    /// Writes the terminator at `[len]` and yields the finished buffer.
+    ///
+    /// The `dest[length] = 0` at `lib/curlx/strdup.c:L94` and the
+    /// `*ns = 0` at `lib/escape.c:L147`: one byte, once, at the end.
+    ///
+    /// A `len` below what was written is how a caller reports a result shorter
+    /// than the reservation, which is the C's `*olen` at
+    /// `lib/escape.c:L149-L151` and the shorter second formatting pass in
+    /// [`CBuf::format`]. The block keeps its full capacity either way, as the
+    /// C keeps its `malloc`ed size.
+    ///
+    /// # Ownership
+    ///
+    /// **Ownership moves into the returned buffer.** On a `None` return the
+    /// block is dropped here, and so released.
+    ///
+    /// # Returns
+    ///
+    /// `None` when `len` exceeds either the reserved capacity or the bytes
+    /// actually written -- the latter because content that was never written
+    /// cannot be claimed as content.
+    #[must_use = "the finished buffer is owned; dropping it releases the memory"]
+    pub(crate) fn finish(mut self, len: usize) -> Option<CBuf> {
+        if len > self.cap || len > self.written() {
+            return None;
+        }
+        if !self.block.put_byte(len, 0) {
+            return None;
+        }
+        Some(CBuf {
+            block: self.block,
+            len,
+        })
+    }
+
+    /// Finishes at exactly the number of bytes written.
+    ///
+    /// The shape `crate::decode` wants: the decoded length is whatever the
+    /// single pass produced.
+    #[must_use = "the finished buffer is owned; dropping it releases the memory"]
+    pub(crate) fn finish_written(self) -> Option<CBuf> {
+        let len = self.written();
+        self.finish(len)
+    }
+}
+
+impl fmt::Debug for CBufWriter {
+    /// Prints the reservation and how much of it has been written.
+    ///
+    /// The contents are deliberately not shown, for the reason [`CBuf`]'s own
+    /// implementation gives: a URL part can carry credentials.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CBufWriter")
+            .field("cap", &self.cap)
+            .field("written", &self.written())
+            .finish_non_exhaustive()
     }
 }
 
@@ -800,20 +961,20 @@ impl fmt::Write for CountSink {
 
 /// Second pass of [`CBuf::format`]: writes into the C allocation.
 ///
-/// Every write goes through [`CBuf::fill`], which bounds-checks against the
-/// buffer's logical length, so this sink cannot write outside the block even
-/// if the second pass disagrees with the first about how many bytes the
+/// Every write goes through [`CBufWriter::put`], which bounds-checks against
+/// the reserved content capacity, so this sink cannot write outside the block
+/// even if the second pass disagrees with the first about how many bytes the
 /// output needs.
 struct FillSink<'a> {
     /// The destination, borrowed for the duration of the pass.
-    buf: &'a mut CBuf,
+    writer: &'a mut CBufWriter,
     /// Bytes written so far, and the offset of the next write.
     offset: usize,
 }
 
 impl fmt::Write for FillSink<'_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        if !self.buf.fill(self.offset, s.as_bytes()) {
+        if !self.writer.put(self.offset, s.as_bytes()) {
             // The second pass wants more room than the first pass measured.
             // Refused here rather than accommodated, so the failure is a
             // null return instead of a buffer overrun.
@@ -1048,8 +1209,8 @@ mod tests {
         // The dynbuf handover: a block wider than the logical length, which
         // invariant 2 permits and lib/urlapi.c relies on at L1185 and
         // friends. The terminator is written here rather than assumed.
-        let mut block = CBlock::zeroed(32).unwrap();
-        block.bytes_mut()[..16].copy_from_slice(b"example.com/path");
+        let mut block = CBlock::alloc(32).unwrap();
+        assert!(block.put(0, b"example.com/path"));
         let buf = CBuf::from_block(block, 11).unwrap();
         assert_eq!(buf.len(), 11);
         assert_eq!(buf.as_bytes(), b"example.com".as_slice());
@@ -1062,14 +1223,87 @@ mod tests {
         // [0] is the terminator slot. Asking for a length of one would put
         // the terminator outside the block, which breaks invariant 3, so the
         // request is refused rather than accommodated.
-        let block = CBlock::zeroed(1).unwrap();
+        let block = CBlock::alloc(1).unwrap();
         assert!(CBuf::from_block(block, 1).is_none());
-        let block = CBlock::zeroed(1).unwrap();
+        let block = CBlock::alloc(1).unwrap();
         let buf = CBuf::from_block(block, 0).unwrap();
         assert!(buf.is_empty());
         // A length whose terminator index cannot be represented at all.
-        let block = CBlock::zeroed(4).unwrap();
+        let block = CBlock::alloc(4).unwrap();
         assert!(CBuf::from_block(block, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn cbuf_from_block_refuses_content_that_was_never_written() {
+        // The other half of the contract: a block wide enough for the claim
+        // but with an initialized prefix shorter than it. Accepting that would
+        // hand `as_bytes` a slice over memory no write has reached, which is
+        // undefined behavior; it is refused instead, and the block is released
+        // here rather than handed back.
+        let mut block = CBlock::alloc(32).unwrap();
+        assert!(block.put(0, b"eight!!!"));
+        assert!(CBuf::from_block(block, 9).is_none());
+        // Exactly the written length is fine, terminator slot included.
+        let mut block = CBlock::alloc(32).unwrap();
+        assert!(block.put(0, b"eight!!!"));
+        let buf = CBuf::from_block(block, 8).unwrap();
+        assert_eq!(buf.as_bytes_with_nul(), b"eight!!!\0".as_slice());
+    }
+
+    #[test]
+    fn cbuf_writer_writes_only_the_content_and_one_terminator() {
+        // The C's write pattern, asserted rather than intended: the block is
+        // uninitialized when it arrives, `put` accounts for exactly the bytes
+        // it copies, and `finish` adds exactly one terminator.
+        let mut writer = CBuf::writer(16).unwrap();
+        assert_eq!((writer.written(), writer.remaining()), (0, 16));
+        assert!(writer.put(0, b"https://"));
+        assert_eq!((writer.written(), writer.remaining()), (8, 8));
+        // Content may fill the reservation exactly; the terminator slot is
+        // above it and is not part of the capacity a caller may write.
+        assert!(writer.put(8, b"curl.se/"));
+        assert_eq!(writer.remaining(), 0);
+        assert!(!writer.put(16, b"x"), "the terminator slot is reserved");
+        assert!(
+            !writer.push(b'x'),
+            "and so it is for the byte-at-a-time face"
+        );
+        let buf = writer.finish_written().unwrap();
+        assert_eq!(buf.as_bytes(), b"https://curl.se/".as_slice());
+        assert_eq!(buf.as_bytes_with_nul().last(), Some(&0));
+        assert_eq!(buf.capacity(), 17);
+    }
+
+    #[test]
+    fn cbuf_writer_finishes_short_and_refuses_to_overclaim() {
+        // The shape lib/escape.c:L149-L151 reports through *olen: the block is
+        // sized from the input and the answer is shorter.
+        let mut writer = CBuf::writer(10).unwrap();
+        assert!(writer.push(b'a'));
+        assert!(writer.push(b'b'));
+        assert!(writer.push(b'c'));
+        // Above what was written is refused, so no unwritten byte can ever be
+        // presented as content.
+        let mut overclaim = CBuf::writer(10).unwrap();
+        assert!(overclaim.push(b'a'));
+        assert!(overclaim.finish(4).is_none());
+        let buf = writer.finish(2).unwrap();
+        assert_eq!(buf.as_bytes(), b"ab".as_slice());
+        assert_eq!(buf.len(), 2);
+        // The reservation survives the short finish, as the C's malloc does.
+        assert_eq!(buf.capacity(), 11);
+    }
+
+    #[test]
+    fn cbuf_writer_reserves_room_for_an_empty_string() {
+        // curlx_strdup("") at lib/urlapi.c:L815 and L1059 must be
+        // representable: a one-byte block holding just the terminator.
+        let writer = CBuf::writer(0).unwrap();
+        assert_eq!((writer.written(), writer.remaining()), (0, 0));
+        let buf = writer.finish(0).unwrap();
+        assert!(buf.is_empty());
+        assert_eq!(buf.as_bytes_with_nul(), b"\0".as_slice());
+        assert_eq!(buf.capacity(), 1);
     }
 
     #[test]

@@ -132,15 +132,15 @@
 //! the C original is no different: `struct dynbuf` carries no lock and
 //! `lib/urlapi.c` only ever uses one on the stack of the calling thread.
 
-// This module is a complete port of the ten operations the URL API uses,
-// and which of them are reachable depends on which sibling modules a given
-// feature configuration compiles. `add` in particular exists for the
-// literal appends and is not needed by every configuration. Warnings are
-// errors for this crate, so the allowance is stated once, here, with its
-// reason rather than left for the feature matrix to decide, exactly as
-// `src/alloc.rs` and `src/error.rs` do. It is scoped to this module and to
-// this one lint.
-#![allow(dead_code)]
+// This module is a complete port of the ten operations the URL API uses, and
+// which of them are reachable depends on which sibling modules a given feature
+// configuration compiles. `add` in particular exists for the literal appends
+// and is not needed by every configuration.
+//
+// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
+// covers the whole feature matrix in one place, which is where the reason for
+// it belongs; see "DEAD-CODE POLICY" there.
+
 // `unsafe` belongs to `src/ffi.rs` alone. This module goes further and
 // presents an API of slices, so that `src/encode.rs`, `src/getset.rs` and all
 // of `src/parse/` need none either; the lint keeps a future edit from
@@ -205,15 +205,18 @@ const MAX_DYNBUF_SIZE: usize = usize::MAX / 2;
 /// below both assumes and re-establishes them:
 ///
 /// 1. `block` is either `None`, in which case `leng` is zero, or a live
-///    [`CBlock`] this value alone owns, which carries that type's own four
+///    [`CBlock`] this value alone owns, which carries that type's own five
 ///    invariants.
 /// 2. `leng < block.capacity()` whenever there is a block. The strict
 ///    inequality is contract 2 in the module documentation: there is always
 ///    room for the terminator at `[leng]`.
 /// 3. When there is a block, byte `[leng]` is zero, so the content is a
-///    valid C string of exactly `leng` bytes. Bytes above `[leng]` are
-///    initialized -- `CBlock` guarantees that over its whole capacity -- but
-///    they are not content, and no read-only face ever exposes them.
+///    valid C string of exactly `leng` bytes, and the block's initialized
+///    prefix is at least `leng + 1`: every byte up to and including the
+///    terminator has been written. Bytes above the terminator are
+///    uninitialized spare, exactly as `dyn_nappend()` leaves them at
+///    `lib/curlx/dynbuf.c:L104-L117`, and no face of this type exposes
+///    them.
 /// 4. `toobig` never changes after construction, not even across
 ///    [`DynBuf::free`], which is what makes a freed buffer reusable.
 ///
@@ -221,11 +224,15 @@ const MAX_DYNBUF_SIZE: usize = usize::MAX / 2;
 ///
 /// Rust owns the block, and the block releases itself: there is no `Drop`
 /// implementation here to forget, because the `CBlock` in the field below has
-/// one. That is what removes the failure-path leak class the C original
-/// carries: `lib/urlapi.c` has to reach `curlx_dyn_free()` on every path out
-/// of every function that declares a buffer, and `docs/KNOWN-DIVERGENCES.md`
-/// records where it does not. [`DynBuf::into_cbuf`] and [`DynBuf::into_raw`]
-/// are the only ways out of that ownership.
+/// one. In the C the same property has to be maintained by hand -- every
+/// function that declares a `struct dynbuf` has to reach `curlx_dyn_free()`
+/// on every path out, helped by contract 1 above, under which a failed append
+/// has already freed the buffer. `docs/KNOWN-DIVERGENCES.md` records that all
+/// eleven `curlx_dyn_init` sites in `lib/urlapi.c` were checked against that
+/// obligation and every one of them meets it; there is no cleanup omission to
+/// reproduce. What this type removes is the *class* of mistake, not an
+/// instance of it. [`DynBuf::into_cbuf`] and [`DynBuf::into_raw`] are the only
+/// ways out of that ownership.
 pub(crate) struct DynBuf {
     /// The allocation, or `None` before the first append and after a free.
     ///
@@ -493,9 +500,16 @@ impl DynBuf {
             // where C leaves it: a successful growth moves it to the new
             // block, and a failure leaves the old block owned here, which is
             // why the `free()` below is correct and not a double free.
+            //
+            // The two arms are `realloc` and `malloc`, which is exactly the
+            // pair C reaches through `Curl_srealloc` at L105, a null pointer
+            // making it behave as `malloc`. Neither initializes what it newly
+            // exposes and neither does the port: `CBlock` records how far its
+            // initialized prefix reaches, and the append that follows this
+            // call advances it by precisely the bytes it writes.
             let grown = match self.block.as_mut() {
                 Some(block) => block.resize(a),
-                None => match CBlock::zeroed(a) {
+                None => match CBlock::alloc(a) {
                     Some(block) => {
                         self.block = Some(block);
                         true
@@ -523,11 +537,17 @@ impl DynBuf {
     /// `[capacity - 1]` or run past the end, which keeps invariant 2 true no
     /// matter what a caller asks for.
     ///
-    /// An ordinary slice assignment, because [`CBlock`] guarantees its whole
-    /// capacity is initialized. That is the property that lets this module
-    /// hold to `#![forbid(unsafe_code)]`: the C original leaves everything
-    /// above the content uninitialized, so forming a `&mut [u8]` over it
-    /// would have been undefined behavior and a raw copy the only option.
+    /// The copy goes through [`CBlock::put`], which performs it and extends
+    /// the block's initialized prefix to cover exactly the bytes it wrote.
+    /// That is the property that lets this module hold to
+    /// `#![forbid(unsafe_code)]` while still leaving the space above the
+    /// content untouched, as the C does: nothing here forms a slice over a
+    /// byte no write has reached.
+    ///
+    /// Every call site appends, so `offset` is always the current length,
+    /// which is at most the prefix -- the contiguity condition
+    /// [`CBlock::put`] documents is therefore satisfied by construction and
+    /// not by luck.
     fn write_at(&mut self, offset: usize, src: &[u8]) -> bool {
         if src.is_empty() {
             // C skips the copy entirely when the length is zero, L114, and
@@ -545,15 +565,7 @@ impl DynBuf {
         let Some(block) = self.block.as_mut() else {
             return false;
         };
-        match block.bytes_mut().get_mut(offset..end) {
-            Some(target) => {
-                target.copy_from_slice(src);
-                true
-            }
-            // Unreachable: `end < capacity` was just established. Reported
-            // rather than asserted, because this crate has no panic path.
-            None => false,
-        }
+        block.put(offset, src)
     }
 
     /// Writes the terminator at `[leng]`.
@@ -571,14 +583,17 @@ impl DynBuf {
     /// and invariant 3 has nothing to maintain.
     fn terminate(&mut self) {
         let leng = self.leng;
-        // Invariant 2 gives `leng < capacity`, so the `get_mut` cannot fail
-        // when there is a block; it is used anyway so that the bound is
-        // checked by the compiler. The write is what establishes invariant 3
-        // for the current length.
+        // Invariant 2 gives `leng < capacity`, and every caller either has
+        // just appended content up to `leng` or has shortened to below the old
+        // length, so `leng` is also at or below the block's initialized prefix.
+        // `put_byte` therefore cannot refuse the write; it is used rather than
+        // a raw store so that both bounds are checked by code instead of by
+        // argument. The write is what establishes invariant 3 for the current
+        // length. Its answer is deliberately discarded: there is no state in
+        // which it can be false, and this crate has no panic path in which to
+        // say so.
         if let Some(block) = self.block.as_mut() {
-            if let Some(slot) = block.bytes_mut().get_mut(leng) {
-                *slot = 0;
-            }
+            let _written = block.put_byte(leng, 0);
         }
     }
 
@@ -798,7 +813,6 @@ impl DynBuf {
     /// contract.
     pub(crate) fn setlen(&mut self, set: usize) -> bool {
         if set > self.leng {
-            // L287-L288.
             return false;
         }
         self.leng = set;
@@ -929,9 +943,10 @@ impl DynBuf {
         // wrap. It is exact here: invariant 2 required `leng + 1` to be a
         // real allocation size, so `leng` cannot be `usize::MAX`.
         let with_nul = self.leng.saturating_add(1);
-        // Invariant 2 makes the capacity at least `with_nul` and invariant 3
-        // makes the last byte of the range the terminator, so the range is in
-        // bounds and the fallback is unreachable.
+        // Invariant 2 makes the capacity at least `with_nul`, and invariant 3
+        // makes the initialized prefix at least that wide with the last byte
+        // of the range the terminator, so the range is in bounds and the
+        // fallback is unreachable.
         block.bytes().get(..with_nul).unwrap_or(&[])
     }
 
@@ -987,9 +1002,9 @@ impl DynBuf {
             return &mut [];
         };
         // The reasoning of `as_bytes_with_nul`, with a unique borrow. `&mut
-        // self` rules out any other reference to these bytes, and `CBlock`
-        // guarantees every byte of the capacity is initialized, so the caller
-        // may read as well as write every byte of the range.
+        // self` rules out any other reference to these bytes, and invariant 3
+        // puts the whole range inside the block's initialized prefix, so the
+        // caller may read as well as write every byte of it.
         block.bytes_mut().get_mut(..with_nul).unwrap_or(&mut [])
     }
 
@@ -1102,12 +1117,14 @@ impl DynBuf {
     ///
     /// There is no `Drop` implementation on this type, and it needs none.
     /// `CBlock` has one, so a buffer that is simply dropped releases its
-    /// block, which is what removes the failure-path leak class the C original
-    /// carries: `lib/urlapi.c` has to reach `curlx_dyn_free()` on every path
-    /// out of every function that declares a buffer, which it manages at
-    /// L669, L1189, L1282, L1955, L1960 and L1988 but which
-    /// `docs/KNOWN-DIVERGENCES.md` records it missing elsewhere. Here there is
-    /// no path to miss and no hand-written `drop` to get wrong.
+    /// block, which is what removes the failure-path leak *class* the C
+    /// original is exposed to: `lib/urlapi.c` has to reach `curlx_dyn_free()`
+    /// on every path out of every function that declares a buffer, which it
+    /// does explicitly at L669, L1189, L1282, L1955, L1960 and L1988 and
+    /// everywhere else by relying on contract 1 above.
+    /// `docs/KNOWN-DIVERGENCES.md` records that every site was checked and
+    /// none of them misses it. Here there is no path to miss and no
+    /// hand-written `drop` to get wrong.
     #[must_use = "ownership moves to the caller; discarding this leaks"]
     pub(crate) fn into_raw(mut self) -> *mut c_char {
         match self.block.take() {
