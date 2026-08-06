@@ -334,10 +334,11 @@ reader can check the rule rather than trust it.
    cannot forbid what it exists to contain. `rust-urlapi/src/lib.rs` cannot
    either, because an inner attribute on the crate root reaches every module
    including the facade; the crate root carries a different policy instead --
-   `deny(clippy::missing_safety_doc)` and
-   `deny(clippy::undocumented_unsafe_blocks)` at
-   `rust-urlapi/src/lib.rs:L331-L332`, and `deny(unsafe_op_in_unsafe_fn)` at
-   its L334 -- which does not ban `unsafe` but does require every
+   `deny(clippy::missing_safety_doc)`,
+   `deny(clippy::undocumented_unsafe_blocks)` and
+   `deny(unsafe_op_in_unsafe_fn)` in the crate root's lint block, named by
+   symbol rather than by line so the claim cannot drift -- which does not ban
+   `unsafe` but does require every
    block and every `unsafe fn` in the facade to justify itself, and stops
    an `unsafe fn` body from being implicitly unsafe throughout. Ownership
    crosses the boundary in that one file, so the reasoning stays in one

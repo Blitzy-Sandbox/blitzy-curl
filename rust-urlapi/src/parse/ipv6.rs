@@ -208,17 +208,6 @@
 //! run. It is a later deliverable and does not exist yet, so the tests at the
 //! foot of this file are the only oracle this file can currently point at.
 
-// `src/parse/mod.rs` declares `mod ipv6;`, and this stage's four C call sites
-// land in `src/parse/host.rs`, `src/parse/authority.rs` and `src/getset.rs`, as
-// the module documentation sets out. All of them exist and are compiled
-// unconditionally.
-//
-// No dead-code allowance appears in this module, and none is needed: every item
-// below is reached from this crate's own paths in every configuration it
-// builds. There is no crate-wide allowance either -- an item without a
-// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
-// `src/lib.rs` requires.
-
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the technical
 // specification forbids `unsafe` outside FFI code (1.3.2.1). `forbid` rather
 // than `deny` because an inner `allow` here would be a design change and

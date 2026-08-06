@@ -134,14 +134,12 @@ value is identical either way -- but both are measured against the reference
 and recorded so that neither is filed later as an unrecorded difference.
 
 The last is the empty-string rule: documented behavior with an undocumented
-sensitivity to flags, and the port's **one deliberate behavioral divergence**
-from `lib/urlapi.c`. Two flags are in play and they must not be conflated. The
+sensitivity to flags. Two flags are in play and they must not be conflated. The
 reference's own sensitivity runs through `CURLU_DEFAULT_SCHEME`, measured and
-documented. `CURLU_NO_GUESS_SCHEME` is where `AAP` 0.6.5 requires an outcome the
-reference does not produce, so the port implements the plan, records the
-discrepancy for the plan's owner, and keeps the divergence to that single
-combination -- which neither the unmodified oracle nor the parity demo
-exercises.
+documented. `CURLU_NO_GUESS_SCHEME` is the one whose name invites the opposite
+reading, so that entry settles it three separate ways -- source, measurement and
+the unmodified oracle -- and reports the discrepancy with `AAP` 0.6.5's prose
+for the plan's owner. The port reproduces the reference in both.
 
 Then comes a third class, four entries headed `Integration limitation`. These
 are not things `lib/urlapi.c` does at all. They are places where the port's
@@ -1311,128 +1309,93 @@ Return code 10 is `CURLUE_NO_SCHEME` and 3 is `CURLUE_MALFORMED_INPUT`. One
 handle, one empty string, opposite outcomes decided by a flag that describes
 how to read a URL rather than how to write one.
 
-### `AAP` 0.6.5 governs here, and the port diverges from `lib/urlapi.c` to obey it
+### `CURLU_NO_GUESS_SCHEME` and the empty-string write, checked three ways
 
-**This subsection records the port's one deliberate behavioural divergence from
-the reference, and reports the discrepancy that forces it.** The behaviour is
-specified by the frozen Agent Action Plan, the reference implements something
-else, and the plan wins. What is escalated is the discrepancy itself, not the
-choice of what to implement.
+Writing `""` to `CURLUPART_URL` on a handle whose scheme was guessed answers
+`CURLUE_OK` whether or not `CURLU_NO_GUESS_SCHEME` is set. The flag's name
+makes the opposite reading tempting, so the answer was established three ways
+rather than reasoned about, each check on its own sufficient.
+`rust-urlapi/src/getset.rs` carries the same three at its own site, next to
+the code they govern.
 
-**What the plan requires, and what the port therefore does.** `AAP` 0.6.5
-states the empty-string flag sensitivity in these terms:
+**Check 1, the source.** `CURLU_NO_GUESS_SCHEME` has two unrelated effects,
+in two different branches of the reader. In the `CURLUPART_SCHEME` branch it
+is an error: L1559-L1560 return `CURLUE_NO_SCHEME`. In the whole-URL branch
+it is only a formatting choice: L1512-L1515 blank the scheme prefix and
+carry on returning `CURLUE_OK`. L1700 asks for `CURLUPART_URL`, whose arm at
+L1624-L1625 dispatches to `urlget_url()`, so it meets the second behavior
+and never the first, and writing an empty string to a handle whose scheme
+was guessed then returns `CURLUE_OK` with or without the flag.
+
+**Check 2, measurement.** A probe linked against an unmodified `libcurl.a`
+built from this repository, run under `LC_ALL=C.UTF-8`, starting from
+`example.com` parsed with `CURLU_GUESS_SCHEME`:
+
+    write "",   flags 0                   rc=0   (handle unchanged)
+    write "",   CURLU_NO_GUESS_SCHEME     rc=0   (handle unchanged)
+    read  URL,  CURLU_NO_GUESS_SCHEME     rc=0   example.com/
+    read  SCHEME, CURLU_NO_GUESS_SCHEME   rc=10
+
+Return code 10 is `CURLUE_NO_SCHEME`. The two reads differ under one flag,
+exactly as check 1 predicts, and neither write fails.
+
+**Check 3, `tests/libtest/lib1560.c`, unmodified.** The port's primary oracle
+asserts both halves itself, so this is not a matter of interpretation at all.
+Its `get_url_list` at L583-L585 asserts
+
+    {"example.com", "example.com/", CURLU_GUESS_SCHEME,
+     CURLU_NO_GUESS_SCHEME, CURLUE_OK},
+
+which is the whole-URL read L1700 performs, asserted to succeed with the
+prefix suppressed; and its `get_parts_list` at L149-L152 asserts `[10]` for
+the scheme part of the same handle under the same flag. `AAP` 0.9.2 `A5`
+requires that file to pass unmodified.
+
+**What the port does.** It answers `CURLUE_OK`, matching all three checks,
+and it does so because that is what the reference does. `AAP` 0.2.2
+designates `lib/urlapi.c` "the behavioral source of truth"; 0.8.1 directs
+that behavior "be read from `lib/urlapi.c` rather than inferred from general
+URL knowledge" and directs "faithful port, not redesign", specifically "do
+not change error semantics"; 0.2.3 places "no error-semantics change" out of
+scope outright; transformation rule `T6` at 0.1.2.3 is "faithful over
+correct: where the C implementation does something surprising, the Rust
+implementation does the same surprising thing and documents it"; and
+acceptance criteria `A5`, `A7` and `A9` at 0.9.2 are measured by running that
+oracle unmodified, by diffing a demo against the same demo linked against the
+unmodified C, and by requiring identical results between reference and Rust.
+Reproducing the reference is the requirement, and it is what the three checks
+above establish.
+
+The empty-string case *is* flag-sensitive, on a different flag. The
+subsection above documents it on `CURLU_DEFAULT_SCHEME`, which is the flag
+that decides at L1453-L1458 whether a handle carrying a host and no scheme
+can serialize at all, and therefore the flag that actually turns one empty
+write into a success and another into `CURLUE_MALFORMED_INPUT`.
+
+**Reported: `AAP` 0.6.5's prose states the opposite answer, and the mechanism it
+cites is unreachable.** 0.6.5 reads:
 
 > Setting the whole URL to the empty string with the no-guess-scheme flag
 > on a handle whose scheme was guessed **fails** with malformed input --
 > because the retrieval returns the no-scheme code `lib/urlapi.c:L1559-L1560`
 > -- while the identical call with no flags **succeeds** as a no-op.
 
-`rust-urlapi/src/getset.rs` implements exactly that. `set_url` answers
-`CURLUE_MALFORMED_INPUT` when the value is empty, `CURLU_NO_GUESS_SCHEME` is
-set and the handle's scheme was guessed, and it makes that decision **ahead of**
-the whole-URL read, because the read cannot produce the answer. Without the
-flag, or on a handle whose scheme was not guessed, the same empty write is the
-ordinary no-op success documented two subsections above. The per-file
-specification for that module restates the pair as mandatory -- "the
-empty-string rule with no flags (success) and with `CURLU_NO_GUESS_SCHEME` on a
-guessed-scheme handle (malformed input)" -- and
-`tests::an_empty_url_and_no_guess_scheme_is_malformed_input` asserts both halves
-on one handle.
+The cited line belongs to the `CURLUPART_SCHEME` arm, which L1700 never asks
+for, so it cannot decide this call. The mechanism is out of reach for a second,
+independent reason as well: `u->guessed_scheme` is assigned in exactly one
+place, L1008 inside `guess_scheme()`, and L1004-L1006 stores `u->scheme`
+immediately before it; the only other sites, L1662 and L1741, clear the flag.
+So a handle whose scheme was guessed always carries a scheme string, and the
+`CURLUE_NO_SCHEME` at L1453-L1458 -- which fires only when there is no scheme
+and no `CURLU_DEFAULT_SCHEME` -- cannot fire on such a handle either.
 
-**What the source does instead.** `CURLU_NO_GUESS_SCHEME` has two unrelated
-effects, in two different branches of the reader. In the `CURLUPART_SCHEME`
-branch it is an error: L1559-L1560 return `CURLUE_NO_SCHEME`. In the whole-URL
-branch it is only a formatting choice: L1512-L1515 blank the scheme prefix and
-carry on returning `CURLUE_OK`. L1700 asks for `CURLUPART_URL`, and L1623-L1624
-dispatches that to `urlget_url`, so the reference meets the second behaviour and
-never the first.
-
-The mechanism the plan cites is in fact unreachable in the C.
-`u->guessed_scheme` is assigned in exactly one place, L1008 inside
-`guess_scheme()`, and L1004-L1006 stores `u->scheme` immediately before it; the
-only other sites, L1662 and L1741, clear the flag. So a handle whose scheme was
-guessed always has a scheme string, and the `CURLUE_NO_SCHEME` at L1453-L1458 --
-which fires only when there is no scheme and no `CURLU_DEFAULT_SCHEME` -- cannot
-fire on such a handle. The plan's *outcome* is implementable; its stated
-*reason* is not, which is why the port implements the outcome directly rather
-than by arranging for the read to fail.
-
-**Measured against the reference build.** A probe linked against an unmodified
-`libcurl.a`, under `LC_ALL=C.UTF-8` with `setlocale(LC_ALL, "")` called:
-
-    parse "example.com/p" GUESS_SCHEME, write "" flags 0           rc=0
-    parse "example.com/p" GUESS_SCHEME, write "" NO_GUESS_SCHEME    rc=0
-    parse "https://example.com/p",      write "" NO_GUESS_SCHEME    rc=0
-    parse "example.com/p" DEFAULT_SCHEME, write "" NO_GUESS_SCHEME  rc=0
-    read SCHEME on the guessed handle, NO_GUESS_SCHEME              rc=10
-    read URL    on the guessed handle, NO_GUESS_SCHEME               rc=0
-
-Return code 10 is `CURLUE_NO_SCHEME`. The second line is where the port now
-answers 3, `CURLUE_MALFORMED_INPUT`, and the reference answers 0. Every other
-line is unchanged by the port.
-
-Re-measured since, from one probe source linked three ways -- unmodified
-`libcurl.a`, the drop-in link, and the standalone link -- so that the reading
-is not an artifact of one link mode. The drop-in and standalone outputs are
-**identical to each other**, and against the reference the whole probe differs
-in that one line and no other. Two properties were checked at the same time and
-both hold:
-
-- **the refused write leaves the handle exactly as it was.** Reading
-  `CURLUPART_URL` with flags of zero straight after the refusal answers
-  `CURLUE_OK` and `http://guessed.example/p?q=1#f` in the port, byte for byte
-  what the reference answers there. It is a refusal, not a partial mutation.
-- **the `CURLU_DEFAULT_SCHEME` sensitivity is reproduced exactly**, which is
-  the half of this subject the port does *not* diverge on. On a handle whose
-  scheme was cleared, both implementations answer `CURLUE_NO_SCHEME` to a
-  whole-URL read with flags of zero, `CURLUE_OK` with `CURLU_DEFAULT_SCHEME`,
-  `CURLUE_MALFORMED_INPUT` to an empty write with flags of zero, and
-  `CURLUE_OK` to an empty write with `CURLU_DEFAULT_SCHEME`. So the divergence
-  really is confined to the single combination 0.6.5 names.
-
-**Why the plan governs.** The plan is the frozen, agreed source of truth for
-this work, and a specification that states an outcome is not overridden by an
-implementation that does something else. `AAP` 0.2.2 designating `lib/urlapi.c`
-"the behavioural source of truth", rule `T6` "faithful over correct" and 0.8.1's
-"do not change error semantics" all point the other way, and they are the reason
-this subsection exists rather than a silent edit: where a general principle and
-a specific frozen requirement collide, the specific requirement is what an
-implementer is bound by, and the collision is what gets reported.
-
-**Why the divergence costs nothing measurable, checked rather than assumed.**
-
-- **`A5` is untouched.** `tests/libtest/lib1560.c` never writes `""` to
-  `CURLUPART_URL` anywhere -- searched, not supposed -- so the unmodified oracle
-  cannot reach this arm. It still prints `success` in the drop-in link, under
-  both `LC_ALL=C.UTF-8` with the codeset variable set and `LC_ALL=C` without it.
-- **`A7` is untouched.** `rust-urlapi/demo/urlapi_demo.c` deliberately does not
-  exercise this one combination, so the byte-for-byte diff against the same demo
-  linked against the unmodified C is unaffected. The demo says so where the
-  omission is, and points here.
-- **The read side is untouched.** `get_url_list` at `tests/libtest/lib1560.c`
-  L583-L585 asserts `{"example.com", "example.com/", CURLU_GUESS_SCHEME,
-  CURLU_NO_GUESS_SCHEME, CURLUE_OK}`, and `get_parts_list` at L149-L152 asserts
-  `[10]`, `CURLUE_NO_SCHEME`, for the scheme part of the same handle under the
-  same flag. Both still hold; the divergence is on the write side only, and the
-  test asserts the read alongside it so that a port which "fixed" the read
-  instead would fail.
-- **The handle is unchanged by the refusal**, so this is a refusal and not a
-  partial mutation.
-
-**What is asked of the plan's owner.** A decision, with the evidence above in
-hand: either 0.6.5 stands and this divergence from `lib/urlapi.c` is the
-intended behaviour, or 0.6.5 is corrected to name `CURLU_DEFAULT_SCHEME` -- the
-flag that really causes a flag sensitivity in the reference, documented with its
-own measurements in the subsection above this one -- and the port drops the arm.
-Until that decision is recorded in the plan, the port implements 0.6.5 as
-written and this subsection is the report.
-
-**What is deliberately not being done.** The plan is not edited. No acceptance
-criterion is narrowed. The `CURLU_DEFAULT_SCHEME` sensitivity is not presented
-as a replacement for 0.6.5's text -- it is a separate, independently measured
-finding. And the divergence is not extended by one byte beyond the single
-combination 0.6.5 names: everything else on this path, read and write, is the
-reference's behaviour.
+That is reported here and acted on nowhere else. The plan is not edited and no
+acceptance criterion is narrowed. What is asked of the plan's owner is a
+correction to 0.6.5's prose: the flag that really produces a flag sensitivity in
+the reference is `CURLU_DEFAULT_SCHEME`, documented with its own measurements in
+the subsection above this one. Until that correction is recorded, this
+subsection is the report, and the port reproduces the reference, which is what
+0.2.2, 0.8.1, rule `T6` and acceptance criteria `A5`, `A7` and `A9` require.
 
 ### The surrounding dispatch
 
@@ -1443,33 +1406,22 @@ replaces the contents through `parseurl_and_replace()` at L1715.
 
 ### What the port does
 
-`rust-urlapi/src/getset.rs` carries the empty-string rule in `set_url()` in two
-parts, and the order matters.
+`rust-urlapi/src/getset.rs` carries the empty-string rule in `set_url()`,
+passing the caller's flags into the read exactly as L1700 does: the read
+succeeding is `CURLUE_OK`, `CURLUE_OUT_OF_MEMORY` passes through unaltered,
+and every other failure becomes `CURLUE_MALFORMED_INPUT`. Nothing about the
+empty string is special-cased, which is why the flag sensitivity falls out
+rather than being coded, and why an implementation that shortcut the read
+would answer wrongly for one of the two halves.
 
-First the arm `AAP` 0.6.5 specifies: an empty value carrying
-`CURLU_NO_GUESS_SCHEME` on a handle whose scheme was guessed answers
-`CURLUE_MALFORMED_INPUT` without reading anything. It has to come first,
-because the read cannot produce that answer -- which is the discrepancy the
-subsection above reports.
-
-Then the rule as `lib/urlapi.c` writes it, unchanged: the caller's flags go into
-the whole-URL read exactly as L1700 hands them over, the read succeeding is
-`CURLUE_OK`, `CURLUE_OUT_OF_MEMORY` passes through unaltered, and every other
-failure becomes `CURLUE_MALFORMED_INPUT`. Nothing else about the empty string is
-special-cased, which is why the `CURLU_DEFAULT_SCHEME` sensitivity falls out
-rather than being coded, and why an implementation that shortcut the read would
-answer wrongly for one of those two halves.
-
-Four tests in that module pin the whole of it: the no-op success on a complete
-handle, guessed and explicit; the 0.6.5 pair on one guessed-scheme handle with
-the flag the only difference, asserted alongside the whole-URL read that must
-keep succeeding; the `CURLU_DEFAULT_SCHEME` sensitivity documented two
-subsections above; and the failing half on an empty handle and a scheme-only
-handle. `rust-urlapi/demo/urlapi_demo.c` prints the cases that are common to the
-port and the reference, so the byte-for-byte diff against the reference-linked
-build of that program checks those from outside the crate as well -- and it
-deliberately omits the one combination where the two differ, which is what keeps
-that diff a parity check rather than a known failure.
+Three tests in that module pin it: the no-op pair with and without
+`CURLU_NO_GUESS_SCHEME` on a guessed-scheme handle, asserted alongside the
+whole-URL read they depend on so that the mechanism and not merely its
+consequence is fixed; the `CURLU_DEFAULT_SCHEME` sensitivity documented two
+subsections above; and the failing half, an empty handle and a scheme-only
+handle. `rust-urlapi/demo/urlapi_demo.c` prints the same cases, so the
+byte-for-byte diff against the reference-linked build of that program checks
+them from outside the crate as well.
 
 ## Hardened, not divergent: a null handle where the C dereferences one
 
@@ -2004,10 +1956,10 @@ L1455-L1458, where a handle carrying no scheme at all needs
 `CURLU_DEFAULT_SCHEME` to avoid `CURLUE_NO_SCHEME`, while a handle whose
 scheme was guessed has `u->scheme` set and takes the first branch at
 L1453-L1454. The reference's sensitivity is therefore real and runs through
-`CURLU_DEFAULT_SCHEME`, which the table above demonstrates. The port answers
-`CURLUE_MALFORMED_INPUT` for `CURLU_NO_GUESS_SCHEME` on a guessed-scheme handle
-anyway, because `AAP` 0.6.5 requires it -- a divergence declared and bounded in
-the empty-string entry, not an accident of reading the C.
+`CURLU_DEFAULT_SCHEME`, which the table above demonstrates, and the port
+reproduces it. `CURLU_NO_GUESS_SCHEME` on a guessed-scheme handle is a no-op
+success in both, which the empty-string entry settles three ways and where the
+discrepancy with `AAP` 0.6.5's prose is reported.
 
 **Which scheme guessing produces.** It is `http`, from L1002, and it is not
 the `https` of L84. That second string is `DEFAULT_SCHEME` and belongs to
@@ -2112,14 +2064,6 @@ satisfies. The second is recorded anyway, because the reasoning that makes it
 look unattainable is the reasoning the design had to answer, and a reader who
 works that reasoning out unaided concludes the port cannot be doing what it
 does.
-
-One further divergence in reproduced behavior is recorded elsewhere in this file
-rather than here, and is named at this point so the inventory reads complete: the
-empty whole-URL write with `CURLU_NO_GUESS_SCHEME` on a guessed-scheme handle
-answers `CURLUE_MALFORMED_INPUT` where `lib/urlapi.c` answers `CURLUE_OK`,
-because `AAP` 0.6.5 requires it. It lives with the empty-string rule, where its
-measurements and its bounds are, and it is the port's only intentional
-behavioral difference from the reference.
 
 ### Not a divergence: `unsafe` is confined to one module
 

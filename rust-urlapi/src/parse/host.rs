@@ -124,16 +124,6 @@
 //! code: every vector in them was captured from a C program linked against an
 //! unmodified libcurl archive rather than derived by reading this module.
 
-// `src/parse/mod.rs` declares `mod host;`, and this stage's three C call sites
-// land in `src/parse/authority.rs` and `src/getset.rs`. All three consumers
-// exist and are compiled unconditionally.
-//
-// No dead-code allowance appears in this module, and none is needed: every item
-// below is reached from this crate's own paths in every configuration it
-// builds. There is no crate-wide allowance either -- an item without a
-// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
-// `src/lib.rs` requires.
-
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the technical
 // specification forbids `unsafe` outside FFI code (1.3.2.1). `forbid` rather
 // than `deny` because an inner `allow` here would be a design change and

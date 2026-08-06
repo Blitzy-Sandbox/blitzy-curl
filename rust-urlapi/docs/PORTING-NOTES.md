@@ -94,11 +94,14 @@ Outside `rust-urlapi/src/`, `rust-urlapi/harness/` is complete: `first.h`,
 `runner.c`, `main.c`, `shims.c` and `.checksrc`.
 `rust-urlapi/include/curl_urlapi_rs.h` exists. `rust-urlapi/demo/` holds
 `.checksrc` and `urlapi_demo.c`; what it does not hold is
-`expected-output.txt`, the golden capture from the reference link. Nor is
-there a `rust-urlapi/tests/`, a `rust-urlapi/scripts/`, a
-`rust-urlapi/README.md` or a `rust-urlapi/GNUmakefile`.
+`expected-output.txt`, the golden capture from the reference link.
+`rust-urlapi/tests/` holds all five integration suites -- `abi_constants.rs`,
+`encode_decode.rs`, `path_dedot.rs`, `host_ip.rs` and `ffi_surface.rs` -- so
+sentences below about them describe tests a reader can run. What is not in the
+tree is a `rust-urlapi/scripts/`, a `rust-urlapi/README.md` or a
+`rust-urlapi/GNUmakefile`.
 
-Those five are the whole of what is outstanding, and wherever one of them
+Those four are the whole of what is outstanding, and wherever one of them
 appears below the sentence states a requirement on work still to be done and
 is worded as one. Present tense is reserved for what a reader can open
 today.
@@ -1164,9 +1167,10 @@ added to any of them is a compile error rather than a review finding, and
 back. The two that do not carry it are the two that cannot. `ffi.rs` cannot
 forbid what it exists to contain. `lib.rs` cannot either, because an inner
 attribute on the crate root reaches every module including the facade; what
-the crate root carries instead is `deny(clippy::missing_safety_doc)` and
-`deny(clippy::undocumented_unsafe_blocks)` at its L331-L332 and
-`deny(unsafe_op_in_unsafe_fn)` at its L334, which do not ban `unsafe`
+the crate root carries instead is `deny(clippy::missing_safety_doc)`,
+`deny(clippy::undocumented_unsafe_blocks)` and
+`deny(unsafe_op_in_unsafe_fn)` in its lint block -- named by symbol rather than
+by line so the claim cannot drift -- which do not ban `unsafe`
 anywhere but do make an undocumented block, an undocumented `unsafe fn` or
 an implicitly unsafe `unsafe fn` body a build failure. The property the Agent
 Action Plan states at 0.3.3 and 0.7.2, and which specification 1.3.2.1

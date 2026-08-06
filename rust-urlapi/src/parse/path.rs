@@ -100,21 +100,6 @@
 //! pointer, so the obligation stays typed until `src/ffi.rs` releases it into
 //! C. `rust-urlapi/docs/MEMORY-OWNERSHIP.md` records the chain.
 
-// Reachability here matches the C. `handle_path` is called from the parse
-// pipeline at `lib/urlapi.c` L1183, so its consumer is `src/parse/mod.rs`,
-// which declares `mod path;` and runs the stage from the same position;
-// `src/getset.rs` reaches the dot-segment removal through the path setter.
-// `is_dot` and `dedotdotify` are reached only from inside this file, and
-// `dedotdotify` is additionally exported to C in unit-test builds of the
-// original, which this port deliberately does not reproduce. Every consumer
-// named here exists and is compiled unconditionally.
-//
-// No dead-code allowance appears in this module, and none is needed: every item
-// below is reached from this crate's own paths in every configuration it
-// builds. There is no crate-wide allowance either -- an item without a
-// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
-// `src/lib.rs` requires.
-
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a

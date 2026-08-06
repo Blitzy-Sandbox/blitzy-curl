@@ -107,21 +107,6 @@
 //! Returning it inside a `Result` reproduces the C's own discipline of
 //! writing `*urllen` at L237 only, after both rejections have been passed.
 
-// Reachability here is decided by two consumers, both of which exist.
-// `Curl_junkscan` is called from the parse pipeline at `lib/urlapi.c` L1120
-// and re-exported to C for `lib/doh.c` L1127, so its consumers are
-// `src/parse/mod.rs` and `src/ffi.rs`.
-//
-// `src/parse/mod.rs` declares `mod junk;` and runs this stage first in the
-// pipeline, and `src/ffi.rs` exports it to C as `Curl_junkscan`. Both consumers
-// are compiled unconditionally.
-//
-// No dead-code allowance appears in this module, and none is needed: every item
-// below is reached from this crate's own paths in every configuration it
-// builds. There is no crate-wide allowance either -- an item without a
-// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
-// `src/lib.rs` requires.
-
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a

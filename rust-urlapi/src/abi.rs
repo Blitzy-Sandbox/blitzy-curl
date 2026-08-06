@@ -58,19 +58,6 @@
 //! defines exactly 33 plus 11 plus 16 ABI constants, the four supporting
 //! constants, one companion spelling of `DEFAULT_SCHEME`, and no more.
 
-// Reachability here is decided entirely by the consumers. This module is the
-// crate's foundation and depends on nothing: `src/ffi.rs` and `src/getset.rs`
-// read the 33 result codes and the 11 part identifiers, `src/getset.rs` and
-// the stages under `src/parse/` read the flag bits, and `src/lib.rs` re-checks
-// every value at compile time. `src/lib.rs` declares this module `pub mod abi;`
-// so that an integration test can name the constants as well.
-//
-// No dead-code allowance appears in this module, and none is needed: every item
-// below is reached from this crate's own paths in every configuration it
-// builds. There is no crate-wide allowance either -- an item without a
-// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
-// `src/lib.rs` requires.
-
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a

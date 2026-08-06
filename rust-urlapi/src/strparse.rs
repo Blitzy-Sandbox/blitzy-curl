@@ -107,19 +107,6 @@
 //! Reproducing curl's acceptance set exactly is the whole job of this
 //! module, so the scanning loop is written out rather than delegated.
 
-// Reachability here is decided by the consumers. The three public scanners
-// mirror `curlx_str_number`, `curlx_str_hex` and `curlx_str_octal`, and
-// `src/parse/port.rs` and `src/parse/host.rs` reach them from the port parser
-// and the IPv4 normaliser exactly where `lib/urlapi.c` does. The base table and
-// its compile-time proof exist to keep the three radices checkable in one
-// place, so they are deliberately not folded into the callers.
-//
-// No dead-code allowance appears in this module, and none is needed: every item
-// below is reached from this crate's own paths in every configuration it
-// builds. There is no crate-wide allowance either -- an item without a
-// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
-// `src/lib.rs` requires.
-
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a

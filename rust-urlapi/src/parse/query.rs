@@ -158,16 +158,6 @@
 //! the script that is to drive that run; it is a later deliverable and does
 //! not exist yet.
 
-// The only consumer is `src/parse/mod.rs`, which declares `mod query;` and runs
-// the fragment and query stages in the order `parseurl` runs them. It is
-// compiled unconditionally.
-//
-// No dead-code allowance appears in this module, and none is needed: every item
-// below is reached from this crate's own paths in every configuration it
-// builds. There is no crate-wide allowance either -- an item without a
-// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
-// `src/lib.rs` requires.
-
 // The plan puts every `unsafe` block in `src/ffi.rs` (AAP 0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1). This
 // module needs none: it inspects slices and stores owned buffers, and both

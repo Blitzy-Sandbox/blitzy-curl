@@ -128,19 +128,6 @@
 //! `CBlock` holds a raw pointer and is therefore neither `Send` nor
 //! `Sync`, matching the URL API's own posture: a `CURLU` handle and the
 //! strings it owns are not safe to share across threads either.
-
-// Section 1 is a deliberately complete allocator adapter, so that no other
-// module ever has a reason to reach past `src/alloc.rs` to the C allocator
-// directly. Completeness and use are different things: which primitives are
-// reachable depends on the selected feature set, and `curl_free` in particular
-// is called only from the `cfree`-gated export.
-//
-// Dead-code diagnostics are answered at the items. Where an item below has no
-// production caller, it carries its own `#[allow(dead_code)]` with the reason
-// it is kept immediately above it, and there is no crate-wide allowance to
-// fall back on; see "DEAD-CODE POLICY" in `src/lib.rs` for the four outcomes
-// that policy permits.
-
 use core::fmt;
 use core::mem;
 use core::ptr;
@@ -3281,6 +3268,30 @@ pub(crate) mod exports {
     /// scheme and its terminator, and nothing else in L182-L220 writes at all.
     /// So the extent is one byte when the answer is zero and `n + 1` when it is
     /// `n`, clamped to `buflen`.
+    ///
+    /// # `url` and `buf` may overlap, which is why this is staged
+    ///
+    /// The C permits it. `Curl_strntolower`, which L214 calls to fill `buf`,
+    /// documents at `lib/strcase.c` L100-L104 that "the strings may overlap",
+    /// and nothing in `Curl_is_absolute_url` narrows that. Forming a `&[u8]`
+    /// over `url` and a `&mut [u8]` over `buf` at the same time would make an
+    /// overlapping call undefined behaviour in Rust even though it is defined
+    /// in C, so no two such views are ever live together here. Instead, in the
+    /// C's own order of effects:
+    ///
+    /// 1. `buf[0] = 0` goes out through a raw pointer write, with no borrow of
+    ///    `url` outstanding -- so if the two overlap, the read in step 2 sees
+    ///    the zeroed byte exactly as the C's read at L194 does.
+    /// 2. The scan runs against a shared borrow of `url` alone, writing any
+    ///    scheme it finds into a local array rather than into `buf`.
+    /// 3. That borrow ends, and the scheme is copied out with
+    ///    `copy_nonoverlapping` from the local array -- whose address cannot
+    ///    overlap `buf`, whatever `url` does.
+    ///
+    /// Staging also makes the copy behave as `memmove` rather than as C's
+    /// forward byte loop, which is only well defined for a destination at or
+    /// below the source. Every overlap the C defines gives the same bytes here;
+    /// the ones it does not define are merely defined rather than different.
     ///
     /// # Safety
     ///

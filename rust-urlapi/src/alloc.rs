@@ -227,17 +227,6 @@
 //! including how `curl_free()` resolves and every allocation site in
 //! `lib/urlapi.c`.
 
-// The adapter is deliberately complete, so that no other module has a reason
-// to reach past it to the C allocator directly. Completeness and use are
-// different things: which primitives a given build reaches depends on the
-// selected feature set, so some of them are unreached in some configuration.
-//
-// Dead-code diagnostics are answered at the items. Where an item below has no
-// production caller, it carries its own `#[allow(dead_code)]` with the reason
-// it is kept immediately above it, and there is no crate-wide allowance to
-// fall back on; see "DEAD-CODE POLICY" in `src/lib.rs` for the four outcomes
-// that policy permits.
-
 // `unsafe` belongs to `src/ffi.rs` alone; the lint keeps a future edit from
 // reintroducing one here without deleting this line first.
 #![forbid(unsafe_code)]

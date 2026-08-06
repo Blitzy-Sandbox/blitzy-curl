@@ -111,20 +111,6 @@
 //! string. The module needs neither `libc` nor `src/alloc.rs`, and depends
 //! on `src/abi.rs` alone.
 
-// Which of the items below is reachable depends on the selected features: the
-// message table is reached from the `strerror`-gated export in `src/ffi.rs`
-// and from the crate's own tests, the non-verbose form mirrors an arm of the C
-// file that no configuration of this crate selects, and `idn2cu` is reached
-// only from the IDN paths. Mirroring `#[cfg(feature = "strerror")]` on the
-// table here would be worse than leaving it unconditional, because the table
-// has to remain visible to `cargo test` in every configuration.
-//
-// Dead-code diagnostics are answered at the items. Where an item below has no
-// production caller, it carries its own `#[allow(dead_code)]` with the reason
-// it is kept immediately above it, and there is no crate-wide allowance to
-// fall back on; see "DEAD-CODE POLICY" in `src/lib.rs` for the four outcomes
-// that policy permits.
-
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a

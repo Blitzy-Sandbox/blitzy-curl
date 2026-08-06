@@ -73,20 +73,6 @@
 //! `Curl_udigits` at `lib/mprintf.c` L39, and supplies `raw_tolower` for the
 //! in-place pass at `lib/urlapi.c` L1922-L1932 to use.
 
-// Reachability here is decided by the consumers, not by this file. The module
-// re-implements a set of C macros as a whole, and which of them a given build
-// reaches depends on its feature set: the classification predicates are spread
-// across the parser stages, `hexbyte` and `raw_tolower` belong to
-// `src/encode.rs`, and `hexval` to `src/decode.rs` and `src/parse/host.rs`.
-// Porting the set and not its individual members is what keeps it checkable
-// against `lib/curl_ctype.h` line for line.
-//
-// No dead-code allowance appears in this module, and none is needed: every item
-// below is reached from this crate's own paths in every configuration it
-// builds. There is no crate-wide allowance either -- an item without a
-// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
-// `src/lib.rs` requires.
-
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a

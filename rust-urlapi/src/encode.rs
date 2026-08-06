@@ -136,17 +136,6 @@
 //! function-by-function map, and `docs/MEMORY-OWNERSHIP.md` the whole
 //! ownership chain.
 
-// The consumers of this module are `src/getset.rs`, `src/parse/path.rs`,
-// `src/parse/query.rs` and `src/parse/redirect.rs`, all of which exist and all
-// of which are compiled unconditionally. Which individual helpers a given build
-// reaches still depends on the selected feature set.
-//
-// Dead-code diagnostics are answered at the items. Where an item below has no
-// production caller, it carries its own `#[allow(dead_code)]` with the reason
-// it is kept immediately above it, and there is no crate-wide allowance to
-// fall back on; see "DEAD-CODE POLICY" in `src/lib.rs` for the four outcomes
-// that policy permits.
-
 // The plan puts every `unsafe` block in `src/ffi.rs` (AAP 0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1). This
 // module needs none: the `DynBuf` API is shaped so that an encoder can be

@@ -217,16 +217,6 @@
 //! yet. Expectations below were taken from that table rather than from a
 //! reading of RFC 3986, and the ones that came from it name their line.
 
-// Reachability here matches the C exactly: `redirect_url` has one caller,
-// `set_url` at `lib/urlapi.c` L1727, which is `src/getset.rs` in this crate.
-// It exists and is compiled unconditionally.
-//
-// No dead-code allowance appears in this module, and none is needed: every item
-// below is reached from this crate's own paths in every configuration it
-// builds. There is no crate-wide allowance either -- an item without a
-// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
-// `src/lib.rs` requires.
-
 // The plan puts every `unsafe` block in `src/ffi.rs` (AAP 0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1). This
 // module inspects two byte slices, appends to a buffer and calls back into

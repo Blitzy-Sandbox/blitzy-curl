@@ -214,22 +214,6 @@
 //! a later deliverable, so it does not exist yet and the tests below are the
 //! oracle currently in force.
 
-// Reachability here is decided by two consumers, both of which exist.
-// `parse_authority` is called from the parse pipeline at `lib/urlapi.c`
-// L1149, and `Curl_url_set_authority` is re-exported to C for
-// `lib/http2.c` L739, so its consumers are `src/parse/mod.rs` and
-// `src/ffi.rs`.
-//
-// `src/parse/mod.rs` declares `mod authority;` and calls `parse_authority` from
-// the pipeline, and `src/ffi.rs` reaches the authority setter through it as
-// `Curl_url_set_authority`. Both consumers are compiled unconditionally.
-//
-// No dead-code allowance appears in this module, and none is needed: every item
-// below is reached from this crate's own paths in every configuration it
-// builds. There is no crate-wide allowance either -- an item without a
-// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
-// `src/lib.rs` requires.
-
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a

@@ -169,21 +169,6 @@
 //! symbol in this crate drops it, and the backend's copy is reached only
 //! through its module path, so the two never look alike at a call site.
 
-// The consumer of this module is `src/getset.rs`: `host_decode` and
-// `host_encode` stand in for the calls at `lib/urlapi.c` L1404 and L1414 in
-// `urlget_format` and at L1499 and L1506 in `urlget_url`, and `is_ascii_name`
-// for the four gates at L1402, L1412, L1498 and L1505. The `Curl_idn_*` layer
-// is crate-visible because it is not static in C and because it is the only
-// layer at which the three `CURLcode` values are still distinguishable; the
-// wrappers above it fold two of them together. Which of these a given build
-// reaches is therefore decided by the feature set.
-//
-// No dead-code allowance appears in this module, and none is needed: every item
-// below is reached from this crate's own paths in every configuration it
-// builds. There is no crate-wide allowance either -- an item without a
-// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
-// `src/lib.rs` requires.
-
 // `unsafe` belongs to `src/ffi.rs` alone, and the lint matters more here than
 // in most modules: the default backend really does call into libidn2, and
 // keeping that call in `crate::ffi::idn2` is what lets this module state that

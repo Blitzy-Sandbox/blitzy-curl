@@ -150,17 +150,6 @@
 //! `docs/KNOWN-DIVERGENCES.md` records `FB1` through `FB6`.
 //! `docs/PORTING-NOTES.md` maps every C function to its Rust module.
 
-// The handle is a foundation type whose consumers are `src/ffi.rs`,
-// `src/getset.rs` and the modules under `src/parse/`, all of which exist.
-// Which of the accessors below any one build reaches still depends on the
-// selected feature set.
-//
-// Dead-code diagnostics are answered at the items. Where an item below has no
-// production caller, it carries its own `#[allow(dead_code)]` with the reason
-// it is kept immediately above it, and there is no crate-wide allowance to
-// fall back on; see "DEAD-CODE POLICY" in `src/lib.rs` for the four outcomes
-// that policy permits.
-
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a

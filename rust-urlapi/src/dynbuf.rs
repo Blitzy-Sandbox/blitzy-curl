@@ -132,17 +132,6 @@
 //! the C original is no different: `struct dynbuf` carries no lock and
 //! `lib/urlapi.c` only ever uses one on the stack of the calling thread.
 
-// This module is a complete port of the ten operations the URL API uses, and
-// which of them are reachable depends on which sibling modules a given feature
-// configuration compiles. `add` in particular exists for the literal appends
-// and is not needed by every configuration.
-//
-// Dead-code diagnostics are answered at the items. Where an item below has no
-// production caller, it carries its own `#[allow(dead_code)]` with the reason
-// it is kept immediately above it, and there is no crate-wide allowance to
-// fall back on; see "DEAD-CODE POLICY" in `src/lib.rs` for the four outcomes
-// that policy permits.
-
 // `unsafe` belongs to `src/ffi.rs` alone. This module goes further and
 // presents an API of slices, so that `src/encode.rs`, `src/getset.rs` and all
 // of `src/parse/` need none either; the lint keeps a future edit from

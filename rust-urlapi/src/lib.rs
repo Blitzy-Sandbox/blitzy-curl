@@ -242,23 +242,6 @@
 //! and reinstating the leak would mean suppressing `Drop` deliberately. The
 //! divergence document records both omissions under `FB2` and `FB3`.
 //!
-//! `FB2` and `FB3` need one qualification, because in the C each is a leak as
-//! well as a behaviour and only the behaviour is reproduced here. The C
-//! overwrites a pointer it still owns: `parse_hostname_login`'s shared exit
-//! label nulls `user`, `password` and `options` at `lib/urlapi.c` L328-L330
-//! without releasing them, and the bracketed-address stage assigns `zoneid` at
-//! L418 over whatever was there. What a caller can observe through the public
-//! API -- three parts reading as absent, and a stale zone identifier that
-//! survives a host replacement -- is reproduced exactly.
-//!
-//! The leaks are not, and cannot be without writing worse Rust than the port
-//! needs: `CurlUrl::clear` assigns `None` and `CurlUrl::store` assigns
-//! `Some(..)` over the field, and either way the displaced `CBuf` is dropped
-//! and its block released. A leak is invisible to the URL API, so this does
-//! not move any answer the parity diff compares; it is a real difference all
-//! the same and is recorded as such in `docs/KNOWN-DIVERGENCES.md` rather than
-//! filed under "reproduced".
-//!
 //! `FB1` is worth singling out, because it is observable through the public API
 //! and the upstream suite cannot catch it: the duplication sub-test of
 //! `tests/libtest/lib1560.c` compares original against copy with flags of

@@ -118,20 +118,6 @@
 //! words out the way the C descriptors write them, and are therefore defined
 //! inside that backend and nowhere else.
 
-// Reachability here is decided by the feature set and by the consumers, not by
-// this file. `getn_scheme` is the length-delimited entry point that mirrors
-// `Curl_getn_scheme`, and a build whose parser only ever holds NUL-terminated
-// schemes reaches `get_scheme` alone; the drop-in mirror deliberately describes
-// all six fields of `struct Curl_scheme` while reading three, since the three
-// that are read sit *after* the three that are not and cannot be located
-// without them.
-//
-// No dead-code allowance appears in this module, and none is needed: every item
-// below is reached from this crate's own paths in every configuration it
-// builds. There is no crate-wide allowance either -- an item without a
-// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
-// `src/lib.rs` requires.
-
 // `unsafe` belongs to `src/ffi.rs` alone, and the lint matters more here than
 // in most modules: in drop-in mode the lookup really does cross into libcurl,
 // and keeping that crossing in `crate::ffi::scheme_import` is what lets this

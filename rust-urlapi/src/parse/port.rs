@@ -185,18 +185,6 @@
 //! is a later deliverable, so it does not exist yet and no claim here rests
 //! on its having run.
 
-// Reachability here matches the C exactly. `Curl_parse_port` has one caller in
-// the C tree, `parse_authority` at `lib/urlapi.c` L627, so the sole in-crate
-// consumer of `parse_port` is `src/parse/authority.rs`, which calls it at its
-// own L726. `src/parse/mod.rs` declares `mod port;`, and both modules are
-// compiled unconditionally, so nothing here is unreached.
-//
-// No dead-code allowance appears in this module, and none is needed: every item
-// below is reached from this crate's own paths in every configuration it
-// builds. There is no crate-wide allowance either -- an item without a
-// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
-// `src/lib.rs` requires.
-
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // `forbid` rather than `deny` because an inner `allow` here would be a

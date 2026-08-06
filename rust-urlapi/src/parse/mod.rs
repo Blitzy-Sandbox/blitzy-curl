@@ -189,18 +189,6 @@
 //! | 5 | `append` | 11 | `urldup` |
 //! | 6 | `scopeid` | | |
 
-// Reachability here is decided by two consumers, matching the C exactly.
-// `parseurl_and_replace` has two callers in the C -- `set_url` at L1715 and
-// L1723, and `redirect_url` at L1277 -- which are `src/getset.rs` and
-// `src/parse/redirect.rs` in this crate. Both exist and are compiled
-// unconditionally.
-//
-// No dead-code allowance appears in this module, and none is needed: every item
-// below is reached from this crate's own paths in every configuration it
-// builds. There is no crate-wide allowance either -- an item without a
-// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
-// `src/lib.rs` requires.
-
 // The plan puts every `unsafe` block in `src/ffi.rs` (AAP 0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
 // Orchestration needs none of it: this module inspects slices, calls the
