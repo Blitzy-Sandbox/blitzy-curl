@@ -344,6 +344,71 @@ reader can check the rule rather than trust it.
    crosses the boundary in that one file, so the reasoning stays in one
    place.
 
+## How the cleanup contract is evidenced, and why not by reading the buffer
+
+`include/curl/urlapi.h:L116-L118` says `curl_url_cleanup()` frees the handle
+and the resources used for parsing, and "will not free strings previously
+returned with the URL API". That is the contract the whole arrangement above
+exists to satisfy: the getter's buffers come from the C allocator through
+`src/alloc.rs` and are owned by the caller, not by the handle.
+
+The tempting way to test it is to retrieve a part, clean the handle up, and
+then read the buffer back. That shape is **fail-unsafe, exactly when it
+matters**. If the defect it hunts is present, cleanup has released that
+block and the read is a use-after-free: the test commits undefined behavior
+instead of reporting the violation, and under a hardened or sanitizing
+allocator it aborts with a diagnostic about the test rather than failing with
+one about the implementation. A test may not prove liveness by reading memory
+after the operation under test, so this crate does not.
+
+Three instruments cover the contract between them, and none of them reads or
+releases the block under test after cleanup.
+
+**One, structural independence, deterministic.**
+`tests/ffi_surface.rs::a_returned_buffer_is_independent_of_the_handle_that_produced_it`
+releases the *buffer* first -- always sound -- and then reads all eleven
+parts of the still-live handle and asserts every one is unchanged.
+Independence is symmetric, so observing it in this direction establishes it
+in both: had the getter handed out a pointer into the handle's own storage,
+freeing the buffer would have disturbed the handle, and those reads would
+disagree.
+
+**Two, allocator instrumentation, no dereference.**
+`tests/ffi_surface.rs::cleanup_does_not_recycle_a_previously_returned_string`
+records the block's address as a plain integer -- taking an address is not a
+dereference -- runs the cleanup, and then asks the C allocator whether that
+block has come back to it, by replaying the identical request eight times and
+keeping every reply alive so each replay samples a distinct block. Replaying
+the same operation makes the request size exact by construction, which no
+hand-picked `malloc` size could guarantee. A false failure is impossible: a
+live allocation can never be handed out twice. The final release of the block
+is *guarded* by that assertion rather than being the evidence for it, so on a
+failing path the assertion panics first and no double free can occur.
+
+Its sensitivity was measured rather than assumed. With the defect simulated
+-- the buffer released before the cleanup, so the block genuinely is on the
+free list -- the probe caught the recycled address on the second replay, in
+five consecutive runs out of five. Eight replays therefore carry a wide
+margin.
+
+**Three, an external memory checker, deterministic, for the direction neither
+test can observe safely.** The raw sequence -- retrieve, clean up, read, then
+release -- was run under Valgrind's Memcheck against the crate. Memcheck
+intercepts the allocator, so it judges the read on its own account:
+
+    retrieve, cleanup, read, release   ERROR SUMMARY: 0 errors from 0 contexts
+    control: release, then read        Invalid read of size 1  (exit code 42)
+
+The control line is the same read with the buffer deliberately released
+first, and it is there because an instrument that reports nothing is only
+evidence once it has been shown able to report something. Cleanup leaves the
+buffer intact; a genuinely freed buffer is flagged. The probe itself is a
+throwaway and is not part of the crate, which is why the result is recorded
+here rather than as a committed test.
+
+Curl's own allocation counter is not available as a fourth instrument, for
+the reason the next section gives.
+
 ## Reported limitation R3: memory-debug builds
 
 A memory-debug build of libcurl resolves `curlx_free` to `curl_dbg_free()`,
@@ -368,17 +433,63 @@ would still leave the accounting wrong, because the matching allocation was
 never logged.
 
 The parity harness is therefore built without the memory-debug
-configuration. The visible cost is the ceiling that
-`tests/data/test1560:L40` asserts, `Allocations: 3000`: curl's own
-allocation counter belongs to the memory-debug build, so it does not run
-here, and **that ceiling is consequently not validated in this
-configuration**. No substitute measurement is claimed for it, and none
-should be inferred from the port's structure. Validating it needs an
-independent count -- the platform's own allocation tooling over the harness
-binary, or a harness rebuilt against a memory-debug libcurl once the
-allocator mismatch above is solved -- and until such a count exists the
-ceiling is simply unmeasured. `tests/data/test1560` is read-only for this
-work; it is cited here and never edited.
+configuration. The visible cost is that curl's own allocation counter, which
+belongs to that build, does not run -- so the ceiling
+`tests/data/test1560:L38-L40` asserts, `Allocations: 3000`, cannot be
+checked by the mechanism that wrote it.
+
+## The allocation ceiling, measured independently
+
+`AAP` 0.9.4 names the substitute for exactly this situation: "an independent
+allocation count via the platform's own tooling". Two of them exist, and
+together they are what discharges implicit requirement I11.
+
+**Around the parity harness.** With a counting allocator interposed into the
+process -- `malloc`, `calloc`, `realloc` and `strdup` forwarded to glibc's own
+`__libc_*` entry points, which is the same accounting
+`tests/memanalyzer.pm:L439` uses, `mallocs + callocs + reallocs + strdups +
+wcsdups` -- the unmodified `tests/libtest/lib1560.c` costs:
+
+    reference libcurl.a         3,114 allocations   2,839 releases
+    the port, drop-in link      3,046 allocations   2,839 releases
+    the port, standalone link   3,046 allocations   2,839 releases
+
+The port is 68 allocations **cheaper** than the C for the identical test, and
+identical in both link modes, which is what I11's "not materially more
+allocation-hungry than the original" asks about. Both totals sit a little
+above 3,000 because a process-wide counter also sees stdio, locale and
+libidn2 activity that curl's own counter never attributed to curl; the
+reference passes the 3,000 limit under that counter, and the port costs less
+than the reference under this one.
+
+**Inside the crate's own suite.**
+`rust-urlapi/tests/ffi_surface.rs`'s
+`the_allocation_count_stays_within_the_test1560_ceiling` reproduces the same
+accounting without any external tooling: it defines `malloc`, `calloc`,
+`realloc` and `free` in the test binary and forwards them to the same glibc
+aliases, so the crate's own `libc::malloc` calls are counted with nothing
+added to the library. A fixed workload of twenty-four `lib1560` vectors, each
+parsed, read part by part, serialised under two codec flag sets, duplicated
+and amended, costs **575 allocations** and leaves nothing outstanding --
+identical in all four feature configurations and in both profiles. The test
+asserts three things: at most 3,000 allocations, the literal ceiling; at most
+forty per cycle, which is the sharp guard, since twenty-four cycles against
+3,000 would let the per-operation cost grow five-fold unnoticed; and that
+every block created was destroyed.
+
+That last assertion needs one distinction to be meaningful, and getting it
+wrong was a real defect in the first version of the counter. A `realloc` is
+one allocation by `memanalyzer`'s reckoning, but it *replaces* a block rather
+than adding one, and glibc releases the old extent itself without calling
+`free`. The metric and the outstanding-block balance therefore need separate
+counters: the workload's 575 allocations comprise 574 blocks created and one
+`realloc`, and 574 blocks were destroyed. Read through one pair of counters it
+looked like a one-block leak, and it is not one.
+
+What is still **not** claimed: this is not a re-measurement of `lib1560`
+under curl's counter, because that counter cannot run here for the reason
+above. `tests/data/test1560` is read-only for this work; it is cited here and
+never edited.
 
 ## Reported limitation R4: alternative memory functions
 

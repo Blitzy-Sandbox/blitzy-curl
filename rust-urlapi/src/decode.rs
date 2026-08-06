@@ -225,9 +225,14 @@
 //! and so gives a round-trip check without reaching outside this module's
 //! dependencies. That is the coverage in force.
 //!
-//! The same behavior is also to be driven through the exported C entry points
-//! by the crate's integration test `rust-urlapi/tests/encode_decode.rs`, which
-//! is a later deliverable and does not exist yet.
+//! The same behavior is also driven through the exported C entry points by the
+//! crate's integration test `rust-urlapi/tests/encode_decode.rs`, which reaches
+//! this module only as a C caller would -- through `curl_url_set` and
+//! `curl_url_get` under `CURLU_URLDECODE` -- because an integration test is a
+//! separate crate and this module is crate-private. The two passes are
+//! complementary rather than duplicated: the tests below reach the rules
+//! directly, including the ones no flag combination can isolate from outside,
+//! and that file checks that the flags actually route to them.
 
 // `urldecode` serves every production call site, and all three pass the length
 // explicitly or pass zero exactly as the C does: `src/getset.rs` calls it on

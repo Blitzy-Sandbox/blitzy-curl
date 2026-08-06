@@ -4,29 +4,21 @@
 
 //! Run-time verification of the numeric ABI surface of `curl_urlapi_rs`.
 //!
-//! This file is the run-time half of a deliberate double guarantee. The
-//! compile-time half is the `_ABI_PARITY` block in `src/lib.rs`, which is in
-//! force for every build of every feature configuration and every target; this
-//! file re-checks the same 60 numbers under `cargo test`, where a regression
-//! surfaces as a named failing test rather than only as a build error. Both
-//! halves are required rather than one being a substitute for the other: the
-//! plan asks for the values to be enforced twice (0.4.2.1) and names this file
-//! as the run-time pass in acceptance criterion A3 (0.9.2).
+//! This is the run-time half of a double check. The compile-time half is the
+//! `_ABI_PARITY` block in `src/lib.rs`; this file re-checks the same 60 numbers
+//! under `cargo test`, where a regression surfaces as a named failing test
+//! rather than only as a build error. Neither half substitutes for the other.
 //!
 //! # `include/curl/urlapi.h` is the only authority
 //!
 //! Every number here was transcribed from `include/curl/urlapi.h` L34-L105 and
-//! from nowhere else. The manual pages are specifically not a source, and the
-//! counts are worth stating so that nobody has to re-derive them:
-//! `docs/libcurl/curl_url_get.md` documents nine of the sixteen flags as
-//! entries of its own, at L52, L57, L62, L67, L81, L91, L104, L118 and L130,
-//! and `docs/libcurl/curl_url_set.md` documents nine at L167, L177, L182, L198,
-//! L204, L220, L227, L234 and L245. An editor who "corrects" the flag family
-//! below against either page alone would silently delete seven bits from the
-//! check. More decisively still, neither page states a numeric value or a bit
-//! position anywhere at all, so no reading of them could confirm one of these
-//! numbers even for a flag they do name. The four supporting constants are not
-//! in the public header, so each is cited to the C file that does define it.
+//! from nowhere else. The manual pages are specifically not a source:
+//! `docs/libcurl/curl_url_get.md` documents nine of the sixteen flags and
+//! `docs/libcurl/curl_url_set.md` documents nine, so a flag family "corrected"
+//! against either page alone loses seven bits, and neither page states a
+//! numeric value or a bit position anywhere at all. The four supporting
+//! constants are not in the public header, so each is cited to the C file that
+//! does define it.
 //!
 //! Nothing may be added either. This port introduces no new `CURLUcode` value,
 //! no new `CURLUPart` value and no new `CURLU_*` flag, so a new name appearing
@@ -34,75 +26,56 @@
 //!
 //! # Why every expectation is a literal integer
 //!
-//! Parity here is positional. `CURLUE_OK` at L35 carries no explicit value,
-//! L36-L66 carry the ordinal as a trailing comment for 1 through 31, and
-//! `CURLUE_LAST` at L67 carries no comment at all, so the number 32 appears
+//! Parity here is positional. `CURLUE_OK` at L35 carries no explicit value and
+//! `CURLUE_LAST` at L67 carries no ordinal comment, so the number 32 appears
 //! nowhere in curl's C source: it exists only because 32 enumerators are
-//! declared before it and C numbers enumerators sequentially from zero.
-//! `CURLUPart` at L70-L82 states no ordinals whatsoever. Callers switch on
-//! these numbers, so inserting, removing or reordering a single entry is an ABI
-//! break that no compiler on either side of the boundary reports.
+//! declared before it. `CURLUPart` at L70-L82 states no ordinals whatsoever.
+//! Callers switch on these numbers, so inserting, removing or reordering a
+//! single entry is an ABI break that no compiler on either side of the boundary
+//! reports.
 //!
-//! Three consequences shape this file. Each expectation is a literal, never
-//! derived from another constant, because `CURLUE_BAD_PARTPOINTER + 1` would
-//! follow a wrong `CURLUE_BAD_PARTPOINTER` and pass. The expectations are not a
-//! Rust `enum` and not an array indexed by ordinal, for the same reason. And
-//! the sentinel `CURLUE_LAST` is checked like every other value, because a
-//! shift in it is precisely the signal that a code was inserted.
+//! So each expectation is a literal, never derived from another constant,
+//! because `CURLUE_BAD_PARTPOINTER + 1` would follow a wrong
+//! `CURLUE_BAD_PARTPOINTER` and pass; the expectations are not a Rust `enum`
+//! and not an array indexed by ordinal, for the same reason; and the sentinel
+//! `CURLUE_LAST` is checked like every other value, because a shift in it is
+//! precisely the signal that a code was inserted.
 //!
-//! The spellings are chosen to be independent of the ones already in the crate.
+//! The spellings are also chosen to differ from the ones already in the crate.
 //! `src/lib.rs` writes the flags as the header's `1 << n` shifts and the unit
-//! tests at the end of `src/abi.rs` cross-check them as hexadecimal masks in an
-//! array; this file asserts each flag twice more, once as the shift and once as
-//! a plain decimal, and asserts the two enumerations one named constant at a
-//! time rather than array against array. A transcription slip therefore has to
-//! be made in several different shapes before it can survive, which is the only
-//! defence against a mistake that is consistent between the definition and its
-//! check.
+//! tests at the end of `src/abi.rs` cross-check them as hexadecimal masks; this
+//! file asserts each flag once as the shift and once as a plain decimal, and
+//! asserts the two enumerations one named constant at a time. A transcription
+//! slip therefore has to be made in several shapes before it can survive, which
+//! is the only defence against a mistake that is consistent between a
+//! definition and its check.
 //!
 //! # Structural checks
 //!
 //! Per-constant equality catches a typo in one value. It cannot catch an entry
 //! deleted along with its own assertion, an entry inserted, or a whole block
 //! shifted by one: every individual line would still agree. The three
-//! structural tests here close that gap, each with its own failure signature --
-//! the result codes and the part identifiers are pairwise distinct and fill
-//! their ranges exactly, with the documented maximum at the top, and the
-//! sixteen flags are single-bit, mutually disjoint and cover the low sixteen
-//! bits and nothing above them.
+//! structural tests here close that gap -- the result codes and the part
+//! identifiers are pairwise distinct and fill their ranges exactly with the
+//! documented maximum at the top, and the sixteen flags are single-bit,
+//! mutually disjoint and cover the low sixteen bits and nothing above them.
 //!
-//! # Posture
+//! # Two constraints on this file
 //!
-//! There is no `unsafe` here. This file reads constants and calls no
-//! `extern "C"` function, which makes it the one file under
-//! `rust-urlapi/tests/` that needs none. There is no `#[cfg(feature = ...)]`
-//! either: nothing in `src/abi.rs` is feature-gated, because an ABI does not
-//! vary with the features a particular build selects, so `cargo test` and
-//! `cargo test --no-default-features --features idn-libidn2` are required to
-//! give identical results. Anything that made them differ would be a reference
-//! to a gated item and should be removed rather than wrapped in a `cfg`.
+//! There is no `#[cfg(feature = ...)]` anywhere in it. Nothing in `src/abi.rs`
+//! is feature-gated, because an ABI does not vary with the features a build
+//! selects, so `cargo test` and
+//! `cargo test --no-default-features --features idn-libidn2` must give
+//! identical results. Anything that made them differ would be a reference to a
+//! gated item and belongs removed rather than wrapped in a `cfg`.
 //!
-//! The crate is named once, `use curl_urlapi_rs::abi;`, and every reference is
-//! qualified from there. Named imports rather than a glob are the crate-wide
-//! rule (0.4.3), and at sixty constants a glob would also stop a reader seeing
-//! which module each name belongs to. Reaching `abi` at all is possible because
-//! `src/lib.rs` declares it `pub mod abi;` -- an integration test links the
-//! crate as an external crate and can name only its public items -- and because
-//! `Cargo.toml` lists the `rlib` crate type beside `staticlib` and `cdylib`.
-//! Neither of those two facts is incidental; removing either breaks this file.
-//!
-//! An assertion here may never be weakened to make something pass. These tests
-//! supplement the authoritative oracles, `tests/libtest/lib1560.c` executed
-//! unmodified through `rust-urlapi/harness/` and the byte-for-byte demo diff
-//! against the reference link; they do not replace them. A value that does not
-//! match the header means the port is wrong, so the fix belongs in
-//! `src/abi.rs`.
+//! And reaching `abi` at all depends on two things that are not incidental:
+//! `src/lib.rs` declares it `pub mod abi;`, since an integration test links the
+//! crate as an external crate and can name only public items, and `Cargo.toml`
+//! lists the `rlib` crate type beside `staticlib` and `cdylib`. Removing either
+//! breaks this file.
 
 use curl_urlapi_rs::abi;
-
-// ---------------------------------------------------------------------------
-// CURLUcode -- the 33 result codes, include/curl/urlapi.h:L34-L68
-// ---------------------------------------------------------------------------
 
 /// Every `CURLUcode` value against the ordinal the header gives it.
 ///
@@ -147,10 +120,6 @@ fn error_codes_match_the_header() {
     assert_eq!(abi::CURLUE_LAST, 32);
 }
 
-// ---------------------------------------------------------------------------
-// CURLUPart -- the 11 part identifiers, include/curl/urlapi.h:L70-L82
-// ---------------------------------------------------------------------------
-
 /// Every `CURLUPart` value against its position in the header.
 ///
 /// The header gives no ordinals at all here, so all eleven of these numbers
@@ -186,7 +155,6 @@ fn part_identifiers_match_the_header() {
 // authoritative and this is what it defines.
 // ---------------------------------------------------------------------------
 
-/// Every `CURLU_*` flag against the shift the header uses to define it.
 #[test]
 fn flag_bits_match_the_header_shifts() {
     assert_eq!(abi::CURLU_DEFAULT_PORT, 1 << 0);
@@ -207,7 +175,6 @@ fn flag_bits_match_the_header_shifts() {
     assert_eq!(abi::CURLU_NO_GUESS_SCHEME, 1 << 15);
 }
 
-/// The same sixteen flags as the decimal values a caller passes.
 #[test]
 fn flag_bits_match_their_decimal_values() {
     assert_eq!(abi::CURLU_DEFAULT_PORT, 1);
@@ -414,21 +381,23 @@ fn flag_bits_are_single_bit_pairwise_disjoint_and_cover_the_low_sixteen() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Type aliases
-// ---------------------------------------------------------------------------
-
 /// Both aliases carry the whole asserted range, and carry it signed.
 ///
-/// `src/abi.rs` declares `CURLUcode` and `CURLUPart` as `c_int` rather than as
-/// an unsigned type, and that is not cosmetic. A C enumeration whose
-/// enumerators all fit in `int` has `int` as its compatible type, and `int` is
-/// what a C caller compiled against `include/curl/urlapi.h` passes to
-/// `curl_url_get` and `curl_url_set` and receives back from them. The typed
-/// bindings below are the plain statement that the constants really are of the
-/// alias type; the widening round-trip is the statement that no value is lost
-/// on the way through, which is the property a narrower or unsigned alias would
-/// break.
+/// `src/abi.rs` declares `CURLUcode` and `CURLUPart` as `c_int`. What the
+/// header establishes is the *size*: both C enumerations are 4 bytes wide, and
+/// `c_int` is 4 bytes on the targets this crate is built for, so a value
+/// crossing the boundary is neither truncated nor widened. Which of `int` and
+/// `unsigned int` a given compiler picks as the compatible type is that
+/// compiler's choice -- gcc against this repository reports both enumerations
+/// compatible with `unsigned int` -- and it does not change what is passed,
+/// because every enumerator is non-negative and inside the common range.
+///
+/// So nothing below claims a signedness rule. The typed bindings are the plain
+/// statement that the constants really are of the alias type; the widening
+/// round-trip is the statement that no value is lost on the way through, which
+/// a narrower alias would break; and the signedness assertion pins the alias as
+/// `src/abi.rs` currently writes it, so that swapping it fails here rather than
+/// at some call site months later.
 #[test]
 fn the_type_aliases_carry_the_full_asserted_range() {
     let last: abi::CURLUcode = abi::CURLUE_LAST;
@@ -445,25 +414,26 @@ fn the_type_aliases_carry_the_full_asserted_range() {
     assert_eq!(abi::CURLUcode::try_from(i64::from(last)), Ok(last));
     assert_eq!(abi::CURLUPart::try_from(i64::from(zoneid)), Ok(zoneid));
 
-    // Signedness, asserted through the alias so that swapping it for an
+    // The alias as `src/abi.rs` writes it, pinned so that swapping it for an
     // unsigned type fails here rather than at some call site months later.
     assert_eq!(
         abi::CURLUcode::MIN.signum(),
         -1,
-        "CURLUcode must stay signed"
+        "CURLUcode is declared signed in src/abi.rs"
     );
     assert_eq!(
         abi::CURLUPart::MIN.signum(),
         -1,
-        "CURLUPart must stay signed"
+        "CURLUPart is declared signed in src/abi.rs"
     );
 
-    // Both mirror the same C type, so they must remain the same width as each
-    // other whatever platform decides what that width is.
+    // Both mirror a 4-byte C enumeration, so they must remain the same width as
+    // each other whatever platform decides what that width is.
     assert_eq!(
         ::core::mem::size_of::<abi::CURLUcode>(),
         ::core::mem::size_of::<abi::CURLUPart>(),
-        "both aliases mirror C's int and must stay the same width"
+        "both aliases mirror a 4-byte C enumeration and must stay the same \
+         width"
     );
 }
 
@@ -476,7 +446,6 @@ fn the_type_aliases_carry_the_full_asserted_range() {
 // positionally: here the value itself is the whole claim.
 // ---------------------------------------------------------------------------
 
-/// The four supporting constants, each against its own C source.
 #[test]
 fn supporting_constants_match_their_c_sources() {
     // lib/urlapi.c:L55, a ceiling on the accepted input rather than a

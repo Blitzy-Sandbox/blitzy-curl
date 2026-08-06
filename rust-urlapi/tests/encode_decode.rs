@@ -4,48 +4,37 @@
 
 //! Percent-encoding and percent-decoding parity tests for `curl-urlapi-rs`.
 //!
-//! `AAP` 0.2.1.4 lists this file and 0.4.1.5 states its job: port selected
-//! encoder and decoder table cases from `tests/libtest/lib1560.c` to Rust. The
-//! behavioural authority is `lib/urlapi.c` itself, and every expectation below
+//! The behavioural authority is `lib/urlapi.c`, and every expectation below
 //! carries the line of C it came from. An expectation with no citation would be
-//! a guess.
+//! a guess. Each one was also produced by a C program linked against a libcurl
+//! built from the unmodified tree, printing every byte of every answer, and
+//! compared against this crate's answer for the same input, so a failure here
+//! means the port diverged from the reference.
 //!
-//! Two things about the expectations are worth stating before the first test.
+//! # Every vector is a byte string, and has to be
 //!
-//! They were not read off the C by eye. Each one was produced by a C program
-//! linked against a libcurl built from the unmodified tree, printing every byte
-//! of every answer, and then compared against this crate's answer for the same
-//! input. So a failure here means the port diverged from the reference, which is
-//! the only thing this file is for. Per `AAP` 0.9, these tests *supplement* the
-//! two authoritative oracles -- `tests/libtest/lib1560.c` run unmodified
-//! through `rust-urlapi/harness/`, and the byte-for-byte demo diff -- and no
-//! assertion here should be weakened to make something pass. If one fails, the
-//! encoder or the decoder is wrong, not the test.
-//!
-//! And they are all written as byte strings. `AAP` 0.7.2 holds new files to the
-//! repository's own gates, and `scripts/spacecheck.pl` L173-L196 rejects both
-//! literal control bytes and non-ASCII bytes in any tracked file, so a vector
-//! containing byte `0x02` or byte `0xFF` cannot be spelled literally. It cannot
-//! be spelled as a `str` escape either: Rust rejects `"\xff"` in a `str`
-//! literal outright, and `"\u{ff}"` is the *character* U+00FF, which encodes as
-//! the two bytes `0xC3 0xBF` and is therefore a different input entirely. That
-//! substitution silently turns `%FF` into `%C3%BF`. Byte strings -- `b"...\xff"`
-//! -- are exact, stay pure ASCII in the source, and are what every helper here
-//! takes.
+//! `scripts/spacecheck.pl` rejects both literal control bytes and non-ASCII
+//! bytes in any tracked file, so a vector containing byte `0x02` or byte `0xFF`
+//! cannot be spelled literally. It cannot be spelled as a `str` escape either:
+//! Rust rejects `"\xff"` in a `str` literal outright, and `"\u{ff}"` is the
+//! *character* U+00FF, which encodes as the two bytes `0xC3 0xBF` and is
+//! therefore a different input entirely -- that substitution silently turns
+//! `%FF` into `%C3%BF`. Byte strings, `b"...\xff"`, are exact, stay pure ASCII
+//! in the source, and are what every helper here takes.
 //!
 //! # How the crate is reached
 //!
 //! Through the C ABI, with the four entry points declared in the `extern` block
 //! below rather than called as Rust paths.
 //!
-//! That is not a stylistic choice. `src/lib.rs` L376-L390 makes `abi` and `ffi`
-//! public and keeps the other thirteen modules crate-private, so `encode` and
-//! `decode` cannot be called from here at all -- an integration test is a
-//! separate crate. `src/ffi.rs` L2561 then declares the exported functions
+//! That is not a stylistic choice. The module tree in `src/lib.rs` makes `abi`
+//! and `ffi` public and keeps the other thirteen modules crate-private, so
+//! `encode` and `decode` cannot be called from here at all -- an integration
+//! test is a separate crate. `src/ffi.rs` declares the exported functions
 //! inside `pub(crate) mod exports`, and nothing re-exports them, so
 //! `curl_urlapi_rs::ffi::exports::curl_url` is a privacy error too. What makes
-//! the functions reachable is the attribute, not the module tree:
-//! `src/ffi.rs` L2482-L2496 spells this out, that `#[no_mangle]` puts the
+//! the functions reachable is the attribute, not the module tree: that
+//! module's own documentation spells this out, that `#[no_mangle]` puts the
 //! symbol in the table under the name C asks for and that `pub` contributes
 //! nothing to the symbol table either way. Declaring the four symbols here
 //! creates the undefined references that pull them out of the `rlib`, and it
@@ -61,33 +50,31 @@
 //! returned pointer outlives the call that produced it and none is ever written
 //! through.
 //!
-//! The release call is `libc::free`, deliberately, and it is correct for a
-//! reason rather than by luck: `src/alloc.rs` is the crate's only producer of
-//! C-visible memory and it allocates every one of those buffers with the C
-//! allocator, which is the whole point of `AAP` 0.6.4. `libc::free` also needs
-//! no feature gate, whereas `ffi::curl_free` exists only under the `cfree`
-//! feature and is absent from the drop-in configuration -- see the feature note
-//! below.
+//! The release call is `libc::free`, and it is correct for a reason rather than
+//! by luck: `src/alloc.rs` is the crate's only producer of C-visible memory and
+//! it allocates every one of those buffers with the C allocator. `libc::free`
+//! also needs no feature gate, whereas `ffi::curl_free` exists only under the
+//! `cfree` feature and is absent from the drop-in configuration.
 //!
 //! # Feature configurations
 //!
-//! `Cargo.toml` declares six features and two configurations are validated:
-//! the defaults, and `--no-default-features --features idn-libidn2`, which is
-//! the drop-in one. This file compiles and passes under both, which takes three
-//! deliberate accommodations.
+//! `Cargo.toml` declares six features. Two configurations are validated: the
+//! defaults, and `--no-default-features --features idn-libidn2`, which is the
+//! drop-in one. This file compiles and passes under both, which takes three
+//! accommodations.
 //!
 //! It never names `ffi::curl_url_strerror` (feature `strerror`) or
 //! `ffi::curl_free` (feature `cfree`); [`shown`] renders a code as a number and
 //! `libc::free` releases the buffers.
 //!
 //! It supplies `Curl_get_scheme` and `Curl_getn_scheme` itself when
-//! `scheme-table` is off. That accommodation is the interesting one and
-//! [`libcurl_scheme_shim`] documents why it is needed and why it is honest.
+//! `scheme-table` is off; [`libcurl_scheme_shim`] documents why that is needed
+//! and why it is honest.
 //!
 //! And every assertion that depends on internationalised-domain support is
 //! gated on the backend that would perform it, because the three backends give
-//! three different answers and `AAP` 0.6.3 records all three. The tests at the
-//! end of this file take each in turn.
+//! three different answers. The tests at the end of this file take each in
+//! turn.
 
 use core::ffi::{c_char, c_uint, c_void, CStr};
 use core::ptr;
@@ -132,15 +119,16 @@ extern "C" {
 /// # Why this module has to exist
 ///
 /// With `scheme-table` off the crate does not compile a table; it imports
-/// libcurl's own lookup. `src/scheme.rs` L1310-L1327 states that this is
-/// deliberate and that the archive must show the symbol as *undefined*, or the
+/// libcurl's own lookup. The backend-selection documentation in
+/// `src/scheme.rs` states that this is deliberate and that the archive must
+/// show the symbol as *undefined*, or the
 /// drop-in link acquires a duplicate of something `lib/url.c` already defines.
 /// The consequence lands here: a `cargo test` in that configuration links no
 /// libcurl at all, so every integration test binary fails with
 ///
 /// ```text
-/// undefined symbol: Curl_get_scheme   (referenced by src/ffi.rs:1992)
-/// undefined symbol: Curl_getn_scheme  (referenced by src/ffi.rs:2017)
+/// undefined symbol: Curl_get_scheme   (referenced by ffi::scheme_import)
+/// undefined symbol: Curl_getn_scheme  (referenced by ffi::scheme_import)
 /// ```
 ///
 /// regardless of what the test file contains. The two ways out are to compile
@@ -153,11 +141,12 @@ extern "C" {
 ///
 /// # What it has to get right
 ///
-/// The layout, and only the layout. `src/ffi.rs` L1886-L1909 mirrors
-/// `struct Curl_scheme` from `lib/urldata.h` L515-L524 and reads three of its
-/// six fields through the returned pointer, so the offsets are the entire
-/// contract; L1904-L1943 in that file explain that a wrong integer width here
-/// does not fail to compile, it silently returns one field's bytes as another's.
+/// The layout, and only the layout. `scheme_import::CurlScheme` in
+/// `src/ffi.rs` mirrors `struct Curl_scheme` from `lib/urldata.h` L515-L524
+/// and `scheme_import::describe` reads three of its six fields through the
+/// returned pointer, so the offsets are the entire contract; that structure's
+/// own documentation explains that a wrong integer width here does not fail to
+/// compile, it silently returns one field's bytes as another's.
 /// [`CurlScheme`] therefore repeats that shape field for field.
 ///
 /// The lookup itself follows `lib/url.c` L1477-L1540: names of one to seven
@@ -173,8 +162,9 @@ mod libcurl_scheme_shim {
 
     /// `struct Curl_scheme`, `lib/urldata.h` L515-L524.
     ///
-    /// Field for field as `src/ffi.rs` L1886-L1909 describes it: two pointers,
-    /// two 32-bit protocol words, the flag word, and the 16-bit default port.
+    /// Field for field as `scheme_import::CurlScheme` in `src/ffi.rs`
+    /// describes it: two pointers, two 32-bit protocol words, the flag word,
+    /// and the 16-bit default port.
     /// `protocol` and `family` are never read by anything -- neither by the
     /// crate nor here -- and they are present precisely because the two fields
     /// that *are* read sit after them and cannot be located otherwise.
@@ -270,7 +260,8 @@ mod libcurl_scheme_shim {
     ///
     /// `scheme` must be non-null and point at a NUL-terminated byte string that
     /// stays readable and unmodified for the duration of the call. That is what
-    /// `src/ffi.rs` L1984-L1994 promises when it calls this through a `&CStr`.
+    /// `scheme_import::get_scheme` in `src/ffi.rs` promises when it calls
+    /// this through a `&CStr`.
     #[no_mangle]
     #[allow(non_snake_case)]
     pub unsafe extern "C" fn Curl_get_scheme(scheme: *const c_char) -> *const CurlScheme {
@@ -291,7 +282,8 @@ mod libcurl_scheme_shim {
     /// `scheme` must point at `len` readable, initialised bytes that stay valid
     /// and unmodified for the duration of the call, or `len` must be zero. No
     /// terminator is needed, which is the reason this entry point exists;
-    /// `src/ffi.rs` L2006-L2018 satisfies it from a non-empty slice.
+    /// `scheme_import::getn_scheme` in `src/ffi.rs` satisfies it from a
+    /// non-empty slice.
     #[no_mangle]
     #[allow(non_snake_case)]
     pub unsafe extern "C" fn Curl_getn_scheme(
@@ -351,7 +343,6 @@ fn shown(bytes: &[u8]) -> String {
     out
 }
 
-/// Compares two byte strings and reports both, escaped, on a mismatch.
 fn same(context: &str, got: &[u8], want: &[u8]) {
     assert!(
         got == want,
@@ -371,7 +362,6 @@ fn same(context: &str, got: &[u8], want: &[u8]) {
 struct Url(*mut c_void);
 
 impl Url {
-    /// `curl_url()`, `lib/urlapi.c` L1288-L1291.
     fn new() -> Url {
         // SAFETY: `curl_url` takes no argument and has no precondition. It
         // returns either null, on allocation failure, or a fresh handle this
@@ -381,10 +371,6 @@ impl Url {
         Url(handle)
     }
 
-    /// A handle with `part` already assigned, asserting that it took.
-    ///
-    /// The two-step that most tests here start from: parse an input, then
-    /// interrogate or amend it.
     fn parsed(input: &[u8], flags: c_uint) -> Url {
         let url = Url::new();
         let code = url.set(URL, input, flags);
@@ -419,7 +405,6 @@ impl Url {
         unsafe { curl_url_set(self.0, what, terminated.as_ptr().cast::<c_char>(), flags) }
     }
 
-    /// [`Url::set`], asserting success.
     fn set_ok(&self, what: abi::CURLUPart, value: &[u8], flags: c_uint) {
         let code = self.set(what, value, flags);
         assert_eq!(
@@ -443,6 +428,18 @@ impl Url {
     /// blocks from the C allocator. It is also the only release call available
     /// in both feature configurations, since `ffi::curl_free` is gated on
     /// `cfree`.
+    ///
+    /// # Why the code is inspected before the pointer
+    ///
+    /// The returned code, not the pointer, decides whether a buffer exists.
+    /// `lib/urlapi.c` L1552 stores null into the caller's slot on entry, before
+    /// anything can fail, and every failing return sits after it -- so a failure
+    /// is required to leave the slot null and this helper asserts exactly that
+    /// rather than assuming it. Reading a non-null pointer written by a *failing*
+    /// call would be undefined behaviour, which would turn a port defect into
+    /// undefined behaviour instead of into the readable assertion failure a test
+    /// exists to produce. `tests/host_ip.rs` orders it the same way, and so do
+    /// the other two suites that drive this entry point.
     fn get(&self, what: abi::CURLUPart, flags: c_uint) -> (abi::CURLUcode, Option<Vec<u8>>) {
         let mut part: *mut c_char = ptr::null_mut();
         // SAFETY: the handle is non-null and live, and this call takes it as
@@ -450,11 +447,30 @@ impl Url {
         // across the call is sound. `part` is a live, writable, properly
         // aligned local that nothing else aliases.
         let code = unsafe { curl_url_get(self.0.cast_const(), what, &mut part, flags) };
-        if part.is_null() {
+        if code != abi::CURLUE_OK {
+            // No buffer was produced, so there is nothing to read and nothing to
+            // release. The pointer is checked rather than ignored because
+            // L1552's unconditional null is the contract a caller relies on to
+            // avoid releasing a stale pointer, and a violation must be reported
+            // here rather than dereferenced.
+            assert!(
+                part.is_null(),
+                "get part {what} flags {flags:#x} failed with {code} yet stored \
+                 a pointer; lib/urlapi.c L1552 nulls the slot before any \
+                 failing return can be taken"
+            );
             return (code, None);
         }
-        // SAFETY: `part` is non-null and, since the call reported through it,
-        // addresses a NUL-terminated buffer this thread now owns. `to_bytes`
+        if part.is_null() {
+            // Success with no buffer is a real answer, not a fault: a blank part
+            // under `CURLU_GET_EMPTY` reaches `src/getset.rs` with an empty
+            // dynamic buffer and `lib/urlapi.c` L1399 stores whatever
+            // `curlx_dyn_ptr` gave it. Reporting it as "no bytes" keeps which
+            // vectors reach it a property of the vectors themselves.
+            return (code, None);
+        }
+        // SAFETY: the call reported `CURLUE_OK` and stored a non-null pointer, so
+        // it addresses a NUL-terminated buffer this thread now owns. `to_bytes`
         // copies nothing, so the `Vec` is built before the block is released and
         // the borrow has ended by the time `free` runs.
         let bytes = unsafe { CStr::from_ptr(part) }.to_bytes().to_vec();
@@ -465,7 +481,6 @@ impl Url {
         (code, Some(bytes))
     }
 
-    /// [`Url::get`], asserting success and yielding the bytes.
     fn text(&self, what: abi::CURLUPart, flags: c_uint) -> Vec<u8> {
         let (code, part) = self.get(what, flags);
         assert_eq!(
@@ -504,10 +519,6 @@ impl Drop for Url {
         unsafe { curl_url_cleanup(self.0) };
     }
 }
-
-// ---------------------------------------------------------------------------
-// Assignment-side encoding: the append_list table
-// ---------------------------------------------------------------------------
 
 /// One row of the `append_list` table.
 ///
@@ -640,7 +651,6 @@ fn set_query_without_append_escapes_every_equals() {
     );
 }
 
-/// The separator rules at `lib/urlapi.c` L1935-L1962, each in isolation.
 #[test]
 fn append_query_separator_is_added_only_when_needed() {
     // An empty-but-present query: `https://x/?` parses with `query_present` set
@@ -687,10 +697,6 @@ fn append_query_without_encode_keeps_the_space() {
         b"https://x/?name=joe doe",
     );
 }
-
-// ---------------------------------------------------------------------------
-// Retrieval-side encoding: the space rule and the `left` state
-// ---------------------------------------------------------------------------
 
 /// A space becomes `%20` before the query delimiter and `+` after it.
 ///
@@ -841,6 +847,82 @@ fn get_encode_escapes_are_upper_case_hex() {
     same("host alone", &url.text(HOST, ENCODE), b"%FF.127.0.0.1");
 }
 
+/// The *other* half of the encoder's range: a byte strictly below `0x20`.
+///
+/// L157 is `(*iptr < ' ') || (*iptr >= 0x7f)`, two disjuncts, and
+/// [`get_encode_escapes_are_upper_case_hex`] reaches only the second one --
+/// every vector it has is a high byte, because that is what the C table holds.
+/// The low half needs its own vectors and cannot borrow those: a control byte
+/// cannot arrive through a parsed URL at all, since `Curl_junkscan` rejects
+/// every byte at or below 0x1f before the parser sees it (L223-L239, and
+/// [`junkscan_rejects_more_than_reject_ctrl_does`] pins that).
+///
+/// The way in is the assignment side without `CURLU_URLENCODE`. L1915-L1932
+/// stores the value as given and only folds existing escapes to lower case, so
+/// a literal control byte is stored literally -- and it is not checked, because
+/// the `Curl_urldecode` guard with `REJECT_CTRL` at L1970-L1980 belongs to
+/// `CURLUPART_HOST` alone. Reading the part back with `CURLU_URLENCODE` then
+/// runs the encoder over it, which is the path under test.
+///
+/// Three parts are covered because the encoder's initial `left` state differs
+/// between them (L135) and a control byte must be escaped regardless of it, and
+/// `0x01` and `0x1f` are both used so that the bottom of the range and the byte
+/// immediately below the threshold are each seen. The whole-URL read is asserted
+/// too, for the opposite reason: `urlget_url` escapes the *host* only (L1493)
+/// and interpolates the path, query and fragment verbatim into the L1517
+/// template, so the control bytes come back raw there. That contrast is the
+/// point -- one flag, two answers, decided by which part is being read.
+#[test]
+fn get_encode_escapes_bytes_below_the_space() {
+    let url = Url::parsed(b"https://example.com/p", NONE);
+
+    // The fragment: `left` starts TRUE here, and neither byte is a space, so
+    // the escape form is the only thing under test.
+    url.set_ok(FRAGMENT, b"a\x01\x1fb", NONE);
+    same(
+        "stored verbatim, because the setter without CURLU_URLENCODE copies",
+        &url.text(FRAGMENT, NONE),
+        b"a\x01\x1fb",
+    );
+    same(
+        "0x01 and 0x1f both escape, upper case",
+        &url.text(FRAGMENT, ENCODE),
+        b"a%01%1Fb",
+    );
+
+    // The query: `left` starts FALSE, which changes what a space becomes and
+    // nothing about a control byte.
+    url.set_ok(QUERY, b"a\x1fb", NONE);
+    same("query stored verbatim", &url.text(QUERY, NONE), b"a\x1fb");
+    same(
+        "0x1f escapes in the query too",
+        &url.text(QUERY, ENCODE),
+        b"a%1Fb",
+    );
+
+    // The path, which the setter also gives a leading slash (L1880-L1884).
+    url.set_ok(PATH, b"/a\x1fb", NONE);
+    same("path stored verbatim", &url.text(PATH, NONE), b"/a\x1fb");
+    same(
+        "and escapes on the way out",
+        &url.text(PATH, ENCODE),
+        b"/a%1Fb",
+    );
+
+    // The whole URL leaves all three raw: L1493 escapes the host and nothing
+    // else, so `CURLU_URLENCODE` reaches no other part of the template.
+    same(
+        "the whole URL carries the raw bytes even with CURLU_URLENCODE",
+        &url.text(URL, ENCODE),
+        b"https://example.com/a\x1fb?a\x1fb#a\x01\x1fb",
+    );
+    same(
+        "and identically without it",
+        &url.text(URL, NONE),
+        b"https://example.com/a\x1fb?a\x1fb#a\x01\x1fb",
+    );
+}
+
 /// The host escape differs between a part read and a whole-URL read.
 ///
 /// The two paths use different predicates and the difference is deliberate, so
@@ -928,10 +1010,6 @@ fn get_whole_url_leaves_path_query_and_fragment_alone() {
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// Parts where a codec is meaningless, cleared, or overridden
-// ---------------------------------------------------------------------------
 
 /// The scheme is never encoded on assignment.
 ///
@@ -1114,10 +1192,6 @@ fn set_space_becomes_plus_only_for_the_query() {
     same("user", &url.text(USER, NONE), b"a%20b");
 }
 
-// ---------------------------------------------------------------------------
-// The not-encoding branch: pre-existing escapes fold to lower case
-// ---------------------------------------------------------------------------
-
 /// Without `CURLU_URLENCODE`, an existing `%XX` is folded to lower case.
 ///
 /// `lib/urlapi.c` L1915-L1932 is the else branch of the encoder. It stores the
@@ -1223,10 +1297,6 @@ fn new_escapes_are_upper_case_and_existing_ones_fold_to_lower_case() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Decoding
-// ---------------------------------------------------------------------------
-
 /// `CURLU_URLDECODE` decodes once, not repeatedly.
 ///
 /// `tests/libtest/lib1560.c` L196-L199. `urlget_format` calls `Curl_urldecode`
@@ -1292,13 +1362,49 @@ fn get_plus_conversion_precedes_percent_decoding() {
 /// documented API behaviour. The threshold is `< 0x20` -- strictly below, and
 /// byte 127 is not in the set. L1388 turns a rejection into `CURLUE_URLDECODE`.
 ///
-/// Four vectors pin the boundary from both sides: `%00` and `%01` are rejected,
-/// `%20` decodes to a space, and `%7F` decodes to byte 0x7F and succeeds. The
-/// last is the one that would break if the threshold were ever widened to match
-/// the parser's rejection set, which is what
+/// Five vectors pin the boundary from both sides. `%00`, `%01` and `%1F` are
+/// rejected -- the bottom of the range, one above it, and the **last** rejected
+/// value, which is the one an off-by-one in the comparison would let through;
+/// `%20` decodes to a space, and `%7F` decodes to byte 0x7F and succeeds. That
+/// last one would break if the threshold were ever widened to match the parser's
+/// rejection set, which is what
 /// [`junkscan_rejects_more_than_reject_ctrl_does`] is about.
+///
+/// `%1F` is asserted on the path, the query and the fragment, and in both
+/// spellings of its hex digit, because `urlget_format` runs one decoder over
+/// whichever part it was handed (L1383-L1389) and the digits are read
+/// case-insensitively while the encoder only ever writes upper case. The
+/// whole-URL read is asserted alongside them: `urlget_url` never decodes, so the
+/// same handle answers the same flag two different ways depending on the part,
+/// and a decode rejection cannot leak into the serialisation.
 #[test]
 fn get_urldecode_rejects_only_bytes_below_0x20() {
+    // The last rejected escape, on every part that decodes, in both spellings.
+    let url = Url::parsed(b"https://curl.se/%1F?%1f#%1F", NONE);
+    same(
+        "the path keeps the escape as written",
+        &url.text(PATH, NONE),
+        b"/%1F",
+    );
+    same(
+        "and so does the query, lower case included",
+        &url.text(QUERY, NONE),
+        b"%1f",
+    );
+    for (part, name) in [(PATH, "path"), (QUERY, "query"), (FRAGMENT, "fragment")] {
+        assert_eq!(
+            url.failing(part, DECODE),
+            abi::CURLUE_URLDECODE,
+            "%1F is the last byte REJECT_CTRL refuses, and the {name} decoder \
+             must refuse it"
+        );
+    }
+    same(
+        "the whole URL never decodes, so it answers with the escapes intact",
+        &url.text(URL, DECODE),
+        b"https://curl.se/%1F?%1f#%1F",
+    );
+
     for (escape, part) in [(&b"%00"[..], QUERY), (&b"%01"[..], QUERY)] {
         let mut input = b"https://curl.se/?".to_vec();
         input.extend_from_slice(escape);
@@ -1431,9 +1537,292 @@ fn parse_space_requires_allow_space() {
     same("in the path", &url.text(PATH, NONE), b"/a b");
 }
 
-// ---------------------------------------------------------------------------
-// Non-ASCII vectors and internationalised domains
-// ---------------------------------------------------------------------------
+/// The number of bytes the encoder may write before the buffer refuses.
+///
+/// `handle_path` at `lib/urlapi.c` L1072 gives the encode buffer a ceiling of
+/// `CURL_MAX_INPUT_LENGTH`, and `lib/urldata.h` L131 sets that to 8,000,000.
+/// `handle_query` L1044 and `handle_fragment` L1021 do the same.
+const ENCODE_CEILING: usize = 8_000_000;
+
+/// `CURLUE_TOO_LARGE` from an encode expansion, both sides of the boundary.
+///
+/// # Why this is the only public door to that code
+///
+/// `cc2cu` at `lib/urlapi.c` L121-L122 is the whole of the mapping -- "convert
+/// `CURLcode` to `CURLUcode`" -- and it answers `CURLUE_TOO_LARGE` for exactly
+/// one input, `CURLE_TOO_LARGE`, which only `dyn_nappend` produces, at
+/// `lib/curlx/dynbuf.c` L82-L85, when `len + idx + 1` would exceed the buffer's
+/// ceiling. Of the eight buffers this module creates, seven cannot reach it:
+/// `curl_url_set`'s own encode buffer at L1880 is sized `nalloc * 3 + 1 +
+/// leadingslash`, which is precisely the worst case of a three-byte escape per
+/// input byte, so it fits by construction; the whole-URL and authority buffers
+/// take content already bounded by `Curl_junkscan`; and the append-query buffer
+/// at L1944 turns a failure into `CURLUE_OUT_OF_MEMORY` at L1959-L1961 rather
+/// than mapping it.
+///
+/// The one that can is `urlencode_str` writing into `handle_path`'s buffer at
+/// L1070-L1077. Its input is a path already inside the 8,000,000-byte input
+/// ceiling, but each space or high byte becomes three, so a path over a third of
+/// the ceiling in escapable bytes overflows a buffer of exactly the ceiling and
+/// L169-L170 maps the result.
+///
+/// # The arithmetic, so the two vectors are derived and not tuned
+///
+/// The path is one slash followed by `n` escapable bytes, and the encoder writes
+/// the slash then three bytes per escape, so the final append sees
+/// `len + idx + 1` = `3 + (1 + 3(n - 1)) + 1` = `3n + 2`. The buffer refuses
+/// when that exceeds 8,000,000, so `n = 2,666,666` is the largest path that
+/// fits -- `3n + 2` is exactly 8,000,000 -- and `n = 2,666,667` is the first
+/// that does not. The stored path is then `1 + 3n` = 7,999,999 bytes, which the
+/// success case asserts, because a port that trimmed instead of refusing would
+/// also return `CURLUE_OK` here.
+///
+/// Both the space spelling, which needs `CURLU_ALLOW_SPACE` because
+/// `Curl_junkscan` L232-L235 refuses a space without it, and the high-byte
+/// spelling, which needs no extra flag because the scan only refuses bytes at or
+/// below 0x20 and 127. `urlencode_str` L157-L161 escapes both, so the two must
+/// land on the same boundary; if only one did, the `left` state or the byte test
+/// would be wrong.
+///
+/// # Cost
+///
+/// Four parses of roughly 2.7 MB and four 8 MB buffers, tens of milliseconds
+/// measured. Not marked `#[ignore]`: `AAP` 0.9.2 A1 wants the suite to run in
+/// full, and a boundary nobody runs is not a boundary.
+#[test]
+fn encode_expansion_over_the_buffer_ceiling_is_too_large() {
+    // Derived above, not chosen: 3n + 2 == ENCODE_CEILING at the last size that
+    // fits.
+    let fits = (ENCODE_CEILING - 2) / 3;
+    assert_eq!(fits * 3 + 2, ENCODE_CEILING, "the boundary must be exact");
+
+    for (escapable, flags, label) in [
+        (b' ', SPACE, "spaces"),
+        // 0xff is above 0x7f, so `urlencode_str` L157 escapes it, and it is
+        // outside `Curl_junkscan`'s refused range, so no flag is needed. Written
+        // as a numeric byte because `scripts/spacecheck.pl` L173-L196 refuses a
+        // non-ASCII byte in a tracked file.
+        (0xff_u8, NONE, "high bytes"),
+    ] {
+        // One byte under the boundary: it parses, and the stored path is the
+        // full expansion rather than a truncation of it.
+        let mut input = b"https://x.com/".to_vec();
+        input.resize(input.len() + fits, escapable);
+        let url = Url::parsed(&input, ENCODE | flags);
+        let path = url.text(PATH, NONE);
+        assert_eq!(
+            path.len(),
+            1 + 3 * fits,
+            "{label}: {fits} escapes should give a path of {} bytes, not {}",
+            1 + 3 * fits,
+            path.len()
+        );
+        assert_eq!(path.first(), Some(&b'/'), "{label}: and it starts with /");
+        // Spot-check the expansion rather than build a 7,999,999-byte
+        // expectation: the first escape and the last, which between them pin the
+        // encoding and the absence of a trailing truncation.
+        let escape = format!("%{escapable:02X}").into_bytes();
+        assert_eq!(
+            path.get(1..4),
+            Some(&escape[..]),
+            "{label}: the first escape is upper-case hexadecimal"
+        );
+        assert_eq!(
+            path.get(path.len() - 3..),
+            Some(&escape[..]),
+            "{label}: and so is the last"
+        );
+
+        // One byte over it: `CURLUE_TOO_LARGE`, 31.
+        let mut input = b"https://x.com/".to_vec();
+        input.resize(input.len() + fits + 1, escapable);
+        let url = Url::new();
+        assert_eq!(
+            url.set(URL, &input, ENCODE | flags),
+            abi::CURLUE_TOO_LARGE,
+            "{label}: {} escapes exceed the {ENCODE_CEILING}-byte buffer",
+            fits + 1
+        );
+        // And the failed set left nothing behind. `parseurl` L1188-L1191 frees
+        // the whole temporary and `parseurl_and_replace` L1204-L1207 only swaps
+        // on success, so a handle that was empty is still empty -- no host, and
+        // therefore no partially encoded path either.
+        assert_eq!(
+            url.failing(HOST, NONE),
+            abi::CURLUE_NO_HOST,
+            "{label}: the rejected parse left no host"
+        );
+        assert_eq!(
+            url.failing(SCHEME, NONE),
+            abi::CURLUE_NO_SCHEME,
+            "{label}: nor a scheme"
+        );
+
+        // Still under the input ceiling, so the refusal really is the encode
+        // buffer's and not `Curl_junkscan`'s at L229-L230 -- that one answers
+        // `CURLUE_MALFORMED_INPUT`, 3, and this one must not.
+        assert!(
+            input.len() < ENCODE_CEILING,
+            "{label}: the input itself must stay inside the input ceiling"
+        );
+        // Proof of the same point from the other side: without the encoder the
+        // very same input parses.
+        let url = Url::new();
+        assert_eq!(
+            url.set(URL, &input, flags),
+            abi::CURLUE_OK,
+            "{label}: unencoded, the same input is fine"
+        );
+    }
+}
+
+/// `curl_url_set(CURLUPART_HOST, ..., CURLU_URLENCODE)` and its one surprise.
+///
+/// The host arm of `curl_url_set` is the only part with a validation step of its
+/// own, at `lib/urlapi.c` L1965-L1992, and the flag decides which of two
+/// branches performs it:
+///
+/// * With `CURLU_URLENCODE`, L1985 hands `hostname_check` the **encoded** text
+///   directly.
+/// * Without it, L1974-L1984 assumes the caller supplied something already
+///   encoded and runs `Curl_urldecode` first, so the check sees decoded bytes.
+///
+/// # The surprise
+///
+/// `%` is a member of the reject set at L456. So under `CURLU_URLENCODE`, any
+/// host that needs even one escape produces text containing `%` and is then
+/// refused by the very check that runs over it -- `CURLUE_BAD_HOSTNAME`, 21.
+/// The flag is therefore not "encode this host for me": it is "this host is
+/// already legal, and if encoding it would change it, that is an error".
+/// Verified against the reference build rather than reasoned about, for a space,
+/// a reserved byte, a high byte and a pre-encoded escape alike.
+///
+/// The accepting side is the unreserved set of `lib/curl_ctype.h` L47-L49 --
+/// alphanumerics plus `-`, `.`, `_`, `~` -- which the encoder leaves alone, so
+/// the check sees exactly what the caller passed. Note that it is not
+/// lower-cased: `Curl_strntolower` runs on the scheme, never on a host set
+/// through this path.
+///
+/// # And the side effect that outlives the failure
+///
+/// L1846-L1849 releases the zone identifier as soon as the arm is selected,
+/// before any validation. So a **failing** host assignment still destroys it,
+/// while leaving the host itself in place -- asserted at the end, because it is
+/// the kind of asymmetry a port would smooth over by moving the release after
+/// the check.
+#[test]
+fn set_host_with_urlencode_accepts_only_what_needs_no_escape() {
+    // The accepting side: every byte unreserved, so encoding is the identity and
+    // `hostname_check` sees the caller's own text.
+    for host in [
+        &b"example.org"[..],
+        // Not lower-cased, unlike a scheme.
+        b"EXAMPLE.org",
+        // The remaining three unreserved punctuation bytes.
+        b"ex-am_ple.org",
+        b"ex~ample.org",
+        // A dotted-quad, which `ipv4_normalize` never sees on this path: the
+        // setter stores what it is given.
+        b"192.168.0.1",
+    ] {
+        let url = Url::parsed(b"https://example.org/p", NONE);
+        url.set_ok(HOST, host, ENCODE);
+        same("stored exactly as given", &url.text(HOST, NONE), host);
+        let mut want = b"https://".to_vec();
+        want.extend_from_slice(host);
+        want.extend_from_slice(b"/p");
+        same("and serialised the same way", &url.text(URL, NONE), &want);
+    }
+
+    // The refusing side. Every one of these is `CURLUE_BAD_HOSTNAME` and the
+    // reason is the same in each case: the encoder writes a `%`, and `%` is in
+    // the reject set.
+    for (host, why) in [
+        (&b"exa mple.org"[..], "a space becomes %20"),
+        (b"exa$mple.org", "a reserved byte becomes %24"),
+        (b"exa\xffmple.org", "a high byte becomes %FF"),
+        (
+            b"exa%20mple.org",
+            "an already-escaped host has its % escaped to %25",
+        ),
+        (
+            b"exa%41mple.org",
+            "and so does one whose escape would have decoded to a letter",
+        ),
+        // Not an address on this path: `[` is in the reject set and
+        // `hostname_check` L452-L453 only routes to `ipv6_parse` when the byte
+        // is the first, which it is here -- but `[fe80::1]` also holds `:`, so
+        // the encoder escapes both and the bracket no longer leads.
+        (b"[fe80::1]", "a bracketed address cannot survive encoding"),
+        // L1972-L1973, the one refusal that is not about `%` at all.
+        (b"", "an empty value is refused before the check even runs"),
+    ] {
+        let url = Url::parsed(b"https://example.org/p", NONE);
+        assert_eq!(
+            url.set(HOST, host, ENCODE),
+            abi::CURLUE_BAD_HOSTNAME,
+            "{why}: \"{}\" must be refused",
+            shown(host)
+        );
+        // L1987-L1989 returns before `*storep` is replaced at L1994-L1995, so
+        // the handle keeps the host it had. Read from this handle, not a fresh
+        // one, or the claim is about a different object.
+        same(
+            "and the previous host survives",
+            &url.text(HOST, NONE),
+            b"example.org",
+        );
+        same(
+            "as does the whole URL",
+            &url.text(URL, NONE),
+            b"https://example.org/p",
+        );
+    }
+
+    // The contrast that isolates the branch: the same pre-encoded value that
+    // fails with the flag succeeds without it, because L1974-L1984 decodes
+    // before checking and `%41` decodes to `A`.
+    let url = Url::parsed(b"https://example.org/p", NONE);
+    url.set_ok(HOST, b"exa%41mple.org", NONE);
+    same(
+        "stored with the escape intact, not decoded",
+        &url.text(HOST, NONE),
+        b"exa%41mple.org",
+    );
+    // And a pre-encoded value whose decoding is a rejected byte still fails,
+    // which is what proves the decode-then-check order rather than a blanket
+    // acceptance of anything containing `%`.
+    let url = Url::parsed(b"https://example.org/p", NONE);
+    assert_eq!(
+        url.set(HOST, b"exa%2fmple.org", NONE),
+        abi::CURLUE_BAD_HOSTNAME,
+        "%2f decodes to / , which L456 refuses"
+    );
+
+    // The zone identifier is destroyed by a host assignment that FAILS.
+    let url = Url::parsed(b"https://[fe80::1%25eth0]/p", NONE);
+    same(
+        "the zone parsed",
+        &url.text(abi::CURLUPART_ZONEID, NONE),
+        b"eth0",
+    );
+    assert_eq!(
+        url.set(HOST, b"exa mple.org", ENCODE),
+        abi::CURLUE_BAD_HOSTNAME,
+        "the assignment is refused"
+    );
+    assert_eq!(
+        url.failing(abi::CURLUPART_ZONEID, NONE),
+        abi::CURLUE_NO_ZONEID,
+        "yet the zone identifier is gone, because L1848 released it before the \
+         switch body ever validated anything"
+    );
+    same(
+        "while the host it belonged to is still there",
+        &url.text(HOST, NONE),
+        b"[fe80::1]",
+    );
+}
 
 // The three non-ASCII hostnames the reference measurements in `AAP` 0.6.3 use,
 // with the compatibility form of each. They are written as byte escapes because
@@ -1534,9 +1923,130 @@ fn urlencode_overrides_the_idn_flags() {
     );
 }
 
-/// The environment's locale, adopted for the calling thread and then restored.
+/// With both internationalised-domain flags set and no `CURLU_URLENCODE`,
+/// `CURLU_PUNYCODE` wins.
 ///
-/// # Why the locale has to be adopted at all
+/// This is the middle of the same if / else-if / else-if chain at
+/// `lib/urlapi.c` L1391-L1420, and [`urlencode_overrides_the_idn_flags`] only
+/// establishes the first link of it. Order inside the chain decides this one:
+/// `punycode` is tested at L1400 and `depunyfy` at L1411, so with both flags set
+/// the second is unreachable. The whole-URL path repeats the chain in the same
+/// order at L1492-L1509, and it is asserted here too, because a port could
+/// plausibly get one right and the other wrong.
+///
+/// The vector is chosen so that the answer needs **no backend and no locale**,
+/// which is what lets this test be unconditional where the conversions
+/// themselves cannot be. The host is already in compatibility form, so:
+///
+/// * the `punycode` arm is entered and its guard, `!Curl_is_ASCII_name(u->host)`
+///   at L1401, is false -- so the arm does nothing and the host comes back
+///   exactly as stored, without libidn2 ever being called;
+/// * the `depunyfy` arm, had it been reached, *would* have converted, because
+///   its guard at L1412 is the same predicate the other way round.
+///
+/// So "unchanged" is the signature of `CURLU_PUNYCODE` having won, and the
+/// contrast is asserted immediately: the same handle with only
+/// `CURLU_PUNY2IDN` converts. That second half needs a backend, so it is gated
+/// -- and gated on the two backends separately being present, not on either
+/// being correct, since both agree on this name.
+#[test]
+fn punycode_wins_over_puny2idn_when_both_flags_are_set() {
+    let mut input = b"https://".to_vec();
+    input.extend_from_slice(SWEDISH_ACE);
+    input.extend_from_slice(b"/p?q#f");
+    let url = Url::parsed(&input, NONE);
+
+    same(
+        "both flags: the punycode arm is entered and is a no-op on an ASCII \
+         host, so nothing changes",
+        &url.text(HOST, abi::CURLU_PUNYCODE | abi::CURLU_PUNY2IDN),
+        SWEDISH_ACE,
+    );
+    let mut whole = b"https://".to_vec();
+    whole.extend_from_slice(SWEDISH_ACE);
+    whole.extend_from_slice(b"/p?q#f");
+    same(
+        "and the whole-URL chain at L1492-L1509 answers the same way",
+        &url.text(URL, abi::CURLU_PUNYCODE | abi::CURLU_PUNY2IDN),
+        &whole,
+    );
+
+    // The proof that the arm order is what decided it: drop CURLU_PUNYCODE and
+    // the same handle converts. Only this half needs a backend.
+    #[cfg(any(feature = "idn-libidn2", feature = "idn-pure"))]
+    same(
+        "with CURLU_PUNY2IDN alone the depunyfy arm is reached and converts",
+        &url.text(HOST, abi::CURLU_PUNY2IDN),
+        SWEDISH,
+    );
+    // Without one, the same call reports that support is absent -- which is
+    // still evidence the arm was reached, and is the only answer available.
+    #[cfg(not(any(feature = "idn-libidn2", feature = "idn-pure")))]
+    assert_eq!(
+        url.failing(HOST, abi::CURLU_PUNY2IDN),
+        abi::CURLUE_LACKS_IDN,
+        "the depunyfy arm is reached; only the conversion is unavailable"
+    );
+}
+
+/// `CURLU_PUNY2IDN` on the whole URL, succeeding.
+///
+/// The compatibility-to-Unicode direction has its own site on the whole-URL
+/// path, `lib/urlapi.c` L1504-L1509, which is a different call to `host_encode`
+/// from the one `urlget_format` makes at L1411-L1419 for the host part. Both
+/// have to work, and [`puny2idn_conversion_ignores_the_locale`] exercises only
+/// the part. This asserts the serialisation: the converted host is what L1517's
+/// template interpolates through `allochost`, so the surrounding user, port,
+/// path, query and fragment have to survive the substitution unchanged, and they
+/// are included in the vector for exactly that reason.
+///
+/// No locale guard is needed, and that is the asymmetry `AAP` 0.6.3 records:
+/// `idn_encode` calls `idn2_to_unicode_8z8z` at `lib/idn.c` L281-L297, which is
+/// UTF-8 in and UTF-8 out and reads no locale, where the other direction goes
+/// through the locale-aware `IDN2_LOOKUP`. So this succeeds in the `C` locale as
+/// well, which is why the assertion is exact rather than branched on the
+/// codeset the way [`punycode_conversion_follows_the_locale_codeset`] has to be.
+#[cfg(any(feature = "idn-libidn2", feature = "idn-pure"))]
+#[test]
+fn puny2idn_serialises_the_whole_url() {
+    let mut input = b"https://user@".to_vec();
+    input.extend_from_slice(SWEDISH_ACE);
+    input.extend_from_slice(b":8080/a/b?q=1#frag");
+    let url = Url::parsed(&input, NONE);
+
+    let mut want = b"https://user@".to_vec();
+    want.extend_from_slice(SWEDISH);
+    want.extend_from_slice(b":8080/a/b?q=1#frag");
+    same(
+        "the whole URL carries the Unicode host and nothing else moves",
+        &url.text(URL, abi::CURLU_PUNY2IDN),
+        &want,
+    );
+    same(
+        "the host part agrees, through the other call site",
+        &url.text(HOST, abi::CURLU_PUNY2IDN),
+        SWEDISH,
+    );
+    // And the handle itself is untouched: the conversion is a property of the
+    // read, not a mutation. L1409 and L1508 both convert a copy.
+    same(
+        "the stored host is still the ACE form",
+        &url.text(HOST, NONE),
+        SWEDISH_ACE,
+    );
+    let mut stored = b"https://user@".to_vec();
+    stored.extend_from_slice(SWEDISH_ACE);
+    stored.extend_from_slice(b":8080/a/b?q=1#frag");
+    same(
+        "and so is the plain serialisation",
+        &url.text(URL, NONE),
+        &stored,
+    );
+}
+
+/// A named locale, installed for the calling thread and then restored.
+///
+/// # Why a locale has to be installed at all
 ///
 /// A Rust program never calls `setlocale`, so it runs in the `C` locale whatever
 /// the environment says. `lib/idn.c` L39-L40 reaches libidn2 through
@@ -1546,14 +2056,25 @@ fn urlencode_overrides_the_idn_flags() {
 /// the equivalent call, and `AAP` 0.6.3 notes that a harness omitting it passes
 /// while exercising none of this.
 ///
+/// # Why a NAMED locale and not the environment's
+///
+/// Because a test whose outcome the runner's environment decides is not a test
+/// of the code. An earlier version of this guard adopted whatever the
+/// environment named, which meant that under `LC_ALL=C` only the failure branch
+/// ran and under `LC_ALL=C.UTF-8` only the success branch did -- so the
+/// successful conversion could have been deleted outright and this file would
+/// still have been green on a runner with no locale set, which is the default.
+/// `AAP` 0.9.2 asks at A8 that the internationalised-domain assertions actually
+/// execute and at A9 that behaviour be established "under both locale
+/// configurations". Naming the locale is what makes one run do both.
+///
 /// # Why the per-thread interface and not `setlocale`
 ///
 /// `setlocale` mutates process-wide state, and Cargo runs the tests in this
 /// binary on several threads at once, so calling it here would race with
 /// whatever else is in flight. `newlocale` followed by `uselocale` installs the
 /// locale for the calling thread only, which makes the change invisible to every
-/// other test and removes the race rather than hoping to lose it. The measured
-/// effect is the same: the codeset becomes the environment's.
+/// other test and removes the race rather than hoping to lose it.
 ///
 /// The type is a guard rather than a function because the locale object has to
 /// outlive the work and then be released. `Drop` puts the thread back on the
@@ -1562,41 +2083,73 @@ fn urlencode_overrides_the_idn_flags() {
 /// at which point it is current in no thread and releasing it is defined. Doing
 /// it in that order is the difference between a clean run under a leak detector
 /// and one leaked locale per test.
+///
+/// # POSIX only, and that is stated rather than papered over
+///
+/// `newlocale` and `uselocale` are POSIX. On a platform without them there is no
+/// way to install a locale for one thread, and the previous stand-in here
+/// reported an unknown codeset -- which the test then read as "not UTF-8" and so
+/// silently exercised the failure branch only. Rather than keep a stand-in whose
+/// effect is to skip the interesting half, the locale tests are compiled on
+/// `unix` alone. `AAP` 0.8.5 already scopes validation to the platform parity is
+/// demonstrated on and records that the Windows paths are ported but not
+/// exercised, so this is the same boundary drawn in one more place.
 #[cfg(all(unix, any(feature = "idn-libidn2", feature = "idn-pure")))]
 struct ThreadLocale {
-    /// The locale this guard installed, or null if it could not be built.
+    /// The locale this guard installed. Never null: a failed construction is
+    /// reported by [`ThreadLocale::try_named`] returning `None` instead.
     installed: libc::locale_t,
-    /// What the thread was using before, to be restored by `Drop`.
     previous: libc::locale_t,
+    /// The name asked for, for an assertion message.
+    name: &'static [u8],
     /// `nl_langinfo(CODESET)` as it reads with `installed` in force.
     codeset: Vec<u8>,
 }
 
 #[cfg(all(unix, any(feature = "idn-libidn2", feature = "idn-pure")))]
 impl ThreadLocale {
-    fn adopt_environment() -> ThreadLocale {
-        // SAFETY: the second argument is a NUL-terminated empty string, which is
-        // `newlocale`'s documented request for "take every category from the
-        // environment", and the third is the null base, which asks for a fresh
-        // object rather than a modification of an existing one. The literal
-        // outlives the call. A null return means the locale could not be built
-        // and is handled below rather than dereferenced.
+    /// The names a UTF-8 locale might go by, most specific first.
+    ///
+    /// `C.UTF-8` is what `tests/data/test1560` sets and what glibc 2.35 and
+    /// later provide built in, so it is first. `C.utf8` is the same locale under
+    /// the spelling `locale -a` prints on some systems -- and although glibc
+    /// resolves both, a platform that generated only one of them would accept
+    /// only that one. The two `en_US` spellings are the fallback for an image
+    /// that generated a national locale but no `C.UTF-8`; neither exists on this
+    /// container, which is precisely why more than one candidate is needed.
+    const UTF8_NAMES: [&'static [u8]; 4] =
+        [b"C.UTF-8\0", b"C.utf8\0", b"en_US.UTF-8\0", b"en_US.utf8\0"];
+
+    /// Installs `name`, or answers `None` if the platform has no such locale.
+    ///
+    /// `name` must end in a NUL, which every caller here spells literally.
+    /// Nothing is installed on failure, so a `None` leaves the calling thread
+    /// exactly as it was.
+    fn try_named(name: &'static [u8]) -> Option<ThreadLocale> {
+        debug_assert_eq!(
+            name.last(),
+            Some(&0),
+            "a locale name must be NUL-terminated"
+        );
+        // SAFETY: the second argument is a NUL-terminated `'static` literal,
+        // which is what `newlocale` reads, and the third is the null base, which
+        // asks for a fresh object rather than a modification of an existing one.
+        // A null return means the locale does not exist on this platform and is
+        // handled below rather than dereferenced.
         let installed = unsafe {
             libc::newlocale(
                 libc::LC_ALL_MASK,
-                b"\0".as_ptr().cast::<c_char>(),
+                name.as_ptr().cast::<c_char>(),
                 ptr::null_mut(),
             )
         };
-        let previous = if installed.is_null() {
-            ptr::null_mut()
-        } else {
-            // SAFETY: `installed` is a live locale object, and this call takes
-            // it for the calling thread only. The returned handle is the
-            // thread's previous locale, kept for `Drop` and never dereferenced
-            // here.
-            unsafe { libc::uselocale(installed) }
-        };
+        if installed.is_null() {
+            return None;
+        }
+        // SAFETY: `installed` is a live locale object, and this call takes it
+        // for the calling thread only. The returned handle is the thread's
+        // previous locale, kept for `Drop` and never dereferenced here.
+        let previous = unsafe { libc::uselocale(installed) };
         // SAFETY: `nl_langinfo` returns a pointer to a NUL-terminated string
         // owned by the C library and valid until this thread's locale changes
         // next. The bytes are copied out immediately, well inside that window,
@@ -1604,14 +2157,69 @@ impl ThreadLocale {
         let codeset = unsafe { CStr::from_ptr(libc::nl_langinfo(libc::CODESET)) }
             .to_bytes()
             .to_vec();
-        ThreadLocale {
+        Some(ThreadLocale {
             installed,
             previous,
+            name,
             codeset,
-        }
+        })
     }
 
-    /// The codeset name now in force, for an assertion message.
+    /// A UTF-8 locale, or a failed test.
+    ///
+    /// Failing is deliberate and is the point of the whole rework. A missing
+    /// UTF-8 locale means the successful half of the conversion cannot be
+    /// exercised, and quietly proceeding without it is the behaviour that let
+    /// the gap exist. If this ever fires, generate one of the named locales on
+    /// the runner; do not weaken the assertion.
+    fn utf8() -> ThreadLocale {
+        for name in Self::UTF8_NAMES {
+            if let Some(locale) = Self::try_named(name) {
+                assert!(
+                    locale.is_utf8(),
+                    "the locale {} was built but reports codeset {}",
+                    shown(locale.name()),
+                    shown(locale.codeset())
+                );
+                return locale;
+            }
+        }
+        panic!(
+            "no UTF-8 locale could be built; tried {}. The libidn2 path is \
+             locale-sensitive, so without one the successful conversion cannot \
+             be exercised at all",
+            Self::UTF8_NAMES
+                .iter()
+                .map(|name| shown(name))
+                .collect::<Vec<String>>()
+                .join(", ")
+        );
+    }
+
+    /// The `C` locale, whose codeset is not UTF-8.
+    ///
+    /// POSIX requires it of every conforming platform, so unlike
+    /// [`ThreadLocale::utf8`] there is no candidate list: a failure here would
+    /// mean the platform is not one this file can run on, and saying so is more
+    /// useful than skipping.
+    fn posix() -> ThreadLocale {
+        let locale = Self::try_named(b"C\0")
+            .unwrap_or_else(|| panic!("POSIX requires a \"C\" locale and this platform has none"));
+        assert!(
+            !locale.is_utf8(),
+            "the \"C\" locale reports codeset {}, which is UTF-8; the non-UTF-8 \
+             half of this file cannot be exercised on such a platform",
+            shown(locale.codeset())
+        );
+        locale
+    }
+
+    /// The name this guard was built from, for an assertion message.
+    fn name(&self) -> &[u8] {
+        // Without the terminator, which belongs to C and not to a message.
+        self.name.split_last().map_or(b"", |(_nul, rest)| rest)
+    }
+
     fn codeset(&self) -> &[u8] {
         &self.codeset
     }
@@ -1622,10 +2230,8 @@ impl ThreadLocale {
     /// name is spelled `UTF-8` by glibc and `utf8` or `UTF8` elsewhere and none
     /// of those is a different encoding.
     ///
-    /// Only the `idn-libidn2` backend needs the answer: it is the one whose
-    /// result depends on the codeset, which is precisely the divergence
-    /// `rust-urlapi/docs/KNOWN-DIVERGENCES.md` L591-L633 records.
-    #[cfg(feature = "idn-libidn2")]
+    /// This is a sanity check on the guard rather than a branch in a test: the
+    /// two constructors above assert it, so no test below has to ask.
     fn is_utf8(&self) -> bool {
         let letters: Vec<u8> = self
             .codeset
@@ -1640,9 +2246,6 @@ impl ThreadLocale {
 #[cfg(all(unix, any(feature = "idn-libidn2", feature = "idn-pure")))]
 impl Drop for ThreadLocale {
     fn drop(&mut self) {
-        if self.installed.is_null() {
-            return;
-        }
         // SAFETY: `previous` is what `uselocale` returned for this thread, so it
         // is either a live locale object or the sentinel standing for the global
         // locale, and passing either back is how the interface is restored. The
@@ -1656,103 +2259,132 @@ impl Drop for ThreadLocale {
     }
 }
 
-/// The same guard for platforms without the POSIX per-thread locale interface.
-///
-/// The codeset reads as empty, meaning "unknown", which
-/// [`punycode_conversion_follows_the_locale_codeset`] treats as the non-UTF-8
-/// case. That is the conservative reading, because a locale that was never
-/// adopted behaves exactly that way.
-#[cfg(all(not(unix), any(feature = "idn-libidn2", feature = "idn-pure")))]
-struct ThreadLocale;
-
-#[cfg(all(not(unix), any(feature = "idn-libidn2", feature = "idn-pure")))]
-impl ThreadLocale {
-    fn adopt_environment() -> ThreadLocale {
-        ThreadLocale
-    }
-
-    fn codeset(&self) -> &[u8] {
-        b""
-    }
-
-    #[cfg(feature = "idn-libidn2")]
-    fn is_utf8(&self) -> bool {
-        false
-    }
-}
-
-/// `CURLU_PUNYCODE` converts only when the locale codeset is UTF-8.
+/// On the `idn2_lookup_ul` branch, `CURLU_PUNYCODE` converts under a UTF-8
+/// codeset and fails under any other, and BOTH are asserted in the same run.
 ///
 /// This is the locale trap `AAP` 0.6.3 documents, and
-/// `rust-urlapi/docs/KNOWN-DIVERGENCES.md` L591-L633 records the same
-/// measurement against libidn2 2.3.8: under a UTF-8 codeset the three names
-/// convert, and under any other codeset `idn2_lookup_ul` reports that it could
-/// not convert the string, which `lib/urlapi.c` L1338-L1355 maps to
-/// `CURLUE_BAD_HOSTNAME`.
+/// `rust-urlapi/docs/KNOWN-DIVERGENCES.md` records the same measurement against
+/// libidn2 2.3.8: under a UTF-8 codeset the three names convert, and under any
+/// other codeset `idn2_lookup_ul` reports that it could not convert the string,
+/// which `lib/urlapi.c` L1338-L1355 maps to `CURLUE_BAD_HOSTNAME`.
 ///
-/// Both outcomes are asserted exactly rather than either being tolerated: the
-/// codeset is established first, and it decides which of the two answers is the
-/// correct one. So this test never fails merely because the runner's locale is
-/// `C`, and it never passes vacuously either.
-#[cfg(feature = "idn-libidn2")]
+/// # Why the locale is named rather than adopted
+///
+/// Because the two outcomes are the whole content of the test and only one of
+/// them runs per locale. Reading the codeset from the environment and branching
+/// on it -- which is what this test used to do -- means that on a runner with no
+/// locale set, which is the default, only the failure branch executes: the
+/// successful conversion could have been deleted from the crate and this file
+/// would still have passed. And on a runner with `LC_ALL=C.UTF-8` the reverse
+/// hole opens, and the reference's non-UTF-8 failure mode goes unexercised.
+/// `AAP` 0.9.2 A8 asks that these assertions actually execute and A9 that
+/// behaviour be established under both locale configurations, so both locales
+/// are constructed here and neither is optional. [`ThreadLocale`] fails the test
+/// if either cannot be built.
+///
+/// # The two scopes
+///
+/// One guard at a time, each in its own block, so that the first is restored and
+/// released before the second is installed and no assertion can run while two
+/// are stacked.
+///
+/// # The claim is scoped to one of the two branches, deliberately
+///
+/// `lib/idn.c` L36-L41 chooses between two entry points, and only one of them
+/// reads the locale. Under `_WIN32` with `UNICODE` the macro expands to
+/// `idn2_lookup_u8`, which takes UTF-8 bytes directly and consults no locale at
+/// all, so on that branch conversion neither depends on the codeset nor fails
+/// because of it. `src/ffi.rs` mirrors the same choice under
+/// `cfg(win32_unicode)`.
+///
+/// The `unix` gate below is what confines this test to the locale-aware branch:
+/// the `_WIN32` arm is unreachable there, and reading a codeset at all needs
+/// `newlocale`/`uselocale`, which is the same platform condition. The
+/// `idn2_lookup_u8` branch is documented here rather than asserted, since
+/// `AAP` 0.8.5 ports Windows paths without validating them on this platform.
+#[cfg(all(unix, feature = "idn-libidn2"))]
 #[test]
 fn punycode_conversion_follows_the_locale_codeset() {
-    let locale = ThreadLocale::adopt_environment();
-    let codeset = locale.codeset().to_vec();
-    let utf8 = locale.is_utf8();
-
-    for (name, ace) in [
-        (SWEDISH, SWEDISH_ACE),
-        (SHARP_S, SHARP_S_ACE),
-        (CJK, CJK_ACE),
-    ] {
-        let mut input = b"https://".to_vec();
-        input.extend_from_slice(name);
-        let url = Url::parsed(&input, NONE);
-        if utf8 {
+    {
+        let locale = ThreadLocale::utf8();
+        let where_ = format!(
+            "locale {} (codeset {})",
+            shown(locale.name()),
+            shown(locale.codeset())
+        );
+        for (name, ace) in [
+            (SWEDISH, SWEDISH_ACE),
+            (SHARP_S, SHARP_S_ACE),
+            (CJK, CJK_ACE),
+        ] {
+            let mut input = b"https://".to_vec();
+            input.extend_from_slice(name);
+            let url = Url::parsed(&input, NONE);
             same(
-                &format!("\"{}\" under codeset {}", shown(name), shown(&codeset)),
+                &format!("\"{}\" converts under {where_}", shown(name)),
                 &url.text(HOST, abi::CURLU_PUNYCODE),
                 ace,
             );
-        } else {
-            assert_eq!(
-                url.failing(HOST, abi::CURLU_PUNYCODE),
-                abi::CURLUE_BAD_HOSTNAME,
-                "\"{}\" cannot convert under codeset {}",
-                shown(name),
-                shown(&codeset)
-            );
         }
-    }
 
-    // `tests/libtest/lib1560.c` L629-L631, the whole-URL form of the first name,
-    // which is the assertion curl's own suite makes. The conversion happens at
-    // `lib/urlapi.c` L1495-L1500 rather than in `urlget_format`, so it is a
-    // second code path over the same libidn2 call.
-    let mut input = b"https://".to_vec();
-    input.extend_from_slice(SWEDISH);
-    input.extend_from_slice(b"/path?q#frag");
-    let url = Url::parsed(&input, NONE);
-    if utf8 {
+        // `tests/libtest/lib1560.c` L629-L631, the whole-URL form of the first
+        // name, which is the assertion curl's own suite makes. The conversion
+        // happens at `lib/urlapi.c` L1495-L1500 rather than in `urlget_format`,
+        // so it is a second code path over the same libidn2 call.
+        let mut input = b"https://".to_vec();
+        input.extend_from_slice(SWEDISH);
+        input.extend_from_slice(b"/path?q#frag");
+        let url = Url::parsed(&input, NONE);
         let mut want = b"https://".to_vec();
         want.extend_from_slice(SWEDISH_ACE);
         want.extend_from_slice(b"/path?q#frag");
         same(
-            "lib1560.c L630-L631, the whole URL",
+            &format!("lib1560.c L630-L631, the whole URL, under {where_}"),
             &url.text(URL, abi::CURLU_PUNYCODE),
             &want,
         );
-    } else {
+    }
+
+    {
+        let locale = ThreadLocale::posix();
+        let where_ = format!(
+            "locale {} (codeset {})",
+            shown(locale.name()),
+            shown(locale.codeset())
+        );
+        for name in [SWEDISH, SHARP_S, CJK] {
+            let mut input = b"https://".to_vec();
+            input.extend_from_slice(name);
+            let url = Url::parsed(&input, NONE);
+            assert_eq!(
+                url.failing(HOST, abi::CURLU_PUNYCODE),
+                abi::CURLUE_BAD_HOSTNAME,
+                "\"{}\" cannot convert under {where_}",
+                shown(name)
+            );
+            // The name itself is unaffected: only the conversion is refused, and
+            // the stored bytes are what arrived. So the failure is the
+            // conversion's and not the parse's.
+            same(
+                "and the stored host is untouched",
+                &url.text(HOST, NONE),
+                name,
+            );
+        }
+
+        let mut input = b"https://".to_vec();
+        input.extend_from_slice(SWEDISH);
+        input.extend_from_slice(b"/path?q#frag");
+        let url = Url::parsed(&input, NONE);
         assert_eq!(
             url.failing(URL, abi::CURLU_PUNYCODE),
             abi::CURLUE_BAD_HOSTNAME,
-            "the whole-URL path fails the same way"
+            "the whole-URL path fails the same way under {where_}"
         );
     }
 }
 
-/// `CURLU_PUNY2IDN` converts whatever the locale says.
+/// `CURLU_PUNY2IDN` converts whatever the locale is, because it reads none.
 ///
 /// The two directions are not symmetric and this is the half that surprises.
 /// `idn_decode` at `lib/idn.c` L247-L279 goes through the locale-aware
@@ -1761,49 +2393,65 @@ fn punycode_conversion_follows_the_locale_codeset() {
 /// compatibility-to-Unicode direction succeeds in the `C` locale, where the
 /// Unicode-to-compatibility direction cannot.
 ///
+/// That claim only means something if both locales are tried, so the body runs
+/// twice -- once under a UTF-8 locale and once under `C` -- and the expectation
+/// is the same both times. Read against
+/// [`punycode_conversion_follows_the_locale_codeset`], which runs the same two
+/// locales and gets two different answers, this pair is what establishes that
+/// the locale sensitivity belongs to one direction and not to the API.
+///
 /// The no-op halves are asserted alongside, because each conversion is guarded by
 /// `Curl_is_ASCII_name` -- `lib/idn.c` L223-L236 -- at `lib/urlapi.c` L1400 and
 /// L1411: `CURLU_PUNYCODE` on a host that is already ASCII does nothing, and
 /// `CURLU_PUNY2IDN` on a host that is not ASCII does nothing. Neither reports an
 /// error, and neither converts.
-#[cfg(feature = "idn-libidn2")]
+#[cfg(all(unix, feature = "idn-libidn2"))]
 #[test]
 fn puny2idn_conversion_ignores_the_locale() {
-    let locale = ThreadLocale::adopt_environment();
-    let codeset = locale.codeset().to_vec();
-
-    for (name, ace) in [
-        (SWEDISH, SWEDISH_ACE),
-        (SHARP_S, SHARP_S_ACE),
-        (CJK, CJK_ACE),
+    // Constructors rather than guards, because a guard installs its locale when
+    // it is built: an array of two would install both before the first
+    // iteration ran, leaving the second in force for the first pass. Calling
+    // inside the body keeps exactly one installed at a time, and `locale` drops
+    // at the end of each iteration.
+    for build in [
+        ThreadLocale::utf8 as fn() -> ThreadLocale,
+        ThreadLocale::posix,
     ] {
+        let locale = build();
+        let where_ = format!(
+            "locale {} (codeset {})",
+            shown(locale.name()),
+            shown(locale.codeset())
+        );
+        for (name, ace) in [
+            (SWEDISH, SWEDISH_ACE),
+            (SHARP_S, SHARP_S_ACE),
+            (CJK, CJK_ACE),
+        ] {
+            let mut input = b"https://".to_vec();
+            input.extend_from_slice(ace);
+            let url = Url::parsed(&input, NONE);
+            same(
+                &format!("\"{}\" back to Unicode under {where_}", shown(ace)),
+                &url.text(HOST, abi::CURLU_PUNY2IDN),
+                name,
+            );
+            same(
+                "and punycode on an ASCII host is a no-op",
+                &url.text(HOST, abi::CURLU_PUNYCODE),
+                ace,
+            );
+        }
+
         let mut input = b"https://".to_vec();
-        input.extend_from_slice(ace);
+        input.extend_from_slice(SWEDISH);
         let url = Url::parsed(&input, NONE);
         same(
-            &format!(
-                "\"{}\" back to Unicode under codeset {}",
-                shown(ace),
-                shown(&codeset)
-            ),
+            "puny2idn on a non-ASCII host is a no-op",
             &url.text(HOST, abi::CURLU_PUNY2IDN),
-            name,
-        );
-        same(
-            "and punycode on an ASCII host is a no-op",
-            &url.text(HOST, abi::CURLU_PUNYCODE),
-            ace,
+            SWEDISH,
         );
     }
-
-    let mut input = b"https://".to_vec();
-    input.extend_from_slice(SWEDISH);
-    let url = Url::parsed(&input, NONE);
-    same(
-        "puny2idn on a non-ASCII host is a no-op",
-        &url.text(HOST, abi::CURLU_PUNY2IDN),
-        SWEDISH,
-    );
 }
 
 /// The pure-Rust backend converts regardless of the locale.
@@ -1822,24 +2470,46 @@ fn puny2idn_conversion_ignores_the_locale() {
 /// ones the C produces under a UTF-8 codeset. The differences the document
 /// records -- the absent transitional retry and the independently versioned
 /// Unicode tables -- are not reachable through these three.
-#[cfg(feature = "idn-pure")]
+///
+/// # Which is why the locale is named twice
+///
+/// "Regardless of the locale" is the claim, so the body runs under a UTF-8
+/// locale and under `C` and expects the same answer from both. Under `C` that
+/// answer is the divergence itself: the libidn2 backend reports
+/// `CURLUE_BAD_HOSTNAME` for these very inputs -- see
+/// [`punycode_conversion_follows_the_locale_codeset`] -- and this backend
+/// converts them. Asserting it under one ambient locale, as this test used to,
+/// could not distinguish "locale-independent" from "the runner happened to be
+/// UTF-8".
+#[cfg(all(unix, feature = "idn-pure"))]
 #[test]
 fn punycode_conversion_with_the_pure_backend_ignores_the_locale() {
-    let locale = ThreadLocale::adopt_environment();
-    let codeset = locale.codeset().to_vec();
-    for (name, ace) in [
-        (SWEDISH, SWEDISH_ACE),
-        (SHARP_S, SHARP_S_ACE),
-        (CJK, CJK_ACE),
+    // See the note in `puny2idn_conversion_ignores_the_locale` for why these are
+    // constructors rather than an array of guards.
+    for build in [
+        ThreadLocale::utf8 as fn() -> ThreadLocale,
+        ThreadLocale::posix,
     ] {
-        let mut input = b"https://".to_vec();
-        input.extend_from_slice(name);
-        let url = Url::parsed(&input, NONE);
-        same(
-            &format!("\"{}\" under codeset {}", shown(name), shown(&codeset)),
-            &url.text(HOST, abi::CURLU_PUNYCODE),
-            ace,
+        let locale = build();
+        let where_ = format!(
+            "locale {} (codeset {})",
+            shown(locale.name()),
+            shown(locale.codeset())
         );
+        for (name, ace) in [
+            (SWEDISH, SWEDISH_ACE),
+            (SHARP_S, SHARP_S_ACE),
+            (CJK, CJK_ACE),
+        ] {
+            let mut input = b"https://".to_vec();
+            input.extend_from_slice(name);
+            let url = Url::parsed(&input, NONE);
+            same(
+                &format!("\"{}\" under {where_}", shown(name)),
+                &url.text(HOST, abi::CURLU_PUNYCODE),
+                ace,
+            );
+        }
     }
 }
 

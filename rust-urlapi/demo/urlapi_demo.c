@@ -118,22 +118,63 @@ void curl_free(void *p);
 
 /* Reports an allocation failure and asks for a non-zero exit.
 
-   This is the only thing in the program that writes to stderr, and the only
-   thing that gives up early. Both are deliberate. stdout carries the
-   transcript and is what gets diffed, so a diagnostic must not go there;
-   and an allocation failure is the one condition under which no comparable
-   transcript exists to carry on producing. curl_url() returns NULL only on
-   out of memory, per docs/libcurl/curl_url.md, and curl_url_dup() likewise,
-   so on any machine that can run this program at all stderr stays empty and
-   the status stays 0.
+   This is the only thing in the program that writes to stderr, and that is
+   deliberate: stdout carries the transcript and is what gets diffed, so a
+   diagnostic must never go there.
+
+   An allocation failure is also the only condition the program reports at
+   all. Every other CURLUcode is an expected line of the transcript -- the
+   inputs below are chosen to produce them -- whereas out of memory means the
+   transcript no longer describes what the URL API does. curl_url() and
+   curl_url_dup() return NULL only on out of memory, per
+   docs/libcurl/curl_url.md and docs/libcurl/curl_url_dup.md, and
+   curl_url_get() and curl_url_set() report it as CURLUE_OUT_OF_MEMORY; both
+   routes end here, the first at its call site and the second through
+   status_of(). So on any machine that can run this program at all, stderr
+   stays empty and the status stays 0.
+
+   Called once per failing call rather than once per run, so a run that hits
+   several says so several times. The status is what main() returns; the
+   count is not carried, because one is already enough to fail the run.
 
    fputs() rather than fprintf(): scripts/checksrc.pl bans fprintf and
    ./.checksrc waives only printf, so the message is a plain literal
    string. It needs no formatting anyway. */
 static int oom(void)
 {
-  fputs("urlapi_demo: out of memory; transcript is incomplete\n", stderr);
+  fputs("urlapi_demo: out of memory; transcript is not trustworthy\n",
+        stderr);
   return DEMO_ERR_OOM;
+}
+
+/* Maps one CURLUcode to this program's exit status.
+
+   CURLUE_OUT_OF_MEMORY is the only code that means the transcript itself is
+   unreliable; every other code -- CURLUE_NO_SCHEME on a handle that has no
+   scheme, CURLUE_MALFORMED_INPUT on an input designed to be malformed, and
+   the rest -- is an expected line of the transcript and part of what the
+   byte-for-byte diff checks. Distinguishing them here rather than at each
+   call site is what keeps the transcript's meaning in one place.
+
+   Out of memory reaches this program two ways and both are covered. A NULL
+   from curl_url() or curl_url_dup() is handled by oom() at the call site,
+   because there is no handle to carry on with. A CURLUE_OUT_OF_MEMORY from
+   curl_url_get() (lib/urlapi.c:L1533, L1611, L1630) or curl_url_set()
+   (L1707, L1855, L1898, L1946, L1994) leaves the handle usable, so the code
+   is printed like any other -- which keeps the transcript comparable for as
+   long as it can be -- and this mapping then carries the status out through
+   the section that produced it. Without that, a get or set that ran out of
+   memory would print its code into the transcript and the process would
+   still exit 0, which is exactly the false success the demo exists to make
+   impossible.
+
+   The diagnostic goes to stderr, once per failing call, and never to
+   stdout. */
+static int status_of(CURLUcode uc)
+{
+  if(uc != CURLUE_OUT_OF_MEMORY)
+    return 0;
+  return oom();
 }
 
 /* Retrieves one part and prints it.
@@ -162,9 +203,15 @@ static int oom(void)
    allocators through the alternative-allocator entry point at
    lib/easy.c:L237 (AAP 0.2.4.4).
 
-   The handle is const because curl_url_get() takes const CURLU *. */
-static void showpart(const CURLU *u, CURLUPart part, const char *label,
-                     unsigned int flags)
+   The handle is const because curl_url_get() takes const CURLU *.
+
+   Returns DEMO_ERR_OOM if the retrieval ran out of memory and 0 otherwise,
+   so that every caller can carry the status out to main(). See status_of()
+   for why that one code is singled out. The buffer, if there was one, is
+   released before the status is computed, so no path here can return early
+   and leave it behind. */
+static int showpart(const CURLU *u, CURLUPart part, const char *label,
+                    unsigned int flags)
 {
   char *value = NULL;
   CURLUcode uc = curl_url_get(u, part, &value, flags);
@@ -177,6 +224,8 @@ static void showpart(const CURLU *u, CURLUPart part, const char *label,
     /* curl_url_strerror() returns a pointer to a static string, per
        docs/libcurl/curl_url_strerror.md, so it is never freed. */
     printf("%s: rc=%d (%s)\n", label, (int)uc, curl_url_strerror(uc));
+
+  return status_of(uc);
 }
 
 /* Assigns one part and prints the outcome, success included, so that a
@@ -184,12 +233,19 @@ static void showpart(const CURLU *u, CURLUPart part, const char *label,
    curl_url_strerror() is exercised on its success path too.
 
    Nothing is allocated here for this caller to own: curl_url_set() copies
-   the value it is given, per include/curl/urlapi.h:L138-L139. */
-static void setpart(CURLU *u, CURLUPart part, const char *value,
-                    const char *label, unsigned int flags)
+   the value it is given, per include/curl/urlapi.h:L138-L139.
+
+   Returns DEMO_ERR_OOM if the assignment ran out of memory and 0 otherwise,
+   for the reason status_of() gives. An assignment that fails any other way
+   leaves the handle unchanged -- lib/urlapi.c:L1197-L1209 parses into a
+   zeroed temporary and swaps only on success -- so carrying on with it is
+   sound and is what section 11 relies on. */
+static int setpart(CURLU *u, CURLUPart part, const char *value,
+                   const char *label, unsigned int flags)
 {
   CURLUcode uc = curl_url_set(u, part, value, flags);
   printf("%s: rc=%d (%s)\n", label, (int)uc, curl_url_strerror(uc));
+  return status_of(uc);
 }
 
 static void section(const char *heading)
@@ -208,20 +264,28 @@ static void note(const char *text)
    include/curl/urlapi.h:L70-L82 declares them, under one set of flags.
    Parts a given handle does not carry report their own code rather than
    being skipped, which is the point: those codes are as much a part of the
-   contract as the values. */
-static void showallparts(const CURLU *u, unsigned int flags)
+   contract as the values.
+
+   The eleven statuses are accumulated with |= rather than short-circuited,
+   so that all eleven lines reach the transcript whatever any one of them
+   reported. That is the same choice main() makes, for the same reason: a
+   truncated transcript is harder to diff than a complete one. */
+static int showallparts(const CURLU *u, unsigned int flags)
 {
-  showpart(u, CURLUPART_URL, "url", flags);
-  showpart(u, CURLUPART_SCHEME, "scheme", flags);
-  showpart(u, CURLUPART_USER, "user", flags);
-  showpart(u, CURLUPART_PASSWORD, "password", flags);
-  showpart(u, CURLUPART_OPTIONS, "options", flags);
-  showpart(u, CURLUPART_HOST, "host", flags);
-  showpart(u, CURLUPART_PORT, "port", flags);
-  showpart(u, CURLUPART_PATH, "path", flags);
-  showpart(u, CURLUPART_QUERY, "query", flags);
-  showpart(u, CURLUPART_FRAGMENT, "fragment", flags);
-  showpart(u, CURLUPART_ZONEID, "zoneid", flags);
+  int rc = 0;
+
+  rc |= showpart(u, CURLUPART_URL, "url", flags);
+  rc |= showpart(u, CURLUPART_SCHEME, "scheme", flags);
+  rc |= showpart(u, CURLUPART_USER, "user", flags);
+  rc |= showpart(u, CURLUPART_PASSWORD, "password", flags);
+  rc |= showpart(u, CURLUPART_OPTIONS, "options", flags);
+  rc |= showpart(u, CURLUPART_HOST, "host", flags);
+  rc |= showpart(u, CURLUPART_PORT, "port", flags);
+  rc |= showpart(u, CURLUPART_PATH, "path", flags);
+  rc |= showpart(u, CURLUPART_QUERY, "query", flags);
+  rc |= showpart(u, CURLUPART_FRAGMENT, "fragment", flags);
+  rc |= showpart(u, CURLUPART_ZONEID, "zoneid", flags);
+  return rc;
 }
 
 /* Parses base, applies rel to it as a relative URL and prints the result.
@@ -233,6 +297,7 @@ static int redirect_case(const char *base, const char *rel,
 {
   CURLU *u = curl_url();
   CURLUcode uc;
+  int rc;
 
   if(!u)
     return oom();
@@ -241,16 +306,20 @@ static int redirect_case(const char *base, const char *rel,
   if(!uc)
     uc = curl_url_set(u, CURLUPART_URL, rel, 0);
 
-  if(uc)
+  if(uc) {
     printf("%s: rc=%d (%s)\n", label, (int)uc, curl_url_strerror(uc));
+    rc = status_of(uc);
+  }
   else
-    showpart(u, CURLUPART_URL, label, 0);
+    rc = showpart(u, CURLUPART_URL, label, 0);
 
-  /* The handle is this function's to release. The string showpart()
+  /* The handle is this function's to release, on the failing path as much as
+     on the succeeding one, so the cleanup happens before the status is
+     returned rather than after an early exit. The string showpart()
      retrieved was released by showpart() itself; curl_url_cleanup() would
      not have released it, per include/curl/urlapi.h:L116-L118. */
   curl_url_cleanup(u);
-  return 0;
+  return rc;
 }
 
 /* 1. A whole URL parsed with every part read back, and the one part an
@@ -259,16 +328,17 @@ static int s01_parse_and_all_parts(void)
 {
   CURLU *u;
   CURLU *m;
+  int rc = 0;
 
   section("1. full parse and all eleven parts");
 
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL,
-          "https://user:secret@example.com:8080/a/b/../c?x=1&y=2#frag",
-          "set url", 0);
-  showallparts(u, 0);
+  rc |= setpart(u, CURLUPART_URL,
+                "https://user:secret@example.com:8080/a/b/../c?x=1&y=2#frag",
+                "set url", 0);
+  rc |= showallparts(u, 0);
   curl_url_cleanup(u);
 
   /* The options part is suppressed on the whole-URL path unless the scheme
@@ -279,13 +349,13 @@ static int s01_parse_and_all_parts(void)
   m = curl_url();
   if(!m)
     return oom();
-  setpart(m, CURLUPART_URL, "imap://user;auth=NTLM@example.com/INBOX",
-          "set imap url", 0);
-  showpart(m, CURLUPART_USER, "imap user", 0);
-  showpart(m, CURLUPART_OPTIONS, "imap options", 0);
-  showpart(m, CURLUPART_URL, "imap url", 0);
+  rc |= setpart(m, CURLUPART_URL, "imap://user;auth=NTLM@example.com/INBOX",
+                "set imap url", 0);
+  rc |= showpart(m, CURLUPART_USER, "imap user", 0);
+  rc |= showpart(m, CURLUPART_OPTIONS, "imap options", 0);
+  rc |= showpart(m, CURLUPART_URL, "imap url", 0);
   curl_url_cleanup(m);
-  return 0;
+  return rc;
 }
 
 /* 2. The path that is never absent, and all four relative branches. */
@@ -299,12 +369,12 @@ static int s02_path_and_relative(void)
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://example.com", "set url", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com", "set url", 0);
   /* lib/urlapi.c:L1605-L1607 substitutes "/" when the field is null, which
      docs/libcurl/curl_url_get.md:L196-L197 documents, so the path part
      never reports missing. */
-  showpart(u, CURLUPART_PATH, "path of a URL with none", 0);
-  showpart(u, CURLUPART_URL, "url", 0);
+  rc |= showpart(u, CURLUPART_PATH, "path of a URL with none", 0);
+  rc |= showpart(u, CURLUPART_URL, "url", 0);
   curl_url_cleanup(u);
 
   rc |= redirect_case("http://example.com/path/index.html",
@@ -326,50 +396,52 @@ static int s02_path_and_relative(void)
 static int s03_default_port(void)
 {
   CURLU *u;
+  int rc = 0;
 
   section("3. default port and no default port");
 
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://example.com/", "set url", 0);
-  showpart(u, CURLUPART_PORT, "port", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com/", "set url", 0);
+  rc |= showpart(u, CURLUPART_PORT, "port", 0);
   /* lib/urlapi.c:L1586-L1594 injects the scheme's default when there is no
      stored port, and L1461-L1468 does the same on the whole-URL path. */
-  showpart(u, CURLUPART_PORT, "port default_port", CURLU_DEFAULT_PORT);
-  showpart(u, CURLUPART_URL, "url default_port", CURLU_DEFAULT_PORT);
+  rc |= showpart(u, CURLUPART_PORT, "port default_port", CURLU_DEFAULT_PORT);
+  rc |= showpart(u, CURLUPART_URL, "url default_port", CURLU_DEFAULT_PORT);
   curl_url_cleanup(u);
 
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://example.com:443/", "set url", 0);
-  showpart(u, CURLUPART_PORT, "port", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com:443/", "set url", 0);
+  rc |= showpart(u, CURLUPART_PORT, "port", 0);
   /* lib/urlapi.c:L1595-L1602 and L1469-L1474 drop a stored port that
      equals the scheme's default. */
-  showpart(u, CURLUPART_PORT, "port no_default_port",
-           CURLU_NO_DEFAULT_PORT);
-  showpart(u, CURLUPART_URL, "url no_default_port",
-           CURLU_NO_DEFAULT_PORT);
+  rc |= showpart(u, CURLUPART_PORT, "port no_default_port",
+                 CURLU_NO_DEFAULT_PORT);
+  rc |= showpart(u, CURLUPART_URL, "url no_default_port",
+                 CURLU_NO_DEFAULT_PORT);
   curl_url_cleanup(u);
 
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "http://example.com/", "set http url", 0);
-  showpart(u, CURLUPART_PORT, "http port default_port",
-           CURLU_DEFAULT_PORT);
-  setpart(u, CURLUPART_URL, "http://example.com:80/", "set http url", 0);
-  showpart(u, CURLUPART_PORT, "http port no_default_port",
-           CURLU_NO_DEFAULT_PORT);
-  showpart(u, CURLUPART_URL, "http url no_default_port",
-           CURLU_NO_DEFAULT_PORT);
+  rc |= setpart(u, CURLUPART_URL, "http://example.com/", "set http url", 0);
+  rc |= showpart(u, CURLUPART_PORT, "http port default_port",
+                 CURLU_DEFAULT_PORT);
+  rc |= setpart(u, CURLUPART_URL, "http://example.com:80/", "set http url", 0);
+  rc |= showpart(u, CURLUPART_PORT, "http port no_default_port",
+                 CURLU_NO_DEFAULT_PORT);
+  rc |= showpart(u, CURLUPART_URL, "http url no_default_port",
+                 CURLU_NO_DEFAULT_PORT);
   /* A non-default port survives both flags. */
-  setpart(u, CURLUPART_URL, "http://example.com:8080/", "set http url", 0);
-  showpart(u, CURLUPART_PORT, "http port 8080 no_default_port",
-           CURLU_NO_DEFAULT_PORT);
+  rc |= setpart(u, CURLUPART_URL, "http://example.com:8080/",
+                "set http url", 0);
+  rc |= showpart(u, CURLUPART_PORT, "http port 8080 no_default_port",
+                 CURLU_NO_DEFAULT_PORT);
   curl_url_cleanup(u);
-  return 0;
+  return rc;
 }
 
 /* 4. Encoding on assignment and decoding on retrieval.
@@ -382,41 +454,42 @@ static int s03_default_port(void)
 static int s04_encode_decode(void)
 {
   CURLU *u;
+  int rc = 0;
 
   section("4. encode on set, decode on get");
 
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://example.com/", "set url", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com/", "set url", 0);
 
   /* Query mode turns a space into a plus before anything else, and
      percent-encodes everything outside the unreserved set, so both the
      ampersand and the equals sign are encoded here. */
-  setpart(u, CURLUPART_QUERY, "name=hello world&x=1",
-          "set query urlencode", CURLU_URLENCODE);
-  showpart(u, CURLUPART_QUERY, "query raw", 0);
+  rc |= setpart(u, CURLUPART_QUERY, "name=hello world&x=1",
+                "set query urlencode", CURLU_URLENCODE);
+  rc |= showpart(u, CURLUPART_QUERY, "query raw", 0);
   /* Retrieval undoes both, and the plus-to-space half applies to the query
      part alone, lib/urlapi.c:L1612. */
-  showpart(u, CURLUPART_QUERY, "query urldecode", CURLU_URLDECODE);
+  rc |= showpart(u, CURLUPART_QUERY, "query urldecode", CURLU_URLDECODE);
 
-  /* Path mode additionally leaves seventeen characters alone,
-     lib/urlapi.c:L1779-L1803, so the plus survives while the space and the
-     percent do not. */
-  setpart(u, CURLUPART_PATH, "/a b+c%20d?e", "set path urlencode",
-          CURLU_URLENCODE);
-  showpart(u, CURLUPART_PATH, "path raw", 0);
-  showpart(u, CURLUPART_PATH, "path urldecode", CURLU_URLDECODE);
+  /* Path mode additionally leaves eighteen characters alone -- the cases
+     allowed_in_path() lists at lib/urlapi.c:L1779-L1803 -- so the plus
+     survives while the space and the percent do not. */
+  rc |= setpart(u, CURLUPART_PATH, "/a b+c%20d?e", "set path urlencode",
+                CURLU_URLENCODE);
+  rc |= showpart(u, CURLUPART_PATH, "path raw", 0);
+  rc |= showpart(u, CURLUPART_PATH, "path urldecode", CURLU_URLDECODE);
 
-  setpart(u, CURLUPART_QUERY, "na\xc3\xaf" "ve=1",
-          "set query non-ascii urlencode", CURLU_URLENCODE);
-  showpart(u, CURLUPART_QUERY, "query non-ascii raw", 0);
+  rc |= setpart(u, CURLUPART_QUERY, "na\xc3\xaf" "ve=1",
+                "set query non-ascii urlencode", CURLU_URLENCODE);
+  rc |= showpart(u, CURLUPART_QUERY, "query non-ascii raw", 0);
 
   /* The whole-URL path escapes the host when asked to encode,
      lib/urlapi.c:L1492-L1496 -- the opposite of the part encoder, which
      exempts the host deliberately at L127 so that IDN resolution can still
      work. Both are the source behaviour. */
-  showpart(u, CURLUPART_URL, "url urlencode", CURLU_URLENCODE);
+  rc |= showpart(u, CURLUPART_URL, "url urlencode", CURLU_URLENCODE);
   curl_url_cleanup(u);
 
   /* Without CURLU_URLENCODE an escape already present is not re-encoded but
@@ -424,38 +497,39 @@ static int s04_encode_decode(void)
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://example.com/", "set url", 0);
-  setpart(u, CURLUPART_PATH, "/%C3%AF/%2F", "set path plain", 0);
-  showpart(u, CURLUPART_PATH, "path escapes lowercased", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com/", "set url", 0);
+  rc |= setpart(u, CURLUPART_PATH, "/%C3%AF/%2F", "set path plain", 0);
+  rc |= showpart(u, CURLUPART_PATH, "path escapes lowercased", 0);
   /* Decoding is demonstrated on escapes that decode to ASCII. Decoding the
      two bytes of %C3%AF above would put them in the transcript, and the
      transcript has to stay ASCII whatever the vector was. */
-  setpart(u, CURLUPART_PATH, "/%2Fa%20b", "set path ascii escapes", 0);
-  showpart(u, CURLUPART_PATH, "path raw", 0);
-  showpart(u, CURLUPART_PATH, "path urldecode", CURLU_URLDECODE);
+  rc |= setpart(u, CURLUPART_PATH, "/%2Fa%20b", "set path ascii escapes", 0);
+  rc |= showpart(u, CURLUPART_PATH, "path raw", 0);
+  rc |= showpart(u, CURLUPART_PATH, "path urldecode", CURLU_URLDECODE);
   curl_url_cleanup(u);
-  return 0;
+  return rc;
 }
 
 /* 5. Appending to the query, and the separator rule. */
 static int s05_append_query(void)
 {
   CURLU *u;
+  int rc = 0;
 
   section("5. append query");
 
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://example.com/?a=1", "set url", 0);
-  setpart(u, CURLUPART_QUERY, "b=2", "append b", CURLU_APPENDQUERY);
-  showpart(u, CURLUPART_QUERY, "query", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com/?a=1", "set url", 0);
+  rc |= setpart(u, CURLUPART_QUERY, "b=2", "append b", CURLU_APPENDQUERY);
+  rc |= showpart(u, CURLUPART_QUERY, "query", 0);
   /* With encoding as well, the first equals sign is left alone so the
      appended pair stays a pair, while the space still becomes a plus. */
-  setpart(u, CURLUPART_QUERY, "c=hello world", "append c encoded",
-          CURLU_APPENDQUERY | CURLU_URLENCODE);
-  showpart(u, CURLUPART_QUERY, "query", 0);
-  showpart(u, CURLUPART_URL, "url", 0);
+  rc |= setpart(u, CURLUPART_QUERY, "c=hello world", "append c encoded",
+                CURLU_APPENDQUERY | CURLU_URLENCODE);
+  rc |= showpart(u, CURLUPART_QUERY, "query", 0);
+  rc |= showpart(u, CURLUPART_URL, "url", 0);
   curl_url_cleanup(u);
 
   /* An existing query already ending in the separator does not gain a
@@ -463,10 +537,10 @@ static int s05_append_query(void)
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://example.com/?a=1&", "set url", 0);
-  showpart(u, CURLUPART_QUERY, "query before", 0);
-  setpart(u, CURLUPART_QUERY, "b=2", "append b", CURLU_APPENDQUERY);
-  showpart(u, CURLUPART_QUERY, "query after", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com/?a=1&", "set url", 0);
+  rc |= showpart(u, CURLUPART_QUERY, "query before", 0);
+  rc |= setpart(u, CURLUPART_QUERY, "b=2", "append b", CURLU_APPENDQUERY);
+  rc |= showpart(u, CURLUPART_QUERY, "query after", 0);
   curl_url_cleanup(u);
 
   /* The whole append block is guarded by a non-zero existing length, so
@@ -474,39 +548,40 @@ static int s05_append_query(void)
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://example.com/?", "set url", 0);
-  showpart(u, CURLUPART_QUERY, "query before get_empty",
-           CURLU_GET_EMPTY);
-  setpart(u, CURLUPART_QUERY, "b=2", "append b", CURLU_APPENDQUERY);
-  showpart(u, CURLUPART_QUERY, "query after", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com/?", "set url", 0);
+  rc |= showpart(u, CURLUPART_QUERY, "query before get_empty",
+                 CURLU_GET_EMPTY);
+  rc |= setpart(u, CURLUPART_QUERY, "b=2", "append b", CURLU_APPENDQUERY);
+  rc |= showpart(u, CURLUPART_QUERY, "query after", 0);
   curl_url_cleanup(u);
-  return 0;
+  return rc;
 }
 
 /* 6. Blank queries and fragments, which are absent until asked for. */
 static int s06_get_empty(void)
 {
   CURLU *u;
+  int rc = 0;
 
   section("6. get empty");
 
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://example.com/?#", "set url", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com/?#", "set url", 0);
   /* lib/urlapi.c:L1613-L1615 suppresses a blank query and L1620-L1622
      reports a blank fragment only under the flag. */
-  showpart(u, CURLUPART_QUERY, "query", 0);
-  showpart(u, CURLUPART_FRAGMENT, "fragment", 0);
-  showpart(u, CURLUPART_QUERY, "query get_empty", CURLU_GET_EMPTY);
-  showpart(u, CURLUPART_FRAGMENT, "fragment get_empty", CURLU_GET_EMPTY);
+  rc |= showpart(u, CURLUPART_QUERY, "query", 0);
+  rc |= showpart(u, CURLUPART_FRAGMENT, "fragment", 0);
+  rc |= showpart(u, CURLUPART_QUERY, "query get_empty", CURLU_GET_EMPTY);
+  rc |= showpart(u, CURLUPART_FRAGMENT, "fragment get_empty", CURLU_GET_EMPTY);
   /* The whole-URL path is asymmetric between the two: L1432-L1433 tests
      the fragment's presence alone while L1434-L1435 also requires a
      non-empty first byte from the query. */
-  showpart(u, CURLUPART_URL, "url", 0);
-  showpart(u, CURLUPART_URL, "url get_empty", CURLU_GET_EMPTY);
+  rc |= showpart(u, CURLUPART_URL, "url", 0);
+  rc |= showpart(u, CURLUPART_URL, "url get_empty", CURLU_GET_EMPTY);
   curl_url_cleanup(u);
-  return 0;
+  return rc;
 }
 
 /* Parses one input into a handle of its own and prints the whole URL that
@@ -518,14 +593,15 @@ static int parse_case(const char *input, unsigned int flags,
                       const char *label)
 {
   CURLU *u = curl_url();
+  int rc;
 
   if(!u)
     return oom();
 
-  setpart(u, CURLUPART_URL, input, label, flags);
-  showpart(u, CURLUPART_URL, "url", 0);
+  rc = setpart(u, CURLUPART_URL, input, label, flags);
+  rc |= showpart(u, CURLUPART_URL, "url", 0);
   curl_url_cleanup(u);
-  return 0;
+  return rc;
 }
 
 /* 7. Guessing a missing scheme, and refusing the guess afterwards. */
@@ -542,18 +618,18 @@ static int s07_scheme_guessing(void)
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "example.com", "set guess_scheme",
-          CURLU_GUESS_SCHEME);
-  showpart(u, CURLUPART_SCHEME, "scheme", 0);
+  rc |= setpart(u, CURLUPART_URL, "example.com", "set guess_scheme",
+                CURLU_GUESS_SCHEME);
+  rc |= showpart(u, CURLUPART_SCHEME, "scheme", 0);
   /* The two arms of CURLU_NO_GUESS_SCHEME: an error for the scheme part,
      lib/urlapi.c:L1559-L1560, and a suppressed prefix for the whole URL,
      L1512-L1515. tests/libtest/lib1560.c asserts this very pair, at its
      L149-L152 and L583-L585. */
-  showpart(u, CURLUPART_SCHEME, "scheme no_guess_scheme",
-           CURLU_NO_GUESS_SCHEME);
-  showpart(u, CURLUPART_URL, "url", 0);
-  showpart(u, CURLUPART_URL, "url no_guess_scheme",
-           CURLU_NO_GUESS_SCHEME);
+  rc |= showpart(u, CURLUPART_SCHEME, "scheme no_guess_scheme",
+                 CURLU_NO_GUESS_SCHEME);
+  rc |= showpart(u, CURLUPART_URL, "url", 0);
+  rc |= showpart(u, CURLUPART_URL, "url no_guess_scheme",
+                 CURLU_NO_GUESS_SCHEME);
   curl_url_cleanup(u);
 
   /* Three rows of the hostname-prefix guess table,
@@ -585,14 +661,15 @@ static int s08_dup_and_fb1(void)
 {
   CURLU *u;
   CURLU *copy;
+  int rc = 0;
 
   section("8. duplication and FB1");
 
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "example.com", "set guess_scheme",
-          CURLU_GUESS_SCHEME);
+  rc |= setpart(u, CURLUPART_URL, "example.com", "set guess_scheme",
+                CURLU_GUESS_SCHEME);
 
   /* OWNERSHIP. curl_url_dup() returns a new handle this caller owns and
      must pass to curl_url_cleanup() in its own right, per
@@ -604,14 +681,14 @@ static int s08_dup_and_fb1(void)
     return oom();
   }
 
-  showpart(u, CURLUPART_SCHEME, "original scheme no_guess_scheme",
-           CURLU_NO_GUESS_SCHEME);
-  showpart(copy, CURLUPART_SCHEME, "copy scheme no_guess_scheme",
-           CURLU_NO_GUESS_SCHEME);
-  showpart(u, CURLUPART_URL, "original url no_guess_scheme",
-           CURLU_NO_GUESS_SCHEME);
-  showpart(copy, CURLUPART_URL, "copy url no_guess_scheme",
-           CURLU_NO_GUESS_SCHEME);
+  rc |= showpart(u, CURLUPART_SCHEME, "original scheme no_guess_scheme",
+                 CURLU_NO_GUESS_SCHEME);
+  rc |= showpart(copy, CURLUPART_SCHEME, "copy scheme no_guess_scheme",
+                 CURLU_NO_GUESS_SCHEME);
+  rc |= showpart(u, CURLUPART_URL, "original url no_guess_scheme",
+                 CURLU_NO_GUESS_SCHEME);
+  rc |= showpart(copy, CURLUPART_URL, "copy url no_guess_scheme",
+                 CURLU_NO_GUESS_SCHEME);
   note("the two lines above differ because curl_url_dup at "
        "lib/urlapi.c:L1310-L1332 copies the ten strings, portnum, "
        "fragment_present and query_present but not guessed_scheme");
@@ -625,24 +702,24 @@ static int s08_dup_and_fb1(void)
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://user@example.com:8080/p?q=1#f",
-          "set url", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://user@example.com:8080/p?q=1#f",
+                "set url", 0);
   copy = curl_url_dup(u);
   if(!copy) {
     curl_url_cleanup(u);
     return oom();
   }
-  showpart(u, CURLUPART_URL, "original url", 0);
-  showpart(copy, CURLUPART_URL, "copy url", 0);
-  showpart(copy, CURLUPART_USER, "copy user", 0);
-  showpart(copy, CURLUPART_PORT, "copy port", 0);
+  rc |= showpart(u, CURLUPART_URL, "original url", 0);
+  rc |= showpart(copy, CURLUPART_URL, "copy url", 0);
+  rc |= showpart(copy, CURLUPART_USER, "copy user", 0);
+  rc |= showpart(copy, CURLUPART_PORT, "copy port", 0);
   /* A copy is independent: changing it leaves the original alone. */
-  setpart(copy, CURLUPART_HOST, "other.example.com", "copy set host", 0);
-  showpart(copy, CURLUPART_URL, "copy url after set", 0);
-  showpart(u, CURLUPART_URL, "original url after copy set", 0);
+  rc |= setpart(copy, CURLUPART_HOST, "other.example.com", "copy set host", 0);
+  rc |= showpart(copy, CURLUPART_URL, "copy url after set", 0);
+  rc |= showpart(u, CURLUPART_URL, "original url after copy set", 0);
   curl_url_cleanup(copy);
   curl_url_cleanup(u);
-  return 0;
+  return rc;
 }
 
 /* 9. The punycode flag, on a host that is already in punycode form.
@@ -652,9 +729,9 @@ static int s08_dup_and_fb1(void)
       libidn2 through the macro at lib/idn.c:L35-L41, which off Windows
       expands to the locale-aware idn2_lookup_ul, so converting a non-ASCII
       host succeeds only while the process codeset is UTF-8 -- AAP 0.6.3
-      measures both outcomes. ../scripts/run-parity.sh runs this program
+      measures both outcomes. ../scripts/run-parity.sh is to run this program
       under LC_ALL=C.UTF-8 and again under LC_ALL=C, which acceptance
-      criterion A9 requires, and one committed transcript cannot match a
+      criterion A9 requires, and one committed transcript could not match a
       converted host in the first run and CURLUE_BAD_HOSTNAME in the
       second. IDN coverage therefore belongs to the other oracle, where
       tests/libtest/lib1560.c gates exactly those rows on
@@ -674,22 +751,23 @@ static int s08_dup_and_fb1(void)
 static int s09_punycode_flag(void)
 {
   CURLU *u;
+  int rc = 0;
 
   section("9. punycode flag on an ascii host");
 
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://xn--rksmrgs-5wao1o.se/path",
-          "set ace url", 0);
-  showpart(u, CURLUPART_HOST, "host", 0);
-  showpart(u, CURLUPART_HOST, "host punycode", CURLU_PUNYCODE);
-  showpart(u, CURLUPART_URL, "url punycode", CURLU_PUNYCODE);
+  rc |= setpart(u, CURLUPART_URL, "https://xn--rksmrgs-5wao1o.se/path",
+                "set ace url", 0);
+  rc |= showpart(u, CURLUPART_HOST, "host", 0);
+  rc |= showpart(u, CURLUPART_HOST, "host punycode", CURLU_PUNYCODE);
+  rc |= showpart(u, CURLUPART_URL, "url punycode", CURLU_PUNYCODE);
   note("CURLU_PUNY2IDN and non-ascii hosts are exercised by the lib1560 "
        "oracle instead, because their result depends on the process "
        "codeset");
   curl_url_cleanup(u);
-  return 0;
+  return rc;
 }
 
 /* 10. Addresses: bracketed IPv6, a zone identifier, and the numeric
@@ -697,6 +775,7 @@ static int s09_punycode_flag(void)
 static int s10_addresses(void)
 {
   CURLU *u;
+  int rc = 0;
 
   section("10. ipv6, zone id and ipv4 normalisation");
 
@@ -705,11 +784,12 @@ static int s10_addresses(void)
     return oom();
   /* The host comes back bracketed, per
      docs/libcurl/curl_url_get.md:L179. */
-  setpart(u, CURLUPART_URL, "https://[fe80::1]:8080/p", "set ipv6 url", 0);
-  showpart(u, CURLUPART_HOST, "host", 0);
-  showpart(u, CURLUPART_PORT, "port", 0);
-  showpart(u, CURLUPART_URL, "url", 0);
-  showpart(u, CURLUPART_ZONEID, "zoneid", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://[fe80::1]:8080/p",
+                "set ipv6 url", 0);
+  rc |= showpart(u, CURLUPART_HOST, "host", 0);
+  rc |= showpart(u, CURLUPART_PORT, "port", 0);
+  rc |= showpart(u, CURLUPART_URL, "url", 0);
+  rc |= showpart(u, CURLUPART_ZONEID, "zoneid", 0);
   curl_url_cleanup(u);
 
   u = curl_url();
@@ -718,27 +798,27 @@ static int s10_addresses(void)
   /* The delimiter is written percent-encoded in the input, and the
      whole-URL path re-emits it that way from the separate zone field,
      lib/urlapi.c:L1480-L1491. */
-  setpart(u, CURLUPART_URL, "https://[fe80::1%25eth0]/p", "set zoned url",
-          0);
-  showpart(u, CURLUPART_HOST, "host", 0);
-  showpart(u, CURLUPART_ZONEID, "zoneid", 0);
-  showpart(u, CURLUPART_URL, "url", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://[fe80::1%25eth0]/p",
+                "set zoned url", 0);
+  rc |= showpart(u, CURLUPART_HOST, "host", 0);
+  rc |= showpart(u, CURLUPART_ZONEID, "zoneid", 0);
+  rc |= showpart(u, CURLUPART_URL, "url", 0);
   curl_url_cleanup(u);
 
   u = curl_url();
   if(!u)
     return oom();
   /* The vector tests/libtest/lib1560.c:L155 asserts. */
-  setpart(u, CURLUPART_URL, "https://0.000/", "set ipv4 url", 0);
-  showpart(u, CURLUPART_HOST, "host", 0);
-  showpart(u, CURLUPART_URL, "url", 0);
-  setpart(u, CURLUPART_URL, "https://0x7f.1/", "set ipv4 hex url", 0);
-  showpart(u, CURLUPART_HOST, "host", 0);
-  setpart(u, CURLUPART_URL, "https://256.256.256.256/",
-          "set out-of-range ipv4", 0);
-  showpart(u, CURLUPART_HOST, "host", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://0.000/", "set ipv4 url", 0);
+  rc |= showpart(u, CURLUPART_HOST, "host", 0);
+  rc |= showpart(u, CURLUPART_URL, "url", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://0x7f.1/", "set ipv4 hex url", 0);
+  rc |= showpart(u, CURLUPART_HOST, "host", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://256.256.256.256/",
+                "set out-of-range ipv4", 0);
+  rc |= showpart(u, CURLUPART_HOST, "host", 0);
   curl_url_cleanup(u);
-  return 0;
+  return rc;
 }
 
 /* 11. The error surface: null preconditions, rejected input, clearing a
@@ -749,6 +829,7 @@ static int s11_errors_and_strerror(void)
   char *value = NULL;
   CURLUcode uc;
   int code;
+  int rc = 0;
 
   section("11. error paths and null preconditions");
 
@@ -766,7 +847,7 @@ static int s11_errors_and_strerror(void)
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://example.com/p?a=1#f", "set url", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com/p?a=1#f", "set url", 0);
 
   /* lib/urlapi.c:L1550-L1551: a null output pointer is rejected too, and
      nothing is allocated, so nothing is freed on this path. */
@@ -777,57 +858,57 @@ static int s11_errors_and_strerror(void)
   /* Clearing by assigning a null value, lib/urlapi.c:L1819-L1821 into the
      clear dispatch at L1732-L1777. The query's presence bit goes with it,
      L1765-L1767, so it is absent even under CURLU_GET_EMPTY. */
-  setpart(u, CURLUPART_QUERY, NULL, "clear query", 0);
-  showpart(u, CURLUPART_QUERY, "query after clear", CURLU_GET_EMPTY);
-  setpart(u, CURLUPART_FRAGMENT, NULL, "clear fragment", 0);
-  showpart(u, CURLUPART_FRAGMENT, "fragment after clear",
-           CURLU_GET_EMPTY);
-  showpart(u, CURLUPART_URL, "url after clears", 0);
+  rc |= setpart(u, CURLUPART_QUERY, NULL, "clear query", 0);
+  rc |= showpart(u, CURLUPART_QUERY, "query after clear", CURLU_GET_EMPTY);
+  rc |= setpart(u, CURLUPART_FRAGMENT, NULL, "clear fragment", 0);
+  rc |= showpart(u, CURLUPART_FRAGMENT, "fragment after clear",
+                 CURLU_GET_EMPTY);
+  rc |= showpart(u, CURLUPART_URL, "url after clears", 0);
   curl_url_cleanup(u);
 
   u = curl_url();
   if(!u)
     return oom();
   /* A port above 65535 is refused, lib/urlapi.c:L1673-L1675. */
-  setpart(u, CURLUPART_URL, "https://example.com:65536/", "set bad port",
-          0);
-  setpart(u, CURLUPART_PORT, "70000", "set bad port part", 0);
-  setpart(u, CURLUPART_PORT, "8o80", "set non-numeric port", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com:65536/", "set bad port",
+                0);
+  rc |= setpart(u, CURLUPART_PORT, "70000", "set bad port part", 0);
+  rc |= setpart(u, CURLUPART_PORT, "8o80", "set non-numeric port", 0);
   /* Leading zeros are stripped because the text is regenerated from the
      number, lib/urlapi.c:L1676. */
-  setpart(u, CURLUPART_URL, "https://example.com:00080/",
-          "set padded port", 0);
-  showpart(u, CURLUPART_PORT, "port", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com:00080/",
+                "set padded port", 0);
+  rc |= showpart(u, CURLUPART_PORT, "port", 0);
 
   /* An unknown scheme is refused unless the caller allows it,
      lib/urlapi.c:L1646-L1647. */
-  setpart(u, CURLUPART_URL, "custom://example.com/", "set unknown scheme",
-          0);
-  setpart(u, CURLUPART_URL, "custom://example.com/",
-          "set unknown scheme allowed", CURLU_NON_SUPPORT_SCHEME);
-  showpart(u, CURLUPART_URL, "url", 0);
+  rc |= setpart(u, CURLUPART_URL, "custom://example.com/",
+                "set unknown scheme", 0);
+  rc |= setpart(u, CURLUPART_URL, "custom://example.com/",
+                "set unknown scheme allowed", CURLU_NON_SUPPORT_SCHEME);
+  rc |= showpart(u, CURLUPART_URL, "url", 0);
   /* Bad scheme syntax is a different code again,
      lib/urlapi.c:L1641-L1643 and L1650-L1660. */
-  setpart(u, CURLUPART_SCHEME, "1nvalid", "set bad scheme syntax",
-          CURLU_NON_SUPPORT_SCHEME);
+  rc |= setpart(u, CURLUPART_SCHEME, "1nvalid", "set bad scheme syntax",
+                CURLU_NON_SUPPORT_SCHEME);
   curl_url_cleanup(u);
 
   u = curl_url();
   if(!u)
     return oom();
   /* Embedded credentials can be refused by the caller. */
-  setpart(u, CURLUPART_URL, "https://user:pass@example.com/",
-          "set url disallow_user", CURLU_DISALLOW_USER);
+  rc |= setpart(u, CURLUPART_URL, "https://user:pass@example.com/",
+                "set url disallow_user", CURLU_DISALLOW_USER);
   /* A space is refused unless allowed, and then stored as it stands --
      which is why the brackets around retrieved values matter. */
-  setpart(u, CURLUPART_URL, "https://example.com/a b", "set url with space",
-          0);
-  setpart(u, CURLUPART_URL, "https://example.com/a b ",
-          "set url with space allowed", CURLU_ALLOW_SPACE);
-  showpart(u, CURLUPART_PATH, "path with space", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com/a b",
+                "set url with space", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com/a b ",
+                "set url with space allowed", CURLU_ALLOW_SPACE);
+  rc |= showpart(u, CURLUPART_PATH, "path with space", 0);
   /* An empty host, and a hostname with a character no host may carry. */
-  setpart(u, CURLUPART_HOST, "", "set empty host", 0);
-  setpart(u, CURLUPART_HOST, "exam ple.net", "set bad hostname", 0);
+  rc |= setpart(u, CURLUPART_HOST, "", "set empty host", 0);
+  rc |= setpart(u, CURLUPART_HOST, "exam ple.net", "set bad hostname", 0);
   curl_url_cleanup(u);
 
   /* Documented as taking no action, docs/libcurl/curl_url_cleanup.md, so
@@ -860,7 +941,7 @@ static int s11_errors_and_strerror(void)
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://example.com/", "set url", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com/", "set url", 0);
   uc = curl_url_get(u, (CURLUPart)(CURLUPART_ZONEID + 1), &value, 0);
   printf("get with out-of-range part: rc=%d (%s)\n", (int)uc,
          curl_url_strerror(uc));
@@ -868,7 +949,7 @@ static int s11_errors_and_strerror(void)
   printf("set with out-of-range part: rc=%d (%s)\n", (int)uc,
          curl_url_strerror(uc));
   curl_url_cleanup(u);
-  return 0;
+  return rc;
 }
 
 /* 12. The empty whole URL: a relative URL that changes nothing, and the
@@ -876,32 +957,47 @@ static int s11_errors_and_strerror(void)
 static int s12_empty_url(void)
 {
   CURLU *u;
+  int rc = 0;
 
   section("12. the empty url rule");
 
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://example.com/p?a=1#f", "set url", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com/p?a=1#f", "set url", 0);
   /* lib/urlapi.c:L1697-L1710. The comment at L1698-L1699 gives the intent:
      a blank URL is accepted only because a complete one is already
      present. */
-  setpart(u, CURLUPART_URL, "", "set empty url", 0);
-  showpart(u, CURLUPART_URL, "url unchanged", 0);
+  rc |= setpart(u, CURLUPART_URL, "", "set empty url", 0);
+  rc |= showpart(u, CURLUPART_URL, "url unchanged", 0);
   curl_url_cleanup(u);
 
+  /* A guessed scheme changes nothing about the ordinary empty write. It is
+     written out separately all the same, because the guessed-scheme marker
+     is the one thing that CAN change the answer -- see the note below. */
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "example.com", "set guess_scheme",
-          CURLU_GUESS_SCHEME);
-  setpart(u, CURLUPART_URL, "", "set empty url", 0);
-  setpart(u, CURLUPART_URL, "", "set empty url no_guess_scheme",
-          CURLU_NO_GUESS_SCHEME);
-  showpart(u, CURLUPART_URL, "url unchanged", 0);
-  note("both empty writes above succeed: L1700 reads CURLUPART_URL, whose "
-       "arm treats CURLU_NO_GUESS_SCHEME as a formatting choice at "
-       "L1512-L1515, not as the error L1559-L1560 is");
+  rc |= setpart(u, CURLUPART_URL, "example.com", "set guess_scheme",
+                CURLU_GUESS_SCHEME);
+  rc |= setpart(u, CURLUPART_URL, "", "set empty url", 0);
+  rc |= showpart(u, CURLUPART_URL, "url unchanged", 0);
+  /* Deliberately NOT exercised here: the same empty write carrying
+     CURLU_NO_GUESS_SCHEME on this very handle. That combination is the
+     crate's one bounded divergence from the C on the write side -- AAP
+     0.6.5 requires CURLUE_MALFORMED_INPUT and lib/urlapi.c answers
+     CURLUE_OK, because L1700 reads CURLUPART_URL, whose arm treats the flag
+     as a formatting choice at L1512-L1515 rather than as the error
+     L1559-L1560 is. Putting it in this transcript would make the two link
+     modes disagree with the reference-linked build of this same file, and
+     acceptance criterion A7 is that they do not disagree by a single byte.
+     It is covered instead by ../tests/ffi_surface.rs and by the unit test in
+     ../src/getset.rs, neither of which is diffed against the C, and it is
+     recorded in ../docs/KNOWN-DIVERGENCES.md under "Divergence: the empty
+     whole-URL write under CURLU_NO_GUESS_SCHEME". */
+  note("a guessed scheme does not change the ordinary empty write; the one "
+       "combination that does is kept out of this transcript on purpose, "
+       "see the comment at this line in demo/urlapi_demo.c");
   curl_url_cleanup(u);
 
   /* The sensitivity that is real. A handle with a host and no scheme
@@ -911,12 +1007,12 @@ static int s12_empty_url(void)
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_HOST, "example.com", "set host only", 0);
-  showpart(u, CURLUPART_URL, "url", 0);
-  showpart(u, CURLUPART_URL, "url default_scheme", CURLU_DEFAULT_SCHEME);
-  setpart(u, CURLUPART_URL, "", "set empty url", 0);
-  setpart(u, CURLUPART_URL, "", "set empty url default_scheme",
-          CURLU_DEFAULT_SCHEME);
+  rc |= setpart(u, CURLUPART_HOST, "example.com", "set host only", 0);
+  rc |= showpart(u, CURLUPART_URL, "url", 0);
+  rc |= showpart(u, CURLUPART_URL, "url default_scheme", CURLU_DEFAULT_SCHEME);
+  rc |= setpart(u, CURLUPART_URL, "", "set empty url", 0);
+  rc |= setpart(u, CURLUPART_URL, "", "set empty url default_scheme",
+                CURLU_DEFAULT_SCHEME);
   note("the caller's flags are passed into that internal read unfiltered, "
        "which is what makes one empty value answer two ways");
   curl_url_cleanup(u);
@@ -925,34 +1021,35 @@ static int s12_empty_url(void)
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "", "set empty url on empty handle", 0);
+  rc |= setpart(u, CURLUPART_URL, "", "set empty url on empty handle", 0);
   curl_url_cleanup(u);
-  return 0;
+  return rc;
 }
 
 /* 13. Dot segments, removed or preserved. */
 static int s13_path_as_is(void)
 {
   CURLU *u;
+  int rc = 0;
 
   section("13. path as is");
 
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://example.com/a/b/../c/./d/..",
-          "set url", 0);
-  showpart(u, CURLUPART_PATH, "path", 0);
-  showpart(u, CURLUPART_URL, "url", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com/a/b/../c/./d/..",
+                "set url", 0);
+  rc |= showpart(u, CURLUPART_PATH, "path", 0);
+  rc |= showpart(u, CURLUPART_URL, "url", 0);
   curl_url_cleanup(u);
 
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://example.com/a/b/../c/./d/..",
-          "set url path_as_is", CURLU_PATH_AS_IS);
-  showpart(u, CURLUPART_PATH, "path", 0);
-  showpart(u, CURLUPART_URL, "url", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com/a/b/../c/./d/..",
+                "set url path_as_is", CURLU_PATH_AS_IS);
+  rc |= showpart(u, CURLUPART_PATH, "path", 0);
+  rc |= showpart(u, CURLUPART_URL, "url", 0);
   curl_url_cleanup(u);
 
   /* The percent-encoded form of a dot segment is detected as well,
@@ -960,10 +1057,11 @@ static int s13_path_as_is(void)
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "https://example.com/a/%2e%2e/b", "set url", 0);
-  showpart(u, CURLUPART_PATH, "path", 0);
+  rc |= setpart(u, CURLUPART_URL, "https://example.com/a/%2e%2e/b",
+                "set url", 0);
+  rc |= showpart(u, CURLUPART_PATH, "path", 0);
   curl_url_cleanup(u);
-  return 0;
+  return rc;
 }
 
 /* 14. The file scheme, which has no authority, and an unknown scheme
@@ -971,29 +1069,31 @@ static int s13_path_as_is(void)
 static int s14_file_and_no_authority(void)
 {
   CURLU *u;
+  int rc = 0;
 
   section("14. file scheme and no authority");
 
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "file:///tmp/example.txt", "set file url", 0);
-  showpart(u, CURLUPART_SCHEME, "scheme", 0);
-  showpart(u, CURLUPART_HOST, "host", 0);
-  showpart(u, CURLUPART_PATH, "path", 0);
-  showpart(u, CURLUPART_PORT, "port default_port", CURLU_DEFAULT_PORT);
+  rc |= setpart(u, CURLUPART_URL, "file:///tmp/example.txt",
+                "set file url", 0);
+  rc |= showpart(u, CURLUPART_SCHEME, "scheme", 0);
+  rc |= showpart(u, CURLUPART_HOST, "host", 0);
+  rc |= showpart(u, CURLUPART_PATH, "path", 0);
+  rc |= showpart(u, CURLUPART_PORT, "port default_port", CURLU_DEFAULT_PORT);
   /* The file branch of the serialiser is a five-argument template with no
      authority at all, lib/urlapi.c:L1440-L1447. */
-  showpart(u, CURLUPART_URL, "url", 0);
+  rc |= showpart(u, CURLUPART_URL, "url", 0);
   curl_url_cleanup(u);
 
   u = curl_url();
   if(!u)
     return oom();
-  setpart(u, CURLUPART_URL, "file://localhost/tmp/example.txt",
-          "set file url with host", 0);
-  showpart(u, CURLUPART_HOST, "host", 0);
-  showpart(u, CURLUPART_URL, "url", 0);
+  rc |= setpart(u, CURLUPART_URL, "file://localhost/tmp/example.txt",
+                "set file url with host", 0);
+  rc |= showpart(u, CURLUPART_HOST, "host", 0);
+  rc |= showpart(u, CURLUPART_URL, "url", 0);
   curl_url_cleanup(u);
 
   u = curl_url();
@@ -1001,15 +1101,15 @@ static int s14_file_and_no_authority(void)
     return oom();
   /* An empty authority is accepted only under CURLU_NO_AUTHORITY,
      lib/urlapi.c:L1967. */
-  setpart(u, CURLUPART_URL, "custom://", "set empty authority",
-          CURLU_NON_SUPPORT_SCHEME);
-  setpart(u, CURLUPART_URL, "custom://", "set empty authority allowed",
-          CURLU_NON_SUPPORT_SCHEME | CURLU_NO_AUTHORITY);
-  showpart(u, CURLUPART_URL, "url", 0);
-  showpart(u, CURLUPART_HOST, "host", 0);
-  showpart(u, CURLUPART_PATH, "path", 0);
+  rc |= setpart(u, CURLUPART_URL, "custom://", "set empty authority",
+                CURLU_NON_SUPPORT_SCHEME);
+  rc |= setpart(u, CURLUPART_URL, "custom://", "set empty authority allowed",
+                CURLU_NON_SUPPORT_SCHEME | CURLU_NO_AUTHORITY);
+  rc |= showpart(u, CURLUPART_URL, "url", 0);
+  rc |= showpart(u, CURLUPART_HOST, "host", 0);
+  rc |= showpart(u, CURLUPART_PATH, "path", 0);
   curl_url_cleanup(u);
-  return 0;
+  return rc;
 }
 
 int main(void)
@@ -1017,13 +1117,13 @@ int main(void)
   int rc = 0;
 
   /* The banner exists so that the licence annotation lands in the golden
-     transcript. ../demo/expected-output.txt is a tracked file reuse lint
-     covers, and it cannot carry an inline annotation without corrupting the
-     very bytes it asserts, so the program prints one and the golden file
-     legitimately contains it. REUSE.toml:L4-L6 asks that a file be
-     annotated directly unless it cannot carry comments, and this route
-     satisfies that without a sidecar and without touching REUSE.toml, which
-     is out of scope.
+     transcript. ../demo/expected-output.txt is to be a tracked file reuse
+     lint covers, and it will not be able to carry an inline annotation
+     without corrupting the very bytes it asserts, so the program prints one
+     and the golden file legitimately contains it. REUSE.toml:L4-L6 asks that
+     a file be annotated directly unless it cannot carry comments, and this
+     route satisfies that without a sidecar and without touching REUSE.toml,
+     which is out of scope.
 
      Printed unconditionally in both link modes. Anything conditional here
      would make the two modes' transcripts differ, and acceptance criterion
@@ -1048,7 +1148,14 @@ int main(void)
   /* Accumulated rather than short-circuited, deliberately. Every section
      runs whatever the ones before it reported, so the transcript is never
      truncated and the diff always covers the whole surface; the status is
-     non-zero only if some section could not allocate. */
+     non-zero only if some allocation failed somewhere inside.
+
+     Each section accumulates the same way over its own calls, and showpart()
+     and setpart() each answer DEMO_ERR_OOM for a CURLUE_OUT_OF_MEMORY, so
+     the chain from one failing retrieval or assignment to this program's
+     exit status is unbroken. Nothing swallows that code: a run that printed
+     an out-of-memory line into the transcript cannot also exit 0, which is
+     the whole point of returning a status from the two printers. */
   rc |= s01_parse_and_all_parts();
   rc |= s02_path_and_relative();
   rc |= s03_default_port();

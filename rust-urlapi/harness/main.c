@@ -90,8 +90,14 @@
    and is also why memory_tracking_init() is gone. The consequence is stated
    rather than papered over: curl's allocation counter belongs to the
    memory-debug build, so it does not run here and the ceiling of
-   Allocations: 3000 at tests/data/test1560:L40 is not measured in this
-   configuration. The whole chain is in ../docs/MEMORY-OWNERSHIP.md. */
+   Allocations: 3000 at tests/data/test1560:L38-L40 cannot be checked by the
+   mechanism that wrote it. It is checked by the substitute AAP 0.9.4 names
+   instead -- an allocator interposed into this process counts 3,046
+   allocations for a run of lib1560 against the crate and 3,114 against the
+   reference libcurl.a, in the same accounting tests/memanalyzer.pm:L439
+   uses -- and ../tests/ffi_surface.rs enforces the ceiling inside cargo
+   test. The whole chain, and both sets of numbers, are in
+   ../docs/MEMORY-OWNERSHIP.md. */
 
 #include "first.h"
 

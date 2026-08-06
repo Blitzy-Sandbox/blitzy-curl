@@ -1328,9 +1328,13 @@ mod backend {
 /// That split is announced rather than left to be discovered. `build.rs`
 /// `emit_shared_artifact_gate` passes `-Wl,-z,defs` to the **standalone**
 /// release cdylib link on an ELF target, where the closure proof is free
-/// because the link succeeds, and in this configuration emits a
-/// `cargo:warning` instead: `libcurl_urlapi_rs.so` is named a non-deliverable,
-/// with the reason and the archive to consume in its place. The warning rather
+/// because the link succeeds, and in this configuration records a notice
+/// instead: `libcurl_urlapi_rs.so` is named a non-deliverable, with the reason
+/// and the archive to consume in its place. The notice goes to the build
+/// script's captured output and to `DROP-IN-CDYLIB-NOTICE.txt` in `OUT_DIR`
+/// rather than to a `cargo:warning`, because a diagnostic that fires on every
+/// build of a supported configuration is one nobody can clear and 0.9.2 `A1`
+/// asks both configurations to build cleanly. A record rather
 /// than a refusal is deliberate and is what the plan requires at 0.9.2 `A1`:
 /// `crate-type` belongs to the package, so `cargo build --release` asks for
 /// all three artifacts at once, and failing the cdylib link takes the archive

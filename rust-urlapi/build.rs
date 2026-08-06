@@ -1767,7 +1767,7 @@ const ELF_TARGET_OS: [&str; 11] = [
 /// refused by the linker where refusing it is free, announced to whoever
 /// started the build where refusing it would destroy the deliverables.
 ///
-/// # The defect this closes
+/// # The mismatch this addresses
 ///
 /// `crate-type` in Cargo.toml is a property of the *package*, so every
 /// configuration of this crate offers all three artifacts. The scheme
@@ -1781,13 +1781,12 @@ const ELF_TARGET_OS: [&str; 11] = [
 /// is exactly right -- the two names must appear as *undefined* in it, so
 /// that the linker binds them to the `url.c.o` sitting in the same libcurl
 /// archive -- while the shared object built from the same compilation is
-/// wrong in a way that, before this function existed, nothing announced:
-/// `libcurl_urlapi_rs.so` came out with
-/// `U Curl_get_scheme` and `U Curl_getn_scheme`, no `libcurl` in its NEEDED
-/// list, and no prospect of ever resolving them, because both symbols are
-/// hidden by libcurl's own visibility rules and so absent from a shared
-/// libcurl's dynamic symbol table. Loading it fails, every time, at
-/// `dlopen`.
+/// unusable: `libcurl_urlapi_rs.so` carries `U Curl_get_scheme` and
+/// `U Curl_getn_scheme`, no `libcurl` in its NEEDED list, and no prospect of
+/// ever resolving them, because both symbols are hidden by libcurl's own
+/// visibility rules and so absent from a shared libcurl's dynamic symbol
+/// table. Loading it fails, every time, at `dlopen`. Nothing in the
+/// compilation reports that, which is why this function announces it.
 ///
 /// # The strategy, stated as a rule
 ///
@@ -1810,33 +1809,47 @@ const ELF_TARGET_OS: [&str; 11] = [
 /// remembers to run `nm -D -u`, and it costs nothing, because the link
 /// succeeds.
 ///
-/// In the **drop-in** configuration it is the wrong instrument, and that was a
-/// real defect rather than a debatable choice. `crate-type` is a property of
+/// In the **drop-in** configuration it is the wrong instrument, and the reason
+/// is mechanical rather than a matter of taste. `crate-type` is a property of
 /// the package, so `cargo build --release` asks for the archive, the rlib
 /// *and* the cdylib in one invocation. Refusing the cdylib link there does not
 /// merely decline to emit a shared object: Cargo stops at the first failing
 /// link, so the archive and the rlib -- the artifacts that configuration
-/// exists to produce -- were never written either, and the command exited 101
+/// exists to produce -- are never written either, and the command exits 101
 /// with nothing to show. The plan requires the opposite at 0.9.2 `A1`, "the
 /// crate builds cleanly in both feature configurations", which names
 /// `--no-default-features --features idn-libidn2` as one of the two, and at
 /// 0.1.1.1 `G1`, one archive and one shared object from a single crate.
 ///
-/// So the rule is enforced where enforcing it is free, and *announced* where
+/// So the rule is enforced where enforcing it is free, and *recorded* where
 /// enforcing it would destroy the deliverables:
 ///
 /// * standalone release cdylib on an ELF target -- `-Wl,-z,defs`, the closure
 ///   proof, silent because it passes;
-/// * drop-in release cdylib -- no directive, and a `cargo:warning` naming
+/// * drop-in release cdylib -- no directive, and a notice naming
 ///   `libcurl_urlapi_rs.so` a non-deliverable, saying why it cannot load, and
-///   naming the archive as what to consume instead. A warning reaches whoever
-///   started the build, which is the person able to act on it, and this is one
-///   of the few things in a build worth spending one on.
+///   naming the archive as what to consume instead.
+///
+/// That notice is deliberately **not** a `cargo:warning`, and the reasoning is
+/// worth stating because the obvious choice is the wrong one here. The drop-in
+/// configuration is one of the two 0.9.2 `A1` requires to build cleanly, and
+/// the specification's zero-warning requirement at 3.2.1.2 covers every
+/// supported build; a warning that fires on every single one of them can never
+/// be cleared, because it describes a property of the configuration rather than
+/// anything the builder did. It would also devalue the warning channel for the
+/// diagnostics that *are* actionable -- a cross build reading the host's
+/// libidn2 header, `CURL_URLAPI_WIN32_UNICODE` set on a non-Windows target, and
+/// `announce_idn_pure_posture`, each of which reports a choice the builder made
+/// and can reverse. So the notice goes where an artifact diagnostic belongs:
+/// beside the artifacts. [`record_dropin_cdylib_notice`] puts it in this
+/// script's captured output and in a file in OUT_DIR, and
+/// docs/KNOWN-DIVERGENCES.md carries the standing account under the heading
+/// the text cites.
 ///
 /// `CURL_URLAPI_STRICT_CDYLIB=1` restores the refusal in the drop-in
-/// configuration, for a packaging job that would rather fail than have to read
-/// a warning. It is opt-in precisely because switching it on trades `A1` away
-/// for that absoluteness, and only somebody who knows they want that trade
+/// configuration, for a packaging job that would rather fail than rely on
+/// reading a notice. It is opt-in precisely because switching it on trades `A1`
+/// away for that absoluteness, and only somebody who knows they want that trade
 /// should be making it.
 ///
 /// The directive is `rustc-cdylib-link-arg`, which Cargo applies to the
@@ -1861,9 +1874,9 @@ const ELF_TARGET_OS: [&str; 11] = [
 /// # What a drop-in release build produces
 ///
 /// `cargo build --release --no-default-features --features idn-libidn2`
-/// succeeds and writes all three artifacts. Two of them are deliverables and
-/// one is not; the warning says which is which, and the shared object is the
-/// one that is not.
+/// succeeds, warning-free, and writes all three artifacts. Two of them are
+/// deliverables and one is not; the notice says which is which, and the shared
+/// object is the one that is not.
 ///
 /// The archive from that command is an *input* rather than the drop-in
 /// artifact, for a reason unrelated to this gate: Cargo cannot apply link-time
@@ -1941,23 +1954,38 @@ fn emit_shared_artifact_gate(scheme_table: bool) {
              The release cdylib link will fail here by design, and because \
              Cargo stops at the first failing link, `cargo build --release` \
              emits no archive and no rlib either. Unset the variable to get \
-             the plan's 0.9.2 A1 behaviour back, which is a successful build \
-             plus a warning about the shared object.",
+             the plan's 0.9.2 A1 behaviour back, which is a successful, \
+             warning-free build plus a DROP-IN-CDYLIB-NOTICE.txt in OUT_DIR \
+             recording that the shared object is not a deliverable.",
         );
         return;
     }
 
     // Drop-in configuration, default posture. The shared object cannot work
     // and must not be shipped, but refusing it would take the archive and the
-    // rlib down with it, so it is announced instead of refused. This text
-    // reaches a terminal verbatim: keep it short enough to read and specific
-    // enough to act on, and keep the heading it cites in step with
+    // rlib down with it, so it is recorded instead of refused.
+    //
+    // Recorded, and deliberately NOT through `cargo:warning`. This
+    // configuration is one of the two the plan requires to build cleanly at
+    // 0.9.2 `A1`, and the specification's zero-warning requirement (3.2.1.2)
+    // applies to every supported build, so a diagnostic that fires on every
+    // one of them is a warning that can never be cleared -- there is nothing
+    // the builder can do about it, because it is a property of the
+    // configuration rather than of the invocation. The distinction against
+    // `announce_idn_pure_posture`, which does warn, is exactly that: selecting
+    // `idn-pure` is a choice the builder made and can reverse, so a warning
+    // there is actionable.
+    //
+    // Two places carry it instead, both beside the artifacts rather than in
+    // front of a reader who cannot act: this script's captured output, and a
+    // notice file in OUT_DIR. Keep the heading it cites in step with
     // docs/KNOWN-DIVERGENCES.md.
+    //
     // Worded for the configuration rather than for this invocation, because a
     // build script cannot see which crate types were asked for: `cargo rustc
     // --crate-type staticlib` reaches here as well, and the sentence has to be
     // true there too.
-    warn(
+    record_dropin_cdylib_notice(
         "in the drop-in configuration libcurl_urlapi_rs.so is NOT a \
          deliverable: it comes out with Curl_get_scheme and Curl_getn_scheme \
          undefined and no libcurl NEEDED entry, both being libcurl-private \
@@ -1966,7 +1994,7 @@ fn emit_shared_artifact_gate(scheme_table: bool) {
          configuration. See docs/KNOWN-DIVERGENCES.md, \"Integration \
          limitation: the shared object exists in one configuration only\". \
          CURL_URLAPI_STRICT_CDYLIB=1 makes the linker refuse that object \
-         instead of this warning announcing it.",
+         instead of this notice recording it.",
     );
     note(&format!(
         "cdylib link-closure gate off in the drop-in configuration, whose \
@@ -1979,6 +2007,60 @@ fn emit_shared_artifact_gate(scheme_table: bool) {
          `localize_dropin_archive`."
     ));
 }
+
+/// Record the drop-in shared-object notice where an artifact diagnostic
+/// belongs: beside the artifacts, not on the warning channel.
+///
+/// Two destinations, because they answer two different questions.
+///
+/// The build script's **captured output** -- `note` -- answers "what did this
+/// build decide?". Cargo keeps every non-directive line this script prints in
+/// `target/<profile>/build/curl-urlapi-rs-<hash>/output`, which is where the
+/// rest of this script's configuration record already goes, so the notice sits
+/// with the reasoning that produced it.
+///
+/// A **notice file in OUT_DIR** answers "may I ship this .so?". It is written
+/// to `.../curl-urlapi-rs-<hash>/out/DROP-IN-CDYLIB-NOTICE.txt`, the sibling
+/// directory of that `output` file, so a packaging step or a reviewer who
+/// found the artifacts can find the answer without having to have watched the
+/// build go by. That mirrors what [`localize_dropin_archive`] already does
+/// with its `.a.provenance` record next to the archive it certifies.
+///
+/// A failure to write is reported through `note` rather than by panicking. The
+/// notice is advisory -- the archive and the rlib are correct whether or not it
+/// was written -- so failing the build over it would trade a real deliverable
+/// for a piece of paperwork, which is the same trade this whole function exists
+/// to refuse. The captured note is emitted either way, so the diagnostic is
+/// never lost entirely.
+fn record_dropin_cdylib_notice(message: &str) {
+    note(message);
+
+    let path = PathBuf::from(cargo_env("OUT_DIR")).join(DROPIN_CDYLIB_NOTICE);
+    let body = format!(
+        "curl-urlapi-rs {} -- drop-in configuration, {} profile, target {}\n\
+         \n\
+         {}\n",
+        cargo_env("CARGO_PKG_VERSION"),
+        cargo_env("PROFILE"),
+        cargo_env("TARGET"),
+        sanitize(message)
+    );
+    if let Err(error) = fs::write(&path, body.as_bytes()) {
+        note(&format!(
+            "could not write the shared-object notice {}: {error}. The notice \
+             is advisory and the archive is unaffected, so this does not fail \
+             the build; the note above carries the same text.",
+            path.display()
+        ));
+    }
+}
+
+/// The name of the file [`record_dropin_cdylib_notice`] writes into OUT_DIR.
+///
+/// Upper case and hyphenated so that it stands out among the object files and
+/// generated sources OUT_DIR otherwise holds, and named for what it is about
+/// rather than for the function that writes it.
+const DROPIN_CDYLIB_NOTICE: &str = "DROP-IN-CDYLIB-NOTICE.txt";
 
 /// Emit what is needed to link against the C internationalised-domain
 /// library, and say something useful when it cannot be found.

@@ -16,16 +16,13 @@
 //! Two independent reasons, and either alone would be enough.
 //!
 //! `src/lib.rs` publishes exactly two modules, `abi` and `ffi`, and every item
-//! inside `src/ffi.rs` -- its `exports` module included -- is `pub(crate)`.
-//! A Cargo integration test links this crate as an external crate, so it can
-//! name only `pub` items: `parse::port`, `parse::host` and `parse::ipv6` are
-//! unreachable from here by construction, and even `ffi::curl_url_get` is not
+//! inside `src/ffi.rs` -- its `exports` module included -- is `pub(crate)`, so
+//! `parse::port`, `parse::host` and `parse::ipv6` are unreachable from an
+//! integration test by construction and even `ffi::curl_url_get` is not
 //! nameable. What *is* reachable is the C ABI itself, because `#[no_mangle]`
 //! visibility is a linker property rather than a Rust one. The `extern "C"`
-//! block below therefore declares the five entry points and the linker
-//! resolves them against the `rlib`, which is exactly the surface a C consumer
-//! sees. `use curl_urlapi_rs::abi` keeps the crate on the link line and
-//! supplies the numeric constants.
+//! block below declares the five entry points and the linker resolves them
+//! against the `rlib`, which is exactly the surface a C consumer sees.
 //!
 //! The second reason is scope. The isolated port extractor is declared inside
 //! `#ifdef UNITTESTS` at `lib/urlapi-int.h` L35-L38 and is not one of the
@@ -63,10 +60,9 @@
 //!
 //! # Two configurations, one set of expectations
 //!
-//! The crate builds with default features (`strerror`, `cfree`,
-//! `scheme-table`, `idn-libidn2`) and in the drop-in configuration
-//! (`--no-default-features --features idn-libidn2`). This file compiles and
-//! passes in both, which takes two deliberate choices.
+//! This file compiles and passes under the crate's default features and under
+//! the drop-in configuration, `--no-default-features --features idn-libidn2`,
+//! which takes two choices.
 //!
 //! *Freeing.* Buffers come back from `curl_url_get` allocated by the C
 //! allocator -- `src/alloc.rs` is the sole producer of C-visible memory -- and
@@ -76,26 +72,22 @@
 //! `Curl_cfree` hook still holding its default. `ffi::curl_free` is not used,
 //! and could not be: it exists only under the `cfree` feature. Nothing is ever
 //! written through a returned pointer, per L46 of the same page.
-//!
-//! `curl_url_strerror` is not called either, for the same kind of reason and one
-//! more. It exists only under the `strerror` feature, so any use would need a
-//! `cfg`; and a failure message that reads differently depending on the
-//! configuration is worse than one that does not, so every assertion below
-//! reports the numeric code and the input instead. The codes are the ABI, and
-//! `src/abi.rs` names them.
+//! `curl_url_strerror` is not called either, since it exists only under the
+//! `strerror` feature; every assertion below reports the numeric code and the
+//! input instead, and the codes are the ABI.
 //!
 //! *Scheme resolution.* This is the most scheme-dependent of the crate's
 //! tests: default-port injection and suppression read `h->defport`, and almost
 //! every vector starts with `https`. With `scheme-table` on, the crate answers
-//! from its own table; with it off, `src/ffi.rs` L1822 imports
+//! from its own table; with it off, the `scheme_import` module in
+//! `src/ffi.rs` imports
 //! `Curl_get_scheme` from libcurl, and a Cargo test has no libcurl, so the
 //! link fails on an undefined symbol before any test runs. Gating the
 //! scheme-dependent tests away would silently delete most of this file in the
-//! configuration that matters most, so instead `scheme_standin` below supplies the
-//! two symbols under `cfg(not(feature = "scheme-table"))`, answering for
+//! configuration that matters most, so instead `scheme_standin` below supplies
+//! the two symbols under `cfg(not(feature = "scheme-table"))`, answering for
 //! `http` and `https` exactly as the built-in table does. Every expectation
-//! below then holds unchanged in both configurations, which is checked rather
-//! than assumed.
+//! below then holds unchanged in both configurations.
 //!
 //! No internationalised-domain assertion appears here, and that is a decision
 //! rather than an omission: none of these vectors needs a non-ASCII name, the
@@ -107,15 +99,9 @@
 //! `tests/data/test1560` and `tests/runtests.pl` L837-L839 do, is where that
 //! behaviour is checked.
 //!
-//! # Posture
-//!
-//! These tests supplement the two authoritative oracles -- unmodified
-//! `tests/libtest/lib1560.c` through `rust-urlapi/harness/`, and the
-//! byte-for-byte demo diff. A failure here means the port is wrong, so the fix
-//! belongs in `src/parse/host.rs`, `src/parse/ipv6.rs` or `src/parse/port.rs`
-//! and never in this file. Assertions may panic: the crate root's denial of
-//! the panicking constructs binds library code, which crosses the C boundary,
-//! and a test binary does not.
+//! Assertions may panic: the crate root's denial of the panicking constructs
+//! binds library code, which crosses the C boundary, and a test binary does
+//! not.
 
 use curl_urlapi_rs::abi;
 
@@ -136,9 +122,9 @@ struct CurlU {
 }
 
 // The five entry points, spelled as `include/curl/urlapi.h` L113-L142 declares
-// them and as `src/ffi.rs` L2801, L2827, L2876, L2962 and L3060 define them.
-// `CURLUcode` and `CURLUPart` are both `c_int` and the flag word is `c_uint`,
-// per `src/abi.rs` L92 and L103.
+// them and as the `exports` module in `src/ffi.rs` defines them. `CURLUcode`
+// and `CURLUPart` are both `c_int` and the flag word is `c_uint`, per the two
+// type aliases in `src/abi.rs`.
 extern "C" {
     fn curl_url() -> *mut CurlU;
     fn curl_url_cleanup(handle: *mut CurlU);
@@ -164,7 +150,6 @@ struct Handle {
 }
 
 impl Handle {
-    /// `curl_url()`, `lib/urlapi.c` L1288-L1291.
     fn new() -> Self {
         // SAFETY: the constructor takes no arguments and either allocates a
         // zeroed handle or returns null, which the assertion catches.
@@ -173,7 +158,6 @@ impl Handle {
         Handle { raw }
     }
 
-    /// `curl_url_dup()`, `lib/urlapi.c` L1310-L1332.
     fn dup(&self) -> Self {
         // SAFETY: `self.raw` is a live handle for the whole borrow, and the
         // duplicate is a fresh allocation this wrapper takes ownership of.
@@ -254,8 +238,6 @@ impl Drop for Handle {
     }
 }
 
-/// Renders a part for an assertion message, which is only ever reached on
-/// failure.
 fn shown(value: &Option<Vec<u8>>) -> String {
     match value {
         None => "<none>".to_owned(),
@@ -274,8 +256,6 @@ fn shown(value: &Option<Vec<u8>>) -> String {
     }
 }
 
-/// Parses `input` as a whole URL and returns the resulting handle, or the code
-/// that stopped it.
 fn parse(input: &[u8], set_flags: c_uint) -> Result<Handle, c_int> {
     let handle = Handle::new();
     let code = handle.set(abi::CURLUPART_URL, input, set_flags);
@@ -286,7 +266,6 @@ fn parse(input: &[u8], set_flags: c_uint) -> Result<Handle, c_int> {
     }
 }
 
-/// Asserts that parsing `input` and reading `what` back yields `expected`.
 fn expect_part(
     input: &[u8],
     set_flags: c_uint,
@@ -323,8 +302,6 @@ fn expect_part(
     }
 }
 
-/// Asserts that parsing `input` and reading it back as a whole URL yields
-/// `expected`.
 fn expect_url(input: &[u8], set_flags: c_uint, get_flags: c_uint, expected: &str, why: &str) {
     expect_part(
         input,
@@ -380,13 +357,14 @@ fn expect_missing(handle: &Handle, what: c_int, expected: c_int, why: &str) {
 /// The scheme table libcurl would supply, for the drop-in configuration only.
 ///
 /// With `scheme-table` off the crate reads the real table through
-/// `Curl_get_scheme`, declared at `src/ffi.rs` L1916-L1927 against the mirror
-/// of `struct Curl_scheme` at `lib/urldata.h` L515-L524. A Cargo test links no
-/// libcurl, so without a stand-in the test binary does not link at all: the
-/// symbol is referenced from `src/ffi.rs` L1992 and L2017 whether or not any
-/// test calls it. The crate has the same problem for its own unit tests and
-/// solves it the same way at `src/ffi.rs` L2180 and L2193, under `cfg(test)`,
-/// which does not extend to an integration test.
+/// `Curl_get_scheme`, declared in the `scheme_import` module of `src/ffi.rs`
+/// against its mirror of `struct Curl_scheme` at `lib/urldata.h` L515-L524. A
+/// Cargo test links no libcurl, so without a stand-in the test binary does not
+/// link at all: the symbol is referenced from that module's `get_scheme` and
+/// `getn_scheme` whether or not any test calls it. The crate has the same
+/// problem for its own unit tests and solves it the same way in that module's
+/// `tests` submodule, under `cfg(test)`, which does not extend to an
+/// integration test.
 ///
 /// Two rows, because two are all this file's vectors name. The parser reads
 /// exactly three members of a descriptor -- `flags`, tested only for
@@ -395,9 +373,8 @@ fn expect_missing(handle: &Handle, what: c_int, expected: c_int, why: &str) {
 /// for "this protocol is implemented", and `flags` of zero, which is the
 /// truthful value for the one bit that is read: neither descriptor sets
 /// `PROTOPT_URLOPTIONS`, at `lib/http.c` L5011-L5023 and L5028-L5040. The
-/// answers therefore match the built-in table at `src/scheme.rs` L588-L603 for
-/// these two names, and every expectation in this file holds in both
-/// configurations.
+/// answers therefore match the built-in table in `src/scheme.rs` for these two
+/// names, and every expectation in this file holds in both configurations.
 #[cfg(not(feature = "scheme-table"))]
 mod scheme_standin {
     use libc::{c_char, c_void, size_t};
@@ -478,9 +455,9 @@ mod scheme_standin {
         if scheme.is_null() {
             return ptr::null();
         }
-        // SAFETY: the caller is `src/ffi.rs` L1992, which passes
-        // `CStr::as_ptr`, so the pointer is NUL terminated and stays valid for
-        // the call. Nothing is written through it.
+        // SAFETY: the caller is `scheme_import::get_scheme` in `src/ffi.rs`,
+        // which passes `CStr::as_ptr`, so the pointer is NUL terminated and
+        // stays valid for the call. Nothing is written through it.
         find(unsafe { CStr::from_ptr(scheme) }.to_bytes())
     }
 
@@ -490,8 +467,9 @@ mod scheme_standin {
         if scheme.is_null() || len == 0 {
             return ptr::null();
         }
-        // SAFETY: the caller is `src/ffi.rs` L2017, which rejects an empty
-        // slice and then passes that slice's pointer with its own length, so
+        // SAFETY: the caller is `scheme_import::getn_scheme` in `src/ffi.rs`,
+        // which rejects an empty slice and then passes that slice's pointer
+        // with its own length, so
         // exactly `len` initialised bytes are readable and stay borrowed for
         // the call. `u8` and `c_char` share size and alignment.
         find(unsafe { slice::from_raw_parts(scheme.cast::<u8>(), len) })
@@ -568,6 +546,32 @@ fn ipv4_single_part_is_thirty_two_bits() {
         "https://0x100000000/",
         "one hexadecimal part over 32 bits stays a hostname",
     );
+    // The decimal spelling of the ceiling, so all three radices have a
+    // max/max+1 pair at this arity rather than only hexadecimal.
+    expect_url(
+        b"https://4294967295",
+        0,
+        0,
+        "https://255.255.255.255/",
+        "one decimal part at the 32-bit ceiling",
+    );
+    // And the octal pair, which is the third radix L502-L503 selects and the
+    // one the arity tests otherwise never take to its limit. 037777777777 is
+    // 0xffffffff; one more digit position and `curlx_str_octal` overflows.
+    expect_url(
+        b"https://037777777777",
+        0,
+        0,
+        "https://255.255.255.255/",
+        "one octal part at the 32-bit ceiling",
+    );
+    expect_url(
+        b"https://040000000000",
+        0,
+        0,
+        "https://040000000000/",
+        "one octal part over 32 bits stays a hostname",
+    );
 }
 
 #[test]
@@ -604,6 +608,88 @@ fn ipv4_two_parts_split_eight_and_twenty_four() {
         0,
         "https://255.0.255.255/",
         "two parts, the second under the 24-bit ceiling",
+    );
+    // Both halves of L540-L541 need a max and a max+1 case, because the two
+    // disjuncts are independent: `parts[0] > 0xff` and `parts[1] > 0xffffff`
+    // guard different fields, and a port that dropped either one would still
+    // satisfy the accepting rows above.
+    //
+    // The first field at its own ceiling, and one past it.
+    expect_url(
+        b"https://255.1",
+        0,
+        0,
+        "https://255.0.0.1/",
+        "two parts, the first at its 8-bit ceiling",
+    );
+    expect_url(
+        b"https://256.1",
+        0,
+        0,
+        "https://256.1/",
+        "two parts, the first over 8 bits, stays a hostname",
+    );
+    // The same overflow in a radix normalisation would change, which is the
+    // spelling that distinguishes rejection from acceptance rather than merely
+    // agreeing with it -- see the note in `ipv4_four_parts_are_four_octets`.
+    expect_url(
+        b"https://0x100.1",
+        0,
+        0,
+        "https://0x100.1/",
+        "two parts, the first over 8 bits in hexadecimal",
+    );
+    // The second field at its ceiling in decimal, and one past it in both
+    // decimal and hexadecimal, since the scanner accepts 0x1000000 happily and
+    // it is L541 alone that refuses it.
+    expect_url(
+        b"https://1.16777215",
+        0,
+        0,
+        "https://1.255.255.255/",
+        "two parts, the second at its 24-bit ceiling in decimal",
+    );
+    expect_url(
+        b"https://1.16777216",
+        0,
+        0,
+        "https://1.16777216/",
+        "two parts, the second over 24 bits, stays a hostname",
+    );
+    expect_url(
+        b"https://1.0x1000000",
+        0,
+        0,
+        "https://1.0x1000000/",
+        "two parts, the second over 24 bits in hexadecimal, stays a hostname",
+    );
+    // The octal spelling of both fields at their ceilings, so this arity too
+    // exercises all three radices at the boundary and not only in the middle.
+    expect_url(
+        b"https://0377.077777777",
+        0,
+        0,
+        "https://255.255.255.255/",
+        "two octal parts, both at their ceilings",
+    );
+    // The same two disjuncts reached by the second reviewer's vectors, kept
+    // alongside the rows above rather than in place of them: the stored HOST is
+    // asserted verbatim as well as the serialisation, and the both-ceilings row
+    // shows the pair are boundaries and not a rejection of two-part input.
+    expect_part(
+        b"https://256.1",
+        0,
+        abi::CURLUPART_HOST,
+        0,
+        "256.1",
+        "two parts, first over 8 bits, host stored verbatim",
+    );
+    expect_url(
+        b"https://255.16777215",
+        0,
+        0,
+        "https://255.255.255.255/",
+        "two parts at both ceilings at once, still an address",
     );
 }
 
@@ -649,6 +735,85 @@ fn ipv4_three_parts_split_eight_eight_and_sixteen() {
         "https://1.2.0x100.3/",
         "four parts, the third over 8 bits, stays a hostname",
     );
+    // L551 is three independent disjuncts and the rows above only push the
+    // third, so the first two get their own max and max+1 pairs here. Without
+    // them a port could drop either check and still pass this test.
+    expect_url(
+        b"https://255.2.3",
+        0,
+        0,
+        "https://255.2.0.3/",
+        "three parts, the first at its 8-bit ceiling",
+    );
+    expect_url(
+        b"https://256.2.3",
+        0,
+        0,
+        "https://256.2.3/",
+        "three parts, the first over 8 bits, stays a hostname",
+    );
+    expect_url(
+        b"https://1.255.3",
+        0,
+        0,
+        "https://1.255.0.3/",
+        "three parts, the second at its 8-bit ceiling",
+    );
+    expect_url(
+        b"https://1.256.3",
+        0,
+        0,
+        "https://1.256.3/",
+        "three parts, the second over 8 bits, stays a hostname",
+    );
+    // And both of those in hexadecimal, so the boundary is exercised in a radix
+    // whose acceptance would be visible as a changed spelling.
+    expect_url(
+        b"https://0x100.2.3",
+        0,
+        0,
+        "https://0x100.2.3/",
+        "three parts, the first over 8 bits in hexadecimal",
+    );
+    expect_url(
+        b"https://1.0x100.3",
+        0,
+        0,
+        "https://1.0x100.3/",
+        "three parts, the second over 8 bits in hexadecimal",
+    );
+    // The first two disjuncts of L551 again, in the spellings the second review
+    // named, with the stored HOST asserted verbatim and the all-ceilings
+    // companion that makes them read as boundaries.
+    expect_url(
+        b"https://256.1.1",
+        0,
+        0,
+        "https://256.1.1/",
+        "three parts, the first one past its 8 bits, stays a hostname",
+    );
+    expect_part(
+        b"https://256.1.1",
+        0,
+        abi::CURLUPART_HOST,
+        0,
+        "256.1.1",
+        "three parts, first over 8 bits, host stored verbatim",
+    );
+    expect_url(
+        b"https://1.256.1",
+        0,
+        0,
+        "https://1.256.1/",
+        "three parts, the second one past its 8 bits, stays a hostname",
+    );
+    expect_url(
+        b"https://255.255.65535",
+        0,
+        0,
+        "https://255.255.255.255/",
+        "three parts, every field at its ceiling, still an address",
+    );
 }
 
 #[test]
@@ -661,7 +826,6 @@ fn ipv4_four_parts_are_four_octets() {
         "https://255.255.255.255/",
         "four parts, mixed radix, L560-L571",
     );
-    // Already normal, and normalisation is idempotent.
     expect_url(
         b"https://0.0.0.0",
         0,
@@ -685,6 +849,112 @@ fn ipv4_four_parts_are_four_octets() {
         0,
         "https://256.1.1.1/",
         "four parts, the first over 8 bits, stays a hostname",
+    );
+    // L561-L562 has four disjuncts. The rows above reach the first, third and
+    // fourth; this is the second, which was the gap.
+    expect_url(
+        b"https://1.256.3.4",
+        0,
+        0,
+        "https://1.256.3.4/",
+        "four parts, the second over 8 bits, stays a hostname",
+    );
+
+    // A DECIMAL over-range part cannot prove this arm's range check at all, and
+    // the reason is specific to this arity: L563-L570 prints all four parts
+    // verbatim, with none of the shifting and masking the other three arms do.
+    // So for `1.256.3.4` the accepting path would recompose the very same text
+    // the rejecting path leaves alone, and the row above -- like lib1560's own
+    // `1.2.3.256` and this file's `256.1.1.1` -- passes either way.
+    //
+    // Verified rather than reasoned about: with `parts[1] > 0xff` deleted from
+    // L561, `https://1.256.3.4` still reads back as `https://1.256.3.4/`.
+    //
+    // The fix is to spell the over-range part in a radix normalisation would
+    // change, so that acceptance and rejection produce different bytes. Each of
+    // the four rows below puts `0x100` in one position: rejected, the input
+    // survives; accepted, it would come back as `256`.
+    expect_url(
+        b"https://0x100.1.1.1",
+        0,
+        0,
+        "https://0x100.1.1.1/",
+        "four parts, the first over 8 bits in a radix that would change",
+    );
+    expect_url(
+        b"https://1.0x100.3.4",
+        0,
+        0,
+        "https://1.0x100.3.4/",
+        "four parts, the second over 8 bits in a radix that would change",
+    );
+    expect_url(
+        b"https://1.2.3.0x100",
+        0,
+        0,
+        "https://1.2.3.0x100/",
+        "four parts, the fourth over 8 bits in a radix that would change",
+    );
+    // And the octal spelling of the same idea, since L502-L503 is a third
+    // branch of the scanner and 0400 is 256.
+    expect_url(
+        b"https://1.0400.3.4",
+        0,
+        0,
+        "https://1.0400.3.4/",
+        "four parts, the second over 8 bits in octal",
+    );
+    // The accepting side of the same four disjuncts. The mixed-radix row above
+    // proves the radices; these prove 255 is inside the limit for every field
+    // rather than only for the ones one spelling happened to reach.
+    expect_url(
+        b"https://255.1.1.1",
+        0,
+        0,
+        "https://255.1.1.1/",
+        "four parts, the first at its 8-bit ceiling",
+    );
+    expect_url(
+        b"https://255.255.255.255",
+        0,
+        0,
+        "https://255.255.255.255/",
+        "four parts, every field at its ceiling",
+    );
+    // The all-octal and all-hexadecimal spellings of a four-part address, so
+    // this arity has each radix in every position rather than one each.
+    expect_url(
+        b"https://0377.0377.0377.0377",
+        0,
+        0,
+        "https://255.255.255.255/",
+        "four octal parts at their ceilings",
+    );
+    expect_url(
+        b"https://0x1.0x2.0x3.0x4",
+        0,
+        0,
+        "https://1.2.3.4/",
+        "four hexadecimal parts",
+    );
+    // L561's second disjunct in its decimal spelling, plus the stored HOST. By
+    // the note above, a decimal over-range part cannot on its own prove this
+    // arity's range check -- the `0x100`/`0400` rows are what do that -- but
+    // these pin the observed answer, including the verbatim host text.
+    expect_url(
+        b"https://1.256.1.1",
+        0,
+        0,
+        "https://1.256.1.1/",
+        "four parts, the second over 8 bits, stays a hostname",
+    );
+    expect_part(
+        b"https://1.256.1.1",
+        0,
+        abi::CURLUPART_HOST,
+        0,
+        "1.256.1.1",
+        "four parts, second over 8 bits, host stored verbatim",
     );
 }
 
@@ -866,6 +1136,160 @@ fn percent_escapes_that_decode_to_a_rejected_byte_are_rejected() {
     );
 }
 
+/// What answers first when a rejected byte is spelled literally.
+///
+/// The reject set at `lib/urlapi.c` L456 is a deny list for `hostname_check`,
+/// but `hostname_check` is the *last* stage of the authority pipeline, and for
+/// nine of its thirty-one bytes something earlier has already had its say. So a
+/// table that expected `CURLUE_BAD_HOSTNAME` for all thirty-one would be wrong
+/// about nine of them, and one that only listed the twenty-two would be silent
+/// about which stage owns the rest. This names the stage.
+enum Literally {
+    /// `hostname_check` L456 is what refuses it: `CURLUE_BAD_HOSTNAME`, 21.
+    RefusedByTheCheck,
+    /// An earlier stage consumes the byte and the parse succeeds. The string is
+    /// the whole URL that results, so the row says what became of it rather
+    /// than merely that nothing failed.
+    ConsumedEarlier(&'static str),
+    /// `Curl_parse_port` L335-L388 reaches it first, and the tail is not a
+    /// number: `CURLUE_BAD_PORT_NUMBER`, 4.
+    RefusedByThePortParser,
+    /// `Curl_junkscan` L223-L239 reaches it first, from `parseurl` L1124:
+    /// `CURLUE_MALFORMED_INPUT`, 3.
+    RefusedByTheJunkScan,
+}
+
+/// Every byte of the reject set, in both spellings, with the stage that answers.
+///
+/// The two tests above are the lib1560-cited ones: they exist because upstream
+/// has a row for those bytes, and they carry the row numbers. This one exists
+/// for a different reason -- the set has thirty-one members and upstream
+/// exercises nine of them, so removing any one of the other twenty-two from
+/// `HOST_REJECT` would leave both of those tests, and the whole suite, green.
+/// It closes the set.
+///
+/// # Why the table has two columns of expectation
+///
+/// Percent-encoded, every one of the thirty-one is `CURLUE_BAD_HOSTNAME`,
+/// because `parse_authority` L640-L643 decodes before it checks and the check
+/// therefore sees the byte itself. That is the uniform column, and it is the
+/// one that proves membership in the set: `%24` reaching the check as `$` and
+/// being refused is exactly the claim "`$` is in the set".
+///
+/// Spelled literally, nine of them never reach the check at all, and the second
+/// column records which stage got there first. Those nine are not a weakness in
+/// the set -- they are the pipeline order, and asserting them is what stops a
+/// reader concluding that `https://exam@ple.net` is somehow accepted *by*
+/// `hostname_check`.
+///
+/// # How the vectors are built
+///
+/// From the byte value, not transcribed. Each row supplies one byte and the
+/// escape is rendered from it with `%{:02X}`, so the two spellings of a row
+/// cannot disagree about which byte they mean -- which is the mistake a
+/// hand-written table of sixty-two strings invites. It also keeps the source
+/// pure ASCII with no control bytes in it, which `scripts/spacecheck.pl`
+/// L173-L196 requires of every tracked file: the space, tab, carriage return
+/// and newline rows exist only as numbers here.
+#[test]
+fn every_byte_of_the_reject_set_is_driven_through_the_pipeline() {
+    // `lib/urlapi.c` L456, byte for byte and in the C's own order. The first
+    // four are the control bytes; the rest are printable.
+    let set: [(u8, Literally); 31] = [
+        (b' ', Literally::RefusedByTheJunkScan),
+        (b'\r', Literally::RefusedByTheJunkScan),
+        (b'\n', Literally::RefusedByTheJunkScan),
+        (b'\t', Literally::RefusedByTheJunkScan),
+        // `parseurl` L1143 measures the authority with `strcspn(hostp, "/?#")`,
+        // so these three end it rather than belong to it. The host is `exam`
+        // and the remainder becomes the path, the query or the fragment.
+        (b'/', Literally::ConsumedEarlier("https://exam/ple.net")),
+        // `Curl_parse_port` L343-L347 finds the colon and reads `ple.net` as a
+        // port number, which it is not.
+        (b':', Literally::RefusedByThePortParser),
+        (b'#', Literally::ConsumedEarlier("https://exam/#ple.net")),
+        (b'?', Literally::ConsumedEarlier("https://exam/?ple.net")),
+        (b'!', Literally::RefusedByTheCheck),
+        // `parse_hostname_login` L273 finds the `@` and splits: the user
+        // becomes `exam` and the host `ple.net`, both legal.
+        (b'@', Literally::ConsumedEarlier("https://exam@ple.net/")),
+        (b'{', Literally::RefusedByTheCheck),
+        (b'}', Literally::RefusedByTheCheck),
+        (b'[', Literally::RefusedByTheCheck),
+        (b']', Literally::RefusedByTheCheck),
+        (b'\\', Literally::RefusedByTheCheck),
+        (b'$', Literally::RefusedByTheCheck),
+        (b'\'', Literally::RefusedByTheCheck),
+        (b'"', Literally::RefusedByTheCheck),
+        (b'^', Literally::RefusedByTheCheck),
+        (b'`', Literally::RefusedByTheCheck),
+        (b'*', Literally::RefusedByTheCheck),
+        (b'<', Literally::RefusedByTheCheck),
+        (b'>', Literally::RefusedByTheCheck),
+        (b'=', Literally::RefusedByTheCheck),
+        (b';', Literally::RefusedByTheCheck),
+        (b',', Literally::RefusedByTheCheck),
+        (b'+', Literally::RefusedByTheCheck),
+        (b'&', Literally::RefusedByTheCheck),
+        (b'(', Literally::RefusedByTheCheck),
+        (b')', Literally::RefusedByTheCheck),
+        (b'%', Literally::RefusedByTheCheck),
+    ];
+
+    // The set has no duplicate, so thirty-one rows really are thirty-one
+    // distinct bytes and the loop below runs once per member rather than twice
+    // over some and never over another. Checked before the loop because the
+    // loop consumes the table.
+    let mut seen = [false; 256];
+    for (byte, _) in &set {
+        assert!(
+            !seen[usize::from(*byte)],
+            "byte {byte:#04x} appears twice in the table"
+        );
+        seen[usize::from(*byte)] = true;
+    }
+
+    for (byte, literally) in set {
+        // `https://exam<byte>ple.net`: the byte sits inside the authority, well
+        // clear of the first and last positions, so no leading-`[` or
+        // trailing-colon special case can account for the answer.
+        let mut literal = b"https://exam".to_vec();
+        literal.push(byte);
+        literal.extend_from_slice(b"ple.net");
+        let why = format!("byte {byte:#04x} spelled literally");
+        match literally {
+            Literally::RefusedByTheCheck => {
+                expect_parse_error(&literal, 0, abi::CURLUE_BAD_HOSTNAME, &why);
+            }
+            Literally::ConsumedEarlier(url) => {
+                expect_url(&literal, 0, 0, url, &why);
+            }
+            Literally::RefusedByThePortParser => {
+                expect_parse_error(&literal, 0, abi::CURLUE_BAD_PORT_NUMBER, &why);
+            }
+            Literally::RefusedByTheJunkScan => {
+                expect_parse_error(&literal, 0, abi::CURLUE_MALFORMED_INPUT, &why);
+            }
+        }
+
+        // The same byte behind an escape, which is the spelling that always
+        // reaches the check -- except for the three control bytes below 0x20,
+        // which `Curl_urldecode` refuses in `REJECT_CTRL` mode at
+        // `lib/escape.c` L105 and which `urldecode_host` L592-L593 then reports
+        // with the same 21. Either way the code is `CURLUE_BAD_HOSTNAME`, which
+        // is why one expectation serves all thirty-one.
+        let mut encoded = b"https://exam".to_vec();
+        encoded.extend_from_slice(format!("%{byte:02X}").as_bytes());
+        encoded.extend_from_slice(b"ple.net");
+        expect_parse_error(
+            &encoded,
+            0,
+            abi::CURLUE_BAD_HOSTNAME,
+            &format!("byte {byte:#04x} percent-encoded"),
+        );
+    }
+}
+
 #[test]
 fn a_percent_escape_that_decodes_to_a_legal_byte_is_accepted_and_decoded() {
     // lib1560.c L650. This is the case that proves the ordering: the host is
@@ -911,13 +1335,205 @@ fn an_empty_host_is_no_host() {
         abi::CURLUE_BAD_HOSTNAME,
         "an empty value for CURLUPART_HOST is bad rather than absent"
     );
+    // Read back from `handle` -- the handle the setter just failed on -- and not
+    // from a freshly parsed one. The distinction is the whole assertion: L1987-
+    // L1989 returns before `*storep` is replaced at L1994-L1995, so the claim
+    // being made is that *this* handle still holds what it held, and a second
+    // handle parsed from the same input could not tell anyone whether the first
+    // one had been mutated.
+    let (code, host) = handle.get(abi::CURLUPART_HOST, 0);
+    assert_eq!(
+        code,
+        abi::CURLUE_OK,
+        "the host survives a rejected setter, it does not become absent"
+    );
+    assert_eq!(
+        host.as_deref(),
+        Some(&b"example.org"[..]),
+        "a rejected host setter leaves the previous host in place, got {}",
+        shown(&host)
+    );
+}
+
+/// `CURLU_NO_AUTHORITY` makes an empty authority legal, on both paths that have
+/// one.
+///
+/// The flag is read in exactly two places and they are different code:
+///
+/// * `parseurl` L1154-L1158. When `strcspn(hostp, "/?#")` at L1143 measures the
+///   authority as zero bytes, the flag turns what would be `CURLUE_NO_HOST` at
+///   L1160 into an empty host -- `curlx_dyn_add(&host, "")`, so the field is
+///   present and holds nothing rather than being absent.
+/// * `curl_url_set`'s host arm, L1967-L1969. The flag skips the whole check for
+///   an empty value, where L1972-L1973 would otherwise set `bad = TRUE`.
+///
+/// Both are asserted here, each with the negative case beside it, because the
+/// flag's only observable content is the difference it makes. Without the pair a
+/// port that ignored the flag entirely would fail one assertion; without the
+/// negative case a port that *always* allowed an empty authority would pass.
+///
+/// # Why an empty host still serialises
+///
+/// `urlget_url` L1448-L1449 rejects a **null** host with `CURLUE_NO_HOST`, and
+/// an empty one is not null, so L1517-L1532 runs with `u->host` contributing no
+/// bytes between the `//` and the path. That is where the three slashes in
+/// `http:///?hi` come from: two from the scheme separator at L1513 and one from
+/// the path default at L1528.
+#[test]
+fn no_authority_allows_an_empty_host_on_both_paths() {
+    // `tests/libtest/lib1560.c` L1376-L1379, the authoritative row: a base URL
+    // with everything in it, then a whole-URL set of a value whose authority is
+    // empty, carried by the flag.
+    let handle = parse(b"http://user:foo@example.com/path?query#frag", 0)
+        .expect("the base URL from lib1560.c L1376 parses");
+    assert_eq!(
+        handle.set(abi::CURLUPART_URL, b"http://?hi", abi::CURLU_NO_AUTHORITY),
+        abi::CURLUE_OK,
+        "lib1560.c L1378-L1379 expects this to succeed"
+    );
+    let (code, url) = handle.get(abi::CURLUPART_URL, 0);
+    assert_eq!(code, abi::CURLUE_OK, "the whole URL reads back");
+    assert_eq!(
+        url.as_deref(),
+        Some(&b"http:///?hi"[..]),
+        "lib1560.c L1378 expects three slashes, got {}",
+        shown(&url)
+    );
+    // The parts behind that serialisation, which the C row does not check and
+    // which is where an empty host differs from an absent one.
+    let (code, host) = handle.get(abi::CURLUPART_HOST, 0);
+    assert_eq!(
+        code,
+        abi::CURLUE_OK,
+        "the host is present, L1156 stored an empty string for it"
+    );
+    assert_eq!(
+        host.as_deref(),
+        Some(&b""[..]),
+        "and it holds no bytes, got {}",
+        shown(&host)
+    );
+    // `CURLU_GET_EMPTY` changes nothing here: it governs the query and the
+    // fragment at L1433-L1435, and the host was already reportable.
+    let (code, host) = handle.get(abi::CURLUPART_HOST, abi::CURLU_GET_EMPTY);
+    assert_eq!(code, abi::CURLUE_OK);
+    assert_eq!(host.as_deref(), Some(&b""[..]));
     expect_part(
-        b"https://example.org/",
+        b"http://?hi",
+        abi::CURLU_NO_AUTHORITY,
+        abi::CURLUPART_PATH,
         0,
-        abi::CURLUPART_HOST,
+        "/",
+        "the path is the L1604-L1607 default, no bytes of it came from the input",
+    );
+    expect_part(
+        b"http://?hi",
+        abi::CURLU_NO_AUTHORITY,
+        abi::CURLUPART_QUERY,
         0,
-        "example.org",
-        "a rejected host setter leaves the previous host in place",
+        "hi",
+        "and the query is what followed the delimiter",
+    );
+    // The replacement discarded the base's credentials, as any successful
+    // whole-URL set does through `parseurl_and_replace` L1204-L1207.
+    expect_missing(
+        &handle,
+        abi::CURLUPART_USER,
+        abi::CURLUE_NO_USER,
+        "the base's user did not survive the replacement",
+    );
+
+    // The negative half of the same row: without the flag, L1160 answers, and
+    // because `set_url` reaches the parser through `parseurl_and_replace` the
+    // live handle is left exactly as it was, L1188-L1191 and L1204-L1207.
+    let handle = parse(b"http://user:foo@example.com/path?query#frag", 0)
+        .expect("the base URL parses again");
+    assert_eq!(
+        handle.set(abi::CURLUPART_URL, b"http://?hi", 0),
+        abi::CURLUE_NO_HOST,
+        "without CURLU_NO_AUTHORITY the empty authority is no host at all"
+    );
+    let (code, url) = handle.get(abi::CURLUPART_URL, 0);
+    assert_eq!(code, abi::CURLUE_OK);
+    assert_eq!(
+        url.as_deref(),
+        Some(&b"http://user:foo@example.com/path?query#frag"[..]),
+        "and the rejected set changed nothing, got {}",
+        shown(&url)
+    );
+
+    // `tests/libtest/lib1560.c` L836-L845, the same flag on the parse path with
+    // a scheme no table holds. Three rows: allowed with the flag, refused
+    // without it, and -- the row that is easy to leave out -- unchanged by the
+    // flag when there *is* an authority.
+    expect_url(
+        b"custom-scheme://?expected=test-new-good",
+        abi::CURLU_NON_SUPPORT_SCHEME | abi::CURLU_NO_AUTHORITY,
+        0,
+        "custom-scheme:///?expected=test-new-good",
+        "lib1560.c L839-L842",
+    );
+    expect_parse_error(
+        b"custom-scheme://?expected=test-bad",
+        abi::CURLU_NON_SUPPORT_SCHEME,
+        abi::CURLUE_NO_HOST,
+        "lib1560.c L836-L838, the same input without the flag",
+    );
+    expect_url(
+        b"custom-scheme://host?expected=test-still-good",
+        abi::CURLU_NON_SUPPORT_SCHEME | abi::CURLU_NO_AUTHORITY,
+        0,
+        "custom-scheme://host/?expected=test-still-good",
+        "lib1560.c L843-L845, the flag permits rather than imposes",
+    );
+
+    // The second reader of the flag, `curl_url_set`'s host arm at L1967-L1969.
+    // `tests/libtest/lib1560.c` L1144-L1148 drives it through the `setget`
+    // table with the part name `host` and an empty value.
+    let handle = parse(b"custom-scheme://host", abi::CURLU_NON_SUPPORT_SCHEME)
+        .expect("the base URL from lib1560.c L1144 parses");
+    assert_eq!(
+        handle.set(
+            abi::CURLUPART_HOST,
+            b"",
+            abi::CURLU_NON_SUPPORT_SCHEME | abi::CURLU_NO_AUTHORITY
+        ),
+        abi::CURLUE_OK,
+        "lib1560.c L1147-L1148 expects the empty host to be accepted"
+    );
+    let (code, url) = handle.get(abi::CURLUPART_URL, 0);
+    assert_eq!(code, abi::CURLUE_OK);
+    assert_eq!(
+        url.as_deref(),
+        Some(&b"custom-scheme:///"[..]),
+        "lib1560.c L1146 expects the host to vanish from the serialisation, got {}",
+        shown(&url)
+    );
+    let (code, host) = handle.get(abi::CURLUPART_HOST, 0);
+    assert_eq!(
+        code,
+        abi::CURLUE_OK,
+        "the field is present and empty, not cleared"
+    );
+    assert_eq!(host.as_deref(), Some(&b""[..]));
+
+    // And the negative half, `tests/libtest/lib1560.c` L1139-L1143: the same
+    // setter without the flag takes the `!n` branch at L1972-L1973 and the
+    // previous host stays.
+    let handle = parse(b"custom-scheme://host", abi::CURLU_NON_SUPPORT_SCHEME)
+        .expect("the base URL parses again");
+    assert_eq!(
+        handle.set(abi::CURLUPART_HOST, b"", abi::CURLU_NON_SUPPORT_SCHEME),
+        abi::CURLUE_BAD_HOSTNAME,
+        "lib1560.c L1143 expects CURLUE_BAD_HOSTNAME without the flag"
+    );
+    let (code, host) = handle.get(abi::CURLUPART_HOST, 0);
+    assert_eq!(code, abi::CURLUE_OK);
+    assert_eq!(
+        host.as_deref(),
+        Some(&b"host"[..]),
+        "and the rejected setter left the host alone, got {}",
+        shown(&host)
     );
 }
 
@@ -1259,24 +1875,32 @@ fn a_zone_that_is_not_an_address_suffix_is_still_a_zone() {
 // ---------------------------------------------------------------------------
 //
 // `lib1560.c` L1681-L1809 walks this exact sequence and inspects **only return
-// codes**: every step frees the retrieved buffer without looking at it. That is
-// precisely why finding FB3 survives upstream, and it is why this file repeats
-// the sequence and asserts the strings.
+// codes**: every step frees the retrieved buffer without looking at it. So the
+// strings it produces are unasserted upstream, which is why this file repeats
+// the sequence and asserts them.
 //
-// The sequence also crosses the asymmetry that FB3 is about. The parse path
-// splits the zone off the host and stores the two separately; the host setter
-// does not, because it validates a decoded *copy* at L1974-L1983 and stores the
-// original text. The zone identifier therefore ends up recorded twice over --
-// once inside the host string and once in its own field -- and serialisation,
-// which appends the field to the host unconditionally at L1480-L1491, writes it
-// twice. That is reproduced here rather than fixed.
+// What the sequence shows is a property of the public **host setter**, reached
+// only through `curl_url_set(CURLUPART_HOST, ..)`. The parse path splits the
+// zone off the host and stores the two separately; the host setter does not,
+// because it validates a decoded *copy* at L1974-L1983 and stores the original
+// text. Assigning a zoned bracketed host therefore records the zone twice over
+// -- once inside the host string and once in its own field -- and
+// serialisation, which appends the field to the host at L1480-L1491 whenever
+// the host begins with `[`, writes it twice. That is reproduced here rather
+// than fixed.
+//
+// This is a different behaviour from finding FB3, which is about a zone
+// identifier left *stale* because nothing clears it, and whose reachable route
+// is `Curl_url_set_authority` running `parse_authority` on a live handle. This
+// sequence never calls that entry point, and `curl_url_set(CURLUPART_HOST, ..)`
+// does clear the field, at L1848. FB3 is asserted where it belongs, in
+// `rust-urlapi/tests/ffi_surface.rs`.
 
 #[test]
 fn the_scopeid_sequence_holds_the_values_upstream_never_looks_at() {
     let handle = parse(b"https://[fe80::20c:29ff:fe9c:409b%25eth0]/hello.html", 0)
         .expect("lib1560.c L1688-L1689: the zoned URL parses");
 
-    // Step 1. The parse path separated them, so the host has no zone in it.
     assert_eq!(
         handle.get(abi::CURLUPART_HOST, 0).1.as_deref(),
         Some(&b"[fe80::20c:29ff:fe9c:409b]"[..]),
@@ -1318,7 +1942,6 @@ fn the_scopeid_sequence_holds_the_values_upstream_never_looks_at() {
         "step 2: the path survives a host replacement"
     );
 
-    // Step 3. An ordinary hostname, so nothing bracketed is involved at all.
     assert_eq!(
         handle.set(abi::CURLUPART_HOST, b"example.com", 0),
         abi::CURLUE_OK,
@@ -1362,8 +1985,6 @@ fn the_scopeid_sequence_holds_the_values_upstream_never_looks_at() {
          from the field"
     );
 
-    // Step 5. Assigning the zone identifier replaces only the field, so the
-    // host's embedded copy stays and the two spellings sit side by side.
     assert_eq!(
         handle.set(abi::CURLUPART_ZONEID, b"clown", 0),
         abi::CURLUE_OK,
@@ -1518,7 +2139,6 @@ fn the_host_setter_reports_every_address_fault_as_a_bad_hostname() {
             "{why}: the host setter reports one code for every fault"
         );
     }
-    // And the host is still the original, since none of those reached L1993.
     assert_eq!(
         handle.get(abi::CURLUPART_HOST, 0).1.as_deref(),
         Some(&b"example.org"[..]),
@@ -1885,8 +2505,6 @@ fn the_default_port_is_added_on_request_and_suppressed_on_request() {
         "80",
         "and answers per scheme, not with a fixed number",
     );
-    // Without the flag the same handle reports the part as missing, which is
-    // what makes the flag meaningful.
     let handle = parse(b"https://example.com/", 0).expect("base URL parses");
     expect_missing(
         &handle,
@@ -1916,7 +2534,6 @@ fn the_default_port_is_added_on_request_and_suppressed_on_request() {
          got {} instead",
         shown(&value)
     );
-    // A port that is not the default survives the same flag untouched.
     expect_part(
         b"https://example.com:8443/",
         0,
@@ -2068,7 +2685,6 @@ fn unit1653_addresses_that_survive_the_whole_pipeline() {
         "eth3",
         "unit1653.c L194: an unescaped zone identifier, expectation re-derived",
     );
-    // It serialises with the escape, so the two spellings converge on output.
     expect_url(
         unescaped,
         0,

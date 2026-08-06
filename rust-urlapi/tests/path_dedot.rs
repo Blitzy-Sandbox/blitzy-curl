@@ -5,53 +5,42 @@
 //! Dot-segment removal and the path stage, driven through the C surface.
 //!
 //! The behavioural authority for every expectation in this file is
-//! `lib/urlapi.c`; the vectors come from `tests/libtest/lib1560.c`. Both are
-//! read-only references and neither is edited. Every assertion below carries a
-//! comment naming the line of `lib/urlapi.c` that produces it, or the row of
-//! `tests/libtest/lib1560.c` it is ported from. An expectation without such a
-//! citation would be a guess, and a guess that happened to match the port
-//! would prove nothing.
+//! `lib/urlapi.c`; the vectors come from `tests/libtest/lib1560.c`. Every
+//! assertion below carries a comment naming the line of `lib/urlapi.c` that
+//! produces it, or the row of `tests/libtest/lib1560.c` it is ported from. An
+//! expectation without such a citation would be a guess.
 //!
-//! # What this file tests, and what it deliberately does not
+//! # Everything goes through the public API, and has to
 //!
 //! Three C functions do the work: `is_dot` at `lib/urlapi.c` L682-L697,
 //! `dedotdotify` at L716-L821, and `handle_path` at L1066-L1108, with
 //! `redirect_url` at L1214-L1284 feeding the last of them on the relative-URL
-//! path. None of the three is reachable from here, and that is intentional
-//! twice over.
+//! path. None of the three is reachable from here, for two independent reasons.
 //!
-//! * `src/lib.rs` L376-L390 exports only `abi` and `ffi`; `parse` and
-//!   everything beneath it is crate-private. There is no path from an
+//! * The module tree in `src/lib.rs` exports only `abi` and `ffi`; `parse`
+//!   and everything beneath it is crate-private. There is no path from an
 //!   integration test to `parse::path`.
 //! * `dedotdotify` carries the `UNITTEST` marker at `lib/urlapi.c` L715-L716,
 //!   so even the C exports it only in unit-test builds. It is not one of the
-//!   eight symbols the drop-in replacement must define, and widening the crate's
-//!   exported surface to reach it from a test would break the "no new API
-//!   surface" constraint the port is built under.
+//!   eight symbols the drop-in replacement must define, and widening the
+//!   crate's exported surface to reach it from a test would add API surface the
+//!   port may not add.
 //!
-//! So every case here goes through the public API: `curl_url()`, then
-//! `curl_url_set(CURLUPART_URL, ...)`, then `curl_url_get(CURLUPART_URL, ...)`
-//! and `curl_url_get(CURLUPART_PATH, ...)`, then `curl_url_cleanup()`. That is
-//! also how `tests/libtest/lib1560.c` itself reaches this code -- see its
-//! `set_url` driver at L1388-L1426 and its `get_url` driver at L1541-L1577 --
-//! so the coverage is expressed exactly as the authoritative oracle expresses
-//! it.
+//! So every case here goes through `curl_url()`, `curl_url_set(CURLUPART_URL,
+//! ...)`, `curl_url_get(CURLUPART_URL, ...)`, `curl_url_get(CURLUPART_PATH,
+//! ...)` and `curl_url_cleanup()` -- which is also how
+//! `tests/libtest/lib1560.c` reaches this code, in its `set_url` driver at
+//! L1388-L1426 and its `get_url` driver at L1541-L1577.
 //!
-//! # How the C entry points are reached
-//!
-//! Not by a Rust path. `src/ffi.rs` places all ten exported functions in a
-//! `pub(crate) mod exports`, which `src/lib.rs` documents as deliberate: every
-//! item that file declares is crate-private and they "reach the symbol table
-//! purely by attribute". `curl_urlapi_rs::ffi` is therefore an empty module
-//! from outside the crate, and naming `ffi::curl_url` here would not compile.
-//!
-//! This file declares the four entry points it needs in its own `extern "C"`
-//! block instead, mirroring `include/curl/urlapi.h` L113-L142, and lets the
-//! linker resolve them against the `#[no_mangle]` definitions in the `rlib`.
-//! That is strictly closer to the thing being validated: it is the same view a
-//! C consumer of the drop-in archive gets, so a mangled, missing or
-//! wrongly-typed export fails this file at link time rather than passing it on
-//! a Rust-internal path no C caller could use.
+//! Those entry points are reached by symbol rather than by Rust path.
+//! `src/ffi.rs` places all ten exported functions in a `pub(crate) mod
+//! exports`, so `curl_urlapi_rs::ffi` is an empty module from outside the crate
+//! and naming `ffi::curl_url` here would not compile. This file declares the
+//! four entry points it needs in its own `extern "C"` block, mirroring
+//! `include/curl/urlapi.h` L113-L142, and lets the linker resolve them against
+//! the `#[no_mangle]` definitions in the `rlib`. That is the same view a C
+//! consumer of the drop-in archive gets, so a mangled, missing or wrongly-typed
+//! export fails this file at link time.
 //!
 //! # Memory ownership
 //!
@@ -71,14 +60,6 @@
 //! `libc` is an unconditional `[dependencies]` entry, so it is available to
 //! this target in both configurations.
 //!
-//! # Testing posture
-//!
-//! These cases supplement the two authoritative oracles -- `lib1560.c` run
-//! unmodified through `rust-urlapi/harness/`, and the byte-for-byte demo diff
-//! -- and never substitute for them. No assertion here may be weakened to make
-//! something pass: if a case fails, the port is wrong and `src/parse/path.rs`
-//! or `src/parse/redirect.rs` is what needs fixing.
-//!
 //! Panicking is fine here. The crate root's denial of `unwrap`, `expect`,
 //! indexing and `panic!` binds library code, which must never let a panic reach
 //! the C boundary; a test's whole job is to panic on a failed assertion and it
@@ -90,10 +71,6 @@ use core::ffi::{c_char, c_uint, c_void, CStr};
 use std::ffi::CString;
 
 use curl_urlapi_rs::abi;
-
-// ---------------------------------------------------------------------------
-// The C surface
-// ---------------------------------------------------------------------------
 
 /// Opaque stand-in for `CURLU`.
 ///
@@ -138,10 +115,6 @@ extern "C" {
     ) -> abi::CURLUcode;
 }
 
-// ---------------------------------------------------------------------------
-// Feature-configuration plumbing
-// ---------------------------------------------------------------------------
-
 // This file must compile and pass under the crate's default features and under
 // the drop-in configuration, `--no-default-features --features idn-libidn2`.
 // The difference that reaches this file is the scheme backend, and it needs
@@ -180,16 +153,12 @@ extern "C" {
 // L1586-L1601 (act only under `CURLU_DEFAULT_PORT` or `CURLU_NO_DEFAULT_PORT`,
 // neither of which is passed here, and on `options`, which is always absent),
 // and L1645 (`set_url_scheme`, and `CURLUPART_SCHEME` is never set here). The
-// equivalence is not merely argued: the two configurations were run side by
-// side and produced identical output for all of the cases below.
+// equivalence is also checked rather than only argued, because `cargo test` in
+// both configurations has to give the same answers for every case below.
 
-/// Flags every vector adds to its own, to keep one set of expectations valid in
-/// both feature configurations. See the block comment above.
 #[cfg(feature = "scheme-table")]
 const MODE_FLAGS: c_uint = 0;
 
-/// Flags every vector adds to its own, to keep one set of expectations valid in
-/// both feature configurations. See the block comment above.
 #[cfg(not(feature = "scheme-table"))]
 const MODE_FLAGS: c_uint = abi::CURLU_NON_SUPPORT_SCHEME;
 
@@ -216,10 +185,6 @@ extern "C" fn Curl_get_scheme(_scheme: *const c_char) -> *const c_void {
 extern "C" fn Curl_getn_scheme(_scheme: *const c_char, _len: usize) -> *const c_void {
     core::ptr::null()
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 /// An owned URL handle that cleans itself up.
 ///
@@ -276,8 +241,17 @@ fn set_part(handle: &Handle, what: abi::CURLUPart, value: &str, flags: c_uint) -
 /// The single place in this file that touches a pointer the API returned. It
 /// copies the bytes out and releases the buffer with `libc::free` exactly once,
 /// honouring `docs/libcurl/curl_url_get.md` L45, and never writes through the
-/// pointer, honouring L46. `None` means no buffer was produced, which is what
-/// `lib/urlapi.c` L1552 guarantees for every failing code.
+/// pointer, honouring L46. `None` means no buffer was produced.
+///
+/// The returned code, not the pointer, decides whether a buffer exists, and the
+/// order matters. `lib/urlapi.c` L1552 stores null into the caller's slot on
+/// entry, before anything can fail, and every failing return sits after it -- so
+/// a failure is required to leave the slot null, and this function asserts that
+/// instead of assuming it. Dereferencing a pointer written by a *failing* call
+/// would be undefined behaviour, and a test that reaches for undefined behaviour
+/// exactly when the defect it hunts is present cannot report that defect. Only a
+/// `CURLUE_OK` result is read, and `tests/host_ip.rs` and the other suites order
+/// it identically.
 ///
 /// The copy goes through `String::from_utf8_lossy`. Every expectation in this
 /// file is ASCII, so for a correct port the conversion is exact; for an
@@ -295,13 +269,31 @@ fn get_part(
     // the one pointer the callee stores, and it is initialised to null first so
     // that the null test below is meaningful even if the callee wrote nothing.
     let code = unsafe { curl_url_get(handle.0, what, &mut content, flags) };
-    if content.is_null() {
+    if code != abi::CURLUE_OK {
+        // Nothing was produced, so there is nothing to read and nothing to
+        // release. The slot is checked rather than ignored: L1552's
+        // unconditional null is what lets a caller avoid releasing a stale
+        // pointer, so a violation is reported here, never dereferenced.
+        assert!(
+            content.is_null(),
+            "get part {what} flags {flags:#x} failed with {code} yet stored a \
+             pointer; lib/urlapi.c L1552 nulls the slot before any failing \
+             return can be taken"
+        );
         return (code, None);
     }
-    // SAFETY: `content` is non-null and, per the contract at
-    // `include/curl/urlapi.h` L130-L131, points at a NUL-terminated buffer this
-    // caller now owns. `CStr::from_ptr` only reads up to that terminator, and
-    // the bytes are copied before the buffer is released on the next line.
+    if content.is_null() {
+        // Success with no buffer is a real answer rather than a fault -- a blank
+        // part retrieved under `CURLU_GET_EMPTY` reaches it -- so it is reported
+        // as "no content" and which vectors arrive here stays a property of the
+        // vectors.
+        return (code, None);
+    }
+    // SAFETY: the call reported `CURLUE_OK` and `content` is non-null, so per the
+    // contract at `include/curl/urlapi.h` L130-L131 it points at a
+    // NUL-terminated buffer this caller now owns. `CStr::from_ptr` only reads up
+    // to that terminator, and the bytes are copied before the buffer is released
+    // on the next line.
     let owned = String::from_utf8_lossy(unsafe { CStr::from_ptr(content) }.to_bytes()).into_owned();
     // SAFETY: `content` was allocated by the crate's C-allocator adapter, has
     // not been freed, and is freed exactly once here. See the module
@@ -348,10 +340,6 @@ fn path_of(handle: &Handle, getflags: c_uint) -> String {
     content.expect("CURLUE_OK from curl_url_get(CURLUPART_PATH) without a buffer")
 }
 
-// ---------------------------------------------------------------------------
-// Vector tables
-// ---------------------------------------------------------------------------
-
 /// One row of a parse-then-read case, modelled on `struct urltestcase` at
 /// `tests/libtest/lib1560.c` L125-L131.
 ///
@@ -360,15 +348,10 @@ fn path_of(handle: &Handle, getflags: c_uint) -> String {
 /// succeed, and adds `path` so a failure localises to the path stage instead of
 /// only to serialisation.
 struct GetCase {
-    /// The URL handed to `curl_url_set(CURLUPART_URL, ...)`.
     input: &'static str,
-    /// What `curl_url_get(CURLUPART_URL, ...)` must return.
     url: &'static str,
-    /// What `curl_url_get(CURLUPART_PATH, ...)` must return.
     path: &'static str,
-    /// Flags for the set, before [`MODE_FLAGS`] is added.
     urlflags: c_uint,
-    /// Where the row comes from, quoted in the failure message.
     origin: &'static str,
 }
 
@@ -376,19 +359,12 @@ struct GetCase {
 /// `tests/libtest/lib1560.c` L88-L95, with the same added `path` column as
 /// [`GetCase`].
 struct RedirCase {
-    /// The base URL, set first.
     base: &'static str,
-    /// The value then handed to `curl_url_set(CURLUPART_URL, ...)`.
     relative: &'static str,
-    /// What `curl_url_get(CURLUPART_URL, ..., 0)` must then return.
     url: &'static str,
-    /// What `curl_url_get(CURLUPART_PATH, ..., 0)` must then return.
     path: &'static str,
-    /// Flags for the base set, before [`MODE_FLAGS`] is added.
     urlflags: c_uint,
-    /// Flags for the relative set, before [`MODE_FLAGS`] is added.
     setflags: c_uint,
-    /// Where the row comes from, quoted in the failure message.
     origin: &'static str,
 }
 
@@ -456,10 +432,6 @@ fn run_redir_cases(cases: &[RedirCase]) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CURLU_PATH_AS_IS: the on/off pair
-// ---------------------------------------------------------------------------
-
 /// `CURLU_PATH_AS_IS` decides whether dot segments survive the parse.
 ///
 /// The pair is `tests/libtest/lib1560.c` L779-L781 and L782-L784: the same
@@ -495,10 +467,6 @@ fn path_as_is_decides_whether_dot_segments_survive() {
         },
     ]);
 }
-
-// ---------------------------------------------------------------------------
-// The percent-encoded dot
-// ---------------------------------------------------------------------------
 
 /// `%2e` and `%2E` are dots, and mixing the two forms changes nothing.
 ///
@@ -628,10 +596,6 @@ fn only_e_and_capital_e_complete_the_encoded_dot() {
         },
     ]);
 }
-
-// ---------------------------------------------------------------------------
-// The rest of the dot-removal rows from set_url_list
-// ---------------------------------------------------------------------------
 
 /// The dot-removal and relative-resolution rows of `set_url_list`, ported.
 ///
@@ -803,10 +767,6 @@ fn set_url_list_dot_and_relative_rows() {
     ]);
 }
 
-// ---------------------------------------------------------------------------
-// Behaviours no row of the C table isolates
-// ---------------------------------------------------------------------------
-
 /// `CURLU_PATH_AS_IS` is force-cleared when a relative URL is applied.
 ///
 /// `redirect_url` rebuilds the combined URL and re-parses it with
@@ -915,6 +875,140 @@ fn the_path_is_encoded_before_dot_segments_are_removed() {
     ]);
 }
 
+/// Relative resolution and `CURLU_URLENCODE` in one call: the tail is encoded,
+/// the authority is not, and the dot segments still go.
+///
+/// Everything up to here has exercised those mechanisms one at a time. This is
+/// the public path that runs all of them in a single `curl_url_set`, and it is
+/// the only place `urlencode_str`'s `relative` argument is observable at all.
+///
+/// # The one call site where the host exemption is live
+///
+/// `redirect_url` ends at `lib/urlapi.c` L1275 with
+/// `urlencode_str(&urlbuf, useurl, strlen(useurl), !host_changed, FALSE)`. That
+/// fourth argument is `relative`, and this is the only call in the file that
+/// can pass it as FALSE -- `urlget_format` hardcodes TRUE at L1395. FALSE
+/// switches on the block at L138-L148, which calls `find_host_sep` (L104-L118),
+/// copies everything up to the first `/` or `?` after a `//` **verbatim**, and
+/// encodes only what follows. The in-source comment at L124-L127 gives the
+/// reason: encoding a hostname would break internationalised-domain resolution.
+///
+/// `host_changed` is TRUE for exactly one of the four branches, the
+/// protocol-relative one at L1232-L1238, so:
+///
+/// * a **plain relative** value is encoded end to end -- the base's own
+///   authority is not at risk, because L1272 copies the base prefix straight
+///   out of the base and only `useurl` reaches the encoder;
+/// * a **protocol-relative** value carries its own authority, and that
+///   authority is what the exemption protects.
+///
+/// # How "verbatim" is made observable
+///
+/// A space is the only byte that can demonstrate it. The encoder substitutes
+/// three classes -- a space, a byte below `0x20` and a byte at or above `0x7f`
+/// (L151-L161) -- and of those only the space can survive the re-parse inside
+/// an authority: `hostname_check` at L457 rejects a space in a *host*, and a
+/// byte below 0x20 or 127 is refused by `Curl_junkscan` before that. But the
+/// exemption covers the whole authority, userinfo included, and a space is legal
+/// in the userinfo -- `parse_hostname_login` splits at the `@` and percent-
+/// decodes with `REJECT_CTRL`, which passes 0x20. So a space in the **user** of
+/// a protocol-relative value comes back as a space if and only if the authority
+/// was copied verbatim; had the encoder touched it, it would come back as
+/// `%20`, and would then have been decoded to a space again by a *different*
+/// mechanism -- which is why the assertion below reads the user part rather
+/// than inferring from the whole URL alone.
+///
+/// `CURLU_ALLOW_SPACE` is therefore required on the call, and not incidentally:
+/// L1276-L1277 re-parses the rebuilt URL, and `Curl_junkscan` refuses a raw
+/// space without it (L232-L235). The same re-parse is what removes the dot
+/// segments, and it is handed `flags & ~CURLU_PATH_AS_IS`, so the third row
+/// below asserts that a caller passing `CURLU_PATH_AS_IS` alongside
+/// `CURLU_URLENCODE` still gets its dots removed --
+/// [`path_as_is_is_cleared_on_the_relative_url_path`] pins that clearing on its
+/// own, and this row is the combination.
+#[test]
+fn a_relative_url_is_encoded_without_its_authority_being_encoded() {
+    run_redir_cases(&[
+        RedirCase {
+            // Plain relative, so `relative` is TRUE and the whole value is
+            // encoded: the space becomes %20 while `left` still holds (L152).
+            // The base is cut after its last slash (L1259-L1264), its query and
+            // fragment go with the cut, and `.`/`..` are resolved by the
+            // re-parse.
+            base: "http://example.org/a/b/c?q=1#f",
+            relative: "../d e/./f/../g",
+            url: "http://example.org/a/d%20e/g",
+            path: "/a/d%20e/g",
+            urlflags: 0,
+            setflags: abi::CURLU_URLENCODE | abi::CURLU_ALLOW_SPACE,
+            origin: "derived from lib/urlapi.c:1275 with relative=TRUE",
+        },
+        RedirCase {
+            // Protocol-relative, so `host_changed` is TRUE and `relative` is
+            // FALSE. `find_host_sep` stops at the first slash of
+            // `us er@ex.org/p q/...`, so `us er@ex.org` is copied byte for byte
+            // -- the space in the userinfo included -- and only `/p q/./x/../y`
+            // is encoded. The base is cut at the start of its host (L1235-L1237),
+            // so the base's own user, query and fragment all go.
+            base: "http://user@example.org/a/b?q=1#f",
+            relative: "//us er@ex.org/p q/./x/../y",
+            url: "http://us er@ex.org/p%20q/y",
+            path: "/p%20q/y",
+            urlflags: 0,
+            setflags: abi::CURLU_URLENCODE | abi::CURLU_ALLOW_SPACE,
+            origin: "derived from lib/urlapi.c:1275 with relative=FALSE",
+        },
+        RedirCase {
+            // The same protocol-relative value with CURLU_PATH_AS_IS added.
+            // L1277 clears it before the re-parse, so the answer is identical to
+            // the row above: encoding happens, and so does dot removal.
+            base: "http://user@example.org/a/b?q=1#f",
+            relative: "//us er@ex.org/p q/./x/../y",
+            url: "http://us er@ex.org/p%20q/y",
+            path: "/p%20q/y",
+            urlflags: 0,
+            setflags: abi::CURLU_URLENCODE | abi::CURLU_ALLOW_SPACE | abi::CURLU_PATH_AS_IS,
+            origin: "derived from lib/urlapi.c:1275-1277",
+        },
+    ]);
+
+    // The authority, read part by part, because that is the claim the rows above
+    // cannot make on their own: a whole-URL read would show the same bytes
+    // whether the space had survived the encoder or been encoded and then
+    // decoded by the re-parse.
+    let handle = parsed("http://user@example.org/a/b?q=1#f", 0);
+    let code = set_part(
+        &handle,
+        abi::CURLUPART_URL,
+        "//us er@ex.org/p q/./x/../y",
+        abi::CURLU_URLENCODE | abi::CURLU_ALLOW_SPACE | MODE_FLAGS,
+    );
+    assert_eq!(code, abi::CURLUE_OK, "the protocol-relative set failed");
+
+    let (code, user) = get_part(&handle, abi::CURLUPART_USER, 0);
+    assert_eq!(code, abi::CURLUE_OK, "the resolved URL has a user");
+    assert_eq!(
+        user.as_deref(),
+        Some("us er"),
+        "the authority is copied verbatim, so the space is still a space"
+    );
+
+    let (code, host) = get_part(&handle, abi::CURLUPART_HOST, 0);
+    assert_eq!(code, abi::CURLUE_OK, "and a host");
+    assert_eq!(host.as_deref(), Some("ex.org"), "which came from the value");
+
+    // The base's query went with the cut at L1235-L1237, which is the other half
+    // of "the authority changed": nothing of the old authority or of what
+    // followed it survives.
+    let (code, query) = get_part(&handle, abi::CURLUPART_QUERY, 0);
+    assert_eq!(
+        code,
+        abi::CURLUE_NO_QUERY,
+        "the base's query does not survive a protocol-relative resolution"
+    );
+    assert!(query.is_none(), "and no buffer is written for it");
+}
+
 /// A path of one byte or none is not stored, and the getter reports `/` anyway.
 ///
 /// Two independent steps, and they are worth separating because they can hide
@@ -1011,4 +1105,218 @@ fn paths_that_collapse_entirely() {
         "",
         "CURLUPART_PATH for file:./ is present but empty (lib/urlapi.c:814-818)"
     );
+}
+
+/// The leading-dot prologue, all four of its branches, reached from a real URL.
+///
+/// `dedotdotify` runs rules A and D once, before the loop, on a path whose first
+/// byte is a dot -- `lib/urlapi.c` L728-L755. That prologue is *separate code*
+/// from the `/./` and `/../` handling inside the loop at L757-L811, and it is
+/// the only part of the function a path beginning with a slash can never reach.
+/// Every path this crate sees through an `http:` URL begins with a slash,
+/// because `parseurl` L1143-L1144 sets the path to what `strcspn(hostp, "/?#")`
+/// stopped at and a relative value is resolved against a base first. So the
+/// prologue has exactly one public door: a `file:` URL, where `parse_file`
+/// L835-L836 takes the path from `&url[5]` and does not require a slash there.
+///
+/// The four branches, and what distinguishes each from the others:
+///
+/// * L734-L736, `.` alone. Consumed, nothing left, jump to `end`. Covered by
+///   `file:./` in [`paths_that_collapse_entirely`] and by `file:%2e/x` below.
+/// * L737-L741, `./` followed by more. The prefix goes, the remainder is the
+///   path.
+/// * L746-L748, `..` alone at the end. Both dots consumed, jump to `end`.
+/// * L749-L753, `../` followed by more. The three bytes go, the remainder is
+///   the path.
+///
+/// # The row that pins "once, not repeatedly"
+///
+/// `file:../../y` gives `../y`, not `y`. The prologue is a straight-line `if`
+/// rather than a loop, so it strips the *first* `../` and the loop then copies
+/// what remains verbatim -- L757's body only recognises a dot segment after a
+/// slash, and `../y` starts with a dot. A port that wrapped the prologue in a
+/// `while` would produce `y` here and pass every other row in this file.
+///
+/// # The encoded spelling is the same code
+///
+/// `is_dot` at L682-L697 accepts `%2e` in either case as well as a literal dot,
+/// and the prologue calls it twice, so `%2e%2e/x` takes exactly the L749-L753
+/// branch that `../x` takes. The rows below pair each literal form with its
+/// encoded one. `only_e_and_capital_e_complete_the_encoded_dot` covers which
+/// third bytes qualify; this covers where in the path they may appear.
+///
+/// # And one input that never gets that far
+///
+/// `file:.` is seven bytes -- wait, six -- and `parse_file` L830-L832 rejects
+/// anything of six or fewer with `CURLUE_BAD_FILE_URL` before a path exists at
+/// all. It is here so that the shortest spelling of the L734-L736 branch is not
+/// silently assumed to reach it.
+#[test]
+fn the_leading_dot_prologue_is_reached_through_a_file_url() {
+    // L749-L753 and its encoded twin: `../` at the front, something after it.
+    for input in ["file:../x", "file:%2e%2e/x", "file:%2E%2E/x"] {
+        let handle = parsed(input, 0);
+        assert_eq!(
+            path_of(&handle, 0),
+            "x",
+            "CURLUPART_PATH for {input:?} (lib/urlapi.c:749-753)"
+        );
+        // The file arm of `urlget_url` at L1441-L1446 prints `u->path` with no
+        // `/` default of its own, so a path with no leading slash serialises
+        // straight after the two slashes of `file://`.
+        assert_eq!(
+            whole_url(&handle, 0),
+            "file://x",
+            "CURLUPART_URL for {input:?} (lib/urlapi.c:1441-1446)"
+        );
+    }
+
+    // L746-L748 and its encoded twin: `..` and nothing after it. `goto end`
+    // with an empty buffer, so L812-L818 stores an allocated empty string --
+    // the same outcome `file:./` reaches through L734-L736.
+    for input in ["file:..", "file:%2e%2e", "file:%2E%2E"] {
+        let handle = parsed(input, 0);
+        assert_eq!(
+            path_of(&handle, 0),
+            "",
+            "CURLUPART_PATH for {input:?} (lib/urlapi.c:746-748 and 812-818)"
+        );
+        assert_eq!(
+            whole_url(&handle, 0),
+            "file://",
+            "CURLUPART_URL for {input:?}"
+        );
+    }
+
+    // L737-L741, the single-dot-then-slash branch, in its encoded spelling. The
+    // literal `file:./` is in `paths_that_collapse_entirely`; this is the same
+    // branch with something left over, which that row does not have.
+    let handle = parsed("file:%2e/x", 0);
+    assert_eq!(
+        path_of(&handle, 0),
+        "x",
+        "CURLUPART_PATH for file:%2e/x (lib/urlapi.c:737-741)"
+    );
+    assert_eq!(whole_url(&handle, 0), "file://x");
+
+    // The prologue runs once. See the note above -- this is the row that says
+    // so, and it is the reason the branch cannot be implemented as a loop.
+    let handle = parsed("file:../../y", 0);
+    assert_eq!(
+        path_of(&handle, 0),
+        "../y",
+        "CURLUPART_PATH for file:../../y: the prologue strips one prefix, not all \
+         of them (lib/urlapi.c:728-755)"
+    );
+    assert_eq!(whole_url(&handle, 0), "file://../y");
+
+    // The prologue hands its remainder to the loop, which then does its own
+    // work: `../a/../b` loses the leading `../` at L749-L753 and the inner
+    // `/../` to rule C at L790-L796.
+    let handle = parsed("file:../a/../b", 0);
+    assert_eq!(
+        path_of(&handle, 0),
+        "a/b",
+        "CURLUPART_PATH for file:../a/../b: prologue then rule C"
+    );
+    assert_eq!(whole_url(&handle, 0), "file://a/b");
+
+    // And the length gate, which answers before any of the above.
+    let handle = new_handle();
+    let code = set_part(&handle, abi::CURLUPART_URL, "file:.", MODE_FLAGS);
+    assert_eq!(
+        code,
+        abi::CURLUE_BAD_FILE_URL,
+        "file: URLs of six bytes or fewer are rejected at lib/urlapi.c:830-832, \
+         before a path exists to dedot"
+    );
+}
+
+/// The late `set_url` rows, where dot removal has to leave the credentials in
+/// place.
+///
+/// `tests/libtest/lib1560.c` L1364-L1375, three consecutive rows that every
+/// other test in this file skips. They matter because `redirect_url` at
+/// `lib/urlapi.c` L1214-L1284 does not edit the handle: it serialises the old
+/// URL, splices the relative part onto the text, and re-parses the result at
+/// L1277. So the user and the password survive a `../../` only if they were
+/// serialised into that intermediate text and parsed back out of it, and a port
+/// that resolved the path *in place* instead would drop them while producing the
+/// right path.
+///
+/// The rows are driven the way `set_url` drives them at L1388-L1426 -- set the
+/// base, set the relative value over it, read the whole URL with flags of zero
+/// -- and then the parts are read as well, which the C row does not do. That is
+/// the point: `http://user:foo@example.com/newpage` is what the C compares, and
+/// the parts are what say *why* it is right.
+#[test]
+fn late_redirect_rows_keep_the_credentials_across_dot_removal() {
+    // L1364-L1367, the row with no credentials, so the pair below is a
+    // comparison rather than a single observation. `../../` climbs past the
+    // root, which rule C at L779-L796 clamps to `/`, and the fragment comes
+    // from the relative value rather than the base.
+    run_redir_cases(&[
+        RedirCase {
+            base: "http://example.com/path?query#frag",
+            relative: "../../newpage#foo",
+            url: "http://example.com/newpage#foo",
+            path: "/newpage",
+            urlflags: 0,
+            setflags: 0,
+            origin: "tests/libtest/lib1560.c:1364-1367",
+        },
+        RedirCase {
+            base: "http://user:foo@example.com/path?query#frag",
+            relative: "../../newpage",
+            url: "http://user:foo@example.com/newpage",
+            path: "/newpage",
+            urlflags: 0,
+            setflags: 0,
+            origin: "tests/libtest/lib1560.c:1368-1371",
+        },
+        RedirCase {
+            base: "http://user:foo@example.com/path?query#frag",
+            relative: "../newpage",
+            url: "http://user:foo@example.com/newpage",
+            path: "/newpage",
+            urlflags: 0,
+            setflags: 0,
+            origin: "tests/libtest/lib1560.c:1372-1375",
+        },
+    ]);
+
+    // The same two rows again, with the credentials read as parts. `../../` and
+    // `../` reach the root by different routes -- two applications of rule C
+    // against a one-segment path versus one -- and both must leave the user and
+    // the password exactly as the base had them.
+    for relative in ["../../newpage", "../newpage"] {
+        let handle = parsed("http://user:foo@example.com/path?query#frag", 0);
+        let code = set_part(&handle, abi::CURLUPART_URL, relative, MODE_FLAGS);
+        assert_eq!(
+            code,
+            abi::CURLUE_OK,
+            "setting {relative:?} over the credentialled base failed with {code}"
+        );
+        let (code, user) = get_part(&handle, abi::CURLUPART_USER, 0);
+        assert_eq!(code, abi::CURLUE_OK, "the user survived {relative:?}");
+        assert_eq!(user.as_deref(), Some("user"));
+        let (code, password) = get_part(&handle, abi::CURLUPART_PASSWORD, 0);
+        assert_eq!(code, abi::CURLUE_OK, "the password survived {relative:?}");
+        assert_eq!(password.as_deref(), Some("foo"));
+        // And the base's query and fragment did not, because the re-parse at
+        // L1277 sees a URL the splice built without them: L1265-L1269 truncates
+        // the base at its last slash after stripping any `?` or `#`.
+        let (code, _) = get_part(&handle, abi::CURLUPART_QUERY, 0);
+        assert_eq!(
+            code,
+            abi::CURLUE_NO_QUERY,
+            "the base's query did not survive {relative:?}"
+        );
+        let (code, _) = get_part(&handle, abi::CURLUPART_FRAGMENT, 0);
+        assert_eq!(
+            code,
+            abi::CURLUE_NO_FRAGMENT,
+            "the base's fragment did not survive {relative:?}"
+        );
+    }
 }

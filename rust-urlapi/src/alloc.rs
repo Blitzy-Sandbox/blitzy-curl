@@ -107,11 +107,26 @@
 //! accounting wrong, because the matching allocation was never logged in
 //! the tracking table. There is no fix available from inside this
 //! directory, so the parity harness is built *without* the memory-debug
-//! configuration. The visible cost is the `Allocations: 3000` ceiling
-//! asserted by `tests/data/test1560`: curl's allocation counter belongs to
-//! the memory-debug build, so it does not run and **that ceiling is not
-//! measured in this configuration**. No substitute measurement is claimed.
-//! This is reported, not worked around.
+//! configuration. The visible cost is that curl's own allocation counter
+//! belongs to that build and so does not run, which means the
+//! `Allocations: 3000` ceiling asserted by `tests/data/test1560` cannot be
+//! checked by the mechanism that wrote it. This is reported, not worked
+//! around.
+//!
+//! The ceiling itself *is* measured, by the substitute `AAP` 0.9.4 names --
+//! an independent count from the platform's own tooling, in the same
+//! `mallocs + callocs + reallocs` accounting `tests/memanalyzer.pm:L439`
+//! uses. Interposed around the parity harness, the unmodified
+//! `tests/libtest/lib1560.c` costs 3,046 allocations linked against this
+//! crate and 3,114 linked against the reference `libcurl.a`, so the port is
+//! the cheaper of the two for the identical test; and
+//! `rust-urlapi/tests/ffi_surface.rs`'s
+//! `the_allocation_count_stays_within_the_test1560_ceiling` reproduces the
+//! same accounting inside `cargo test`, over a fixed twenty-four-vector
+//! workload, and enforces the 3,000 ceiling along with a per-cycle budget
+//! and a created-equals-destroyed balance. `../docs/MEMORY-OWNERSHIP.md`
+//! carries both sets of numbers and the one accounting subtlety they turn
+//! on.
 //!
 //! # Reported limitation R4: alternative memory functions
 //!

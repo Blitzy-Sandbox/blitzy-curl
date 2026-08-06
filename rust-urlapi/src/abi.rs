@@ -35,13 +35,18 @@
 //! and change 33 numbers at once without producing a single compiler error.
 //! An explicit constant cannot drift, and a wrong one is visible in a diff.
 //!
-//! Second, the values are asserted rather than merely written once.
-//! `src/lib.rs` asserts every one of them at compile time, which is the check
-//! in force, and the small `tests` module at the end of this file is the fast
-//! local one. A second, run-time pass over the same set is to live in
-//! `rust-urlapi/tests/abi_constants.rs`; that file is a later deliverable and
-//! does not exist yet, so nothing here should be read as saying it already
-//! rechecks these values.
+//! Second, the values are asserted rather than merely written once, in three
+//! places that fail in three different ways. `src/lib.rs` asserts every one of
+//! them at **compile time**, so a wrong constant fails the build rather than
+//! the parity run. The small `tests` module at the end of this file is the
+//! fast local check. And `rust-urlapi/tests/abi_constants.rs` is the run-time
+//! pass over the same set: it exists, it is one of the crate's five Cargo
+//! integration tests, and it re-derives all 33 result codes, 11 part
+//! identifiers and 16 flag bits from this module's `pub` constants -- which is
+//! why the module is `pub` at all. It checks the properties the literals alone
+//! cannot show, contiguity and uniqueness of the ordinals and the bit union of
+//! the flags, so the three checks overlap deliberately rather than
+//! redundantly.
 //!
 //! # The header is the only authority
 //!

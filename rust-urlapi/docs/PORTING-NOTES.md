@@ -1023,10 +1023,15 @@ package, so `cargo build --release` asks for the archive, the rlib and the
 cdylib together, Cargo stops at the first failing link, and a refused cdylib
 means no archive and no rlib either -- exit 101 with nothing written, against a
 plan that requires that command to succeed at 0.9.2 `A1`. So the drop-in
-release build gets a `cargo:warning` instead, naming
+release build records a notice instead, naming
 `libcurl_urlapi_rs.so` a non-deliverable, why it cannot load, and the archive
-to consume in its place. `CURL_URLAPI_STRICT_CDYLIB=1` restores the refusal for
-a caller who would rather have it than a warning.
+to consume in its place. The notice goes to the build script's captured output
+and to `DROP-IN-CDYLIB-NOTICE.txt` in OUT_DIR rather than to `cargo:warning`,
+because a diagnostic that fires on every build of a supported configuration is
+one nobody can clear and 0.9.2 `A1` asks both configurations to build cleanly;
+`docs/KNOWN-DIVERGENCES.md` argues that at length under "Why the notice is not
+a `cargo:warning`". `CURL_URLAPI_STRICT_CDYLIB=1` restores the refusal for a
+caller who would rather have it than a record.
 
 `cargo check` and `cargo clippy` are unaffected by the directive, which Cargo
 applies to the cdylib link alone.

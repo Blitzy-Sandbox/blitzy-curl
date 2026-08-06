@@ -210,10 +210,12 @@
 //! rather than as a Rust `enum`, whose discriminants would be exactly as
 //! implicit as C's. The assertion block at the bottom of this file re-checks
 //! every one of them at compile time, so an edit that reorders a constant
-//! fails the build rather than the parity run. A second, run-time check of the
-//! same set is to live in `rust-urlapi/tests/abi_constants.rs`; that file is a
-//! later deliverable and does not exist yet, so the compile-time block is the
-//! whole of the verification today.
+//! fails the build rather than the parity run. The run-time half of the same
+//! check is `rust-urlapi/tests/abi_constants.rs`, one of the crate's five
+//! Cargo integration tests: it reads the constants back through the `pub`
+//! [`abi`] module and adds the structural properties the literals cannot show
+//! on their own -- that the ordinals are contiguous and unique and that the
+//! sixteen flag bits are distinct and union to the expected mask.
 //!
 //! # Faithfully reproduced findings
 //!
@@ -356,12 +358,13 @@
 //
 // `abi` is public because the ABI constants are not cross-module helpers.
 // They mirror the public C header and are part of what this crate promises,
-// and the planned `rust-urlapi/tests/abi_constants.rs` is a Cargo integration
-// test, which links this crate as an external crate and can therefore name
-// only `pub` items. That file does not exist yet, so the `pub` is currently
-// there for the run-time half of the verification to become possible rather
-// than because something already uses it. `ffi` is public because it is the
-// facade.
+// and `rust-urlapi/tests/abi_constants.rs` is a Cargo integration test, which
+// links this crate as an external crate and can therefore name only `pub`
+// items. That file reads every one of the 60 constants back through this
+// module, so the `pub` is load-bearing rather than anticipatory: making it
+// private again breaks the run-time half of the ABI verification.
+// `rust-urlapi/tests/ffi_surface.rs` reaches it the same way. `ffi` is public
+// because it is the facade.
 //
 // Neither widens the C ABI, which is the reasonable first worry about a `pub
 // mod` in a crate whose export set is audited. A cdylib exposes symbols the
