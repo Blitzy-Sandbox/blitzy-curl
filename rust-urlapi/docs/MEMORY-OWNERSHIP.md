@@ -352,61 +352,103 @@ returned with the URL API". That is the contract the whole arrangement above
 exists to satisfy: the getter's buffers come from the C allocator through
 `src/alloc.rs` and are owned by the caller, not by the handle.
 
-The tempting way to test it is to retrieve a part, clean the handle up, and
-then read the buffer back. That shape is **fail-unsafe, exactly when it
-matters**. If the defect it hunts is present, cleanup has released that
-block and the read is a use-after-free: the test commits undefined behavior
-instead of reporting the violation, and under a hardened or sanitizing
-allocator it aborts with a diagnostic about the test rather than failing with
-one about the implementation. A test may not prove liveness by reading memory
-after the operation under test, so this crate does not.
+Two shapes of test were tried and rejected, and both are recorded because both
+look reasonable and both are **fail-unsafe exactly when the contract is
+broken**. A test that is unsound in the presence of the defect it hunts is
+worth less than no test: it reports undefined behavior instead of a violation,
+and under a hardened or sanitizing allocator it aborts with a diagnostic about
+the *test*.
 
-Three instruments cover the contract between them, and none of them reads or
-releases the block under test after cleanup.
+*Rejected: read the buffer back afterwards.* Retrieve a part, clean the handle
+up, then read the buffer. If cleanup did release that block, the read is a
+use-after-free.
 
-**One, structural independence, deterministic.**
-`tests/ffi_surface.rs::a_returned_buffer_is_independent_of_the_handle_that_produced_it`
-releases the *buffer* first -- always sound -- and then reads all eleven
-parts of the still-live handle and asserts every one is unchanged.
-Independence is symmetric, so observing it in this direction establishes it
-in both: had the getter handed out a pointer into the handle's own storage,
-freeing the buffer would have disturbed the handle, and those reads would
-disagree.
+*Rejected: prove liveness by releasing something else first.* Release the
+*buffer* and then read the handle, on the reasoning that independence is
+symmetric. It is -- but the reasoning is about the conclusion, not about the
+operation: if the getter had handed out a pointer into the handle's own storage,
+that release frees memory the handle still uses and every read after it is a
+use-after-free. Freeing something and then asking whether that was allowed is
+never a sound order.
 
-**Two, allocator instrumentation, no dereference.**
-`tests/ffi_surface.rs::cleanup_does_not_recycle_a_previously_returned_string`
-records the block's address as a plain integer -- taking an address is not a
-dereference -- runs the cleanup, and then asks the C allocator whether that
-block has come back to it, by replaying the identical request eight times and
-keeping every reply alive so each replay samples a distinct block. Replaying
-the same operation makes the request size exact by construction, which no
-hand-picked `malloc` size could guarantee. A false failure is impossible: a
-live allocation can never be handed out twice. The final release of the block
-is *guarded* by that assertion rather than being the evidence for it, so on a
-failing path the assertion panics first and no double free can occur.
+*Rejected: probe for recycling.* Replay the identical request after the cleanup
+and check the block is not handed back. This avoids the dereference, and it is
+what an earlier revision of this file described, but it has two faults. It is
+evidence rather than proof -- an allocator may satisfy a request without reusing
+the most recently freed block, so a wrongly freed block can go unnoticed -- and
+it leaves the final release of that block resting on the probe's verdict, so a
+probe that missed the defect ends in a double free.
 
-Its sensitivity was measured rather than assumed. With the defect simulated
--- the buffer released before the cleanup, so the block genuinely is on the
-free list -- the probe caught the recycled address on the second replay, in
-five consecutive runs out of five. Eight replays therefore carry a wide
-margin.
+**What the crate does instead: ask the allocator, and touch nothing.**
+`tests/ffi_surface.rs` interposes `malloc`, `calloc`, `realloc` and `free` in
+the test binary -- the same `count` module the allocation ceiling is measured
+with -- and records, for a watched window, the *address* of every block created
+and every block destroyed. An address is taken as an integer and is never
+dereferenced, so the record stays valid evidence whatever happens to the block
+it names. Three properties follow, and together they are what makes the two
+tests below sound rather than merely passing:
 
-**Three, an external memory checker, deterministic, for the direction neither
-test can observe safely.** The raw sequence -- retrieve, clean up, read, then
-release -- was run under Valgrind's Memcheck against the crate. Memcheck
-intercepts the allocator, so it judges the read on its own account:
+**One, independence, established positively.**
+`a_returned_buffer_is_independent_of_the_handle_that_produced_it` watches the
+`curl_url_get()` call itself and asserts that the pointer it returned is a block
+the allocator handed out **during** that call. A block that came into existence
+inside the call cannot be interior storage of a handle that existed before it,
+which is what "independent allocation" means. The bytes and all eleven parts of
+the still-live handle are then read with nothing released; the buffer is
+released last, its release is watched and must give back exactly one block, and
+only then -- with the provenance already established -- is the handle read
+again. That final read is sound *because* of the evidence, which is the whole
+difference between this shape and the second rejected one.
+
+**Two, the cleanup's frees, observed directly.**
+`cleanup_does_not_recycle_a_previously_returned_string` records the buffer's
+address, watches the `curl_url_cleanup()` call, and asserts the address is
+**not** among the blocks the cleanup gave back. That is the contract's own
+question answered by direct observation rather than inference, and it holds
+whatever the allocator does afterwards. It also asserts the cleanup released
+more than one block, because a cleanup that released almost nothing would
+satisfy the first assertion without meaning anything.
+
+**Three, the release cannot be skipped, repeated or mis-ordered.** Every buffer
+kept past the call that produced it is held in an owning wrapper whose `Drop`
+performs the single release. An assertion firing between the retrieval and the
+release therefore does not abandon the block, ownership being unique means no
+ordering can release it twice, and tying the release to the end of the scope is
+what makes "read the handle, *then* let the buffer go" the default rather than
+something each test has to remember. Both tests check the return code before the
+pointer is looked at, and the helpers that release a getter buffer assert the
+null-on-error contract -- `lib/urlapi.c:L1552` writes null into the caller's
+slot ahead of every failing return -- rather than assuming it.
+
+**The instrument is calibrated, not trusted.**
+`the_address_ledgers_report_what_the_allocator_did` drives the two ledgers with
+blocks it owns outright, through `libc::malloc` and `libc::free` directly rather
+than through the crate, so that a failure there is unambiguously the
+instrument's. It asserts that a creation inside a window is seen, that a release
+inside a window is seen, that a block which existed before the window and is
+still alive after it appears on neither ledger, and that a window with more
+events than the ledger holds sets its overflow flag. The last two are the ones
+that matter: "absent from the destroyed ledger" is the answer the ownership
+tests read as "the contract held", so it has to mean "nothing happened to this
+block" and not "the ledger was empty or full". Both tests assert the overflow
+flag is clear before reading anything else.
+
+**And an external memory checker, for the direction no test can observe
+safely.** The raw sequence the first rejected shape describes -- retrieve, clean
+up, read, then release -- was run under Valgrind's Memcheck against the crate.
+Memcheck intercepts the allocator, so it judges the read on its own account:
 
     retrieve, cleanup, read, release   ERROR SUMMARY: 0 errors from 0 contexts
     control: release, then read        Invalid read of size 1  (exit code 42)
 
-The control line is the same read with the buffer deliberately released
-first, and it is there because an instrument that reports nothing is only
-evidence once it has been shown able to report something. Cleanup leaves the
-buffer intact; a genuinely freed buffer is flagged. The probe itself is a
-throwaway and is not part of the crate, which is why the result is recorded
-here rather than as a committed test.
+The control line is the same read with the buffer deliberately released first,
+and it is there because an instrument that reports nothing is only evidence once
+it has been shown able to report something. Cleanup leaves the buffer intact; a
+genuinely freed buffer is flagged. That probe is a throwaway and is not part of
+the crate -- committing it would commit the unsound sequence -- which is why the
+result is recorded here instead.
 
-Curl's own allocation counter is not available as a fourth instrument, for
+Curl's own allocation counter is not available as a further instrument, for
 the reason the next section gives.
 
 ## Reported limitation R3: memory-debug builds
@@ -462,20 +504,44 @@ libidn2 activity that curl's own counter never attributed to curl; the
 reference passes the 3,000 limit under that counter, and the port costs less
 than the reference under this one.
 
-**Inside the crate's own suite.**
-`rust-urlapi/tests/ffi_surface.rs`'s
-`the_allocation_count_stays_within_the_test1560_ceiling` reproduces the same
-accounting without any external tooling: it defines `malloc`, `calloc`,
-`realloc` and `free` in the test binary and forwards them to the same glibc
-aliases, so the crate's own `libc::malloc` calls are counted with nothing
-added to the library. A fixed workload of twenty-four `lib1560` vectors, each
-parsed, read part by part, serialised under two codec flag sets, duplicated
-and amended, costs **575 allocations** and leaves nothing outstanding --
-identical in all four feature configurations and in both profiles. The test
-asserts three things: at most 3,000 allocations, the literal ceiling; at most
-forty per cycle, which is the sharp guard, since twenty-four cycles against
-3,000 would let the per-operation cost grow five-fold unnoticed; and that
-every block created was destroyed.
+**Inside the crate's own suite.** `rust-urlapi/tests/ffi_surface.rs` reproduces
+the same accounting without any external tooling: its `count` module defines
+`malloc`, `calloc`, `realloc` and `free` in the test binary and forwards them
+to the same glibc aliases, so the crate's own `libc::malloc` calls are counted
+**with nothing added to the library**. That last point is the design
+constraint, not an aside. The crate ships no counter of its own: an instrument
+compiled into `rust-urlapi/src/ffi.rs` would put a Rust API and permanent
+bookkeeping into a drop-in replacement for one C object file, and it would
+observe nothing that interposition does not. Two tests read the interposed
+counters, and both are kept because their workloads answer different questions.
+
+`the_allocation_count_stays_within_the_test1560_ceiling` runs a fixed workload
+of twenty-four `lib1560` vectors, each parsed, read part by part, serialised
+under two codec flag sets, duplicated and amended. It costs **575
+allocations** and leaves nothing outstanding -- identical in all four feature
+configurations and in both profiles -- and it asserts three things: at most
+3,000 allocations, the literal ceiling; at most forty per cycle, which is the
+sharp guard, since twenty-four cycles against 3,000 would let the
+per-operation cost grow five-fold unnoticed; and that every block created was
+destroyed.
+
+`the_allocation_count_stays_under_the_test1560_ceiling` is calibrated instead
+of broad. Its twenty rows and six rounds are sized so that the same sequence
+of C calls, run against `libcurl.a` from the unmodified tree with
+`-Wl,--wrap=malloc,calloc,realloc,strdup`, costs exactly 3,000 -- measured at
+500, 1,000, 1,500, 3,000 and 3,500 for one, two, three, six and seven rounds.
+The port costs 475 per round, so 2,850 at the calibration point: 5% of margin
+against the point at which the original spends its whole budget, rather than an
+unquantified "under the limit". The test also asserts that two rounds cost
+exactly twice one and six exactly six times one, which is what makes the
+extrapolation sound and what a per-handle regression would break first.
+
+For scale, the real thing: `lib1560` itself, run through the parity harness
+relinked with the same wrappers, prints `success` and costs 2,840 allocations
+-- 809 mallocs, 410 callocs, 1,146 reallocs and 475 strdups -- against the same
+3,000. So the ceiling in curl's own suite runs at 95% utilisation, and a
+workload calibrated to sit exactly at it measures on the same scale rather than
+a generous one.
 
 That last assertion needs one distinction to be meaningful, and getting it
 wrong was a real defect in the first version of the counter. A `realloc` is

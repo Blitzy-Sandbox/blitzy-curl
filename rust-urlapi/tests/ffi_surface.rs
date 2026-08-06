@@ -448,6 +448,20 @@ mod libcurl_scheme_stand_in {
     /// pointer, and Rust guarantees nothing about the two having the same
     /// representation. This asserts it for the target actually being built,
     /// which is the only scope in which it can be asserted at all.
+    ///
+    /// # Why the offsets are measured rather than named
+    ///
+    /// `mem::offset_of!` would say this in one line each, and it arrived in
+    /// Rust 1.77. This crate's declared minimum is 1.75 -- `Cargo.toml`'s
+    /// `rust-version` and `rust-toolchain.toml` both say so, and the plan fixes
+    /// it -- so the macro is unavailable here and using it would break
+    /// `cargo +1.75.0 check --tests --all-targets` for the drop-in
+    /// configuration, which is the authoritative one. The offsets are therefore
+    /// taken from a live value by subtracting field addresses from the base
+    /// address, which is exactly as authoritative, costs one stack slot in a
+    /// test, and is the same technique `src/ffi.rs`'s
+    /// `mirror_field_offsets_are_where_the_c_layout_puts_them` uses on the
+    /// crate's own copy of this type.
     #[test]
     fn layout_matches_the_crate_s_mirror() {
         let pointer_width = mem::size_of::<*const c_char>();
@@ -465,25 +479,42 @@ mod libcurl_scheme_stand_in {
              pointer, so the members after `run` would move"
         );
 
-        assert_eq!(mem::offset_of!(CurlScheme, name), 0);
-        assert_eq!(mem::offset_of!(CurlScheme, run), pointer_width);
+        // A live value to measure. Its fields are only ever addressed, never
+        // read, so the zeroed contents carry no meaning.
+        let probe = CurlScheme {
+            name: ptr::null(),
+            run: None,
+            protocol: 0,
+            family: 0,
+            flags: 0,
+            defport: 0,
+        };
+        let base = (&probe as *const CurlScheme).cast::<u8>() as usize;
+        let offset_of = |field: usize| field.wrapping_sub(base);
+
+        assert_eq!(offset_of((&probe.name as *const *const c_char) as usize), 0);
         assert_eq!(
-            mem::offset_of!(CurlScheme, protocol),
+            offset_of((&probe.run as *const Option<extern "C" fn()>) as usize),
+            pointer_width,
+            "run must follow name immediately"
+        );
+        assert_eq!(
+            offset_of((&probe.protocol as *const u32) as usize),
             2 * pointer_width,
             "protocol must follow the two pointers with no padding"
         );
         assert_eq!(
-            mem::offset_of!(CurlScheme, family),
+            offset_of((&probe.family as *const u32) as usize),
             2 * pointer_width + 4,
             "family must follow protocol, so curl_prot_t is 32 bits here"
         );
         assert_eq!(
-            mem::offset_of!(CurlScheme, flags),
+            offset_of((&probe.flags as *const u32) as usize),
             2 * pointer_width + 8,
             "flags is read through this offset by ffi::scheme_import"
         );
         assert_eq!(
-            mem::offset_of!(CurlScheme, defport),
+            offset_of((&probe.defport as *const u16) as usize),
             2 * pointer_width + 12,
             "defport is read through this offset by ffi::scheme_import"
         );
@@ -744,6 +775,84 @@ impl Drop for Handle {
         // pointer to it or reference into it survives, because `Drop` runs when
         // the sole owner goes away.
         unsafe { curl_url_cleanup(self.0) };
+    }
+}
+
+/// An owned buffer that `curl_url_get()` handed out, released exactly once.
+///
+/// Every test that keeps a returned pointer past the call that produced it holds
+/// it in one of these instead of in a bare `*mut c_char`. That buys three
+/// properties the bare pointer does not have, and each of them was a real defect
+/// in an earlier revision of this file:
+///
+/// * **The release cannot be skipped.** An assertion that fires between the
+///   retrieval and a manual `free` abandons the block, and a test binary's
+///   response to a failed assertion is to unwind. `Drop` runs on that path.
+/// * **The release cannot happen twice.** Ownership is unique and `Drop`
+///   consumes it, so no ordering of assertions can produce a double free.
+/// * **The release cannot happen too early.** It is tied to the end of the
+///   scope, which is what makes "read the handle, *then* let the buffer go" the
+///   default rather than something each test has to remember.
+///
+/// `libc::free` is the correct release in every feature configuration:
+/// `src/alloc.rs` is the crate's sole producer of C-visible memory and it
+/// allocates through the C allocator, so a plain `free` matches the allocator
+/// that produced the block. `docs/libcurl/curl_url_get.md` L45 names
+/// `curl_free()`, which resolves to exactly that in both supported link modes --
+/// `rust-urlapi/docs/MEMORY-OWNERSHIP.md` records the chain, and
+/// [`curl_free_releases_a_getter_buffer`] exercises the exported symbol itself.
+struct CBuffer(*mut c_char);
+
+impl CBuffer {
+    /// Takes ownership of a buffer a **successful** getter produced.
+    ///
+    /// The caller must have checked the return code first. That order is the
+    /// point: this type exists so that a buffer is owned from the moment it
+    /// exists, and a getter that failed produced nothing to own --
+    /// `lib/urlapi.c` L1552 nulls the caller's slot before any failing return.
+    fn new(raw: *mut c_char) -> Self {
+        assert!(
+            !raw.is_null(),
+            "a CURLUE_OK retrieval must have produced a buffer"
+        );
+        Self(raw)
+    }
+
+    /// The address of the block, as an integer.
+    ///
+    /// For handing to `count::Observed`, which answers questions *about* a block
+    /// without touching it. Deliberately not a `*const c_void` reborrow used for
+    /// access: nothing in this file dereferences an address it is asking the
+    /// allocator about.
+    fn address(&self) -> *const c_void {
+        self.0.cast::<c_void>().cast_const()
+    }
+
+    /// The bytes, as a `str`.
+    ///
+    /// Sound for as long as the value is alive, which is the guarantee the type
+    /// exists to provide: the block cannot have been released while `self` is
+    /// borrowed.
+    fn text(&self) -> &str {
+        // SAFETY: `self.0` is non-null -- `new` asserted it -- and points at the
+        // NUL-terminated buffer `curl_url_get` allocated and handed over. This
+        // value owns it and has not released it, so the bytes are live for the
+        // whole borrow.
+        unsafe { CStr::from_ptr(self.0) }
+            .to_str()
+            .expect("the URL API returns ASCII-compatible bytes for these vectors")
+    }
+}
+
+impl Drop for CBuffer {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is the block this value has owned since it was
+        // constructed, it came from this crate's C allocator by way of
+        // `src/alloc.rs`, it has not been released, and no reference into it
+        // survives -- `Drop` runs when the sole owner goes away. This is the
+        // documented release at `docs/libcurl/curl_url_get.md` L45, performed
+        // exactly once.
+        unsafe { libc::free(self.0.cast::<c_void>()) };
     }
 }
 
@@ -1593,41 +1702,224 @@ fn reading_a_handle_never_changes_it() {
 /// The URL the two cleanup-ownership tests below share.
 const KEEPME_URL: &str = "https://example.com/keepme";
 
-/// How many identical requests the recycling probe replays after cleanup.
+/// The address ledgers report what the allocator did, both ways round.
 ///
-/// Cleanup legitimately releases the handle and its own strings, so several
-/// blocks reach the allocator's free lists alongside any block it wrongly
-/// released. Replaying the request more than once means the block under test does
-/// not have to be the very first one handed back for the probe to notice it.
-const RECYCLE_SAMPLES: usize = 8;
+/// The two tests that follow rest their conclusions on
+/// [`count::Observed::created`] and [`count::Observed::destroyed`], and an
+/// instrument that answered `false` to everything would let both of them pass
+/// while checking nothing. So it is calibrated here, against blocks this test
+/// owns outright rather than against the crate: a `malloc` and a `free` inside a
+/// watched window must be seen, and a block that existed beforehand and is still
+/// alive afterwards must not be. That last case is the one that matters -- it is
+/// the answer the ownership tests read as "the contract held", so it has to mean
+/// "nothing happened to this block" rather than "the ledger was empty".
+///
+/// The calibration is deliberately done on `libc::malloc` and `libc::free`
+/// directly. Driving it through the crate would make a failure here ambiguous
+/// between the instrument and the implementation, which is precisely the
+/// ambiguity the ownership tests need removed.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn the_address_ledgers_report_what_the_allocator_did() {
+    // A block that exists before any window opens and outlives all of them.
+    // SAFETY: a 32-byte request; the result is checked for null below and is
+    // released at the end of this test exactly once. Nothing reads through it.
+    let untouched = unsafe { libc::malloc(32) };
+    assert!(!untouched.is_null(), "the test allocator failed");
 
-/// The returned buffer is a separate allocation from the handle, in the one
-/// direction that can be observed with no unsafe ordering at all.
+    // A creation inside the window is seen; the older block is not.
+    count::watch();
+    // SAFETY: as above -- a plain sized request whose result is checked below.
+    let fresh = unsafe { libc::malloc(64) };
+    let creation = count::unwatch();
+    assert!(!fresh.is_null(), "the test allocator failed");
+    assert!(!creation.overflowed());
+    assert!(
+        creation.created(fresh.cast_const()),
+        "a malloc inside a watched window was not recorded, so the created \
+         ledger cannot be relied on"
+    );
+    assert!(
+        !creation.created(untouched.cast_const()),
+        "a block allocated before the window was reported as created inside it"
+    );
+
+    // A release inside the window is seen; the still-live block is not.
+    count::watch();
+    // SAFETY: `fresh` is the non-null block from the `malloc` above, released
+    // exactly once here, with nothing referring into it.
+    unsafe { libc::free(fresh) };
+    let release = count::unwatch();
+    assert!(!release.overflowed());
+    assert!(
+        release.destroyed(fresh.cast_const()),
+        "a free inside a watched window was not recorded, so the destroyed \
+         ledger cannot be relied on -- and a test reading it would report a \
+         wrongly freed block as untouched"
+    );
+    assert!(
+        !release.destroyed(untouched.cast_const()),
+        "a block that was not freed was reported as destroyed"
+    );
+    assert_eq!(release.destroyed_count(), 1);
+
+    // And the overflow flag is real, not decorative: a window with more events
+    // than the ledger holds must say so rather than truncate in silence.
+    count::watch();
+    let mut many = [ptr::null_mut::<c_void>(); 64];
+    for slot in &mut many {
+        // SAFETY: a plain sized request; every result is released below.
+        *slot = unsafe { libc::malloc(8) };
+    }
+    let flooded = count::unwatch();
+    for block in many {
+        if !block.is_null() {
+            // SAFETY: each entry came from the `malloc` above, is released
+            // exactly once here, and nothing refers into it.
+            unsafe { libc::free(block) };
+        }
+    }
+    assert!(
+        flooded.overflowed(),
+        "64 allocations did not overflow a ledger of 32, so the flag the \
+         ownership tests check first would never fire"
+    );
+
+    // SAFETY: `untouched` is the non-null block from the first `malloc`,
+    // released exactly once here, with nothing referring into it.
+    unsafe { libc::free(untouched) };
+}
+
+/// The returned buffer is a separate allocation from the handle's own storage.
 ///
 /// `include/curl/urlapi.h` L116-L118 states the contract from the other side:
 /// cleanup frees the handle and the resources used for parsing, and "will not
-/// free strings previously returned with the URL API". That is a statement about
-/// two allocations being independent, and independence is symmetric -- so it can
-/// be tested by releasing the *buffer* first, which is always safe, instead of by
-/// releasing the handle first and then reaching into the buffer, which is not.
+/// free strings previously returned with the URL API". That presupposes two
+/// independent allocations, and independence is what this test establishes.
 ///
-/// If the getter had handed out a pointer into the handle's own storage -- the
-/// mistake the contract exists to forbid, and the reason `src/alloc.rs` is the
-/// crate's sole producer of C-visible memory -- then freeing the buffer would
-/// have released memory the handle still uses, and the reads that follow would
-/// disagree. Every one of the eleven parts is read afterwards, so the claim
-/// cannot hold merely because the part that moved was not looked at.
+/// # How it is established, and why not by freeing the buffer first
+///
+/// The obvious shape -- release the buffer, then read the handle and check
+/// nothing moved -- is **fail-unsafe in exactly the case it exists to catch**.
+/// If the getter had handed out a pointer into the handle's own storage, that
+/// release would free memory the handle still uses and every read afterwards
+/// would be a use-after-free: the test would commit undefined behaviour instead
+/// of reporting the violation, and under a hardened or sanitizing allocator it
+/// would abort with a diagnostic about the *test*. Freeing something and then
+/// asking whether that was allowed is never a sound order.
+///
+/// So the question is put to the allocator instead. [`count`] records the
+/// address of every block created inside a watched window, taking the address as
+/// an integer and never dereferencing it, so the test can ask whether the
+/// pointer `curl_url_get` returned is a block the allocator handed out **during
+/// that call**. A block that came into existence inside the call cannot be
+/// interior storage of a handle that existed before it -- which is the property
+/// "independent allocation" means -- and asking costs nothing and touches
+/// nothing.
+///
+/// Everything else is ordered so that no read can follow a release:
+///
+/// 1. Retrieve, with the window watching, and check the code before the pointer.
+/// 2. Take ownership in a [`CBuffer`], so the release is the scope's business
+///    rather than a statement that an assertion could jump over.
+/// 3. Assert the block was created inside the call. This is the evidence.
+/// 4. Read the bytes, and read all eleven parts of the still-live handle, with
+///    nothing released.
+/// 5. Only now let the buffer go -- and, since step 3 proved the block is not
+///    the handle's, re-read the handle afterwards to confirm the release did not
+///    disturb it. That last read is sound *because* of the evidence, which is
+///    the difference between this and the shape it replaces.
 ///
 /// [`cleanup_does_not_recycle_a_previously_returned_string`] covers the other
-/// direction.
-///
-/// The sequence has to be spelled out rather than expressed through
-/// [`Handle::get`], because that helper releases the buffer before it returns.
-/// The release still precedes every fallible step, for the reason that helper
-/// records: an assertion is an unwind, and an unwind before the release is a
-/// leak of a C allocation.
+/// direction: what `curl_url_cleanup()` does and does not release.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[test]
 fn a_returned_buffer_is_independent_of_the_handle_that_produced_it() {
+    let handle = Handle::parse(KEEPME_URL, 0);
+    let before = handle.snapshot(CURLU_GET_EMPTY);
+
+    let mut part: *mut c_char = ptr::null_mut();
+    count::watch();
+    // SAFETY: `handle` owns a live handle and `part` is a writable, aligned
+    // local that cannot alias it.
+    let code = unsafe { curl_url_get(handle.as_const(), CURLUPART_URL, &mut part, 0) };
+    let observed = count::unwatch();
+
+    // The code decides, before the pointer is looked at. `lib/urlapi.c` L1552
+    // writes null into `*part` on entry, so a failing retrieval has handed this
+    // caller nothing -- and nothing to leak by asserting here.
+    assert_eq!(code, CURLUE_OK);
+    let kept = CBuffer::new(part);
+
+    // The evidence. A full ledger would make an absent address ambiguous, so
+    // that is ruled out first.
+    assert!(
+        !observed.overflowed(),
+        "the address ledger filled up, so a missing address would be \
+         indistinguishable from a block that never moved"
+    );
+    assert!(
+        observed.created(kept.address()),
+        "the pointer curl_url_get() returned was not a block the allocator \
+         handed out during the call, so it is not an independent allocation -- \
+         include/curl/urlapi.h L116-L118 requires that it is"
+    );
+
+    // Read the buffer and the whole handle while nothing has been released, so
+    // both reads are unconditionally sound.
+    assert_eq!(kept.text(), KEEPME_URL);
+    assert_eq!(
+        handle.snapshot(CURLU_GET_EMPTY),
+        before,
+        "retrieving the whole URL disturbed the handle"
+    );
+
+    // Release the buffer, on its own, and watch what that release touches. One
+    // block, and it is this one: the handle's ten strings and its own block are
+    // not among them.
+    let address = kept.address();
+    count::watch();
+    drop(kept);
+    let freed = count::unwatch();
+    assert!(!freed.overflowed());
+    assert!(
+        freed.destroyed(address),
+        "releasing the buffer did not release the block it named"
+    );
+    assert_eq!(
+        freed.destroyed_count(),
+        1,
+        "releasing the buffer gave back {} blocks, so it was not one \
+         self-contained allocation",
+        freed.destroyed_count()
+    );
+
+    // Sound because the block was proved above to be one the getter allocated
+    // rather than a pointer into the handle: the handle cannot have lost
+    // anything it owns.
+    assert_eq!(
+        handle.snapshot(CURLU_GET_EMPTY),
+        before,
+        "freeing a buffer curl_url_get() handed out disturbed the handle"
+    );
+    assert_eq!(handle.text(CURLUPART_URL, 0), KEEPME_URL);
+
+    // `handle`'s own `Drop` performs the single `curl_url_cleanup()`, after the
+    // buffer is already gone.
+}
+
+/// The same claim where the allocator cannot be observed, minus the step that
+/// needs the observation.
+///
+/// [`count`] forwards to glibc's `__libc_*` aliases, which exist on no other C
+/// library. Without them the block's provenance cannot be established, so the
+/// read-after-release step is dropped rather than performed on faith: what
+/// remains is the ordering that is sound unconditionally -- retrieve, check the
+/// code, read the bytes, read every part of the live handle, and only then let
+/// the buffer go.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[test]
+fn a_returned_buffer_reads_back_with_the_handle_still_live() {
     let handle = Handle::parse(KEEPME_URL, 0);
     let before = handle.snapshot(CURLU_GET_EMPTY);
 
@@ -1635,90 +1927,48 @@ fn a_returned_buffer_is_independent_of_the_handle_that_produced_it() {
     // SAFETY: `handle` owns a live handle and `part` is a writable, aligned
     // local that cannot alias it.
     let code = unsafe { curl_url_get(handle.as_const(), CURLUPART_URL, &mut part, 0) };
-    // Neither assertion can leak. `lib/urlapi.c` L1552 writes null into
-    // `*part` before the switch, so a retrieval that reports anything but
-    // `CURLUE_OK` has handed this caller nothing to release.
     assert_eq!(code, CURLUE_OK);
-    assert!(!part.is_null());
+    let kept = CBuffer::new(part);
 
-    // Read the buffer while the handle is still live and nothing has been
-    // released, so this read is unconditionally sound.
-    // SAFETY: the call reported `CURLUE_OK` and a non-null pointer, so it
-    // addresses a NUL-terminated buffer this caller owns, and nothing has been
-    // freed since.
-    let kept = unsafe { CStr::from_ptr(part) }
-        .to_str()
-        .expect("the getter returns ASCII for this vector")
-        .to_owned();
-    assert_eq!(kept, KEEPME_URL);
-
-    // Release the buffer first. This is the documented release at
-    // `docs/libcurl/curl_url_get.md` L45, performed exactly once, and `kept` is
-    // an independent copy so no borrow into the block survives.
-    // SAFETY: the block came from this crate's C allocator through
-    // `src/alloc.rs`, it has not been released, and no reference into it is live.
-    unsafe { libc::free(part.cast::<c_void>()) };
-
-    // The handle is untouched by that release: it still answers every part
-    // exactly as it did, and it still serialises to the same URL.
+    assert_eq!(kept.text(), KEEPME_URL);
     assert_eq!(
         handle.snapshot(CURLU_GET_EMPTY),
         before,
-        "freeing a buffer curl_url_get() handed out disturbed the handle, so the \
-         two are not independent allocations"
+        "retrieving the whole URL disturbed the handle"
     );
-    assert_eq!(handle.text(CURLUPART_URL, 0), KEEPME_URL);
-
-    // `handle`'s own `Drop` performs the single `curl_url_cleanup()`, after the
-    // buffer is already gone -- so no ordering in this test can touch released
-    // memory.
+    drop(kept);
 }
 
 /// `curl_url_cleanup()` does not release a string the getter handed out earlier.
 ///
-/// # Why this is not tested by reading the buffer afterwards
+/// # The frees are observed, not inferred
 ///
-/// The obvious shape -- retrieve a part, clean the handle up, then read the
-/// buffer back -- is fail-unsafe, and precisely when it matters. If the defect
-/// it hunts is present, cleanup has released that block, and reading it is a
-/// use-after-free: the test would commit undefined behaviour instead of
-/// reporting the contract violation, and under a hardened or a sanitizing
-/// allocator it would abort with a diagnostic about the *test* rather than fail
-/// with one about the implementation. A test may not prove liveness by reading
-/// memory after the operation under test.
+/// Two shapes were rejected before this one, and both are worth naming because
+/// both look reasonable.
 ///
-/// # What it does instead
+/// Reading the buffer back after the cleanup is a use-after-free precisely when
+/// the defect is present, so it cannot be the test.
 ///
-/// It records the block's address as a plain integer -- taking an address is not
-/// a dereference, so the value stays usable as evidence whatever cleanup does to
-/// the block it names -- and then asks the C allocator whether that block has
-/// been returned to it. If cleanup had wrongly freed it, the block would now sit
-/// on the free list for its size class, and glibc's per-thread cache is
-/// last-in-first-out, so an identical request would be handed it straight back.
-/// The probe therefore replays the very operation that produced it,
-/// [`RECYCLE_SAMPLES`] times, keeping every reply alive so each replay samples a
-/// distinct block; a replay is size-exact by construction, which no hand-picked
-/// `malloc` size could guarantee. Nothing reads the block under test, so a
-/// regression surfaces as the assertion below, and a false failure is impossible:
-/// an allocation that is still live can never be handed out a second time.
+/// Probing for *recycling* -- replaying the same request afterwards and checking
+/// the block is not handed back -- avoids the dereference but has two faults of
+/// its own. It is only evidence, not proof: an allocator may satisfy a request
+/// without reusing the most recently freed block, so a wrongly freed block can
+/// go unnoticed. And it leaves the final release of that block resting on the
+/// probe's verdict, so a probe that missed the defect ends in a double free.
 ///
-/// The release at the end is *guarded* by that assertion rather than being the
-/// evidence for it. On the failing path the assertion panics first, so the
-/// release is unreachable and no double free can occur; on the passing path the
-/// block has been shown to be still allocated, so the release is the ordinary
-/// documented one and the buffer does not leak.
+/// What this does instead is watch the cleanup. [`count`] records the address of
+/// every block handed back to the allocator inside a watched window, as an
+/// integer, without touching it. So the question becomes exactly the contract's
+/// question -- did `curl_url_cleanup()` free *this* block -- and the answer is a
+/// direct observation rather than an inference. A wrongly freed block is caught
+/// whatever the allocator then does with it, and the release at the end is
+/// reached only after the block has been shown to be still allocated, so no
+/// ordering here can double free.
 ///
-/// # What the probe does not prove, and what covers that
-///
-/// Recycling is strong evidence rather than a proof: an allocator is free to
-/// satisfy a request without reusing the most recently freed block.
-/// [`a_returned_buffer_is_independent_of_the_handle_that_produced_it`] carries
-/// the deterministic half of the contract, and
-/// `rust-urlapi/docs/MEMORY-OWNERSHIP.md` records the sanitizer evidence for the
-/// direction neither test can observe safely. curl's own allocation counter is
-/// not available as an instrument here, because the parity harness is
-/// deliberately built without the memory-debug configuration -- `AAP` 0.2.4.3,
-/// reportable constraint `R3`.
+/// The cleanup's own frees are counted too, and asserted to be several: a
+/// cleanup that released nothing at all would trivially satisfy "it did not
+/// release my block".
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[test]
 fn cleanup_does_not_recycle_a_previously_returned_string() {
     let handle = Handle::parse(KEEPME_URL, 0);
@@ -1728,64 +1978,78 @@ fn cleanup_does_not_recycle_a_previously_returned_string() {
     // local that cannot alias it.
     let code = unsafe { curl_url_get(handle.as_const(), CURLUPART_URL, &mut part, 0) };
     assert_eq!(code, CURLUE_OK);
-    assert!(!part.is_null());
+    let kept = CBuffer::new(part);
 
-    // Everything this test needs from the block is taken now, while it is
+    // Everything the test needs from the block is taken now, while it is
     // unambiguously live: its bytes, and its address as an integer.
-    // SAFETY: the call reported `CURLUE_OK` and a non-null pointer, so it
-    // addresses a NUL-terminated buffer this caller owns, and nothing has been
-    // freed since.
-    let kept = unsafe { CStr::from_ptr(part) }
-        .to_str()
-        .expect("the getter returns ASCII for this vector")
-        .to_owned();
-    assert_eq!(kept, KEEPME_URL);
-    let block = part as usize;
-
-    // The array is on the stack and is filled in below, so the probe adds no
-    // heap traffic of its own beyond the replies it is measuring.
-    let mut samples: [*mut c_char; RECYCLE_SAMPLES] = [ptr::null_mut(); RECYCLE_SAMPLES];
+    assert_eq!(kept.text(), KEEPME_URL);
+    let address = kept.address();
 
     // The operation under test. `into_raw` suppresses the wrapper's own `Drop`,
     // so this is the single release of the handle.
     let raw = handle.into_raw();
+    count::watch();
     // SAFETY: `raw` is the live handle `Handle::parse` produced, it has not been
     // released, and no other pointer to it survives -- `into_raw` consumed the
     // only owner.
     unsafe { curl_url_cleanup(raw) };
+    let observed = count::unwatch();
 
-    for slot in &mut samples {
-        let probe = Handle::parse(KEEPME_URL, 0);
-        let mut fresh: *mut c_char = ptr::null_mut();
-        // SAFETY: `probe` owns a live handle and `fresh` is a writable, aligned
-        // local that cannot alias it.
-        let rc = unsafe { curl_url_get(probe.as_const(), CURLUPART_URL, &mut fresh, 0) };
-        assert_eq!(rc, CURLUE_OK);
-        assert!(!fresh.is_null());
-        assert_ne!(
-            fresh as usize, block,
-            "the allocator re-issued the block curl_url_get() had handed out, so \
-             curl_url_cleanup() released a buffer the caller still owns; \
-             include/curl/urlapi.h L116-L118 forbids exactly that"
-        );
-        *slot = fresh;
-    }
+    assert!(
+        !observed.overflowed(),
+        "the address ledger filled up during the cleanup, so a missing address \
+         would be indistinguishable from a block that was not released"
+    );
+    assert!(
+        !observed.destroyed(address),
+        "curl_url_cleanup() released the block curl_url_get() had handed out, \
+         which include/curl/urlapi.h L116-L118 forbids: it frees the handle and \
+         the resources used for parsing, and not strings previously returned"
+    );
+    assert!(
+        observed.destroyed_count() > 1,
+        "the cleanup gave back only {} block(s); a cleanup that released almost \
+         nothing would satisfy the assertion above without meaning anything, so \
+         the instrument is checked here as well as the implementation",
+        observed.destroyed_count()
+    );
 
-    for sample in samples {
-        // SAFETY: each entry came from the `curl_url_get` above, is non-null,
-        // has not been released, is released exactly once here, and no reference
-        // into it is live.
-        unsafe { libc::free(sample.cast::<c_void>()) };
-    }
+    // Reached only because the block was shown to be still allocated, which is
+    // what makes this release the ordinary documented one rather than a second
+    // free. It is `kept`'s `Drop`, so it happens exactly once on every path out
+    // of this function, the panicking ones included.
+    drop(kept);
+}
 
-    // Reached only because the assertion above found the block still allocated,
-    // which is what makes this release -- the documented one at
-    // `docs/libcurl/curl_url_get.md` L45 -- safe rather than a second free.
-    // SAFETY: the block came from this crate's C allocator through
-    // `src/alloc.rs`, it has been shown to be still allocated, it is released
-    // exactly once here, and `kept` is an independent copy so no reference into
-    // it is live.
-    unsafe { libc::free(part.cast::<c_void>()) };
+/// The same claim where the allocator cannot be observed.
+///
+/// Without [`count`]'s glibc aliases the cleanup's frees cannot be watched, and
+/// no sound substitute exists -- the two unsound shapes are named in the sibling
+/// test's documentation. What is still checked is that the buffer survives the
+/// cleanup as an *owned* value whose release happens after it, which is the half
+/// of the contract that needs no observation: a getter buffer outliving the
+/// handle is exactly what `include/curl/urlapi.h` L116-L118 promises, and
+/// `rust-urlapi/docs/MEMORY-OWNERSHIP.md` records the external-memory-checker
+/// evidence for the rest.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[test]
+fn a_getter_buffer_outlives_the_handle_that_produced_it() {
+    let handle = Handle::parse(KEEPME_URL, 0);
+
+    let mut part: *mut c_char = ptr::null_mut();
+    // SAFETY: `handle` owns a live handle and `part` is a writable, aligned
+    // local that cannot alias it.
+    let code = unsafe { curl_url_get(handle.as_const(), CURLUPART_URL, &mut part, 0) };
+    assert_eq!(code, CURLUE_OK);
+    let kept = CBuffer::new(part);
+    assert_eq!(kept.text(), KEEPME_URL);
+
+    let raw = handle.into_raw();
+    // SAFETY: `raw` is the live handle `Handle::parse` produced, released
+    // exactly once here, with no other owner.
+    unsafe { curl_url_cleanup(raw) };
+
+    drop(kept);
 }
 
 /// The input the guessed-scheme cases are built from.
@@ -2483,69 +2747,68 @@ fn the_empty_string_outcome_depends_on_the_read_flags() {
     assert_eq!(handle.code(CURLUPART_URL, 0), CURLUE_NO_SCHEME);
 }
 
-/// `CURLU_NO_GUESS_SCHEME` on a guessed-scheme handle makes the empty-string
-/// write `CURLUE_MALFORMED_INPUT`, which is what `AAP` 0.6.5 specifies.
+/// `CURLU_NO_GUESS_SCHEME` on a guessed-scheme handle leaves the empty-string
+/// write a no-op success, which is what the C reference answers.
 ///
-/// # The contract
+/// # Why this test spells out its reasoning at length
 ///
-/// 0.6.5 states it in as many words: "Setting the whole URL to the empty string
-/// with the no-guess-scheme flag on a handle whose scheme was guessed **fails**
-/// with malformed input ... while the identical call with no flags **succeeds**
-/// as a no-op." Both halves are asserted below, and the plan governs the
-/// implementation, so this is the contract the crate implements and this test
-/// is what holds it in place.
+/// `AAP` 0.6.5 asserts the opposite -- "Setting the whole URL to the empty
+/// string with the no-guess-scheme flag on a handle whose scheme was guessed
+/// **fails** with malformed input -- because the retrieval returns the no-scheme
+/// code `lib/urlapi.c:L1559-L1560`" -- and the specification for this file
+/// anticipates that sentence, directs that the outcome be derived from
+/// `lib/urlapi.c` and confirmed against a reference build, and states that under
+/// no circumstances may an assertion here contradict the C reference. That is
+/// what was done, and the result is recorded so nobody has to redo it.
 ///
-/// # It is a bounded divergence from the C, and saying so is part of the test
+/// # Three readings, each on its own sufficient
 ///
-/// The reference answers `CURLUE_OK` for this one call. That is not a doubt
-/// about the requirement; it is the shape of the divergence, and a reader who
-/// does not know it will eventually "correct" the wrong side.
+/// **The source.** `CURLU_NO_GUESS_SCHEME` has two unrelated effects in two
+/// different branches of the reader. In the `CURLUPART_SCHEME` branch it is an
+/// error: L1559-L1560 return `CURLUE_NO_SCHEME` when the member is set. In the
+/// whole-URL branch it is only a formatting choice: L1512-L1515 blank
+/// `schemebuf` and the function carries on to return `CURLUE_OK`. L1700 asks for
+/// `CURLUPART_URL`, and L1624-L1625 dispatches that straight into `urlget_url`,
+/// so the read meets the second behaviour and never reaches the guard 0.6.5
+/// attributes the failure to. L1701-L1706 then make the write a no-op success.
 ///
-/// `CURLU_NO_GUESS_SCHEME` has two unrelated effects in two different branches
-/// of the reader. In the `CURLUPART_SCHEME` branch it is an error: L1559-L1560
-/// return `CURLUE_NO_SCHEME` when the member is set. In the whole-URL branch it
-/// is only a formatting choice: L1512-L1515 blank `schemebuf` and the function
-/// carries on to return `CURLUE_OK`. L1700 asks for `CURLUPART_URL`, and
-/// L1624-L1625 dispatches that straight into `urlget_url`, so the read meets the
-/// second behaviour and never reaches the guard 0.6.5 attributes the failure to.
-/// A probe linked against a `libcurl.a` built from the unmodified tree confirms
-/// it: `CURLUE_OK`, with the flag and without it, handle unchanged.
+/// **The other way the read could fail is unreachable too.** `u->guessed_scheme`
+/// is assigned in exactly one place, L1008 inside `guess_scheme`, and L1004-L1006
+/// stores `u->scheme` immediately before it. So a guessed-scheme handle always
+/// carries a scheme string, and the `CURLUE_NO_SCHEME` at L1453-L1458 -- which
+/// fires only when there is no scheme and no `CURLU_DEFAULT_SCHEME` -- cannot
+/// fire on such a handle.
 ///
-/// The port therefore tests the combination *ahead* of that read, in
-/// `src/getset.rs`'s `set_url`, because the read cannot produce the answer.
-/// `rust-urlapi/docs/KNOWN-DIVERGENCES.md` carries the entry "Divergence: the
-/// empty whole-URL write under `CURLU_NO_GUESS_SCHEME`", which records the
-/// measurement and bounds the divergence to exactly this combination.
+/// **Measurement.** A probe linked against a `libcurl.a` built from the
+/// unmodified tree answers `rc=0` for this exact call, with the flag and without
+/// it, and leaves the handle serialising as it did before.
 ///
-/// # Why the divergence costs no acceptance criterion
+/// `rust-urlapi/docs/KNOWN-DIVERGENCES.md` carries the entry "Checked and not a
+/// divergence: the empty whole-URL write under `CURLU_NO_GUESS_SCHEME`" with the
+/// same three readings, and `src/getset.rs`'s `set_url` makes no special case
+/// for the combination -- the answer falls out of the read, exactly as in the C.
 ///
-/// Nothing measurable reaches it. `tests/libtest/lib1560.c` writes `""` to
-/// `CURLUPART_URL` in one place only -- `set_url_list` at its L1227-L1230, with
-/// set-flags of zero -- so `A5` runs unaffected by this test's subject; and
-/// `rust-urlapi/demo/urlapi_demo.c` keeps the combination out of its transcript,
-/// which is what `A7`, a byte-for-byte diff against the same demo linked against
-/// the unmodified C, requires of it.
+/// # What is asserted, and why each line is here
 ///
-/// What the oracle *does* pin is the read, and the port leaves that alone: its
-/// `get_url_list` asserts that a guessed handle's whole-URL read under
-/// `CURLU_NO_GUESS_SCHEME` succeeds with the prefix suppressed, while its
-/// `get_parts_list` asserts `CURLUE_NO_SCHEME` for the scheme part of the same
-/// handle under the same flag. Both are asserted below alongside the write, so
-/// a change that widened the divergence onto the read side would fail here
-/// before it failed the oracle.
+/// The two reads the unmodified oracle pins are asserted alongside the write,
+/// because they are what explains it: `tests/libtest/lib1560.c`'s `get_url_list`
+/// asserts that a guessed handle's whole-URL read under `CURLU_NO_GUESS_SCHEME`
+/// succeeds with the prefix suppressed, while its `get_parts_list` asserts
+/// `CURLUE_NO_SCHEME` for the scheme part of the same handle under the same
+/// flag. The write's answer is the first of those two, not the second.
 #[test]
-fn an_empty_url_and_no_guess_scheme_is_malformed_input() {
+fn an_empty_url_under_no_guess_scheme_is_still_a_no_op() {
     let mut handle = Handle::parse(GUESSED_INPUT, CURLU_GUESS_SCHEME);
     let before = handle.snapshot(CURLU_GET_EMPTY);
 
-    // The read side, untouched by the divergence: CURLUE_OK with the prefix
-    // suppressed, L1512-L1515. tests/libtest/lib1560.c asserts this vector.
+    // The read L1700 performs: CURLUE_OK with the prefix suppressed,
+    // L1512-L1515. tests/libtest/lib1560.c asserts this vector.
     assert_eq!(
         handle.text(CURLUPART_URL, CURLU_NO_GUESS_SCHEME),
         "example.com:1234/"
     );
     // The scheme branch, for contrast. It is a different part, and it is the
-    // one L1559-L1560 governs.
+    // only one L1559-L1560 governs -- which is why it cannot decide the write.
     assert_eq!(
         handle.code(CURLUPART_SCHEME, CURLU_NO_GUESS_SCHEME),
         CURLUE_NO_SCHEME
@@ -2553,23 +2816,23 @@ fn an_empty_url_and_no_guess_scheme_is_malformed_input() {
 
     assert_eq!(
         handle.set(CURLUPART_URL, "", CURLU_NO_GUESS_SCHEME),
-        CURLUE_MALFORMED_INPUT,
-        "AAP 0.6.5 specifies malformed input for this combination; the \
-         reference answers CURLUE_OK and the divergence is bounded and \
-         recorded in docs/KNOWN-DIVERGENCES.md"
+        CURLUE_OK,
+        "the reference answers CURLUE_OK here; AAP 0.6.5 attributes a failure \
+         to L1559-L1560, which is the CURLUPART_SCHEME arm and is not on this \
+         path -- see docs/KNOWN-DIVERGENCES.md"
     );
-    // The other half of 0.6.5: the identical call with no flags is the no-op.
+    // The identical call with no flags, which must answer the same way: the
+    // flag is inert on this path rather than compensated for elsewhere.
     assert_eq!(handle.set(CURLUPART_URL, "", 0), CURLUE_OK);
     assert_eq!(
         handle.snapshot(CURLU_GET_EMPTY),
         before,
-        "neither call mutates the handle: the refusal is not a partial write \
-         and the success is a no-op"
+        "neither call may mutate the handle: an empty write is a no-op, not a \
+         write that happens to land on the same bytes"
     );
 
-    // The refusal needs a *guessed* scheme, not merely the flag. A handle
-    // carrying its scheme explicitly succeeds, because L1512's second disjunct
-    // is true when the member is clear and 0.6.5's condition names the member.
+    // The same answer with the guessed-scheme marker absent, both ways it can
+    // be absent, so the marker is varied while the outcome is not.
     let mut explicit = Handle::parse("https://example.com/p", 0);
     assert_eq!(
         explicit.set(CURLUPART_URL, "", CURLU_NO_GUESS_SCHEME),
@@ -2577,8 +2840,8 @@ fn an_empty_url_and_no_guess_scheme_is_malformed_input() {
     );
     assert_eq!(explicit.text(CURLUPART_URL, 0), "https://example.com/p");
 
-    // And with CURLU_DEFAULT_SCHEME instead of a guess, which stores no scheme
-    // at all and so does not set the member either.
+    // CURLU_DEFAULT_SCHEME stores no scheme at all, so it does not set the
+    // member either -- L1455 assigns a local.
     let mut defaulted = Handle::parse("example.com/p", CURLU_DEFAULT_SCHEME);
     assert_eq!(
         defaulted.set(CURLUPART_URL, "", CURLU_NO_GUESS_SCHEME),
@@ -2937,22 +3200,52 @@ fn curl_url_strerror_returns_the_c_messages() {
 /// `curlx_free`, which resolves to `free` in a non-memory-debug build, and
 /// `free(NULL)` is defined to do nothing.
 ///
-/// # Why nothing here is skipped on a null pointer
+/// # The order: code, then null-on-error, then release
 ///
-/// Each call's code is asserted **immediately**, before the pointer is looked
-/// at, and every part's expectation is stated up front. Deciding what to do from
-/// the pointer alone -- skipping the part when it is null, without having looked
-/// at the code -- would let a getter that failed and wrote nothing quietly
-/// remove itself from this test's coverage: the release path this test exists to
-/// exercise would go unexercised and the test would still report success. So the
-/// two vectors below between them cover all eleven parts with a buffer, and the
-/// only null the test tolerates is one it names in advance.
+/// Each call's code is judged **before** the buffer is touched at all, and the
+/// release is the last step rather than the first. Two rules make that safe and
+/// keep it honest:
+///
+/// * A failing retrieval must have left the caller's slot null. `lib/urlapi.c`
+///   L1552 writes null into it on entry, ahead of every failing return, so this
+///   is a contract the test asserts rather than an assumption it makes. A defect
+///   that returned an error alongside a stale pointer would be caught here
+///   instead of releasing that pointer.
+/// * Every part's expectation is stated up front, so a getter that quietly
+///   failed cannot remove itself from this test's coverage: the release path the
+///   test exists to exercise would go unexercised and the test would still pass.
+///   The two vectors below between them cover all eleven parts with a buffer,
+///   and the only null the test tolerates is one it names in advance.
+///
+/// The release itself is `Release`'s `Drop`, which is what lets it come last
+/// without becoming the thing skipped when an assertion fires: an unwind runs it
+/// too, so no path out of the helper abandons a buffer, and ownership being
+/// unique means no path releases one twice.
 #[cfg(feature = "cfree")]
 #[test]
 fn curl_free_releases_a_getter_buffer() {
-    /// Retrieves one part, asserts the code first and the pointer second, and
-    /// releases the buffer through the exported symbol. Returns whether a buffer
-    /// was produced.
+    /// A getter buffer released through the exported `curl_free()`.
+    ///
+    /// The counterpart to [`CBuffer`] for this one test. It exists separately
+    /// because the point here is *which function* performs the release: every
+    /// other release in this file goes through `libc::free`, and this one has to
+    /// go through the crate's own export or the export is compiled and never
+    /// called.
+    struct Release(*mut c_char);
+
+    impl Drop for Release {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is the non-null block the getter handed over, it
+            // came from this crate's C allocator through `src/alloc.rs`, it has
+            // not been released, and no reference into it exists. This is the
+            // documented release at `include/curl/urlapi.h` L130-L131, performed
+            // exactly once, through the very function the header names.
+            unsafe { curl_free(self.0.cast::<c_void>()) };
+        }
+    }
+
+    /// Retrieves one part, judges the code and the null-on-error contract, and
+    /// releases whatever was produced through the exported symbol.
     fn release_through_curl_free(
         handle: &Handle,
         what: CURLUPart,
@@ -2963,33 +3256,47 @@ fn curl_free_releases_a_getter_buffer() {
         // SAFETY: `handle` owns a live handle and `part` is a writable, aligned
         // local in a distinct allocation, so it cannot alias the handle.
         let code = unsafe { curl_url_get(handle.as_const(), what, &mut part, CURLU_GET_EMPTY) };
-        // The pointer is null-checked and never dereferenced, so nothing is read
-        // out of it before the code has been judged. `lib/urlapi.c` L1552 writes
-        // null into the caller's slot ahead of every failing return, so a
-        // non-null pointer here means the call reported `CURLUE_OK`.
-        let produced = !part.is_null();
-        if produced {
-            // SAFETY: `part` came from this crate's C allocator through
-            // `src/alloc.rs`, it has not been released, and no reference into it
-            // exists. This is the documented release, performed exactly once for
-            // this pointer, through the very function the header names. It runs
-            // ahead of the assertions below rather than after them, because an
-            // assertion that fired first would abandon this buffer -- the
-            // release is the subject of the test and must not be the thing
-            // skipped when the test fails.
-            unsafe { curl_free(part.cast::<c_void>()) };
-        }
+
+        // Nothing is read through the pointer and nothing is released until the
+        // code has been judged. A non-null pointer is taken into an owner
+        // immediately, so from here on the release cannot be skipped or repeated
+        // whichever assertion fires.
+        let owned = if part.is_null() {
+            None
+        } else {
+            Some(Release(part))
+        };
+
         assert_eq!(
             code, expected,
             "part {what} was expected to answer {expected}"
         );
-        assert_eq!(
-            produced,
-            buffer_expected,
-            "part {what} answered {code} and {} a buffer, which is not what this \
-             vector expects; a part that produces none exercises no release",
-            if produced { "produced" } else { "withheld" }
-        );
+        if code == CURLUE_OK {
+            assert_eq!(
+                owned.is_some(),
+                buffer_expected,
+                "part {what} answered CURLUE_OK and {} a buffer, which is not \
+                 what this vector expects; a part that produces none exercises \
+                 no release",
+                if owned.is_some() {
+                    "produced"
+                } else {
+                    "withheld"
+                }
+            );
+        } else {
+            assert!(
+                owned.is_none(),
+                "part {what} answered {code} yet stored a pointer; lib/urlapi.c \
+                 L1552 nulls the caller's slot before any failing return can be \
+                 taken, so a buffer here is a contract violation and releasing \
+                 it would be releasing something this caller was never given"
+            );
+            assert!(
+                !buffer_expected,
+                "part {what} was expected to produce a buffer but answered {code}"
+            );
+        }
     }
 
     // Every one of the eleven parts is populated here, so every read succeeds
@@ -3228,6 +3535,21 @@ fn without_a_backend_the_idn_conversions_lack_idn() {
 
 // ===========================================================================
 // The allocation ceiling, implicit requirement I11 -- first instrument
+//
+// Two instruments measure the same ceiling and both are kept. This one is
+// calibrated: its workload is sized so that the unmodified C spends exactly
+// the 3,000 allocations `tests/data/test1560` allows, which turns "under the
+// ceiling" into a like-for-like comparison rather than a loose bound. The
+// second, further down, is broader -- twenty-four vectors, more parts, and a
+// created-versus-destroyed balance -- and is the one that would notice a
+// regression this one's fixed shape does not reach.
+//
+// Both read the same counters, in `mod count`, which interposes the process
+// allocator from inside this test binary. Nothing in the crate counts for
+// itself: an instrument compiled into `src/ffi.rs` would put a Rust API and
+// permanent bookkeeping into a drop-in replacement for one C object file, and
+// `AAP` 0.9.4 asks for "an independent allocation count via the platform's
+// own tooling", which is what interposition is.
 // ===========================================================================
 
 /// The URL rows the allocation workload parses, with the flags each needs.
@@ -3244,8 +3566,9 @@ fn without_a_backend_the_idn_conversions_lack_idn() {
 /// is touched; and a dotted quad with a deep path.
 ///
 /// Every row must parse. A row that failed would silently cost fewer
-/// allocations than intended and quietly loosen the measurement, so
-/// [`Handle::parse`] asserting success is part of the instrument.
+/// allocations than intended and quietly loosen the measurement, so the round
+/// counts a failed parse and the test asserts the count is zero -- after the
+/// measurement window closes, because an assertion message allocates.
 const ALLOCATION_WORKLOAD: [(&str, c_uint); 20] = [
     ("https://user:pwd@example.com:8080/a/b/c?x=1&y=2#frag", 0),
     ("http://example.org/", 0),
@@ -3278,8 +3601,44 @@ const ALLOCATION_WORKLOAD: [(&str, c_uint); 20] = [
     ),
 ];
 
+/// The part-by-part construction each round performs after the rows.
+///
+/// This is the `setget_parts` shape: build a URL one part at a time, read it,
+/// then apply a relative value and read it again. It is included because
+/// assignment allocates on a different path from parsing -- the encode buffer
+/// at `lib/urlapi.c` L1880 and the append-query buffer at L1944 -- and a round
+/// without it would measure only half the API. The relative write that follows
+/// these nine is spelled out in the round itself, because it is a different
+/// shape: it reaches `redirect_url` and is bracketed by two whole-URL reads.
+const ALLOCATION_BUILD: [(CURLUPart, &str, c_uint); 9] = [
+    (CURLUPART_SCHEME, "https", 0),
+    (CURLUPART_HOST, "example.org", 0),
+    (CURLUPART_USER, "bob", 0),
+    (CURLUPART_PASSWORD, "s3cret", 0),
+    (CURLUPART_PORT, "8443", 0),
+    (CURLUPART_PATH, "/one/two", 0),
+    (CURLUPART_QUERY, "k=v", 0),
+    (CURLUPART_QUERY, "k2=v2", CURLU_APPENDQUERY),
+    (CURLUPART_FRAGMENT, "here", 0),
+];
+
+/// The relative value the round applies after the nine part writes.
+const ALLOCATION_RELATIVE: &str = "../elsewhere?z";
+
 /// The ceiling `tests/data/test1560` asserts: `<limits>Allocations: 3000`.
 const ALLOCATION_CEILING: u64 = 3000;
+
+/// One pre-converted URL row: the value, and the flags to parse it under.
+///
+/// Named rather than written out because both instruments carry vectors of it
+/// and a measured window may not allocate, so the conversion has to happen once
+/// and be handed around afterwards.
+type UrlRow = (CString, c_uint);
+
+/// One pre-converted part write: the part, the value, and the flags.
+///
+/// Named for the same reason as [`UrlRow`], and shared by both instruments.
+type PartWrite = (CURLUPart, CString, c_uint);
 
 /// Rounds of [`allocation_workload_round`] the measurement runs.
 ///
@@ -3289,6 +3648,25 @@ const ALLOCATION_CEILING: u64 = 3000;
 /// spending; more would put the reference itself over its own ceiling and the
 /// comparison would stop meaning anything.
 const ALLOCATION_ROUNDS: u64 = 6;
+
+/// The workload's inputs, converted before any measurement window opens.
+///
+/// Every `CString` here is built outside the window on purpose: a conversion
+/// allocates on the Rust side, and an allocation inside the window would be
+/// charged to the crate. The same discipline governs [`workload_inputs`]
+/// further down, for the same reason.
+fn round_inputs() -> (Vec<UrlRow>, Vec<PartWrite>) {
+    let rows = ALLOCATION_WORKLOAD
+        .iter()
+        .map(|&(url, flags)| (c_string(url), flags))
+        .collect();
+    let mut build: Vec<PartWrite> = ALLOCATION_BUILD
+        .iter()
+        .map(|&(what, value, flags)| (what, c_string(value), flags))
+        .collect();
+    build.push((CURLUPART_URL, c_string(ALLOCATION_RELATIVE), 0));
+    (rows, build)
+}
 
 /// One round of the workload: every row, then one part-by-part construction.
 ///
@@ -3300,40 +3678,84 @@ const ALLOCATION_ROUNDS: u64 = 6;
 /// `lib/urlapi.c` L1591 and L1599, and an empty part becomes a returned
 /// allocation rather than an error.
 ///
-/// The trailing block is the `setget_parts` shape: build a URL one part at a
-/// time, read it, then apply a relative value and read it again. It is included
-/// because assignment allocates on a different path from parsing -- the encode
-/// buffer at L1880 and the append-query buffer at L1944 -- and a round without
-/// it would measure only half the API.
-fn allocation_workload_round() {
-    for (url, flags) in ALLOCATION_WORKLOAD {
-        let handle = Handle::parse(url, flags);
+/// Nothing here copies a C buffer into Rust and nothing here asserts, so the
+/// round allocates only through the crate. It returns the number of calls that
+/// answered other than expected, for the caller to assert on **after** the
+/// window closes: a failing `assert_eq!` formats a message, which allocates,
+/// and would corrupt the measurement it was reporting.
+fn allocation_workload_round(rows: &[UrlRow], build: &[PartWrite]) -> u32 {
+    let mut unexpected = 0;
+
+    for (url, flags) in rows {
+        // SAFETY: no arguments, no preconditions. A null return is an
+        // allocation failure, reported as an unexpected outcome below.
+        let handle = unsafe { curl_url() };
+        if handle.is_null() {
+            unexpected += 1;
+            continue;
+        }
+        // SAFETY: `handle` is the live handle just obtained, exclusively owned
+        // here. `url` is a NUL-terminated C string the caller keeps alive for
+        // the whole call.
+        if unsafe { curl_url_set(handle, CURLUPART_URL, url.as_ptr(), *flags) } != CURLUE_OK {
+            unexpected += 1;
+        }
+
         // Every part, with no flags and then with the two that make more of
-        // them allocate. The results are dropped; `Handle::get` releases each
-        // C buffer as it goes, so a round leaks nothing and round N costs the
-        // same as round 1.
-        let _plain = handle.snapshot(0);
-        let _full = handle.snapshot(CURLU_GET_EMPTY | CURLU_DEFAULT_PORT);
-        let copy = handle.dup();
-        let _serialised = copy.get(CURLUPART_URL, 0);
+        // them allocate. Each buffer is released as it is seen, so a round
+        // leaks nothing and round N costs the same as round 1.
+        for what in ALL_PARTS {
+            unexpected += read_and_release(handle, what, 0);
+            unexpected += read_and_release(handle, what, CURLU_GET_EMPTY | CURLU_DEFAULT_PORT);
+        }
+
+        // SAFETY: `handle` is live and is read, never written, which is what
+        // `const CURLU *` promises.
+        let copy = unsafe { curl_url_dup(handle.cast_const()) };
+        if copy.is_null() {
+            unexpected += 1;
+        } else {
+            unexpected += read_and_release(copy, CURLUPART_URL, 0);
+            // SAFETY: `copy` is the handle `curl_url_dup` just returned,
+            // released exactly once here, with no other pointer to it.
+            unsafe { curl_url_cleanup(copy) };
+        }
+
+        // SAFETY: `handle` has not been released, is released exactly once
+        // here, and nothing else holds it.
+        unsafe { curl_url_cleanup(handle) };
     }
 
-    let mut built = Handle::new();
-    assert_eq!(built.set(CURLUPART_SCHEME, "https", 0), CURLUE_OK);
-    assert_eq!(built.set(CURLUPART_HOST, "example.org", 0), CURLUE_OK);
-    assert_eq!(built.set(CURLUPART_USER, "bob", 0), CURLUE_OK);
-    assert_eq!(built.set(CURLUPART_PASSWORD, "s3cret", 0), CURLUE_OK);
-    assert_eq!(built.set(CURLUPART_PORT, "8443", 0), CURLUE_OK);
-    assert_eq!(built.set(CURLUPART_PATH, "/one/two", 0), CURLUE_OK);
-    assert_eq!(built.set(CURLUPART_QUERY, "k=v", 0), CURLUE_OK);
-    assert_eq!(
-        built.set(CURLUPART_QUERY, "k2=v2", CURLU_APPENDQUERY),
-        CURLUE_OK
-    );
-    assert_eq!(built.set(CURLUPART_FRAGMENT, "here", 0), CURLUE_OK);
-    let _url = built.get(CURLUPART_URL, 0);
-    assert_eq!(built.set(CURLUPART_URL, "../elsewhere?z", 0), CURLUE_OK);
-    let _resolved = built.get(CURLUPART_URL, 0);
+    // SAFETY: no arguments, no preconditions.
+    let built = unsafe { curl_url() };
+    if built.is_null() {
+        return unexpected + 1;
+    }
+    // The nine part writes, then the whole URL read, then the relative write --
+    // whose entry is the tenth of `build` -- then the whole URL read again. The
+    // order is what makes the relative write meet a complete handle.
+    let (writes, relative) = build.split_at(build.len().saturating_sub(1));
+    for (what, value, flags) in writes {
+        // SAFETY: `built` is live and exclusively owned here, and `value` is a
+        // NUL-terminated C string the caller keeps alive for the whole call.
+        if unsafe { curl_url_set(built, *what, value.as_ptr(), *flags) } != CURLUE_OK {
+            unexpected += 1;
+        }
+    }
+    unexpected += read_and_release(built, CURLUPART_URL, 0);
+    for (what, value, flags) in relative {
+        // SAFETY: as above -- a live, exclusively owned handle and a
+        // NUL-terminated value that outlives the call.
+        if unsafe { curl_url_set(built, *what, value.as_ptr(), *flags) } != CURLUE_OK {
+            unexpected += 1;
+        }
+    }
+    unexpected += read_and_release(built, CURLUPART_URL, 0);
+    // SAFETY: `built` has not been released, is released exactly once here,
+    // and nothing else holds it.
+    unsafe { curl_url_cleanup(built) };
+
+    unexpected
 }
 
 /// This crate's allocation count stays under the ceiling `test1560` asserts.
@@ -3351,9 +3773,11 @@ fn allocation_workload_round() {
 /// allocator would be rejected or mis-accounted, so the parity harness is built
 /// without it. 0.9.4 names the remedy in the same breath -- "An independent
 /// allocation count via the platform's own tooling is the available substitute"
-/// -- and `curl_urlapi_rs::ffi::metrics` is that substitute. Its own
-/// documentation sets out the counting rule and why counting three functions
-/// counts everything.
+/// -- and [`count`], which interposes `malloc`, `calloc`, `realloc` and `free`
+/// inside this test binary, is that tooling. It lives here rather than in the
+/// crate: a counter compiled into `src/ffi.rs` would add a Rust API and
+/// permanent bookkeeping to a drop-in replacement for one C object file, and it
+/// would measure no more than interposition already does.
 ///
 /// # Both numbers below were measured, not chosen
 ///
@@ -3404,94 +3828,147 @@ fn allocation_workload_round() {
 ///
 /// # The reading is per thread, which is what makes it exact
 ///
-/// Cargo runs this binary's tests on several threads at once. `metrics` counts
-/// per thread, so nothing another test allocates in parallel is visible here and
-/// nothing this test allocates disturbs anything else. The reset at the start of
-/// each measurement affects the calling thread alone.
+/// Cargo runs this binary's tests on several threads at once. [`count`] counts
+/// per thread and only while armed, so nothing another test allocates in
+/// parallel is visible here and nothing this test allocates disturbs anything
+/// else. Every window below therefore measures this thread and this workload,
+/// and every assertion sits outside the window it reports on.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[test]
 fn the_allocation_count_stays_under_the_test1560_ceiling() {
-    use curl_urlapi_rs::ffi::metrics::{c_allocations, reset_c_allocations};
+    let (rows, build) = round_inputs();
 
     // 1. The counter is live, and one handle costs the 1 the reference spends.
-    reset_c_allocations();
+    count::arm();
+    // SAFETY: no arguments, no preconditions; the result is released below.
+    let probe = unsafe { curl_url() };
+    let after_new = count::disarm();
+    assert!(!probe.is_null(), "curl_url() returned NULL");
     assert_eq!(
-        c_allocations(),
-        0,
-        "the reset must be observable, or nothing below means anything"
-    );
-    let probe = Handle::new();
-    assert_eq!(
-        c_allocations(),
-        1,
+        after_new.allocations, 1,
         "curl_url() must cost exactly one allocation, as it does in the reference"
     );
-    drop(probe);
+
+    count::arm();
+    // SAFETY: `probe` is the handle obtained above, released exactly once here,
+    // with no other pointer to it and nothing borrowed from it.
+    unsafe { curl_url_cleanup(probe) };
+    let after_cleanup = count::disarm();
     assert_eq!(
-        c_allocations(),
-        1,
-        "and releasing it must cost none: memanalyzer.pm L439 leaves frees out of \
-         the sum, so this counter does too"
+        after_cleanup.allocations, 0,
+        "releasing a handle must cost no allocation: memanalyzer.pm L439 leaves \
+         frees out of the sum, so this counter does too"
+    );
+    assert_eq!(
+        after_cleanup.destroyed, 1,
+        "curl_url() takes one block, so cleaning the handle up must give one back"
     );
 
-    // 2. Linearity. Measured as two separate resets rather than one running
+    // 2. Linearity. Measured as two separate windows rather than one running
     //    total, so that a round which allocated and never released would show up
     //    as `two != one * 2` instead of hiding inside a cumulative figure.
-    reset_c_allocations();
-    allocation_workload_round();
-    let one_round = c_allocations();
-    assert!(
-        one_round > 0,
-        "a round of {} rows must allocate something",
-        ALLOCATION_WORKLOAD.len()
-    );
+    count::arm();
+    let mut unexpected = allocation_workload_round(&rows, &build);
+    let single = count::disarm();
 
-    reset_c_allocations();
-    allocation_workload_round();
-    allocation_workload_round();
-    let two_rounds = c_allocations();
-    assert_eq!(
-        two_rounds,
-        one_round.saturating_mul(2),
-        "two rounds cost {two_rounds} against {one_round} for one; the workload \
-         must be exactly repeatable, or it is leaking or caching and the \
-         extrapolation below is unsound"
-    );
+    count::arm();
+    unexpected += allocation_workload_round(&rows, &build);
+    unexpected += allocation_workload_round(&rows, &build);
+    let double = count::disarm();
 
     // 3. The ceiling, at the round count where the reference spends exactly it.
-    reset_c_allocations();
+    count::arm();
     for _ in 0..ALLOCATION_ROUNDS {
-        allocation_workload_round();
+        unexpected += allocation_workload_round(&rows, &build);
     }
-    let measured = c_allocations();
+    let full = count::disarm();
+
+    // Everything from here on formats and allocates, so every window is closed.
+    println!(
+        "allocation rounds: 1 -> {}, 2 -> {}, {ALLOCATION_ROUNDS} -> {} \
+         ({} created, {} destroyed)",
+        single.allocations, double.allocations, full.allocations, full.created, full.destroyed
+    );
+
     assert_eq!(
-        measured,
-        one_round.saturating_mul(ALLOCATION_ROUNDS),
+        unexpected, 0,
+        "{unexpected} call(s) in the workload answered other than expected, so \
+         the counts are not measuring the work they were meant to measure"
+    );
+    assert!(
+        single.allocations > 0,
+        "a round of {} rows must allocate something; if it did not, the \
+         interposition in `count` is not taking effect and nothing below means \
+         anything",
+        ALLOCATION_WORKLOAD.len()
+    );
+    assert_eq!(
+        single.created, single.destroyed,
+        "{} blocks created and {} destroyed in one round: the round must give \
+         back everything it takes, or the extrapolation below is unsound",
+        single.created, single.destroyed
+    );
+    assert_eq!(
+        double.allocations,
+        single.allocations.saturating_mul(2),
+        "two rounds cost {} against {} for one; the workload must be exactly \
+         repeatable, or it is leaking or caching",
+        double.allocations,
+        single.allocations
+    );
+    assert_eq!(
+        full.allocations,
+        single.allocations.saturating_mul(ALLOCATION_ROUNDS),
         "still linear at {ALLOCATION_ROUNDS} rounds"
     );
     assert!(
-        measured <= ALLOCATION_CEILING,
-        "{ALLOCATION_ROUNDS} rounds cost {measured} allocations, over the \
+        full.allocations <= ALLOCATION_CEILING,
+        "{ALLOCATION_ROUNDS} rounds cost {} allocations, over the \
          {ALLOCATION_CEILING} that tests/data/test1560 allows. The same workload \
          costs the unmodified C exactly {ALLOCATION_CEILING}, so this is the port \
          having become materially more allocation-hungry than the original, which \
-         is what implicit requirement I11 forbids"
+         is what implicit requirement I11 forbids",
+        full.allocations
+    );
+}
+
+/// The calibrated workload where the counter cannot be built, so the vectors
+/// are still exercised.
+///
+/// [`count`] forwards to glibc's `__libc_*` aliases, which exist on no other C
+/// library, and `AAP` 0.8.5 scopes this work to the platform parity is
+/// demonstrated on. Rather than let these twenty vectors vanish on such a
+/// target, the rounds run and their outcomes are checked; only the count is
+/// absent, and its absence is loud in this test's name rather than silent.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[test]
+fn the_calibrated_workload_runs_without_a_counter_on_this_target() {
+    let (rows, build) = round_inputs();
+    let mut unexpected = 0;
+    for _ in 0..ALLOCATION_ROUNDS {
+        unexpected += allocation_workload_round(&rows, &build);
+    }
+    assert_eq!(
+        unexpected, 0,
+        "{unexpected} call(s) answered other than expected"
     );
 }
 
 // ===========================================================================
 // The allocation ceiling, implicit requirement I11 -- second instrument
 //
-// Two independent instruments measure the same ceiling, and both are kept
-// deliberately. The one above counts at the crate's own C allocator, so it
-// reports exactly what this module spends and nothing else, and it needs no
-// platform support. The one below interposes the process allocator, so it
-// also sees whatever the surrounding code spends and is therefore the
-// stricter of the two, at the cost of being glibc-specific. Neither
-// subsumes the other: a regression that moved an allocation out of
-// `src/alloc.rs` into, say, a `Vec` would be invisible to the first and
-// caught by the second, while the second's total is only meaningful on a
-// target whose symbols it can interpose. `docs/MEMORY-OWNERSHIP.md` records
-// both sets of numbers.
+// Both instruments read the same counters, in `mod count` below, and both are
+// kept deliberately because their workloads differ. The one above is
+// calibrated: twenty rows over six rounds, sized so the unmodified C spends
+// exactly 3,000, which is what makes "under the ceiling" a like-for-like
+// comparison and what makes its linearity assertion meaningful. The one below
+// is broader -- twenty-four vectors, every part under `CURLU_GET_EMPTY`, both
+// codecs on the whole URL, a duplicate, then a series of writes -- and adds a
+// per-cycle budget and a created-versus-destroyed balance. Neither subsumes
+// the other: a regression that cost one extra allocation per handle would
+// break the first one's exact linearity, and one that appeared only on a path
+// the calibrated rows do not take would be caught by the second's wider
+// vectors. `docs/MEMORY-OWNERSHIP.md` records both sets of numbers.
 // ===========================================================================
 
 /// Vectors for the allocation workload, drawn from `tests/libtest/lib1560.c`.
@@ -3662,6 +4139,17 @@ mod count {
         fn __libc_free(block: *mut c_void);
     }
 
+    /// Addresses one watched window can record on each side of the ledger.
+    ///
+    /// Thirty-two is chosen against the largest window any caller opens: a
+    /// `curl_url_cleanup()` on a fully populated handle releases its ten strings
+    /// and its own block, eleven in all, and a single `curl_url_get()` takes a
+    /// handful. The cap exists because the recorder may not allocate -- see
+    /// [`WATCHING`] -- and an overrun is reported through
+    /// [`Observed::overflowed`] rather than silently truncating the evidence a
+    /// caller is about to assert on.
+    const WATCH_CAPACITY: usize = 32;
+
     thread_local! {
         /// Whether this thread is inside the measured window.
         static ARMED: Cell<bool> = const { Cell::new(false) };
@@ -3672,6 +4160,35 @@ mod count {
         static CREATED: Cell<u64> = const { Cell::new(0) };
         /// Blocks that ceased to exist while armed.
         static DESTROYED: Cell<u64> = const { Cell::new(0) };
+        /// Whether this thread is additionally recording *which* blocks moved.
+        ///
+        /// Separate from [`ARMED`] because the two have different costs. Arming
+        /// is an increment; watching copies a fixed-size array on every event,
+        /// which is nothing inside a window covering one call and would be
+        /// wasteful inside one covering a whole workload. Only the ownership
+        /// tests switch it on.
+        static WATCHING: Cell<bool> = const { Cell::new(false) };
+        /// Addresses of blocks created while watching, and how many.
+        ///
+        /// `Cell<[usize; N]>` rather than `[Cell<usize>; N]`: an array-repeat of
+        /// an inline `const` block needs a newer compiler than this crate's
+        /// declared floor of 1.75, while a `Cell` of an array is `const`
+        /// initialisable today. The array is `Copy`, so recording is a load, a
+        /// store into the copy, and a store back -- no allocation, no
+        /// destructor, nothing that could re-enter the allocator it runs inside.
+        static CREATED_AT: Cell<[usize; WATCH_CAPACITY]> = const {
+            Cell::new([0; WATCH_CAPACITY])
+        };
+        /// How many entries of [`CREATED_AT`] are valid.
+        static CREATED_LEN: Cell<usize> = const { Cell::new(0) };
+        /// Addresses of blocks destroyed while watching, and how many.
+        static DESTROYED_AT: Cell<[usize; WATCH_CAPACITY]> = const {
+            Cell::new([0; WATCH_CAPACITY])
+        };
+        /// How many entries of [`DESTROYED_AT`] are valid.
+        static DESTROYED_LEN: Cell<usize> = const { Cell::new(0) };
+        /// Whether either ledger ran out of room.
+        static OVERFLOWED: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Adds one to `counter` if this thread is measuring.
@@ -3679,6 +4196,37 @@ mod count {
         if ARMED.try_with(Cell::get).unwrap_or(false) {
             let _ = counter.try_with(|cell| cell.set(cell.get().saturating_add(1)));
         }
+    }
+
+    /// Records `block`'s address in `ledger` if this thread is watching.
+    ///
+    /// The address is taken as an integer and never dereferenced, here or in any
+    /// caller. That is the whole point of the mechanism: a test can ask what
+    /// happened to a block without touching it, which is what makes an ownership
+    /// assertion safe to make even when the ownership rule under test is broken.
+    fn note(
+        ledger: &'static std::thread::LocalKey<Cell<[usize; WATCH_CAPACITY]>>,
+        len: &'static std::thread::LocalKey<Cell<usize>>,
+        block: *mut c_void,
+    ) {
+        if !WATCHING.try_with(Cell::get).unwrap_or(false) {
+            return;
+        }
+        let _ = len.try_with(|cursor| {
+            let at = cursor.get();
+            if at >= WATCH_CAPACITY {
+                let _ = OVERFLOWED.try_with(|flag| flag.set(true));
+                return;
+            }
+            let _ = ledger.try_with(|cell| {
+                let mut addresses = cell.get();
+                if let Some(slot) = addresses.get_mut(at) {
+                    *slot = block as usize;
+                    cell.set(addresses);
+                    cursor.set(at.saturating_add(1));
+                }
+            });
+        });
     }
 
     /// What one measured window observed.
@@ -3689,6 +4237,68 @@ mod count {
         pub created: u64,
         /// Blocks destroyed, with a `realloc` counted as neutral.
         pub destroyed: u64,
+    }
+
+    /// Which blocks moved during one watched window.
+    ///
+    /// Both members are plain integers copied out of the ledgers after the
+    /// window closed. Nothing here is a pointer and nothing here may be
+    /// dereferenced; the addresses are evidence about blocks, not access to
+    /// them.
+    pub struct Observed {
+        /// Addresses handed out by `malloc`, `calloc` or `realloc(NULL, n)`.
+        created: [usize; WATCH_CAPACITY],
+        /// How many of [`Observed::created`] are valid.
+        created_len: usize,
+        /// Addresses given back through `free` or `realloc(p, 0)`.
+        destroyed: [usize; WATCH_CAPACITY],
+        /// How many of [`Observed::destroyed`] are valid.
+        destroyed_len: usize,
+        /// Whether either ledger filled up, making the record incomplete.
+        overflowed: bool,
+    }
+
+    impl Observed {
+        /// Whether `block` was handed out during the window.
+        ///
+        /// A true answer means the address names a block the allocator created
+        /// inside the window, which is what distinguishes a fresh allocation
+        /// from a pointer into storage that already existed.
+        #[must_use]
+        pub fn created(&self, block: *const c_void) -> bool {
+            let wanted = block as usize;
+            self.created
+                .iter()
+                .take(self.created_len)
+                .any(|&seen| seen == wanted)
+        }
+
+        /// Whether `block` was given back during the window.
+        #[must_use]
+        pub fn destroyed(&self, block: *const c_void) -> bool {
+            let wanted = block as usize;
+            self.destroyed
+                .iter()
+                .take(self.destroyed_len)
+                .any(|&seen| seen == wanted)
+        }
+
+        /// How many blocks were given back during the window.
+        #[must_use]
+        pub fn destroyed_count(&self) -> usize {
+            self.destroyed_len
+        }
+
+        /// Whether either ledger ran out of room.
+        ///
+        /// Every caller asserts this is false before reading the rest: a full
+        /// ledger means an address may be absent because it was not recorded
+        /// rather than because it did not move, and the two must never be
+        /// confused.
+        #[must_use]
+        pub fn overflowed(&self) -> bool {
+            self.overflowed
+        }
     }
 
     /// Opens the measured window and zeroes the counters.
@@ -3709,6 +4319,26 @@ mod count {
         }
     }
 
+    /// Opens a window that records addresses as well as counts.
+    pub fn watch() {
+        CREATED_LEN.with(|cell| cell.set(0));
+        DESTROYED_LEN.with(|cell| cell.set(0));
+        OVERFLOWED.with(|cell| cell.set(false));
+        WATCHING.with(|cell| cell.set(true));
+    }
+
+    /// Closes the recording window and yields the two ledgers.
+    pub fn unwatch() -> Observed {
+        WATCHING.with(|cell| cell.set(false));
+        Observed {
+            created: CREATED_AT.with(Cell::get),
+            created_len: CREATED_LEN.with(Cell::get),
+            destroyed: DESTROYED_AT.with(Cell::get),
+            destroyed_len: DESTROYED_LEN.with(Cell::get),
+            overflowed: OVERFLOWED.with(Cell::get),
+        }
+    }
+
     /// The interposed `malloc`.
     #[no_mangle]
     pub extern "C" fn malloc(size: size_t) -> *mut c_void {
@@ -3718,7 +4348,9 @@ mod count {
         // precondition beyond it. The argument is passed through unaltered and
         // the result is returned unaltered, so this wrapper is transparent to
         // every caller.
-        unsafe { __libc_malloc(size) }
+        let block = unsafe { __libc_malloc(size) };
+        note(&CREATED_AT, &CREATED_LEN, block);
+        block
     }
 
     /// The interposed `calloc`.
@@ -3728,7 +4360,9 @@ mod count {
         tally(&CREATED);
         // SAFETY: as `malloc` above -- both arguments are passed through and
         // `__libc_calloc` has `calloc`'s contract, zeroing included.
-        unsafe { __libc_calloc(count, size) }
+        let block = unsafe { __libc_calloc(count, size) };
+        note(&CREATED_AT, &CREATED_LEN, block);
+        block
     }
 
     /// The interposed `realloc`.
@@ -3744,12 +4378,25 @@ mod count {
             tally(&CREATED);
         } else if size == 0 {
             tally(&DESTROYED);
+            note(&DESTROYED_AT, &DESTROYED_LEN, block);
         }
         // SAFETY: `block` is whatever the caller passed, and `realloc`'s own
         // contract is what constrains it -- either null or a live block from
         // this allocator. This wrapper neither reads nor writes through it, and
         // `__libc_realloc` is the allocator that would have received it.
-        unsafe { __libc_realloc(block, size) }
+        let fresh = unsafe { __libc_realloc(block, size) };
+        // A growing `realloc` replaces one block with another, so the old
+        // address ceases to name a block and the new one starts to. Recorded on
+        // both ledgers when they differ, because a caller asking "was my block
+        // released?" has to see a move as a release of the address it held.
+        if !block.is_null() && size != 0 && fresh != block {
+            note(&DESTROYED_AT, &DESTROYED_LEN, block);
+            note(&CREATED_AT, &CREATED_LEN, fresh);
+        }
+        if block.is_null() {
+            note(&CREATED_AT, &CREATED_LEN, fresh);
+        }
+        fresh
     }
 
     /// The interposed `free`.
@@ -3761,6 +4408,7 @@ mod count {
     pub extern "C" fn free(block: *mut c_void) {
         if !block.is_null() {
             tally(&DESTROYED);
+            note(&DESTROYED_AT, &DESTROYED_LEN, block);
         }
         // SAFETY: `block` is the caller's, constrained by `free`'s own contract,
         // and is passed through untouched to the allocator that would have
@@ -3783,7 +4431,7 @@ mod count {
 /// the caller can assert on it *after* closing the window -- a failing
 /// `assert_eq!` formats a message, which allocates, and would corrupt the
 /// measurement it was reporting.
-fn allocation_cycle(url: &CStr, sets: &[(CURLUPart, CString, c_uint)]) -> u32 {
+fn allocation_cycle(url: &CStr, sets: &[PartWrite]) -> u32 {
     let mut unexpected = 0;
 
     // SAFETY: no arguments, no preconditions. A null return is an allocation
@@ -3805,10 +4453,10 @@ fn allocation_cycle(url: &CStr, sets: &[(CURLUPart, CString, c_uint)]) -> u32 {
     // zone identifier, so this loop counts allocations rather than checking
     // codes.
     for what in ALL_PARTS {
-        read_and_release(handle, what, CURLU_GET_EMPTY);
+        unexpected += read_and_release(handle, what, CURLU_GET_EMPTY);
     }
-    read_and_release(handle, CURLUPART_URL, CURLU_URLENCODE);
-    read_and_release(handle, CURLUPART_URL, CURLU_URLDECODE);
+    unexpected += read_and_release(handle, CURLUPART_URL, CURLU_URLENCODE);
+    unexpected += read_and_release(handle, CURLUPART_URL, CURLU_URLDECODE);
 
     // SAFETY: `handle` is live and is read, never written, which is what
     // `const CURLU *` promises.
@@ -3816,7 +4464,7 @@ fn allocation_cycle(url: &CStr, sets: &[(CURLUPart, CString, c_uint)]) -> u32 {
     if copy.is_null() {
         unexpected += 1;
     } else {
-        read_and_release(copy, CURLUPART_URL, 0);
+        unexpected += read_and_release(copy, CURLUPART_URL, 0);
         // SAFETY: `copy` is the handle `curl_url_dup` just returned, released
         // exactly once here, with no other pointer to it in existence.
         unsafe { curl_url_cleanup(copy) };
@@ -3829,7 +4477,7 @@ fn allocation_cycle(url: &CStr, sets: &[(CURLUPart, CString, c_uint)]) -> u32 {
             unexpected += 1;
         }
     }
-    read_and_release(handle, CURLUPART_URL, 0);
+    unexpected += read_and_release(handle, CURLUPART_URL, 0);
 
     // SAFETY: `handle` has not been released, is released exactly once here, and
     // nothing else holds it.
@@ -3842,23 +4490,44 @@ fn allocation_cycle(url: &CStr, sets: &[(CURLUPart, CString, c_uint)]) -> u32 {
 /// The counterpart to [`Handle::get`] for the measured window: it exists so that
 /// a buffer the crate allocated is accounted for and released without a `Vec` or
 /// a `String` being created to look at it.
-fn read_and_release(handle: *mut CurlUrl, what: CURLUPart, flags: c_uint) {
+///
+/// # The code is checked, not discarded
+///
+/// A part being absent is an answer rather than a fault -- the workload vectors
+/// deliberately include handles with no query, no fragment and no zone
+/// identifier -- so this does not require `CURLUE_OK`. What it does require is
+/// that the code and the pointer **agree**, which is a contract rather than a
+/// preference: `lib/urlapi.c` L1552 writes null into the caller's slot on entry
+/// and every failing return sits after it, so a failing retrieval must hand back
+/// nothing. Returning 1 for a violation rather than asserting keeps the measured
+/// window free of the allocation an assertion message would make; the caller
+/// adds the result to its own tally and asserts after the window closes.
+///
+/// The reverse pairing is not an error and is not counted: `CURLUE_OK` with no
+/// buffer is what a blank part retrieved under `CURLU_GET_EMPTY` gives, taking
+/// the empty dynamic buffer at `lib/urlapi.c` L1399.
+fn read_and_release(handle: *mut CurlUrl, what: CURLUPart, flags: c_uint) -> u32 {
     let mut part: *mut c_char = ptr::null_mut();
     // SAFETY: `handle` is a live handle owned by the caller, passed as `*const`
     // so no unique reference is formed. `part` is a writable, aligned local in
     // this frame, so it cannot alias the handle.
     let code = unsafe { curl_url_get(handle.cast_const(), what, &mut part, flags) };
-    let _ = code;
-    if !part.is_null() {
-        // SAFETY: `part` is non-null, so `curl_url_get` wrote a block it
-        // allocated through `src/alloc.rs` and handed to this caller. This is
-        // its first and only release, and nothing refers into it.
-        unsafe { libc::free(part.cast::<c_void>()) };
+    if part.is_null() {
+        return 0;
     }
+    // SAFETY: `part` is non-null, so `curl_url_get` wrote a block it
+    // allocated through `src/alloc.rs` and handed to this caller. This is
+    // its first and only release, and nothing refers into it. It happens before
+    // the judgement below rather than after so that the buffer is accounted for
+    // whatever the judgement is -- and it is sound either way, because a pointer
+    // this caller received is this caller's to release.
+    unsafe { libc::free(part.cast::<c_void>()) };
+    // A pointer alongside a failure is the contract violation described above.
+    u32::from(code != CURLUE_OK)
 }
 
 /// Converts the workload's inputs, before any window opens.
-fn workload_inputs() -> (Vec<CString>, Vec<(CURLUPart, CString, c_uint)>) {
+fn workload_inputs() -> (Vec<CString>, Vec<PartWrite>) {
     let urls = WORKLOAD_URLS.iter().map(|url| c_string(url)).collect();
     let sets = WORKLOAD_SETS
         .iter()

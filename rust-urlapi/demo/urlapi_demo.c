@@ -972,32 +972,38 @@ static int s12_empty_url(void)
   rc |= showpart(u, CURLUPART_URL, "url unchanged", 0);
   curl_url_cleanup(u);
 
-  /* A guessed scheme changes nothing about the ordinary empty write. It is
-     written out separately all the same, because the guessed-scheme marker
-     is the one thing that CAN change the answer -- see the note below. */
+  /* A guessed scheme changes nothing about the empty write, with or without
+     CURLU_NO_GUESS_SCHEME. Both are printed, because this is the one
+     combination a reader expects to behave differently and it does not.
+
+     AAP 0.6.5 states that this write "fails with malformed input -- because
+     the retrieval returns the no-scheme code lib/urlapi.c:L1559-L1560". It
+     does not. That guard is in the CURLUPART_SCHEME arm; L1700 reads
+     CURLUPART_URL, which L1624-L1625 dispatches to urlget_url, where the
+     same flag is read at L1512-L1515 only to blank the scheme prefix before
+     returning CURLUE_OK -- so L1701-L1706 make the write a no-op success.
+     A guessed scheme also always leaves u->scheme set, L1004-L1008, so the
+     CURLUE_NO_SCHEME at L1453-L1458 cannot fire on such a handle either.
+
+     The three lines below therefore appear identically in this program
+     linked against the unmodified C and linked against the Rust archive,
+     which is what acceptance criterion A7 requires of every line here.
+     ../docs/KNOWN-DIVERGENCES.md records the reading under "Checked and not
+     a divergence: the empty whole-URL write under CURLU_NO_GUESS_SCHEME". */
   u = curl_url();
   if(!u)
     return oom();
   rc |= setpart(u, CURLUPART_URL, "example.com", "set guess_scheme",
                 CURLU_GUESS_SCHEME);
+  rc |= showpart(u, CURLUPART_URL, "url no_guess_scheme",
+                 CURLU_NO_GUESS_SCHEME);
   rc |= setpart(u, CURLUPART_URL, "", "set empty url", 0);
+  rc |= setpart(u, CURLUPART_URL, "", "set empty url no_guess_scheme",
+                CURLU_NO_GUESS_SCHEME);
   rc |= showpart(u, CURLUPART_URL, "url unchanged", 0);
-  /* Deliberately NOT exercised here: the same empty write carrying
-     CURLU_NO_GUESS_SCHEME on this very handle. That combination is the
-     crate's one bounded divergence from the C on the write side -- AAP
-     0.6.5 requires CURLUE_MALFORMED_INPUT and lib/urlapi.c answers
-     CURLUE_OK, because L1700 reads CURLUPART_URL, whose arm treats the flag
-     as a formatting choice at L1512-L1515 rather than as the error
-     L1559-L1560 is. Putting it in this transcript would make the two link
-     modes disagree with the reference-linked build of this same file, and
-     acceptance criterion A7 is that they do not disagree by a single byte.
-     It is covered instead by ../tests/ffi_surface.rs and by the unit test in
-     ../src/getset.rs, neither of which is diffed against the C, and it is
-     recorded in ../docs/KNOWN-DIVERGENCES.md under "Divergence: the empty
-     whole-URL write under CURLU_NO_GUESS_SCHEME". */
-  note("a guessed scheme does not change the ordinary empty write; the one "
-       "combination that does is kept out of this transcript on purpose, "
-       "see the comment at this line in demo/urlapi_demo.c");
+  note("CURLU_NO_GUESS_SCHEME is a formatting choice on the read the empty "
+       "write performs, not an error, so both empty writes above succeed "
+       "and neither changes the handle");
   curl_url_cleanup(u);
 
   /* The sensitivity that is real. A handle with a host and no scheme

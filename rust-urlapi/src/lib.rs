@@ -364,7 +364,14 @@
 // module, so the `pub` is load-bearing rather than anticipatory: making it
 // private again breaks the run-time half of the ABI verification.
 // `rust-urlapi/tests/ffi_surface.rs` reaches it the same way. `ffi` is public
-// because it is the facade.
+// because it is the facade, and for no other reason: **every item it declares
+// is `pub(crate)`**, its exports included, so from outside the crate
+// `curl_urlapi_rs::ffi` is an empty module and no Rust API of any kind reaches
+// a consumer through it. That is a property to keep rather than an accident.
+// A measurement instrument, for one, does not belong here: the allocation
+// count implicit requirement I11 asks for is taken by interposing the process
+// allocator from inside `rust-urlapi/tests/ffi_surface.rs`, which observes the
+// same calls without the crate carrying anything for it.
 //
 // Neither widens the C ABI, which is the reasonable first worry about a `pub
 // mod` in a crate whose export set is audited. A cdylib exposes symbols the
@@ -373,10 +380,7 @@
 // visibility and C linkage are separate mechanisms, so making a module `pub`
 // adds nothing to the symbol table, which is a property any symbol-set check
 // over the archive will see -- `nm -g --defined-only` today, and
-// `rust-urlapi/scripts/check-abi.sh` once that script lands. `src/ffi.rs`
-// demonstrates the same point from the other side: every item it declares is
-// `pub(crate)`, its exports included, and they reach the symbol table purely
-// by attribute.
+// `rust-urlapi/scripts/check-abi.sh` once that script lands.
 pub mod abi;
 mod alloc;
 mod ctype;

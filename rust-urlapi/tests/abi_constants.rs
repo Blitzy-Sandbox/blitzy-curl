@@ -381,23 +381,35 @@ fn flag_bits_are_single_bit_pairwise_disjoint_and_cover_the_low_sixteen() {
     );
 }
 
-/// Both aliases carry the whole asserted range, and carry it signed.
+/// Both aliases carry the whole asserted range without losing a value.
 ///
-/// `src/abi.rs` declares `CURLUcode` and `CURLUPart` as `c_int`. What the
-/// header establishes is the *size*: both C enumerations are 4 bytes wide, and
-/// `c_int` is 4 bytes on the targets this crate is built for, so a value
-/// crossing the boundary is neither truncated nor widened. Which of `int` and
-/// `unsigned int` a given compiler picks as the compatible type is that
-/// compiler's choice -- gcc against this repository reports both enumerations
-/// compatible with `unsigned int` -- and it does not change what is passed,
-/// because every enumerator is non-negative and inside the common range.
+/// What the header establishes about these two types is their *width*: both C
+/// enumerations are 4 bytes, `c_int` is 4 bytes on the targets this crate is
+/// built for, and every enumerator is non-negative and well inside the common
+/// range -- so a value crossing the boundary is neither truncated nor
+/// reinterpreted.
 ///
-/// So nothing below claims a signedness rule. The typed bindings are the plain
-/// statement that the constants really are of the alias type; the widening
-/// round-trip is the statement that no value is lost on the way through, which
-/// a narrower alias would break; and the signedness assertion pins the alias as
-/// `src/abi.rs` currently writes it, so that swapping it fails here rather than
-/// at some call site months later.
+/// What the header does **not** establish is signedness. Which of `int` and
+/// `unsigned int` a compiler picks as an enumeration's compatible type is that
+/// compiler's choice; gcc against this repository reports both of these
+/// enumerations compatible with `unsigned int`, while `src/abi.rs` declares the
+/// aliases as `c_int`. Both are correct, because no enumerator is negative and
+/// none is above `INT_MAX`, so the two choices pass the same bytes for every
+/// value the API can produce or accept.
+///
+/// So nothing here asserts a signedness rule. An earlier revision did, by
+/// checking `MIN.signum() == -1`, and that assertion was self-referential: it
+/// read back the alias `src/abi.rs` had chosen and called the choice a
+/// contract, which is the one thing an independent authority check must not do.
+/// Establishing the C side's compatible type would take a compile probe against
+/// a real compiler, not a Rust assertion about Rust.
+///
+/// What remains is what the header does support. The typed bindings state that
+/// the constants really are of the alias type; the widening round-trip states
+/// that no value is lost on the way through, which a narrower alias would
+/// break; and the equal-width assertion states that the two aliases cannot
+/// drift apart. Every ordinal and bit value is covered exhaustively by the
+/// tests above, and those are the assertions the header actually authorises.
 #[test]
 fn the_type_aliases_carry_the_full_asserted_range() {
     let last: abi::CURLUcode = abi::CURLUE_LAST;
@@ -414,21 +426,13 @@ fn the_type_aliases_carry_the_full_asserted_range() {
     assert_eq!(abi::CURLUcode::try_from(i64::from(last)), Ok(last));
     assert_eq!(abi::CURLUPart::try_from(i64::from(zoneid)), Ok(zoneid));
 
-    // The alias as `src/abi.rs` writes it, pinned so that swapping it for an
-    // unsigned type fails here rather than at some call site months later.
+    // Four bytes, which is what the header does establish, and the same four
+    // for both so they cannot drift apart.
     assert_eq!(
-        abi::CURLUcode::MIN.signum(),
-        -1,
-        "CURLUcode is declared signed in src/abi.rs"
+        ::core::mem::size_of::<abi::CURLUcode>(),
+        4,
+        "CURLUcode mirrors a 4-byte C enumeration"
     );
-    assert_eq!(
-        abi::CURLUPart::MIN.signum(),
-        -1,
-        "CURLUPart is declared signed in src/abi.rs"
-    );
-
-    // Both mirror a 4-byte C enumeration, so they must remain the same width as
-    // each other whatever platform decides what that width is.
     assert_eq!(
         ::core::mem::size_of::<abi::CURLUcode>(),
         ::core::mem::size_of::<abi::CURLUPart>(),

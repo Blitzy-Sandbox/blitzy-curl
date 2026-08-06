@@ -38,7 +38,7 @@
 //!
 //! | Section | Contents | Consumer |
 //! |---------|----------|----------|
-//! | 1 | The C allocator, its `metrics` counter, and `CBlock` | `src/alloc.rs`, `src/dynbuf.rs`, `tests/ffi_surface.rs` |
+//! | 1 | The C allocator and `CBlock` | `src/alloc.rs`, `src/dynbuf.rs` |
 //! | 2 | `inet_sys`, the platform `inet_pton` and `inet_ntop` | `src/inet.rs` |
 //! | 3 | `idn2`, the libidn2 binding | `src/idn.rs` |
 //! | 4 | `scheme_import`, libcurl's own `Curl_get_scheme` | `src/scheme.rs` |
@@ -158,118 +158,6 @@ use crate::alloc::CBuf;
 /// the bound exists for the arithmetic rather than for the data.
 pub(crate) const MAX_ALLOC: usize = isize::MAX as usize;
 
-/// The stand-in for curl's memory-debug allocation counter.
-///
-/// # Why the crate has to count for itself
-///
-/// `tests/data/test1560` asserts `<limits>Allocations: 3000</limits>`, and
-/// `tests/runtests.pl` L1790-L1822 enforces it by reading the memory-debug
-/// log and summing the mallocs, callocs, reallocs, strdups and wcsdups that
-/// `tests/memanalyzer.pm` L439 adds together. That is the instrument the plan
-/// records as implicit requirement I11, and the plan also records at 0.2.4.3
-/// why this port cannot be measured with it: under the memory-debug
-/// configuration `curl_free` becomes a tracking free that validates every
-/// pointer against its own allocation table (`lib/curl_setup.h:L1461`), and a
-/// block this crate took straight from the C allocator would be rejected or
-/// mis-accounted. So the parity harness is built without memory debugging,
-/// and 0.9.4 names the remedy in the same breath: "An independent allocation
-/// count via the platform's own tooling is the available substitute."
-///
-/// This is that substitute, and it is an exact analogue rather than an
-/// approximation, for one structural reason: **every** allocation this crate
-/// makes passes through [`c_malloc`], [`c_calloc`] or [`c_realloc`]. No
-/// module outside this file allocates, and no production path uses the Rust
-/// allocator at all -- `Vec` and `String` appear only inside `#[cfg(test)]`
-/// modules. Counting these three functions therefore counts exactly what
-/// memdebug would have counted for the C original: the module's own
-/// allocations, and nothing belonging to the caller or to the C library.
-///
-/// # The counting rule, stated so it can be relied on
-///
-/// One is added for every call that reaches the C allocator. A call refused
-/// by a guard before it gets there -- a zero size, an overflowing product, a
-/// request above [`MAX_ALLOC`] -- is not counted, because no allocation was
-/// attempted. A call that reaches the allocator and fails **is** counted,
-/// which matches `curl_dbg_malloc` at `lib/memdebug.c`: it logs the call
-/// whether or not the result is null. `c_free` is not counted, for the same
-/// reason `memanalyzer.pm` L439 leaves frees out of the sum.
-///
-/// # Per thread, deliberately
-///
-/// The count is thread-local. Cargo runs the tests of one binary on several
-/// threads at once, so a global counter would report whatever else happened
-/// to be in flight and a measurement taken across a workload would be noise.
-/// Per-thread makes the reading exact: this crate never starts a thread and
-/// never moves a handle between them, so a workload run on one thread
-/// accounts for itself completely.
-///
-/// The cell is `const`-initialised and holds a type with no destructor, so
-/// reading it allocates nothing and registers nothing -- which matters,
-/// because the counter is incremented from inside the allocator itself.
-///
-/// # Cost, and why it is acceptable
-///
-/// One thread-local increment per allocation, always compiled in. It is not
-/// behind a Cargo feature on purpose: `Cargo.toml` freezes the feature set at
-/// the six capability switches the plan tables at 0.3.1.1 and says so, and a
-/// measurement that only exists in a configuration nobody builds is the very
-/// gap this module closes. The plan's non-functional constraints at 0.8.5 put
-/// correctness over performance and set no throughput target, and an
-/// increment beside a `malloc` is not measurable against the `malloc`.
-///
-/// # Not part of the C ABI
-///
-/// Nothing here carries `#[no_mangle]` or `extern "C"`, so the archive's
-/// exported C symbol set is untouched and acceptance criterion A2 in 0.9.2 --
-/// the symbol set matches the object file `lib/urlapi.c` produces, and adds
-/// nothing -- still holds. Rust visibility and C linkage are separate
-/// mechanisms; `src/lib.rs` makes the same point about `pub mod`.
-pub mod metrics {
-    extern crate std;
-
-    use core::cell::Cell;
-
-    std::thread_local! {
-        /// Allocations made on this thread since it started, or since the last
-        /// [`reset_c_allocations`].
-        ///
-        /// `Cell<u64>` rather than an atomic: the value is only ever touched
-        /// by its own thread, so there is nothing to synchronise, and a `Cell`
-        /// read compiles to a load. `const` initialisation keeps the access
-        /// free of lazy setup, which is what makes it safe to do from inside
-        /// an allocator.
-        static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
-    }
-
-    /// Adds one to the calling thread's count.
-    ///
-    /// Saturating rather than wrapping, so an implausibly long-running process
-    /// reports a stuck maximum instead of silently starting again from zero. A
-    /// plain `+` would trip the crate's `clippy::arithmetic_side_effects`
-    /// denial, which is the lint that exists to make exactly this decision
-    /// explicit.
-    pub(crate) fn record_allocation() {
-        ALLOCATIONS.with(|count| count.set(count.get().saturating_add(1)));
-    }
-
-    /// Allocations this crate has made on the calling thread.
-    ///
-    /// Read it before and after a workload and subtract; the difference is
-    /// what `tests/data/test1560`'s ceiling would have been measured against.
-    #[must_use = "the count is the whole point of calling this"]
-    pub fn c_allocations() -> u64 {
-        ALLOCATIONS.with(Cell::get)
-    }
-
-    /// Sets the calling thread's count back to zero.
-    ///
-    /// Only affects the calling thread, so one test using it cannot disturb
-    /// another running beside it.
-    pub fn reset_c_allocations() {
-        ALLOCATIONS.with(|count| count.set(0));
-    }
-}
-
 /// Allocates `size` bytes with the C allocator.
 ///
 /// Mirrors `curlx_malloc`, which resolves to plain `malloc` outside a libcurl
@@ -308,7 +196,6 @@ pub(crate) fn c_malloc(size: usize) -> *mut c_void {
     if size == 0 || size > MAX_ALLOC {
         return ptr::null_mut();
     }
-    metrics::record_allocation();
     // SAFETY: `libc::malloc` has no preconditions beyond a nonzero size,
     // which the guard above establishes. `libc::size_t` is `usize` on every
     // supported target, so `size` passes through unconverted. The result is
@@ -355,7 +242,6 @@ pub(crate) fn c_calloc(nmemb: usize, size: usize) -> *mut c_void {
         Some(total) if total <= MAX_ALLOC => {}
         _ => return ptr::null_mut(),
     }
-    metrics::record_allocation();
     // SAFETY: `libc::calloc` requires nothing of its arguments; the guards
     // above additionally rule out a zero-size request and an overflowing
     // product, so the platform is never asked to resolve either case. The
@@ -408,7 +294,6 @@ pub(crate) unsafe fn c_realloc(p: *mut c_void, size: usize) -> *mut c_void {
     if size == 0 || size > MAX_ALLOC {
         return ptr::null_mut();
     }
-    metrics::record_allocation();
     // SAFETY: the caller guarantees, per the contract above, that `p` is null
     // or a live block from this module's allocator, which is exactly
     // `libc::realloc`'s precondition. `size` is nonzero by the guard, so the
