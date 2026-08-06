@@ -836,15 +836,25 @@ static void error_paths(void)
  * identical call with CURLU_DEFAULT_SCHEME succeeds, because that flag lets
  * the retrieval substitute a scheme and return successfully.
  *
- * The third handle records a case worth stating explicitly because it is easy
- * to predict wrongly. On a handle whose scheme was guessed, an empty
- * assignment carrying CURLU_NO_GUESS_SCHEME still SUCCEEDS. That flag does
- * not make whole-URL retrieval fail; it only blanks the scheme prefix
- * (lib/urlapi.c:1512-1515) and returns success. Retrieval of the scheme PART
- * is what returns a no-scheme code under that flag (lib/urlapi.c:1559-1560),
- * and the empty-assignment path never asks for the scheme part. Both
- * observations are transcribed from the reference implementation rather than
- * predicted from it.
+ * ONE COMBINATION IS DELIBERATELY NOT DEMONSTRATED HERE, and this is the
+ * place to say why, because its absence would otherwise look like an
+ * oversight. An empty assignment carrying CURLU_NO_GUESS_SCHEME on a handle
+ * whose scheme was GUESSED is the port's one intentional behavioural
+ * divergence from lib/urlapi.c: the plan requires a malformed-input error
+ * there, while the reference returns success, because that flag only blanks
+ * the scheme prefix on the whole-URL path (lib/urlapi.c:1512-1515) and the
+ * guard that turns it into a no-scheme code belongs to the scheme PART path
+ * (lib/urlapi.c:1559-1560). This program's whole purpose is that its output be
+ * byte-identical to the same program linked against the unmodified C, so it
+ * exercises only what the two agree on. The divergence, its measurements and
+ * its bounds are recorded in ../docs/KNOWN-DIVERGENCES.md under "The
+ * empty-string rule and its hidden flag sensitivity".
+ *
+ * What the third handle below does show is the half that is common ground: on
+ * a guessed-scheme handle, an empty assignment with NO flags is a successful
+ * no-op, and CURLU_NO_GUESS_SCHEME still suppresses the scheme prefix on
+ * RETRIEVAL exactly as it does in the reference. Both are transcribed from the
+ * reference implementation rather than predicted from it.
  */
 static void empty_url_rule(void)
 {
@@ -881,12 +891,12 @@ static void empty_url_rule(void)
     return;
   setpart(g, CURLUPART_URL, "ftp.example.com/pub", "set guessed host",
           CURLU_GUESS_SCHEME);
-  setpart(g, CURLUPART_URL, "", "set empty with no guess scheme",
-          CURLU_NO_GUESS_SCHEME);
+  showpart(g, CURLUPART_URL, "guessed url, no guess scheme",
+           CURLU_NO_GUESS_SCHEME);
   setpart(g, CURLUPART_URL, "", "set empty with no flags", 0);
-  showpart(g, CURLUPART_URL, "guessed url after empty assignments", 0);
-  note("CURLU_NO_GUESS_SCHEME blanks the scheme prefix without failing, so "
-       "the no-op still succeeds");
+  showpart(g, CURLUPART_URL, "guessed url after empty assignment", 0);
+  note("on retrieval CURLU_NO_GUESS_SCHEME blanks the scheme prefix without "
+       "failing, and an empty assignment with no flags stays a no-op");
   curl_url_cleanup(g);
 }
 

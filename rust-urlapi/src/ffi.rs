@@ -135,9 +135,11 @@
 // reachable depends on the selected feature set, and `curl_free` in particular
 // is called only from the `cfree`-gated export.
 //
-// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
-// covers the whole feature matrix in one place, which is where the reason for
-// it belongs; see "DEAD-CODE POLICY" there.
+// Dead-code diagnostics are answered at the items. Where an item below has no
+// production caller, it carries its own `#[allow(dead_code)]` with the reason
+// it is kept immediately above it, and there is no crate-wide allowance to
+// fall back on; see "DEAD-CODE POLICY" in `src/lib.rs` for the four outcomes
+// that policy permits.
 
 use core::fmt;
 use core::mem;
@@ -389,6 +391,12 @@ pub(crate) unsafe fn c_free(p: *mut c_void) {
 ///
 /// Identical to [`c_free`]: `p` must be null, or a live block from this
 /// module's allocator that has not already been freed.
+// No production caller when the `cfree` feature is off: the exported
+// `curl_free` is compiled only under that feature, because `lib/escape.c`
+// already defines the symbol in the drop-in link. Retained unconditionally
+// rather than gated, so the tests below exercise this release path in both
+// configurations.
+#[allow(dead_code)]
 pub(crate) unsafe fn curl_free(p: *mut c_void) {
     // SAFETY: this function's contract is `c_free`'s contract verbatim, so the
     // caller has already established the precondition; forwarding adds no
@@ -772,6 +780,9 @@ impl CBlock {
     /// measured with `strlen`, and no other owner may release it. A pointer
     /// that came from a different allocator, notably from Rust's, must never
     /// be passed here.
+    // Dead only because `adopt_c_string` is: this is the block half of the
+    // adoption path, and the pair is retained together.
+    #[allow(dead_code)]
     #[must_use = "discarding the value frees the block immediately"]
     pub(crate) unsafe fn from_raw(p: *mut c_char) -> Option<(Self, usize)> {
         if p.is_null() {
@@ -823,6 +834,9 @@ impl CBlock {
     /// `p` must be null, or a block this crate may free of at least `cap`
     /// bytes, all of them initialized, with no other owner. The provenance
     /// requirement is [`CBlock::from_raw`]'s verbatim.
+    // Dead only because `adopt_c_bytes` is, exactly as for
+    // [`CBlock::from_raw`] above.
+    #[allow(dead_code)]
     #[must_use = "discarding the value frees the block immediately"]
     pub(crate) unsafe fn from_raw_parts(p: *mut c_char, cap: usize) -> Option<Self> {
         // A capacity past [`MAX_ALLOC`] cannot describe a block Rust is able
@@ -894,6 +908,11 @@ impl fmt::Debug for CBlock {
 ///
 /// `src` must be null or point at a NUL-terminated string that stays readable
 /// for the duration of the call.
+// No production caller: the port duplicates from slices it already holds,
+// so it calls `crate::alloc` directly. Retained because this is the
+// signature `curlx_strdup` actually has -- a C pointer in, a C pointer out
+// -- which is what a caller replacing a C call site needs.
+#[allow(dead_code)]
 #[must_use = "the caller owns this string; discarding it leaks memory"]
 pub(crate) unsafe fn c_strdup_raw(src: *const c_char) -> *mut c_char {
     if src.is_null() {
@@ -930,6 +949,10 @@ pub(crate) unsafe fn c_strdup_raw(src: *const c_char) -> *mut c_char {
 ///
 /// `src` must point at `len` readable, initialized bytes, or be null when
 /// `len` is zero. No terminator is required or assumed.
+// No production caller, as for `c_strdup_raw`. Retained as the mirror of
+// `Curl_memdup0` at `lib/curlx/strdup.c`, which is the helper the C reaches
+// for when it has a length rather than a terminator.
+#[allow(dead_code)]
 #[must_use = "the caller owns this string; discarding it leaks memory"]
 pub(crate) unsafe fn c_memdup0(src: *const c_char, len: usize) -> *mut c_char {
     if src.is_null() && len != 0 {
@@ -989,6 +1012,12 @@ pub(crate) unsafe fn c_memdup0(src: *const c_char, len: usize) -> *mut c_char {
 /// # Safety
 ///
 /// [`CBlock::from_raw`]'s contract verbatim.
+// No production caller: nothing in the port takes a C-allocated string
+// back across the boundary today. Retained because it is the "take it
+// back" half of the ownership contract that `docs/MEMORY-OWNERSHIP.md`
+// and `crate::alloc::c_strdup` both point at, and the tests below drive
+// the whole round trip through it.
+#[allow(dead_code)]
 #[must_use = "discarding the value frees the block immediately"]
 pub(crate) unsafe fn adopt_c_string(p: *mut c_char) -> Option<CBuf> {
     // SAFETY: the caller's guarantee is `CBlock::from_raw`'s precondition and
@@ -1016,6 +1045,10 @@ pub(crate) unsafe fn adopt_c_string(p: *mut c_char) -> Option<CBuf> {
 ///
 /// `p` must be null, or a block this crate may free of at least `len + 1`
 /// initialized bytes, with no other owner.
+// No production caller, as for `adopt_c_string`. Retained as the
+// explicit-length form, for a block whose size the caller knows rather
+// than measures.
+#[allow(dead_code)]
 #[must_use = "discarding the value frees the block immediately"]
 pub(crate) unsafe fn adopt_c_bytes(p: *mut c_char, len: usize) -> Option<CBuf> {
     let cap = len.checked_add(1)?;
@@ -1445,6 +1478,13 @@ pub(crate) mod idn2 {
         /// The byte-oriented entry point, which reads its input as UTF-8 and
         /// is therefore indifferent to the locale. Selected by `lib/idn.c`
         /// L36-L37 for Windows with wide characters.
+        ///
+        /// Declared under the same condition as the `lookup` arm that calls
+        /// it, so that the declaration and its one caller cannot drift apart.
+        /// On every other target libidn2 still exports the symbol and this
+        /// crate simply does not name it, which is what the C's `#else` at
+        /// L39-L40 amounts to once the preprocessor has run.
+        #[cfg(all(windows, win32_unicode))]
         fn idn2_lookup_u8(src: *const u8, lookupname: *mut *mut u8, flags: c_int) -> c_int;
 
         /// `int idn2_to_unicode_8z8z(const char *input, char **output,
@@ -1816,9 +1856,36 @@ pub(crate) mod idn2 {
 /// imports it, so the archive must show the symbol as undefined rather than
 /// defined, or the drop-in link acquires a duplicate of a symbol `lib/url.c`
 /// already provides and the archive exports something the C object file does
-/// not. `scripts/check-abi.sh` is to be the automated check for that property
-/// and is a later deliverable; until it lands, `nm -u` over the archive is the
-/// way to confirm the symbol is still undefined.
+/// not.
+///
+/// # This import is valid for the ARCHIVE only, and the linker now says so
+///
+/// Both names are declared at `lib/url.h` L76-L77 and are libcurl-private.
+/// libcurl's visibility and export rules keep them out of a shared libcurl's
+/// dynamic symbol table, so no runtime loader can ever supply them: an
+/// undefined reference to either resolves in exactly one situation, a static
+/// link in which `url.c.o` takes part. That is the drop-in link, and it is
+/// the only artifact this module belongs to.
+///
+/// A shared object built from this configuration would come out with both
+/// names undefined, with no `libcurl` NEEDED entry and no prospect of one,
+/// and would fail at `dlopen` every time. It is not a deliverable, and
+/// `build.rs` `emit_shared_artifact_gate` makes that structural rather than
+/// advisory: every **release** cdylib link on an ELF target is given
+/// `-Wl,-z,defs`, so no shippable object of that shape can be produced at
+/// all. The shared artifact belongs to the standalone configuration, whose
+/// built-in table in `src/scheme.rs` needs nothing from libcurl. A drop-in
+/// release build therefore names the artifact it wants -- `cargo rustc
+/// --release --lib --crate-type staticlib` -- rather than asking
+/// `cargo build --release` for all three. The dev profile is left ungated so
+/// that `cargo test` still runs here, and the build log says so.
+///
+/// The archive's own two-sided surface is checked by `build.rs`
+/// `localize_dropin_archive` on the way to the canonical drop-in artifact:
+/// `nm -g --defined-only` must report exactly the eight globals `urlapi.c.o`
+/// defines, and `nm -u` must report both of these names as undefined, so a
+/// build that compiled the built-in table into a drop-in artifact by mistake
+/// is rejected rather than shipped.
 #[cfg(not(feature = "scheme-table"))]
 pub(crate) mod scheme_import {
     use core::ffi::CStr;
@@ -2354,7 +2421,12 @@ pub(crate) mod scheme_import {
 /// path depends on it, and the *library* must not make that call: choosing a
 /// locale is the application's decision, and libcurl does not take it either.
 /// So the crate never calls it, and the tests do.
-#[cfg(test)]
+///
+/// Compiled under exactly the condition its one importer carries, the
+/// `#[cfg(all(idn_backend_libidn2, unix))]` at `src/idn.rs` L1098: those are
+/// the builds that reach `idn2_lookup_ul`, and they are the only ones with a
+/// locale to arrange or a codeset to ask about.
+#[cfg(all(test, idn_backend_libidn2, unix))]
 pub(crate) mod test_locale {
     /// Put the process in the locale its environment names, exactly once.
     ///
@@ -2743,8 +2815,13 @@ pub(crate) mod exports {
     /// The same number [`HANDLE_FITS_MALLOC_ALIGNMENT`] asserts against, made
     /// readable so that the run-time half of the check can report it instead of
     /// only comparing it.
+    ///
+    /// That run-time half is a test, and it is the only caller: the production
+    /// paths need the bound checked, which the two `const` proofs above do at
+    /// compile time, not reported. So this is compiled for tests only rather
+    /// than carried into the library with the diagnostic suppressed.
+    #[cfg(test)]
     pub(crate) fn malloc_alignment() -> usize {
-        let () = HANDLE_FITS_FUNDAMENTAL_ALIGNMENT;
         mem::align_of::<MallocAlignment>()
     }
 
@@ -2771,9 +2848,12 @@ pub(crate) mod exports {
     /// Null when the allocation fails, which is what C returns and what every
     /// caller of `curl_url()` already tests for.
     fn new_handle() -> *mut CurlUrl {
-        // The compile-time alignment proof has to be reachable to be
-        // evaluated; referencing it here costs nothing at run time.
+        // The compile-time alignment proofs have to be reachable to be
+        // evaluated; referencing them here costs nothing at run time. Both are
+        // named, because they check different bounds: the allocator's promise
+        // on this target, and the fundamental-alignment bound on every target.
         let () = HANDLE_FITS_MALLOC_ALIGNMENT;
+        let () = HANDLE_FITS_FUNDAMENTAL_ALIGNMENT;
 
         let block = super::c_calloc(1, mem::size_of::<CurlUrl>());
         if block.is_null() {

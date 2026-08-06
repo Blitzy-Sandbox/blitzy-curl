@@ -141,9 +141,11 @@
 // of which are compiled unconditionally. Which individual helpers a given build
 // reaches still depends on the selected feature set.
 //
-// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
-// covers the whole feature matrix in one place, which is where the reason for
-// it belongs; see "DEAD-CODE POLICY" there.
+// Dead-code diagnostics are answered at the items. Where an item below has no
+// production caller, it carries its own `#[allow(dead_code)]` with the reason
+// it is kept immediately above it, and there is no crate-wide allowance to
+// fall back on; see "DEAD-CODE POLICY" in `src/lib.rs` for the four outcomes
+// that policy permits.
 
 // The plan puts every `unsafe` block in `src/ffi.rs` (AAP 0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1). This
@@ -778,6 +780,9 @@ pub(crate) fn add_preencoded(enc: &mut DynBuf, part: &[u8]) -> CURLUcode {
 /// A `length` beyond the slice is clamped rather than trusted. C would read
 /// past the caller's buffer; clamping is the only defined behaviour available
 /// here, and the single call site inside the URL API passes zero anyway.
+// Dead only because its single caller, `easy_escape`, is: this is that
+// function's `inlength` rule and nothing else uses it.
+#[allow(dead_code)]
 fn escape_window(string: &[u8], length: usize) -> &[u8] {
     if length == 0 {
         cstring_window(string)
@@ -908,6 +913,12 @@ fn escape_all(window: &[u8]) -> Option<DynBuf> {
 /// allocator, and `curl_free()` is therefore the correct release for the
 /// pointer `DynBuf::into_cbuf` or `DynBuf::into_raw` produces. Until one of
 /// those is called, `Drop` releases it.
+// No production caller: `curl_easy_escape` is defined in `lib/escape.c`
+// and is not one of the symbols this crate replaces, so no path inside the
+// URL API reaches it. Retained because the AAP requires this module to
+// carry the escape helper at `lib/escape.c` L50, and the tests below pin
+// it against the C's behaviour for a negative and an oversized length.
+#[allow(dead_code)]
 #[must_use = "the escaped buffer is owned; dropping it releases the memory"]
 pub(crate) fn easy_escape(string: Option<&[u8]>, inlength: c_int) -> Option<DynBuf> {
     // L56-L57, in the C's order: the null test first, then the sign test.

@@ -941,20 +941,96 @@ the object file in a full link. Their consumers are, source-verified:
 
 `ffi.rs` is the only module carrying the export attributes, with every other
 module crate-internal, which is what keeps the archive free of collisions with
-the rest of libcurl. The symbol comparison above therefore runs against the
-crate today, and it does not run against the raw `staticlib`: that archive
-carries the whole Rust standard library, the allocator and the unwinder, so
-`nm -g --defined-only` reports 2413 distinct globals where `urlapi.c.o`
-reports 8. The drop-in artifact is produced from it by the localization pass
-`build.rs` implements -- `ld -r --whole-archive`, then
-`objcopy --keep-global-symbol` for the ABI set, then `ar rcs` -- and that pass
-ends by comparing the complete set `nm` reports against the expected one,
-failing on anything missing and on anything extra. Measured: exactly the eight
-names above in the drop-in configuration, and exactly ten in the standalone
-one, where `curl_url_strerror` and `curl_free` are real exports. The
-`cdylib` needs no such step, because it exposes symbols the way an executable
-does and only an annotated `#[no_mangle] pub extern "C" fn` is exported at
-all.
+the rest of libcurl.
+
+### The canonical static artifact
+
+Cargo's `staticlib` output is an **input**, not the deliverable. It carries
+the whole Rust standard library, the allocator and the unwinder, so
+`nm -g --defined-only` reports thousands of distinct globals where
+`urlapi.c.o` reports 8. No count is quoted here on purpose: it moves with the
+toolchain, and `build.rs` reports the measured figure in the build log at the
+moment it matters rather than leaving a literal to go stale.
+
+**The canonical drop-in artifact is `libcurl_urlapi_rs_dropin.a`**, and it is
+the only static artifact this port offers for a C link line. `build.rs`
+produces it with the localization pass -- `ld -r --whole-archive`, then
+`objcopy --keep-global-symbol` for the ABI set, then `ar rcs` -- and validates
+it in both directions. Measured: exactly the eight names above in the drop-in
+configuration, and exactly ten in the standalone one, where `curl_url_strerror`
+and `curl_free` are real exports. That archive is what `check-abi` compares,
+what the parity link names, and what the cargo-c install path ships; the raw
+Cargo archive is never presented as the drop-in.
+
+The validation is two-sided, and the second side is what makes it a provenance
+check rather than a rename. Before localizing anything the pass inspects the
+**raw** archive:
+
+- every name the requested feature combination must export has to be defined,
+  and the two feature-gated exports have to be defined **if and only if** their
+  feature is on -- so a default-feature archive, which defines
+  `curl_url_strerror` and `curl_free`, is refused by a drop-in invocation;
+- the **undefined** set has to name the providers that combination implies --
+  `Curl_get_scheme` and `Curl_getn_scheme` in the drop-in configuration and in
+  no other, the three unconditional `idn2_*` entry points plus exactly one of
+  the two lookup spellings under the libidn2 backend and none under any other;
+- the archive has to be no older than every file it was built from, which is a
+  different failure from feature incompatibility and no symbol test can see.
+
+The undefined side is the one that earns its keep. An archive built with
+`scheme-table` wrongly left on defines the *same eight globals* as a correct
+drop-in archive, so nothing after `objcopy` can tell the two apart -- but it
+carries no reference to `Curl_get_scheme` at all, and that is what the check
+reads. All of these refusals were exercised deliberately rather than reasoned
+about.
+
+A provenance record is written beside the artifact -- feature set, target,
+profile, the measured raw global count, the exported set, the imported provider
+set, and a content tag for the input, the output and the source inventory -- so
+a certification can be compared with a later one instead of being taken on
+trust. The tag is FNV-1a and is a change detector rather than a cryptographic
+digest; the checks that actually gate the certification are the exact ones
+above.
+
+### The shared artifact belongs to one configuration
+
+The `cdylib` needs no localization step, because it exposes symbols the way an
+executable does and only an annotated `#[no_mangle] pub extern "C" fn` is
+exported at all. It does need a **closure** check, and the reason is the
+scheme provider.
+
+With `scheme-table` off, the crate references `Curl_get_scheme` and
+`Curl_getn_scheme`, declared at `lib/url.h`:L76-L77. Both are libcurl-private,
+and libcurl's visibility rules keep them out of a shared libcurl's dynamic
+symbol table, so an undefined reference to either resolves in exactly one
+situation: a static link in which `url.c.o` takes part. That is the drop-in
+link. A shared object built from that configuration would carry both names
+undefined, with no `libcurl` NEEDED entry and no prospect of one, and would
+fail at `dlopen` every time.
+
+So the rule is that **a shared object is a deliverable only where the crate is
+self-contained**, which is the standalone configuration, and `build.rs`
+`emit_shared_artifact_gate` enforces it with the linker: every **release**
+cdylib link on an ELF target gets `-Wl,-z,defs`, so an unresolved strong
+reference stops the link instead of shipping. The standalone `.so` is
+therefore proved closed on every release build -- its undefined set is libc,
+libgcc and libidn2, each a real NEEDED entry -- and a drop-in release build
+names the artifact it wants rather than asking for all three:
+
+    cargo rustc --release --no-default-features --features idn-libidn2 \
+      --lib --crate-type staticlib
+
+`--crate-type` on `cargo rustc` has been stable since 1.64, below the crate's
+declared 1.75 floor. `cargo check` and `cargo clippy` are unaffected by the
+directive, which Cargo applies to the cdylib link alone.
+
+The gate stops at the release profile deliberately. Cargo builds every crate
+type of a lib target whenever it builds that target, and an integration test
+under `tests/` needs the lib target built, so gating the dev profile as well
+would stop `cargo test` from running in the drop-in configuration. Release is
+the profile that produces deliverables and the profile every documented build
+command names; a debug shared object, which nobody installs, is recorded in
+the build log instead of refused.
 
 ### Two symbols that stay behind a feature
 

@@ -1140,13 +1140,34 @@ fn set_url_port(u: &mut CurlUrl, provided_port: &[u8]) -> CURLUcode {
 /// because an implementation that special-cased the empty string would pass one
 /// and fail the other.
 ///
-/// `CURLU_NO_GUESS_SCHEME` is **not** that flag, although the plan's 0.6.5
-/// says it is. In the whole-URL arm the flag is a formatting choice only,
-/// L1512-L1515, which blanks the scheme prefix and returns `CURLUE_OK`; the
-/// arm where it is an error, L1559-L1560, belongs to `CURLUPART_SCHEME`, which
-/// L1700 never asks for. `docs/KNOWN-DIVERGENCES.md` carries the reported
-/// conflict, the measurements behind it and the decision this module
-/// implements; nothing about it is settled here.
+/// # The second sensitivity, which `AAP` 0.6.5 specifies
+///
+/// `CURLU_NO_GUESS_SCHEME` on a handle whose scheme was **guessed** answers
+/// `CURLUE_MALFORMED_INPUT`, and the port implements that because 0.6.5 states
+/// it and this file's own specification restates it as a mandatory pair:
+/// "with `CURLU_NO_GUESS_SCHEME` on a guessed-scheme handle (malformed
+/// input)". The check is made ahead of the general retrieval, because that is
+/// the only place it can be made -- the retrieval itself cannot produce the
+/// answer.
+///
+/// It is worth being exact about why, since the reason is a divergence from
+/// the C rather than a reading of it. In the reference, the whole-URL arm
+/// reads the flag at L1512-L1515 only to *blank the scheme prefix*, never to
+/// fail; the arm where the flag is an error, L1559-L1560, belongs to
+/// `CURLUPART_SCHEME`, which L1700 never asks for. So the reference answers
+/// `CURLUE_OK` for this call. `AAP` 0.6.5 specifies the failing answer, and a
+/// frozen plan governs an implementation choice, so the failing answer is what
+/// this module returns. `docs/KNOWN-DIVERGENCES.md` records the resulting
+/// oracle conflict in full -- including the measurement against an unmodified
+/// `libcurl.a` -- without weakening the requirement, and notes that
+/// `tests/libtest/lib1560.c` never writes `""` to `CURLUPART_URL`, so the
+/// unmodified oracle is unaffected either way.
+///
+/// The flag is still a formatting choice on the *read* side, exactly as in the
+/// C: `url_get(u, CURLUPART_URL, CURLU_NO_GUESS_SCHEME)` on the same handle
+/// succeeds with the prefix suppressed, which is the vector
+/// `tests/libtest/lib1560.c` asserts at L583-L585. Only the empty *write*
+/// differs, and only in this one combination.
 ///
 /// # The three-way dispatch that follows
 ///
@@ -1162,11 +1183,21 @@ fn set_url_port(u: &mut CurlUrl, provided_port: &[u8]) -> CURLUcode {
 ///
 /// # Errors
 ///
-/// `CURLUE_MALFORMED_INPUT` for an empty value the handle cannot serialize,
-/// `CURLUE_OUT_OF_MEMORY` propagated from either serialization, or whatever
-/// the parse or the resolution reported.
+/// `CURLUE_MALFORMED_INPUT` for an empty value the handle cannot serialize and
+/// for an empty value carrying `CURLU_NO_GUESS_SCHEME` on a guessed-scheme
+/// handle, `CURLUE_OUT_OF_MEMORY` propagated from either serialization, or
+/// whatever the parse or the resolution reported.
 fn set_url(u: &mut CurlUrl, url: &[u8], part_size: usize, flags: c_uint) -> CURLUcode {
     if part_size == 0 {
+        // `AAP` 0.6.5, ahead of the retrieval because the retrieval cannot
+        // produce this answer: the whole-URL arm treats the flag as a
+        // formatting choice (L1512-L1515) and succeeds. See the doc comment
+        // above for the divergence this is, and
+        // `docs/KNOWN-DIVERGENCES.md` for the measurement behind it.
+        if (flags & CURLU_NO_GUESS_SCHEME) != 0 && u.guessed_scheme() {
+            return CURLUE_MALFORMED_INPUT;
+        }
+
         // L1697-L1710. "a blank URL is not a valid URL unless we already have
         // a complete one and this is a redirect".
         return match url_get(u, CURLUPART_URL, flags) {
@@ -1592,48 +1623,54 @@ mod tests {
     //! neither, and `rtmp` is found but not implemented, which is the
     //! disabled-protocol case.
     //!
-    //! # `CURLU_NO_GUESS_SCHEME` and the empty-string write, checked three ways
+    //! # `CURLU_NO_GUESS_SCHEME` and the empty-string write
     //!
-    //! Writing `""` to `CURLUPART_URL` on a guessed-scheme handle answers
-    //! `CURLUE_OK` whether or not `CURLU_NO_GUESS_SCHEME` is set. The flag's
-    //! name makes the opposite reading tempting, so the answer was established
-    //! three ways rather than reasoned about, each on its own sufficient:
+    //! Writing `""` to `CURLUPART_URL` on a **guessed-scheme** handle with
+    //! `CURLU_NO_GUESS_SCHEME` answers `CURLUE_MALFORMED_INPUT`, which is what
+    //! `AAP` 0.6.5 specifies and what this file's specification restates as a
+    //! mandatory test pair. Without the flag the same call is a no-op success.
+    //! [`tests::an_empty_url_and_no_guess_scheme_is_malformed_input`] pins both
+    //! halves.
+    //!
+    //! That answer is a **deliberate divergence from the reference**, and the
+    //! honest thing is to say so here rather than let the test read as a
+    //! transcription. Three separate observations put the reference on the
+    //! other side:
     //!
     //! 1. **The source.** L1559-L1560, the guard that turns the flag into
     //!    `CURLUE_NO_SCHEME`, is in the `CURLUPART_SCHEME` arm. `set_url`
     //!    retrieves `CURLUPART_URL` at L1700, whose arm at L1624-L1625 goes to
     //!    `urlget_url` instead. There the same flag is read at L1512-L1515
     //!    only to *blank the scheme prefix*, never to fail, so the read
-    //!    returns `CURLUE_OK` and L1701-L1706 make the write a no-op success.
+    //!    returns `CURLUE_OK` and L1701-L1706 would make the write a no-op
+    //!    success.
     //! 2. **Measurement.** A probe linked against an unmodified `libcurl.a`
     //!    built from this repository answers `CURLUE_OK` for that exact call,
     //!    with and without the flag, and leaves the handle unchanged.
     //! 3. **`tests/libtest/lib1560.c`, unmodified.** Its `get_url_list` at
     //!    L583-L585 asserts `{"example.com", "example.com/",
-    //!    CURLU_GUESS_SCHEME, CURLU_NO_GUESS_SCHEME, CURLUE_OK}` -- the very
-    //!    read L1700 performs, asserted to succeed with the prefix suppressed
-    //!    -- while its `get_parts_list` at L149-L152 asserts `[10]`,
+    //!    CURLU_GUESS_SCHEME, CURLU_NO_GUESS_SCHEME, CURLUE_OK}` -- the read
+    //!    L1700 performs, asserted to succeed with the prefix suppressed --
+    //!    while its `get_parts_list` at L149-L152 asserts `[10]`,
     //!    `CURLUE_NO_SCHEME`, for the scheme part of the same handle under the
-    //!    same flag. The two arms are asserted to differ, by the oracle the
-    //!    port has to pass unmodified.
+    //!    same flag. The two arms are asserted to differ.
     //!
-    //! So the port answers `CURLUE_OK`, and it does so because that is what
-    //! the reference does. `AAP` 0.2.2 designates `lib/urlapi.c` "the
-    //! behavioral source of truth", 0.8.1 directs that behavior "be read from
-    //! `lib/urlapi.c` rather than inferred" and forbids changing error
-    //! semantics, transformation rule `T6` at 0.1.2.3 is "faithful over
-    //! correct", and acceptance criteria `A5`, `A7` and `A9` at 0.9.2 are
-    //! measured by running that oracle and by diffing a demo against the same
-    //! demo linked against the unmodified C. Reproducing the reference is the
-    //! requirement, and it is what the three checks above establish.
+    //! The plan governs the implementation all the same: 0.6.5 is frozen and
+    //! states the failing answer, so the port returns it and records the
+    //! conflict for the plan's owner instead of quietly preferring the
+    //! reference. Two facts keep the cost at nothing measurable, and both were
+    //! checked: `tests/libtest/lib1560.c` never writes `""` to
+    //! `CURLUPART_URL` at all, so `A5` is untouched; and
+    //! `rust-urlapi/demo/urlapi_demo.c` deliberately does not exercise this
+    //! one combination, so `A7`'s byte-for-byte diff against the
+    //! reference-linked demo is untouched as well. The READ side is unchanged
+    //! and still matches the reference exactly, L583-L585 included.
+    //! `docs/KNOWN-DIVERGENCES.md` carries the whole record.
     //!
-    //! The empty-string case *is* flag-sensitive, on a different flag.
+    //! The empty-string case is flag-sensitive in a second, non-divergent way.
     //! [`tests::the_empty_url_decision_is_flag_sensitive`] pins it on
     //! `CURLU_DEFAULT_SCHEME`, which decides at L1453-L1458 whether a handle
-    //! carrying a host and no scheme can serialize at all, and
-    //! [`tests::an_empty_url_is_a_no_op_success_on_a_complete_handle`] pins
-    //! both halves of the `CURLU_NO_GUESS_SCHEME` pair alongside the read they
-    //! depend on.
+    //! carrying a host and no scheme can serialize at all.
 
     // The crate root denies the panicking constructs so that no panic can ever
     // reach the C boundary. A test's whole job is to panic when an assertion
@@ -2615,23 +2652,15 @@ mod tests {
     // set_url: the whole-URL assignment, L1685-L1730
     // ---------------------------------------------------------------------
 
-    /// L1697-L1710: the empty string as a relative URL that changes nothing,
-    /// with and without `CURLU_NO_GUESS_SCHEME` on a handle whose scheme was
-    /// guessed.
+    /// L1697-L1710: the empty string as a relative URL that changes nothing.
     ///
-    /// **Both calls succeed**, for the reason the module preamble sets out with
-    /// all three of its checks: the write at L1700 reads `CURLUPART_URL`, and
-    /// that arm reads the flag at L1512-L1515 only to blank the scheme prefix,
-    /// never to fail. The read this test asserts first is exactly the vector
-    /// `tests/libtest/lib1560.c` asserts at L583-L585, so the mechanism is
-    /// pinned here and not merely its consequence -- an implementation that
-    /// made the read fail would break this test and that oracle together,
-    /// which is the point of asserting the read alongside the write.
-    ///
-    /// [`the_empty_url_decision_is_flag_sensitive`] pins the sensitivity on
-    /// the flag that really causes it, and
+    /// The no-flags half of the mandatory pair. A handle that can serialize
+    /// itself accepts `""` as a relative URL and nothing about it changes, on a
+    /// guessed-scheme handle and on an explicit-scheme one alike. The failing
+    /// half of the same pair is
+    /// [`an_empty_url_and_no_guess_scheme_is_malformed_input`], and
     /// [`an_empty_url_on_an_incomplete_handle_is_malformed_input`] pins the
-    /// failing half of the rule.
+    /// other way the empty write fails.
     #[test]
     fn an_empty_url_is_a_no_op_success_on_a_complete_handle() {
         let mut guessed = handle(b"example.com", CURLU_GUESS_SCHEME);
@@ -2641,24 +2670,6 @@ mod tests {
         );
         url_is(&guessed, NO_FLAGS, b"http://example.com/");
 
-        let mut same = handle(b"example.com", CURLU_GUESS_SCHEME);
-        // The read L1700 performs, asserted on its own first, because it is
-        // what decides the write below. `tests/libtest/lib1560.c` L583-L585
-        // asserts this same vector: guessed scheme in, `CURLU_NO_GUESS_SCHEME`
-        // out, `CURLUE_OK` with the prefix suppressed.
-        url_is(&same, CURLU_NO_GUESS_SCHEME, b"example.com/");
-        assert_eq!(
-            url_set(&mut same, CURLUPART_URL, Some(b""), CURLU_NO_GUESS_SCHEME),
-            CURLUE_OK,
-            "the read above succeeded, so L1701-L1706 make this a no-op \
-             success; measured against the reference and asserted by \
-             tests/libtest/lib1560.c L583-L585"
-        );
-        // The scheme-less serialization the flag asks for is still available,
-        // and the guessed scheme is still on the handle: nothing changed.
-        url_is(&same, CURLU_NO_GUESS_SCHEME, b"example.com/");
-        url_is(&same, NO_FLAGS, b"http://example.com/");
-
         let mut explicit = handle(b"https://example.com/p?q#f", NO_FLAGS);
         assert_eq!(
             url_set(
@@ -2667,9 +2678,63 @@ mod tests {
                 Some(b""),
                 CURLU_NO_GUESS_SCHEME
             ),
-            CURLUE_OK
+            CURLUE_OK,
+            "this handle's scheme was not guessed, so the AAP 0.6.5 arm does \
+             not apply and the empty write is the ordinary no-op"
         );
         url_is(&explicit, NO_FLAGS, b"https://example.com/p?q#f");
+    }
+
+    /// `AAP` 0.6.5: an empty whole-URL write carrying `CURLU_NO_GUESS_SCHEME`
+    /// on a handle whose scheme was **guessed** is `CURLUE_MALFORMED_INPUT`.
+    ///
+    /// This is the mandatory pair the file's specification names, asserted here
+    /// in both halves on one handle so that neither can be satisfied by
+    /// accident: same handle, same empty value, the flag the only difference.
+    ///
+    /// It is also the port's one deliberate divergence from the reference,
+    /// which answers `CURLUE_OK` here for the reason the module preamble sets
+    /// out. Two properties keep the divergence contained, and both are asserted
+    /// below rather than asserted about:
+    ///
+    /// * The **read** side is untouched. `CURLUPART_URL` under the same flag on
+    ///   the same handle still succeeds with the scheme prefix suppressed,
+    ///   which is exactly the vector `tests/libtest/lib1560.c` asserts at
+    ///   L583-L585. A port that had made the read fail instead would break that
+    ///   oracle.
+    /// * The handle is **unchanged** by the refusal, so the failure is a
+    ///   refusal and not a partial mutation.
+    ///
+    /// The guessed-scheme marker is what selects the arm, so a handle carrying
+    /// the same scheme explicitly is asserted to be unaffected in
+    /// [`an_empty_url_is_a_no_op_success_on_a_complete_handle`].
+    #[test]
+    fn an_empty_url_and_no_guess_scheme_is_malformed_input() {
+        let mut u = handle(b"example.com", CURLU_GUESS_SCHEME);
+
+        // The read the reference would have used to decide this write. It
+        // succeeds, with the prefix blanked, and must keep doing so:
+        // tests/libtest/lib1560.c L583-L585 asserts this exact vector.
+        url_is(&u, CURLU_NO_GUESS_SCHEME, b"example.com/");
+
+        assert_eq!(
+            url_set(&mut u, CURLUPART_URL, Some(b""), CURLU_NO_GUESS_SCHEME),
+            CURLUE_MALFORMED_INPUT,
+            "AAP 0.6.5 requires malformed input for an empty whole-URL write \
+             carrying CURLU_NO_GUESS_SCHEME on a guessed-scheme handle"
+        );
+
+        // Nothing moved: both serializations still answer what they did before.
+        url_is(&u, CURLU_NO_GUESS_SCHEME, b"example.com/");
+        url_is(&u, NO_FLAGS, b"http://example.com/");
+
+        // And the other half of the pair, on the same handle.
+        assert_eq!(
+            url_set(&mut u, CURLUPART_URL, Some(b""), NO_FLAGS),
+            CURLUE_OK,
+            "without the flag the same empty write is the ordinary no-op"
+        );
+        url_is(&u, NO_FLAGS, b"http://example.com/");
     }
 
     /// L1700, the real flag sensitivity: the caller's flags are handed to the

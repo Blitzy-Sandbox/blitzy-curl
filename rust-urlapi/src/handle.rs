@@ -155,9 +155,11 @@
 // Which of the accessors below any one build reaches still depends on the
 // selected feature set.
 //
-// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
-// covers the whole feature matrix in one place, which is where the reason for
-// it belongs; see "DEAD-CODE POLICY" there.
+// Dead-code diagnostics are answered at the items. Where an item below has no
+// production caller, it carries its own `#[allow(dead_code)]` with the reason
+// it is kept immediately above it, and there is no crate-wide allowance to
+// fall back on; see "DEAD-CODE POLICY" in `src/lib.rs` for the four outcomes
+// that policy permits.
 
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
@@ -216,6 +218,12 @@ impl StringField {
     /// all ten. Adding a field to the structure without adding it here is
     /// caught by the exhaustiveness of the matches in
     /// [`CurlUrl::field_mut`], which the compiler checks.
+    // Never read outside the tests: `release_strings` spells the ten fields
+    // out, one assignment per `Curl_safefree` at L86-L98, so that the
+    // correspondence with the C is line for line. Retained because the tests
+    // walk it to prove that no field is left out of an operation that should
+    // cover all ten.
+    #[allow(dead_code)]
     pub(crate) const ALL: [Self; 10] = [
         Self::Scheme,
         Self::User,
@@ -801,6 +809,11 @@ impl CurlUrl {
     #[must_use = "this removes the buffer from the handle even if the \
                   result is discarded; use clear() to release in place or \
                   an accessor to borrow"]
+    // No production caller: the port clears a field in place or borrows it,
+    // for the reason the paragraph above gives. Retained as the move-out half
+    // of the field family, and used by the tests below to check that a taken
+    // buffer is released exactly once.
+    #[allow(dead_code)]
     pub(crate) fn take(&mut self, which: StringField) -> Option<CBuf> {
         self.field_mut(which).take()
     }

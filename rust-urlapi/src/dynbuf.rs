@@ -137,9 +137,11 @@
 // configuration compiles. `add` in particular exists for the literal appends
 // and is not needed by every configuration.
 //
-// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
-// covers the whole feature matrix in one place, which is where the reason for
-// it belongs; see "DEAD-CODE POLICY" there.
+// Dead-code diagnostics are answered at the items. Where an item below has no
+// production caller, it carries its own `#[allow(dead_code)]` with the reason
+// it is kept immediately above it, and there is no crate-wide allowance to
+// fall back on; see "DEAD-CODE POLICY" in `src/lib.rs` for the four outcomes
+// that policy permits.
 
 // `unsafe` belongs to `src/ffi.rs` alone. This module goes further and
 // presents an API of slices, so that `src/encode.rs`, `src/getset.rs` and all
@@ -177,6 +179,10 @@ const MIN_FIRST_ALLOC: usize = 32;
 /// loop early above it. The constant is kept so that the reasoning has a
 /// name, and [`DynBuf::ceiling_is_sane`] exposes the comparison as a query
 /// for a caller that wants to check a ceiling it invented.
+// Never read outside the query named just above: this port saturates where
+// the C asserts. Retained so that the bound the C names has a name here
+// too, rather than living only in a comment.
+#[allow(dead_code)]
 const MAX_DYNBUF_SIZE: usize = usize::MAX / 2;
 
 /// A growable, NUL-terminated byte buffer backed by the C allocator.
@@ -304,6 +310,9 @@ impl DynBuf {
     /// representable size rather than with a wrapped one. The predicate
     /// exists so that the bound has a name a test can check, and so that a
     /// future caller inventing a ceiling has a way to ask.
+    // No production caller: a query and not an assertion, as the paragraph
+    // above says. Retained so the bound has a name a test can check.
+    #[allow(dead_code)]
     #[must_use]
     pub(crate) const fn ceiling_is_sane(&self) -> bool {
         self.toobig <= MAX_DYNBUF_SIZE
@@ -870,6 +879,10 @@ impl DynBuf {
     /// C's `toobig`, fixed by [`DynBuf::new`] and preserved by
     /// [`DynBuf::free`] so that a released buffer can be refilled under the
     /// same limit. Bounds `len() + 1`, not `len()`.
+    // No production caller: `grow` compares against the field directly.
+    // Retained so that a test can read back the ceiling a constructor stored,
+    // which is how the `toobig` values of `lib/urlapi.c` are pinned.
+    #[allow(dead_code)]
     #[must_use]
     pub(crate) const fn ceiling(&self) -> usize {
         self.toobig
@@ -1125,6 +1138,11 @@ impl DynBuf {
     /// `docs/KNOWN-DIVERGENCES.md` records that every site was checked and
     /// none of them misses it. Here there is no path to miss and no
     /// hand-written `drop` to get wrong.
+    // No production caller: the port moves ownership on as a `CBuf` through
+    // `into_cbuf`, which keeps the length. Retained because it is the other
+    // half of the `curlx_dyn_ptr` ownership transfer that the AAP requires
+    // this module to reproduce, and the tests below drive it.
+    #[allow(dead_code)]
     #[must_use = "ownership moves to the caller; discarding this leaks"]
     pub(crate) fn into_raw(mut self) -> *mut c_char {
         match self.block.take() {

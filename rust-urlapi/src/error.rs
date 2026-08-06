@@ -119,9 +119,11 @@
 // table here would be worse than leaving it unconditional, because the table
 // has to remain visible to `cargo test` in every configuration.
 //
-// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
-// covers the whole feature matrix in one place, which is where the reason for
-// it belongs; see "DEAD-CODE POLICY" there.
+// Dead-code diagnostics are answered at the items. Where an item below has no
+// production caller, it carries its own `#[allow(dead_code)]` with the reason
+// it is kept immediately above it, and there is no crate-wide allowance to
+// fall back on; see "DEAD-CODE POLICY" in `src/lib.rs` for the four outcomes
+// that policy permits.
 
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).
@@ -180,8 +182,8 @@ use crate::abi::{
 ///
 /// The variant names keep the C spelling for the same reason the constants
 /// in `src/abi.rs` do: every one of them can be grepped for in the C sources
-/// this module was ported from. The single lint allowance below is the entire
-/// cost of that, and it is narrowed to this item.
+/// this module was ported from. The naming allowance below is the entire cost
+/// of that, and it is narrowed to this item.
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i32)]
@@ -191,6 +193,12 @@ pub(crate) enum CURLcode {
     /// `CURLE_URL_MALFORMAT`, `include/curl/curl.h:L522`.
     CURLE_URL_MALFORMAT = 3,
     /// `CURLE_NOT_BUILT_IN`, `include/curl/curl.h:L523`.
+    // Constructed only by the libidn2 version guard at `lib/idn.c` L271, so
+    // the no-IDN and `idn-pure` configurations never build one. Retained
+    // unconditionally, and not gated per backend, because `idn2cu` folds it in
+    // every configuration and the tests below pin these five discriminants
+    // against `include/curl/curl.h` whichever backend is selected.
+    #[allow(dead_code)]
     CURLE_NOT_BUILT_IN = 4,
     /// `CURLE_OUT_OF_MEMORY`, `include/curl/curl.h:L554`.
     CURLE_OUT_OF_MEMORY = 27,
@@ -223,6 +231,10 @@ impl CURLcode {
     /// returns a `CURLcode`. It exists so that the discriminants pinned in
     /// the declaration are reachable, for a diagnostic or a test, without
     /// anyone writing the numbers a second time.
+    // No production caller: nothing this crate exports accepts or returns a
+    // `CURLcode`, as the paragraph above says. Retained so the discriminants
+    // pinned in the declaration are reachable without writing them twice.
+    #[allow(dead_code)]
     #[must_use]
     pub(crate) const fn as_raw(self) -> c_int {
         self as c_int
@@ -317,6 +329,11 @@ pub(crate) const fn cc2cu(code: CURLcode) -> CURLUcode {
 /// A build without IDN support does not reach this function at all:
 /// `lib/urlapi.c:L1334-L1336` replaces both helpers with macros that yield
 /// `CURLUE_LACKS_IDN`, and `src/idn.rs` reproduces that.
+// No production caller without an IDN backend, for the reason the paragraph
+// immediately above gives: the C replaces both helpers with macros and this
+// fold is never reached. Retained rather than gated on `have_idn`, so that the
+// tests below pin the mapping in every configuration.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) const fn idn2cu(code: CURLcode) -> CURLUcode {
     match code {
@@ -444,6 +461,10 @@ pub(crate) const fn strerror_bytes(code: CURLUcode) -> &'static [u8] {
 /// inspect the text rather than hand a pointer to C. It performs no
 /// allocation and no copy: the returned `CStr` borrows the same `'static`
 /// literal.
+// No production caller: `curl_url_strerror` hands C a pointer, so the
+// exported path uses `strerror` instead. Retained as the safe view of the
+// same literal, which is what the tests below read the messages through.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn strerror_cstr(code: CURLUcode) -> &'static CStr {
     as_cstr(strerror_bytes(code))
@@ -467,6 +488,12 @@ pub(crate) fn strerror_cstr(code: CURLUcode) -> &'static CStr {
 /// `curl_free()`. This is the one string-returning path of the whole API
 /// that does not come from `src/alloc.rs`; see this module's documentation
 /// for why that exception is the correct behaviour rather than an oversight.
+// No production caller when the `strerror` feature is off: the only thing that
+// returns this pointer is `curl_url_strerror`, which the drop-in configuration
+// must not export because `lib/strerror.c` already defines it. Retained
+// unconditionally rather than gated, so the tests below pin the same pointer in
+// both configurations.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) const fn strerror(code: CURLUcode) -> *const c_char {
     // No cast of provenance and no allocation: the pointer is the address of
@@ -503,6 +530,11 @@ pub(crate) const fn strerror(code: CURLUcode) -> *const c_char {
 /// `pub(crate)`, this form is reachable only from inside the crate -- the
 /// tests below drive it. Exporting it would need a new entry point in
 /// `src/ffi.rs`, which is a decision outside this crate.
+// No production caller: this crate always builds the verbose form, for the
+// reason the paragraph above gives. Retained because the AAP requires this
+// module to carry the non-verbose two-string variant of
+// `lib/strerror.c`, and the tests below prove it is the C's two strings.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) const fn strerror_nonverbose_bytes(code: CURLUcode) -> &'static [u8] {
     if code == CURLUE_OK {
@@ -516,6 +548,10 @@ pub(crate) const fn strerror_nonverbose_bytes(code: CURLUcode) -> &'static [u8] 
 ///
 /// The safe Rust view of [`strerror_nonverbose_bytes`], for symmetry with
 /// [`strerror_cstr`].
+// No production caller, as for `strerror_nonverbose_bytes`. Retained for
+// symmetry with `strerror_cstr`, so that both message sets offer the same
+// three views.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn strerror_nonverbose_cstr(code: CURLUcode) -> &'static CStr {
     as_cstr(strerror_nonverbose_bytes(code))
@@ -525,6 +561,10 @@ pub(crate) fn strerror_nonverbose_cstr(code: CURLUcode) -> &'static CStr {
 ///
 /// The counterpart of [`strerror`] for the `#else` arm, with the same
 /// ownership rules: nothing is allocated and the caller frees nothing.
+// No production caller, as for `strerror_nonverbose_bytes`. Retained
+// because this is the pointer form, the one an exported entry point would
+// return, and so the shape the C's `#else` arm actually has.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) const fn strerror_nonverbose(code: CURLUcode) -> *const c_char {
     strerror_nonverbose_bytes(code).as_ptr().cast::<c_char>()
@@ -546,6 +586,9 @@ pub(crate) const fn strerror_nonverbose(code: CURLUcode) -> *const c_char {
 /// a `printf` argument list as at `docs/libcurl/curl_url_strerror.md:L47`,
 /// and a null there is a crash in the caller. An empty message is a visible,
 /// harmless failure; the test is what stops it ever happening.
+// Dead only because both of its callers are: this is their shared view of
+// one of this module's literals.
+#[allow(dead_code)]
 fn as_cstr(message: &'static [u8]) -> &'static CStr {
     // `unwrap_or_default` here is not the forbidden `unwrap`: it cannot
     // panic, which is why clippy prefers it to the equivalent `match`. The

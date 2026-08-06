@@ -16,8 +16,10 @@
 //! constants lib/idn.c compares against live there and nothing else carries
 //! them. It WRITES only OUT_DIR, the one directory Cargo gives a build script
 //! to own, and under the off-by-default `genheader` feature that is where the
-//! regenerated mirror header lands. It never writes into the source tree, and
-//! `mirror_header::generate` below records why that has to stay true.
+//! regenerated mirror header lands. It writes into the source tree only when
+//! `CURL_URLAPI_WRITE_MIRROR_HEADER=1` asks it to install that regenerated
+//! header, and `mirror_header::generate` below records why the default is to
+//! compare rather than to write.
 //!
 //! JOB ONE, translate the C capability selection into Cargo configuration
 //! flags. The C side gates internationalised-domain support in two steps, and
@@ -49,7 +51,8 @@
 //! idn2.h:119,130            IDN2_VERSION, IDN2_VERSION_NUMBER
 //!                           =>  CURL_URLAPI_IDN2_VERSION{,_NUMBER}
 //! lib/idn.c:254             #if IDN2_VERSION_NUMBER >= 0x00140000
-//!                           =>  cfg(idn2_nontransitional)
+//!                           =>  the same comparison, in a const in
+//!                               src/ffi.rs, over the number exported above
 //! lib/idn.c:35              #if defined(_WIN32) && defined(UNICODE)
 //!                           =>  cfg(windows) && cfg(win32_unicode)
 //! CMakeLists.txt:1654-1655  HAVE_INET_PTON, HAVE_INET_NTOP
@@ -226,17 +229,16 @@ fn main() {
     //
     // The directive was stabilised in Cargo 1.80, and an older Cargo answers
     // it with one "rustc-check-cfg requires -Zcheck-cfg flag" warning per
-    // name -- seven warnings on exactly the toolchain Cargo.toml declares as
-    // this crate's floor, which is the one configuration where a clean build
-    // matters most. Skipping the directive there costs nothing, because that
-    // Cargo passes no --check-cfg to rustc, so the lint it guards against
-    // cannot fire.
+    // name in the list below -- on exactly the toolchain Cargo.toml declares
+    // as this crate's floor, which is the one configuration where a clean
+    // build matters most. Skipping the directive there costs nothing, because
+    // that Cargo passes no --check-cfg to rustc, so the lint it guards
+    // against cannot fire.
     if cargo_supports_check_cfg() {
         for name in [
             "have_idn",
             "idn_backend_libidn2",
             "idn_backend_pure",
-            "idn2_nontransitional",
             "win32_unicode",
             "have_inet_pton",
             "have_inet_ntop",
@@ -267,6 +269,10 @@ fn main() {
         check_scheme_layout_precondition(&crate_dir);
     }
 
+    // Which artifact each scheme provider is allowed to serve, enforced by
+    // the linker rather than asserted in prose.
+    emit_shared_artifact_gate(scheme_table);
+
     if idn_pure {
         // Nothing to link: the backend is the pure-Rust idna crate, which
         // Cargo already resolves through the feature's dep:idna entry.
@@ -281,7 +287,7 @@ fn main() {
     // finished archive and there is none during an ordinary build; see
     // `localize_dropin_archive` for why that means a second invocation.
     if let Some(archive) = env_path("CURL_URLAPI_DROPIN_ARCHIVE") {
-        localize_dropin_archive(&archive, strerror, cfree);
+        localize_dropin_archive(&archive, strerror, cfree, scheme_table, idn_libidn2);
     } else {
         // Registered even when unset, so that setting it re-runs this script
         // rather than being ignored because nothing else changed.
@@ -674,22 +680,28 @@ fn idn2_header() -> PathBuf {
 /// Export the two version constants the C reads from `<idn2.h>`, and with them
 /// the preprocessor decision they drive.
 ///
-/// Three things leave this function, and the split between them is the point.
+/// Two things leave this function, and the split between them is the point.
+/// Both are read out of the same header, so they cannot describe two different
+/// installations.
 ///
 /// * `CURL_URLAPI_IDN2_VERSION` carries the version **string**, which
-///   src/idn.rs hands to `idn2_check_version()` exactly as lib/idn.c:252 hands
+///   src/ffi.rs hands to `idn2_check_version()` exactly as lib/idn.c:252 hands
 ///   it `IDN2_VERSION`. The guard's question is "is the runtime library at
 ///   least as new as the header this was compiled against", and it can only be
 ///   asked with the header's own answer.
 /// * `CURL_URLAPI_IDN2_VERSION_NUMBER` carries the packed number, normalised
-///   to eight hexadecimal digits. Nothing in the crate branches on it -- the
-///   cfg below is what does -- but it is what makes the branch auditable, and
-///   src/idn.rs asserts the two agree.
-/// * `idn2_nontransitional` is the cfg standing in for
-///   `#if IDN2_VERSION_NUMBER >= 0x00140000` at lib/idn.c:254. Evaluating the
-///   comparison here, at build time, against the installed header is precisely
-///   what the C preprocessor does; passing the number into Rust and comparing
-///   it there would be a run-time test of a compile-time fact.
+///   to eight hexadecimal digits. This is what the crate branches on: src/ffi.rs
+///   parses it into a `const` and compares it against `0x00140000` in a `const`
+///   too, so `#if IDN2_VERSION_NUMBER >= 0x00140000` at lib/idn.c:254 stays a
+///   compile-time test of a compile-time fact, decided from the installed
+///   header exactly as the C preprocessor decides it.
+///
+/// One mechanism, deliberately. The comparison lives next to the flag word it
+/// decides, and this script does not also emit a `cfg` standing for the same
+/// answer: two switches over one fact are two switches that can disagree, and
+/// the one nothing reads is the one that goes stale unnoticed. What this script
+/// owes that comparison is the number, and a note recording which way it came
+/// out on the machine that built the artifact.
 ///
 /// # Panics
 ///
@@ -750,12 +762,11 @@ fn export_idn2_version(header: &Path) {
         "rustc-env=CURL_URLAPI_IDN2_VERSION_NUMBER=0x{number:08x}"
     ));
 
-    // lib/idn.c:254. The literal is the C's own, not a rounded version of it:
-    // 0x00140000 is libidn2 0.20.0, the release that introduced the flag.
-    if number >= IDN2_NONTRANSITIONAL_SINCE {
-        cargo("rustc-cfg=idn2_nontransitional");
-    }
-
+    // lib/idn.c:254 is answered by src/ffi.rs, from the number just exported,
+    // and not a second time here. What this script owes that comparison is the
+    // number itself and a record of which way it came out; the literal below is
+    // the C's own, not a rounded version of it: 0x00140000 is libidn2 0.20.0,
+    // the release that introduced the flag.
     note(&format!(
         "{} reports IDN2_VERSION {version} and IDN2_VERSION_NUMBER \
          0x{number:08x}; IDN2_NONTRANSITIONAL is {}",
@@ -941,19 +952,55 @@ const DROPIN_SYMBOLS: [&str; 8] = [
     "curl_url_set",
 ];
 
-/// Turn the Rust staticlib into the drop-in artifact: one relocatable object
-/// whose only global symbols are the ones the C object file exported.
+/// The symbols the crate imports from libcurl in the drop-in configuration.
+///
+/// Declared at `lib/url.h` L76-L77, defined at `lib/url.c` L1469-L1541. They
+/// must appear as **undefined** in a drop-in archive, because the whole point
+/// of that configuration is that libcurl's own table answers every capability
+/// question. An archive that lacks these references was built with
+/// `scheme-table` on and is not a drop-in artifact, whatever its defined set
+/// looks like after localization.
+const SCHEME_PROVIDER_SYMBOLS: [&str; 2] = ["Curl_get_scheme", "Curl_getn_scheme"];
+/// The libidn2 entry points `lib/idn.c` calls, which the default backend binds
+/// directly and which must therefore appear as undefined under that backend
+/// and not appear at all under any other.
+///
+/// The lookup entry point is deliberately absent from this list: `lib/idn.c`
+/// L35-L41 chooses between `idn2_lookup_ul` and `idn2_lookup_u8` per platform,
+/// so exactly one of the two is expected and
+/// [`validate_raw_archive`] checks that separately.
+const IDN2_PROVIDER_SYMBOLS: [&str; 3] =
+    ["idn2_check_version", "idn2_free", "idn2_to_unicode_8z8z"];
+
+/// The two spellings of the libidn2 lookup entry point, of which a libidn2
+/// build imports exactly one. `lib/idn.c` L36-L37 selects the byte-oriented
+/// form for Windows with wide characters and L39-L40 the locale-aware form
+/// everywhere else.
+const IDN2_LOOKUP_SYMBOLS: [&str; 2] = ["idn2_lookup_ul", "idn2_lookup_u8"];
+
+/// Turn the Rust staticlib into the canonical drop-in artifact: one
+/// relocatable object whose only global symbols are the ones the C object file
+/// exported.
 ///
 /// # The problem this solves
 ///
 /// `crate-type = ["staticlib"]` produces an archive containing this crate's
-/// code together with the whole of the Rust standard library, the allocator and
-/// the unwinder, and every one of those carries global symbols. Measured on the
-/// release build of this crate: **2413** distinct defined globals where
-/// `urlapi.c.o` defines **8**. That is not a defect in the archive -- it is
-/// what a staticlib is -- but it does not satisfy the Agent Action Plan's G1,
-/// "exporting the complete symbol set that `lib/urlapi.o` exports and no
-/// more", or its acceptance criterion A2.
+/// code together with the whole of the Rust standard library, the allocator
+/// and the unwinder, and every one of those carries global symbols. The count
+/// runs into the thousands where `urlapi.c.o` defines **8**; the measured
+/// figure moves with the toolchain, so this pass reports what it actually
+/// found rather than repeating a literal that goes stale. That is not a defect
+/// in the archive -- it is what a staticlib is -- but it does not satisfy the
+/// Agent Action Plan's G1, "exporting the complete symbol set that
+/// `lib/urlapi.o` exports and no more", or its acceptance criterion A2.
+///
+/// # Which artifact is canonical
+///
+/// **`libcurl_urlapi_rs_dropin.a`, the output of this pass, is the canonical
+/// static deliverable.** Cargo's own `libcurl_urlapi_rs.a` is an *input* to
+/// it and must never be presented as the drop-in: it fails A2 by thousands of
+/// symbols. Everything downstream names the localized archive -- the parity
+/// link line, the symbol comparison, and the archive a C consumer is given.
 ///
 /// # The mechanism
 ///
@@ -984,9 +1031,11 @@ const DROPIN_SYMBOLS: [&str; 8] = [
 /// archive so that the expected symbol set matches what was actually compiled:
 ///
 /// ```text
-/// cargo build --release --no-default-features --features idn-libidn2
+/// cargo rustc --release --no-default-features --features idn-libidn2 \
+///   --lib --crate-type staticlib
 /// CURL_URLAPI_DROPIN_ARCHIVE=target/release/libcurl_urlapi_rs.a \
-///   cargo build --release --no-default-features --features idn-libidn2
+///   cargo rustc --release --no-default-features --features idn-libidn2 \
+///     --lib --crate-type staticlib
 /// ```
 ///
 /// It is deterministic -- the same archive and the same feature set always
@@ -995,7 +1044,52 @@ const DROPIN_SYMBOLS: [&str; 8] = [
 /// `libcurl_urlapi_rs_dropin.a`. `CURL_URLAPI_DROPIN_OUTPUT` overrides the
 /// destination; `LD`, `OBJCOPY`, `AR` and `NM` override the tools, which is
 /// what a cross build needs.
-fn localize_dropin_archive(archive: &Path, strerror: bool, cfree: bool) {
+///
+/// # Why the second invocation cannot certify the wrong archive
+///
+/// Two invocations are two chances to disagree, and the environment variable
+/// names a *path* rather than a build. Nothing stops somebody pointing a
+/// drop-in localization at an archive built with different features, or at
+/// yesterday's archive, and the first version of this pass would have accepted
+/// both: it inspected the result *after* `objcopy`, by which point every
+/// surplus global had already been localized away and every archive of the
+/// right shape looked identical. A default-feature archive fed to a drop-in
+/// invocation was certified as an eight-symbol drop-in artifact.
+///
+/// [`validate_raw_archive`] closes that by inspecting the **raw input**, and
+/// it is deliberately two-sided:
+///
+/// * **Defined globals.** Every name the requested feature combination
+///   implies must be defined, and the two feature-gated exports must be
+///   defined if and only if their feature is on. A default-feature archive
+///   defines `curl_url_strerror` and `curl_free`, so a drop-in invocation
+///   rejects it here -- before `objcopy` can hide the evidence.
+/// * **Undefined providers.** Every name the combination implies the archive
+///   *imports* must be present as undefined, and every name it implies must be
+///   absent must be absent. `Curl_get_scheme` and `Curl_getn_scheme` are
+///   imported exactly when `scheme-table` is off; the libidn2 entry points
+///   exactly under that backend. This is the direction that catches the
+///   `scheme-table` mistake, which is otherwise silent: an archive carrying
+///   the built-in table has no such references at all.
+///
+/// Staleness is a separate question from feature compatibility, and gets a
+/// separate check: the archive must be no older than every file it was
+/// supposedly built from. Finally the pass records a provenance file beside
+/// the canonical artifact, so a certification can be compared with a later one
+/// instead of being taken on trust.
+///
+/// A single orchestrated driver is still the right place for the two steps to
+/// live, and `GNUmakefile` plus `scripts/build-rust.sh` are that driver. This
+/// function's job is to make the coupling between the steps *checkable* rather
+/// than assumed, because a driver can be bypassed and an environment variable
+/// invites exactly that.
+fn localize_dropin_archive(
+    archive: &Path,
+    strerror: bool,
+    cfree: bool,
+    scheme_table: bool,
+    idn_libidn2: bool,
+) {
     rerun_if_changed(archive);
 
     // The expected set follows the feature flags, because the two
@@ -1033,6 +1127,18 @@ fn localize_dropin_archive(archive: &Path, strerror: bool, cfree: bool) {
             output.display()
         );
     }
+
+    // Step 0, and the one that decides whether the rest means anything: prove
+    // the raw input was built from this source tree with these features,
+    // before `objcopy` gets a chance to make every archive look alike.
+    let raw = validate_raw_archive(
+        archive,
+        &expected,
+        strerror,
+        cfree,
+        scheme_table,
+        idn_libidn2,
+    );
 
     let scratch = PathBuf::from(cargo_env("OUT_DIR")).join("curl_urlapi_rs_whole.o");
     let localized = PathBuf::from(cargo_env("OUT_DIR")).join("curl_urlapi_rs_dropin.o");
@@ -1098,12 +1204,342 @@ fn localize_dropin_archive(archive: &Path, strerror: bool, cfree: bool) {
         );
     }
 
+    // The provenance record, beside the canonical artifact so that a later
+    // certification can be compared with this one instead of being taken on
+    // trust. Deliberately free of timestamps: the same input and the same
+    // configuration must produce the same bytes here, or the record is no
+    // longer evidence of anything.
+    let provenance = format!(
+        "curl-urlapi-rs drop-in artifact provenance\n\
+         canonical-artifact: {}\n\
+         built-from: {}\n\
+         raw-content-tag: {:016x}\n\
+         raw-defined-globals: {}\n\
+         localized-content-tag: {:016x}\n\
+         features: strerror={} cfree={} scheme-table={} idn-libidn2={}\n\
+         target: {}\n\
+         profile: {}\n\
+         source-content-tag: {:016x}\n\
+         exported-symbols: {}\n\
+         imported-providers: {}\n",
+        output.display(),
+        archive.display(),
+        raw.content_tag,
+        raw.defined_count,
+        content_tag(&output),
+        onoff(strerror),
+        onoff(cfree),
+        onoff(scheme_table),
+        onoff(idn_libidn2),
+        cargo_env("TARGET"),
+        cargo_env("PROFILE"),
+        raw.source_tag,
+        expected.join(" "),
+        raw.providers.join(" ")
+    );
+    let record = output.with_extension("a.provenance");
+    if let Err(error) = fs::write(&record, provenance.as_bytes()) {
+        panic!(
+            "curl-urlapi-rs: could not write the provenance record {}: \
+             {error}. The record is part of the certification, so a failure \
+             to write it fails the pass rather than being ignored.",
+            record.display()
+        );
+    }
+
     note(&format!(
-        "drop-in archive {} defines exactly the {} expected global symbols: {}",
+        "canonical drop-in archive {} defines exactly the {} expected global \
+         symbols ({}), reduced from {} in the raw input; provenance recorded \
+         in {}",
         output.display(),
         expected.len(),
-        expected.join(" ")
+        expected.join(" "),
+        raw.defined_count,
+        record.display()
     ));
+}
+
+/// What [`validate_raw_archive`] establishes about the raw input, carried
+/// forward so the provenance record can state it rather than re-deriving it.
+struct RawArchiveFacts {
+    /// A change detector over the archive's bytes. See [`content_tag`].
+    content_tag: u64,
+    /// A change detector over the sources the archive was built from.
+    source_tag: u64,
+    /// How many distinct globals the raw archive defines. Reported rather than
+    /// compared against a literal, because the figure moves with the
+    /// toolchain.
+    defined_count: usize,
+    /// The provider symbols the archive was found to import, in the order
+    /// checked.
+    providers: Vec<String>,
+}
+
+/// Prove the raw archive was built from this source tree with these features.
+///
+/// Every check here is exact rather than probabilistic, and each one names the
+/// mistake it exists to catch. The order is deliberate: symbol evidence first,
+/// because it is the evidence `objcopy` destroys.
+///
+/// # Panics
+///
+/// On any disagreement, with a message naming the archive, the expectation and
+/// the likely cause. A build script has no other way to stop a bad artifact
+/// from being certified.
+fn validate_raw_archive(
+    archive: &Path,
+    expected: &[String],
+    strerror: bool,
+    cfree: bool,
+    scheme_table: bool,
+    idn_libidn2: bool,
+) -> RawArchiveFacts {
+    let defined = defined_globals(archive);
+
+    // 1. Every name this configuration must export has to be there. A missing
+    //    one means the archive is not this crate, or is an older revision of
+    //    it that predates the export.
+    let missing: Vec<&String> = expected.iter().filter(|n| !defined.contains(*n)).collect();
+    if !missing.is_empty() {
+        panic!(
+            "curl-urlapi-rs: the raw archive {} does not define {:?}, which \
+             this feature combination requires. Either the archive is not a \
+             build of this crate, or it predates those exports. Rebuild it \
+             with the same flags as this invocation before localizing.",
+            archive.display(),
+            missing
+        );
+    }
+
+    // 2. The two feature-gated exports have to be present exactly when their
+    //    feature is on. THIS is the check that catches a default-feature
+    //    archive handed to a drop-in invocation: it defines both, and after
+    //    localization it would have looked like a clean eight-symbol drop-in.
+    for (name, wanted) in [("curl_url_strerror", strerror), ("curl_free", cfree)] {
+        let present = defined.iter().any(|n| n == name);
+        if present != wanted {
+            panic!(
+                "curl-urlapi-rs: the raw archive {} {} {name}, but this \
+                 invocation's features say it should {}. The archive was \
+                 built with different features than this localization pass \
+                 was given, so localizing it would certify the wrong build: \
+                 curl_url_strerror comes from the \"strerror\" feature and \
+                 curl_free from \"cfree\", and both must be off for a drop-in \
+                 artifact because lib/strerror.c and lib/escape.c already \
+                 define them. Rebuild the archive with exactly the flags used \
+                 here.",
+                archive.display(),
+                if present {
+                    "defines"
+                } else {
+                    "does not define"
+                },
+                if wanted { "be defined" } else { "be absent" }
+            );
+        }
+    }
+
+    // 3. No configuration of this crate defines libcurl's scheme lookup, so
+    //    finding one means the archive is something else entirely.
+    for name in SCHEME_PROVIDER_SYMBOLS {
+        if defined.iter().any(|n| n == name) {
+            panic!(
+                "curl-urlapi-rs: the raw archive {} defines {name}. No \
+                 configuration of this crate defines it -- lib/url.c does -- \
+                 so this archive is not a build of this crate, and localizing \
+                 it would put a duplicate definition on the drop-in link line.",
+                archive.display()
+            );
+        }
+    }
+
+    // 4. The undefined side. What an archive imports is the half of its
+    //    identity that survives nothing later in this pass, and it is the only
+    //    evidence that distinguishes a drop-in build from a standalone one:
+    //    the standalone table produces no scheme references at all, which is
+    //    why leaving `scheme-table` on in a drop-in build is otherwise silent.
+    let undefined = undefined_symbols(archive);
+    let mut providers: Vec<String> = Vec::new();
+
+    for name in SCHEME_PROVIDER_SYMBOLS {
+        let present = undefined.iter().any(|n| n == name);
+        if present != !scheme_table {
+            panic!(
+                "curl-urlapi-rs: the raw archive {} {} {name} as an undefined \
+                 symbol, but this invocation has scheme-table {}. A drop-in \
+                 archive MUST import libcurl's scheme lookup, and a \
+                 standalone one MUST NOT; an archive built with scheme-table \
+                 wrongly on links cleanly against libcurl and then answers \
+                 capability questions from its own modelled table instead of \
+                 the linked libcurl's, which no later check can detect. \
+                 Rebuild the archive with exactly the flags used here.",
+                archive.display(),
+                if present { "carries" } else { "does not carry" },
+                onoff(scheme_table)
+            );
+        }
+        if present {
+            providers.push(name.to_owned());
+        }
+    }
+
+    for name in IDN2_PROVIDER_SYMBOLS {
+        let present = undefined.iter().any(|n| n == name);
+        if present != idn_libidn2 {
+            panic!(
+                "curl-urlapi-rs: the raw archive {} {} {name} as an undefined \
+                 symbol, but this invocation has idn-libidn2 {}. The default \
+                 IDN backend binds libidn2 directly and is the only one the \
+                 bit-for-bit parity claim covers, so an archive built with a \
+                 different backend must not be certified as this one. \
+                 Rebuild the archive with exactly the flags used here.",
+                archive.display(),
+                if present { "carries" } else { "does not carry" },
+                onoff(idn_libidn2)
+            );
+        }
+        if present {
+            providers.push(name.to_owned());
+        }
+    }
+
+    // The lookup entry point is one of two spellings, chosen per platform at
+    // lib/idn.c:35-41, so the requirement is "exactly one" rather than a
+    // specific name. Neither, under the libidn2 backend, means the lookup path
+    // was compiled out; both means two backends were somehow bound at once.
+    let lookups: Vec<&str> = IDN2_LOOKUP_SYMBOLS
+        .into_iter()
+        .filter(|name| undefined.iter().any(|n| n == name))
+        .collect();
+    let wanted_lookups = usize::from(idn_libidn2);
+    if lookups.len() != wanted_lookups {
+        panic!(
+            "curl-urlapi-rs: the raw archive {} imports {} of the two \
+             libidn2 lookup entry points {:?}, and this invocation expects \
+             exactly {wanted_lookups}. lib/idn.c:35-41 selects idn2_lookup_u8 \
+             for Windows with wide characters and idn2_lookup_ul everywhere \
+             else, so exactly one belongs in a libidn2 build and neither in \
+             any other. Found: {lookups:?}.",
+            archive.display(),
+            lookups.len(),
+            IDN2_LOOKUP_SYMBOLS
+        );
+    }
+    for name in lookups {
+        providers.push(name.to_owned());
+    }
+
+    // 5. Staleness, which is a different failure from feature incompatibility
+    //    and needs its own check: an archive built from this configuration but
+    //    from older sources passes every symbol test above. The comparison is
+    //    against the newest input, so a single edited file is enough to fail
+    //    it.
+    let sources = source_inventory();
+    let archive_time = modified_at(archive);
+    for path in &sources {
+        if modified_at(path) > archive_time {
+            panic!(
+                "curl-urlapi-rs: {} is newer than the raw archive {}, so the \
+                 archive is stale and does not contain that edit. Rebuild it \
+                 before localizing: a localization pass cannot tell a stale \
+                 archive from a current one by its symbols alone, because \
+                 the symbol set is the same.",
+                path.display(),
+                archive.display()
+            );
+        }
+    }
+
+    let source_tag = sources.iter().fold(0xcbf2_9ce4_8422_2325_u64, |tag, path| {
+        let bytes = fs::read(path).unwrap_or_default();
+        fnv1a(fnv1a(tag, path.to_string_lossy().as_bytes()), &bytes)
+    });
+
+    note(&format!(
+        "raw archive {} accepted: defines all {} required globals out of {} \
+         total, imports {:?}, and is no older than any of the {} source files \
+         it was built from",
+        archive.display(),
+        expected.len(),
+        defined.len(),
+        providers,
+        sources.len()
+    ));
+
+    RawArchiveFacts {
+        content_tag: content_tag(archive),
+        source_tag,
+        defined_count: defined.len(),
+        providers,
+    }
+}
+
+/// Every file whose content can change what the archive contains, sorted so
+/// that the fold over them is reproducible.
+///
+/// `Cargo.toml` and `build.rs` are here because they decide the feature set
+/// and the configuration flags; `cbindgen.toml` is not, because it affects
+/// only the generated header and never the compiled code.
+fn source_inventory() -> Vec<PathBuf> {
+    let crate_dir = manifest_dir();
+    let mut paths = vec![crate_dir.join("Cargo.toml"), crate_dir.join("build.rs")];
+    collect_rust_sources(&crate_dir.join("src"), &mut paths);
+    paths.sort();
+    paths
+}
+
+/// Append every `.rs` file under `directory`, recursively.
+///
+/// A directory that cannot be read is skipped rather than fatal: the caller
+/// treats the inventory as "everything that could have contributed", and a
+/// missing `src` directory is a failure the compiler reports far more clearly
+/// than a build script could.
+fn collect_rust_sources(directory: &Path, into: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_sources(&path, into);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            into.push(path);
+        }
+    }
+}
+
+/// The modification time of `path` as whole seconds since the epoch, or 0 when
+/// it cannot be read.
+///
+/// Zero for an unreadable file is the conservative answer for the one caller:
+/// it makes that file look old, so it never manufactures a staleness failure
+/// out of a missing timestamp.
+fn modified_at(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_secs())
+}
+
+/// A change detector over a file's bytes.
+///
+/// FNV-1a, 64 bits. This is **not** a cryptographic digest and is not used as
+/// one: its job is to let two provenance records be compared and to make an
+/// accidental reuse of the wrong file visible, while the checks that actually
+/// gate the certification -- the defined set, the imported provider set and
+/// the staleness comparison -- are exact. Choosing it keeps the build script
+/// free of a hashing dependency, which matters because the dependency
+/// inventory is fixed.
+fn content_tag(path: &Path) -> u64 {
+    fnv1a(0xcbf2_9ce4_8422_2325, &fs::read(path).unwrap_or_default())
+}
+
+/// One FNV-1a round over `bytes`, folded into `tag`.
+fn fnv1a(tag: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(tag, |accumulator, byte| {
+        (accumulator ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 /// The name of a binutils tool, overridable by the conventional variable.
@@ -1166,6 +1602,46 @@ fn defined_globals(path: &Path) -> Vec<String> {
             let fields: Vec<&str> = line.split_whitespace().collect();
             match fields.as_slice() {
                 [_value, _kind, name] => Some((*name).to_owned()),
+                _ => None,
+            }
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The sorted, deduplicated names `nm -u` reports as undefined for a file.
+///
+/// The output format is `<spaces> <type> <name>` for an undefined symbol, so a
+/// line is a symbol only when it has two fields. Archive-member banner lines
+/// have one field and a trailing colon; blank lines have none. Weak undefined
+/// references are reported with a lower-case type letter and are kept, because
+/// the caller asks about names rather than about binding strength.
+fn undefined_symbols(path: &Path) -> Vec<String> {
+    let program = tool("NM", "nm");
+    let outcome = Command::new(&program).arg("-u").arg(path).output();
+    let output = match outcome {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => panic!(
+            "curl-urlapi-rs: {program} failed to list the undefined symbols \
+             of {}: {}\n{}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => panic!(
+            "curl-urlapi-rs: could not run {program} to inspect {}: {error}",
+            path.display()
+        ),
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut names: Vec<String> = text
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            match fields.as_slice() {
+                [_kind, name] => Some((*name).to_owned()),
                 _ => None,
             }
         })
@@ -1261,6 +1737,156 @@ fn parse_c_integer(value: &str) -> Option<u32> {
     {
         Some(digits) => u32::from_str_radix(digits, 16).ok(),
         None => value.parse::<u32>().ok(),
+    }
+}
+
+/// The operating systems whose linker understands `-z defs`.
+///
+/// GNU ld, gold and LLD all accept it on an ELF target and all give it the
+/// same meaning. Mach-O's linker has no such option -- the behaviour is its
+/// default and its spelling is `-undefined error` -- and neither the MSVC
+/// linker nor `wasm-ld` has an equivalent, so the gate is skipped rather than
+/// guessed at on anything not listed here. Skipping loses the enforcement on
+/// that target, which is why [`emit_shared_artifact_gate`] says so in the
+/// build log instead of passing over it in silence.
+const ELF_TARGET_OS: [&str; 11] = [
+    "android",
+    "dragonfly",
+    "freebsd",
+    "fuchsia",
+    "haiku",
+    "hurd",
+    "illumos",
+    "linux",
+    "netbsd",
+    "openbsd",
+    "solaris",
+];
+
+/// Refuse to produce a shared object that carries an unresolved import.
+///
+/// # The defect this closes
+///
+/// `crate-type` in Cargo.toml is a property of the *package*, so every
+/// configuration of this crate offers all three artifacts. The scheme
+/// provider, by contrast, is a property of the *feature set*:
+/// `src/scheme.rs` compiles the built-in table under `scheme-table` and
+/// imports libcurl's own `Curl_get_scheme`/`Curl_getn_scheme` without it,
+/// which is what the Agent Action Plan requires at 0.3.1.1, 0.4.2.4 and
+/// 0.6.7 and is not negotiable.
+///
+/// Those two facts do not compose. In the drop-in configuration the archive
+/// is exactly right -- the two names must appear as *undefined* in it, so
+/// that the linker binds them to the `url.c.o` sitting in the same libcurl
+/// archive -- while the shared object built from the same compilation is
+/// wrong in a way nothing announced: `libcurl_urlapi_rs.so` came out with
+/// `U Curl_get_scheme` and `U Curl_getn_scheme`, no `libcurl` in its NEEDED
+/// list, and no prospect of ever resolving them, because both symbols are
+/// hidden by libcurl's own visibility rules and so absent from a shared
+/// libcurl's dynamic symbol table. Loading it fails, every time, at
+/// `dlopen`.
+///
+/// # The strategy, stated as a rule
+///
+/// **A shared object is a deliverable only where the crate is
+/// self-contained.** That is Mode B, the standalone configuration, whose
+/// built-in scheme table needs nothing from libcurl and whose undefined set
+/// is libc, libgcc and libidn2 -- every one of them a real NEEDED entry.
+/// Mode A's deliverable is the archive, which is the only form a drop-in
+/// replacement for `urlapi.c.o` is ever consumed in: it is linked *into*
+/// libcurl, where `Curl_get_scheme` is a sibling object rather than a
+/// foreign import.
+///
+/// This function turns that rule into something the build cannot get wrong.
+/// `-z defs` -- `--no-undefined` under its other name -- makes the linker
+/// refuse to produce a shared object with any unresolved strong reference,
+/// so the Mode-A `.so` can no longer be built at all, and the Mode-B one is
+/// proved closed on every build rather than on the occasions somebody
+/// remembers to run `nm -D -u`. It is the acceptance gate, not a check that
+/// stands beside one.
+///
+/// The directive is `rustc-cdylib-link-arg`, which Cargo applies to the
+/// cdylib link and to nothing else, so the archive, the rlib, `cargo check`
+/// and `cargo clippy` are untouched by it.
+///
+/// # Why the release profile and not every profile
+///
+/// Cargo builds *all* of a lib target's crate types whenever it builds the
+/// lib target, and an integration test under `tests/` needs the lib target
+/// built. Gating every profile would therefore make `cargo test` and
+/// `cargo build` unusable in the drop-in configuration -- measured, not
+/// supposed -- and the plan calls for five integration tests under
+/// `rust-urlapi/tests/` that have to run in both configurations. So the gate
+/// is scoped to the profile that produces **deliverables**, which is
+/// `release`: it is the profile every documented build command names, and the
+/// one `[profile.release]` in Cargo.toml exists to configure. `cargo test`
+/// and `cargo test --lib` keep working in every configuration, and a debug
+/// shared object -- which nobody ships -- is recorded in the build log rather
+/// than refused.
+///
+/// # What a drop-in release build must therefore run
+///
+/// `cargo build --release` asks for all three artifacts at once and so fails
+/// in the drop-in configuration on the cdylib it must not produce. Ask for
+/// the archive by name instead:
+///
+/// ```text
+/// cargo rustc --release --no-default-features --features idn-libidn2 \
+///   --lib --crate-type staticlib
+/// ```
+///
+/// `--crate-type` on `cargo rustc` has been stable since 1.64, well below
+/// the 1.75 floor Cargo.toml declares.
+fn emit_shared_artifact_gate(scheme_table: bool) {
+    let target_os = cargo_env("CARGO_CFG_TARGET_OS");
+    let profile = cargo_env("PROFILE");
+    let provider = if scheme_table {
+        "the built-in table in src/scheme.rs"
+    } else {
+        "libcurl's Curl_get_scheme, which only a static drop-in link supplies"
+    };
+
+    if !ELF_TARGET_OS.contains(&target_os.as_str()) {
+        note(&format!(
+            "target_os={target_os} has no -z defs equivalent, so the cdylib \
+             link-closure gate is not applied here; the scheme provider is \
+             {provider}"
+        ));
+        return;
+    }
+
+    if profile != "release" {
+        note(&format!(
+            "profile={profile} produces no deliverable, so the cdylib \
+             link-closure gate is left off and `cargo test` keeps working; \
+             the scheme provider is {provider}. A shared object built here in \
+             the drop-in configuration carries unresolved libcurl-private \
+             references and must not be installed -- see \
+             docs/KNOWN-DIVERGENCES.md, \"Integration limitation: the shared \
+             object exists in one configuration only\"."
+        ));
+        return;
+    }
+
+    cargo("rustc-cdylib-link-arg=-Wl,-z,defs");
+
+    if scheme_table {
+        note(&format!(
+            "cdylib link-closure gate on (-Wl,-z,defs): the shared object is \
+             a deliverable in this configuration and its scheme provider is \
+             {provider}"
+        ));
+    } else {
+        note(
+            "cdylib link-closure gate on (-Wl,-z,defs): this is the drop-in \
+             configuration, whose scheme provider is libcurl's own \
+             Curl_get_scheme, so no self-contained shared object exists to \
+             build and the release cdylib link is expected to fail. The \
+             deliverable here is the archive: build it with `cargo rustc \
+             --release --no-default-features --features idn-libidn2 --lib \
+             --crate-type staticlib`, then localize it as described by \
+             `localize_dropin_archive`.",
+        );
     }
 }
 
@@ -1657,120 +2283,364 @@ fn pkg_config_value(tool: &str, arguments: &[&str]) -> Option<String> {
 /// all, so a plain `cargo build` neither runs nor pulls in a code generator.
 #[cfg(feature = "genheader")]
 mod mirror_header {
+    use std::fmt::Write as _;
     use std::fs;
     use std::io::ErrorKind;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
-    /// The mirror header, one directory down from the crate root. It mirrors
-    /// include/curl/urlapi.h:34-149 and is a wholly separate file with a
-    /// different name, directory and include guard, so it can neither shadow
-    /// the real header nor be shadowed by it.
+    /// The committed mirror header, which this module regenerates byte for byte.
+    ///
+    /// It mirrors include/curl/urlapi.h:34-149 and is a wholly separate file
+    /// with a different name, directory and include guard, so it can neither
+    /// shadow the real header nor be shadowed by it.
     const MIRROR_HEADER: &str = "curl_urlapi_rs.h";
 
-    /// Generate the mirror header into OUT_DIR and fail the build on any
-    /// drift from the committed include/curl_urlapi_rs.h.
+    /// cbindgen's own output, kept in OUT_DIR under its own name. It is the ABI
+    /// *inventory* this module reads, never a deliverable, and keeping it means
+    /// a drift report can point at the intermediate as well as at the result.
+    const INVENTORY_HEADER: &str = "curl_urlapi_rs_cbindgen.h";
+
+    /// The struct tag of the opaque handle, from include/curl/urlapi.h:107.
     ///
-    /// # This function does not write into the source tree, and must not
+    /// This is the one part of a declaration that does not come from the
+    /// inventory, and the reason is mechanical: cbindgen derives the tag from
+    /// the Rust item name and has no setting for it, so the generated
+    /// inventory writes `typedef struct CURLU CURLU;`. The tag is not ABI --
+    /// the type is incomplete in both spellings and is only ever used through
+    /// a pointer, which is the property that makes this whole port possible --
+    /// while the typedef NAME beside it is taken from the inventory like
+    /// everything else, so a rename there still fails the comparison.
+    const HANDLE_TAG: &str = "Curl_URL";
+
+    /// Set to 1 to update the committed header from the regenerated bytes.
     ///
-    /// The generated bytes land in OUT_DIR, which is the only directory a
-    /// build script owns. include/curl_urlapi_rs.h is *tracked* and
-    /// *hand-authored*, and cbindgen.toml states at its own top that the
-    /// committed file stays authoritative; an earlier version of this
-    /// function overwrote it, which meant an ordinary
-    /// `cargo check --features genheader` destroyed a maintainer's edits with
-    /// nothing but a warning to show for it. Two properties of the setup make
-    /// that unavoidable rather than unlucky, and they are worth stating so
-    /// that nobody restores the write:
+    /// Unset, which is the default, regeneration only ever *compares*. That is
+    /// deliberate: the committed header is tracked and hand-authored, and an
+    /// earlier version of this module overwrote it during an ordinary
+    /// `cargo check --features genheader`, destroying a maintainer's edits
+    /// with nothing but a warning to show for it. Writing is now something a
+    /// caller asks for by name.
+    const WRITE_BACK: &str = "CURL_URLAPI_WRITE_MIRROR_HEADER";
+
+    /// curl's line limit for C sources and headers, from .editorconfig.
+    const LINE_LIMIT: usize = 79;
+
+    /// The heading the result-code enumeration carries in the public header.
+    const CODES_HEADING: &str = "/* the error codes for the URL API */";
+
+    /// Everything above the first declaration: the include guard, the licence
+    /// box, the explanatory prose, the CURL_EXTERN fallback and the opening of
+    /// the `extern "C"` block.
     ///
-    /// * cbindgen 0.29.4's output can never be byte-equal to the committed
-    ///   header. cbindgen.toml records the four shape differences it cannot be
-    ///   configured out of -- the `//` comments on the `extern "C"` wrapper
-    ///   above all, which are not comments in C89 at all -- so the committed
-    ///   header has to be hand-authored to stay C89-clean, and an
-    ///   equality-guarded write therefore fires on *every* fresh checkout.
-    /// * .gitignore cannot mitigate it, because the file is tracked. There is
-    ///   no "ignore my own edits" for a build script.
+    /// # Why the frame is transcribed here as well as committed
+    ///
+    /// No generator can derive prose. For the regenerated bytes to be
+    /// comparable with the committed file *as a whole file* rather than as a
+    /// projection of it, this module has to be able to produce the whole file,
+    /// which means carrying the fixed text. The duplication is the price of an
+    /// exact comparison, and the comparison is what keeps the two copies in
+    /// step: edit one and the build fails until the other matches.
+    ///
+    /// Everything that is not fixed text -- every name, every value, every
+    /// type, every arity, the declaration order and the alignment -- is derived
+    /// from the inventory instead, which is the crate's real ABI as cbindgen
+    /// reads it.
+    const PREAMBLE: &str = r#"#ifndef CURLINC_URLAPI_RS_H
+#define CURLINC_URLAPI_RS_H
+/***************************************************************************
+ *                                  _   _ ____  _
+ *  Project                     ___| | | |  _ \| |
+ *                             / __| | | | |_) | |
+ *                            | (__| |_| |  _ <| |___
+ *                             \___|\___/|_| \_\_____|
+ *
+ * Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+ *
+ * This software is licensed as described in the file COPYING, which
+ * you should have received as part of this distribution. The terms
+ * are also available at https://curl.se/docs/copyright.html.
+ *
+ * You may opt to use, copy, modify, merge, publish, distribute and/or sell
+ * copies of the Software, and permit persons to whom the Software is
+ * furnished to do so, under the terms of the COPYING file.
+ *
+ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
+ * KIND, either express or implied.
+ *
+ * SPDX-License-Identifier: curl
+ *
+ ***************************************************************************/
+
+/*
+ * A one-for-one mirror of the public declarations in
+ * include/curl/urlapi.h:34-149, provided for the standalone link mode, in
+ * which no libcurl takes part and the real header is therefore not on the
+ * include path. Everything from the CURLUcode enumeration down is
+ * transcribed from that file verbatim, cosmetic details included, because a
+ * mirror that improves on its original is no longer a mirror.
+ *
+ * This header neither shadows the real one nor can be shadowed by it: the
+ * file name, the directory and the include guard opened above all differ
+ * deliberately, so a shared guard can never make one of the two silently
+ * vanish. Each link mode uses exactly one of them, and that is the
+ * supported arrangement -- a translation unit including both is rejected,
+ * because the two would declare the same enumerators and typedefs twice.
+ * The CURL_EXTERN block below is guarded all the same, so that the macro
+ * at least cannot collide in either include order.
+ *
+ * WHY THIS FILE HAS NO INCLUDE DIRECTIVE AT ALL
+ *
+ * include/curl/urlapi.h:27 includes "curl.h", and that is the only reason
+ * it does so: "curl.h" is where it obtains CURL_EXTERN, the linkage
+ * decoration its six declarations carry. That line is deliberately not
+ * reproduced. A standalone link contains no libcurl, and drawing in the
+ * whole of "curl.h" to obtain one macro would defeat the purpose of a
+ * self-contained mirror. The decoration is resolved locally instead, by the
+ * block below, which is guarded by ifndef so that a translation unit
+ * including both this mirror and the real "curl.h" cannot redefine it, in
+ * either include order.
+ *
+ * Nothing further is required. The six declarations close over CURLU,
+ * CURLUcode, CURLUPart, char, void, unsigned int and const char * alone --
+ * there is no size_t, no curl_off_t and no CURL anywhere in the surface --
+ * so this file needs no header of its own and includes none.
+ *
+ * WHAT IS DELIBERATELY ABSENT
+ *
+ * curl_free() belongs to include/curl/curl.h:2735, not to urlapi.h, which
+ * refers to it only in the prose below at its lines 130-131. A one-for-one
+ * mirror therefore does not declare it, and a standalone consumer needing
+ * it must obtain that prototype elsewhere.
+ *
+ * The three entry points declared at lib/urlapi-int.h:28-33 --
+ * Curl_is_absolute_url, Curl_url_set_authority and Curl_junkscan -- are
+ * exported by the production object file this crate replaces, and the crate
+ * exports all three so that a drop-in link keeps working. They form no part
+ * of the public contract, so they are absent here.
+ *
+ * Curl_parse_port is a different case and must not be lumped in with them.
+ * Its declaration at lib/urlapi-int.h:36-37 sits inside the #ifdef UNITTESTS
+ * block that spans lines 35 to 38, so it is a global only in a unit-test
+ * build of libcurl and is NOT among the eight globals the production object
+ * file defines. The crate therefore does
+ * not export it either, deliberately: adding it would make the archive's
+ * exported set larger than the object file's, which is the one property the
+ * drop-in has to preserve. The consequence -- that tests/unit/unit1653.c
+ * stays out of reach -- is recorded as constraint R2 rather than worked
+ * around. dedotdotify, marked the same way at lib/urlapi.c:715, is in the
+ * same position.
+ *
+ * curl_url_strerror() is declared below with an unnamed parameter, exactly
+ * as at include/curl/urlapi.h:149, even though its manual page names one.
+ * The omission is reproduced on purpose and must not be repaired;
+ * ../docs/KNOWN-DIVERGENCES.md records it as finding FB5.
+ */
+
+#ifndef CURL_EXTERN
+#ifdef CURL_STATICLIB
+#define CURL_EXTERN
+#elif defined(_WIN32)
+#ifdef BUILDING_LIBCURL
+#define CURL_EXTERN __declspec(dllexport)
+#else
+#define CURL_EXTERN __declspec(dllimport)
+#endif
+#else
+#define CURL_EXTERN
+#endif
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+"#;
+
+    /// Everything below the last declaration: the close of the `extern "C"`
+    /// block and the include guard.
+    const EPILOGUE: &str = r#"
+#ifdef __cplusplus
+} /* end of extern "C" */
+#endif
+
+#endif /* CURLINC_URLAPI_RS_H */
+"#;
+
+    /// The trailing comment each behaviour flag carries in the public header,
+    /// pre-split into the lines that header wraps it onto.
+    ///
+    /// The segments are data rather than something re-wrapped here on purpose:
+    /// the wrap points are the public header's own, and re-deriving them would
+    /// mean reproducing a decision somebody made by eye. What this module
+    /// computes is the *alignment*, which is mechanical.
+    const FLAG_COMMENTS: [(&str, &[&str]); 16] = [
+        ("CURLU_DEFAULT_PORT", &["return default port number"]),
+        (
+            "CURLU_NO_DEFAULT_PORT",
+            &[
+                "act as if no port number was set,",
+                "if the port number matches the",
+                "default for the scheme",
+            ],
+        ),
+        (
+            "CURLU_DEFAULT_SCHEME",
+            &["return default scheme if", "missing"],
+        ),
+        ("CURLU_NON_SUPPORT_SCHEME", &["allow non-supported scheme"]),
+        ("CURLU_PATH_AS_IS", &["leave dot sequences"]),
+        ("CURLU_DISALLOW_USER", &["no user+password allowed"]),
+        ("CURLU_URLDECODE", &["URL decode on get"]),
+        ("CURLU_URLENCODE", &["URL encode on set"]),
+        ("CURLU_APPENDQUERY", &["append a form style part"]),
+        ("CURLU_GUESS_SCHEME", &["legacy curl-style guessing"]),
+        (
+            "CURLU_NO_AUTHORITY",
+            &["Allow empty authority when the", "scheme is unknown."],
+        ),
+        ("CURLU_ALLOW_SPACE", &["Allow spaces in the URL"]),
+        ("CURLU_PUNYCODE", &["get the hostname in punycode"]),
+        ("CURLU_PUNY2IDN", &["punycode => IDN conversion"]),
+        (
+            "CURLU_GET_EMPTY",
+            &[
+                "allow empty queries and fragments",
+                "when extracting the URL or the",
+                "components",
+            ],
+        ),
+        ("CURLU_NO_GUESS_SCHEME", &["for get, do not accept a guess"]),
+    ];
+
+    /// The one part identifier that carries a note in the public header,
+    /// include/curl/urlapi.h:81.
+    const PART_ANNOTATIONS: [(&str, &str); 1] = [("CURLUPART_ZONEID", "added in 7.65.0")];
+
+    /// The six public declarations in header order, each with the comment
+    /// block that precedes it and the parameter names it uses.
+    ///
+    /// Parameter names are not ABI, and the public header's own choices are
+    /// reproduced rather than the inventory's: cbindgen names them after the
+    /// Rust parameters, so it writes `input` where the header writes `in` --
+    /// which is a Rust keyword and cannot be spelled there -- and `code` where
+    /// the header names nothing at all. That last one is finding FB5 in
+    /// docs/KNOWN-DIVERGENCES.md and is reproduced deliberately: an empty
+    /// string here means the parameter stays unnamed, exactly as at
+    /// include/curl/urlapi.h:149.
+    ///
+    /// The ORDER is this table's, and the set has to match the inventory
+    /// exactly -- a function in one and not the other fails before any byte is
+    /// compared, with a message naming it.
+    const FUNCTION_FRAME: [(&str, &str, &[&str]); 6] = [
+        (
+            "curl_url",
+            r#"/*
+ * curl_url() creates a new CURLU handle and returns a pointer to it.
+ * Must be freed with curl_url_cleanup().
+ */"#,
+            &[],
+        ),
+        (
+            "curl_url_cleanup",
+            r#"/*
+ * curl_url_cleanup() frees the CURLU handle and related resources used for
+ * the URL parsing. It will not free strings previously returned with the URL
+ * API.
+ */"#,
+            &["handle"],
+        ),
+        (
+            "curl_url_dup",
+            r#"/*
+ * curl_url_dup() duplicates a CURLU handle and returns a new copy. The new
+ * handle must also be freed with curl_url_cleanup().
+ */"#,
+            &["in"],
+        ),
+        (
+            "curl_url_get",
+            r#"/*
+ * curl_url_get() extracts a specific part of the URL from a CURLU
+ * handle. Returns error code. The returned pointer MUST be freed with
+ * curl_free() afterwards.
+ */"#,
+            &["handle", "what", "part", "flags"],
+        ),
+        (
+            "curl_url_set",
+            r#"/*
+ * curl_url_set() sets a specific part of the URL in a CURLU handle. Returns
+ * error code. The passed in string will be copied. Passing a NULL instead of
+ * a part string, clears that part.
+ */"#,
+            &["handle", "what", "part", "flags"],
+        ),
+        (
+            "curl_url_strerror",
+            r#"/*
+ * curl_url_strerror() turns a CURLUcode value into the equivalent human
+ * readable error string. This is useful for printing meaningful error
+ * messages.
+ */"#,
+            &[""],
+        ),
+    ];
+
+    /// Regenerate the mirror header and require it to equal the committed one
+    /// byte for byte.
+    ///
+    /// # What "exact" means here, and why it is not a projection
+    ///
+    /// An earlier version of this module reduced both files to a set of
+    /// canonical one-line entries and compared the sets. That comparison was
+    /// deliberately blind to declaration *shape* -- enumeration versus macro,
+    /// the struct tag, parameter names, comments, ordering, alignment -- and
+    /// blindness is a liability in a file whose whole purpose is to be a
+    /// one-for-one mirror. It also let the generated intermediate stay
+    /// non-C89: cbindgen's `cpp_compat` wrapper writes `#endif // __cplusplus`,
+    /// and `//` is not a comment in C89 at all.
+    ///
+    /// Both are closed. `cbindgen.toml` sets `cpp_compat = false`, so the
+    /// inventory carries no `//` anywhere, and this module then *emits* the
+    /// mirror rather than diffing against cbindgen's layout: it reads the
+    /// inventory for the ABI -- constant names and values, typedef names and
+    /// kinds, function return types, arities and parameter types -- and renders
+    /// the public header's own shape from it, enumerations and aligned macros
+    /// included. The result is compared with the committed file **byte for
+    /// byte**, and any difference fails the build with the first differing line
+    /// on both sides.
+    ///
+    /// # This function does not write into the source tree unless told to
+    ///
+    /// The generated bytes land in OUT_DIR, which is the only directory a build
+    /// script owns. Setting `CURL_URLAPI_WRITE_MIRROR_HEADER=1` additionally
+    /// updates the committed file, and that is the only path that writes to it.
+    /// With the comparison now exact the write is a no-op on an unchanged
+    /// crate, which is what makes regeneration idempotent: two runs in a row
+    /// leave `git status --porcelain` clean for that path.
     ///
     /// # WHY THE CRATE ROOT AND NOT THE CRATE
     ///
     /// The generator is pointed at src/lib.rs with `Builder::with_src`, not at
     /// the crate directory with `Builder::with_crate`. That is not a stylistic
     /// preference; it is what keeps this feature inside the 1.75 floor that
-    /// Cargo.toml declares, and it must not be changed back.
-    ///
-    /// `Builder::generate` in cbindgen 0.29.4 branches on whether a library
-    /// directory was supplied. With one, it calls `Cargo::load`, which shells
-    /// out to `cargo metadata`; without one it parses the source files given
-    /// to it and never invokes Cargo at all.
-    ///
-    /// `cargo metadata` resolves and parses the *whole* dependency graph,
-    /// optional dependencies included, whether or not the current feature set
-    /// reaches them. This crate's graph contains idna behind the opt-in
-    /// idn-pure feature, and idna pulls idna_adapter, whose manifest declares
-    /// edition 2024. Cargo 1.75 cannot parse that edition, so the subprocess
-    /// exits non-zero and generation fails before it starts -- on a build that
-    /// compiles none of those packages. Source mode never asks the question,
-    /// so the optional high-floor graph stays out of the picture entirely.
-    ///
-    /// Nothing about the emitted bytes changes. Measured with cbindgen 0.29.4
-    /// and this cbindgen.toml, `cbindgen --config cbindgen.toml src/lib.rs`
-    /// and `cbindgen --config cbindgen.toml .` produce byte-identical output,
-    /// because cbindgen's source parser follows the `mod` declarations out of
-    /// the crate root and this configuration sets `parse.parse_deps = false`,
-    /// so a dependency was never going to contribute a declaration in the
-    /// first place. The one thing crate mode adds that source mode does not is
-    /// the resolved package version, and nothing in cbindgen.toml asks for it.
-    ///
-    /// The alternative remedy -- re-pinning the lockfile to an older IDNA and
-    /// internationalisation line so that Cargo 1.75 could parse it -- is
-    /// deliberately not taken. AAP 0.5.1 records idna 1.1.0 and the
-    /// idna_adapter 1.2.2 it resolves to, and 0.5.1.2 records the measured
-    /// consequence: the idn-pure configuration's effective floor is 1.86, and
-    /// that is a documented, deliberate exception. Changing the lock to work
-    /// around a subprocess this function does not need would contradict the
-    /// recorded dependency resolution to fix something the call site owns.
-    ///
-    /// It is also the only shape the check can safely take while
-    /// `cargo cinstall` ships the same file as an install asset, per the
-    /// `[package.metadata.capi.install.include]` block in Cargo.toml.
-    ///
-    /// # Why the comparison is semantic and why it is fatal
-    ///
-    /// Byte equality is unreachable, as above. An earlier version of this
-    /// function therefore compared bytes and, on the inevitable difference,
-    /// emitted a Cargo warning saying some of the difference was expected.
-    /// That made the check worthless as a gate: the baseline output differed
-    /// from the committed header by 357 unified-diff lines on a clean
-    /// checkout, so a real ABI change produced exactly the same signal as the
-    /// known cosmetic delta and nothing distinguished the two.
-    ///
-    /// So the comparison is made over a *normalized semantic surface* instead
-    /// -- see [`surface`] for the model and for every normalization it
-    /// applies, each with the proven reason it is cosmetic -- and any
-    /// remaining difference panics. Panicking is the point: a build script
-    /// panic fails `cargo build`, which is what turns this from a note into a
-    /// gate. The committed header is still never written to; the failure says
-    /// what differs and the human reconciles it, by changing the Rust items or
-    /// this configuration, never by editing include/curl/urlapi.h.
-    ///
-    /// # What it compares, and what it reports
-    ///
-    /// * Surfaces equal: a note naming both paths, and a note if the bytes
-    ///   happen to be equal too.
-    /// * Surfaces different: a panic listing every entry present in one
-    ///   surface and absent from the other, in both directions.
-    /// * Committed header absent: a note saying where the generated copy is,
-    ///   so it can be used as the starting point for the hand-authored file.
-    ///   That is an ordinary state before the file has been authored and is
-    ///   the one case that is not a failure.
-    pub fn generate(crate_dir: &Path) {
-        // cbindgen's source parser follows the `mod` declarations out of the
-        // crate root, so on this path every file under src/ is an input --
-        // wider than the three files an ordinary build watches.
+    /// Cargo.toml declares. Crate mode makes cbindgen run `cargo metadata` and
+    /// expand macros through the toolchain, which drags the whole dependency
+    /// resolution of the package into a build script; source mode parses the
+    /// module tree directly and needs none of it.
+    pub(super) fn generate(crate_dir: &Path) {
         super::rerun_if_changed(&crate_dir.join("src"));
+        super::cargo(&format!("rerun-if-env-changed={WRITE_BACK}"));
 
         let config_path = crate_dir.join("cbindgen.toml");
         let committed = crate_dir.join("include").join(MIRROR_HEADER);
+        // The committed header is an INPUT to this step, because the step
+        // compares against it. Without this the comparison would not re-run
+        // when somebody edited the file, which is the one edit it exists to
+        // catch -- measured, and it really did pass an edited header.
+        super::rerun_if_changed(&committed);
+        let inventory_path = out_dir().join(INVENTORY_HEADER);
         let generated_path = out_dir().join(MIRROR_HEADER);
 
         // Every configuration struct in cbindgen 0.29.4 denies unknown
@@ -1785,10 +2655,8 @@ mod mirror_header {
             ),
         };
 
-        // Source mode, not crate mode, and the difference is the whole reason
-        // this feature works on the toolchain Cargo.toml declares as the
-        // floor. See the "WHY THE CRATE ROOT AND NOT THE CRATE" section of
-        // this function's documentation.
+        // Source mode, not crate mode. See "WHY THE CRATE ROOT AND NOT THE
+        // CRATE" in this function's documentation.
         let root = crate_dir.join("src").join("lib.rs");
         let bindings = match cbindgen::Builder::new()
             .with_src(&root)
@@ -1797,25 +2665,25 @@ mod mirror_header {
         {
             Ok(bindings) => bindings,
             Err(error) => panic!(
-                "curl-urlapi-rs: cbindgen could not generate the mirror \
-                 header from {}: {error}",
+                "curl-urlapi-rs: cbindgen could not generate the ABI \
+                 inventory from {}: {error}",
                 root.display()
             ),
         };
 
-        let mut generated = Vec::new();
-        bindings.write(&mut generated);
+        let mut inventory = Vec::new();
+        bindings.write(&mut inventory);
+        write_out_dir(&inventory_path, &inventory);
 
-        // The one write this function performs, and it is inside OUT_DIR.
-        // Cargo creates OUT_DIR before running the script, so no directory
-        // has to be made here; the write is reported rather than ignored so
-        // that a full disk cannot make the comparison below silently vacuous.
-        if let Err(error) = fs::write(&generated_path, &generated) {
-            panic!(
-                "curl-urlapi-rs: could not write {}: {error}",
-                generated_path.display()
-            );
-        }
+        let abi = Abi::read(&inventory, &inventory_path);
+        let mirror = abi.emit();
+        write_out_dir(&generated_path, mirror.as_bytes());
+
+        // A C89 syntax check of what was just emitted, when a compiler can be
+        // found. The mirror is included by C programs in the standalone link
+        // mode, and curl holds its headers to C89, so "compiles as C89" is
+        // part of the contract rather than a nicety.
+        check_c89(&generated_path);
 
         // A missing committed header is an ordinary state before it has been
         // authored; anything else going wrong while reading it is not, and
@@ -1829,503 +2697,140 @@ mod mirror_header {
             ),
         };
 
+        let identical = existing.as_deref() == Some(mirror.as_bytes());
+        if identical {
+            super::note(&format!(
+                "{} is byte-for-byte what this crate's ABI regenerates: {} \
+                 constants, {} typedefs and {} declarations, emitted into {}",
+                committed.display(),
+                abi.constants.len(),
+                abi.typedef_count(),
+                abi.functions.len(),
+                generated_path.display()
+            ));
+            return;
+        }
+
+        if super::env_flag(WRITE_BACK) {
+            if let Err(error) = fs::write(&committed, mirror.as_bytes()) {
+                panic!(
+                    "curl-urlapi-rs: could not update {}: {error}",
+                    committed.display()
+                );
+            }
+            super::warn(&format!(
+                "{} updated from the regenerated mirror because {WRITE_BACK} \
+                 is set. Review the diff before committing it: the file is \
+                 tracked and hand-authored.",
+                committed.display()
+            ));
+            return;
+        }
+
         let Some(bytes) = existing else {
             super::note(&format!(
-                "{} does not exist; the generated mirror is in {} and can be \
-                 used as the starting point for it",
+                "{} does not exist. The regenerated mirror is in {}; set \
+                 {WRITE_BACK}=1 to install it there.",
                 committed.display(),
                 generated_path.display()
             ));
             return;
         };
 
-        // Byte equality is not required and is not reachable, but if it ever
-        // were reached the semantic comparison below would be vacuous, so say
-        // so rather than let the note be misread.
-        if bytes == generated {
-            super::note(&format!(
-                "{} is byte-equal to the generated mirror in {}",
-                committed.display(),
-                generated_path.display()
-            ));
-        }
-
-        let committed_surface = surface::extract(&bytes, &committed.display().to_string());
-        let generated_surface = surface::extract(&generated, &generated_path.display().to_string());
-
-        // The gate. Anything the two surfaces disagree about is ABI drift by
-        // construction: every difference the generator cannot avoid has
-        // already been normalized away by `surface::extract`, and each of
-        // those normalizations is justified in that module against the shape
-        // of the two inputs. A difference surviving it is a real one.
-        let missing = difference(&committed_surface, &generated_surface);
-        let extra = difference(&generated_surface, &committed_surface);
-        if !missing.is_empty() || !extra.is_empty() {
-            panic!(
-                "curl-urlapi-rs: the public surface of {} does not match the \
-                 surface generated from this crate into {}. Nothing was \
-                 modified. This is ABI drift, not a cosmetic difference: \
-                 every difference cbindgen cannot avoid is normalized away \
-                 before this comparison, and the normalizations are listed in \
-                 build.rs `mod mirror_header::surface`. Reconcile by changing \
-                 the Rust items in src/ffi.rs and src/abi.rs, or cbindgen.toml \
-                 -- never by editing include/curl/urlapi.h, which is \
-                 read-only.\n\
-                 \n\
-                 in the committed header but not generated from the crate \
-                 ({} entries):\n{}\n\
-                 generated from the crate but not in the committed header \
-                 ({} entries):\n{}",
-                committed.display(),
-                generated_path.display(),
-                missing.len(),
-                bullets(&missing),
-                extra.len(),
-                bullets(&extra)
-            );
-        }
-
-        super::note(&format!(
-            "{} and the mirror generated into {} describe the same public \
-             surface: {} entries, matched entry for entry",
+        panic!(
+            "curl-urlapi-rs: {} is not what this crate's ABI regenerates. \
+             Nothing was modified. The regenerated bytes are in {}, and the \
+             inventory they were read from is in {}.\n{}\n\
+             Reconcile by changing the Rust items in src/ffi.rs and \
+             src/abi.rs, or the frame in build.rs `mod mirror_header` -- never \
+             by editing include/curl/urlapi.h, which is read-only. If the \
+             regenerated bytes are the intended ones, rerun with \
+             {WRITE_BACK}=1 to install them.",
             committed.display(),
             generated_path.display(),
-            committed_surface.len()
-        ));
+            inventory_path.display(),
+            first_difference(&bytes, mirror.as_bytes())
+        );
     }
 
-    /// Entries of `left` that do not appear in `right`, in `left` order.
-    fn difference(left: &[String], right: &[String]) -> Vec<String> {
-        left.iter()
-            .filter(|entry| !right.contains(entry))
-            .cloned()
-            .collect()
+    /// Write into OUT_DIR, reporting a failure rather than ignoring it.
+    ///
+    /// Cargo creates OUT_DIR before running the script, so no directory has to
+    /// be made here. The write is checked because a full disk would otherwise
+    /// make the comparison that follows silently vacuous.
+    fn write_out_dir(path: &Path, bytes: &[u8]) {
+        if let Err(error) = fs::write(path, bytes) {
+            panic!(
+                "curl-urlapi-rs: could not write {}: {error}",
+                path.display()
+            );
+        }
     }
 
-    /// One entry per line, indented, for a panic message.
-    fn bullets(entries: &[String]) -> String {
-        if entries.is_empty() {
-            return "  (none)".to_string();
+    /// The first line at which two byte strings differ, rendered for a panic.
+    ///
+    /// Line-oriented rather than offset-oriented because the reader's next
+    /// action is to look at that line in an editor. Trailing-newline-only
+    /// differences have no differing line, so they are named explicitly instead
+    /// of reported as "no difference".
+    fn first_difference(left: &[u8], right: &[u8]) -> String {
+        let left = String::from_utf8_lossy(left);
+        let right = String::from_utf8_lossy(right);
+        let mut lines = left.lines().zip(right.lines()).enumerate();
+        if let Some((index, (l, r))) = lines.find(|(_, (l, r))| l != r) {
+            return format!(
+                "first difference at line {}:\n  committed:   {l}\n  regenerated: {r}",
+                index.saturating_add(1)
+            );
         }
-        entries
-            .iter()
-            .map(|entry| format!("  {entry}"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        format!(
+            "the lines agree, so the difference is in length or in trailing \
+             bytes: committed {} bytes over {} lines, regenerated {} bytes \
+             over {} lines",
+            left.len(),
+            left.lines().count(),
+            right.len(),
+            right.lines().count()
+        )
     }
 
-    /// The normalized semantic surface of a C header, and nothing else.
+    /// Compile the emitted header as strict C89, when a compiler is available.
     ///
-    /// # What a surface is
-    ///
-    /// A sorted list of canonical one-line entries, exactly four kinds:
-    ///
-    /// * `const NAME = VALUE` -- one per object-like macro with a value and
-    ///   one per enumerator, with the value evaluated to a decimal integer.
-    ///   The committed header spells the 33 result codes and the 11 part
-    ///   identifiers as C enumerators with implicit numbering and the 16 flags
-    ///   as `#define NAME (1 << n)`; the generated header spells all 60 as
-    ///   `#define NAME n`. Evaluating both to integers is what makes the two
-    ///   spellings comparable, and it is also the only comparison that matters:
-    ///   parity for those three sets is *positional*, so the number is the
-    ///   contract and the spelling is not.
-    /// * `scalar NAME` -- one per `typedef` of an integer type or of an
-    ///   enumeration. `typedef enum { .. } CURLUcode;` and
-    ///   `typedef int CURLUcode;` both reduce to `scalar CURLUcode`, because a
-    ///   C enumeration whose enumerators all fit in `int` is compatible with
-    ///   `int` on every platform curl supports, and the enumerators themselves
-    ///   are already compared one by one as `const` entries.
-    /// * `opaque NAME` -- one per `typedef struct TAG NAME;`. The tag is
-    ///   dropped: `include/curl/urlapi.h`:L107 writes the tag `Curl_URL` and
-    ///   cbindgen derives it from the Rust item name, but the type is
-    ///   incomplete either way and is only ever used through a pointer, which
-    ///   is precisely the property that makes this port possible. Nothing a C
-    ///   caller can do depends on the tag.
-    /// * `fn RET NAME ( P1 , P2 , .. )` -- one per function declaration, with
-    ///   the return type and each parameter type tokenized and rejoined so
-    ///   that spacing and pointer placement cannot matter.
-    ///
-    /// Anything that is none of those four -- a stray declaration, an unknown
-    /// `typedef`, a valueless macro other than the two named below -- still
-    /// becomes an entry, spelled verbatim, so that it cannot slip past the
-    /// comparison by not fitting a category.
-    ///
-    /// # Every normalization, and why each one is cosmetic
-    ///
-    /// These are the whole list. Each was confirmed against the two actual
-    /// inputs rather than assumed, and none of them can hide a change to a
-    /// number, a name, a type or an arity.
-    ///
-    /// 1. **Comments.** `/* .. */` and `// ..` are removed before anything
-    ///    else. The committed header carries the licence box, the per-value
-    ///    `/* n */` ordinal comments and the descriptive block above each
-    ///    declaration; cbindgen emits `/** .. */` doc comments in their place
-    ///    and `// __cplusplus` / `// extern "C"` trailers, which are not
-    ///    comments in C89 at all. No comment is part of the ABI.
-    /// 2. **Whitespace and line breaks.** Collapsed to single spaces. The
-    ///    generated header breaks `curl_url_get` and `curl_url_set` across
-    ///    four lines each where the committed header uses two.
-    /// 3. **The include guard.** `CURLINC_URLAPI_RS_H` is dropped. Both files
-    ///    define it, so keeping it would be harmless, but it is not part of
-    ///    the surface and dropping it says so.
-    /// 4. **`CURL_EXTERN`.** Dropped both as a macro definition and as a
-    ///    leading token on a declaration. It is linkage decoration: the
-    ///    committed header self-resolves it because a standalone link has no
-    ///    libcurl to define it, and cbindgen.toml's `[fn]` section
-    ///    deliberately injects no prefix, since an undefined macro in front of
-    ///    six declarations would not compile.
-    /// 5. **The opaque tag.** As above under `opaque NAME`.
-    /// 6. **The enumeration-versus-macro representation.** As above under
-    ///    `const` and `scalar`. It is forced: `src/abi.rs` expresses the 60
-    ///    values as explicit integer constants rather than as Rust
-    ///    enumerations, because a Rust enumeration's discriminants could be
-    ///    reordered by a later edit and the C numbering is positional. That is
-    ///    the Agent Action Plan's transformation rule T2, so cbindgen has no
-    ///    enumeration to emit and cannot be configured into emitting one.
-    /// 7. **Parameter names.** Dropped. They are not part of the ABI. Two
-    ///    differ and both are deliberate: `curl_url_dup`'s parameter is `in`
-    ///    at `include/curl/urlapi.h`:L126, a Rust keyword, so `src/ffi.rs`
-    ///    spells it `input`; and `curl_url_strerror`'s is unnamed at L149,
-    ///    a cosmetic detail the committed mirror reproduces and Rust cannot.
-    ///
-    /// Nothing else is normalized. In particular no name, no numeric value, no
-    /// return type, no parameter type, no parameter count and no
-    /// `const` qualifier is touched, so a change to any of them fails the gate.
-    mod surface {
-        /// Extract the normalized semantic surface of `header`.
-        ///
-        /// `origin` names the file, for the panic messages a malformed input
-        /// would otherwise make unattributable.
-        pub fn extract(header: &[u8], origin: &str) -> Vec<String> {
-            // Lossy rather than strict: both inputs are ASCII by
-            // construction, and a stray byte must not turn a comparison into
-            // a decode error whose message says nothing about the surface.
-            let text = String::from_utf8_lossy(header);
-            let text = strip_comments(&text);
+    /// An absent or unusable compiler is a note rather than a failure: the
+    /// check is a bonus on top of the byte comparison, and a build script that
+    /// insisted on a C compiler would make `cargo check --features genheader`
+    /// depend on one.
+    fn check_c89(header: &Path) {
+        let Some(compiler) = super::probe_compiler() else {
+            super::note("no C compiler found, so the C89 check was skipped");
+            return;
+        };
+        let probe = out_dir().join("curl_urlapi_rs_c89_probe.c");
+        let source = format!("#include \"{}\"\n", header.display());
+        write_out_dir(&probe, source.as_bytes());
 
-            let mut entries = Vec::new();
-            let mut declarations = String::new();
-            for line in text.lines() {
-                let line = line.trim();
-                if let Some(rest) = line.strip_prefix('#') {
-                    if let Some(entry) = macro_entry(rest.trim_start()) {
-                        entries.push(entry);
-                    }
-                    // Every other preprocessor line -- the guard's `#ifndef`
-                    // and `#endif`, the `__cplusplus` pair -- is structure
-                    // rather than surface.
-                    continue;
-                }
-                declarations.push(' ');
-                declarations.push_str(line);
-            }
-
-            let (enums, rest) = take_enums(&declarations);
-            entries.extend(enums);
-            entries.extend(statements(&rest, origin));
-            entries.sort();
-            entries
-        }
-
-        /// Remove `/* .. */` and `// ..` comments, keeping line structure so
-        /// that preprocessor lines can still be recognized afterwards.
-        fn strip_comments(text: &str) -> String {
-            let bytes = text.as_bytes();
-            let mut out = String::with_capacity(text.len());
-            let mut i = 0;
-            while i < bytes.len() {
-                let two = bytes.get(i..i.saturating_add(2));
-                match two {
-                    Some(b"/*") => {
-                        // Skip to the closing delimiter, preserving newlines so
-                        // that a comment spanning lines cannot glue two
-                        // preprocessor lines together.
-                        i = i.saturating_add(2);
-                        while i < bytes.len() {
-                            if bytes.get(i..i.saturating_add(2)) == Some(b"*/") {
-                                i = i.saturating_add(2);
-                                break;
-                            }
-                            if bytes.get(i) == Some(&b'\n') {
-                                out.push('\n');
-                            }
-                            i = i.saturating_add(1);
-                        }
-                    }
-                    Some(b"//") => {
-                        while i < bytes.len() && bytes.get(i) != Some(&b'\n') {
-                            i = i.saturating_add(1);
-                        }
-                    }
-                    _ => {
-                        out.push(char::from(bytes.get(i).copied().unwrap_or(b' ')));
-                        i = i.saturating_add(1);
-                    }
-                }
-            }
-            out
-        }
-
-        /// The surface entry, if any, for the body of a preprocessor line.
-        fn macro_entry(body: &str) -> Option<String> {
-            let rest = body.strip_prefix("define")?;
-            if !rest.starts_with(char::is_whitespace) {
-                return None;
-            }
-            let mut parts = rest.trim().splitn(2, char::is_whitespace);
-            let name = parts.next().unwrap_or_default().trim();
-            if name.is_empty() || name.contains('(') {
-                // A function-like macro is not part of this surface and
-                // neither input has one; recorded verbatim so that one
-                // appearing later cannot pass unnoticed.
-                return Some(format!("macro {}", collapse(rest.trim())));
-            }
-            // Normalization 3 and 4: the include guard and the linkage
-            // decoration are structure, not surface.
-            if name == "CURLINC_URLAPI_RS_H" || name == "CURL_EXTERN" {
-                return None;
-            }
-            let value = parts.next().unwrap_or_default().trim();
-            match evaluate(value) {
-                Some(number) => Some(format!("const {name} = {number}")),
-                // A valueless or unevaluatable macro is still an entry, so it
-                // cannot slip past by not being a number.
-                None if value.is_empty() => Some(format!("macro {name}")),
-                None => Some(format!("macro {name} = {}", collapse(value))),
-            }
-        }
-
-        /// Evaluate the integer-constant spellings these two headers use: a
-        /// decimal literal, or a left shift of one, either bare or in one
-        /// layer of parentheses. Anything else is not a number here.
-        fn evaluate(value: &str) -> Option<i64> {
-            let value = value.trim();
-            let value = value
-                .strip_prefix('(')
-                .and_then(|inner| inner.strip_suffix(')'))
-                .unwrap_or(value)
-                .trim();
-            if let Some((left, right)) = value.split_once("<<") {
-                let left: i64 = left.trim().parse().ok()?;
-                let right: u32 = right.trim().parse().ok()?;
-                return left.checked_shl(right);
-            }
-            value.parse().ok()
-        }
-
-        /// Pull every `typedef enum { .. } NAME;` out of `text`, returning its
-        /// entries and the text with those blocks removed.
-        ///
-        /// One `scalar NAME` entry per block, plus one `const` entry per
-        /// enumerator with C's implicit numbering applied: a bare enumerator
-        /// takes the previous value plus one, starting from zero, and an
-        /// explicit `= value` resets the sequence. That is normalization 6 in
-        /// the module note, and it is what lets the committed header's
-        /// enumerations be compared against the generated header's macros.
-        fn take_enums(text: &str) -> (Vec<String>, String) {
-            let mut entries = Vec::new();
-            let mut rest = String::new();
-            let mut remainder = text;
-            while let Some(start) = remainder.find("typedef enum") {
-                let (before, from_start) = remainder.split_at(start);
-                rest.push_str(before);
-                let Some(open) = from_start.find('{') else {
-                    break;
-                };
-                let Some(close) = from_start.find('}') else {
-                    break;
-                };
-                if close < open {
-                    break;
-                }
-                let body = from_start.get(open.saturating_add(1)..close).unwrap_or("");
-                let after = from_start.get(close.saturating_add(1)..).unwrap_or("");
-                let Some(semicolon) = after.find(';') else {
-                    break;
-                };
-                let name = collapse(after.get(..semicolon).unwrap_or(""));
-                entries.push(format!("scalar {name}"));
-                let mut next = 0i64;
-                for member in body.split(',') {
-                    let member = collapse(member);
-                    if member.is_empty() {
-                        continue;
-                    }
-                    let (member, value) = match member.split_once('=') {
-                        Some((left, right)) => {
-                            (collapse(left), evaluate(right).unwrap_or(i64::MIN))
-                        }
-                        None => (member, next),
-                    };
-                    entries.push(format!("const {member} = {value}"));
-                    next = value.saturating_add(1);
-                }
-                remainder = after.get(semicolon.saturating_add(1)..).unwrap_or("");
-            }
-            rest.push_str(remainder);
-            (entries, rest)
-        }
-
-        /// One entry per `;`-terminated declaration left in `text`.
-        fn statements(text: &str, origin: &str) -> Vec<String> {
-            // `extern "C" {` and its closing brace are structure. Removing the
-            // opening form by name leaves only bare braces to drop, and no
-            // declaration in this surface contains one.
-            let text = text.replace("extern \"C\" {", " ");
-            let mut entries = Vec::new();
-            for statement in text.split(';') {
-                let statement = collapse(&statement.replace('}', " "));
-                if statement.is_empty() {
-                    continue;
-                }
-                entries.push(match classify(&statement) {
-                    Some(entry) => entry,
-                    // Not a shape this surface knows. Recorded verbatim and
-                    // attributed, so the comparison fails loudly rather than
-                    // silently ignoring something new.
-                    None => format!("unrecognized in {origin}: {statement}"),
-                });
-            }
-            entries
-        }
-
-        /// Classify one collapsed declaration.
-        fn classify(statement: &str) -> Option<String> {
-            if let Some(rest) = statement.strip_prefix("typedef ") {
-                return Some(typedef_entry(rest));
-            }
-            if statement.contains('(') {
-                return function_entry(statement);
-            }
-            None
-        }
-
-        /// `typedef struct TAG NAME` becomes `opaque NAME`; a typedef of an
-        /// integer type becomes `scalar NAME`; anything else is kept verbatim.
-        fn typedef_entry(rest: &str) -> String {
-            let tokens: Vec<&str> = rest.split_whitespace().collect();
-            let (Some(first), Some(last)) = (tokens.first(), tokens.last()) else {
-                return format!("typedef {rest}");
-            };
-            if *first == "struct" && tokens.len() == 3 {
-                // Normalization 5: the tag is dropped.
-                return format!("opaque {last}");
-            }
-            let integer = tokens
-                .get(..tokens.len().saturating_sub(1))
-                .unwrap_or_default()
-                .iter()
-                .all(|token| {
-                    matches!(
-                        *token,
-                        "char" | "short" | "int" | "long" | "signed" | "unsigned"
-                    )
-                });
-            if integer && tokens.len() >= 2 {
-                // Normalization 6: `typedef int CURLUcode` and
-                // `typedef enum { .. } CURLUcode` are the same scalar.
-                return format!("scalar {last}");
-            }
-            format!("typedef {rest}")
-        }
-
-        /// `fn RET NAME ( P1 , P2 , .. )` for one function declaration.
-        fn function_entry(statement: &str) -> Option<String> {
-            // Normalization 4: the linkage decoration, when the header
-            // carries it.
-            let statement = statement.strip_prefix("CURL_EXTERN ").unwrap_or(statement);
-            let open = statement.find('(')?;
-            let close = statement.rfind(')')?;
-            if close < open {
-                return None;
-            }
-            let head = statement.get(..open)?.trim();
-            let params = statement.get(open.saturating_add(1)..close)?;
-
-            // The declarator's last token is the name, with any `*` of the
-            // return type already split off by `tokenize`.
-            let head_tokens = tokenize(head);
-            let (name, return_type) = head_tokens.split_last()?;
-            if name.is_empty() || !is_identifier(name) {
-                return None;
-            }
-
-            let mut typed = Vec::new();
-            for param in params.split(',') {
-                typed.push(parameter_type(param));
-            }
-            Some(format!(
-                "fn {} {} ( {} )",
-                return_type.join(" "),
-                name,
-                typed.join(" , ")
-            ))
-        }
-
-        /// The type of one parameter, with its name removed if it has one.
-        ///
-        /// Normalization 7. A parameter of two or more tokens whose last token
-        /// is a plain identifier that is not a type keyword carries a name,
-        /// and the name is dropped. A single-token parameter is a bare type --
-        /// `void`, or the unnamed `CURLUcode` of `curl_url_strerror` -- and is
-        /// kept whole.
-        fn parameter_type(param: &str) -> String {
-            let tokens = tokenize(param);
-            let keep = match tokens.split_last() {
-                Some((last, head)) if !head.is_empty() && is_identifier(last) => head.to_vec(),
-                _ => tokens.clone(),
-            };
-            keep.join(" ")
-        }
-
-        /// Split on whitespace, then split every `*` into its own token, so
-        /// that `char **part`, `char ** part` and `char * *part` are one
-        /// spelling. That is normalization 2 applied to pointers.
-        fn tokenize(text: &str) -> Vec<String> {
-            let mut tokens = Vec::new();
-            for word in text.split_whitespace() {
-                let mut current = String::new();
-                for character in word.chars() {
-                    if character == '*' {
-                        if !current.is_empty() {
-                            tokens.push(current.clone());
-                            current.clear();
-                        }
-                        tokens.push("*".to_string());
-                    } else {
-                        current.push(character);
-                    }
-                }
-                if !current.is_empty() {
-                    tokens.push(current);
-                }
-            }
-            tokens
-        }
-
-        /// True for a C identifier that is not one of the type keywords these
-        /// two headers use. Used only to tell a parameter name from a bare
-        /// type, never to validate C.
-        fn is_identifier(token: &str) -> bool {
-            const KEYWORDS: [&str; 12] = [
-                "void", "char", "short", "int", "long", "signed", "unsigned", "float", "double",
-                "const", "struct", "enum",
-            ];
-            if KEYWORDS.contains(&token) {
-                return false;
-            }
-            let mut characters = token.chars();
-            match characters.next() {
-                Some(first) if first.is_ascii_alphabetic() || first == '_' => {
-                    characters.all(|c| c.is_ascii_alphanumeric() || c == '_')
-                }
-                _ => false,
-            }
-        }
-
-        /// Whitespace runs to single spaces, ends trimmed.
-        fn collapse(text: &str) -> String {
-            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        let outcome = Command::new(&compiler)
+            .args(["-std=c89", "-pedantic-errors", "-Wall", "-fsyntax-only"])
+            .arg(&probe)
+            .output();
+        match outcome {
+            Ok(output) if output.status.success() => super::note(&format!(
+                "{} compiles as strict C89 with {compiler} \
+                 -std=c89 -pedantic-errors -Wall",
+                header.display()
+            )),
+            Ok(output) => panic!(
+                "curl-urlapi-rs: the regenerated mirror {} is not valid \
+                 strict C89. curl holds its headers to C89 and the standalone \
+                 link mode includes this file from C, so this is a defect in \
+                 what build.rs emits, not in the check.\n{}",
+                header.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(error) => super::note(&format!(
+                "{compiler} could not be run ({error}), so the C89 check was \
+                 skipped"
+            )),
         }
     }
 
@@ -2335,5 +2840,492 @@ mod mirror_header {
     /// variable produces the one actionable message rather than an unwrap.
     fn out_dir() -> PathBuf {
         PathBuf::from(super::cargo_env("OUT_DIR"))
+    }
+
+    /// A C type as a base spelling plus a pointer depth.
+    ///
+    /// Splitting the two is what lets the emitter place the star against the
+    /// declarator the way the public header does -- `const CURLU *handle`,
+    /// `char **part` -- from a description that says nothing about spacing.
+    struct CType {
+        /// The type without any `*`, with single spaces between its words.
+        base: String,
+        /// How many `*` the type carries.
+        stars: usize,
+    }
+
+    impl CType {
+        /// Read a declaration fragment as a type and, when there is one, the
+        /// declarator name that followed it.
+        ///
+        /// The rule is C's own: after splitting `*` out as its own word, a
+        /// trailing word is a declarator name exactly when something else
+        /// precedes it. `void` alone is therefore a type and not a name, and
+        /// `CURLUcode` alone -- the unnamed parameter at
+        /// include/curl/urlapi.h:149 -- is read as a type too.
+        fn parse(text: &str) -> (Self, String) {
+            let spaced = text.replace('*', " * ");
+            let mut words: Vec<&str> = spaced.split_whitespace().collect();
+            let mut name = String::new();
+            if words.len() > 1 {
+                if let Some(last) = words.last() {
+                    if *last != "*" {
+                        name = (*last).to_owned();
+                        words.pop();
+                    }
+                }
+            }
+            let stars = words.iter().filter(|word| **word == "*").count();
+            let base = words
+                .iter()
+                .filter(|word| **word != "*")
+                .copied()
+                .collect::<Vec<&str>>()
+                .join(" ");
+            (Self { base, stars }, name)
+        }
+
+        /// The type followed by `name`, spaced the way the public header spaces
+        /// it: one space after the base, then the stars against the name.
+        ///
+        /// With an empty name this renders the bare type, which is what an
+        /// unnamed parameter needs.
+        fn declare(&self, name: &str) -> String {
+            let mut text = self.base.clone();
+            if self.stars > 0 || !name.is_empty() {
+                text.push(' ');
+            }
+            for _ in 0..self.stars {
+                text.push('*');
+            }
+            text.push_str(name);
+            text
+        }
+    }
+
+    /// One function declaration, as the inventory describes it.
+    struct CFunction {
+        name: String,
+        returns: CType,
+        parameters: Vec<CType>,
+    }
+
+    /// The ABI the crate declares, read out of cbindgen's output.
+    ///
+    /// Everything the emitter varies comes from here, and nothing here comes
+    /// from the committed header, which is what makes the byte comparison a
+    /// real check rather than a tautology.
+    struct Abi {
+        /// Every object-like macro with an integer value, in file order.
+        constants: Vec<(String, u32)>,
+        /// The names of `typedef struct TAG NAME;` declarations.
+        opaque: Vec<String>,
+        /// The names of `typedef <integer type> NAME;` declarations.
+        scalars: Vec<String>,
+        /// Every function declaration, in file order.
+        functions: Vec<CFunction>,
+    }
+
+    impl Abi {
+        /// Read the inventory.
+        ///
+        /// The parse is deliberately narrow: comments and preprocessor lines
+        /// are handled explicitly, and everything else is expected to be a
+        /// `;`-terminated declaration. Anything that fits none of the shapes
+        /// below fails the build rather than being skipped, because a silently
+        /// ignored declaration is exactly the failure mode this rewrite exists
+        /// to remove.
+        fn read(bytes: &[u8], path: &Path) -> Self {
+            let text = String::from_utf8_lossy(bytes);
+            let mut constants = Vec::new();
+            let mut declarations = String::new();
+
+            for line in text.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("#define ") {
+                    let mut parts = rest.splitn(2, char::is_whitespace);
+                    let name = parts.next().unwrap_or_default();
+                    let value = parts.next().unwrap_or_default().trim();
+                    // A macro with no value is CURL_EXTERN's fallback, which is
+                    // frame rather than ABI. One with a value that is not an
+                    // integer would be something this port does not declare.
+                    if value.is_empty() || name.is_empty() {
+                        continue;
+                    }
+                    if let Some(number) = integer(value) {
+                        constants.push((name.to_owned(), number));
+                    }
+                    continue;
+                }
+                if line.starts_with('#') || line.is_empty() {
+                    continue;
+                }
+                declarations.push(' ');
+                declarations.push_str(line);
+            }
+
+            // Comments only ever appear as whole `/* ... */` runs in cbindgen's
+            // output, and `//` cannot appear at all now that cpp_compat is off,
+            // so removing the block form is the whole of the job.
+            let declarations = strip_comments(&declarations);
+
+            let mut opaque = Vec::new();
+            let mut scalars = Vec::new();
+            let mut functions = Vec::new();
+            for statement in declarations.split(';') {
+                let statement = statement.trim();
+                if statement.is_empty() {
+                    continue;
+                }
+                if let Some(rest) = statement.strip_prefix("typedef ") {
+                    let words: Vec<&str> = rest.split_whitespace().collect();
+                    match words.as_slice() {
+                        ["struct", _tag, name] => opaque.push((*name).to_owned()),
+                        [.., name] => scalars.push((*name).to_owned()),
+                        [] => panic!(
+                            "curl-urlapi-rs: {} contains an empty typedef",
+                            path.display()
+                        ),
+                    }
+                    continue;
+                }
+                functions.push(function(statement, path));
+            }
+
+            Self {
+                constants,
+                opaque,
+                scalars,
+                functions,
+            }
+        }
+
+        /// How many typedefs the inventory holds, for the success note.
+        fn typedef_count(&self) -> usize {
+            self.opaque.len().saturating_add(self.scalars.len())
+        }
+
+        /// The constants whose names begin with `prefix`, in ascending value
+        /// order, with any name that also matches `unless` left out.
+        ///
+        /// The grouping is by name prefix because that is what the public
+        /// header groups by, and the order is by value because that is what
+        /// positional parity means: `CURLUE_*` and `CURLUPART_*` are
+        /// enumerators whose ordinals emerge from declaration order, so
+        /// declaration order has to be the value order.
+        fn group(&self, prefix: &str, unless: &[&str]) -> Vec<(String, u32)> {
+            let mut group: Vec<(String, u32)> = self
+                .constants
+                .iter()
+                .filter(|(name, _)| {
+                    name.starts_with(prefix) && !unless.iter().any(|other| name.starts_with(other))
+                })
+                .cloned()
+                .collect();
+            group.sort_by_key(|(_, value)| *value);
+            group
+        }
+
+        /// Render the whole mirror header.
+        fn emit(&self) -> String {
+            let codes = self.group("CURLUE_", &[]);
+            let parts = self.group("CURLUPART_", &[]);
+            let flags = self.group("CURLU_", &["CURLUE_", "CURLUPART_"]);
+
+            let mut out = String::from(PREAMBLE);
+            out.push_str(CODES_HEADING);
+            out.push('\n');
+            out.push_str(&self.enumeration(&codes, "CURLUcode", true));
+            out.push('\n');
+            out.push_str(&self.enumeration(&parts, "CURLUPart", false));
+            out.push('\n');
+            out.push_str(&macros(&flags));
+            out.push('\n');
+            let handle = match self.opaque.as_slice() {
+                [name] => name,
+                other => panic!(
+                    "curl-urlapi-rs: the ABI inventory declares {} opaque \
+                     typedefs and the mirror describes exactly one, the URL \
+                     handle. Found: {other:?}.",
+                    other.len()
+                ),
+            };
+            let _ = writeln!(out, "typedef struct {HANDLE_TAG} {handle};");
+            for (name, comment, names) in FUNCTION_FRAME {
+                out.push('\n');
+                out.push_str(comment);
+                out.push('\n');
+                out.push_str(&self.declaration(name, names));
+            }
+            out.push_str(EPILOGUE);
+            out
+        }
+
+        /// Render one `typedef enum { .. } NAME;` block.
+        ///
+        /// `numbered` selects the result-code form, where every enumerator
+        /// except the first and the sentinel carries its ordinal as an aligned
+        /// comment. The part-identifier form carries no ordinals and one text
+        /// annotation.
+        fn enumeration(&self, entries: &[(String, u32)], typename: &str, numbered: bool) -> String {
+            if !self.scalars.iter().any(|name| name == typename) {
+                panic!(
+                    "curl-urlapi-rs: the ABI inventory has no typedef named \
+                     {typename}, which the mirror declares as an enumeration. \
+                     Found: {:?}.",
+                    self.scalars
+                );
+            }
+
+            // Every line's declarator first, so the comment column can be the
+            // longest of them. The public header aligns enumerator comments two
+            // columns past the longest declarator; measured against
+            // include/curl/urlapi.h, that is column 30.
+            let last = entries.len().saturating_sub(1);
+            let declarators: Vec<String> = entries
+                .iter()
+                .enumerate()
+                .map(|(index, (name, _))| {
+                    if index == last {
+                        format!("  {name}")
+                    } else {
+                        format!("  {name},")
+                    }
+                })
+                .collect();
+            let commented = |index: usize| numbered && index != 0 && index != last;
+            let column = declarators
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| commented(*index))
+                .map(|(_, text)| text.len().saturating_add(2))
+                .max()
+                .unwrap_or(0);
+
+            let mut out = String::from("typedef enum {\n");
+            for (index, declarator) in declarators.iter().enumerate() {
+                out.push_str(declarator);
+                if commented(index) {
+                    for _ in declarator.len()..column {
+                        out.push(' ');
+                    }
+                    let value = entries.get(index).map_or(0, |(_, value)| *value);
+                    let _ = write!(out, "/* {value} */");
+                } else if let Some((_, note)) = PART_ANNOTATIONS
+                    .iter()
+                    .find(|(name, _)| entries.get(index).is_some_and(|(entry, _)| entry == name))
+                {
+                    let _ = write!(out, " /* {note} */");
+                }
+                out.push('\n');
+            }
+            let _ = writeln!(out, "}} {typename};");
+            out
+        }
+
+        /// Render one function declaration, wrapped the way the public header
+        /// wraps it.
+        fn declaration(&self, name: &str, parameter_names: &[&str]) -> String {
+            let Some(function) = self.functions.iter().find(|f| f.name == name) else {
+                panic!(
+                    "curl-urlapi-rs: the ABI inventory does not declare \
+                     {name}, which the mirror does. Either src/ffi.rs stopped \
+                     exporting it or cbindgen.toml excludes it."
+                );
+            };
+            if function.parameters.len() != parameter_names.len().max(usize::from(false)) {
+                // The `void` parameter list is one CType and no names, so the
+                // arity comparison is against the names plus that one case.
+                if !(parameter_names.is_empty() && function.parameters.len() == 1) {
+                    panic!(
+                        "curl-urlapi-rs: {name} takes {} parameters in the ABI \
+                         inventory and the mirror names {}. A change of arity \
+                         is an ABI break, not a formatting difference.",
+                        function.parameters.len(),
+                        parameter_names.len()
+                    );
+                }
+            }
+
+            let prefix = format!("CURL_EXTERN {}(", function.returns.declare(&function.name));
+            let mut pieces: Vec<String> = Vec::new();
+            for (index, parameter) in function.parameters.iter().enumerate() {
+                let mut piece =
+                    parameter.declare(parameter_names.get(index).copied().unwrap_or(""));
+                if index.saturating_add(1) == function.parameters.len() {
+                    piece.push_str(");");
+                } else {
+                    piece.push(',');
+                }
+                pieces.push(piece);
+            }
+
+            let mut out = String::new();
+            let mut line = prefix.clone();
+            for (index, piece) in pieces.iter().enumerate() {
+                let separated = if index == 0 { 0 } else { 1 };
+                if index > 0 && line.len().saturating_add(separated + piece.len()) > LINE_LIMIT {
+                    out.push_str(&line);
+                    out.push('\n');
+                    line = " ".repeat(prefix.len());
+                } else if index > 0 {
+                    line.push(' ');
+                }
+                line.push_str(piece);
+            }
+            out.push_str(&line);
+            out.push('\n');
+            out
+        }
+    }
+
+    /// Every function that is not one this mirror knows about is a defect, so
+    /// the reverse check runs too.
+    ///
+    /// Called from [`Abi::read`] for each `;`-terminated statement that is not
+    /// a typedef.
+    fn function(statement: &str, path: &Path) -> CFunction {
+        let statement = statement.trim().strip_prefix("CURL_EXTERN").map_or_else(
+            || {
+                panic!(
+                    "curl-urlapi-rs: {} declares `{statement}` without the \
+                     CURL_EXTERN decoration. Every public declaration carries \
+                     it; cbindgen.toml sets it as the [fn] prefix.",
+                    path.display()
+                )
+            },
+            str::trim,
+        );
+        let Some(open) = statement.find('(') else {
+            panic!(
+                "curl-urlapi-rs: {} contains the declaration `{statement}`, \
+                 which is not a function. The mirror describes six functions, \
+                 two enumerations and one opaque handle and nothing else.",
+                path.display()
+            )
+        };
+        let Some(close) = statement.rfind(')') else {
+            panic!(
+                "curl-urlapi-rs: {} contains an unterminated parameter list in \
+                 `{statement}`",
+                path.display()
+            )
+        };
+        let head = statement.get(..open).unwrap_or_default();
+        let inner = statement
+            .get(open.saturating_add(1)..close)
+            .unwrap_or_default();
+        let (returns, name) = CType::parse(head);
+        if name.is_empty() {
+            panic!(
+                "curl-urlapi-rs: {} declares a function with no name in \
+                 `{statement}`",
+                path.display()
+            );
+        }
+        let parameters = inner
+            .split(',')
+            .map(|parameter| CType::parse(parameter).0)
+            .collect();
+        CFunction {
+            name,
+            returns,
+            parameters,
+        }
+    }
+
+    /// Render the sixteen behaviour flags as aligned object-like macros.
+    ///
+    /// The public header aligns their comments one column past the longest
+    /// declaration and indents a continuation three columns further, so that
+    /// continuations line up with the comment text. Measured against
+    /// include/curl/urlapi.h: columns 42 and 45.
+    fn macros(entries: &[(String, u32)]) -> String {
+        let declarations: Vec<String> = entries
+            .iter()
+            .map(|(name, value)| {
+                let bit = value.trailing_zeros();
+                if value.checked_shr(bit) == Some(1) {
+                    format!("#define {name} (1 << {bit})")
+                } else {
+                    // Not a single bit, so not a flag. Rendered as itself so
+                    // that the byte comparison reports it rather than this
+                    // function guessing at an intent.
+                    format!("#define {name} {value}")
+                }
+            })
+            .collect();
+        let column = declarations
+            .iter()
+            .map(|text| text.len().saturating_add(1))
+            .max()
+            .unwrap_or(0);
+        let indent = column.saturating_add(3);
+
+        let mut out = String::new();
+        for (index, declaration) in declarations.iter().enumerate() {
+            out.push_str(declaration);
+            let name = entries.get(index).map(|(name, _)| name.as_str());
+            let segments = FLAG_COMMENTS
+                .iter()
+                .find(|(flag, _)| Some(*flag) == name)
+                .map(|(_, segments)| *segments)
+                .unwrap_or(&[]);
+            for _ in declaration.len()..column {
+                out.push(' ');
+            }
+            for (line, segment) in segments.iter().enumerate() {
+                if line == 0 {
+                    out.push_str("/* ");
+                } else {
+                    out.push('\n');
+                    for _ in 0..indent {
+                        out.push(' ');
+                    }
+                }
+                out.push_str(segment);
+            }
+            if !segments.is_empty() {
+                out.push_str(" */");
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Remove every `/* ... */` run from `text`.
+    ///
+    /// `//` is not handled and does not need to be: `cbindgen.toml` sets
+    /// `cpp_compat = false` and `documentation = false`, so the inventory
+    /// contains no line comments at all -- which is also why it is strict C89.
+    fn strip_comments(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(open) = rest.find("/*") {
+            out.push_str(rest.get(..open).unwrap_or_default());
+            out.push(' ');
+            let after = rest.get(open.saturating_add(2)..).unwrap_or_default();
+            match after.find("*/") {
+                Some(close) => rest = after.get(close.saturating_add(2)..).unwrap_or_default(),
+                None => return out,
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Read a C integer literal, including the `(1 << n)` form the flags use.
+    fn integer(value: &str) -> Option<u32> {
+        let value = value.trim();
+        let inner = value
+            .strip_prefix('(')
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or(value);
+        if let Some((left, right)) = inner.split_once("<<") {
+            let base = super::parse_c_integer(left.trim())?;
+            let shift = super::parse_c_integer(right.trim())?;
+            return base.checked_shl(shift);
+        }
+        super::parse_c_integer(inner)
     }
 }

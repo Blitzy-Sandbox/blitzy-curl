@@ -178,9 +178,11 @@
 // wrappers above it fold two of them together. Which of these a given build
 // reaches is therefore decided by the feature set.
 //
-// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
-// covers the whole feature matrix in one place, which is where the reason for
-// it belongs; see "DEAD-CODE POLICY" there.
+// No dead-code allowance appears in this module, and none is needed: every item
+// below is reached from this crate's own paths in every configuration it
+// builds. There is no crate-wide allowance either -- an item without a
+// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
+// `src/lib.rs` requires.
 
 // `unsafe` belongs to `src/ffi.rs` alone, and the lint matters more here than
 // in most modules: the default backend really does call into libidn2, and
@@ -922,6 +924,7 @@ mod tests {
     /// The outcome is reshaped into `Result<&[u8], &CURLUcode>` so that one
     /// `assert_eq!` compares both the code and the bytes, and so that a failure
     /// prints which of the two went wrong.
+    #[cfg(have_idn)]
     fn decodes_to(input: &str, expected: &str) {
         let outcome = host_decode(&cbuf(input.as_bytes()));
         let produced = outcome.as_ref().map(CBuf::as_bytes);
@@ -929,6 +932,7 @@ mod tests {
     }
 
     /// Assert that [`host_encode`] turns `input` into exactly `expected`.
+    #[cfg(have_idn)]
     fn encodes_to(input: &str, expected: &str) {
         let outcome = host_encode(&cbuf(input.as_bytes()));
         let produced = outcome.as_ref().map(CBuf::as_bytes);
@@ -943,6 +947,11 @@ mod tests {
     }
 
     /// Assert that [`host_encode`] reports exactly `expected` for `input`.
+    // Both callers are conditional and their conditions do not overlap: the
+    // libidn2 backend asserts a rejected name, and a build with no backend
+    // asserts `CURLUE_LACKS_IDN`. The pure backend rejects neither input, so it
+    // has nothing to assert through this helper.
+    #[cfg(any(idn_backend_libidn2, not(have_idn)))]
     fn encode_fails(input: &[u8], expected: CURLUcode) {
         let outcome = host_encode(&cbuf(input));
         let produced = outcome.as_ref().map(CBuf::as_bytes);

@@ -285,24 +285,42 @@
 //! parity claim. This crate is not `no_std`: it allocates C-visible memory
 //! through `libc` but is an ordinary `std` crate otherwise.
 
-// DEAD-CODE POLICY. This crate-level allowance is the only one; no module
-// carries a copy.
+// DEAD-CODE POLICY. There is no crate-level allowance, deliberately.
 //
-// Which items the crate reaches depends on its feature set and its target.
-// `src/scheme.rs` and `src/idn.rs` each compile one of several backends,
-// `src/error.rs` holds a message table that only the `strerror`-gated export
-// consults, `src/alloc.rs` and `src/dynbuf.rs` are deliberately complete
-// adapters so that no other module has a reason to reach past them, and
-// `src/inet.rs` is reached only from the bracketed-address stage. A crate held
-// to zero warnings cannot build clean across that matrix without an allowance,
-// and mirroring the feature matrix in `#[cfg]` attributes on each item would
-// make every one of those tables invisible to `cargo test` in some
-// configuration.
+// A blanket `#![allow(dead_code)]` here is tempting, because the feature matrix
+// does make some items unreachable in some configuration: a build with no IDN
+// backend never folds an IDN result code, and the drop-in build must not export
+// `curl_url_strerror`. It is still the wrong remedy. Measured with
+// `--force-warn dead_code`, a blanket allowance hides three dozen items across
+// this crate's configurations, and among them two helpers carried comments
+// claiming production callers they did not have -- which is to say that the one
+// diagnostic able to catch a false claim was switched off in order to silence
+// the items that were expected.
 //
-// One allowance here rather than one per module, because a per-module copy
-// says nothing the matrix above does not and drifts out of step with it. It
-// is scoped to this one lint.
-#![allow(dead_code)]
+// So every item answers for itself, one of four ways:
+//
+// * **Wired.** An item can be dead only because nothing evaluates it -- a
+//   compile-time proof held in a `const` that no code names. Such proofs are
+//   written as anonymous `const _: () = ..` items, which a current rustc counts
+//   as live, so the proof runs AND the item is not dead. The ABI parity block
+//   below is one; `src/ffi.rs` has the other, and that one is named and
+//   referenced from the allocation path, which is what roots a proof on the
+//   declared floor as well.
+// * **`#[cfg]`-gated narrowly.** An item reachable only on one target, under
+//   one feature, or from the tests carries that condition instead of being
+//   allowed everywhere.
+// * **Removed.** A convenience wrapper with no caller is deleted rather than
+//   excused.
+// * **Allowed at the item, with the reason at the item.** What is left is a
+//   deliberately complete compatibility surface: a table or an operation the
+//   ported C module's own callers use, kept whole so that the port describes
+//   the contract rather than the subset this crate happens to exercise. Each
+//   one carries `#[allow(dead_code)]` and a sentence naming the caller it does
+//   not have and the contract that keeps it.
+//
+// The point of the last case is that it is auditable: `grep` for the attribute
+// and every occurrence has a justification beside it, which is not true of one
+// blanket line at the crate root.
 // The panic denials the "Panic posture" section above explains. `deny` rather
 // than `forbid` so that a test module can relax one for its own assertions,
 // which is the only place in this crate that does; production code never
@@ -408,6 +426,15 @@ use ::core::ffi::{c_int, c_uint};
 /// Neither could actually trigger -- the longest run this is asked about is 33
 /// -- but the file that sets the denials is the last place that should need an
 /// exception to them.
+// Called only from the anonymous parity block below, which every rustc
+// evaluates but which rustc 1.75 -- the floor `Cargo.toml` declares -- does not
+// count as a *use* of what it calls. So the proof runs on the floor and the
+// three helpers are reported dead there; the allowance is a compatibility
+// allowance with that version, spelled the same way the block's own
+// `clippy::assertions_on_constants` allowance is, and not an excuse for a
+// disconnected helper. Removing it on a newer toolchain would reintroduce three
+// warnings on the declared floor, which the zero-warning requirement forbids.
+#[allow(dead_code)]
 const fn ascends_from(values: &[c_int], first: c_int) -> bool {
     match values {
         [] => true,
@@ -416,6 +443,9 @@ const fn ascends_from(values: &[c_int], first: c_int) -> bool {
 }
 
 /// The bitwise union of `flags`.
+// Called from the parity block below only, and allowed for the reason
+// `ascends_from` above states in full.
+#[allow(dead_code)]
 const fn or_all(flags: &[c_uint]) -> c_uint {
     match flags {
         [] => 0,
@@ -424,6 +454,9 @@ const fn or_all(flags: &[c_uint]) -> c_uint {
 }
 
 /// True when every entry of `flags` has exactly one bit set.
+// Called from the parity block below only, and allowed for the reason
+// `ascends_from` above states in full.
+#[allow(dead_code)]
 const fn all_single_bit(flags: &[c_uint]) -> bool {
     match flags {
         [] => true,
@@ -468,8 +501,17 @@ const fn all_single_bit(flags: &[c_uint]) -> bool {
 /// half of the ABI parity check that the crate documentation's "ABI parity is
 /// positional" section requires, and `rust-urlapi/tests/abi_constants.rs` is
 /// the run-time half rather than a substitute for it.
+// Anonymous rather than named: a current rustc treats an anonymous `const _`
+// item as live, so the block itself is never reported as dead code, while a
+// named item is -- and a named item's body does not count as a use of what it
+// calls either. On rustc 1.75, the floor `Cargo.toml` declares, even the
+// anonymous form does not root what it calls, which is why the three helpers
+// above carry an allowance naming that version. The evaluation happens on every
+// version regardless -- a `const` whose body fails an assertion fails the build
+// whatever its name -- so the spelling changes only the diagnostics, and it
+// changes them in the direction of telling the truth.
 #[allow(clippy::assertions_on_constants)]
-const _ABI_PARITY: () = {
+const _: () = {
     // The 33 `CURLUcode` values, `include/curl/urlapi.h` L34-L68. The header
     // carries the ordinal as a trailing comment for 1 through 31 but not for
     // the first or the last, so those two are the ones to check against the

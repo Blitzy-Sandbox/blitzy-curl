@@ -126,9 +126,11 @@
 // that are read sit *after* the three that are not and cannot be located
 // without them.
 //
-// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
-// covers the whole feature matrix in one place, which is where the reason for
-// it belongs; see "DEAD-CODE POLICY" there.
+// No dead-code allowance appears in this module, and none is needed: every item
+// below is reached from this crate's own paths in every configuration it
+// builds. There is no crate-wide allowance either -- an item without a
+// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
+// `src/lib.rs` requires.
 
 // `unsafe` belongs to `src/ffi.rs` alone, and the lint matters more here than
 // in most modules: in drop-in mode the lookup really does cross into libcurl,
@@ -249,7 +251,7 @@ impl SchemeInfo {
     /// Exactly six schemes carry it: `imap`, `imaps`, `pop3`, `pop3s`, `smtp`
     /// and `smtps`.
     pub(crate) const fn has_url_options(self) -> bool {
-        self.flags & PROTOPT_URLOPTIONS != 0
+        self.flags() & PROTOPT_URLOPTIONS != 0
     }
 }
 
@@ -843,11 +845,7 @@ mod backend {
         TABLE
             .iter()
             .find(|entry| eq_ignore_case(name, entry.name))
-            .map(|entry| SchemeInfo {
-                flags: entry.flags,
-                defport: entry.defport,
-                implemented: entry.implemented,
-            })
+            .map(|entry| SchemeInfo::new(entry.flags, entry.defport, entry.implemented))
     }
 
     #[cfg(test)]
@@ -1321,9 +1319,45 @@ mod backend {
 /// The crate declares it and libcurl defines it, so the archive must show the
 /// symbol as undefined rather than defined, or the drop-in link acquires a
 /// duplicate of a symbol `lib/url.c` already provides and the archive exports
-/// something the C object file does not. `nm -u` over the archive is what
-/// confirms that today; `scripts/check-abi.sh` is to automate it and is a
-/// later deliverable.
+/// something the C object file does not.
+///
+/// # Which artifact this backend is valid for, and how that is enforced
+///
+/// **This backend serves the archive and nothing else.** `Curl_get_scheme`
+/// and `Curl_getn_scheme` are declared at `lib/url.h` L76-L77 and are
+/// libcurl-private: libcurl's own visibility and export rules keep them out
+/// of a shared libcurl's dynamic symbol table, so nothing a runtime loader
+/// can reach ever provides them. An undefined reference to either is
+/// therefore resolvable in exactly one situation -- a *static* link in which
+/// `url.c.o` takes part, which is precisely the drop-in link this
+/// configuration exists for.
+///
+/// A shared object built from this configuration is consequently not a
+/// deliverable and never was. It would come out with both names undefined,
+/// no `libcurl` NEEDED entry and no way to acquire one, and it would fail at
+/// `dlopen` every time. The shared artifact belongs to the standalone
+/// configuration instead, where the built-in table above answers every lookup
+/// and the whole undefined set is libc, libgcc and libidn2.
+///
+/// That split is enforced rather than documented. `build.rs`
+/// `emit_shared_artifact_gate` passes `-Wl,-z,defs` to every **release**
+/// cdylib link on an ELF target, so a shipped shared object carrying an
+/// unresolved reference cannot be produced at all: the standalone one is
+/// proved closed on every release build, and the drop-in one fails loudly at
+/// link time instead of silently at load time. The consequence for a drop-in
+/// release build is that it must name the artifact it wants -- `cargo rustc
+/// --release --lib --crate-type staticlib` -- rather than asking
+/// `cargo build --release` for all three. The gate stops at the release
+/// profile deliberately: Cargo builds every crate type of a lib target
+/// whenever it builds that target, so gating the dev profile as well would
+/// stop `cargo test` from running in this configuration.
+///
+/// The archive's own surface is checked separately, by
+/// `build.rs` `localize_dropin_archive`: `nm -g --defined-only` must report
+/// exactly the eight globals `urlapi.c.o` defines, and `nm -u` must report
+/// both of these names as undefined, so that a build which accidentally
+/// compiled the built-in table into a drop-in artifact is rejected rather
+/// than shipped.
 #[cfg(not(feature = "scheme-table"))]
 use crate::ffi::scheme_import as backend;
 

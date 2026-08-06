@@ -232,9 +232,11 @@
 // different things: which primitives a given build reaches depends on the
 // selected feature set, so some of them are unreached in some configuration.
 //
-// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
-// covers the whole feature matrix in one place, which is where the reason for
-// it belongs; see "DEAD-CODE POLICY" there.
+// Dead-code diagnostics are answered at the items. Where an item below has no
+// production caller, it carries its own `#[allow(dead_code)]` with the reason
+// it is kept immediately above it, and there is no crate-wide allowance to
+// fall back on; see "DEAD-CODE POLICY" in `src/lib.rs` for the four outcomes
+// that policy permits.
 
 // `unsafe` belongs to `src/ffi.rs` alone; the lint keeps a future edit from
 // reintroducing one here without deleting this line first.
@@ -629,6 +631,12 @@ impl CBuf {
     /// # Ownership
     ///
     /// Nothing changes hands, exactly as for [`CBuf::len`].
+    // The only production caller is the IDN host path, which asks whether a
+    // conversion came back empty at `lib/idn.c` L317-L320; a build with no IDN
+    // backend compiles that away. Retained unconditionally, both because it is
+    // the companion predicate every `len` is expected to have and because
+    // gating an accessor on an unrelated feature would be misleading.
+    #[allow(dead_code)]
     #[must_use]
     pub(crate) const fn is_empty(&self) -> bool {
         self.len == 0
@@ -643,6 +651,10 @@ impl CBuf {
     /// length; a test that reads only the length cannot tell that apart from
     /// sizing the block to the answer, which is the divergence this crate is
     /// meant not to have.
+    // No production caller: the crate reads a block's length, never its
+    // capacity. Retained so that the tests below can assert the shape of an
+    // allocation and not merely its length, for the reason just given.
+    #[allow(dead_code)]
     pub(crate) const fn capacity(&self) -> usize {
         self.block.capacity()
     }
@@ -1019,6 +1031,11 @@ impl fmt::Write for FillSink<'_> {
 /// # Returns
 ///
 /// A null pointer if the allocation fails, matching `curlx_strdup`.
+// No production caller: the port passes owned `CBuf` values around and
+// only `src/ffi.rs` lowers one to a raw pointer at the boundary. Retained
+// as the `curlx_strdup` mirror that this module's ownership contract and
+// `docs/MEMORY-OWNERSHIP.md` both describe, and driven by the tests below.
+#[allow(dead_code)]
 #[must_use = "the caller owns this string; discarding it leaks memory"]
 pub(crate) fn c_strdup(bytes: &[u8]) -> *mut c_char {
     CBuf::from_slice(bytes).map_or(ptr::null_mut(), CBuf::into_raw)
@@ -1030,9 +1047,14 @@ pub(crate) fn c_strdup(bytes: &[u8]) -> *mut c_char {
 // pointer whose provenance no compiler can check, so they belong to the
 // crate's unsafe island; both build their result through `CBuf` here, so
 // there is still exactly one allocation code path per buffer shape. The
-// slice-taking `c_strdup` above is the form every call site in this crate
-// actually uses, because a Rust slice already carries the length C has to
-// recover with `strlen`.
+// slice-taking `c_strdup` above is the form a Rust caller wants, because a
+// slice already carries the length C has to recover with `strlen`.
+//
+// None of the three has a caller on the port's own paths, which hand owned
+// `CBuf` values around and lower one to a raw pointer only at the boundary in
+// `src/ffi.rs`. Each says so at itself, with the reason it is kept: the C
+// module reaches for all three, so a port that describes its allocation
+// contract has to offer all three.
 
 /// Concatenates byte slices into one NUL-terminated C string.
 ///
@@ -1048,6 +1070,10 @@ pub(crate) fn c_strdup(bytes: &[u8]) -> *mut c_char {
 ///
 /// A null pointer if the allocation fails or the total length would overflow
 /// `usize`, matching `curl_maprintf`.
+// No production caller, for the same reason as `c_strdup`: the port
+// concatenates into a `DynBuf`. Retained as the raw-pointer form of the
+// `curl_maprintf` joining the C does at `lib/urlapi.c` L1517.
+#[allow(dead_code)]
 #[must_use = "the caller owns this string; discarding it leaks memory"]
 pub(crate) fn c_concat(parts: &[&[u8]]) -> *mut c_char {
     CBuf::concat(parts).map_or(ptr::null_mut(), CBuf::into_raw)
@@ -1071,6 +1097,11 @@ pub(crate) fn c_concat(parts: &[&[u8]]) -> *mut c_char {
 ///
 /// A null pointer on any failure, matching `curl_maprintf`, which the C code
 /// checks for at `lib/urlapi.c:L382` and `L1677`.
+// No production caller: every formatting site in the port writes into a
+// `DynBuf` instead. Retained as the `curl_maprintf` mirror the C calls at
+// `lib/urlapi.c` L382 and L1677, whose null-on-failure contract the tests
+// below pin.
+#[allow(dead_code)]
 #[must_use = "the caller owns this string; discarding it leaks memory"]
 pub(crate) fn c_maprintf(args: fmt::Arguments<'_>) -> *mut c_char {
     CBuf::format(args).map_or(ptr::null_mut(), CBuf::into_raw)

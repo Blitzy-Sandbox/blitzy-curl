@@ -50,9 +50,10 @@ edition = "2021"
 # lockfile are worth knowing before touching it.
 #
 # First, idna 1.1.0 resolves idna_adapter 1.2.2, which is published as
-# edition 2024 and pulls the icu 2.x line, and eight of those packages
-# declare rust-version = "1.86". That is why idn-pure is opt-in and is the
-# one documented exception to the floor above -- AAP 0.5.1 records the
+# edition 2024 and pulls the icu 2.x line: the adapter itself and all seven
+# icu_* 2.2.0 packages declare rust-version = "1.86", eight packages in all.
+# That is why idn-pure is opt-in and is the one documented exception to the
+# floor above -- AAP 0.5.1 records the
 # resolution and 0.5.1.2 records the measurement -- and it is why the lock is
 # NOT re-pinned to an older IDNA line to make that configuration reach 1.75.
 #
@@ -68,16 +69,16 @@ edition = "2021"
 #   default                      libc 0.2.189                     -> 1.65
 #   --no-default-features
 #     --features idn-libidn2     libc 0.2.189                     -> 1.65
-#   --features genheader         + cbindgen 0.29.4 and its 32      -> 1.74
-#                                  build-closure packages, whose
-#                                  highest declared floor is
+#   --features genheader         + cbindgen 0.29.4 and the 29      -> 1.74
+#                                  packages in its build closure,
+#                                  whose highest declared floor is
 #                                  cbindgen's own
 #   --features idn-pure          + idna 1.1.0, idna_adapter 1.2.2  -> 1.86
 #                                  and the icu 2.2.0 line
 #
 # So the 1.75 declared above holds for the default, drop-in and genheader
-# configurations, and does NOT hold for idn-pure: idna_adapter 1.2.2 and the
-# five icu_* 2.2.0 packages each declare rust-version = "1.86". That is stated
+# configurations, and does NOT hold for idn-pure: idna_adapter 1.2.2 and all
+# seven icu_* 2.2.0 packages each declare rust-version = "1.86". That is stated
 # again at the idn-pure feature below and in docs/KNOWN-DIVERGENCES.md, and it
 # is one of the two reasons that backend is not the default. Nothing pins an
 # icu 1.5 series; the lock resolves icu 2.2.0.
@@ -144,39 +145,62 @@ publish = false
 name = "curl_urlapi_rs"
 # All three types earn their place.
 #
-# staticlib is what the deliverable is MADE FROM, and the distinction is
-# load-bearing rather than pedantic. The archive contains this crate's code
-# together with all upstream Rust dependencies, which means the whole of the
-# Rust standard library, the allocator and the unwinder, and every one of
-# those carries global symbols. Measured on the release build: 2413 distinct
-# defined globals, where lib/urlapi.c's object file defines 8. That is not a
-# defect -- it is what a staticlib is -- but it is not "exporting the complete
-# symbol set that lib/urlapi.o exports and no more" either, which is what the
-# Agent Action Plan requires at G1 and checks at A2.
+# staticlib is what the deliverable is MADE FROM -- it is an INPUT, not the
+# deliverable -- and the distinction is load-bearing rather than pedantic. The
+# archive contains this crate's code together with all upstream Rust
+# dependencies, which means the whole of the Rust standard library, the
+# allocator and the unwinder, and every one of those carries global symbols.
+# The count runs into the hundreds or thousands depending on whether Cargo
+# applied link-time optimisation, against 8 for lib/urlapi.c's object file. No
+# figure is quoted here on purpose: it moves with the toolchain and with the
+# crate types requested in the same command, so build.rs reports what it
+# actually measured at the moment it matters instead of leaving a literal here
+# to go stale. That surplus is not a defect -- it is what a staticlib is -- but
+# it is not "exporting the complete symbol set that lib/urlapi.o exports and no
+# more" either, which is what the Agent Action Plan requires at G1 and checks
+# at A2.
 #
-# The drop-in artifact is therefore produced FROM this archive by a
-# localization pass, the technique the plan holds in reserve at 0.3.2:
-# `ld -r --whole-archive` combines every member into one relocatable object,
-# `objcopy --keep-global-symbol` localizes every global except the ABI set,
-# and `ar rcs` re-archives it. The result defines exactly 8 globals in the
-# drop-in configuration and exactly 10 in the standalone one, where
-# curl_url_strerror and curl_free are real exports. build.rs implements it and
-# verifies the complete set with `nm -g --defined-only`, failing on anything
-# missing and on anything extra; see `localize_dropin_archive` there for the
-# commands and for why it is a second invocation -- Cargo has no post-build
-# hook, so a build script cannot post-process an archive that does not exist
-# until after it has run:
+# THE CANONICAL STATIC DELIVERABLE IS libcurl_urlapi_rs_dropin.a, produced FROM
+# the Cargo archive by a localization pass -- the technique the plan holds in
+# reserve at 0.3.2: `ld -r --whole-archive` combines every member into one
+# relocatable object, `objcopy --keep-global-symbol` localizes every global
+# except the ABI set, and `ar rcs` re-archives it. The result defines exactly 8
+# globals in the drop-in configuration and exactly 10 in the standalone one,
+# where curl_url_strerror and curl_free are real exports. That archive is what
+# a link line names, what the ABI comparison inspects and what a C consumer is
+# given; the raw Cargo archive is never presented as the drop-in.
 #
-#   cargo build --release --no-default-features --features idn-libidn2
+# build.rs implements the pass in `localize_dropin_archive`, and it validates
+# the RAW INPUT before touching it, which is the part that makes the two-step
+# shape safe. Both halves of the archive's identity are checked: the defined
+# globals must be exactly the gated public set the requested features imply --
+# so a default-feature archive, which defines curl_url_strerror and curl_free,
+# is refused by a drop-in invocation -- and the UNDEFINED set must name the
+# providers those features imply, so an archive built with scheme-table wrongly
+# on is refused too, because it carries no reference to Curl_get_scheme at all.
+# The archive must also be no older than every file it was built from. All four
+# refusals were exercised deliberately. A provenance record is written beside
+# the artifact naming the configuration, the measured raw global count and a
+# content tag for both archives.
+#
+# Two invocations are needed because Cargo has no post-build hook: a build
+# script runs BEFORE the crate is compiled, so it cannot post-process an
+# archive that does not exist until after it has run. GNUmakefile and
+# scripts/build-rust.sh are the single orchestrated driver over the pair; the
+# validation above is what makes bypassing the driver safe rather than silent.
+#
+#   cargo rustc --release --no-default-features --features idn-libidn2 \
+#     --lib --crate-type staticlib
 #   CURL_URLAPI_DROPIN_ARCHIVE=target/release/libcurl_urlapi_rs.a \
-#     cargo build --release --no-default-features --features idn-libidn2
+#     cargo rustc --release --no-default-features --features idn-libidn2 \
+#       --lib --crate-type staticlib
 #
 # Two consequences the link lines have to respect either way: exactly one Rust
 # staticlib may take part in a link, since several are likely to conflict, and
 # the archive's own dynamic dependencies have to be named by hand on the link
 # line because nothing else knows they are needed. Verified end to end --
 # libcurl's own test1560 binary, linked against a libcurl archive with
-# urlapi.c.o deleted plus the localized drop-in archive, resolves all its
+# urlapi.c.o deleted plus the canonical drop-in archive, resolves all its
 # undefined references and prints `success`.
 #
 # cdylib proves the crate is independently linkable. It exposes symbols the
@@ -184,6 +208,52 @@ name = "curl_urlapi_rs"
 # annotated `#[no_mangle] pub extern "C" fn` is. Since src/ffi.rs is the
 # only module carrying those attributes, nothing leaks by accident and the
 # export set stays auditable against the C object file.
+#
+# WHICH CONFIGURATION EACH ARTIFACT BELONGS TO
+#
+# crate-type is a property of this package, so all three types are offered in
+# every configuration. The scheme provider is a property of the FEATURE SET,
+# and the two do not compose: with `scheme-table` off, src/scheme.rs imports
+# libcurl's Curl_get_scheme and Curl_getn_scheme, which lib/url.h:76-77
+# declares and libcurl's visibility rules keep out of a shared libcurl's
+# dynamic symbol table. An undefined reference to either resolves in exactly
+# one situation -- a static link in which url.c.o takes part -- so:
+#
+#   * A SHARED OBJECT IS A DELIVERABLE ONLY IN THE STANDALONE CONFIGURATION.
+#     There the built-in table answers every lookup and the whole undefined
+#     set is libc, libgcc and libidn2, each a real NEEDED entry.
+#   * MODE A'S DELIVERABLE IS THE ARCHIVE, which is the only form a drop-in
+#     replacement for urlapi.c.o is ever consumed in: it is linked INTO
+#     libcurl, where Curl_get_scheme is a sibling object rather than a
+#     foreign import.
+#
+# That is enforced, not merely written down. build.rs
+# `emit_shared_artifact_gate` gives every RELEASE cdylib link on an ELF target
+# `-Wl,-z,defs`, so a shippable shared object with an unresolved strong
+# reference cannot be produced at all: the standalone one is proved closed on
+# every release build instead of on the occasions somebody runs `nm -D -u`,
+# and a drop-in cdylib fails loudly at link time rather than silently at
+# dlopen. The directive reaches the cdylib link and nothing else, so the
+# archive, the rlib, `cargo check` and `cargo clippy` are unaffected.
+#
+# The gate stops at the release profile on purpose. Cargo builds every crate
+# type of a lib target whenever it builds that target, and an integration test
+# under tests/ needs the lib target built, so gating the dev profile too would
+# stop `cargo test` from running in the drop-in configuration -- measured, not
+# supposed. Release is the profile that produces deliverables, is the profile
+# every documented build command names, and is the one [profile.release] below
+# exists to configure. A debug shared object, which nobody installs, is
+# recorded in the build log instead.
+#
+# The consequence for a drop-in RELEASE build is that it must ASK FOR THE
+# ARCHIVE BY NAME, because plain `cargo build` requests all three types at
+# once:
+#
+#   cargo rustc --release --no-default-features --features idn-libidn2 \
+#     --lib --crate-type staticlib
+#
+# `--crate-type` on `cargo rustc` has been stable since 1.64, well below the
+# 1.75 floor declared above.
 #
 # rlib is what makes `cargo test` possible at all: the integration tests
 # under tests/ link the crate as an ordinary Rust library.
@@ -227,6 +297,17 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # Mode A is --no-default-features --features idn-libidn2, and a Mode A
 # integrator should read src/scheme.rs:405-425 before assuming a clean link
 # means a correct one.
+#
+# One half of that silent failure IS now caught, and it is worth being precise
+# about which half. `localize_dropin_archive` in build.rs inspects the raw
+# archive before it localizes anything, and part of that inspection is the
+# UNDEFINED set: in the drop-in configuration Curl_get_scheme and
+# Curl_getn_scheme must appear there, because the whole point is that libcurl
+# supplies them. An archive built with scheme-table wrongly left on has no
+# such references, so the localization step refuses it instead of certifying
+# it. What remains uncaught is a Mode-B archive used on a Mode-A link line
+# without going through that step at all, which is why the guidance above
+# stands.
 [features]
 # Mode B, the standalone configuration: the crate supplies everything the
 # demo program and the lib1560 harness need when no libcurl takes part in
@@ -261,6 +342,14 @@ cfree = []
 # linked libcurl's, and every disagreement between the two is accepted
 # silently. Recorded in docs/KNOWN-DIVERGENCES.md under
 # "Integration limitation: the standalone table models one build".
+#
+# This feature also decides WHICH ARTIFACTS the configuration can produce,
+# for the reason set out under [lib] above: with it off the crate references
+# two libcurl-private symbols that only a static link can resolve, so the
+# configuration yields an archive and an rlib but no shippable shared object,
+# and the release-profile `-Wl,-z,defs` gate build.rs installs makes that a
+# link-time refusal rather than a broken .so. With it on the crate is
+# self-contained and all three artifacts are valid.
 scheme-table = []
 
 # The default IDN backend: bind libidn2 directly and replicate the call
@@ -281,32 +370,46 @@ idn-libidn2 = []
 #
 # Its cost, counted out of the committed Cargo.lock rather than estimated: it
 # takes the dependency closure from one package to thirty-one, adding idna
-# 1.1.0, idna_adapter 1.2.2, the five icu_* 2.2.0 packages with their two data
-# crates, and the zerovec/yoke/zerofrom supporting line. idna_adapter 1.2.2 and
-# every icu_* 2.2.0 package declares rust-version = "1.86", so selecting this
-# backend raises the effective minimum toolchain to 1.86 -- above this crate's
-# declared 1.75 and above curl's documented 1.73. That, and the loss of the
-# bit-for-bit claim, are the two reasons it is not the default. The divergences
-# are recorded in docs/KNOWN-DIVERGENCES.md.
+# 1.1.0, idna_adapter 1.2.2, the seven icu_* 2.2.0 packages -- two of them data
+# crates -- and the zerovec/yoke/zerofrom supporting line. idna_adapter 1.2.2
+# and every one of those seven declares rust-version = "1.86", so selecting
+# this backend raises the effective minimum toolchain to 1.86 -- above this
+# crate's declared 1.75 and above curl's documented 1.73. That, and the loss of
+# the bit-for-bit claim, are the two reasons it is not the default. The
+# divergences are recorded in docs/KNOWN-DIVERGENCES.md.
 idn-pure = ["dep:idna"]
 
 # Check include/curl_urlapi_rs.h against the ABI the crate actually declares,
 # so the committed mirror header cannot drift away from the code it describes
 # without somebody being told.
 #
-# What is compared is an ABI projection, not text: build.rs generates a mirror
-# with cbindgen's library API into OUT_DIR, reduces both that file and the
-# committed one to their constant name/value pairs, their function signatures
-# with parameter names dropped, and their typedef names, and reports any
-# difference between the two sets. The projection is blind to comments, layout,
-# declaration order, parameter names and the enum-versus-macro spelling, which
-# is what makes it an ABI check rather than a diff: the two files are never
-# byte-equal, and cbindgen.toml records the four shape differences that account
-# for it.
+# WHAT IS COMPARED IS THE WHOLE FILE, BYTE FOR BYTE. build.rs runs cbindgen's
+# library API into OUT_DIR to obtain an ABI INVENTORY -- constant names and
+# values, typedef names and kinds, function return types, arities and parameter
+# types -- and then EMITS the mirror header from that inventory in the public
+# header's own shape: two typedef enum blocks rendered from the constants, the
+# sixteen flag macros with their comments aligned to the column urlapi.h uses,
+# the Curl_URL struct tag restored, the six declarations wrapped at 79 columns
+# with urlapi.h's own parameter names. The emitted bytes are then compared with
+# include/curl_urlapi_rs.h and ANY difference fails the build, reporting the
+# first differing line on both sides.
+#
+# An earlier version compared a normalized ABI projection instead and was
+# deliberately blind to declaration shape -- enum versus macro, the struct tag,
+# parameter names, ordering, alignment -- which is a liability in a file whose
+# whole purpose is to be a one-for-one mirror. It also left the generated
+# intermediate non-C89, because cbindgen's cpp_compat wrapper writes
+# `#endif // __cplusplus`. Both are closed: cbindgen.toml sets
+# cpp_compat = false and build.rs writes the wrapper itself, and the emitted
+# mirror is additionally compiled with `-std=c89 -pedantic-errors` whenever a C
+# compiler can be found.
 #
 # Off by default, because the header is committed and an ordinary build must not
-# depend on a code generator. The committed header is never rewritten; build.rs
-# explains why at length.
+# depend on a code generator. Regeneration only ever COMPARES; it writes the
+# committed file only when CURL_URLAPI_WRITE_MIRROR_HEADER=1 asks it to, which
+# is a no-op on an unchanged crate and therefore idempotent -- two runs in a
+# row leave `git status --porcelain` clean for that path. build.rs explains the
+# whole arrangement, including why the fixed prose is carried in both places.
 genheader = ["dep:cbindgen"]
 
 # The six features above are the complete set, and the count is part of the

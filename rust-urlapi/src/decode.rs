@@ -229,17 +229,23 @@
 //! by the crate's integration test `rust-urlapi/tests/encode_decode.rs`, which
 //! is a later deliverable and does not exist yet.
 
-// Both entry points below have callers. `urldecode_bytes` serves the two call
-// sites that pass an explicit length, in `src/getset.rs` and in the host check
-// of the assignment dispatch, and `urldecode` serves `urldecode_host` in
-// `src/parse/host.rs`, which passes zero. `UrlReject::Nada` and
-// `UrlReject::Zero` have no caller in the ported module at all, for the reason
-// the module documentation gives, and are kept so that the enumeration mirrors
-// the C parameter it stands for.
+// `urldecode` serves every production call site, and all three pass the length
+// explicitly or pass zero exactly as the C does: `src/getset.rs` calls it on
+// the retrieval path in `urlget_format` and again on the assignment path in
+// `url_set`, both with a known length, and `src/parse/host.rs` calls it from
+// `urldecode_host` with zero, which is `lib/urlapi.c` L590 verbatim.
 //
-// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
-// covers the whole feature matrix in one place, which is where the reason for
-// it belongs; see "DEAD-CODE POLICY" there.
+// `urldecode_bytes`, the overload that measures the slice for the caller, has
+// no production caller, and `UrlReject::Nada` and `UrlReject::Zero` are never
+// constructed here, for the reason the module documentation gives. All three
+// are kept so that the two entry points and the enumeration mirror the C they
+// stand for, and each records that at itself.
+//
+// Dead-code diagnostics are answered at the items. Where an item below has no
+// production caller, it carries its own `#[allow(dead_code)]` with the reason
+// it is kept immediately above it, and there is no crate-wide allowance to
+// fall back on; see "DEAD-CODE POLICY" in `src/lib.rs` for the four outcomes
+// that policy permits.
 
 // Every `unsafe` block in this crate lives in `src/ffi.rs`, and this module
 // needs nothing from C directly: the allocator it uses reaches the foreign
@@ -294,6 +300,10 @@ pub(crate) enum UrlReject {
     ///
     /// No caller inside the ported module. `curl_easy_unescape` at
     /// `lib/escape.c` L170-L171 is the only user in the C tree.
+    // Never constructed here: `lib/urlapi.c` asks for `REJECT_CTRL` at all
+    // three of its call sites. Retained because `enum urlreject` is reproduced
+    // whole, so that the discriminants keep the C's values.
+    #[allow(dead_code)]
     Nada = 2,
     /// `REJECT_CTRL`, `lib/escape.h` L31. Reject a decoded byte below
     /// `0x20`, and nothing else.
@@ -306,6 +316,9 @@ pub(crate) enum UrlReject {
     ///
     /// Narrower than [`UrlReject::Ctrl`], which already covers zero. No
     /// caller in `lib/urlapi.c`.
+    // Never constructed here, as the paragraph above records. Retained with
+    // `UrlReject::Nada` so that the C enum is complete.
+    #[allow(dead_code)]
     Zero = 4,
 }
 
@@ -586,6 +599,11 @@ pub(crate) fn urldecode(input: &[u8], length: usize, reject: UrlReject) -> Resul
 /// # Errors
 ///
 /// As [`urldecode`].
+// No production caller: every decode site in the port holds a window whose
+// length it already knows and passes it explicitly. Retained as the
+// "measure it yourself" overload `Curl_urldecode` offers at
+// `lib/escape.c` L115, and exercised by the tests below.
+#[allow(dead_code)]
 #[must_use = "the decoded buffer is owned; dropping it releases the memory"]
 pub(crate) fn urldecode_bytes(input: &[u8], reject: UrlReject) -> Result<CBuf, CURLcode> {
     urldecode(input, input.len(), reject)

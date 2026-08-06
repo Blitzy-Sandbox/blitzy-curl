@@ -158,9 +158,11 @@
 // same position in the pipeline. It is compiled unconditionally, so nothing
 // here is unreached.
 //
-// No dead-code allowance is stated here. The crate-level one in `src/lib.rs`
-// covers the whole feature matrix in one place, which is where the reason for
-// it belongs; see "DEAD-CODE POLICY" there.
+// No dead-code allowance appears in this module, and none is needed: every item
+// below is reached from this crate's own paths in every configuration it
+// builds. There is no crate-wide allowance either -- an item without a
+// production caller carries its own, with its reason, as "DEAD-CODE POLICY" in
+// `src/lib.rs` requires.
 
 // The plan puts every `unsafe` block in `src/ffi.rs` and the technical
 // specification forbids `unsafe` outside FFI code. `forbid` rather than
