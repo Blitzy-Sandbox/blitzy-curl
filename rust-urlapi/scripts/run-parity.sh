@@ -2249,6 +2249,58 @@ acceptance criterion A5 -- the single line success, which \
 tests/data/test1560:L37 asserts -- is not measured here"
 fi
 
+# Acceptance criterion A9 is stated over the pair of locale configurations
+# rather than over one environment: behavior has to match under LC_ALL=C.UTF-8
+# AND under LC_ALL=C, the second of which is where the reference's own
+# locale-dependent failure mode lives. Both have to have run for the criterion
+# to be measured at all, so that is checked rather than assumed.
+LOCALES_COVERED=''
+for env_label in "${SELECTED_ENVS[@]}"; do
+  LOCALES_COVERED="${LOCALES_COVERED}$(env_locale "${env_label}") "
+done
+
+case "${LOCALES_COVERED}" in
+  *C.UTF-8*)
+    case "${LOCALES_COVERED}" in
+      *' C '*)
+        for participant in "${PARTICIPANT_LABELS[@]}"; do
+          if [ "${participant}" = "reference" ]; then
+            continue
+          fi
+          mismatches=0
+          for env_label in "${SELECTED_ENVS[@]}"; do
+            reference_key="reference/${env_label}"
+            run_key="${participant}/${env_label}"
+            if [ "${RUN_STATUS["${run_key}"]}" != \
+                 "${RUN_STATUS["${reference_key}"]}" ] ||
+               ! cmp -s "${RUN_STDOUT["${run_key}"]}" \
+                 "${RUN_STDOUT["${reference_key}"]}"; then
+              mismatches=$((mismatches + 1))
+            fi
+          done
+          if [ "${mismatches}" = "0" ]; then
+            pass "${participant}: matches the reference under LC_ALL=C.UTF-8 \
+and under LC_ALL=C, the reference's own non-UTF-8 failure mode included (A9)"
+          else
+            fail "${participant}: diverges from the reference in \
+${mismatches} of the ${#SELECTED_ENVS[@]} environments run, so behavior does \
+not match across both locale configurations (A9)"
+          fi
+        done
+        ;;
+      *)
+        warn "only the C.UTF-8 locale was exercised, so acceptance criterion \
+A9 -- matching behavior under both locale configurations, including the \
+reference's non-UTF-8 failure mode -- is not measured here"
+        ;;
+    esac
+    ;;
+  *)
+    warn "the C.UTF-8 locale was not exercised, so acceptance criterion A9 \
+is not measured here"
+    ;;
+esac
+
 section "That the internationalized-domain assertions really ran"
 
 # Acceptance criterion A8, second half. The first half proved the rows are
@@ -2448,6 +2500,10 @@ section "Per-sub-test report"
 # the numeric order of the codes -- because that is the order in which one
 # failure blocks the rest.
 say ""
+say "  Acceptance criterion A6: each of the eleven sub-tests gets its own"
+say "  verdict below, in the order tests/libtest/lib1560.c runs them, rather"
+say "  than the run being summarized by the first exit code it produced."
+say ""
 say "  Legend: pass    the sub-test ran and reported no error"
 say "          fail    the sub-test ran and reported an error"
 say "          blocked did not run: an earlier sub-test failed first"
@@ -2563,6 +2619,15 @@ say "      crate's C-allocator buffers with its own deallocator. Reported,"
 say "      not worked around; see docs/MEMORY-OWNERSHIP.md."
 say ""
 say "  Honest limits of this validation, beyond the four above:"
+say "    - acceptance criterion A10, that the six faithfully reproduced"
+say "      oddities of the C implementation are preserved rather than"
+say "      fixed, is not measured here. Every one of them is enforced by"
+say "      the crate's own tests, tests/ffi_surface.rs among them, and"
+say "      catalogued in docs/KNOWN-DIVERGENCES.md. What this run does"
+say "      contribute to it is the locale-dependent divergence above:"
+say "      under LC_ALL=C the port reproduces the reference's own"
+say "      CURLUE_BAD_HOSTNAME failure rather than succeeding where the C"
+say "      implementation cannot."
 say "    - tests/unit/unit1653.c is not run, per R2."
 say "    - Windows-specific paths in the port are compiled conditionally"
 say "      and are not exercised here; the rows that would cover them are"
