@@ -1,0 +1,248 @@
+curl URL API parity demonstration
+Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+SPDX-License-Identifier: curl
+--- 1. full parse and all eleven parts ---
+set url: rc=0 (No error)
+url: [https://user:secret@example.com:8080/a/c?x=1&y=2#frag]
+scheme: [https]
+user: [user]
+password: [secret]
+options: rc=13 (No options part in the URL)
+host: [example.com]
+port: [8080]
+path: [/a/c]
+query: [x=1&y=2]
+fragment: [frag]
+zoneid: rc=18 (No zoneid part in the URL)
+set imap url: rc=0 (No error)
+imap user: [user]
+imap options: [auth=NTLM]
+imap url: [imap://user;auth=NTLM@example.com/INBOX]
+--- 2. path default and relative resolution ---
+set url: rc=0 (No error)
+path of a URL with none: [/]
+url: [https://example.com/]
+protocol-relative: [http://other.example.com/x]
+root-relative: [http://example.com/rooted]
+fragment-only: [http://example.com/path/index.html?q=1#newfrag]
+default case: [http://example.com/another/second.html]
+query-only: [http://example.com/path/index.html?new]
+--- 3. default port and no default port ---
+set url: rc=0 (No error)
+port: rc=15 (No port part in the URL)
+port default_port: [443]
+url default_port: [https://example.com:443/]
+set url: rc=0 (No error)
+port: [443]
+port no_default_port: rc=15 (No port part in the URL)
+url no_default_port: [https://example.com/]
+set http url: rc=0 (No error)
+http port default_port: [80]
+set http url: rc=0 (No error)
+http port no_default_port: rc=15 (No port part in the URL)
+http url no_default_port: [http://example.com/]
+set http url: rc=0 (No error)
+http port 8080 no_default_port: [8080]
+--- 4. encode on set, decode on get ---
+set url: rc=0 (No error)
+set query urlencode: rc=0 (No error)
+query raw: [name%3Dhello+world%26x%3D1]
+query urldecode: [name=hello world&x=1]
+set path urlencode: rc=0 (No error)
+path raw: [/a%20b+c%2520d%3Fe]
+path urldecode: [/a b+c%20d?e]
+set query non-ascii urlencode: rc=0 (No error)
+query non-ascii raw: [na%C3%AFve%3D1]
+url urlencode: [https://example.com/a%20b+c%2520d%3Fe?na%C3%AFve%3D1]
+set url: rc=0 (No error)
+set path plain: rc=0 (No error)
+path escapes lowercased: [/%c3%af/%2f]
+set path ascii escapes: rc=0 (No error)
+path raw: [/%2fa%20b]
+path urldecode: [//a b]
+--- 5. append query ---
+set url: rc=0 (No error)
+append b: rc=0 (No error)
+query: [a=1&b=2]
+append c encoded: rc=0 (No error)
+query: [a=1&b=2&c=hello+world]
+url: [https://example.com/?a=1&b=2&c=hello+world]
+set url: rc=0 (No error)
+query before: [a=1&]
+append b: rc=0 (No error)
+query after: [a=1&b=2]
+set url: rc=0 (No error)
+query before get_empty: []
+append b: rc=0 (No error)
+query after: [b=2]
+--- 6. get empty ---
+set url: rc=0 (No error)
+query: rc=16 (No query part in the URL)
+fragment: rc=17 (No fragment part in the URL)
+query get_empty: []
+fragment get_empty: []
+url: [https://example.com/]
+url get_empty: [https://example.com/?#]
+--- 7. scheme guessing ---
+set scheme-less plain: rc=27 (Bad scheme)
+url: rc=14 (No host part in the URL)
+set guess_scheme: rc=0 (No error)
+scheme: [http]
+scheme no_guess_scheme: rc=10 (No scheme part in the URL)
+url: [http://example.com/]
+url no_guess_scheme: [example.com/]
+set ftp-prefixed: rc=0 (No error)
+url: [ftp://ftp.example.com/]
+set imap-prefixed: rc=0 (No error)
+url: [imap://imap.example.com/]
+set dict-prefixed: rc=0 (No error)
+url: [dict://dict.example.com/]
+set unprefixed: rc=0 (No error)
+url: [http://www.example.com/]
+set default_scheme: rc=0 (No error)
+url: [https://ftp.example.com/]
+set both flags: rc=0 (No error)
+url: [https://ftp.example.com/]
+--- 8. duplication and FB1 ---
+set guess_scheme: rc=0 (No error)
+original scheme no_guess_scheme: rc=10 (No scheme part in the URL)
+copy scheme no_guess_scheme: [http]
+original url no_guess_scheme: [example.com/]
+copy url no_guess_scheme: [http://example.com/]
+note: the two lines above differ because curl_url_dup at lib/urlapi.c:L1310-L1332 copies the ten strings, portnum, fragment_present and query_present but not guessed_scheme
+note: reproduced deliberately as finding FB1; see ../docs/KNOWN-DIVERGENCES.md
+set url: rc=0 (No error)
+original url: [https://user@example.com:8080/p?q=1#f]
+copy url: [https://user@example.com:8080/p?q=1#f]
+copy user: [user]
+copy port: [8080]
+copy set host: rc=0 (No error)
+copy url after set: [https://user@other.example.com:8080/p?q=1#f]
+original url after copy set: [https://user@example.com:8080/p?q=1#f]
+--- 9. punycode flag on an ascii host ---
+set ace url: rc=0 (No error)
+host: [xn--rksmrgs-5wao1o.se]
+host punycode: [xn--rksmrgs-5wao1o.se]
+url punycode: [https://xn--rksmrgs-5wao1o.se/path]
+note: CURLU_PUNY2IDN and non-ascii hosts are exercised by the lib1560 oracle instead, because their result depends on the process codeset
+--- 10. ipv6, zone id and ipv4 normalisation ---
+set ipv6 url: rc=0 (No error)
+host: [[fe80::1]]
+port: [8080]
+url: [https://[fe80::1]:8080/p]
+zoneid: rc=18 (No zoneid part in the URL)
+set zoned url: rc=0 (No error)
+host: [[fe80::1]]
+zoneid: [eth0]
+url: [https://[fe80::1%25eth0]/p]
+set ipv4 url: rc=0 (No error)
+host: [0.0.0.0]
+url: [https://0.0.0.0/]
+set ipv4 hex url: rc=0 (No error)
+host: [127.0.0.1]
+set out-of-range ipv4: rc=0 (No error)
+host: [256.256.256.256]
+--- 11. error paths and null preconditions ---
+get with null handle: rc=1 (An invalid CURLU pointer was passed as argument)
+set with null handle: rc=1 (An invalid CURLU pointer was passed as argument)
+set url: rc=0 (No error)
+get with null part pointer: rc=2 (An invalid 'part' argument was passed as argument)
+clear query: rc=0 (No error)
+query after clear: rc=16 (No query part in the URL)
+clear fragment: rc=0 (No error)
+fragment after clear: rc=17 (No fragment part in the URL)
+url after clears: [https://example.com/p]
+set bad port: rc=4 (Port number was not a decimal number between 0 and 65535)
+set bad port part: rc=4 (Port number was not a decimal number between 0 and 65535)
+set non-numeric port: rc=4 (Port number was not a decimal number between 0 and 65535)
+set padded port: rc=0 (No error)
+port: [80]
+set unknown scheme: rc=5 (Unsupported URL scheme)
+set unknown scheme allowed: rc=0 (No error)
+url: [custom://example.com/]
+set bad scheme syntax: rc=27 (Bad scheme)
+set url disallow_user: rc=8 (Credentials was passed in the URL when prohibited)
+set url with space: rc=3 (Malformed input to a URL function)
+set url with space allowed: rc=0 (No error)
+path with space: [/a b ]
+set empty host: rc=21 (Bad hostname)
+set bad hostname: rc=21 (Bad hostname)
+cleanup of a null handle: [survived]
+--- 11b. every curl_url_strerror message ---
+strerror 0: [No error]
+strerror 1: [An invalid CURLU pointer was passed as argument]
+strerror 2: [An invalid 'part' argument was passed as argument]
+strerror 3: [Malformed input to a URL function]
+strerror 4: [Port number was not a decimal number between 0 and 65535]
+strerror 5: [Unsupported URL scheme]
+strerror 6: [URL decode error, most likely because of rubbish in the input]
+strerror 7: [A memory function failed]
+strerror 8: [Credentials was passed in the URL when prohibited]
+strerror 9: [An unknown part ID was passed to a URL API function]
+strerror 10: [No scheme part in the URL]
+strerror 11: [No user part in the URL]
+strerror 12: [No password part in the URL]
+strerror 13: [No options part in the URL]
+strerror 14: [No host part in the URL]
+strerror 15: [No port part in the URL]
+strerror 16: [No query part in the URL]
+strerror 17: [No fragment part in the URL]
+strerror 18: [No zoneid part in the URL]
+strerror 19: [Bad file:// URL]
+strerror 20: [Bad fragment]
+strerror 21: [Bad hostname]
+strerror 22: [Bad IPv6 address]
+strerror 23: [Bad login part]
+strerror 24: [Bad password]
+strerror 25: [Bad path]
+strerror 26: [Bad query]
+strerror 27: [Bad scheme]
+strerror 28: [Unsupported number of slashes following scheme]
+strerror 29: [Bad user]
+strerror 30: [libcurl lacks IDN support]
+strerror 31: [A value or data field is larger than allowed]
+strerror 32: [CURLUcode unknown]
+set url: rc=0 (No error)
+get with out-of-range part: rc=9 (An unknown part ID was passed to a URL API function)
+set with out-of-range part: rc=9 (An unknown part ID was passed to a URL API function)
+--- 12. the empty url rule ---
+set url: rc=0 (No error)
+set empty url: rc=0 (No error)
+url unchanged: [https://example.com/p?a=1#f]
+set guess_scheme: rc=0 (No error)
+url no_guess_scheme: [example.com/]
+set empty url: rc=0 (No error)
+set empty url no_guess_scheme: rc=0 (No error)
+url unchanged: [http://example.com/]
+note: CURLU_NO_GUESS_SCHEME is a formatting choice on the read the empty write performs, not an error, so both empty writes above succeed and neither changes the handle
+set host only: rc=0 (No error)
+url: rc=10 (No scheme part in the URL)
+url default_scheme: [https://example.com/]
+set empty url: rc=3 (Malformed input to a URL function)
+set empty url default_scheme: rc=0 (No error)
+note: the caller's flags are passed into that internal read unfiltered, which is what makes one empty value answer two ways
+set empty url on empty handle: rc=3 (Malformed input to a URL function)
+--- 13. path as is ---
+set url: rc=0 (No error)
+path: [/a/c/]
+url: [https://example.com/a/c/]
+set url path_as_is: rc=0 (No error)
+path: [/a/b/../c/./d/..]
+url: [https://example.com/a/b/../c/./d/..]
+set url: rc=0 (No error)
+path: [/b]
+--- 14. file scheme and no authority ---
+set file url: rc=0 (No error)
+scheme: [file]
+host: rc=14 (No host part in the URL)
+path: [/tmp/example.txt]
+port default_port: [0]
+url: [file:///tmp/example.txt]
+set file url with host: rc=0 (No error)
+host: rc=14 (No host part in the URL)
+url: [file:///tmp/example.txt]
+set empty authority: rc=14 (No host part in the URL)
+set empty authority allowed: rc=0 (No error)
+url: [custom:///]
+host: []
+path: [/]
