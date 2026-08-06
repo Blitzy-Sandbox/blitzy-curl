@@ -850,6 +850,80 @@ fi
 say "  reference facts: ${REFERENCE_FACTS}"
 say "  crate facts:     ${RUST_FACTS}"
 
+# Both summaries have to say the run that wrote them PASSED, and the reference
+# one has to say its oracle passed as well.
+#
+# THE REASON, stated plainly, because it is easy to read this as belt and
+# braces. Everything below is a comparison against the C baseline: the stdout
+# diff, the per-sub-test table and acceptance criteria A5 through A9 all ask
+# "does the port do what the reference did". If the reference itself did not
+# pass lib1560 then the port can reproduce it byte for byte and the pair still
+# says nothing about whether the port is correct -- and a scratch tree is
+# deliberately reusable, so a summary from a run that failed, or from one that
+# died half-way through, is exactly the file that is sitting here waiting to be
+# read. scripts/build-reference.sh and scripts/build-rust.sh each publish
+# result=pass by atomic rename and only after every check of their own has
+# passed, so this gate is one comparison rather than a re-derivation.
+#
+# ORACLE_VERDICT and GOLDEN_STATUS_UTF8_CODESET are the reference's own record
+# of the environment tests/data/test1560 specifies: exit 0 and stdout that is
+# exactly the single line "success". They are checked when present, so that a
+# summary written before those records existed still reads, and the absence is
+# reported rather than passed over.
+require_summary_pass() {
+  local file="${1}"
+  local owner="${2}"
+  local verdict
+
+  verdict="$(read_fact "${file}" 'result')"
+  case "${verdict}" in
+    pass)
+      pass "${owner} recorded result=pass, so its artifacts may be compared"
+      ;;
+    '')
+      fatal "${file} records no result. It was written by a version of \
+${owner} that published no verdict, which means nothing here can tell a \
+finished run from an abandoned one. Re-run ${owner}"
+      ;;
+    *)
+      fatal "${file} records result=${verdict}, so ${owner} did not finish \
+cleanly and its artifacts are not a baseline anything can be compared \
+against. Read its output, fix what it reports, and re-run it"
+      ;;
+  esac
+}
+
+require_summary_pass "${REFERENCE_FACTS}" 'scripts/build-reference.sh'
+require_summary_pass "${RUST_FACTS}" 'scripts/build-rust.sh'
+
+ORACLE_VERDICT="$(read_fact "${REFERENCE_FACTS}" 'ORACLE_VERDICT')"
+GATED_STATUS="$(read_fact "${REFERENCE_FACTS}" 'GOLDEN_STATUS_UTF8_CODESET')"
+case "${ORACLE_VERDICT}" in
+  pass)
+    pass "the reference passes lib1560 in the environment \
+tests/data/test1560 specifies, so it is a usable oracle"
+    ;;
+  '')
+    warn "${REFERENCE_FACTS} records no ORACLE_VERDICT, so whether the C \
+baseline itself passes lib1560 is not stated there. The reference is still \
+compared against its own golden captures below, but re-running \
+scripts/build-reference.sh is what settles it"
+    ;;
+  *)
+    fatal "${REFERENCE_FACTS} records ORACLE_VERDICT=${ORACLE_VERDICT}: the C \
+baseline does not itself pass lib1560 in the environment \
+tests/data/test1560 specifies, so no parity result drawn from it would mean \
+anything, whichever way a diff came out. Fix the baseline first"
+    ;;
+esac
+if [ -n "${GATED_STATUS}" ] && [ "${GATED_STATUS}" != "0" ]; then
+  fatal "${REFERENCE_FACTS} records GOLDEN_STATUS_UTF8_CODESET=\
+${GATED_STATUS}, so the reference harness exited non-zero in the environment \
+tests/data/test1560 specifies. That is the number of the sub-test that \
+failed, and it makes this baseline unusable"
+fi
+fact 'reference-oracle-verdict' "${ORACLE_VERDICT:-unrecorded}"
+
 # Files, never re-derived. Each may be overridden from the environment, and
 # each override is used as given so that a typo in one is reported as a
 # missing file the caller named rather than being quietly replaced.
@@ -2438,10 +2512,12 @@ section "Allocation count"
 # Reported limitation R3 in practice. The ceiling of "Allocations: 3000" at
 # tests/data/test1560:L39-L40 is measured by curl's own memory-debug
 # accounting, and this harness is deliberately built without it: curl_free
-# resolves at compile time and under memory debugging becomes a tracking free
-# that validates pointers against its own table, which would reject the
-# C-allocator buffers the crate hands back. So that ceiling is honored in
-# spirit here and not measured by the mechanism that wrote it.
+# resolves at compile time and under memory debugging becomes curl_dbg_free,
+# which subtracts its own header from the pointer and frees that address
+# without any lookup (lib/memdebug.c:L362-L385), so a C-allocator buffer the
+# crate hands back would corrupt the heap rather than be refused, and the
+# counter would never have seen it. So that ceiling is honored in spirit here
+# and not measured by the mechanism that wrote it.
 #
 # valgrind is the available substitute, and it is opt-in because it multiplies
 # the runtime of every run. The number is REPORTED and never asserted on:
@@ -2600,10 +2676,12 @@ say ""
 say "  R3  The harness is built without curl's memory-debug configuration,"
 say "      so curl's own allocation counter does not run. curl_free"
 say "      forwards to a macro that resolves at compile time"
-say "      (lib/escape.c:L189-L192); under memory debugging it becomes a"
-say "      tracking free that validates every pointer against its own"
-say "      table (lib/memdebug.c:L383), which would reject or mis-account"
-say "      the C-allocator buffers the crate hands back. The ceiling of"
+say "      (lib/escape.c:L189-L192); under memory debugging it becomes"
+say "      curl_dbg_free, which performs no lookup at all -- it subtracts"
+say "      its own header from the pointer and frees that address"
+say "      (lib/memdebug.c:L362-L385) -- so a C-allocator buffer the crate"
+say "      hands back would corrupt the heap rather than be refused, and"
+say "      the counter would never have seen it. The ceiling of"
 say "      Allocations: 3000 at tests/data/test1560:L39-L40 is therefore"
 say "      honored in spirit -- the port is not materially more"
 say "      allocation-hungry -- but is not measured by the mechanism that"

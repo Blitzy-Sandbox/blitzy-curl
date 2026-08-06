@@ -178,12 +178,14 @@
 //! `tests/libtest/lib1560.c`. Neither file is modified; both are read-only
 //! references.
 //!
-//! End-to-end verification is to be the parity run: the unmodified
+//! End-to-end verification is the parity run: the unmodified
 //! `tests/libtest/lib1560.c` built against the reference C library and
 //! against this crate, with the two outputs diffed byte for byte.
-//! `rust-urlapi/scripts/run-parity.sh` is the script that is to drive it and
-//! is a later deliverable, so it does not exist yet and no claim here rests
-//! on its having run.
+//! `rust-urlapi/scripts/run-parity.sh` drives it and reports byte-identical
+//! output in both link modes, which is the evidence the claims here rest on.
+//! What that run cannot reach is `tests/unit/unit1653.c`, which calls this
+//! stage directly and is out of scope as plan constraint R2, which is why the
+//! vectors below carry its cases themselves.
 
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).

@@ -57,12 +57,22 @@ Two conventions keep the tables and the prose narrow.
 - **Crate-local form two: everything else under this crate is written out in
   full.** `rust-urlapi/harness/main.c`, `rust-urlapi/demo/urlapi_demo.c`,
   `rust-urlapi/include/curl_urlapi_rs.h`, `rust-urlapi/Cargo.toml`,
-  `rust-urlapi/README.md`.
+  `rust-urlapi/README.md`. This includes the crate root's own files and the two
+  sibling documents, so `rust-urlapi/build.rs` and
+  `rust-urlapi/docs/KNOWN-DIVERGENCES.md` are never shortened -- a bare
+  `docs/KNOWN-DIVERGENCES.md` would read as a repository path under the rule
+  above and there is no such file.
+- **Crate-local form three, used only in the inventory immediately below:
+  where a sentence has just named a directory under this crate, the files in
+  it follow by leaf name.** `rust-urlapi/harness/` followed by `first.h` means
+  `rust-urlapi/harness/first.h`. The directory is always stated in the same
+  sentence, never inferred from an earlier one.
 
-### What exists today, and what remains
+### What exists today
 
 A reader must be able to tell a claim about code from a requirement on code,
-so the inventory is stated rather than left to be inferred.
+so the inventory is stated rather than left to be inferred. It is complete:
+every file this document names is in the tree.
 
 `rust-urlapi/src/` holds all 26 modules this map describes. The fifteen
 top-level ones are `abi.rs`, `alloc.rs`, `ctype.rs`, `decode.rs`,
@@ -92,19 +102,18 @@ requirements.
 
 Outside `rust-urlapi/src/`, `rust-urlapi/harness/` is complete: `first.h`,
 `runner.c`, `main.c`, `shims.c` and `.checksrc`.
-`rust-urlapi/include/curl_urlapi_rs.h` exists. `rust-urlapi/demo/` holds
-`.checksrc` and `urlapi_demo.c`; what it does not hold is
-`expected-output.txt`, the golden capture from the reference link.
-`rust-urlapi/tests/` holds all five integration suites -- `abi_constants.rs`,
-`encode_decode.rs`, `path_dedot.rs`, `host_ip.rs` and `ffi_surface.rs` -- so
-sentences below about them describe tests a reader can run. What is not in the
-tree is a `rust-urlapi/scripts/`, a `rust-urlapi/README.md` or a
-`rust-urlapi/GNUmakefile`.
+`rust-urlapi/include/curl_urlapi_rs.h` exists. `rust-urlapi/demo/` holds all
+three of `.checksrc`, `urlapi_demo.c` and `expected-output.txt`, the golden
+capture from the reference link. `rust-urlapi/tests/` holds all five
+integration suites -- `abi_constants.rs`, `encode_decode.rs`, `path_dedot.rs`,
+`host_ip.rs` and `ffi_surface.rs`. `rust-urlapi/scripts/` holds all four
+scripts -- `build-reference.sh`, `build-rust.sh`, `check-abi.sh` and
+`run-parity.sh` -- and `rust-urlapi/GNUmakefile` and `rust-urlapi/README.md`
+are both in the tree.
 
-Those four are the whole of what is outstanding, and wherever one of them
-appears below the sentence states a requirement on work still to be done and
-is worded as one. Present tense is reserved for what a reader can open
-today.
+Nothing is outstanding: the crate directory is complete at 55 files, which is
+the count 0.2.1 tables. Every sentence below is therefore in the present tense
+because it describes code a reader opens, not work still to be done.
 
 ### The scope boundary this work does not cross
 
@@ -141,8 +150,11 @@ The first way scans for signatures:
     grep -nE '^(static |UNITTEST |size_t |void |CURLU |CURLUcode )' \
       lib/urlapi.c | grep -vE ';$'
 
-The alternation also needs `const char ` for the one function returning
-that type; it is split out here only so the line fits.
+The alternation needs no arm for `const char`, which is worth saying because
+adding one looks necessary and is not: the single function returning that type
+is `find_host_sep()` at `lib/urlapi.c:104`, and it is `static`, so the first
+arm already matches it. Adding `const char ` to the alternation returns the
+same 38.
 
 That reports 39 matching lines and 38 after the trailing-semicolon filter.
 The line the filter drops is L715, a forward declaration -- shown here with a
@@ -586,14 +598,14 @@ No partial mutation is observable from outside. In Rust the same property is
 to come from constructing a fresh handle and swapping it in, which the borrow
 checker then enforces structurally instead of by discipline.
 
-This is also why finding `FB2` in `KNOWN-DIVERGENCES.md` is harmless on the
-ordinary parse path and harmful only on the live-handle authority path. The
-credential exit label `out` at L323 releases its three local pointers at
-L325-L327 and then sets the three handle fields to null at L328-L330
-without releasing those. On the parse path the fields are already null,
-because the handle is the zeroed temporary from L1202, so the assignments
-discard nothing. `Curl_url_set_authority` at L658-L675 has no temporary, so
-the same three assignments discard whatever the live handle held.
+This is also why finding `FB2` in `rust-urlapi/docs/KNOWN-DIVERGENCES.md` is
+harmless on the ordinary parse path and harmful only on the live-handle
+authority path. The credential exit label `out` at L323 releases its three
+local pointers at L325-L327 and then sets the three handle fields to null at
+L328-L330 without releasing those. On the parse path the fields are already
+null, because the handle is the zeroed temporary from L1202, so the assignments
+discard nothing. `Curl_url_set_authority` at L658-L675 has no temporary, so the
+same three assignments discard whatever the live handle held.
 
 ## Borrowed helpers, and how each one is satisfied
 
@@ -622,49 +634,47 @@ its entry.
 
 **Reimplemented in Rust, with no external symbol and no C dependency.**
 
-- `lib/curlx/dynbuf.c` -- the whole family: `curlx_dyn_init`, `_addn`,
-  `_add`, `_addf`, `_ptr`, `_len`, `_setlen`, `_reset` and `_free`. Into
-  `dynbuf.rs`.
+- `lib/curlx/dynbuf.c` -- the whole family: `curlx_dyn_init`, `_addn`, `_add`,
+  `_addf`, `_ptr`, `_len`, `_setlen`, `_reset` and `_free`. Into `dynbuf.rs`.
 - `lib/curlx/strdup.h`:L30 `curlx_strdup` and `lib/curlx/strdup.c`:L85
-  `curlx_memdup0`, the two duplication helpers `lib/urlapi.c` calls at
-  L418, L815, L838, L977, L1004, L1028, L1052, L1059, L1086, L1304 and
-  L1367. Into `alloc.rs`, whose owned-buffer type replaces both.
+  `curlx_memdup0`, the two duplication helpers `lib/urlapi.c` calls at L418,
+  L815, L838, L977, L1004, L1028, L1052, L1059, L1086, L1304 and L1367. Into
+  `alloc.rs`, whose owned-buffer type replaces both.
 - `lib/curl_setup.h`:L1461-L1484 `curlx_free`, called 32 times. Into
   `alloc.rs`. Its resolution chain is the subject of
-  `MEMORY-OWNERSHIP.md`.
-- `lib/curlx/strparse.c` -- `curlx_str_number` at L195, `curlx_str_hex` at
-  L202 and `curlx_str_octal` at L209. Into `strparse.rs`. The hexadecimal
-  and octal scanners are reached only from `ipv4_normalize`, at
-  `lib/urlapi.c`:L500 and L503.
+  `rust-urlapi/docs/MEMORY-OWNERSHIP.md`.
+- `lib/curlx/strparse.c` -- `curlx_str_number` at L195, `curlx_str_hex` at L202
+  and `curlx_str_octal` at L209. Into `strparse.rs`. The hexadecimal and octal
+  scanners are reached only from `ipv4_normalize`, at `lib/urlapi.c`:L500 and
+  L503.
 - `lib/curlx/inet_pton.c`:L207 and `lib/curlx/inet_ntop.c`:L210. Into
   `inet.rs`.
 - `lib/escape.c` -- `curl_easy_escape` at L50 into `encode.rs`,
   `Curl_urldecode` at L105 into `decode.rs`, `curl_free` at L189-L192 into
   `alloc.rs`, and `Curl_hexbyte` at L222 into `ctype.rs`.
-- `lib/strcase.c` -- `Curl_strntolower` at L106 and `Curl_raw_tolower` at
-  L81, the latter reached from the escape lower-casing pass at
+- `lib/strcase.c` -- `Curl_strntolower` at L106 and `Curl_raw_tolower` at L81,
+  the latter reached from the escape lower-casing pass at
   `lib/urlapi.c`:L1926-L1927. Into `ctype.rs`.
 - `include/curl/curl.h`:L2424 `curl_strequal`, called once at
-  `lib/urlapi.c`:L1440, and `lib/strcase.h`:L33 `checkprefix`, called at
-  L874, L875 and the six scheme-guess sites L989-L999. Into `ctype.rs`.
-- `lib/curl_ctype.h`:L38-L50 -- `ISUNRESERVED` and the classifiers around
-  it. Into `ctype.rs`.
+  `lib/urlapi.c`:L1440, and `lib/strcase.h`:L33 `checkprefix`, called at L874,
+  L875 and the six scheme-guess sites L989-L999. Into `ctype.rs`.
+- `lib/curl_ctype.h`:L38-L50 -- `ISUNRESERVED` and the classifiers around it.
+  Into `ctype.rs`.
 - `memrchr`, from the platform or curl's own fallback, called three times
   inside `redirect_url`. Into `parse/redirect.rs`.
-- `lib/url.c`:L2466 `Curl_parse_login_details`. Into
-  `parse/authority.rs`.
+- `lib/url.c`:L2466 `Curl_parse_login_details`. Into `parse/authority.rs`.
 - `lib/idn.c`:L223 `Curl_is_ASCII_name`. Into `idn.rs`.
-- `lib/strerror.c`:L420-L531 -- the 33 message strings. Into `error.rs`,
-  behind the `strerror` feature.
+- `lib/strerror.c`:L420-L531 -- the 33 message strings. Into `error.rs`, behind
+  the `strerror` feature.
 
 **Bound to a system library, reproducing the C's own call sequence.**
 
-- `lib/idn.c` -- `Curl_idn_decode` at L247 and `Curl_idn_encode` at L326,
-  which `idn.rs` satisfies by calling libidn2 directly under the default
+- `lib/idn.c` -- `Curl_idn_decode` at L247 and `Curl_idn_encode` at L326, which
+  `idn.rs` satisfies by calling libidn2 directly under the default
   `idn-libidn2` feature. That is a real C dependency of the crate, and it is
-  deliberate: it is what makes bit-for-bit parity attainable, libidn2's
-  locale sensitivity included. The `idn-pure` alternative removes the
-  dependency and is not bit-for-bit; `KNOWN-DIVERGENCES.md` records the
+  deliberate: it is what makes bit-for-bit parity attainable, libidn2's locale
+  sensitivity included. The `idn-pure` alternative removes the dependency and
+  is not bit-for-bit; `rust-urlapi/docs/KNOWN-DIVERGENCES.md` records the
   difference.
 
 **Imported as an external symbol in one configuration.**
@@ -679,15 +689,15 @@ its entry.
 
 **Shimmed in the standalone configuration.**
 
-- `lib/mprintf.c` -- `curl_maprintf` at `lib/urlapi.c`:L381, L1441, L1517
-  and L1676, and `curl_msnprintf` at L1465, L1513 and L1591. In the drop-in
+- `lib/mprintf.c` -- `curl_maprintf` at `lib/urlapi.c`:L381, L1441, L1517 and
+  L1676, and `curl_msnprintf` at L1465, L1513 and L1591. In the drop-in
   configuration libcurl supplies both. In the standalone configuration
   `rust-urlapi/harness/shims.c` does, forwarding to the C library, and its
   return value diverges from curl's in the truncating case, which
-  `KNOWN-DIVERGENCES.md` records. On the Rust side the formatting itself is
-  absorbed at each call site through `alloc.rs` and `dynbuf.rs` rather than
-  through a printf-alike, so the whole-URL template at L1517 -- fifteen
-  `%s` conversions in one call -- keeps its assembly order.
+  `rust-urlapi/docs/KNOWN-DIVERGENCES.md` records. On the Rust side the
+  formatting itself is absorbed at each call site through `alloc.rs` and
+  `dynbuf.rs` rather than through a printf-alike, so the whole-URL template at
+  L1517 -- fifteen `%s` conversions in one call -- keeps its assembly order.
 
 The old heading's claim, that every borrowed helper is re-implemented
 internally, was therefore too strong in three places, and each is a real
@@ -698,59 +708,57 @@ property of the build rather than a wording quibble.
 Five of the entries above carry semantics that a naive re-implementation
 loses. They are expanded here so that the inventory stays easy to scan.
 
-- **The dynamic buffer releases itself on failure.** Exceeding the
-  configured maximum releases the buffer and returns the too-large code, at
-  L82-L84, and an allocation failure releases it as well, at L106-L108. A
-  caller that treats either as recoverable and appends again is appending
-  to a released buffer. Note also that `curlx_dyn_ptr` at L237-L242 returns
-  the buffer pointer without clearing the structure, so the ownership
-  handover at `lib/urlapi.c`:L1185 is a convention the caller honors rather
-  than something the buffer enforces. `MEMORY-OWNERSHIP.md` carries that in
+- **The dynamic buffer releases itself on failure.** Exceeding the configured
+  maximum releases the buffer and returns the too-large code, at L82-L84, and
+  an allocation failure releases it as well, at L106-L108. A caller that treats
+  either as recoverable and appends again is appending to a released buffer.
+  Note also that `curlx_dyn_ptr` at L237-L242 returns the buffer pointer
+  without clearing the structure, so the ownership handover at
+  `lib/urlapi.c`:L1185 is a convention the caller honors rather than something
+  the buffer enforces. `rust-urlapi/docs/MEMORY-OWNERSHIP.md` carries that in
   full.
 - `lib/curlx/strparse.c`, the numeric scanners, into `strparse.rs`.
-  `curlx_str_number` at L195 is the decimal entry point, and the port keeps
-  the exact overflow and trailing-junk semantics rather than substituting a
-  Rust integer parser, whose acceptance set differs.
-- `lib/curlx/inet_pton.c` and `lib/curlx/inet_ntop.c`, address conversion,
-  into `inet.rs`. `curlx_inet_pton` at L207 and `curlx_inet_ntop` at
-  L210 are the pair used for the IPv6 normalization at
-  `lib/urlapi.c`:L433-L435, where an address is parsed to bytes and
-  formatted back so that the stored form is canonical.
+  `curlx_str_number` at L195 is the decimal entry point, and the port keeps the
+  exact overflow and trailing-junk semantics rather than substituting a Rust
+  integer parser, whose acceptance set differs.
+- `lib/curlx/inet_pton.c` and `lib/curlx/inet_ntop.c`, address conversion, into
+  `inet.rs`. `curlx_inet_pton` at L207 and `curlx_inet_ntop` at L210 are the
+  pair used for the IPv6 normalization at `lib/urlapi.c`:L433-L435, where an
+  address is parsed to bytes and formatted back so that the stored form is
+  canonical.
 - `lib/escape.c`, four helpers into four modules. `curl_easy_escape` at L50
-  into `encode.rs`, `Curl_urldecode` at L105 into `decode.rs`,
-  `curl_free` at L189-L192 into `ffi.rs`, whose `cfree`-gated export
-  is the only place it can live because it is both an exported symbol and a
-  foreign call, and `Curl_hexbyte` at L222
-  into `ctype.rs`. `Curl_hexbyte` emits uppercase hexadecimal, which is
-  why the lower-casing pass at `lib/urlapi.c`:L1922-L1932 exists at all.
+  into `encode.rs`, `Curl_urldecode` at L105 into `decode.rs`, `curl_free` at
+  L189-L192 into `ffi.rs`, whose `cfree`-gated export is the only place it can
+  live because it is both an exported symbol and a foreign call, and
+  `Curl_hexbyte` at L222 into `ctype.rs`. `Curl_hexbyte` emits uppercase
+  hexadecimal, which is why the lower-casing pass at `lib/urlapi.c`:L1922-L1932
+  exists at all.
 - `lib/strcase.c`, `Curl_strntolower` at L106, into `ctype.rs`.
-- `lib/url.c`, two helpers into two modules. `Curl_get_scheme` at
-  L1469-L1471 into `scheme.rs`, and `Curl_parse_login_details` at
-  `lib/url.c`:L2466 into `parse/authority.rs`.
+- `lib/url.c`, two helpers into two modules. `Curl_get_scheme` at L1469-L1471
+  into `scheme.rs`, and `Curl_parse_login_details` at `lib/url.c`:L2466 into
+  `parse/authority.rs`.
 - `lib/idn.c`, the internationalized-domain conversions at L223-L344, into
-  `idn.rs`. `Curl_is_ASCII_name` at L223-L236 is the gate: a null input
-  counts as ASCII at L228-L229 and the first byte with the high bit set
-  ends the scan at L232-L233. The call sequence inside `idn_decode` at
-  L247 is reproduced step for step, including the version check at L252,
-  the normalizing flag at L253 and the non-transitional flag at L258 behind
-  the version test at L254, and the retry with the transitional flag at
-  L261-L265 that runs on any failure of the first attempt.
-- `lib/curl_ctype.h`, the unreserved-character predicate, into
-  `ctype.rs`. `ISURLPUNTCS` at L47-L48 accepts `-`, `.`, `_` and `~`,
-  and `ISUNRESERVED` at L49 adds the alphanumeric characters.
-- `lib/mprintf.c`, formatted allocation, absorbed at each site where the C
-  code calls into the family. `curl_maprintf` allocates at L381, L1441,
-  L1517 and L1676, and `curl_msnprintf` fills a fixed buffer at L1465,
-  L1513 and L1591. The whole-URL template at L1517 takes fifteen `%s`
-  conversions in one call, so the port keeps the assembly order rather than
-  concatenating piece by piece. In the standalone configuration the harness
-  supplies C shims for the family instead, because no libcurl participates
-  in that link.
-- `lib/strerror.c`, the message strings at L420-L531, into `error.rs`
-  behind the `strerror` feature. The verbose arm carries a case label for
-  every one of the 33 `CURLUcode` values and falls through to
-  `"CURLUcode unknown"` at L524; the non-verbose arm at L525-L530 answers
-  with one of two strings.
+  `idn.rs`. `Curl_is_ASCII_name` at L223-L236 is the gate: a null input counts
+  as ASCII at L228-L229 and the first byte with the high bit set ends the scan
+  at L232-L233. The call sequence inside `idn_decode` at L247 is reproduced
+  step for step, including the version check at L252, the normalizing flag at
+  L253 and the non-transitional flag at L258 behind the version test at L254,
+  and the retry with the transitional flag at L261-L265 that runs on any
+  failure of the first attempt.
+- `lib/curl_ctype.h`, the unreserved-character predicate, into `ctype.rs`.
+  `ISURLPUNTCS` at L47-L48 accepts `-`, `.`, `_` and `~`, and `ISUNRESERVED` at
+  L49 adds the alphanumeric characters.
+- `lib/mprintf.c`, formatted allocation, absorbed at each site where the C code
+  calls into the family. `curl_maprintf` allocates at L381, L1441, L1517 and
+  L1676, and `curl_msnprintf` fills a fixed buffer at L1465, L1513 and L1591.
+  The whole-URL template at L1517 takes fifteen `%s` conversions in one call,
+  so the port keeps the assembly order rather than concatenating piece by
+  piece. In the standalone configuration the harness supplies C shims for the
+  family instead, because no libcurl participates in that link.
+- `lib/strerror.c`, the message strings at L420-L531, into `error.rs` behind
+  the `strerror` feature. The verbose arm carries a case label for every one of
+  the 33 `CURLUcode` values and falls through to `"CURLUcode unknown"` at L524;
+  the non-verbose arm at L525-L530 answers with one of two strings.
 
 ### The one place C layout still matters
 
@@ -797,37 +805,37 @@ No single assertion catches that, because the compiled crate cannot read
 `lib/urldata.h` and the header cannot read the crate. Two checks divide the
 work, and both are worth naming exactly.
 
-- `ffi.rs` pins the Rust side. The `#[repr(C)]` mirror `CurlScheme` is
-  declared there, and the `LAYOUT_PROOF` block just below it asserts at
-  compile time that the mirror is the size a 32-bit `curl_prot_t` implies --
-  32 bytes where a pointer is 8, 24 where it is 4, and 0 for any other
-  pointer width, which fails the assertion deliberately rather than guessing
-  -- that it is pointer-aligned, and that `u32` and `u16` really are 4 and 2
-  bytes. Its test module re-derives every one of the six field offsets at run
-  time besides. What all of that establishes is that nobody edited the Rust
-  side out of shape; it cannot see the C side at all.
-- `build.rs` covers the C side, textually. `check_scheme_layout_precondition`
-  reads `../lib/urldata.h` and requires both a `#define PROTO_TYPE_SMALL`
-  line and a `typedef uint32_t curl_prot_t` line. Reading is not compiling,
-  and the difference is deliberate: compiling that header would need
-  libcurl's private build environment, `curl_config.h` included, which this
-  crate does not have and does not want. If either line is gone the build
-  panics with a message naming both remedies -- widen the mirrored fields, or
-  build with `scheme-table` and describe no C structure at all. If the header
-  cannot be found, which is the ordinary case outside a curl checkout, it
-  emits a note and continues, because refusing to build standalone would
-  trade a real capability for a check with nothing to check.
+- `ffi.rs` pins the Rust side. The `#[repr(C)]` mirror `CurlScheme` is declared
+  there, and the `LAYOUT_PROOF` block just below it asserts at compile time
+  that the mirror is the size a 32-bit `curl_prot_t` implies -- 32 bytes where
+  a pointer is 8, 24 where it is 4, and 0 for any other pointer width, which
+  fails the assertion deliberately rather than guessing -- that it is
+  pointer-aligned, and that `u32` and `u16` really are 4 and 2 bytes. Its test
+  module re-derives every one of the six field offsets at run time besides.
+  What all of that establishes is that nobody edited the Rust side out of
+  shape; it cannot see the C side at all.
+- `rust-urlapi/build.rs` covers the C side, textually.
+  `check_scheme_layout_precondition` reads `../lib/urldata.h` and requires both
+  a `#define PROTO_TYPE_SMALL` line and a `typedef uint32_t curl_prot_t` line.
+  Reading is not compiling, and the difference is deliberate: compiling that
+  header would need libcurl's private build environment, `curl_config.h`
+  included, which this crate does not have and does not want. If either line is
+  gone the build panics with a message naming both remedies -- widen the
+  mirrored fields, or build with `scheme-table` and describe no C structure at
+  all. If the header cannot be found, which is the ordinary case outside a curl
+  checkout, it emits a note and continues, because refusing to build standalone
+  would trade a real capability for a check with nothing to check.
 
-A residual risk survives both, which is why the precondition is documented
-as well as checked. The text of a header is not the preprocessed header: the
-check requires the two lines to be present, not to be reached, so an edit
-that moved either inside a conditional that does not hold would still satisfy
-it. And it reads the header of the tree this crate sits in, which is the
-right tree for a drop-in link against a libcurl built from that tree and the
-wrong one for a link against an archive built somewhere else. **A 32-bit
-`curl_prot_t` therefore remains a documented precondition of drop-in mode**,
-recorded as such in `KNOWN-DIVERGENCES.md`. The live cross-check is the
-parity run, which reads `defport` through the assertions at
+A residual risk survives both, which is why the precondition is documented as
+well as checked. The text of a header is not the preprocessed header: the check
+requires the two lines to be present, not to be reached, so an edit that moved
+either inside a conditional that does not hold would still satisfy it. Separately, it
+reads the header of the tree this crate sits in, which is the right tree for a
+drop-in link against a libcurl built from that tree and the wrong one for a
+link against an archive built somewhere else. **A 32-bit `curl_prot_t`
+therefore remains a documented precondition of drop-in mode**, recorded as such
+in `rust-urlapi/docs/KNOWN-DIVERGENCES.md`. The live cross-check is the parity
+run, which reads `defport` through the assertions at
 `tests/libtest/lib1560.c`:L592-L594 and L786-L788, so a shifted mirror fails
 the first sub-test rather than subtly.
 
@@ -914,12 +922,20 @@ and nothing is written anywhere.
 If a separate copy of the member really is wanted, note that `ar x`
 **creates or overwrites `urlapi.c.o` in the current directory**, which is
 easy to run by accident in a source tree. Do it in a scratch directory made
-for the purpose, and remove it afterwards:
+for the purpose, and let the shell remove it:
 
-    mkdir -p /tmp/urlapi-symbols && cd /tmp/urlapi-symbols
-    ar x /path/to/libcurl.a urlapi.c.o
-    nm -g --defined-only urlapi.c.o
-    cd - && rm -rf /tmp/urlapi-symbols
+    scratch="$(mktemp -d)" && trap 'rm -rf "${scratch}"' EXIT
+    ( cd "${scratch}" && ar x /path/to/libcurl.a urlapi.c.o \
+        && nm -g --defined-only urlapi.c.o )
+
+The directory is created with `mktemp -d` rather than named as a fixed path
+under the system temporary directory, for the same reason
+`rust-urlapi/cbindgen.toml` gives for its own scratch destination: a
+predictable shared name is a name another process can already own, so writing
+to it clobbers whatever is there, and in a world-writable directory it can be
+a symlink pointing somewhere else entirely. The `trap` removes the directory
+on any exit rather than only on the success path, and the subshell keeps the
+`cd` from outliving the command.
 
 `ar p libcurl.a urlapi.c.o` streams the member to standard output instead,
 for a reader who wants the bytes without a file at all.
@@ -948,22 +964,33 @@ the rest of libcurl.
 
 ### The canonical static artifact
 
-Cargo's `staticlib` output is an **input**, not the deliverable. It carries
-the whole Rust standard library, the allocator and the unwinder, so
-`nm -g --defined-only` reports thousands of distinct globals where
-`urlapi.c.o` reports 8. No count is quoted here on purpose: it moves with the
-toolchain, and `build.rs` reports the measured figure in the build log at the
+Cargo's `staticlib` output is an **input**, not the deliverable. It carries the
+whole Rust standard library, the allocator and the unwinder, so
+`nm -g --defined-only` reports thousands of distinct globals where `urlapi.c.o`
+reports 8. No count is quoted here on purpose: it moves with the toolchain, and
+`rust-urlapi/build.rs` reports the measured figure in the build log at the
 moment it matters rather than leaving a literal to go stale.
 
 **The canonical drop-in artifact is `libcurl_urlapi_rs_dropin.a`**, and it is
-the only static artifact this port offers for a C link line. `build.rs`
-produces it with the localization pass -- `ld -r --whole-archive`, then
-`objcopy --keep-global-symbol` for the ABI set, then `ar rcs` -- and validates
-it in both directions. Measured: exactly the eight names above in the drop-in
-configuration, and exactly ten in the standalone one, where `curl_url_strerror`
-and `curl_free` are real exports. That archive is what `check-abi` compares,
-what the parity link names, and what the cargo-c install path ships; the raw
-Cargo archive is never presented as the drop-in.
+the only static artifact this port offers for a C link line.
+`rust-urlapi/build.rs` produces it with the localization pass --
+`ld -r --whole-archive`, then `objcopy --keep-global-symbol` for the ABI set,
+then `ar rcs` -- and validates it in both directions. Measured: exactly the
+eight names above in the drop-in configuration, and exactly ten in the
+standalone one, where `curl_url_strerror` and `curl_free` are real exports.
+That archive is what `rust-urlapi/scripts/check-abi.sh` compares and what the
+parity link names; the raw Cargo archive is never presented as the drop-in.
+
+The `cargo-c` install path is deliberately not on that list, and the reason is
+mechanical rather than a matter of preference. The pass runs only when
+`CURL_URLAPI_DROPIN_ARCHIVE` names an already-built archive, which is a second
+invocation of the build script that `rust-urlapi/scripts/build-rust.sh`
+arranges on purpose; `cargo cbuild` and `cargo cinstall` set no such variable,
+so what that path would install is the raw Cargo archive with every
+Rust-runtime global still exported. That path does not run here at all -- it
+stops on the undeclared `capi` feature, which
+`rust-urlapi/docs/KNOWN-DIVERGENCES.md` records as a reported constraint -- so
+the gap is documented rather than closed.
 
 The validation is two-sided, and the second side is what makes it a provenance
 check rather than a rename. Before localizing anything the pass inspects the
@@ -1011,34 +1038,34 @@ link. A shared object built from that configuration would carry both names
 undefined, with no `libcurl` NEEDED entry and no prospect of one, and would
 fail at `dlopen` every time.
 
-So the rule is that **a shared object is a deliverable only where the crate is
-self-contained**, which is the standalone configuration, and `build.rs`
-`emit_shared_artifact_gate` applies it in the two ways the two configurations
-allow. In the standalone one the **release** cdylib link on an ELF target gets
-`-Wl,-z,defs`, so the object is proved closed on every release build -- its
-undefined set is libc, libgcc and libidn2, each a real NEEDED entry -- and the
-proof costs nothing because the link succeeds. In the drop-in one the same
-directive would cost the deliverables: `crate-type` is a property of the
-package, so `cargo build --release` asks for the archive, the rlib and the
-cdylib together, Cargo stops at the first failing link, and a refused cdylib
-means no archive and no rlib either -- exit 101 with nothing written, against a
-plan that requires that command to succeed at 0.9.2 `A1`. So the drop-in
-release build records a notice instead, naming
+The rule is therefore that **a shared object is a deliverable only where the
+crate is self-contained**, which is the standalone configuration, and
+`rust-urlapi/build.rs` `emit_shared_artifact_gate` applies it in the two ways
+the two configurations allow. In the standalone one the **release** cdylib link
+on an ELF target gets `-Wl,-z,defs`, so the object is proved closed on every
+release build -- its undefined set is libc, libgcc and libidn2, each a real
+NEEDED entry -- and the proof costs nothing because the link succeeds. In the
+drop-in one the same directive would cost the deliverables: `crate-type` is a
+property of the package, so `cargo build --release` asks for the archive, the
+rlib and the cdylib together, Cargo stops at the first failing link, and a
+refused cdylib means no archive and no rlib either -- exit 101 with nothing
+written, against a plan that requires that command to succeed at 0.9.2 `A1`. So
+the drop-in release build records a notice instead, naming
 `libcurl_urlapi_rs.so` a non-deliverable, why it cannot load, and the archive
 to consume in its place. The notice goes to the build script's captured output
 and to `DROP-IN-CDYLIB-NOTICE.txt` in OUT_DIR rather than to `cargo:warning`,
 because a diagnostic that fires on every build of a supported configuration is
 one nobody can clear and 0.9.2 `A1` asks both configurations to build cleanly;
-`docs/KNOWN-DIVERGENCES.md` argues that at length under "Why the notice is not
-a `cargo:warning`". `CURL_URLAPI_STRICT_CDYLIB=1` restores the refusal for a
-caller who would rather have it than a record.
+`rust-urlapi/docs/KNOWN-DIVERGENCES.md` argues that at length under "Why the
+notice is not a `cargo:warning`". `CURL_URLAPI_STRICT_CDYLIB=1` restores the
+refusal for a caller who would rather have it than a record.
 
 `cargo check` and `cargo clippy` are unaffected by the directive, which Cargo
 applies to the cdylib link alone.
 
 The archive a drop-in `cargo build --release` writes is an input rather than
 the artifact a consumer is given, for a reason that has nothing to do with the
-gate: Cargo cannot apply link-time optimisation while an rlib is among the
+gate: Cargo cannot apply link-time optimization while an rlib is among the
 crate types, so the three-type archive is several times larger and still
 carries the Rust standard library's globals. The publishable static artifact is
 the localized one, and it starts from asking for the archive alone:
@@ -1052,11 +1079,12 @@ localization pass that turns that archive into the eight-symbol one.
 
 The gate stops at the release profile deliberately. Cargo builds every crate
 type of a lib target whenever it builds that target, and an integration test
-under `tests/` needs the lib target built, so gating the dev profile as well
-would stop `cargo test` from running in the drop-in configuration whenever the
-strict opt-in was set. Release is the profile that produces deliverables and
-the profile every documented build command names; a debug shared object, which
-nobody installs, is recorded in the build log instead.
+under `rust-urlapi/tests/` needs the lib target built, so gating the dev
+profile as well would stop `cargo test` from running in the drop-in
+configuration whenever the strict opt-in was set. Release is the profile that
+produces deliverables and the profile every documented build command names; a
+debug shared object, which nobody installs, is recorded in the build log
+instead.
 
 ### Two symbols that stay behind a feature
 
@@ -1068,13 +1096,13 @@ beyond reach of any edit, and the same listing that shows eight symbols in
 it only behind the `strerror` feature, which has to be off in the drop-in
 configuration or the link acquires a duplicate definition.
 
-`curl_free` follows the same reasoning from a different starting point. It
-is defined at `lib/escape.c`:L189-L192 and appears in `escape.c.o`, so the
-crate exports it only behind the `cfree` feature, on for the standalone
-configuration where nothing else supplies it and off for the drop-in one.
-`MEMORY-OWNERSHIP.md` carries the ownership half of this: a buffer the
-crate hands to C is released by the caller through whichever of the two
-definitions the link resolved.
+`curl_free` follows the same reasoning from a different starting point. It is
+defined at `lib/escape.c`:L189-L192 and appears in `escape.c.o`, so the crate
+exports it only behind the `cfree` feature, on for the standalone configuration
+where nothing else supplies it and off for the drop-in one.
+`rust-urlapi/docs/MEMORY-OWNERSHIP.md` carries the ownership half of this: a
+buffer the crate hands to C is released by the caller through whichever of the
+two definitions the link resolved.
 
 ### One test beyond drop-in reach
 
@@ -1102,6 +1130,19 @@ byte-unchanged: the port is validated by running that source against the
 Rust-backed library and comparing the result with the same source run
 against the unmodified C. Every bare `Lnnn` in this section and its tables
 refers to that file rather than to `lib/urlapi.c`.
+
+That comparison has been run, and this is what it reported.
+`rust-urlapi/scripts/run-parity.sh` links the harness four ways -- the
+reference, both Rust link modes, and the reference archive with `urlapi.c.o`
+deleted to prove the deletion -- and runs each binary in four environments,
+`LC_ALL` of `C.UTF-8` and `C` crossed with `CURL_TEST_HAVE_CODESET_UTF8` set
+and unset. Standard output was byte-identical to the reference in all four
+environments for both modes, exit status matched in all four, and both modes
+printed exactly the single line `success` in the fully gated environment.
+Thirty-six checks ran and none failed, recorded in
+`rust-urlapi/build/parity-summary.txt` as `PARITY_CHECKS_RUN='36'` and
+`PARITY_CHECKS_FAILED='0'`. Sentences below about what the oracle reports are
+therefore observations rather than expectations.
 
 The single include directive is `"first.h"` at L33, which is the reason the
 crate carries a harness shim. A relative include of the real header pulls in
@@ -1147,15 +1188,22 @@ The consequence for reporting is that a single exit code names one failing
 sub-test rather than summarizing the run. Whatever drives the comparison has
 to map the code back to the name in the table above and iterate, so that a
 report covers every sub-test instead of stopping at whichever failed first.
-`rust-urlapi/scripts/run-parity.sh` is to be that driver and is not written
-yet, so until it lands the mapping is done by reading the table.
+`rust-urlapi/scripts/run-parity.sh` is that driver: it maps the exit code
+through the table above and prints all eleven rows for every mode in every
+environment, marking the failing one and the ones after it as not reached.
+All eleven pass individually for both modes in three of the four
+environments. In the fourth, `LC_ALL=C` with the codeset marker set, `set_url`
+and `set_parts` pass, `get_url` fails and the remaining eight are not reached
+-- which is exactly what the reference does in that environment, the locale
+trap 0.6.3 describes reproduced rather than avoided.
 
 Three sub-tests take the codeset flag read at L2036 as a parameter and gate
 part of their table on it: `setget_parts` at L1446, `get_url` at L1548 and
 `get_parts` at L1591, each of which skips its `CURLU_PUNY2IDN` cases when
 the flag is clear. A parity run therefore has to repeat with the variable
 both set and unset, since a run with it unset exercises none of those cases
-and still reports success.
+and still reports success. The driver does repeat, which is why its
+environment matrix has four cells rather than one.
 
 ## The unsafe boundary
 
@@ -1239,11 +1287,29 @@ which the language reference's panic table states for exactly this
 combination. The worst case is therefore a defined abort rather than
 undefined behavior, and that is the floor rather than the plan.
 
-**Layer two: the release profile removes unwinding altogether.**
-`rust-urlapi/Cargo.toml` sets `panic = "abort"` in `[profile.release]`, so
-the artifacts a C consumer links carry no landing pads and no unwind tables. A
-panic terminates immediately. This also keeps the archive free of the
-personality routine a C link would otherwise have to resolve.
+**Layer two: the release profile removes unwinding from this crate's own
+code.** `rust-urlapi/Cargo.toml` sets `panic = "abort"` in
+`[profile.release]`, so a panic in code compiled from this crate terminates
+immediately rather than unwinding.
+
+What that setting does **not** do is worth stating precisely, because the
+obvious stronger claim -- that the artifacts carry no landing pads, no unwind
+tables and no personality routine -- is measurably false, and a reader who
+believes it is confused the first time they run `readelf` over the
+archive. `panic = "abort"` governs the codegen of the crates Cargo compiles;
+the precompiled `std` that a `staticlib` or `cdylib` bundles was built with
+the unwinding runtime, and it arrives as-is. Measured on the drop-in archive
+this port hands a C consumer: 364 `.gcc_except_table` sections, an
+`.eh_frame`, and both `rust_eh_personality` and `DW.ref.rust_eh_personality`
+defined locally in the localized object. The standalone shared object carries
+the same machinery, `.gcc_except_table` and `.eh_frame` among its sections.
+
+None of that weakens the guarantee, which is behavioral rather than
+structural: no panic in this crate's code unwinds, and layer one already makes
+an escaping panic an abort even where the unwinding runtime is present. The
+personality routine also resolves within the artifact rather than being left
+for the C link to find, which is what a C consumer actually needs. Only the
+behavioral claim is made here; the structural one is not.
 
 **Layer three, and the one that matters: panics are designed out rather than
 caught.** The crate root denies the panicking constructs -- `unwrap`,
@@ -1298,14 +1364,14 @@ the crate works around it, and no CI file is edited to suppress it.
 
 `R1` completes the set of four, so they are listed together once:
 
-- `R1`, above: the distribution check fails until an out-of-scope
-  `Makefile.am` edit is made.
-- `R2`: `tests/unit/unit1653.c` is beyond drop-in reach, recorded under
-  "One test beyond drop-in reach" in this file.
+- `R1`, above: the distribution check fails until an out-of-scope `Makefile.am`
+  edit is made.
+- `R2`: `tests/unit/unit1653.c` is beyond drop-in reach, recorded under "One
+  test beyond drop-in reach" in this file.
 - `R3`: memory-debug builds are incompatible with the crate's C-allocator
-  buffers, recorded in `MEMORY-OWNERSHIP.md`.
-- `R4`: alternative memory functions installed at runtime are not
-  supported, recorded in `MEMORY-OWNERSHIP.md`.
+  buffers, recorded in `rust-urlapi/docs/MEMORY-OWNERSHIP.md`.
+- `R4`: alternative memory functions installed at runtime are not supported,
+  recorded in `rust-urlapi/docs/MEMORY-OWNERSHIP.md`.
 
 None of the four is worked around. Each is reported with its remedy named and
 the remedy deliberately not applied.

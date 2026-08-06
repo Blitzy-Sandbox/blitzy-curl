@@ -60,19 +60,35 @@
 #                               the artifact a link actually consumes.
 #
 #   libcurl_urlapi_rs.a         Cargo's own staticlib. A staticlib carries
-#                               the whole Rust standard library with it -- in
-#                               this crate, measured, 2415 defined globals --
-#                               so it is compared through the filter
-#                               described at rust_exports() below.
+#                               the whole Rust standard library with it, so
+#                               it defines thousands of globals rather than
+#                               eight and is compared through the filter
+#                               described at rust_exports() below. No count is
+#                               quoted here on purpose: it moves with the
+#                               toolchain and with the standard library, so a
+#                               literal would go stale without anything
+#                               breaking. build.rs measures it at the moment
+#                               it matters and records it in the provenance
+#                               file beside the canonical archive, as
+#                               raw-defined-globals.
 #
-# Only DEFINED symbols take part, which is deliberate. The drop-in archive is
-# SUPPOSED to have undefined references: that is what makes it a drop-in
-# rather than a standalone library. In the drop-in configuration it imports
-# Curl_get_scheme and Curl_getn_scheme from lib/url.c:1469-1472, inet_pton
-# and inet_ntop for the address handling in src/inet.rs, four libidn2 entry
-# points for src/idn.rs, and the C allocator entry points for src/alloc.rs.
-# nm --defined-only excludes every one of them, which is exactly right, and
-# nothing here treats an undefined reference as a finding.
+# For the ARCHIVES, only DEFINED symbols take part, and that is deliberate. A
+# drop-in archive is SUPPOSED to have undefined references: that is what makes
+# it a drop-in rather than a standalone library. In the drop-in configuration
+# it imports Curl_get_scheme and Curl_getn_scheme from lib/url.c:1469-1472,
+# inet_pton and inet_ntop for the address handling in src/inet.rs, four
+# libidn2 entry points for src/idn.rs, and the C allocator entry points for
+# src/alloc.rs. nm --defined-only excludes every one of them, which is exactly
+# right for an archive, and nothing in the archive checks treats an undefined
+# reference as a finding.
+#
+# For the SHARED OBJECTS the undefined side is checked too, because there it
+# is a contract rather than a link-time detail: a shared object with an
+# unresolved reference either resolves it from the link it is part of or does
+# not load at all. The section headed "The shared objects, import contracts"
+# asserts that mode A imports exactly the two scheme entry points and that
+# both are names lib/urlapi.o itself leaves undefined, and that mode C imports
+# nothing in either namespace, which is what makes mode C loadable.
 #
 # THE TWO DIRECTIONS
 #
@@ -86,9 +102,9 @@
 # precisely the collision hazard, so both lists are printed and either one
 # being non-empty fails the run.
 #
-# THE TWO CONFIGURATIONS, CHECKED IN OPPOSITE DIRECTIONS
+# THE THREE CONFIGURATIONS, CHECKED IN OPPOSITE DIRECTIONS
 #
-# Mode A, the drop-in configuration -- built with --no-default-features
+# Mode A, the static drop-in configuration -- built with --no-default-features
 # --features idn-libidn2 -- must export the eight and must NOT export
 # curl_url_strerror or curl_free, because a real libcurl already defines both
 # (lib/strerror.c:420 and lib/escape.c:189).
@@ -100,39 +116,211 @@
 # accidentally built with --no-default-features, which would then fail to
 # link the standalone demo for a reason no behavioural test would explain.
 #
+# Mode C, the shared drop-in configuration -- --no-default-features --features
+# idn-libidn2,scheme-table -- must export exactly the same eight as mode A,
+# and its shared object must additionally import nothing in the curl_ or
+# Curl_ namespace. That pair of properties is what makes it the shared half of
+# G1: one shared object from this crate, exporting the complete symbol set
+# lib/urlapi.o exports and no more, and loadable.
+#
 # WHAT IT PRODUCES
 #
 #   build/abi-check-summary.txt   key=value verdicts, for run-parity.sh
 #
 # Nothing else is written. The scratch directory is created with mktemp and
-# removed by an EXIT trap, the extracted archive members and symbol lists
-# live inside it, and no path outside build/ or the system temporary
-# directory is touched. lib/urlapi.c and every other pre-existing file are
-# read only, which is goal G4 and acceptance criterion A12.
+# removed by an EXIT trap, the archive member and the symbol lists live inside
+# it, and no path outside build/ or the system temporary directory is touched.
+# lib/urlapi.c and every other pre-existing file are read only, which is goal
+# G4 and acceptance criterion A12.
 #
-# Exit status is 0 only when every check either passed or was skipped, and
-# --strict makes a skip fail as well.
+# THE SUMMARY FILE IS DATA, NOT SHELL. Its keys are lowercase with dashes,
+# which are deliberately not valid shell identifiers, so the file cannot be
+# sourced even by accident. Every value is validated before it is written --
+# no carriage return, no newline, no other control byte -- and every key is
+# written at most once. run-parity.sh parses it with sed.
+#
+# EXIT STATUS. This is a GATE, so completeness is the default: a check that
+# could not run is a failure, exactly like a check that ran and disagreed.
+# Exit status is 0 only when every check ran and passed. --allow-partial
+# relaxes that to "no check disagreed", which is for somebody working through
+# a single symbol by hand and is never what a workflow wants -- a gate that
+# reports success because it could not find the artifact it was meant to
+# inspect is worse than no gate, because the next script proceeds on the
+# strength of it.
+#
+# FRESHNESS. Every path this script consumes from a summary file is checked
+# against the schema, the generator, the verdict and the recorded sha256 of
+# the producing run, and the two producing runs are checked against each other
+# for source revision. Without that, "the file at the recorded path" and "the
+# file that run produced" are two different claims that coincide most of the
+# time, and the scratch tree is deliberately reusable.
 
 set -eu
+
+# pipefail, so that a failure anywhere in a pipeline is the pipeline's failure.
+# Every symbol list below is produced by a pipeline whose first stage is nm or
+# ar; without pipefail the status belongs to the last stage, which is sort or
+# awk and which succeeds on empty input. An empty symbol list compared against
+# an empty expectation is a check that passes without having looked at
+# anything. The places where a non-zero status is genuinely expected guard
+# themselves explicitly.
+set -o pipefail
+
+# Every file this script creates is created for this user only. The summary is
+# a predictable path by design -- run-parity.sh has to find it -- so the
+# protection against another user planting a symlink there first is the
+# permission mask plus the remove-before-write discipline fresh_path() applies.
+umask 077
 
 # Run from the crate root whatever directory the caller was in, so that every
 # relative path below means one thing and so that an invocation through the
 # abi target of ../GNUmakefile, from inside scripts/, or with an absolute
 # path all behave identically.
-cd "$(dirname "${0}")"/..
+#
+# Derived with parameter expansion rather than with dirname, deliberately, and
+# for the same reason build-reference.sh does it: this is the one place where
+# an external command cannot be checked for first, because the prerequisite
+# table has not run yet. A missing or shadowed dirname would make the command
+# substitution expand to nothing and the cd would then land on the filesystem
+# root instead of failing. Parameter expansion is a shell builtin and cannot
+# fail that way.
+SCRIPT_DIR="${0%/*}"
+if [ "${SCRIPT_DIR}" = "${0}" ]; then
+  SCRIPT_DIR='.'
+elif [ -z "${SCRIPT_DIR}" ]; then
+  SCRIPT_DIR='/'
+fi
+cd "${SCRIPT_DIR}/.."
 
-CRATE_DIR="${PWD}"
+# pwd -P, not pwd: the physical path with every symlink resolved is what the
+# containment check in resolve_output_root() compares against, and comparing a
+# logical path with a physical one is a comparison a symlink can defeat.
+CRATE_DIR="$(pwd -P)"
 
-# The unmodified repository. Needed only by the compile fallback, and taken
-# as the parent directory rather than from git so that the script still works
-# in an exported tree with no .git in it.
-REPO_ROOT="$(cd .. && pwd)"
+# The unmodified repository. Needed by the compile fallback and by the
+# containment rule below, and taken as the parent directory rather than from
+# git so that the script still works in an exported tree with no .git in it.
+REPO_ROOT="$(cd .. && pwd -P)"
 
-# BUILD_DIR is honoured because scripts/build-reference.sh honours it: a
-# caller who moved the scratch tree elsewhere, or who parameterised it per
-# clone for a parallel run, must be able to point this script at the same
-# place without editing anything.
-BUILD="${BUILD_DIR:-${CRATE_DIR}/build}"
+# Where an output tree is allowed to be, and why the question needs asking.
+#
+# BUILD_DIR is environment-controlled, and the summary this script publishes,
+# the scratch directory it creates and the staged reference object it keeps all
+# go underneath it. An unvalidated value therefore lets the environment aim
+# those writes at any directory on the machine, lib/ and tests/ and the
+# repository root among them, where the result would be modifications to
+# pre-existing files. That is goal G4 and acceptance criterion A12 broken by an
+# environment variable, so the value is checked rather than trusted.
+#
+# The rule is the same one build-reference.sh and build-rust.sh apply, stated
+# in full here as well because each script has to stand on its own:
+#
+#   - inside the repository, only <crate>/build and <crate>/target and their
+#     descendants are allowed. Those two are what ../.gitignore covers, so
+#     they are the only places inside the tree where writing cannot show up in
+#     "git status --porcelain";
+#   - outside the repository, anything is allowed except the filesystem root;
+#   - the repository root itself and the empty string are refused outright.
+#
+# The path is canonicalized with cd + pwd -P before any of that is decided,
+# which is what makes a symlink harmless rather than an escape: a build
+# directory that is a symlink to lib/ resolves to lib/ and is refused on the
+# resolved name. Judging the name as given would refuse nothing.
+#
+#   $1  label used in the diagnostic
+#   $2  the path to resolve
+#
+# Prints the canonical path. Never returns on a refusal.
+resolve_output_root() {
+  local label="${1}"
+  local raw="${2}"
+  local canonical
+
+  if [ -z "${raw}" ]; then
+    printf 'check-abi.sh: error: %s\n' \
+      "${label} is set but empty. Unset it to accept the default, or give it \
+a directory" >&2
+    exit 2
+  fi
+
+  if ! mkdir -p -- "${raw}" 2> /dev/null; then
+    printf 'check-abi.sh: error: %s\n' \
+      "${label}=${raw} could not be created" >&2
+    exit 2
+  fi
+
+  if ! canonical="$(cd -- "${raw}" && pwd -P)"; then
+    printf 'check-abi.sh: error: %s\n' \
+      "${label}=${raw} exists but could not be entered, so its real location \
+cannot be established" >&2
+    exit 2
+  fi
+
+  if [ "${canonical}" = '/' ]; then
+    printf 'check-abi.sh: error: %s\n' \
+      "${label} resolves to the filesystem root, and this script writes a \
+summary and a scratch directory underneath it" >&2
+    exit 2
+  fi
+
+  if [ "${canonical}" = "${REPO_ROOT}" ]; then
+    printf 'check-abi.sh: error: %s\n' \
+      "${label}=${raw} resolves to the repository root ${REPO_ROOT}. Writing \
+there would modify pre-existing files, which goal G4 forbids" >&2
+    exit 2
+  fi
+
+  case "${canonical}" in
+    "${CRATE_DIR}/build" | "${CRATE_DIR}/build/"* | \
+    "${CRATE_DIR}/target" | "${CRATE_DIR}/target/"*)
+      # Inside the crate's own ignored output. The allowed in-repository case.
+      ;;
+    "${REPO_ROOT}/"*)
+      printf 'check-abi.sh: error: %s\n' \
+        "${label}=${raw} resolves to ${canonical}, which is inside the \
+repository but outside the crate's ignored output. Only ${CRATE_DIR}/build \
+and ${CRATE_DIR}/target are writable inside the tree -- everything else would \
+leave modifications that acceptance criterion A12 forbids. Point it at one of \
+those, or at a directory outside ${REPO_ROOT} entirely" >&2
+      exit 2
+      ;;
+    *)
+      # Outside the repository. Allowed, and the parallel-clone case.
+      ;;
+  esac
+
+  printf '%s\n' "${canonical}"
+}
+
+# Removes whatever occupies a path so that the next write creates it fresh.
+#
+# The summary is a predictable path underneath the scratch tree, because
+# run-parity.sh has to find it without being told. That predictability is what
+# a symlink attack needs: plant build/abi-check-summary.txt as a link to
+# something else and a plain ">" redirection follows it and truncates the
+# target. rm removes the LINK rather than what it points at, so removing first
+# and creating second turns the whole class of problem into a no-op. Real
+# directories are left alone, and an absent path is not an error.
+#
+#   $1  the path to clear
+fresh_path() {
+  if [ -e "${1}" ] || [ -L "${1}" ]; then
+    if [ -d "${1}" ] && [ ! -L "${1}" ]; then
+      return 0
+    fi
+    rm -f -- "${1}"
+  fi
+}
+
+# BUILD_DIR is honoured because the other three scripts honour it: a caller who
+# moved the scratch tree elsewhere, or who parameterised it per clone for a
+# parallel run, must be able to point all four at the same place without
+# editing anything.
+#
+# The colon-less expansion is deliberate: the default applies when BUILD_DIR is
+# UNSET, and a value that is set and empty is handed to resolve_output_root()
+# to be refused there.
+BUILD="$(resolve_output_root BUILD_DIR "${BUILD_DIR-${CRATE_DIR}/build}")"
 
 LIBRARY='curl_urlapi_rs'
 ARCHIVE="lib${LIBRARY}.a"
@@ -213,7 +401,30 @@ UNITTEST_SYMBOLS=(
 # Options
 # ------------------------------------------------------------------------
 
-STRICT="${STRICT:-0}"
+# Completeness is the DEFAULT, and the reason is what this script is for.
+#
+# It is a gate: run-parity.sh links the Rust archive in place of the object
+# built from lib/urlapi.c and then diffs behaviour, and neither the link nor
+# the diff means anything while the surface disagrees. A gate that reports
+# success because it could not find the artifact it was meant to inspect is
+# worse than no gate at all, because the next script proceeds on the strength
+# of it. So a check that could not run counts as a failure, exactly like a
+# check that ran and disagreed.
+#
+# ALLOW_PARTIAL is the deliberate, manual escape hatch for somebody working
+# through a single symbol by hand, who has built one configuration and knows
+# it. It is never what a workflow wants and the closing summary says so out
+# loud.
+#
+# STRICT is retained as the inverse of ALLOW_PARTIAL so that --strict, which is
+# what the make target and any existing caller pass, keeps working and keeps
+# meaning what it says. It now merely restates the default.
+ALLOW_PARTIAL="${ALLOW_PARTIAL:-0}"
+if [ "${ALLOW_PARTIAL}" != '0' ]; then
+  STRICT=0
+else
+  STRICT="${STRICT:-1}"
+fi
 CHECK_COLLISION="${CHECK_COLLISION:-1}"
 ALLOW_COMPILE_FALLBACK="${ALLOW_COMPILE_FALLBACK:-0}"
 CC_BIN="${CC:-cc}"
@@ -228,11 +439,31 @@ configurations, and reports a per-check verdict. Run this before
 run-parity.sh: a symbol mismatch makes every behavioural result
 meaningless.
 
+Every check must RUN and PASS, and every artifact must have established
+provenance. A check that could not run -- a missing archive, a missing
+shared object, an unreadable artifact -- is a failure, because a gate that
+reports success without having looked is worse than no gate. A build
+summary that is absent, malformed or records a run that did not succeed is
+also a failure, because the artifacts it would name cannot then be shown to
+be the ones this workflow produced. Use --allow-partial to relax both
+deliberately.
+
 Options:
   -h, --help          show this text and exit
-  --strict            treat a skipped check as a failure. Use this in CI,
-                      where a check silently not running is the failure
-                      mode to worry about.
+  --allow-partial     turn this from a gate into a by-hand instrument. A
+                      check that could not run becomes a skip instead of a
+                      failure; a missing or failed build summary is worked
+                      around instead of refused; the environment overrides
+                      and Cargo's own target/release directory are consulted
+                      for artifacts, with no provenance established for what
+                      is found there. For working through a single symbol
+                      when only one configuration has been built. Never
+                      appropriate in a workflow, and the closing summary
+                      says so.
+  --strict            treat a skipped check as a failure. This is now the
+                      default and the option is retained so that existing
+                      callers keep working; it is the inverse of
+                      --allow-partial.
   --no-collision      skip the link collision pre-check, which is the one
                       step that reads every member of the reference
                       archive and so the one that takes noticeable time
@@ -252,10 +483,13 @@ Environment variables, each overriding what the summary files say:
                       an already extracted urlapi object, used as is
   MODE_A_DROPIN       the canonical drop-in archive of mode A
   MODE_A_ARCHIVE      Cargo's own staticlib for mode A
+  MODE_A_SHARED       the mode A shared object, eight exports plus two imports
   MODE_B_DROPIN       the canonical drop-in archive of mode B
   MODE_B_ARCHIVE      Cargo's own staticlib for mode B
-  MODE_B_SHARED       the mode B shared object
-  STRICT=1            --strict
+  MODE_B_SHARED       the mode B shared object, ten exports
+  MODE_C_SHARED       the mode C shared object, eight exports and closed
+  STRICT=1            --strict, which is the default
+  ALLOW_PARTIAL=1     --allow-partial
   CHECK_COLLISION=0   --no-collision
   ALLOW_COMPILE_FALLBACK=1
                       --allow-compile-fallback
@@ -265,9 +499,35 @@ Environment variables, each overriding what the summary files say:
                       where it is the evidence
   CC                  the C compiler for the compile fallback, default cc
   CURL_CONFIG_H       an existing curl_config.h for the compile fallback
+  REFERENCE_FALLBACK_DEFINES
+                      extra preprocessor arguments for the compile fallback,
+                      whitespace separated, empty by default. They are added
+                      after the fixed set this script derives
+                      (-DHAVE_CONFIG_H -DBUILDING_LIBCURL, plus
+                      -D_GNU_SOURCE on the platforms curl's own CMake build
+                      defines it for), so they can add to that set but not
+                      remove from it. Read only on the fallback path, which
+                      --allow-compile-fallback has to enable, and ignored
+                      entirely when a reference archive was found.
+                      ABI-affecting: what lib/urlapi.c compiles to depends on
+                      its preprocessor state, so a value here changes the
+                      symbol set this script certifies against. -DUNITTESTS
+                      in particular would add Curl_parse_port and dedotdotify
+                      to the C side and make the comparison fail against a
+                      Rust archive that correctly does not export them. Leave
+                      it unset unless a platform's reference build genuinely
+                      needs something else, and prefer running
+                      scripts/build-reference.sh, which certifies the object
+                      a real libcurl link consumes instead of one assembled
+                      here from a guessed state.
+                      It carries several arguments in one value, so it IS
+                      split on whitespace -- deliberately, with read -a
+                      rather than by leaving an expansion unquoted -- which
+                      means a define whose value contains a space cannot be
+                      passed this way.
 
-Exit status is 0 only when no check failed, and with --strict only when no
-check was skipped either.
+Exit status is 0 only when every check ran and passed. With
+--allow-partial it is 0 when no check that ran disagreed.
 EOF
 }
 
@@ -279,6 +539,11 @@ while [ "$#" -gt 0 ]; do
       ;;
     --strict)
       STRICT=1
+      ALLOW_PARTIAL=0
+      ;;
+    --allow-partial)
+      STRICT=0
+      ALLOW_PARTIAL=1
       ;;
     --no-collision)
       CHECK_COLLISION=0
@@ -392,10 +657,15 @@ same reason as Curl_parse_port"
 # and a missing summary file is the ordinary state before the corresponding
 # build script has been run.
 #
-# Both formats are handled by the same reader. build-rust.sh writes bare
-# key=value with dashes in the key names -- which is also why neither file
-# can simply be sourced, since key names with dashes are not shell
-# identifiers -- and build-reference.sh writes KEY='value'.
+# Both producers now write the identical format: bare key=value, keys lowercase
+# with dashes. Dashes in the keys are what makes either file impossible to
+# source, since a dash is not allowed in a shell identifier, and that is the
+# reason the format was chosen rather than a side effect of it. Values carry no
+# control byte, because the producers refuse to write one.
+# The reference summary additionally repeats a dozen of its records under an
+# upper-case underscored spelling, because scripts/run-parity.sh reads that
+# one; its fact() accepts either shape and refuses a repeated key, so the two
+# spellings are aliases. Reading either from here works.
 read_fact() {
   local file="${1}"
   local key="${2}"
@@ -415,21 +685,125 @@ read_fact() {
       ;;
   esac
 
-  # The last occurrence wins. Neither writer repeats a key, and taking the
-  # last is what makes an appended correction behave the way a reader would
-  # expect if one ever did.
+  # The last occurrence wins. Neither writer repeats a key -- both refuse a
+  # duplicate outright -- and taking the last is what makes an appended
+  # correction behave the way a reader would expect if one ever did.
   line="$(sed -n "s/^${key}=//p" "${file}" | tail -n 1)"
 
-  # Strip one layer of single quotes when they are there, and leave the value
-  # alone when they are not.
-  case "${line}" in
-    "'"*"'")
-      line="${line#\'}"
-      line="${line%\'}"
+  printf '%s\n' "${line}"
+}
+
+# ------------------------------------------------------------------------
+# Trusting a summary file
+#
+# WHY THIS SECTION EXISTS. Every artifact path this script inspects comes out
+# of a summary file written by another script, minutes or hours earlier, into a
+# scratch tree that is deliberately reusable. Reading a path out of such a file
+# and inspecting whatever now sits there conflates two different claims: "the
+# file at the recorded path" and "the file that run produced". They coincide
+# most of the time. When they do not, this script declares a symbol set correct
+# on the strength of bytes nobody built in this workflow, run-parity.sh links
+# them, and the parity result that follows describes something no one can
+# name.
+#
+# Five things are therefore checked before any recorded path is used, and each
+# one closes a different way of being wrong:
+#
+#   schema      -- the file is the kind of file this script thinks it is, and
+#                  not an older or a hand-written one;
+#   generated-by-- it was written by the script it claims, so an unrelated
+#                  key=value file cannot stand in;
+#   result=pass -- the producing run actually SUCCEEDED. A failed or
+#                  interrupted run leaves result=fail or result=in-progress,
+#                  and its paths must not be consumed at all;
+#   sha256      -- the bytes at the path are the bytes that run produced;
+#   source-revision across the two producers -- the reference build and the
+#                  Rust build came from one checkout, so a symbol set is not
+#                  compared against an oracle from a different revision.
+# ------------------------------------------------------------------------
+
+# Validates one summary file and reports why it cannot be trusted, if it
+# cannot.
+#
+#   $1  the file
+#   $2  the schema it must declare
+#   $3  the generator it must name
+#
+# Returns 0 when the file is present, well formed and records a successful run.
+# Prints nothing on success; on failure prints one line saying why. Never
+# exits, because a missing summary is an ordinary state -- the corresponding
+# build script has simply not run -- and the caller decides whether that is
+# fatal.
+summary_is_trustworthy() {
+  local file="${1}"
+  local want_schema="${2}"
+  local want_generator="${3}"
+  local got
+
+  if [ ! -f "${file}" ]; then
+    printf '%s is not there\n' "${file}"
+    return 1
+  fi
+  if [ ! -r "${file}" ]; then
+    printf '%s cannot be read\n' "${file}"
+    return 1
+  fi
+
+  got="$(read_fact "${file}" 'schema')"
+  if [ "${got}" != "${want_schema}" ]; then
+    printf '%s declares schema "%s" rather than "%s"\n' \
+      "${file}" "${got:-none}" "${want_schema}"
+    return 1
+  fi
+
+  got="$(read_fact "${file}" 'generated-by')"
+  if [ "${got}" != "${want_generator}" ]; then
+    printf '%s says it was written by "%s" rather than by %s\n' \
+      "${file}" "${got:-nothing}" "${want_generator}"
+    return 1
+  fi
+
+  got="$(read_fact "${file}" 'result')"
+  if [ "${got}" != 'pass' ]; then
+    printf '%s records result=%s, so the run that wrote it did not succeed\n' \
+      "${file}" "${got:-none}"
+    return 1
+  fi
+
+  return 0
+}
+
+# Confirms that the bytes at a path are the bytes a summary recorded.
+#
+#   $1  the artifact
+#   $2  the summary file
+#   $3  the key holding the expected digest
+#
+# Returns 0 when the digest matches, or when the summary records no digest for
+# it -- an override the caller named by hand has no recorded digest and must
+# not be refused for lacking one. Prints one line on a mismatch.
+artifact_matches_digest() {
+  local artifact="${1}"
+  local file="${2}"
+  local key="${3}"
+  local expected
+  local actual
+
+  expected="$(read_fact "${file}" "${key}")"
+  case "${expected}" in
+    '' | unavailable | not-produced | not-measured | not-a-deliverable | \
+    not-found | unknown)
+      return 0
       ;;
   esac
 
-  printf '%s\n' "${line}"
+  actual="$(sha256sum "${artifact}" | awk '{ print $1 }')"
+  if [ "${actual}" != "${expected}" ]; then
+    printf '%s does not match the sha256 in %s (%s, expected %s)\n' \
+      "${artifact}" "${file}" "${actual}" "${expected}"
+    return 1
+  fi
+  return 0
 }
 
 # The first of an environment override, a summary-file fact, and a default
@@ -446,6 +820,7 @@ first_existing_artifact() {
   local key="${3}"
   local fallback="${4}"
   local candidate
+  local digest_complaint
 
   if [ -n "${override}" ]; then
     # An explicit override is used even when it does not exist, so that a
@@ -455,7 +830,30 @@ first_existing_artifact() {
     return 0
   fi
 
-  candidate="$(read_fact "${file}" "${key}")"
+  # A summary that does not record a successful producing run is not consulted
+  # at all. Its facts are exactly as trustworthy as the run that wrote them,
+  # and a path out of a failed run is how this gate ends up inspecting bytes
+  # nobody built.
+  case "${file}" in
+    "${RUST_FACTS}")
+      if [ "${RUST_FACTS_TRUST}" != 'trusted' ]; then
+        candidate=''
+      else
+        candidate="$(read_fact "${file}" "${key}")"
+      fi
+      ;;
+    "${REFERENCE_FACTS}")
+      if [ "${REFERENCE_FACTS_TRUST}" != 'trusted' ]; then
+        candidate=''
+      else
+        candidate="$(read_fact "${file}" "${key}")"
+      fi
+      ;;
+    *)
+      candidate="$(read_fact "${file}" "${key}")"
+      ;;
+  esac
+
   # build-rust.sh writes the literal not-produced, not-measured and
   # not-a-deliverable for artifacts a configuration deliberately does not
   # have. Those are facts, not paths, and must not be treated as filenames.
@@ -465,6 +863,19 @@ first_existing_artifact() {
       ;;
   esac
   if [ -n "${candidate}" ] && [ -r "${candidate}" ]; then
+    # The bytes must be the bytes that run recorded. build-rust.sh writes an
+    # sha256 beside every artifact path it publishes, so a file that has been
+    # replaced since -- by a later partial run, by a hand-edit, by a build in a
+    # different configuration -- is refused here rather than inspected and
+    # certified. A path with no recorded digest passes: an override the caller
+    # named by hand has none and must not be refused for lacking one.
+    if ! digest_complaint="$(artifact_matches_digest "${candidate}" \
+         "${file}" "${key}-sha256")"; then
+      warn "${digest_complaint}"
+      warn "refusing to inspect it. Rerun the build that produced it so that \
+the recorded digest and the file agree"
+      return 0
+    fi
     printf '%s\n' "${candidate}"
     return 0
   fi
@@ -549,10 +960,13 @@ write_symbol_list() {
 #
 # WHY THIS FILTER EXISTS, so that nobody later mistakes it for hiding a
 # problem: Cargo's staticlib carries the entire Rust standard library inside
-# the same archive. Measured on this crate, that is 2415 defined globals --
+# the same archive, which is thousands of defined globals rather than eight --
 # core, alloc, std, the panic machinery, the compiler builtins -- none of
 # which is part of any contract with C, and every one of which would show up
-# as "unexpectedly exported" against a set of eight.
+# as "unexpectedly exported" against a set of eight. The exact number is
+# deliberately not written here: it moves with the toolchain, so a literal
+# would go stale silently. build.rs measures it per build and records it in the
+# provenance file beside the canonical archive.
 #
 # The filter keeps three things: every name in the expected set, every name
 # in the forbidden set, and every name in the curl_ and Curl_ namespaces.
@@ -685,6 +1099,25 @@ MISSING=()
 # command -v, never which: .github/scripts/shellcheck.sh enables
 # deprecate-which, and command -v is a shell builtin that needs nothing
 # installed in order to answer.
+#
+# The claim this table makes is that it is COMPLETE, and the claim is meant
+# literally: it was built by extracting every command position from this file
+# rather than by recollection, because a table that is merely nearly complete
+# produces the failure it exists to prevent -- a missing tool discovered in the
+# middle of a comparison rather than here.
+#
+# Two commands necessarily escape it, and both are named rather than left as
+# silent gaps: mkdir and rm ran a moment ago, creating and clearing the output
+# root, and are listed anyway; and git is deliberately NOT required, being
+# consulted by neither this script nor its consumers here -- the source
+# revision it compares comes out of the two summary files rather than from git.
+#
+# uname is required rather than optional even though only the compile fallback
+# reads it, because it costs nothing to check and a caller who reaches that
+# fallback has already had one thing go wrong.
+#
+# Shell builtins are absent by definition: printf, cd, pwd, read, command,
+# trap, umask and the pattern-matching constructs need nothing installed.
 REQUIRED_TOOLS=(
   'nm:binutils'
   'ar:binutils'
@@ -692,10 +1125,19 @@ REQUIRED_TOOLS=(
   'sed:sed'
   'sort:coreutils'
   'comm:coreutils'
+  'cat:coreutils'
+  'cp:coreutils'
+  'dirname:coreutils'
+  'mkdir:coreutils'
+  'mv:coreutils'
+  'rm:coreutils'
+  'sha256sum:coreutils'
   'tail:coreutils'
   'tr:coreutils'
+  'uname:coreutils'
   'wc:coreutils'
   'mktemp:coreutils'
+  'find:findutils'
   'grep:grep'
 )
 
@@ -734,10 +1176,14 @@ note "${#REQUIRED_TOOLS[@]} required tools present"
 # ------------------------------------------------------------------------
 
 mkdir -p "${BUILD}"
+fresh_path "${SUMMARY}"
 
 # Declared before the trap is installed so that the trap can never read an
-# unset variable under set -u.
+# unset variable under set -u. That is not a stylistic preference: a handler
+# that fails leaves no verdict at all, which is the one outcome this
+# arrangement exists to make impossible.
 SCRATCH=''
+SUMMARY_INPROGRESS=''
 RESULT='fail'
 
 # A run that stops part-way through must not leave a summary file that reads
@@ -773,8 +1219,9 @@ finish() {
       rm -rf "${SCRATCH:?}"
     fi
   fi
-  if [ "${RESULT}" != 'pass' ] && [ -f "${SUMMARY}" ]; then
-    printf 'result=fail\n' >> "${SUMMARY}"
+  publish_summary "${RESULT}" || true
+  if [ -n "${SUMMARY_INPROGRESS}" ]; then
+    rm -f -- "${SUMMARY_INPROGRESS}"
   fi
   return "${status}"
 }
@@ -788,20 +1235,122 @@ note "scratch: ${SCRATCH}"
 
 # ------------------------------------------------------------------------
 # The summary file
+#
+# One fact per line, in the same shape build-rust.sh uses, so that
+# run-parity.sh can read this file with the reader it already has -- and with
+# the same three guarantees, for the same reasons.
 # ------------------------------------------------------------------------
 
-# One fact per line, in the same shape build-rust.sh uses, so that
-# run-parity.sh can read this file with the reader it already has.
+# Facts accumulate here and the published path is only ever REPLACED, never
+# appended to.
+if ! SUMMARY_INPROGRESS="$(mktemp "${BUILD}/abi-check-summary.txt.XXXXXX")"
+then
+  die "could not create a temporary summary file in ${BUILD}"
+fi
+
+printf '%s\n' \
+  '# curl-urlapi-rs ABI gate summary. DATA, NOT SHELL: the keys contain' \
+  '# dashes and are therefore not valid shell identifiers, so this file' \
+  '# cannot be sourced. Parse it with sed, the way run-parity.sh does.' \
+  '# Do not act on it unless result=pass.' \
+  > "${SUMMARY_INPROGRESS}"
+
+# Append one fact, having first established that both halves are fit to be
+# written.
+#
+#   the key must be lowercase letters, digits and dashes. A dash is not allowed
+#   in a shell identifier, so a file of these keys cannot be sourced by
+#   anything -- which is the point;
+#
+#   the value must contain no control byte. A newline would let one value forge
+#   a second key on the following line, which is the whole injection; a
+#   carriage return would leave an invisible trailing byte in the value
+#   run-parity.sh reads back. This matters more here than anywhere else,
+#   because several values are symbol lists and artifact paths that arrived
+#   from another summary file or from an environment override;
+#
+#   the key must not have been written already, because a consumer taking the
+#   last occurrence would silently read the second one.
+SUMMARY_KEYS=' '
 summary() {
-  printf '%s=%s\n' "${1}" "${2}" >> "${SUMMARY}"
+  local key="${1}"
+  local value="${2}"
+
+  case "${key}" in
+    '' | *[!a-z0-9-]* | [!a-z]*)
+      die "summary: refusing the key '${key}'. Summary keys are lowercase \
+letters, digits and dashes, starting with a letter, deliberately: a dash \
+makes the key invalid as a shell identifier, which is what keeps this file \
+from ever being sourceable"
+      ;;
+  esac
+
+  case "${SUMMARY_KEYS}" in
+    *" ${key} "*)
+      die "summary: the key '${key}' has already been written. A duplicate \
+key is a programming error here: a consumer that takes the last occurrence \
+would read the wrong one of the two"
+      ;;
+  esac
+
+  case "${value}" in
+    *[[:cntrl:]]*)
+      die "summary: refusing the value of '${key}' because it contains a \
+control character. A newline in a value forges a key on the next line, a \
+carriage return leaves an invisible byte in what run-parity.sh reads back, \
+and no legitimate value here -- a path, a symbol list, a verdict, a count -- \
+contains either"
+      ;;
+  esac
+
+  SUMMARY_KEYS="${SUMMARY_KEYS}${key} "
+  printf '%s=%s\n' "${key}" "${value}" >> "${SUMMARY_INPROGRESS}"
 }
 
-: > "${SUMMARY}"
+# Replaces the published summary with the in-progress file plus one verdict
+# line, atomically.
+#
+# Atomic matters because run-parity.sh can legitimately be started while this
+# script is still running, and rename() is the only way to guarantee it reads
+# either the whole old file or the whole new one.
+#
+#   $1  the verdict to record
+publish_summary() {
+  local verdict="${1}"
+  local staged
+
+  if [ -z "${SUMMARY_INPROGRESS}" ] || [ ! -f "${SUMMARY_INPROGRESS}" ]; then
+    return 0
+  fi
+
+  if ! staged="$(mktemp "${BUILD}/abi-check-summary.txt.XXXXXX")"; then
+    warn "could not stage the summary file, so ${SUMMARY} was left alone"
+    return 1
+  fi
+
+  cat "${SUMMARY_INPROGRESS}" > "${staged}"
+  printf 'result=%s\n' "${verdict}" >> "${staged}"
+  if ! mv -f -- "${staged}" "${SUMMARY}"; then
+    rm -f -- "${staged}"
+    warn "could not publish the summary to ${SUMMARY}"
+    return 1
+  fi
+  return 0
+}
+
 summary 'schema' 'curl-urlapi-rs/check-abi/1'
 summary 'generated-by' 'rust-urlapi/scripts/check-abi.sh'
+
+# Published the moment those two literal keys are in place, and no later.
+# Everything after this line can fail, and each of those failures has to leave
+# a file that says so rather than the previous run's verdict.
+publish_summary 'in-progress' || true
+
+summary 'generated-at' "${EPOCHSECONDS:-0}"
 summary 'crate-root' "${CRATE_DIR}"
 summary 'build-root' "${BUILD}"
 summary 'strict' "${STRICT}"
+summary 'allow-partial' "${ALLOW_PARTIAL}"
 
 # ------------------------------------------------------------------------
 # The C side: the oracle
@@ -814,6 +1363,107 @@ summary 'strict' "${STRICT}"
 
 step 'The C side'
 
+# Whether each summary file may be consulted at all. Established once, here,
+# rather than at each read: a file that records a failed run has to be refused
+# as a whole, because the individual facts inside it are exactly as
+# untrustworthy as the run that wrote them.
+REFERENCE_FACTS_TRUST='untrusted'
+REFERENCE_FACTS_WHY="$(summary_is_trustworthy "${REFERENCE_FACTS}" \
+  'curl-urlapi-rs/build-reference/1' \
+  'rust-urlapi/scripts/build-reference.sh')" && \
+  REFERENCE_FACTS_TRUST='trusted'
+
+RUST_FACTS_TRUST='untrusted'
+RUST_FACTS_WHY="$(summary_is_trustworthy "${RUST_FACTS}" \
+  'curl-urlapi-rs/build-rust/1' \
+  'rust-urlapi/scripts/build-rust.sh')" && RUST_FACTS_TRUST='trusted'
+
+if [ "${REFERENCE_FACTS_TRUST}" = 'trusted' ]; then
+  note "reference summary: ${REFERENCE_FACTS} (result=pass)"
+else
+  note "reference summary: not usable -- ${REFERENCE_FACTS_WHY}"
+fi
+if [ "${RUST_FACTS_TRUST}" = 'trusted' ]; then
+  note "Rust summary:      ${RUST_FACTS} (result=pass)"
+else
+  note "Rust summary:      not usable -- ${RUST_FACTS_WHY}"
+fi
+
+summary 'reference-facts' "${REFERENCE_FACTS}"
+summary 'reference-facts-trust' "${REFERENCE_FACTS_TRUST}"
+summary 'rust-facts' "${RUST_FACTS}"
+summary 'rust-facts-trust' "${RUST_FACTS_TRUST}"
+
+# In the default mode BOTH summaries must be trustworthy, and this is where
+# that is enforced.
+#
+# The reasoning follows from what the two modes are for. In the default mode
+# this script is a gate on a workflow: its job is to certify that the artifacts
+# THAT WORKFLOW produced export the right surface, and it cannot certify
+# anything of the sort about files whose provenance it is unable to establish.
+# Falling back to a conventional path and inspecting whatever is there produces
+# the worst possible outcome -- a confident pass over bytes nobody in this run
+# built -- which is precisely the failure mode this check exists to close.
+#
+# Under --allow-partial the script is a by-hand instrument instead. Then a
+# missing or failed summary is a fact to work around rather than a fault, the
+# conventional locations and the environment overrides are honoured, and every
+# resulting verdict is qualified in the closing summary.
+if [ "${ALLOW_PARTIAL}" != '1' ]; then
+  if [ "${REFERENCE_FACTS_TRUST}" != 'trusted' ]; then
+    die "the reference summary cannot be trusted: ${REFERENCE_FACTS_WHY}. \
+Every verdict below would be a comparison against an oracle whose provenance \
+this script cannot establish, so it refuses to produce one. Run \
+scripts/build-reference.sh, which builds libcurl out of tree from the \
+unmodified repository and records what it built. To inspect artifacts by hand \
+instead, pass --allow-partial and read the qualified verdict it prints"
+  fi
+  if [ "${RUST_FACTS_TRUST}" != 'trusted' ]; then
+    die "the Rust build summary cannot be trusted: ${RUST_FACTS_WHY}. The \
+archives this script would otherwise inspect have no established provenance \
+-- the scratch tree is reusable, so a file at the conventional path may be \
+from any earlier run in any configuration -- and certifying those would be \
+worse than not checking at all. Run scripts/build-rust.sh, which builds both \
+configurations and records an sha256 for each artifact. To inspect artifacts \
+by hand instead, pass --allow-partial"
+  fi
+fi
+
+# One checkout, or two? Both producers record the commit they built from, so a
+# disagreement means an oracle from one revision is about to be compared with
+# an archive from another -- a comparison whose result describes neither.
+# Refused rather than warned about, because the whole value of this gate is
+# that a mismatch it reports is a real one.
+#
+# Either side recording "unknown" is the exported-tree case, where there is no
+# git to ask. That is reported and allowed: a check that cannot be made is not
+# the same as a check that failed, and the summary records which it was so that
+# a reader is never left to assume.
+REVISION_STATE='not-compared'
+if [ "${REFERENCE_FACTS_TRUST}" = 'trusted' ] &&
+   [ "${RUST_FACTS_TRUST}" = 'trusted' ]; then
+  REFERENCE_REVISION="$(read_fact "${REFERENCE_FACTS}" 'source-revision')"
+  RUST_REVISION="$(read_fact "${RUST_FACTS}" 'source-revision')"
+  if [ "${REFERENCE_REVISION}" = 'unknown' ] ||
+     [ "${RUST_REVISION}" = 'unknown' ] ||
+     [ -z "${REFERENCE_REVISION}" ] || [ -z "${RUST_REVISION}" ]; then
+    REVISION_STATE='unknown'
+    note 'source revision: not recorded by one of the two builds, so the two'
+    note '                 could not be confirmed to come from one checkout'
+  elif [ "${REFERENCE_REVISION}" = "${RUST_REVISION}" ]; then
+    REVISION_STATE='agree'
+    note "source revision:   ${REFERENCE_REVISION} (both builds)"
+  else
+    REVISION_STATE='disagree'
+    summary 'source-revision-state' "${REVISION_STATE}"
+    die "the reference build was made from ${REFERENCE_REVISION} and the Rust \
+build from ${RUST_REVISION}. Comparing a symbol set from one checkout against \
+an oracle from another describes neither: rebuild both from the same tree. \
+scripts/build-reference.sh followed by scripts/build-rust.sh does that"
+  fi
+fi
+summary 'source-revision-state' "${REVISION_STATE}"
+
 # The already-extracted object, when scripts/build-reference.sh produced one.
 # Preferring it is not a shortcut: that script extracted the member from the
 # archive it certified and asserted the eight-symbol contract against it, so
@@ -823,14 +1473,91 @@ REFERENCE_URLAPI_OBJECT="${REFERENCE_URLAPI_OBJECT:-}"
 REFERENCE_ARCHIVE="${REFERENCE_ARCHIVE:-}"
 REFERENCE_MEMBER=''
 REFERENCE_SOURCE=''
+digest_complaint=''
 
-if [ -z "${REFERENCE_URLAPI_OBJECT}" ]; then
-  REFERENCE_URLAPI_OBJECT="$(read_fact "${REFERENCE_FACTS}" \
-    'REFERENCE_URLAPI_OBJECT')"
+# Read from the summary only when the summary may be consulted. The keys are
+# the lowercase-dashed names build-reference.sh writes.
+if [ "${REFERENCE_FACTS_TRUST}" = 'trusted' ]; then
+  if [ -z "${REFERENCE_URLAPI_OBJECT}" ]; then
+    REFERENCE_URLAPI_OBJECT="$(read_fact "${REFERENCE_FACTS}" \
+      'reference-urlapi-object')"
+
+    # And the bytes at that path must be the bytes that run recorded. This is
+    # the oracle: every verdict below is a comparison against its symbol table,
+    # so an object that has been replaced since would make the whole run
+    # describe something nobody built. Refused rather than inspected.
+    if [ -n "${REFERENCE_URLAPI_OBJECT}" ] &&
+       [ -r "${REFERENCE_URLAPI_OBJECT}" ]; then
+      if ! digest_complaint="$(artifact_matches_digest \
+           "${REFERENCE_URLAPI_OBJECT}" "${REFERENCE_FACTS}" \
+           'reference-urlapi-object-sha256')"; then
+        warn "${digest_complaint}"
+        die "the oracle object does not match the digest \
+${REFERENCE_FACTS} recorded for it, so it is not the object that run \
+extracted. Every verdict this script produces is a comparison against its \
+symbol table, so nothing here would mean anything. Rerun \
+scripts/build-reference.sh"
+      fi
+    fi
+  fi
+  if [ -z "${REFERENCE_ARCHIVE}" ]; then
+    REFERENCE_ARCHIVE="$(read_fact "${REFERENCE_FACTS}" 'reference-archive')"
+
+    # The archive is used by the collision pre-check, which asks what the mode
+    # A link would resolve. Same reasoning, same refusal.
+    if [ -n "${REFERENCE_ARCHIVE}" ] && [ -r "${REFERENCE_ARCHIVE}" ]; then
+      if ! digest_complaint="$(artifact_matches_digest \
+           "${REFERENCE_ARCHIVE}" "${REFERENCE_FACTS}" \
+           'reference-archive-sha256')"; then
+        warn "${digest_complaint}"
+        die "the reference archive does not match the digest \
+${REFERENCE_FACTS} recorded for it. The collision pre-check asks what the \
+mode A link would resolve, and an archive nobody in this workflow built \
+cannot answer that. Rerun scripts/build-reference.sh"
+      fi
+    fi
+  fi
 fi
-if [ -z "${REFERENCE_ARCHIVE}" ]; then
-  REFERENCE_ARCHIVE="$(read_fact "${REFERENCE_FACTS}" 'REFERENCE_ARCHIVE')"
+
+# Whether the Rust build used the two configurations acceptance criteria A1 and
+# A2 name. The symbol sets compared below -- eight in mode A, ten in mode B --
+# are the sets those two configurations produce; a build with a different IDN
+# backend or an extra feature is a different contract, and comparing it against
+# these numbers tests the wrong thing.
+#
+# Refused by default, permitted under --allow-partial with the consequence
+# stated, because somebody deliberately checking a non-canonical configuration
+# is a legitimate thing to be doing and the gate should say what it is looking
+# at rather than pretend.
+CANONICAL_STATE='not-recorded'
+if [ "${RUST_FACTS_TRUST}" = 'trusted' ]; then
+  CANONICAL_STATE="$(read_fact "${RUST_FACTS}" 'canonical-configurations')"
+  case "${CANONICAL_STATE}" in
+    yes)
+      note 'Rust configurations: the two canonical ones A1 and A2 name'
+      ;;
+    *)
+      if [ "${ALLOW_PARTIAL}" = '1' ]; then
+        warn "${RUST_FACTS} records canonical-configurations=\
+${CANONICAL_STATE:-none}, so the archives below were not built in the two \
+configurations acceptance criteria A1 and A2 name. --allow-partial permits \
+that; the eight and ten symbol counts checked here are the counts those two \
+configurations produce, so a disagreement may be the configuration rather \
+than the port"
+      else
+        summary 'canonical-configurations' "${CANONICAL_STATE:-none}"
+        die "${RUST_FACTS} records canonical-configurations=\
+${CANONICAL_STATE:-none}. The symbol sets this script compares -- eight in \
+mode A, ten in mode B -- are the sets the two canonical configurations \
+produce, so comparing a build made with another IDN backend or an extra \
+feature against them tests the wrong contract. Run scripts/build-rust.sh \
+with no --idn-backend and no --features, or pass --allow-partial to check a \
+non-canonical build deliberately"
+      fi
+      ;;
+  esac
 fi
+summary 'canonical-configurations' "${CANONICAL_STATE:-none}"
 
 # The archive, when neither an override nor the summary file named a readable
 # one. Searched for rather than assumed: the CMake build puts it at
@@ -879,8 +1606,33 @@ $(tr '\n' ' ' < "${SCRATCH}/ar-t.err")"
   # The pattern is deliberately wider than the anchored one used to find the
   # archive: a member whose name merely contains urlapi is still a candidate
   # worth reporting, and reporting it is the whole value of this function.
-  grep -E 'urlapi' "${members}" > "${matches}" || true
+  #
+  # It is wider in one direction only. A candidate must still be a BARE FILE
+  # NAME: letters, digits, dot, underscore, plus and dash, with no slash and no
+  # dot-dot anywhere in it. That is not decoration. The name discovered here
+  # was previously handed straight to "ar x", which writes into the current
+  # directory using the member name as a relative path -- so a member called
+  # ../../lib/urlapi.c, in an archive an environment override pointed this
+  # script at, would have been extracted OUTSIDE the scratch directory and over
+  # a pre-existing file. The anchored pattern refuses that shape outright, and
+  # the extraction below no longer uses the name as a path at all.
+  grep -E '^[A-Za-z0-9._+-]*urlapi[A-Za-z0-9._+-]*$' "${members}" \
+    > "${matches}" || true
   count="$(wc -l < "${matches}" | tr -d ' ')"
+
+  # A name that contains urlapi but is not a bare file name is reported rather
+  # than silently dropped, because "no member matched" and "a member matched
+  # and was refused" want different reactions from a reader.
+  if [ "${count}" -eq 0 ] && grep -q -E 'urlapi' "${members}"; then
+    printf 'check-abi.sh: %s\n' \
+      "members of ${archive} contain urlapi but none is a bare file name:" >&2
+    grep -E 'urlapi' "${members}" | sed 's/^/  /' >&2
+    die "a member name with a slash or a dot-dot in it is refused rather than \
+extracted: ar uses the member name as a relative path, so such a name would \
+write outside the scratch directory. A libcurl archive built from \
+lib/Makefile.inc:267 names its members after their source files, giving \
+urlapi.c.o, urlapi.o or libcurl_la-urlapi.o, none of which has either"
+  fi
 
   if [ "${count}" -ne 1 ]; then
     printf 'check-abi.sh: %s members of %s match urlapi:\n' \
@@ -995,7 +1747,7 @@ then
   C_OBJECT="${REFERENCE_URLAPI_OBJECT}"
   REFERENCE_SOURCE='extracted-by-build-reference'
   REFERENCE_MEMBER="$(read_fact "${REFERENCE_FACTS}" \
-    'REFERENCE_URLAPI_MEMBER')"
+    'reference-urlapi-member')"
   note "object:  ${C_OBJECT}"
   note "member:  ${REFERENCE_MEMBER:-not recorded, the object was named \
 directly}"
@@ -1005,20 +1757,31 @@ elif [ -n "${REFERENCE_ARCHIVE}" ] && [ -r "${REFERENCE_ARCHIVE}" ]; then
   REFERENCE_MEMBER="$(discover_member "${REFERENCE_ARCHIVE}")"
   note "member:  ${REFERENCE_MEMBER}"
 
-  # ar x extracts into the CURRENT directory and offers --output only in
-  # newer binutils, so the extraction is done from inside the scratch
-  # directory in a subshell. The subshell is what keeps the cd from leaking
-  # into the rest of the script, which would silently relocate every relative
-  # path after this point.
-  (
-    cd "${SCRATCH}" &&
-    ar x "${REFERENCE_ARCHIVE}" "${REFERENCE_MEMBER}"
-  ) || die "could not extract ${REFERENCE_MEMBER} from ${REFERENCE_ARCHIVE}"
-
-  if [ ! -f "${SCRATCH}/${REFERENCE_MEMBER}" ]; then
-    die "ar reported success but ${SCRATCH}/${REFERENCE_MEMBER} is not there"
+  # ar p, not ar x, and the difference is a safety property rather than a
+  # convenience.
+  #
+  # ar x writes into the CURRENT directory using the MEMBER NAME as a relative
+  # path, which is why the old form had to cd into the scratch directory in a
+  # subshell first -- and why a member called ../../lib/urlapi.c would have
+  # landed outside that directory and over a pre-existing file. ar p writes the
+  # member to standard output instead, so THIS script chooses the destination
+  # and the member name never reaches the filesystem. The name is also required
+  # to be a bare file name by discover_member() above; the two together mean
+  # there is no path for a hostile name to travel down.
+  #
+  # The destination is fixed rather than named after the member, so that
+  # everything downstream refers to one path whatever the archive called its
+  # member.
+  C_OBJECT="${SCRATCH}/urlapi-reference.o"
+  fresh_path "${C_OBJECT}"
+  if ! ar p "${REFERENCE_ARCHIVE}" "${REFERENCE_MEMBER}" > "${C_OBJECT}"; then
+    die "could not read ${REFERENCE_MEMBER} out of ${REFERENCE_ARCHIVE}"
   fi
-  C_OBJECT="${SCRATCH}/${REFERENCE_MEMBER}"
+
+  if [ ! -s "${C_OBJECT}" ]; then
+    die "ar reported success but ${C_OBJECT} is empty, so ${REFERENCE_MEMBER} \
+carried no content"
+  fi
 elif [ "${ALLOW_COMPILE_FALLBACK}" = '1' ]; then
   REFERENCE_SOURCE='compiled-here'
   compile_reference_object "${C_OBJECT}"
@@ -1154,6 +1917,9 @@ note 'the C side matches the eight-symbol drop-in contract'
 case "${C_OBJECT}" in
   "${SCRATCH}"/*)
     mkdir -p "${BUILD}/abi"
+    # Cleared before the copy: the destination is a predictable path, and cp
+    # onto an existing symlink writes through it. See fresh_path().
+    fresh_path "${BUILD}/abi/urlapi-reference.o"
     if cp "${C_OBJECT}" "${BUILD}/abi/urlapi-reference.o"; then
       C_OBJECT_RECORDED="${BUILD}/abi/urlapi-reference.o"
     else
@@ -1204,11 +1970,19 @@ rust_artifact() {
     return 0
   fi
 
-  # Cargo's own output directory, the last resort. Only Cargo's archive and
-  # shared object can ever be there: the canonical drop-in archive is
-  # produced by a second, explicitly driven pass, so its absence from
-  # target/release is not an oversight.
-  if [ -r "${CRATE_DIR}/target/release/${name}" ]; then
+  # Cargo's own output directory, the last resort -- and only when the caller
+  # accepted an unverified inspection. Only Cargo's archive and shared object
+  # can ever be there: the canonical drop-in archive is produced by a second,
+  # explicitly driven pass, so its absence from target/release is not an
+  # oversight.
+  #
+  # Gated on --allow-partial because a file at this path has no provenance at
+  # all: the target tree is reusable and persistent, so it may hold an artifact
+  # from any earlier build in any configuration. That is exactly what somebody
+  # debugging a single symbol by hand wants to look at, and exactly what a gate
+  # must not silently certify.
+  if [ "${ALLOW_PARTIAL}" = '1' ] &&
+     [ -r "${CRATE_DIR}/target/release/${name}" ]; then
     printf '%s\n' "${CRATE_DIR}/target/release/${name}"
     return 0
   fi
@@ -1476,49 +2250,243 @@ summary 'mode-b-staticlib-verdict' "${MODE_B_RAW_VERDICT}"
 summary 'standalone-symbol-count' "${STANDALONE_COUNT}"
 
 # ------------------------------------------------------------------------
-# The shared object, as a second and independent confirmation
+# The shared objects, as a second and independent confirmation
 #
 # Symbol visibility differs between crate types. A cdylib exposes symbols the
 # way an executable does, so only the #[no_mangle] extern "C" items reach its
-# dynamic symbol table: an ordinary `pub fn` does not. That makes the shared
+# dynamic symbol table: an ordinary `pub fn` does not. That makes a shared
 # object a confirmation arrived at through a DIFFERENT mechanism than the
 # archive check rather than a repetition of it -- the archive check reads what
 # the compiler emitted, this reads what the linker decided to publish.
 #
-# Only mode B has a shared object to check. In mode A the crate imports
-# libcurl's own Curl_get_scheme and Curl_getn_scheme, which are
-# libcurl-private and never reach a shared libcurl's dynamic symbol table, so
-# a cdylib built in that configuration cannot load and
-# scripts/build-rust.sh records it as not-a-deliverable rather than as an
-# artifact. Its absence is therefore not a fault and is not reported as one.
+# EVERY shared object is checked, in all three configurations, because every
+# one of them has an export set that has to be exactly right:
+#
+#   mode A, static drop-in  eight names, the drop-in list, and it additionally
+#                           IMPORTS Curl_get_scheme and Curl_getn_scheme
+#   mode B, standalone      ten names, the standalone list
+#   mode C, shared drop-in  eight names, the drop-in list, and closed
+#
+# Mode A's imports are the part that used to go unchecked, and they are the
+# reason this section grew a second assertion. Those two names are
+# libcurl-private (lib/url.h:76-77) and resolve only in a link where url.c.o
+# takes part, so that object does not load on its own -- but it is not
+# therefore unverifiable. Its contract is the one lib/urlapi.o already has,
+# narrowed: the reference object leaves seventeen Curl_*/curl_* names
+# undefined and this one leaves two, both of them in that seventeen. Both
+# halves are asserted below against the reference object rather than taken on
+# trust, and mode C is the configuration that closes the link while keeping
+# the same eight exports, which is the shared half of G1.
 # ------------------------------------------------------------------------
 
-step 'The shared object'
+step 'The shared objects'
 
-MODE_B_SHARED="$(rust_artifact "${MODE_B_SHARED:-}" 'mode-b-shared-object' \
-  'b' "${SHARED}")"
+# The non-system imports of a shared object: every undefined dynamic symbol in
+# the curl_ or Curl_ namespace. Everything else an undefined dynamic symbol can
+# be here is a real NEEDED dependency -- libc, libgcc, libidn2 -- and those are
+# not the crate's business.
+#
+#   $1  the shared object
+#   $2  the file to write the C-sorted list to
+#
+# Returns non-zero only when nm could not read the object.
+shared_curl_imports() {
+  local object="${1}"
+  local out="${2}"
+  local raw="${out}.nm"
+  local err="${out}.err"
 
-SHARED_VERDICT='skip'
-if [ -n "${MODE_B_SHARED}" ] && [ -r "${MODE_B_SHARED}" ]; then
-  if check_artifact 'mode B shared object, dynamic symbol table' \
-     'mode-b-shared' "${MODE_B_SHARED}" "${STANDALONE_LIST}" 'dynamic' \
-     'standalone'; then
+  : > "${out}"
+  if ! nm -g --undefined-only -PD "${object}" > "${raw}" 2> "${err}"; then
+    warn "nm could not read the dynamic symbols of ${object}: \
+$(tr '\n' ' ' < "${err}")"
+    return 1
+  fi
+
+  # -P prints "name type value size" and an undefined symbol has type U, so
+  # the name is field one. A versioned name arrives as sym@VER, and the @ and
+  # everything after it is dropped so that idn2_free@IDN2_0.0.0 and a bare
+  # idn2_free compare equal; a C identifier cannot contain @, so the cut
+  # cannot truncate a real name. LC_ALL=C for the same reason as everywhere
+  # else here: only in the C locale do Curl_ names sort ahead of curl_ ones.
+  awk '/:$/ { next } { sub(/@.*$/, "", $1); print $1 }' "${raw}" |
+    LC_ALL=C grep -E '^(curl_|Curl_)' | LC_ALL=C sort -u > "${out}" || true
+  return 0
+}
+
+# One shared object's dynamic export set.
+#
+#   $1  the mode tag, a, b or c
+#   $2  the required symbol list file
+#   $3  the label for the required column
+#
+# Reports through pass/fail/skip and leaves the verdict in SHARED_VERDICT and
+# the resolved path in SHARED_OBJECT. Two globals rather than a printed value,
+# deliberately: pass(), fail(), skip() and check_artifact() all write the
+# listing a reader needs to stdout, and capturing this function's output in a
+# command substitution would swallow every one of those lines.
+SHARED_VERDICT=''
+SHARED_OBJECT=''
+check_shared() {
+  local tag="${1}"
+  local required="${2}"
+  local required_label="${3}"
+  local variable="MODE_${tag^^}_SHARED"
+
+  SHARED_VERDICT='skip'
+  SHARED_OBJECT="$(rust_artifact "${!variable:-}" \
+    "mode-${tag}-shared-object" "${tag}" "${SHARED}")"
+  summary "mode-${tag}-shared-object" "${SHARED_OBJECT:-none}"
+
+  if [ -z "${SHARED_OBJECT}" ] || [ ! -r "${SHARED_OBJECT}" ]; then
+    skip "mode ${tag^^} shared object: not found. Every configuration builds \
+one, so this means that configuration has not been built here yet"
+    return 0
+  fi
+
+  if check_artifact "mode ${tag^^} shared object, dynamic symbol table" \
+     "mode-${tag}-shared" "${SHARED_OBJECT}" "${required}" 'dynamic' \
+     "${required_label}"; then
     SHARED_VERDICT='pass'
   else
     SHARED_VERDICT='fail'
   fi
-else
-  skip "mode B shared object: not found. It is a deliverable only in the \
-standalone configuration, so this is expected when only mode A was built"
-fi
+}
 
-note 'the mode A shared object is deliberately not checked: with'
-note 'scheme-table off the crate imports two libcurl-private symbols that'
-note 'only a static link can resolve, so that cdylib is not a deliverable'
+check_shared 'a' "${EXPECTED_LIST}" 'C oracle'
+summary 'mode-a-shared-verdict' "${SHARED_VERDICT}"
+MODE_A_SHARED_PATH="${SHARED_OBJECT}"
 
-summary 'mode-b-shared-object' "${MODE_B_SHARED:-none}"
+check_shared 'b' "${STANDALONE_LIST}" 'standalone'
 summary 'mode-b-shared-verdict' "${SHARED_VERDICT}"
 
+check_shared 'c' "${EXPECTED_LIST}" 'C oracle'
+summary 'mode-c-shared-verdict' "${SHARED_VERDICT}"
+MODE_C_SHARED_PATH="${SHARED_OBJECT}"
+
+# ------------------------------------------------------------------------
+# The import contracts of the two drop-in shared objects
+#
+# The export sets above say what each object publishes. These say what each
+# one still needs, which is the half the earlier version of this script left
+# unchecked and the half G1's "linkable in place of lib/urlapi.o" turns on.
+#
+# Mode A must import exactly the two scheme entry points, and each of them
+# must be DEFINED by the reference libcurl archive -- otherwise a drop-in link
+# against that archive would leave the reference unresolved. Mode C must import
+# nothing in either namespace at all, which is what makes it loadable.
+# ------------------------------------------------------------------------
+
+step 'The shared objects, import contracts'
+
+SCHEME_IMPORT_LIST="${SCRATCH}/scheme-imports.txt"
+write_symbol_list "${SCHEME_IMPORT_LIST}" Curl_get_scheme Curl_getn_scheme
+
+EMPTY_IMPORT_LIST="${SCRATCH}/no-imports.txt"
+: > "${EMPTY_IMPORT_LIST}"
+
+IMPORT_A_VERDICT='skip'
+if [ -n "${MODE_A_SHARED_PATH}" ] && [ -r "${MODE_A_SHARED_PATH}" ]; then
+  OBSERVED_A="${SCRATCH}/mode-a-imports.txt"
+  if shared_curl_imports "${MODE_A_SHARED_PATH}" "${OBSERVED_A}"; then
+    if compare_symbol_sets 'mode A shared object, curl imports' \
+       'mode-a-imports' "${SCHEME_IMPORT_LIST}" "${OBSERVED_A}"; then
+      IMPORT_A_VERDICT='pass'
+    else
+      IMPORT_A_VERDICT='fail'
+    fi
+  else
+    fail "mode A shared object: its dynamic imports could not be read"
+    IMPORT_A_VERDICT='fail'
+  fi
+else
+  skip 'mode A shared object: not found, so its import contract is unchecked'
+fi
+summary 'mode-a-shared-import-verdict' "${IMPORT_A_VERDICT}"
+
+IMPORT_C_VERDICT='skip'
+if [ -n "${MODE_C_SHARED_PATH}" ] && [ -r "${MODE_C_SHARED_PATH}" ]; then
+  OBSERVED_C="${SCRATCH}/mode-c-imports.txt"
+  if shared_curl_imports "${MODE_C_SHARED_PATH}" "${OBSERVED_C}"; then
+    if compare_symbol_sets 'mode C shared object, curl imports' \
+       'mode-c-imports' "${EMPTY_IMPORT_LIST}" "${OBSERVED_C}"; then
+      IMPORT_C_VERDICT='pass'
+    else
+      IMPORT_C_VERDICT='fail'
+    fi
+  else
+    fail "mode C shared object: its dynamic imports could not be read"
+    IMPORT_C_VERDICT='fail'
+  fi
+else
+  skip 'mode C shared object: not found, so its import contract is unchecked'
+fi
+summary 'mode-c-shared-import-verdict' "${IMPORT_C_VERDICT}"
+
+# The property mode A's contract actually rests on, asserted rather than
+# asserted-about: every name that object imports is DEFINED by the reference
+# libcurl archive, so the link a drop-in is consumed in resolves it. Both names
+# are declared side by side at lib/url.h:76-77 and defined in lib/url.c, the
+# NUL-terminated entry point at its 1469-1472 and the length-bounded sibling it
+# forwards to at its 1477.
+#
+# This is a different claim from "the predecessor leaves it undefined too", and
+# the difference is worth stating because only one of the two is true of both
+# names. lib/urlapi.c reaches the scheme table through Curl_get_scheme only,
+# always having a NUL-terminated scheme string to hand; the port also reaches
+# Curl_getn_scheme, because it has places where the scheme is a bounded slice
+# and passing a length is what avoids materialising a copy. So Curl_get_scheme
+# is among the names the C object leaves to the link and Curl_getn_scheme is
+# not -- while both are supplied by the same libcurl, from the same file, and
+# the port's two-name import set is far smaller than the seventeen-name one it
+# replaces. The counted comparison below reports both figures.
+PROVIDER_VERDICT='skip'
+if [ -n "${REFERENCE_ARCHIVE:-}" ] && [ -r "${REFERENCE_ARCHIVE:-}" ]; then
+  REFERENCE_DEFINED="${SCRATCH}/reference-archive-defined.txt"
+  if nm_defined "${REFERENCE_ARCHIVE}" "${REFERENCE_DEFINED}"; then
+    PROVIDER_VERDICT='pass'
+    while IFS= read -r symbol; do
+      if ! LC_ALL=C grep -q -x -F "${symbol}" "${REFERENCE_DEFINED}"; then
+        fail "mode A shared object imports ${symbol}, which \
+${REFERENCE_ARCHIVE} does not define. A drop-in link against that archive \
+would leave the reference unresolved, so the import contract does not hold"
+        PROVIDER_VERDICT='fail'
+      fi
+    done < "${SCHEME_IMPORT_LIST}"
+    if [ "${PROVIDER_VERDICT}" = 'pass' ]; then
+      pass "both names mode A imports are defined by ${REFERENCE_ARCHIVE}, so \
+the drop-in link resolves them"
+    fi
+  else
+    fail "mode A import provider check: the symbol table of \
+${REFERENCE_ARCHIVE} could not be read"
+    PROVIDER_VERDICT='fail'
+  fi
+else
+  skip 'no reference archive, so the import provider check is skipped'
+fi
+summary 'shared-import-provider-verdict' "${PROVIDER_VERDICT}"
+
+# The counted comparison, reported and not asserted. It is the figure that
+# makes "narrowed" a measurement rather than a claim: how many curl_/Curl_
+# names the C object being replaced leaves to the link, against the two this
+# object does. No verdict, because a change in either count is a fact about
+# libcurl's internals rather than a defect in this crate.
+if [ -n "${C_OBJECT:-}" ] && [ -r "${C_OBJECT:-}" ]; then
+  REFERENCE_UNDEFINED="${SCRATCH}/reference-undefined.txt"
+  nm -g --undefined-only -P "${C_OBJECT}" 2> /dev/null |
+    awk '/:$/ { next } { print $1 }' |
+    LC_ALL=C grep -E '^(curl_|Curl_)' |
+    LC_ALL=C sort -u > "${REFERENCE_UNDEFINED}" || true
+  REFERENCE_UNDEFINED_COUNT="$(wc -l < "${REFERENCE_UNDEFINED}" | tr -d ' ')"
+  note "${C_OBJECT} leaves ${REFERENCE_UNDEFINED_COUNT} curl_/Curl_ names to"
+  note '  the link; the mode A shared object leaves 2, and the crate'
+  note '  re-implements the rest internally. Full list:'
+  note "  ${REFERENCE_UNDEFINED}"
+  summary 'reference-object-curl-imports' "${REFERENCE_UNDEFINED_COUNT}"
+else
+  summary 'reference-object-curl-imports' 'not-measured'
+fi
 # ------------------------------------------------------------------------
 # The link collision pre-check
 #
@@ -1539,20 +2507,70 @@ step 'The mode A link collision pre-check'
 
 COLLISION_VERDICT='skip'
 
+# Named before the chain below, because the nm invocation that writes them is
+# one of that chain's conditions and a condition cannot declare its own
+# variables.
+COLLISION_NM_OUT="${SCRATCH}/reference-all.nm"
+COLLISION_NM_ERR="${SCRATCH}/reference-all.nm.err"
+
 if [ "${CHECK_COLLISION}" != '1' ]; then
   skip 'link collision pre-check: --no-collision was given'
 elif [ -z "${REFERENCE_ARCHIVE}" ] || [ ! -r "${REFERENCE_ARCHIVE}" ]; then
   skip "link collision pre-check: it needs the whole reference archive, and \
 only the urlapi object is available in this run"
+elif ! nm -g --defined-only -P "${REFERENCE_ARCHIVE}" \
+     > "${COLLISION_NM_OUT}" 2> "${COLLISION_NM_ERR}"; then
+  # THE STATUS IS CHECKED, and the reason is arithmetic rather than caution.
+  # This used to read "|| true", which turned an unreadable archive or a broken
+  # nm into an empty symbol list -- and the comparison below is an
+  # intersection, which is empty whenever either side is. So the check reported
+  # "nothing is defined on both sides", the single most reassuring answer it
+  # has, for the one input where it had established nothing at all.
+  #
+  # A failure, therefore, and not a skip: a skip says "this could not be
+  # checked", which is true but leaves the exit status to the skip policy,
+  # whereas an unreadable reference archive is a broken workflow whatever the
+  # policy. stderr is kept and quoted, because "nm failed" is not actionable
+  # and "nm said the file format is not recognised" is.
+  fail "link collision pre-check: nm could not read ${REFERENCE_ARCHIVE}: \
+$(tr '\n' ' ' < "${COLLISION_NM_ERR}")"
+  COLLISION_VERDICT='fail'
 else
+  # The member name, discovered here if it is not already known.
+  #
+  # THIS IS NOT REDUNDANT with the discovery on the archive-member branch
+  # above, and the case it covers used to produce a confident, wrong answer.
+  # When the oracle object arrives from REFERENCE_URLAPI_OBJECT -- an override,
+  # or a summary that recorded the already-extracted object -- that branch
+  # never runs, so REFERENCE_MEMBER could still be empty here. The awk filter
+  # below then had nothing to exclude, so every symbol of the urlapi member
+  # stayed in the "everything else" set, and the comparison reported the eight
+  # names the port is REQUIRED to define as collisions and exited 1. A gate
+  # that fails on correct input is as useless as one that passes on incorrect
+  # input.
+  #
+  # The archive is what this check reads, so the member has to be discovered
+  # from the archive whenever the archive is used, whatever supplied the
+  # object.
+  if [ -z "${REFERENCE_MEMBER}" ]; then
+    note 'the urlapi member was not recorded, so it is discovered from the'
+    note 'archive now: this comparison has to exclude that member, and'
+    note 'excluding nothing would report the drop-in symbols themselves'
+    REFERENCE_MEMBER="$(discover_member "${REFERENCE_ARCHIVE}")"
+    note "member:  ${REFERENCE_MEMBER}"
+    summary 'collision-member-source' 'discovered-here'
+  else
+    summary 'collision-member-source' 'already-known'
+  fi
+
   # Every global defined by the reference archive EXCEPT those defined by the
-  # urlapi member. nm's own archive member headers are what makes this
-  # possible in one pass: each header names the member the following symbols
-  # belong to, so the urlapi member's block can be stepped over without
-  # invoking nm once per member.
+  # urlapi member. nm's own archive member headers are what makes this possible
+  # in one pass: each header names the member the following symbols belong to,
+  # so the urlapi member's block can be stepped over without invoking nm once
+  # per member. The listing was produced -- successfully, which the chain above
+  # established -- by the nm invocation in the elif.
   OTHERS="${SCRATCH}/reference-others.txt"
-  nm -g --defined-only -P "${REFERENCE_ARCHIVE}" \
-    > "${SCRATCH}/reference-all.nm" 2> /dev/null || true
+
   awk -v skip="[${REFERENCE_MEMBER}]:" '
     /:$/ {
       # A member header. From here to the next header the symbols belong to
@@ -1561,16 +2579,25 @@ else
       next
     }
     NF >= 3 && !skipping { print $1 }
-  ' "${SCRATCH}/reference-all.nm" | LC_ALL=C sort -u > "${OTHERS}"
+  ' "${COLLISION_NM_OUT}" | LC_ALL=C sort -u > "${OTHERS}"
 
   OTHERS_COUNT="$(wc -l < "${OTHERS}" | tr -d ' ')"
   note "the reference archive without ${REFERENCE_MEMBER:-the urlapi member} \
 defines ${OTHERS_COUNT} globals"
 
   if [ "${OTHERS_COUNT}" -eq 0 ]; then
-    skip "link collision pre-check: the reference archive reported no \
-symbols outside the urlapi member, which means it could not be read the way \
-this check needs"
+    # nm succeeded and still reported nothing outside the urlapi member, which
+    # cannot be true of a 178-member libcurl archive. A failure for the same
+    # arithmetic reason as the nm failure above: the intersection below would
+    # be empty and would read as "no collisions", which is the reassuring
+    # answer arrived at from no evidence.
+    fail "link collision pre-check: nm read ${REFERENCE_ARCHIVE} but reported \
+no globals outside ${REFERENCE_MEMBER:-the urlapi member}. A libcurl archive \
+defines thousands, so either the archive is not a libcurl archive or every \
+member carries intermediate representation rather than a symbol table, which \
+is what link-time optimization produces. Comparing against nothing would \
+report no collisions from no evidence"
+    COLLISION_VERDICT='fail'
   else
     # The Rust side of the comparison. The canonical archive is used whole,
     # because it has already been reduced to the ABI. For Cargo's staticlib
@@ -1716,23 +2743,38 @@ fi
 
 if [ "${CHECKS_SKIPPED}" -gt 0 ] && [ "${STRICT}" = '1' ]; then
   say ''
-  die "${CHECKS_SKIPPED} check(s) were skipped and --strict was given. Each \
-skip is named above with what would make it run; scripts/build-rust.sh \
-building both configurations and scripts/build-reference.sh producing the \
-archive is what makes every check in this script run"
+  die "${CHECKS_SKIPPED} check(s) could not run. This is a GATE, so that is a \
+failure and not a footnote: run-parity.sh links the Rust archive in place of \
+${REFERENCE_MEMBER:-the urlapi object} and diffs behaviour on the strength of \
+what this script says, and a check that did not run has agreed to nothing. \
+Each skip is named above with what would make it run; \
+scripts/build-reference.sh producing the archive and scripts/build-rust.sh \
+building both configurations is what makes every check here run. Pass \
+--allow-partial to accept an incomplete gate deliberately"
 fi
 
+# The verdict, decided here and nowhere else: after every check has had its
+# chance to fail and after the skip tally has been judged. publish_summary() is
+# the only writer of the result line, so the file carries exactly one verdict.
 RESULT='pass'
-summary 'result' 'pass'
+publish_summary "${RESULT}" || die "could not publish ${SUMMARY}"
 
 say ''
 if [ "${CHECKS_SKIPPED}" -gt 0 ]; then
-  say "check-abi.sh: the symbol sets agree. ${CHECKS_PASSED} check(s) \
-passed and ${CHECKS_SKIPPED} were skipped; --strict would have failed on the \
-skips."
+  # Reachable only under --allow-partial, since otherwise a skip has already
+  # failed the run above. The wording is deliberately not reassuring: the
+  # sentence a reader must not be able to take away from a partial run is "the
+  # symbol sets agree", because the sets that were not compared are exactly the
+  # ones nobody looked at.
+  say "check-abi.sh: PARTIAL. ${CHECKS_PASSED} check(s) passed and \
+${CHECKS_SKIPPED} could not run, which --allow-partial permitted. The \
+surface is verified only as far as the checks that ran: what the skipped \
+ones cover is unknown, not agreed. Run scripts/build-reference.sh and \
+scripts/build-rust.sh and then this script without --allow-partial before \
+drawing any conclusion from run-parity.sh."
 else
-  say "check-abi.sh: the symbol sets agree, all ${CHECKS_PASSED} checks \
-passed. The Rust archive exports exactly what the object built from \
+  say "check-abi.sh: the symbol sets agree, all ${CHECKS_PASSED} checks ran \
+and passed. The Rust archive exports exactly what the object built from \
 lib/urlapi.c exports, so run-parity.sh can now link it and compare \
 behaviour."
 fi

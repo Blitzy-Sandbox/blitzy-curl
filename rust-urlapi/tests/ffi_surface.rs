@@ -3110,7 +3110,15 @@ fn a_failed_whole_url_set_changes_nothing() {
 #[cfg(feature = "strerror")]
 #[test]
 fn curl_url_strerror_returns_the_c_messages() {
-    use curl_urlapi_rs::abi::CURLUE_LAST;
+    // Named imports rather than a glob, per AAP 0.4.3, and placed here rather
+    // than at file scope because the whole test is gated on the `strerror`
+    // feature: a file-scope import of a name only this test reads would be an
+    // unused import in the drop-in configuration.
+    use curl_urlapi_rs::abi::{
+        CURLUE_BAD_FILE_URL, CURLUE_BAD_FRAGMENT, CURLUE_BAD_LOGIN, CURLUE_BAD_PASSWORD,
+        CURLUE_BAD_PATH, CURLUE_BAD_QUERY, CURLUE_BAD_SLASHES, CURLUE_BAD_USER, CURLUE_LACKS_IDN,
+        CURLUE_LAST, CURLUE_OUT_OF_MEMORY, CURLUE_URLDECODE,
+    };
 
     fn message(code: CURLUcode) -> &'static str {
         // SAFETY: `curl_url_strerror` returns a pointer to a NUL-terminated
@@ -3127,50 +3135,115 @@ fn curl_url_strerror_returns_the_c_messages() {
             .expect("the message table is ASCII")
     }
 
-    // A spread across the table, transcribed from lib/strerror.c.
-    assert_eq!(message(CURLUE_OK), "No error");
+    // The whole table, transcribed row for row from lib/strerror.c L423-L521,
+    // and complete rather than a sample. A subset checked exactly with the rest
+    // checked only for being non-empty lets a wrong-but-plausible message
+    // through, which is the one defect a message table can have: 33 rows, one
+    // per code the enumeration defines plus the sentinel, each with the bytes
+    // the C returns.
+    //
+    // Written in declaration order and cross-checked against the ordinal below,
+    // so the table is also a second, independent statement of the numbering that
+    // include/curl/urlapi.h L34-L68 leaves implicit. A row inserted or removed
+    // by a later edit fails on the ordinal, not merely on the message.
+    const MESSAGES: [(CURLUcode, &str); 33] = [
+        (CURLUE_OK, "No error"),
+        (
+            CURLUE_BAD_HANDLE,
+            "An invalid CURLU pointer was passed as argument",
+        ),
+        (
+            CURLUE_BAD_PARTPOINTER,
+            "An invalid 'part' argument was passed as argument",
+        ),
+        (CURLUE_MALFORMED_INPUT, "Malformed input to a URL function"),
+        (
+            CURLUE_BAD_PORT_NUMBER,
+            "Port number was not a decimal number between 0 and 65535",
+        ),
+        (CURLUE_UNSUPPORTED_SCHEME, "Unsupported URL scheme"),
+        (
+            CURLUE_URLDECODE,
+            "URL decode error, most likely because of rubbish in the input",
+        ),
+        (CURLUE_OUT_OF_MEMORY, "A memory function failed"),
+        (
+            CURLUE_USER_NOT_ALLOWED,
+            "Credentials was passed in the URL when prohibited",
+        ),
+        (
+            CURLUE_UNKNOWN_PART,
+            "An unknown part ID was passed to a URL API function",
+        ),
+        (CURLUE_NO_SCHEME, "No scheme part in the URL"),
+        (CURLUE_NO_USER, "No user part in the URL"),
+        (CURLUE_NO_PASSWORD, "No password part in the URL"),
+        (CURLUE_NO_OPTIONS, "No options part in the URL"),
+        (CURLUE_NO_HOST, "No host part in the URL"),
+        (CURLUE_NO_PORT, "No port part in the URL"),
+        (CURLUE_NO_QUERY, "No query part in the URL"),
+        (CURLUE_NO_FRAGMENT, "No fragment part in the URL"),
+        (CURLUE_NO_ZONEID, "No zoneid part in the URL"),
+        (CURLUE_BAD_FILE_URL, "Bad file:// URL"),
+        (CURLUE_BAD_FRAGMENT, "Bad fragment"),
+        (CURLUE_BAD_HOSTNAME, "Bad hostname"),
+        (CURLUE_BAD_IPV6, "Bad IPv6 address"),
+        (CURLUE_BAD_LOGIN, "Bad login part"),
+        (CURLUE_BAD_PASSWORD, "Bad password"),
+        (CURLUE_BAD_PATH, "Bad path"),
+        (CURLUE_BAD_QUERY, "Bad query"),
+        (CURLUE_BAD_SCHEME, "Bad scheme"),
+        (
+            CURLUE_BAD_SLASHES,
+            "Unsupported number of slashes following scheme",
+        ),
+        (CURLUE_BAD_USER, "Bad user"),
+        (CURLUE_LACKS_IDN, "libcurl lacks IDN support"),
+        (
+            CURLUE_TOO_LARGE,
+            "A value or data field is larger than allowed",
+        ),
+        // The sentinel. lib/strerror.c L518-L519 gives it `break`, so it reaches
+        // the fallthrough at L521 like any out-of-range value; it is listed here
+        // rather than left out so that the table spans 0..=CURLUE_LAST with no
+        // gap.
+        (CURLUE_LAST, "CURLUcode unknown"),
+    ];
+
+    let mut ordinal: CURLUcode = 0;
+    for (code, expected) in MESSAGES {
+        assert_eq!(
+            code, ordinal,
+            "the message table is out of step with the enumeration at ordinal \
+             {ordinal}; include/curl/urlapi.h L34-L68 numbers these implicitly, \
+             so a row inserted or removed here is an ABI change"
+        );
+        assert_eq!(
+            message(code),
+            expected,
+            "code {code} does not answer with the bytes lib/strerror.c returns"
+        );
+        ordinal += 1;
+    }
     assert_eq!(
-        message(CURLUE_BAD_HANDLE),
-        "An invalid CURLU pointer was passed as argument"
-    );
-    assert_eq!(
-        message(CURLUE_BAD_PARTPOINTER),
-        "An invalid 'part' argument was passed as argument"
-    );
-    assert_eq!(
-        message(CURLUE_MALFORMED_INPUT),
-        "Malformed input to a URL function"
-    );
-    assert_eq!(
-        message(CURLUE_BAD_PORT_NUMBER),
-        "Port number was not a decimal number between 0 and 65535"
-    );
-    assert_eq!(message(CURLUE_UNSUPPORTED_SCHEME), "Unsupported URL scheme");
-    assert_eq!(
-        message(CURLUE_USER_NOT_ALLOWED),
-        "Credentials was passed in the URL when prohibited"
-    );
-    assert_eq!(
-        message(CURLUE_UNKNOWN_PART),
-        "An unknown part ID was passed to a URL API function"
-    );
-    assert_eq!(message(CURLUE_NO_SCHEME), "No scheme part in the URL");
-    assert_eq!(message(CURLUE_NO_ZONEID), "No zoneid part in the URL");
-    assert_eq!(message(CURLUE_BAD_IPV6), "Bad IPv6 address");
-    assert_eq!(
-        message(CURLUE_TOO_LARGE),
-        "A value or data field is larger than allowed"
+        ordinal,
+        CURLUE_LAST + 1,
+        "the table must cover every code from CURLUE_OK to CURLUE_LAST"
     );
 
-    // Every code the enumeration defines has a real message. The range is
-    // 0..CURLUE_LAST exclusive, since the sentinel is not an error.
-    for code in 0..CURLUE_LAST {
-        let text = message(code);
-        assert!(!text.is_empty(), "code {code} has an empty message");
-        assert_ne!(
-            text, "CURLUcode unknown",
-            "code {code} is in range and must have its own message"
-        );
+    // No two in-range codes share a message, so a row copied from the wrong
+    // neighbour is caught even where both messages are individually plausible.
+    // The sentinel is excluded because it shares the fallthrough by design.
+    for (left, (left_code, left_text)) in MESSAGES.iter().enumerate() {
+        for (right_code, right_text) in MESSAGES.iter().skip(left + 1) {
+            if *left_code == CURLUE_LAST || *right_code == CURLUE_LAST {
+                continue;
+            }
+            assert_ne!(
+                left_text, right_text,
+                "codes {left_code} and {right_code} share a message"
+            );
+        }
     }
 
     // The sentinel and everything outside the range fall through, L525-L529.
@@ -3200,27 +3273,54 @@ fn curl_url_strerror_returns_the_c_messages() {
 /// `curlx_free`, which resolves to `free` in a non-memory-debug build, and
 /// `free(NULL)` is defined to do nothing.
 ///
-/// # The order: code, then null-on-error, then release
+/// # The order: code, then null-on-error, then ownership, then release
 ///
-/// Each call's code is judged **before** the buffer is touched at all, and the
-/// release is the last step rather than the first. Two rules make that safe and
-/// keep it honest:
+/// Each call's code is judged **before** the pointer is touched at all, and
+/// nothing adopts that pointer until the code has established there is
+/// something to adopt. Two rules make that safe and keep it honest:
 ///
 /// * A failing retrieval must have left the caller's slot null. `lib/urlapi.c`
 ///   L1552 writes null into it on entry, ahead of every failing return, so this
-///   is a contract the test asserts rather than an assumption it makes. A defect
-///   that returned an error alongside a stale pointer would be caught here
-///   instead of releasing that pointer.
+///   is a contract the test asserts rather than an assumption it makes -- and it
+///   is asserted *before* any owner exists. Adopting first and judging second
+///   would hand a stale or non-owned error-path pointer to an owner whose `Drop`
+///   releases it, and an unwinding assertion runs that `Drop` too, so the very
+///   assertion meant to report the defect would perform an invalid free instead.
+///   Ownership therefore begins where it actually transfers: after `CURLUE_OK`.
 /// * Every part's expectation is stated up front, so a getter that quietly
 ///   failed cannot remove itself from this test's coverage: the release path the
 ///   test exists to exercise would go unexercised and the test would still pass.
 ///   The two vectors below between them cover all eleven parts with a buffer,
 ///   and the only null the test tolerates is one it names in advance.
 ///
-/// The release itself is `Release`'s `Drop`, which is what lets it come last
-/// without becoming the thing skipped when an assertion fires: an unwind runs it
-/// too, so no path out of the helper abandons a buffer, and ownership being
-/// unique means no path releases one twice.
+/// # The release is observed, not merely performed
+///
+/// Calling `curl_free()` proves nothing on its own. An export whose body did
+/// nothing would satisfy every call below, leak every block, and leave this test
+/// and the demo transcript alike unchanged. So the test asks the allocator what
+/// the call did. [`count`] records the address of every block handed back inside
+/// a watched window, as an integer it never dereferences, which turns the
+/// question into exactly the contract's question: did *this* block go back?
+/// Three things are asserted together and each rules out a way of being fooled:
+///
+/// * the ledger did not overflow, so an absent address means "not released"
+///   rather than "not recorded";
+/// * the block's own address is on the destroyed side, which is the release
+///   `include/curl/urlapi.h` L130-L131 and `docs/libcurl/curl_url_get.md` L45
+///   name;
+/// * exactly one block was destroyed, so a release that also gave back
+///   something else -- interior storage of the still-live handle, say -- is
+///   caught rather than passed.
+///
+/// The address is taken before the release and compared as an integer
+/// afterwards. Nothing is read through the pointer once it has been given up,
+/// which is what keeps the observation sound: reading the buffer back would be a
+/// use-after-free precisely when the release worked.
+///
+/// [`count`] forwards to glibc's `__libc_*` aliases, so the observation exists
+/// only there. Elsewhere the release still happens and the exported symbol is
+/// still exercised, and `release_and_observe` carries that difference in one
+/// place instead of the whole test being written twice.
 #[cfg(feature = "cfree")]
 #[test]
 fn curl_free_releases_a_getter_buffer() {
@@ -3233,6 +3333,19 @@ fn curl_free_releases_a_getter_buffer() {
     /// called.
     struct Release(*mut c_char);
 
+    impl Release {
+        /// The address of the block, as an integer.
+        ///
+        /// For handing to [`count::Observed`], which answers questions *about* a
+        /// block without touching it, and which is the one thing that stays
+        /// meaningful after the release. Deliberately not a reborrow used for
+        /// access: nothing here dereferences an address it is only asking the
+        /// allocator about.
+        fn address(&self) -> *const c_void {
+            self.0.cast::<c_void>().cast_const()
+        }
+    }
+
     impl Drop for Release {
         fn drop(&mut self) {
             // SAFETY: `self.0` is the non-null block the getter handed over, it
@@ -3244,8 +3357,59 @@ fn curl_free_releases_a_getter_buffer() {
         }
     }
 
+    /// Releases `owned` through the exported symbol and proves the block was
+    /// destroyed.
+    ///
+    /// The address is read out first, the window is opened, the release happens,
+    /// the window closes, and only then is anything asserted -- so the
+    /// diagnostics an assertion builds cannot land in the ledger they are about
+    /// to be judged from.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn release_and_observe(owned: Release, what: CURLUPart) {
+        let address = owned.address();
+        count::watch();
+        drop(owned);
+        let freed = count::unwatch();
+
+        assert!(
+            !freed.overflowed(),
+            "the address ledger filled up while releasing part {what}, so a \
+             missing address would be indistinguishable from a block that was \
+             never given back"
+        );
+        assert!(
+            freed.destroyed(address),
+            "curl_free() did not hand part {what}'s block back to the \
+             allocator. The export has to perform the release that \
+             include/curl/urlapi.h L130-L131 names, and a body that did nothing \
+             at all would satisfy every other check here"
+        );
+        assert_eq!(
+            freed.destroyed_count(),
+            1,
+            "releasing part {what} gave back {} blocks rather than the single \
+             one it was handed, so the release is not confined to the buffer",
+            freed.destroyed_count()
+        );
+    }
+
+    /// The same release where the allocator cannot be watched.
+    ///
+    /// INVOCATION ONLY, and labelled as such rather than left to look like the
+    /// glibc variant. It exercises the exported symbol and asserts nothing about
+    /// the effect, because [`count`] rests on glibc's `__libc_*` aliases and no
+    /// sound substitute exists: reading the buffer back is a use-after-free
+    /// exactly when the release worked, and a recycling probe leaves the verdict
+    /// resting on the allocator's discretion. A no-op `curl_free()` is caught by
+    /// the glibc build, which is where this crate's parity is established.
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    fn release_and_observe(owned: Release, _what: CURLUPart) {
+        drop(owned);
+    }
+
     /// Retrieves one part, judges the code and the null-on-error contract, and
-    /// releases whatever was produced through the exported symbol.
+    /// releases whatever a **successful** retrieval produced through the
+    /// exported symbol.
     fn release_through_curl_free(
         handle: &Handle,
         what: CURLUPart,
@@ -3257,46 +3421,51 @@ fn curl_free_releases_a_getter_buffer() {
         // local in a distinct allocation, so it cannot alias the handle.
         let code = unsafe { curl_url_get(handle.as_const(), what, &mut part, CURLU_GET_EMPTY) };
 
-        // Nothing is read through the pointer and nothing is released until the
-        // code has been judged. A non-null pointer is taken into an owner
-        // immediately, so from here on the release cannot be skipped or repeated
-        // whichever assertion fires.
-        let owned = if part.is_null() {
-            None
-        } else {
-            Some(Release(part))
-        };
-
+        // The code decides, and it decides first. Nothing is read through the
+        // pointer and nothing adopts it until the code has established that this
+        // caller was given a block at all.
         assert_eq!(
             code, expected,
             "part {what} was expected to answer {expected}"
         );
-        if code == CURLUE_OK {
-            assert_eq!(
-                owned.is_some(),
-                buffer_expected,
-                "part {what} answered CURLUE_OK and {} a buffer, which is not \
-                 what this vector expects; a part that produces none exercises \
-                 no release",
-                if owned.is_some() {
-                    "produced"
-                } else {
-                    "withheld"
-                }
-            );
-        } else {
+
+        if code != CURLUE_OK {
+            // A failure hands this caller nothing, so there is nothing here to
+            // own and nothing to release. The pointer is only compared, never
+            // adopted: releasing an error-path pointer would be releasing
+            // something this caller was never given.
             assert!(
-                owned.is_none(),
+                part.is_null(),
                 "part {what} answered {code} yet stored a pointer; lib/urlapi.c \
                  L1552 nulls the caller's slot before any failing return can be \
-                 taken, so a buffer here is a contract violation and releasing \
-                 it would be releasing something this caller was never given"
+                 taken, so a buffer here is a contract violation"
             );
             assert!(
                 !buffer_expected,
                 "part {what} was expected to produce a buffer but answered {code}"
             );
+            return;
         }
+
+        assert_eq!(
+            !part.is_null(),
+            buffer_expected,
+            "part {what} answered CURLUE_OK and {} a buffer, which is not what \
+             this vector expects; a part that produces none exercises no release",
+            if part.is_null() {
+                "withheld"
+            } else {
+                "produced"
+            }
+        );
+        if part.is_null() {
+            return;
+        }
+
+        // Ownership transfers here, and only here: `CURLUE_OK` with a pointer is
+        // the one shape that makes this caller the owner, per
+        // `include/curl/urlapi.h` L130-L131.
+        release_and_observe(Release(part), what);
     }
 
     // Every one of the eleven parts is populated here, so every read succeeds
@@ -3767,11 +3936,12 @@ fn allocation_workload_round(rows: &[UrlRow], build: &[PartWrite]) -> u32 {
 /// the mallocs, callocs, reallocs, strdups and wcsdups that
 /// `tests/memanalyzer.pm` L439 adds together. The plan records that limit as
 /// implicit requirement I11 and records at 0.2.4.3 why this port cannot be put on
-/// the same scale: under the memory-debug configuration `curl_free` becomes a
-/// tracking free that validates each pointer against its own table
-/// (`lib/curl_setup.h` L1461), and a block this crate took straight from the C
-/// allocator would be rejected or mis-accounted, so the parity harness is built
-/// without it. 0.9.4 names the remedy in the same breath -- "An independent
+/// the same scale: under the memory-debug configuration `curl_free` becomes
+/// `curl_dbg_free` (`lib/curl_setup.h` L1461), which performs no lookup -- it
+/// subtracts its own header from the pointer and frees that address
+/// (`lib/memdebug.c` L362-L385) -- so a block this crate took straight from the
+/// C allocator would corrupt the heap rather than be refused, and the counter
+/// would never have seen it. The parity harness is therefore built without it. 0.9.4 names the remedy in the same breath -- "An independent
 /// allocation count via the platform's own tooling is the available substitute"
 /// -- and [`count`], which interposes `malloc`, `calloc`, `realloc` and `free`
 /// inside this test binary, is that tooling. It lives here rather than in the
@@ -4491,7 +4661,7 @@ fn allocation_cycle(url: &CStr, sets: &[PartWrite]) -> u32 {
 /// a buffer the crate allocated is accounted for and released without a `Vec` or
 /// a `String` being created to look at it.
 ///
-/// # The code is checked, not discarded
+/// # The code is checked first, and it decides whether anything is released
 ///
 /// A part being absent is an answer rather than a fault -- the workload vectors
 /// deliberately include handles with no query, no fragment and no zone
@@ -4499,9 +4669,21 @@ fn allocation_cycle(url: &CStr, sets: &[PartWrite]) -> u32 {
 /// that the code and the pointer **agree**, which is a contract rather than a
 /// preference: `lib/urlapi.c` L1552 writes null into the caller's slot on entry
 /// and every failing return sits after it, so a failing retrieval must hand back
-/// nothing. Returning 1 for a violation rather than asserting keeps the measured
-/// window free of the allocation an assertion message would make; the caller
-/// adds the result to its own tally and asserts after the window closes.
+/// nothing.
+///
+/// The order matters and is not interchangeable. The code is judged before the
+/// pointer is used for anything, and the release happens only on the
+/// `CURLUE_OK` path, because that is the only path on which ownership
+/// transferred. A defective implementation that reported an error and left a
+/// stale or non-owned pointer in the slot would otherwise have that pointer
+/// freed here -- an invalid free inside the measured window, in the one helper
+/// that runs thousands of times, which is undefined behaviour rather than a
+/// finding. The violation is reported instead: this returns 1 and releases
+/// nothing.
+///
+/// Returning a count rather than asserting keeps the measured window free of the
+/// allocation an assertion message would make; the caller adds the result to its
+/// own tally and asserts after the window closes.
 ///
 /// The reverse pairing is not an error and is not counted: `CURLUE_OK` with no
 /// buffer is what a blank part retrieved under `CURLU_GET_EMPTY` gives, taking
@@ -4512,18 +4694,20 @@ fn read_and_release(handle: *mut CurlUrl, what: CURLUPart, flags: c_uint) -> u32
     // so no unique reference is formed. `part` is a writable, aligned local in
     // this frame, so it cannot alias the handle.
     let code = unsafe { curl_url_get(handle.cast_const(), what, &mut part, flags) };
+    if code != CURLUE_OK {
+        // Nothing was handed over on this path, so nothing is released. A
+        // pointer here is the contract violation described above, reported
+        // rather than acted on.
+        return u32::from(!part.is_null());
+    }
     if part.is_null() {
         return 0;
     }
-    // SAFETY: `part` is non-null, so `curl_url_get` wrote a block it
-    // allocated through `src/alloc.rs` and handed to this caller. This is
-    // its first and only release, and nothing refers into it. It happens before
-    // the judgement below rather than after so that the buffer is accounted for
-    // whatever the judgement is -- and it is sound either way, because a pointer
-    // this caller received is this caller's to release.
+    // SAFETY: the code is `CURLUE_OK` and `part` is non-null, so `curl_url_get`
+    // wrote a block it allocated through `src/alloc.rs` and transferred to this
+    // caller. This is its first and only release, and nothing refers into it.
     unsafe { libc::free(part.cast::<c_void>()) };
-    // A pointer alongside a failure is the contract violation described above.
-    u32::from(code != CURLUE_OK)
+    0
 }
 
 /// Converts the workload's inputs, before any window opens.

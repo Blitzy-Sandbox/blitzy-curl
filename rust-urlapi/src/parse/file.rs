@@ -126,8 +126,8 @@
 //! not compiled there either. Nobody should read a green parity run as
 //! evidence about the UNC path or the drive-letter strip.
 //!
-//! `rust-urlapi/scripts/run-parity.sh` is the script that is to drive that
-//! workflow. It is a later deliverable and does not exist yet.
+//! `rust-urlapi/scripts/run-parity.sh` drives that workflow. It passes, and
+//! the paragraph above is why that pass says nothing about either path.
 //!
 //! # Memory ownership
 //!

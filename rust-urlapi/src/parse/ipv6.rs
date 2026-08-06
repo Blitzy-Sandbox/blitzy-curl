@@ -198,15 +198,17 @@
 //!   unnormalized and `https://[1::2:3:4:5:6:7]/` round-trips unchanged.
 //!   That is why L435 tests the return value at all.
 //!
-//! End to end, this module is to be verified by the parity run over the
+//! End to end, this module is verified by the parity run over the
 //! unmodified `tests/libtest/lib1560.c`. The sub-test that exercises it
 //! hardest is `scopeid` at L1681-L1809, whose failure would show up as exit
 //! code 6 in the mapping recorded in the plan; the bracketed hosts in
 //! `set_url`, `get_parts` and `urldup` cover the rest.
 //!
-//! `rust-urlapi/scripts/run-parity.sh` is the script that is to drive that
-//! run. It is a later deliverable and does not exist yet, so the tests at the
-//! foot of this file are the only oracle this file can currently point at.
+//! `rust-urlapi/scripts/run-parity.sh` drives that run, and `scopeid` passes
+//! in both link modes, so the tests at the foot of this file are a second
+//! oracle rather than the only one.
+//! The tests also reach cases that run does not: a maximal zone identifier,
+//! and the one-past-the-length write recorded as `FB6`.
 
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the technical
 // specification forbids `unsafe` outside FFI code (1.3.2.1). `forbid` rather

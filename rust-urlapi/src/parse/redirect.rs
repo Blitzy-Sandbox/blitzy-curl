@@ -207,15 +207,15 @@
 //! # End-to-end verification
 //!
 //! The tests at the end of this file drive all four branches and each
-//! subtlety above, and they are the oracle currently in force.
+//! subtlety above.
 //!
-//! The end-to-end oracle is to be the unmodified `tests/libtest/lib1560.c`,
+//! The end-to-end oracle is the unmodified `tests/libtest/lib1560.c`,
 //! whose `set_url_list` table at L1226-L1381 is forty-odd redirect cases. The
 //! sub-test this file drives is `set_url`, whose failure is reported as exit
-//! code 1 by that entry point. `rust-urlapi/scripts/run-parity.sh` is the
-//! script that is to run it and is a later deliverable, so it does not exist
-//! yet. Expectations below were taken from that table rather than from a
-//! reading of RFC 3986, and the ones that came from it name their line.
+//! code 1 by that entry point. `rust-urlapi/scripts/run-parity.sh` runs it and
+//! that sub-test passes in both link modes. Expectations below were taken from
+//! that table rather than from a reading of RFC 3986, and the ones that came
+//! from it name their line.
 
 // The plan puts every `unsafe` block in `src/ffi.rs` (AAP 0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1). This

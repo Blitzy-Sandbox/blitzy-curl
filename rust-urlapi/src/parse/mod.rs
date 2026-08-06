@@ -168,17 +168,16 @@
 //! # End-to-end verification
 //!
 //! The tests at the end of this file cover the ordering and the
-//! short-circuit shape; each stage is tested in its own file. Those are the
-//! oracle currently in force.
+//! short-circuit shape; each stage is tested in its own file.
 //!
-//! The end-to-end oracle is to be the unmodified `tests/libtest/lib1560.c`,
+//! The end-to-end oracle is the unmodified `tests/libtest/lib1560.c`,
 //! whose success condition is the literal single line `success` on stdout --
 //! which is exactly what `tests/data/test1560` asserts.
-//! `rust-urlapi/scripts/run-parity.sh` is the script that is to run it and is
-//! a later deliverable, so it does not exist yet. That entry point returns a
-//! distinct exit code per failing sub-test and short-circuits at the first
-//! failure, so the script is to map the code back to the name and iterate
-//! rather than report only the first one it meets:
+//! `rust-urlapi/scripts/run-parity.sh` runs it, and both link modes print that
+//! line. That entry point returns a distinct exit code per failing sub-test
+//! and short-circuits at the first failure, so the script maps the code back
+//! to the name and prints all eleven rows rather than reporting only the first
+//! one it meets:
 //!
 //! | Code | Sub-test | Code | Sub-test |
 //! |---|---|---|---|

@@ -32,10 +32,11 @@
    directory holding a symlink to the test source beside a copy of this
    header, so that the name lands here and not on the original, which pulls
    libcurl's private build environment in at tests/libtest/first.h:L33 and
-   L46. rust-urlapi/scripts/run-parity.sh is to create that directory; it is
-   a later deliverable and does not exist yet, so for now the staging is set
-   up by hand and nothing here should be read as a claim that the script has
-   run. Either way, nothing under tests/ is edited. */
+   L46. rust-urlapi/scripts/build-reference.sh creates that directory and
+   records it as HARNESS_STAGE_DIR, and rust-urlapi/scripts/run-parity.sh
+   reuses the same one for both Rust link modes, so all three links compile
+   the identical staged source against this header. The staging lives under
+   the ignored build/ tree; nothing under tests/ is edited. */
 
 /* CURL_EXTERN has to expand to nothing. include/curl/curl.h:L122-L136 makes
    it __declspec(dllimport) on Windows unless this macro or BUILDING_LIBCURL

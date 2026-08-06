@@ -112,10 +112,9 @@
 
 /* The status this binary exits with when it could not put itself into the
    locale the parity run depends on. Chosen so that whatever drives the run
-   can tell a harness that never started from a sub-test that failed --
-   ../scripts/run-parity.sh is to be that driver and is not written yet, so
-   for now the status is read by hand: every code test_lib1560() returns is
-   1 through 11
+   can tell a harness that never started from a sub-test that failed.
+   ../scripts/run-parity.sh is that driver, and it reads this status back:
+   every code test_lib1560() returns is 1 through 11
    (tests/libtest/lib1560.c:L2040-L2071), every TEST_ERR_* value the real
    harness uses is a CURLE_OBSOLETE* below 57
    (tests/libtest/first.h:L106-L117), and 126 and 127 belong to the shell.
@@ -155,10 +154,9 @@ int main(int argc, const char **argv)
      expectation at tests/libtest/lib1560.c:L629-L631, that
      r\xc3\xa4ksm\xc3\xb6rg\xc3\xa5s.se comes back as
      xn--rksmrgs-5wao1o.se, is exactly where a porting mistake shows.
-     ../scripts/run-parity.sh is to export both variables and repeat the
-     run with the codeset one set and unset; that script is a later
-     deliverable and does not exist yet, so for now they are exported by
-     hand on the command line that starts this binary.
+     ../scripts/run-parity.sh exports both variables and repeats the run
+     with the codeset one set and unset, which is why its environment matrix
+     has four cells rather than one.
 
      Unconditional, unlike the HAVE_SETLOCALE guard at
      tests/libtest/first.c:L230, for the reason above the include.
@@ -181,10 +179,10 @@ int main(int argc, const char **argv)
      The status is deliberately outside the range the test itself returns.
      tests/libtest/lib1560.c:L2040-L2071 answers with a sub-test number, 1
      through 11, and the exit status is what any caller maps back to a
-     sub-test name -- ../scripts/run-parity.sh is to do that mapping once it
-     lands, and by hand until then. 120 cannot be mistaken for one of those
-     numbers either way, so refusing to start stays distinguishable from a
-     sub-test failing.
+     sub-test name -- ../scripts/run-parity.sh does that mapping, and reports
+     this status under its own name instead. 120 cannot be mistaken for one of
+     those numbers either way, so refusing to start stays distinguishable from
+     a sub-test failing.
 
      The format string is a literal, as every format string in this
      harness is, so nothing the environment supplies is ever interpreted
@@ -203,9 +201,9 @@ int main(int argc, const char **argv)
      program is. tests/libtest/first.c requires argv[1] to name a test, at
      its L237-L241, and reads the URL from argv[2] at its L257-L258; there
      is one test here, so the URL moves up to argv[1] and nothing is
-     mandatory -- the binary can be, and today is, invoked bare, and
-     ../scripts/run-parity.sh and ../GNUmakefile are to invoke it the same
-     way once they land. Written across two lines because
+     mandatory -- ../scripts/run-parity.sh, which ../GNUmakefile delegates to,
+     invokes this binary bare and with its standard input taken from
+     /dev/null. Written across two lines because
      scripts/checksrc.pl reports a conditional body on the if() line as
      ONELINECONDITION. */
   if(argc > 1)
@@ -224,8 +222,8 @@ int main(int argc, const char **argv)
      code tests/libtest/lib1560.c:L2040-L2071 returns being 1 through 11,
      and it is carried over anyway because those codes are this harness's
      per-sub-test report: a caller reads the status back and names the
-     sub-test that failed, which ../scripts/run-parity.sh is to automate
-     once it lands. Nothing on this path is remapped, collapsed into 0 and
-     1, or swallowed. */
+     sub-test that failed, which ../scripts/run-parity.sh automates by
+     printing all eleven rows. Nothing on this path is remapped, collapsed
+     into 0 and 1, or swallowed. */
   return (int)result <= 125 ? (int)result : 125;
 }

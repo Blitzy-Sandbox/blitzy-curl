@@ -147,16 +147,15 @@
 //!
 //! # Verification
 //!
-//! The unit tests below cover each difference on its own, and they are the
-//! oracle currently in force for this file.
+//! The unit tests below cover each difference on its own.
 //!
 //! End to end, the parity run over the unmodified `tests/libtest/lib1560.c` is
 //! what is to settle it: the `get_parts`, `append` and `get_nothing` sub-tests
 //! -- exit codes 4, 5 and 7 in the mapping the Agent Action Plan gives at
 //! 0.6.8 -- all exercise this file, and `set_parts`, exit code 2, reaches it
-//! through every whole-URL assignment. `rust-urlapi/scripts/run-parity.sh` is
-//! the script that is to drive that run; it is a later deliverable and does
-//! not exist yet.
+//! through every whole-URL assignment. `rust-urlapi/scripts/run-parity.sh`
+//! drives that run, and all four of those sub-tests pass in both link
+//! modes.
 
 // The plan puts every `unsafe` block in `src/ffi.rs` (AAP 0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1). This

@@ -121,11 +121,24 @@ source list."
      MSVC 2015 and newer => accepted through that guard's _MSC_VER arm,
                   for the reason given above it.
 
-   The requirement also belongs on the command line that compiles this file.
-   ../GNUmakefile and ../scripts/ are the deliverables that are to state it,
-   and neither exists yet, so today it is stated by the hand-written compile
-   line; the guard is what makes any caller that forgets it -- a build file
-   or a person -- fail here instead of silently.
+   Exactly one command in this crate compiles this file, and it is the Mode B
+   harness link in ../scripts/run-parity.sh, which ../GNUmakefile drives
+   through its parity target. That link is also the only place
+   HARNESS_MODE_B is defined, which is what unlocks the definitions below.
+   It passes the options ../scripts/build-reference.sh recorded as
+   HARNESS_CFLAGS, "-O2 -Wall -Wextra" by default, and deliberately no
+   -std= at all: the compiler default decides, and every default this crate
+   is built with satisfies the guard -- gcc and clang have defaulted to a
+   C99-or-later dialect for many releases. Not naming a standard is the
+   right call rather than an omission, because the reference link and the
+   two Rust links have to be given one identical option list or the
+   byte-for-byte diff compares two different compilations, and that list is
+   recorded once in the summary file instead of being spelled out three
+   times.
+   So the guard is the enforcement, not the command line: a caller that
+   forces -std=c89 -- a build file, or a person -- fails here loudly instead
+   of silently miscompiling the one shim whose whole job is to be
+   bound-correct.
 
    No C89 fallback is offered, and that is a decision. Bounded formatting
    without vsnprintf means formatting into an oversized buffer with vsprintf

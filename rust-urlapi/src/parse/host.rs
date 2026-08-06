@@ -111,16 +111,16 @@
 //!
 //! # Where the parity oracle lives
 //!
-//! End-to-end verification is to be the parity run over the unmodified
+//! End-to-end verification is the parity run over the unmodified
 //! `tests/libtest/lib1560.c`. The sub-tests that exercise this file hardest
 //! are `get_parts`, whose failure would show up as exit code 4, and
 //! `set_parts`, exit code 2, per the exit-code mapping in the plan; the host
 //! tables in `set_url` and `get_url` cover the rest.
-//! `rust-urlapi/scripts/run-parity.sh` is the script that is to drive it and
-//! is a later deliverable, so it does not exist yet.
+//! `rust-urlapi/scripts/run-parity.sh` drives it, and both of those sub-tests
+//! pass in both link modes.
 //!
-//! The unit tests at the foot of this file are therefore the oracle currently
-//! in force, and they are an independent one rather than a restatement of this
+//! The unit tests at the foot of this file are a second, independent oracle
+//! rather than a restatement of this
 //! code: every vector in them was captured from a C program linked against an
 //! unmodified libcurl archive rather than derived by reading this module.
 

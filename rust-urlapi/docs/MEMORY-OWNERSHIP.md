@@ -13,14 +13,13 @@ port, so the record is kept at two levels: a safety comment at every site
 that touches the boundary, and this file. A comment explains one line. This
 file explains the whole chain. Neither one replaces the other.
 
-Two statements about state, so that nothing below is read as more, or less,
-than it is. `rust-urlapi/src/alloc.rs` and `rust-urlapi/src/ffi.rs` both
-exist and both carry the safety comments described here, so every claim in
-this file about what they contain or enforce is a claim about code in the
-tree and is citable by path and line. `rust-urlapi/README.md` is the
-exception: it is named below as the intended home of the build material this
-file deliberately leaves out, and it is not written yet, so the one sentence
-that points at it points at a later deliverable.
+One statement about state, so that nothing below is read as more, or less,
+than it is. Every file this document names is in the tree, `rust-urlapi/`
+being complete at 55 files, so every claim here about what a file contains or
+enforces is a claim about something a reader can open. That includes
+`rust-urlapi/src/alloc.rs` and `rust-urlapi/src/ffi.rs`, which carry the safety
+comments described here, and `rust-urlapi/README.md`, which is where the build
+material this file deliberately leaves out actually lives.
 
 Every path in this file is relative to the repository root, with no
 exceptions, so a file belonging to this crate is written out in full --
@@ -347,10 +346,11 @@ reader can check the rule rather than trust it.
 ## How the cleanup contract is evidenced, and why not by reading the buffer
 
 `include/curl/urlapi.h:L116-L118` says `curl_url_cleanup()` frees the handle
-and the resources used for parsing, and "will not free strings previously
-returned with the URL API". That is the contract the whole arrangement above
+and the resources used for the URL parsing, and states in as many words that it
+`will not free strings previously returned with the URL API`.
+That is the contract the whole arrangement above
 exists to satisfy: the getter's buffers come from the C allocator through
-`src/alloc.rs` and are owned by the caller, not by the handle.
+`rust-urlapi/src/alloc.rs` and are owned by the caller, not by the handle.
 
 Two shapes of test were tried and rejected, and both are recorded because both
 look reasonable and both are **fail-unsafe exactly when the contract is
@@ -380,7 +380,7 @@ it leaves the final release of that block resting on the probe's verdict, so a
 probe that missed the defect ends in a double free.
 
 **What the crate does instead: ask the allocator, and touch nothing.**
-`tests/ffi_surface.rs` interposes `malloc`, `calloc`, `realloc` and `free` in
+`rust-urlapi/tests/ffi_surface.rs` interposes `malloc`, `calloc`, `realloc` and `free` in
 the test binary -- the same `count` module the allocation ceiling is measured
 with -- and records, for a watched window, the *address* of every block created
 and every block destroyed. An address is taken as an integer and is never
@@ -448,7 +448,7 @@ genuinely freed buffer is flagged. That probe is a throwaway and is not part of
 the crate -- committing it would commit the unsound sequence -- which is why the
 result is recorded here instead.
 
-Curl's own allocation counter is not available as a further instrument, for
+curl's own allocation counter is not available as a further instrument, for
 the reason the next section gives.
 
 ## Reported limitation R3: memory-debug builds
@@ -484,25 +484,49 @@ checked by the mechanism that wrote it.
 
 `AAP` 0.9.4 names the substitute for exactly this situation: "an independent
 allocation count via the platform's own tooling". Two of them exist, and
-together they are what discharges implicit requirement I11.
+together they are what discharges implicit requirement I11. Both are
+reproducible from committed tooling, which is the property that matters: a
+number in a document that nobody can re-derive is an assertion, not evidence.
 
-**Around the parity harness.** With a counting allocator interposed into the
-process -- `malloc`, `calloc`, `realloc` and `strdup` forwarded to glibc's own
-`__libc_*` entry points, which is the same accounting
-`tests/memanalyzer.pm:L439` uses, `mallocs + callocs + reallocs + strdups +
-wcsdups` -- the unmodified `tests/libtest/lib1560.c` costs:
+**Around the parity harness.** One command:
 
-    reference libcurl.a         3,114 allocations   2,839 releases
-    the port, drop-in link      3,046 allocations   2,839 releases
-    the port, standalone link   3,046 allocations   2,839 releases
+    rust-urlapi/scripts/run-parity.sh --allocations
 
-The port is 68 allocations **cheaper** than the C for the identical test, and
-identical in both link modes, which is what I11's "not materially more
-allocation-hungry than the original" asks about. Both totals sit a little
-above 3,000 because a process-wide counter also sees stdio, locale and
-libidn2 activity that curl's own counter never attributed to curl; the
-reference passes the 3,000 limit under that counter, and the port costs less
-than the reference under this one.
+That step relinks each of the three harnesses -- the reference one and one per
+link mode -- with `-Wl,--wrap` over `malloc`, `calloc`, `realloc`, `strdup` and
+`free`, against a counter the script generates into the ignored
+`rust-urlapi/build/parity/` tree, and runs the unmodified
+`tests/libtest/lib1560.c` under each. The metric column is the accounting
+`tests/memanalyzer.pm:L439` performs, `mallocs + callocs + reallocs +
+strdups`, and the created and destroyed columns are kept separately for the
+reason the paragraph after the table gives.
+
+The linker's own `--wrap` is used rather than a preloaded library, and that is
+not a preference: the harnesses are statically linked against archives, so a
+preloaded shared object would never be consulted for calls the static link had
+already resolved. `--wrap` redirects the call sites at link time instead and
+hands the real entry point back as `__real_*`.
+
+Measured on the environment `rust-urlapi/build/reference-build.env` records:
+
+    reference libcurl.a         metric 2,840   created 2,732   destroyed 2,732
+    the port, drop-in link      metric 2,772   created 2,732   destroyed 2,732
+    the port, standalone link   metric 2,772   created 2,732   destroyed 2,732
+
+The port is **68 metric allocations cheaper** than the C for the identical
+test, and identical in both link modes, which is what I11's "not materially
+more allocation-hungry than the original" asks about. The composition differs
+more than the total does -- the reference spends 809 mallocs, 410 callocs,
+1,146 reallocs and 475 strdups, where the port spends 2,322 mallocs, 410
+callocs, 40 reallocs and no strdups -- and that is expected: the port grows a
+buffer where curl's dynamic buffer reallocates, and it has no `strdup` call at
+all because `rust-urlapi/src/alloc.rs` allocates and copies in one place.
+Created equals destroyed in all three, so nothing is outstanding at exit under
+any of them.
+
+The absolute figures are a property of that environment rather than of the
+port, so they are stated with it. What is a property of the port is the
+comparison, and re-deriving it takes one command.
 
 **Inside the crate's own suite.** `rust-urlapi/tests/ffi_surface.rs` reproduces
 the same accounting without any external tooling: its `count` module defines
@@ -516,7 +540,7 @@ observe nothing that interposition does not. Two tests read the interposed
 counters, and both are kept because their workloads answer different questions.
 
 `the_allocation_count_stays_within_the_test1560_ceiling` runs a fixed workload
-of twenty-four `lib1560` vectors, each parsed, read part by part, serialised
+of twenty-four `lib1560` vectors, each parsed, read part by part, serialized
 under two codec flag sets, duplicated and amended. It costs **575
 allocations** and leaves nothing outstanding -- identical in all four feature
 configurations and in both profiles -- and it asserts three things: at most
@@ -536,10 +560,12 @@ unquantified "under the limit". The test also asserts that two rounds cost
 exactly twice one and six exactly six times one, which is what makes the
 extrapolation sound and what a per-handle regression would break first.
 
-For scale, the real thing: `lib1560` itself, run through the parity harness
-relinked with the same wrappers, prints `success` and costs 2,840 allocations
+For scale, the real thing, and it is the same figure the table above reports
+because it is the same measurement:
+`rust-urlapi/scripts/run-parity.sh --allocations` relinks the reference harness
+with these wrappers, and `lib1560` prints `success` at a metric cost of 2,840
 -- 809 mallocs, 410 callocs, 1,146 reallocs and 475 strdups -- against the same
-3,000. So the ceiling in curl's own suite runs at 95% utilisation, and a
+3,000. The ceiling in curl's own suite therefore runs at 95% utilization, and a
 workload calibrated to sit exactly at it measures on the same scale rather than
 a generous one.
 

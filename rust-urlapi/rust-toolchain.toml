@@ -4,11 +4,15 @@
 #
 # Toolchain selection for curl-urlapi-rs, the Rust re-implementation of
 # curl's URL API. It standardises the channel, the rustup profile and the
-# components, so GNUmakefile and scripts/build-rust.sh can invoke a bare
-# `cargo build` without either of them naming a toolchain: this file replaces
-# the compiler checks a configure script would otherwise carry. It does not
-# pin a compiler version, so it does not make builds byte-reproducible; see
-# the channel key below for why that is the wanted trade. rustup applies it
+# components, which is what lets GNUmakefile and scripts/build-rust.sh invoke
+# a bare `cargo build` without either of them naming a toolchain -- and
+# neither does: GNUmakefile's test, clippy, fmt and genheader targets and every
+# cargo invocation in scripts/build-rust.sh rely on this file to select one.
+# It replaces the compiler checks a configure script would otherwise carry.
+#
+# It does not pin a compiler version, so it does not make builds
+# byte-reproducible; see the channel key below for why that is the wanted
+# trade. rustup applies it
 # to every command run anywhere under rust-urlapi/ and to nothing outside it,
 # so curl's own autotools and CMake builds are unaffected by its presence.
 #
@@ -94,15 +98,25 @@ channel = "stable"
 # present whichever profile a contributor already had configured.
 profile = "minimal"
 
-# clippy             `cargo clippy -- -D warnings` has to pass clean, so the
-#                    lint driver belongs to the pinned toolchain rather than
-#                    being something a build script hopes to find.
-# rustfmt            .editorconfig carries no [*.rs] section, so Rust
-#                    sources fall back to rustfmt's own defaults; the
-#                    formatter has to be present to apply and to check them.
-# llvm-tools-preview the LLVM binary utilities, llvm-profdata and llvm-cov,
-#                    that the coverage tooling drives.
-components = ["clippy", "rustfmt", "llvm-tools-preview"]
+# clippy   `cargo clippy -- -D warnings` has to pass clean, so the lint
+#          driver belongs to the pinned toolchain rather than being something
+#          a build script hopes to find. scripts/build-rust.sh runs it for
+#          both canonical configurations and fails the run on any finding.
+# rustfmt  .editorconfig carries no [*.rs] section, so Rust sources fall back
+#          to rustfmt's own defaults; the formatter has to be present to
+#          apply and to check them. scripts/build-rust.sh runs `cargo fmt
+#          --check` and GNUmakefile's lint target does the same.
+#
+# The list is exactly the components a documented command in this directory
+# runs, and nothing else. llvm-tools-preview was here for a coverage run, and
+# it is deliberately gone: no build, lint, ABI, parity or acceptance command
+# in this crate drives llvm-profdata or llvm-cov, README.md documents no
+# coverage target, and the Agent Action Plan names none among the acceptance
+# criteria at 0.9.2. Provisioning it added an install and download surface
+# with no consumer. Should coverage ever become a supported target, the
+# component and the profile-data ignore patterns that go with it belong in
+# the same change as the command that produces them.
+components = ["clippy", "rustfmt"]
 
 # There is deliberately no `targets` key. The crate is built for the host
 # only: the parity demonstration runs on one platform, and the Windows-only

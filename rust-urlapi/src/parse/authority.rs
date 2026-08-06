@@ -207,12 +207,12 @@
 //! its `CURLU_DISALLOW_USER` exit, because a suite that only checked result
 //! codes could not see either.
 //!
-//! End-to-end verification is to be the parity run: the unmodified
+//! End-to-end verification is the parity run: the unmodified
 //! `tests/libtest/lib1560.c` built against the reference C library and against
 //! this crate, with the two outputs diffed byte for byte.
-//! `rust-urlapi/scripts/run-parity.sh` is the script that is to drive it and is
-//! a later deliverable, so it does not exist yet and the tests below are the
-//! oracle currently in force.
+//! `rust-urlapi/scripts/run-parity.sh` drives it and reports byte-identical
+//! output in both link modes, so the tests below are a second oracle rather
+//! than the only one.
 
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).

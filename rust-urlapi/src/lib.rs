@@ -18,19 +18,25 @@
 //!
 //! # The exported surface
 //!
-//! Eight symbols, not six. Five are the public functions
-//! `include/curl/urlapi.h` declares; the other three are internal entry points
+//! Eight symbols, not six. `include/curl/urlapi.h` declares six public
+//! functions; five of those six are implemented in `lib/urlapi.c` and are
+//! reproduced here, while the sixth, `curl_url_strerror`, is declared there but
+//! implemented in `lib/strerror.c` and so is feature-gated below rather than
+//! unconditional. The other three of the eight are internal entry points
 //! `lib/urlapi-int.h` L28-L33 declares and other translation units of libcurl
 //! call. The object file being replaced defines all eight, so a crate
 //! exporting only the public five could not stand in for it.
 //!
+//! The right-hand column names the translation units that call each symbol and
+//! is exhaustive for `lib/` as it stands, not a sample.
+//!
 //! | Symbol | Declared at | Called from |
 //! |--------|-------------|-------------|
-//! | `curl_url` | `include/curl/urlapi.h` L113 | `lib/url.c`, `lib/http.c`, `lib/http1.c` |
-//! | `curl_url_cleanup` | L120 | `lib/url.c`, `lib/http.c`, `lib/http1.c` |
+//! | `curl_url` | `include/curl/urlapi.h` L113 | `lib/url.c`, `lib/http.c`, `lib/http1.c`, `lib/http2.c` L723 |
+//! | `curl_url_cleanup` | L120 | `lib/url.c`, `lib/http.c`, `lib/http1.c`, `lib/http2.c` L759 |
 //! | `curl_url_dup` | L126 | `lib/http.c`, `lib/url.c` |
-//! | `curl_url_get` | L133 | `lib/http.c`, `lib/imap.c`, `lib/transfer.c`, `lib/url.c` |
-//! | `curl_url_set` | L141 | `lib/url.c`, `lib/http.c`, `lib/http1.c` |
+//! | `curl_url_get` | L133 | `lib/http.c`, `lib/imap.c`, `lib/transfer.c`, `lib/url.c`, `lib/http2.c` L755 |
+//! | `curl_url_set` | L141 | `lib/url.c`, `lib/http.c`, `lib/http1.c`, `lib/http2.c` L730, L748 |
 //! | `Curl_is_absolute_url` | `lib/urlapi-int.h` L28 | `lib/http1.c` L220, `lib/url.c` L1661, `lib/http.c` L1177 |
 //! | `Curl_url_set_authority` | `lib/urlapi-int.h` L31 | `lib/http2.c` L739 |
 //! | `Curl_junkscan` | `lib/urlapi-int.h` L33 | `lib/doh.c` L1127 |
@@ -69,22 +75,25 @@
 //! | `idn-pure` | off | Use the `idna` crate instead, outside the parity claim |
 //! | `genheader` | off | Check the mirror header against the crate's ABI |
 //!
-//! `genheader` is a check, which its name understates. It never rewrites
-//! `include/curl_urlapi_rs.h`. `build.rs` generates a second mirror with
-//! cbindgen's library API into `OUT_DIR`, reduces both that file and the
-//! committed one to an ABI projection -- constant name and value pairs,
-//! function signatures with parameter names dropped, typedef names -- and
-//! warns on any difference between the two. The projection is blind to
-//! comments, layout, declaration order, parameter names and the
-//! enum-versus-macro spelling of a constant, which is what makes it an ABI
-//! check rather than a diff: the two files are never byte-equal and are not
-//! meant to be, and `cbindgen.toml` records the shape differences that
-//! account for it.
+//! `genheader` is a check, which its name understates. `build.rs` reads the
+//! crate's ABI through cbindgen's library API, regenerates the whole of
+//! `include/curl_urlapi_rs.h` from it -- the prose frame included -- into
+//! `OUT_DIR`, and requires the committed file to equal those bytes exactly.
+//! Any difference fails the build, with the first differing line quoted and
+//! nothing modified. It is a whole-file comparison rather than a projection of
+//! one, which is why `build.rs` carries the fixed text as well: the
+//! duplication is what buys an exact comparison, and the comparison is what
+//! keeps the two copies in step, because editing either one fails the build
+//! until the other matches. Regeneration writes into the source tree only
+//! when `CURL_URLAPI_WRITE_MIRROR_HEADER=1` asks it to, because an earlier
+//! version of that module overwrote the tracked, hand-authored header during
+//! an ordinary `cargo check --features genheader`.
 //!
-//! Exactly two configurations are intended to be built and validated, and the
-//! validation half is the parity workflow that `rust-urlapi/scripts/` is to
-//! carry. Those scripts are a later deliverable and do not exist yet, so what
-//! follows describes the two link modes rather than reporting a run of them.
+//! Three configurations are built and validated, and the validation half is
+//! the parity workflow in `rust-urlapi/scripts/`, driven by `GNUmakefile`.
+//! `scripts/build-rust.sh` builds all three, `scripts/check-abi.sh` proves
+//! their symbol sets and import contracts, and `scripts/run-parity.sh` links
+//! and runs them; `README.md` sets the workflow out end to end.
 //!
 //! ```text
 //! cargo build --release --no-default-features --features idn-libidn2
@@ -95,8 +104,9 @@
 //! define anything libcurl still defines: `strerror`, `cfree` and
 //! `scheme-table` are all off, and `src/scheme.rs` imports `Curl_get_scheme`
 //! from `lib/url.c` instead of compiling its own table. Of those three,
-//! `scheme-table` is the one to watch, because leaving it on produces no
-//! duplicate symbol and no link error at all -- only a silently wrong table.
+//! `scheme-table` is the one to watch: leaving it on in the archive that
+//! replaces `urlapi.c.o` produces no duplicate symbol and no link error at
+//! all -- only a silently wrong table.
 //!
 //! ```text
 //! cargo build --release
@@ -106,11 +116,28 @@
 //! strings, the free function and a scheme table itself, alongside the small C
 //! shims for the `curl_mprintf` family in `harness/shims.c`.
 //!
+//! ```text
+//! cargo build --release --no-default-features \
+//!   --features idn-libidn2,scheme-table
+//! ```
+//!
+//! Mode C, the shared drop-in: the same eight exports as Mode A, but with the
+//! scheme table compiled in, so the shared object imports no libcurl-private
+//! name and therefore loads on its own. `build.rs` proves that closed with
+//! `-Wl,-z,defs` and `scripts/run-parity.sh` confirms it under `dlopen`, which
+//! is what makes this the `cdylib` half of the deliverable. Its price is
+//! exactly the one the Mode A caution names -- the table is the crate's own
+//! model of curl's rather than the linked libcurl's -- which is why the
+//! authoritative artifact for the parity comparison stays Mode A's archive.
+//!
 //! # Module tree
 //!
-//! One C translation unit of 1,998 lines becomes fifteen modules. Each is
-//! named for what it owns rather than for where the C put it, and the
-//! rightmost column is where to look in the C for the behaviour it reproduces.
+//! One C translation unit of 1,998 lines becomes fifteen top-level modules and
+//! eleven parser stages, 26 source files in all. The table below is the fifteen
+//! top-level ones; `parse` is a directory, and the eleven files inside it are
+//! listed after the table. Each module is named for what it owns rather than
+//! for where the C put it, and the rightmost column is where to look in the C
+//! for the behaviour it reproduces.
 //!
 //! | Module | Responsibility | Ported from |
 //! |--------|----------------|-------------|
@@ -130,12 +157,14 @@
 //! | `scheme` | Scheme resolution and the default ports | `lib/url.c` L1469-L1471 |
 //! | `strparse` | Numeric scanners with curl's exact semantics | `lib/curlx/strparse.c` L195 |
 //!
-//! `parse` is a directory rather than a file. Its root, `src/parse/mod.rs`,
-//! declares the ten stage modules it orchestrates -- `junk`, `scheme`,
-//! `authority`, `host`, `ipv6`, `port`, `path`, `query`, `file` and `redirect`,
-//! eleven files counting the root itself -- and runs them in the order
-//! `lib/urlapi.c` L1110-L1192 does. That order is behaviour rather than style,
-//! because an earlier stage mutates the buffer a later one reads.
+//! `parse` is a directory rather than a file, and it is where the other eleven
+//! of the 26 live. Its root, `src/parse/mod.rs`, declares the ten stage modules
+//! it orchestrates -- `junk`, `scheme`, `authority`, `host`, `ipv6`, `port`,
+//! `path`, `query`, `file` and `redirect`, eleven files counting the root
+//! itself -- and runs them in the order `lib/urlapi.c` L1110-L1192 does. That
+//! order is behaviour rather than style, because an earlier stage mutates the
+//! buffer a later one reads. So the count is fifteen plus eleven, which is 26,
+//! and a claim about "the modules" means all 26 unless it says otherwise.
 //!
 //! # Import discipline
 //!
@@ -189,13 +218,23 @@
 //!
 //! Instead every buffer that crosses into C originates in `src/alloc.rs` and is
 //! allocated with the C allocator, which makes a plain `free` -- and therefore
-//! libcurl's `curl_free`, whichever of its three resolutions is in force --
+//! libcurl's `curl_free` in either of the two resolutions this port supports --
 //! correct by construction rather than by discipline at each site. Two
-//! consequences are reported rather than worked around, and
-//! `docs/MEMORY-OWNERSHIP.md` sets out the whole chain: a memory-debug build of
-//! libcurl validates pointers against its own allocation table and would
-//! reject these, and an application that installs its own allocators would
-//! release them with the wrong deallocator.
+//! configurations are reported as unsupported rather than worked around, and
+//! `docs/MEMORY-OWNERSHIP.md` sets out the whole chain.
+//!
+//! The first is a memory-debug build of libcurl, and the mechanism matters
+//! because the reassuring version of it is wrong. `curl_free` resolves to
+//! `curl_dbg_free` there, which does not consult a table before releasing
+//! anything: it subtracts its own allocation header from the pointer it was
+//! given and frees that address unconditionally. A buffer from the C allocator
+//! carries no such header, so the address freed is not the start of any
+//! allocation -- heap corruption, not a clean refusal. That is why the parity
+//! harness is built without memory debugging.
+//!
+//! The second is an application that installs its own allocators through
+//! `curl_global_init_mem`, which would release these buffers with a deallocator
+//! that never allocated them.
 //!
 //! # ABI parity is positional
 //!
@@ -364,23 +403,37 @@
 // module, so the `pub` is load-bearing rather than anticipatory: making it
 // private again breaks the run-time half of the ABI verification.
 // `rust-urlapi/tests/ffi_surface.rs` reaches it the same way. `ffi` is public
-// because it is the facade, and for no other reason: **every item it declares
-// is `pub(crate)`**, its exports included, so from outside the crate
-// `curl_urlapi_rs::ffi` is an empty module and no Rust API of any kind reaches
+// because it is the facade, and for no other reason: from outside the crate
+// `curl_urlapi_rs::ffi` reaches nothing, so no Rust API of any kind arrives at
 // a consumer through it. That is a property to keep rather than an accident.
+//
+// The mechanism is a private submodule rather than per-item visibility, and the
+// distinction is worth stating exactly because the shorter claim -- "every item
+// it declares is `pub(crate)`" -- is not true of the exports. The ten exported
+// functions have to be `pub extern "C"`: `#[no_mangle]` on a non-`pub` function
+// still emits the symbol, but the plainer spelling keeps rustc from warning
+// about an item it cannot see used, and `pub` is what the attribute is normally
+// paired with. They are `pub` INSIDE `mod exports`, which is itself
+// `pub(crate)`, so the path a consumer would need to reach them stops one level
+// short. `#[no_mangle]` ignores module nesting entirely, so the symbol table is
+// the same either way -- which is the whole point: the C linkage is unaffected
+// and the Rust surface is closed.
+//
 // A measurement instrument, for one, does not belong here: the allocation
 // count implicit requirement I11 asks for is taken by interposing the process
-// allocator from inside `rust-urlapi/tests/ffi_surface.rs`, which observes the
-// same calls without the crate carrying anything for it.
+// allocator from inside `rust-urlapi/tests/ffi_surface.rs`, and repeated over
+// the linked harness by `rust-urlapi/scripts/run-parity.sh --allocations`,
+// neither of which needs the crate to carry anything for it.
 //
-// Neither widens the C ABI, which is the reasonable first worry about a `pub
-// mod` in a crate whose export set is audited. A cdylib exposes symbols the
-// way an executable does: a plain `pub fn foo() {}` is not an exported symbol,
-// and only an annotated `#[no_mangle] pub extern "C" fn foo() {}` is. Rust
+// Neither `pub mod` widens the C ABI, which is the reasonable first worry in a
+// crate whose export set is audited. A cdylib exposes symbols the way an
+// executable does: a plain `pub fn foo() {}` is not an exported symbol, and
+// only an annotated `#[no_mangle] pub extern "C" fn foo() {}` is. Rust
 // visibility and C linkage are separate mechanisms, so making a module `pub`
-// adds nothing to the symbol table, which is a property any symbol-set check
-// over the archive will see -- `nm -g --defined-only` today, and
-// `rust-urlapi/scripts/check-abi.sh` once that script lands.
+// adds nothing to the symbol table -- a property
+// `rust-urlapi/scripts/check-abi.sh` verifies on every run, comparing the
+// archive's defined set against the object built from `lib/urlapi.c` in both
+// directions.
 pub mod abi;
 mod alloc;
 mod ctype;

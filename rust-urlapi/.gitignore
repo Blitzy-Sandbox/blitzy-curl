@@ -45,20 +45,6 @@ build/
 # literal name libcurl.pc only, not this crate's.
 *.pc
 
-# Source-based coverage artifacts. rust-toolchain.toml provisions
-# llvm-tools-preview, so a coverage run is expected here, and these two
-# patterns are required rather than precautionary: measured, a
-# RUSTFLAGS="-C instrument-coverage" cargo test writes its raw profiles into
-# the PACKAGE ROOT -- this directory -- and not into target/, because that is
-# the working directory Cargo gives a test binary. Verified with
-# "git check-ignore -v": before these lines, a default_*.profraw here was
-# reported by "git status --porcelain" as untracked, which is exactly the state
-# the purpose note at the top of this file rules out. .profdata is listed with
-# it because llvm-profdata merge writes wherever it is told, and the same
-# directory is the obvious place.
-*.profraw
-*.profdata
-
 # Deliberately NOT listed above, so that each omission reads as a decision
 # rather than an oversight. Line numbers refer to the root .gitignore.
 #
@@ -67,11 +53,24 @@ build/
 # Makefile    already ignored, root line 35. That entry carries no slash, so
 #             unlike "/build/" it matches at every depth: a file named
 #             Makefile in this directory would be silently untracked. That is
-#             precisely why the build driver here is named GNUmakefile, a name
-#             GNU make prefers anyway, so a bare "make" still works. The entry
-#             is deliberately not re-enabled with a "!Makefile" negation,
-#             which would change repository-wide behavior to suit one
-#             directory.
+#             precisely why the build driver here is the tracked file
+#             GNUmakefile, a name GNU make prefers anyway, so a bare "make"
+#             in this directory still finds it and needs no -f option. The
+#             root entry is deliberately not re-enabled with a "!Makefile"
+#             negation, which would change repository-wide behavior to suit
+#             one directory.
 # Cargo.lock  intentionally tracked, never ignored. Library crates often
 #             ignore their lockfile; this one commits it so the resolved
 #             dependency versions stay pinned and reproducible.
+# *.profraw   source-based coverage artifacts, and the reason they are absent
+# *.profdata  is that nothing here produces them. No build, lint, ABI, parity
+#             or acceptance command in this crate drives llvm-profdata or
+#             llvm-cov, README.md documents no coverage target, and
+#             rust-toolchain.toml no longer provisions llvm-tools-preview.
+#             An ignore rule for an artifact class no supported command can
+#             create describes a workflow that does not exist. If coverage
+#             ever becomes a supported target, these two patterns and that
+#             toolchain component belong in the same change as the command
+#             that writes the profiles -- which, measured, lands them in this
+#             directory rather than in target/, because that is the working
+#             directory Cargo gives a test binary.

@@ -83,14 +83,14 @@
 //! a zero-length string, and the whole-URL template at L1528 substitutes `/`
 //! only for a null path.
 //!
-//! End to end, this module is to be exercised by the parity run over the
+//! End to end, this module is exercised by the parity run over the
 //! unmodified `tests/libtest/lib1560.c`. The two sub-tests that press hardest
 //! on it are `set_url` and `get_url`, exit codes 1 and 3 in the table in
 //! `AAP` 0.6.8, and the dot-segment cases they carry are at
 //! `tests/libtest/lib1560.c` L779-L784, L1253-L1259, L1289-L1297 and
-//! L1336-L1339. `rust-urlapi/scripts/run-parity.sh` is the script that is to
-//! drive that run; it is a later deliverable and does not exist yet, so until
-//! it does the tests at the foot of this file are the oracle in force.
+//! L1336-L1339. `rust-urlapi/scripts/run-parity.sh` drives that run and both
+//! of those sub-tests pass in both link modes, so the tests at the foot of
+//! this file are a second oracle rather than the only one.
 //!
 //! # No allocation escapes by accident
 //!

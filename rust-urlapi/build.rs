@@ -14,12 +14,40 @@
 //! false. It READS the installed libidn2 header, wherever pkg-config or the
 //! IDN2_INCLUDE_ROOTS search below locates it, because the two version
 //! constants lib/idn.c compares against live there and nothing else carries
-//! them. It WRITES only OUT_DIR, the one directory Cargo gives a build script
-//! to own, and under the off-by-default `genheader` feature that is where the
-//! regenerated mirror header lands. It writes into the source tree only when
-//! `CURL_URLAPI_WRITE_MIRROR_HEADER=1` asks it to install that regenerated
-//! header, and `mirror_header::generate` below records why the default is to
-//! compare rather than to write.
+//! them.
+//!
+//! What it WRITES, in full, because a partial list here is worse than none.
+//! There are four destinations and each has its own trigger:
+//!
+//! 1. `OUT_DIR`, the one directory Cargo gives a build script to own. Every
+//!    ordinary build writes here and nowhere else. Under the off-by-default
+//!    `genheader` feature this is where the regenerated mirror header lands,
+//!    and on a release build of the drop-in configuration it is where
+//!    `DROP-IN-CDYLIB-NOTICE.txt` lands.
+//!
+//! 2. The source tree, at include/curl_urlapi_rs.h, and ONLY when
+//!    `CURL_URLAPI_WRITE_MIRROR_HEADER=1` asks for the regenerated header to
+//!    be installed over the committed one. `mirror_header::generate` below
+//!    records why the default is to compare rather than to write.
+//!    scripts/build-rust.sh actively clears the variable rather than passing
+//!    it on, so no scripted run can reach this destination.
+//!
+//! 3. A canonical drop-in archive, when `CURL_URLAPI_DROPIN_ARCHIVE` names a
+//!    staticlib to localize. That pass is a SECOND invocation of this script
+//!    rather than part of an ordinary build -- Cargo has no post-build hook --
+//!    and it writes `libcurl_urlapi_rs_dropin.a` BESIDE the input archive by
+//!    default, or wherever `CURL_URLAPI_DROPIN_OUTPUT` points instead. Neither
+//!    is under `OUT_DIR`, which is the whole point: the artifact has to
+//!    outlive the build directory to be linkable. `localize_dropin_archive`
+//!    refuses to overwrite its own input.
+//!
+//! 4. A provenance record beside that archive, named after it with
+//!    `.a.provenance`, written by the same pass and never separately. A
+//!    failure to write it fails the pass, because the record is part of the
+//!    certification rather than a convenience.
+//!
+//! Nothing else is written anywhere, and nothing outside this crate directory
+//! is written under any configuration -- goal G4 and acceptance criterion A12.
 //!
 //! JOB ONE, translate the C capability selection into Cargo configuration
 //! flags. The C side gates internationalised-domain support in two steps, and
@@ -77,8 +105,10 @@
 //! the dynamic loader and the math library -- belongs on the link line of
 //! whoever links the executable, never here, because a directive emitted from
 //! a build script is imposed on every consumer of the archive rather than on
-//! the one link that actually needs it. GNUmakefile and scripts/ are to carry
-//! those link lines; neither exists yet, so today they are written by hand.
+//! the one link that actually needs it. Those link lines are carried by
+//! scripts/run-parity.sh, which assembles all four of them -- the harness and
+//! the demo, once per link mode -- from the options scripts/build-reference.sh
+//! recorded, and GNUmakefile's parity target drives it.
 //!
 //! JOB THREE, under the optional `genheader` feature only, generate an ABI
 //! mirror of include/curl_urlapi_rs.h from the crate and check the committed
@@ -134,11 +164,19 @@ const LIBIDN2_LINK_NAME: &str = "idn2";
 /// does with them. The reference measurements behind the parity claim were
 /// taken against the 2.3 series.
 ///
-/// Security: the heap-overflow fixed in libidn2 2.2.0, CVE-2019-12290,
-/// affects the 2.0 and 2.1 series, which reach the very entry points this
-/// crate calls. Accepting them would be accepting a known-vulnerable
-/// provider, so the floor sits above the fix and a provider below it is a
-/// hard configuration failure rather than a warning.
+/// Security: CVE-2019-12290, fixed in libidn2 2.2.0, affects every release
+/// before it. It is not a memory-safety defect -- no overflow and no crash --
+/// and describing it as one would send a reader looking for the wrong thing.
+/// It is a missing input check: libidn2 before 2.2.0 omits the roundtrip
+/// verification RFC 3490 section 4.2 requires when converting an A-label back
+/// to a U-label, so a name carrying punycoded characters that are discarded on
+/// the way through Unicode and back can impersonate a different domain. The
+/// scored impact is integrity alone. The fix is the "perform A-label roundtrip
+/// for lookup functions by default" change of 2.2.0, and it lands in the very
+/// lookup entry points this crate calls, so a provider below the floor answers
+/// this crate's conversions without that check. Accepting one would be
+/// accepting a known-vulnerable provider, so the floor sits at the fix and a
+/// provider below it is a hard configuration failure rather than a warning.
 ///
 /// The version this crate then *requires at run time* is not this floor. It
 /// is the exact version of the provider selected here, discovered below and
@@ -1763,9 +1801,8 @@ const ELF_TARGET_OS: [&str; 11] = [
     "solaris",
 ];
 
-/// Make sure a shared object carrying an unresolved import is never shipped:
-/// refused by the linker where refusing it is free, announced to whoever
-/// started the build where refusing it would destroy the deliverables.
+/// Give each feature configuration the shared-object strategy that closes it,
+/// and let the linker prove the closure rather than a comment asserting it.
 ///
 /// # The mismatch this addresses
 ///
@@ -1777,80 +1814,110 @@ const ELF_TARGET_OS: [&str; 11] = [
 /// which is what the Agent Action Plan requires at 0.3.1.1, 0.4.2.4 and
 /// 0.6.7 and is not negotiable.
 ///
-/// Those two facts do not compose. In the drop-in configuration the archive
-/// is exactly right -- the two names must appear as *undefined* in it, so
-/// that the linker binds them to the `url.c.o` sitting in the same libcurl
-/// archive -- while the shared object built from the same compilation is
-/// unusable: `libcurl_urlapi_rs.so` carries `U Curl_get_scheme` and
-/// `U Curl_getn_scheme`, no `libcurl` in its NEEDED list, and no prospect of
-/// ever resolving them, because both symbols are hidden by libcurl's own
-/// visibility rules and so absent from a shared libcurl's dynamic symbol
-/// table. Loading it fails, every time, at `dlopen`. Nothing in the
-/// compilation reports that, which is why this function announces it.
+/// Those two facts pull in different directions for the *shared* artifact.
+/// With `scheme-table` off the archive is exactly right -- the two names must
+/// appear as *undefined* in it, so that the linker binds them to the
+/// `url.c.o` sitting in the same libcurl archive -- while a shared object
+/// built from the same compilation carries `U Curl_get_scheme` and
+/// `U Curl_getn_scheme` with no `libcurl` NEEDED entry, and both names are
+/// hidden by libcurl's own visibility rules (lib/url.h:76-77) and so absent
+/// from a shared libcurl's dynamic symbol table. `dlopen` on that object
+/// fails on those two names.
 ///
 /// # The strategy, stated as a rule
 ///
-/// **A shared object is a deliverable only where the crate is
-/// self-contained.** That is Mode B, the standalone configuration, whose
-/// built-in scheme table needs nothing from libcurl and whose undefined set
-/// is libc, libgcc and libidn2 -- every one of them a real NEEDED entry.
-/// Mode A's deliverable is the archive, which is the only form a drop-in
-/// replacement for `urlapi.c.o` is ever consumed in: it is linked *into*
-/// libcurl, where `Curl_get_scheme` is a sibling object rather than a
-/// foreign import.
+/// **Every configuration gets a shared object with a closed contract; which
+/// contract follows the scheme provider, and the linker enforces the one
+/// that can be enforced.** Three configurations matter, and the third exists
+/// precisely so that the shared half of 0.1.1.1 `G1` is met:
+///
+/// | configuration | features | shared object |
+/// |---|---|---|
+/// | static drop-in | `idn-libidn2` | imports the scheme provider |
+/// | **shared drop-in** | `idn-libidn2,scheme-table` | **closed, exactly eight exports** |
+/// | standalone | the manifest defaults | closed, ten exports |
+///
+/// The middle row is the deliverable shared object of the drop-in surface. It
+/// is built from this same crate with nothing but the six features the plan
+/// tables at 0.3.1.1, it passes `-z defs`, it loads under `dlopen` and its
+/// dynamic symbol table holds exactly the eight names `lib/urlapi.o` defines
+/// and no others -- which is the whole of what `G1` asks of a shared artifact,
+/// since `T1` makes the *linkage surface* the thing that may not change. Its
+/// one documented consequence is that scheme resolution comes from the crate's
+/// own table rather than from the linked libcurl's, which
+/// docs/KNOWN-DIVERGENCES.md records under "Integration limitation: the
+/// standalone table models one build" and `src/scheme.rs` records at its
+/// `mod capability`.
+///
+/// The top row is not a lesser artifact, it is a *different* contract, and the
+/// contract is a narrower version of the one the object file being replaced
+/// already has. `lib/urlapi.o` itself leaves **seventeen** `Curl_*`/`curl_*`
+/// names undefined -- measured with `nm -g --undefined-only` on the member
+/// extracted from a reference `libcurl.a` -- of which `Curl_get_scheme` is
+/// one. This crate re-implements sixteen of the seventeen internally and
+/// reaches one further name the C module does not, `Curl_getn_scheme`: the
+/// length-bounded sibling that `Curl_get_scheme` itself forwards to at
+/// `lib/url.c:1469-1472`, used where the scheme is a bounded slice and copying
+/// it to get a terminator would be waste. So the import set is two names
+/// against seventeen, both declared side by side at `lib/url.h:76-77` and both
+/// defined in `lib/url.c`, which means the same libcurl link that resolved the
+/// predecessor's seventeen resolves these two.
+/// `scripts/check-abi.sh` asserts all of that rather than passing over the
+/// artifact: the eight exports, the import set being exactly those two names,
+/// and both of them being defined by the reference archive.
 ///
 /// # How the rule is expressed, and where it stops
 ///
 /// `-z defs` -- `--no-undefined` under its other name -- makes the linker
-/// refuse to produce a shared object with any unresolved strong reference. In
-/// the **standalone** configuration that is exactly the right instrument: the
-/// crate is self-contained there, so the directive proves the shared object
-/// closed on every release build rather than on the occasions somebody
-/// remembers to run `nm -D -u`, and it costs nothing, because the link
-/// succeeds.
+/// refuse to produce a shared object with any unresolved strong reference. It
+/// is applied to both configurations whose scheme provider is the built-in
+/// table, which is where it is both meaningful and free: the crate is
+/// self-contained there, so the directive proves the object closed on every
+/// release build rather than on the occasions somebody remembers to run
+/// `nm -D -u`, and the link succeeds.
 ///
-/// In the **drop-in** configuration it is the wrong instrument, and the reason
-/// is mechanical rather than a matter of taste. `crate-type` is a property of
-/// the package, so `cargo build --release` asks for the archive, the rlib
-/// *and* the cdylib in one invocation. Refusing the cdylib link there does not
-/// merely decline to emit a shared object: Cargo stops at the first failing
-/// link, so the archive and the rlib -- the artifacts that configuration
-/// exists to produce -- are never written either, and the command exits 101
-/// with nothing to show. The plan requires the opposite at 0.9.2 `A1`, "the
-/// crate builds cleanly in both feature configurations", which names
-/// `--no-default-features --features idn-libidn2` as one of the two, and at
-/// 0.1.1.1 `G1`, one archive and one shared object from a single crate.
+/// In the static drop-in configuration it is the wrong instrument, and the
+/// reason is mechanical rather than a matter of taste. `crate-type` is a
+/// property of the package, so `cargo build --release` asks for the archive,
+/// the rlib *and* the cdylib in one invocation. Refusing the cdylib link there
+/// does not merely decline to emit a shared object: Cargo stops at the first
+/// failing link, so the archive and the rlib -- the artifacts that
+/// configuration exists to produce -- are never written either, and the
+/// command exits 101 with nothing to show. The plan requires the opposite at
+/// 0.9.2 `A1`, "the crate builds cleanly in both feature configurations",
+/// which names `--no-default-features --features idn-libidn2` as one of the
+/// two.
 ///
-/// So the rule is enforced where enforcing it is free, and *recorded* where
-/// enforcing it would destroy the deliverables:
+/// So the enforcement is placed where it is free, and the *contract* is
+/// recorded where enforcement would destroy the deliverables:
 ///
-/// * standalone release cdylib on an ELF target -- `-Wl,-z,defs`, the closure
-///   proof, silent because it passes;
-/// * drop-in release cdylib -- no directive, and a notice naming
-///   `libcurl_urlapi_rs.so` a non-deliverable, saying why it cannot load, and
-///   naming the archive as what to consume instead.
+/// * `scheme-table` on, release cdylib, ELF target -- `-Wl,-z,defs`, the
+///   closure proof, silent because it passes;
+/// * `scheme-table` off, release cdylib -- no directive, and a notice stating
+///   the import contract, naming the two imports, and naming the shared
+///   drop-in configuration for a caller who needs a `dlopen`-able object.
 ///
 /// That notice is deliberately **not** a `cargo:warning`, and the reasoning is
-/// worth stating because the obvious choice is the wrong one here. The drop-in
-/// configuration is one of the two 0.9.2 `A1` requires to build cleanly, and
-/// the specification's zero-warning requirement at 3.2.1.2 covers every
-/// supported build; a warning that fires on every single one of them can never
-/// be cleared, because it describes a property of the configuration rather than
-/// anything the builder did. It would also devalue the warning channel for the
-/// diagnostics that *are* actionable -- a cross build reading the host's
-/// libidn2 header, `CURL_URLAPI_WIN32_UNICODE` set on a non-Windows target, and
-/// `announce_idn_pure_posture`, each of which reports a choice the builder made
-/// and can reverse. So the notice goes where an artifact diagnostic belongs:
-/// beside the artifacts. [`record_dropin_cdylib_notice`] puts it in this
-/// script's captured output and in a file in OUT_DIR, and
+/// worth stating because the obvious choice is the wrong one here. The
+/// static drop-in configuration is one of the two 0.9.2 `A1` requires to build
+/// cleanly, and the specification's zero-warning requirement at 3.2.1.2 covers
+/// every supported build; a warning that fires on every single one of them can
+/// never be cleared, because it describes a property of the configuration
+/// rather than anything the builder did. It would also devalue the warning
+/// channel for the diagnostics that *are* actionable -- a cross build reading
+/// the host's libidn2 header, `CURL_URLAPI_WIN32_UNICODE` set on a non-Windows
+/// target, and `announce_idn_pure_posture`, each of which reports a choice the
+/// builder made and can reverse. So the notice goes where an artifact
+/// diagnostic belongs: beside the artifacts. [`record_dropin_cdylib_notice`]
+/// puts it in this script's captured output and in a file in OUT_DIR, and
 /// docs/KNOWN-DIVERGENCES.md carries the standing account under the heading
 /// the text cites.
 ///
-/// `CURL_URLAPI_STRICT_CDYLIB=1` restores the refusal in the drop-in
-/// configuration, for a packaging job that would rather fail than rely on
-/// reading a notice. It is opt-in precisely because switching it on trades `A1`
-/// away for that absoluteness, and only somebody who knows they want that trade
-/// should be making it.
+/// `CURL_URLAPI_STRICT_CDYLIB=1` applies `-z defs` in the static drop-in
+/// configuration too, for a packaging job that would rather fail than link an
+/// object whose imports it does not want to satisfy. It is opt-in precisely
+/// because switching it on trades `A1` away for that absoluteness, and the
+/// shared drop-in configuration reaches the same end without the trade.
 ///
 /// The directive is `rustc-cdylib-link-arg`, which Cargo applies to the
 /// cdylib link and to nothing else, so the archive, the rlib, `cargo check`
@@ -1861,24 +1928,27 @@ const ELF_TARGET_OS: [&str; 11] = [
 /// Cargo builds *all* of a lib target's crate types whenever it builds the
 /// lib target, and an integration test under `tests/` needs the lib target
 /// built. Gating every profile would therefore make `cargo test` unusable in
-/// the drop-in configuration whenever the strict opt-in was set -- measured,
-/// not supposed -- and the plan calls for five integration tests under
-/// `rust-urlapi/tests/` that have to run in both configurations. So the gate
-/// is scoped to the profile that produces **deliverables**, which is
+/// the static drop-in configuration whenever the strict opt-in was set --
+/// measured, not supposed -- and the plan calls for five integration tests
+/// under `rust-urlapi/tests/` that have to run in both configurations. So the
+/// gate is scoped to the profile that produces **deliverables**, which is
 /// `release`: it is the profile every documented build command names, and the
 /// one `[profile.release]` in Cargo.toml exists to configure. `cargo test`
 /// and `cargo test --lib` keep working in every configuration and under every
-/// setting of the opt-in, and a debug shared object -- which nobody ships --
-/// is recorded in the build log rather than refused.
+/// setting of the opt-in.
 ///
-/// # What a drop-in release build produces
+/// # What each release build produces
 ///
-/// `cargo build --release --no-default-features --features idn-libidn2`
-/// succeeds, warning-free, and writes all three artifacts. Two of them are
-/// deliverables and one is not; the notice says which is which, and the shared
-/// object is the one that is not.
+/// All three commands succeed, warning-free, and write all three artifacts:
 ///
-/// The archive from that command is an *input* rather than the drop-in
+/// ```text
+/// cargo build --release --no-default-features --features idn-libidn2
+/// cargo build --release --no-default-features \
+///   --features idn-libidn2,scheme-table
+/// cargo build --release
+/// ```
+///
+/// The archive from any of them is an *input* rather than the drop-in
 /// artifact, for a reason unrelated to this gate: Cargo cannot apply link-time
 /// optimisation while an rlib is among the crate types, so a three-type build
 /// yields a markedly larger archive with the whole Rust standard library's
@@ -1906,7 +1976,7 @@ fn emit_shared_artifact_gate(scheme_table: bool) {
     let provider = if scheme_table {
         "the built-in table in src/scheme.rs"
     } else {
-        "libcurl's Curl_get_scheme, which only a static drop-in link supplies"
+        "libcurl's Curl_get_scheme, imported the way lib/urlapi.o imports it"
     };
 
     if !ELF_TARGET_OS.contains(&target_os.as_str()) {
@@ -1922,23 +1992,20 @@ fn emit_shared_artifact_gate(scheme_table: bool) {
         note(&format!(
             "profile={profile} produces no deliverable, so the cdylib \
              link-closure gate is left off and `cargo test` keeps working; \
-             the scheme provider is {provider}. A shared object built here in \
-             the drop-in configuration carries unresolved libcurl-private \
-             references and must not be installed -- see \
-             docs/KNOWN-DIVERGENCES.md, \"Integration limitation: the shared \
-             object exists in one configuration only\"."
+             the scheme provider is {provider}"
         ));
         return;
     }
 
     if scheme_table {
-        // Self-contained configuration: the closure proof is free, because the
-        // link succeeds. Keep it absolute.
+        // Self-contained configuration -- the shared drop-in and the
+        // standalone build both land here. The closure proof is free, because
+        // the link succeeds. Keep it absolute.
         cargo("rustc-cdylib-link-arg=-Wl,-z,defs");
         note(&format!(
             "cdylib link-closure gate on (-Wl,-z,defs): the shared object is \
-             a deliverable in this configuration and its scheme provider is \
-             {provider}"
+             closed and loadable in this configuration and its scheme \
+             provider is {provider}"
         ));
         return;
     }
@@ -1946,24 +2013,30 @@ fn emit_shared_artifact_gate(scheme_table: bool) {
     if strict {
         // Asked for explicitly, so the refusal is what the caller wants. Say
         // which artifacts it costs them, because Cargo stops at the first
-        // failing link and the archive is one of the casualties.
+        // failing link and the archive is one of the casualties, and name the
+        // configuration that reaches the same end without the cost.
         cargo("rustc-cdylib-link-arg=-Wl,-z,defs");
         note(
             "CURL_URLAPI_STRICT_CDYLIB is set, so the cdylib link-closure \
-             gate (-Wl,-z,defs) is applied in the drop-in configuration too. \
-             The release cdylib link will fail here by design, and because \
-             Cargo stops at the first failing link, `cargo build --release` \
-             emits no archive and no rlib either. Unset the variable to get \
-             the plan's 0.9.2 A1 behaviour back, which is a successful, \
-             warning-free build plus a DROP-IN-CDYLIB-NOTICE.txt in OUT_DIR \
-             recording that the shared object is not a deliverable.",
+             gate (-Wl,-z,defs) is applied in the static drop-in \
+             configuration too. The release cdylib link will fail here by \
+             design, and because Cargo stops at the first failing link, \
+             `cargo build --release` emits no archive and no rlib either. For \
+             a closed, loadable shared object with the same eight exports, \
+             build --no-default-features --features idn-libidn2,scheme-table \
+             instead of setting this variable. Unset it to get the plan's \
+             0.9.2 A1 behaviour back, which is a successful, warning-free \
+             build plus a DROP-IN-CDYLIB-NOTICE.txt in OUT_DIR recording the \
+             shared object's import contract.",
         );
         return;
     }
 
-    // Drop-in configuration, default posture. The shared object cannot work
-    // and must not be shipped, but refusing it would take the archive and the
-    // rlib down with it, so it is recorded instead of refused.
+    // Static drop-in configuration, default posture. The shared object here
+    // has an import contract rather than a closed one, and the contract is
+    // stated rather than the artifact being written off: it is the contract
+    // lib/urlapi.o already has, narrowed. Enforcing closure would take the
+    // archive and the rlib down with it, so the contract is recorded.
     //
     // Recorded, and deliberately NOT through `cargo:warning`. This
     // configuration is one of the two the plan requires to build cleanly at
@@ -1986,25 +2059,32 @@ fn emit_shared_artifact_gate(scheme_table: bool) {
     // --crate-type staticlib` reaches here as well, and the sentence has to be
     // true there too.
     record_dropin_cdylib_notice(
-        "in the drop-in configuration libcurl_urlapi_rs.so is NOT a \
-         deliverable: it comes out with Curl_get_scheme and Curl_getn_scheme \
-         undefined and no libcurl NEEDED entry, both being libcurl-private \
-         (lib/url.h:76-77), so it fails at dlopen every time. Consume the \
-         ARCHIVE; the shared artifact belongs to the standalone \
-         configuration. See docs/KNOWN-DIVERGENCES.md, \"Integration \
-         limitation: the shared object exists in one configuration only\". \
-         CURL_URLAPI_STRICT_CDYLIB=1 makes the linker refuse that object \
+        "in the static drop-in configuration libcurl_urlapi_rs.so has an \
+         IMPORT CONTRACT rather than a closed one: it exports exactly the \
+         eight names lib/urlapi.o defines, and it imports Curl_get_scheme and \
+         Curl_getn_scheme, which are libcurl-private (lib/url.h:76-77). Two \
+         names, where lib/urlapi.o itself leaves seventeen Curl_*/curl_* \
+         names to the link, and both defined in the same lib/url.c that \
+         supplied its Curl_get_scheme. It resolves in a link where libcurl \
+         participates, and it does NOT resolve at a bare dlopen. For a closed, loadable shared object with the same \
+         eight exports, build --no-default-features --features \
+         idn-libidn2,scheme-table; scheme resolution then comes from this \
+         crate's own table, which is the one documented consequence. See \
+         docs/KNOWN-DIVERGENCES.md, \"Integration limitation: the shared \
+         object's contract varies by mode\". \
+         CURL_URLAPI_STRICT_CDYLIB=1 makes the linker refuse this object \
          instead of this notice recording it.",
     );
     note(&format!(
-        "cdylib link-closure gate off in the drop-in configuration, whose \
-         scheme provider is {provider}: applying -Wl,-z,defs here would fail \
-         the cdylib link and, with it, the whole `cargo build --release` that \
-         the plan requires to succeed at 0.9.2 A1. The publishable static \
-         artifact is the localized archive from `cargo rustc --release \
-         --no-default-features --features idn-libidn2 --lib --crate-type \
-         staticlib` followed by a CURL_URLAPI_DROPIN_ARCHIVE invocation; see \
-         `localize_dropin_archive`."
+        "cdylib link-closure gate off in the static drop-in configuration, \
+         whose scheme provider is {provider}: applying -Wl,-z,defs here would \
+         fail the cdylib link and, with it, the whole `cargo build --release` \
+         that the plan requires to succeed at 0.9.2 A1. scripts/check-abi.sh \
+         asserts this object's export set and its import set instead. The \
+         publishable static artifact is the localized archive from `cargo \
+         rustc --release --no-default-features --features idn-libidn2 --lib \
+         --crate-type staticlib` followed by a CURL_URLAPI_DROPIN_ARCHIVE \
+         invocation; see `localize_dropin_archive`."
     ));
 }
 
@@ -2250,8 +2330,8 @@ fn check_scheme_layout_precondition(crate_dir: &Path) {
 /// [`LIBIDN2_MIN_VERSION`].
 ///
 /// A failure rather than a warning, because both reasons the floor exists are
-/// reasons not to build: below 2.2.0 the provider carries the
-/// CVE-2019-12290 heap overflow in the very entry points this crate calls,
+/// reasons not to build: below 2.2.0 the provider performs no A-label roundtrip
+/// check in the very entry points this crate calls, which is CVE-2019-12290,
 /// and the flag set that reaches those entry points is not the one the parity
 /// measurements were taken with. A warning on a build that then links anyway
 /// leaves an artifact whose behaviour nobody has measured.
@@ -2262,13 +2342,14 @@ fn require_libidn2_floor(version: &str) {
         Some(_) => panic!(
             "curl-urlapi-rs: the selected {LIBIDN2_MODULE} is {version}, \
              which is older than the {LIBIDN2_MIN_VERSION} this crate \
-             requires. Two reasons, either of which is enough. The \
-             heap-overflow fixed in 2.2.0, CVE-2019-12290, reaches the \
-             lookup entry points this crate calls. And lib/idn.c gates \
-             IDN2_NONTRANSITIONAL on the compile-time version and checks the \
-             runtime one with idn2_check_version(), so an older library \
-             changes which flags reach the lookup and parity with the C \
-             implementation is not claimed for it. Upgrade libidn2, or build \
+             requires. Two reasons, either of which is enough. \
+             CVE-2019-12290, fixed in 2.2.0, is a missing A-label roundtrip \
+             check that lets one domain impersonate another, and it is missing \
+             from the lookup entry points this crate calls. And lib/idn.c \
+             gates IDN2_NONTRANSITIONAL on the compile-time version and \
+             checks the runtime one with idn2_check_version(), so an older \
+             library changes which flags reach the lookup and parity with the \
+             C implementation is not claimed for it. Upgrade libidn2, or build \
              with --no-default-features --features idn-pure and read \
              docs/KNOWN-DIVERGENCES.md first."
         ),
@@ -2359,9 +2440,19 @@ fn cargo_supports_check_cfg() -> bool {
 ///
 /// The backend diverges in ways no configuration closes: no transitional
 /// retry, locale-independent conversion where `idn2_lookup_ul` is not,
-/// different Unicode tables, and allocation through Rust's global allocator,
-/// whose failure handler aborts the process where `curl_url_set()` is
-/// documented to answer an allocation failure with `CURLUE_OUT_OF_MEMORY`.
+/// different Unicode tables, and a residual abort risk on allocation failure.
+///
+/// That last one needs stating precisely, because the obvious wording
+/// overstates it. The RESULT of a conversion is not at risk: `src/idn.rs` does
+/// not call `idna::domain_to_ascii`, which would build a `String` through
+/// Rust's global allocator and abort on failure, but drives `Uts46::process`
+/// into a caller-supplied sink that accumulates over the C allocator and turns
+/// a refused write into `CURLE_OUT_OF_MEMORY`, which is what
+/// `docs/libcurl/curl_url_set.md` documents. What remains is `Uts46::process`
+/// allocating internally while it normalizes, through Rust's global allocator,
+/// with no API to make those allocations fallible. So the abort risk is the
+/// crate's internal working set rather than every result string: smaller, no
+/// longer proportional to the input, and not zero.
 ///
 /// This warns rather than refusing the build. `idn-pure` is one of the six
 /// features the manifest offers, so selecting it deliberately is a supported
@@ -2373,8 +2464,10 @@ fn announce_idn_pure_posture() {
     warn(
         "the \"idn-pure\" backend is selected and is NOT covered by the \
          bit-for-bit IDN parity claim: no transitional retry, \
-         locale-independent conversion, different Unicode tables, and an \
-         allocation failure aborts instead of returning \
+         locale-independent conversion, different Unicode tables, and a \
+         residual abort risk if one of the idna crate's own internal \
+         normalization allocations fails, which no API makes fallible. The \
+         conversion result itself is allocated fallibly and answers \
          CURLUE_OUT_OF_MEMORY. Use \"idn-libidn2\" for parity runs; every \
          divergence is recorded in docs/KNOWN-DIVERGENCES.md.",
     );

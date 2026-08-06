@@ -169,9 +169,10 @@
 //! They are not intended to be the last word. The end-to-end oracle is the
 //! unmodified `tests/libtest/lib1560.c` compiled against the reference C
 //! library and against this crate, with the two outputs diffed byte for byte.
-//! The script that is to drive that comparison,
-//! `rust-urlapi/scripts/run-parity.sh`, is a later deliverable and does not
-//! exist yet, so nothing here should be read as a claim that it has run.
+//! `rust-urlapi/scripts/run-parity.sh` drives that comparison, and it reports
+//! byte-identical output in both link modes across its whole environment
+//! matrix, so the claims here rest on a run that happened rather than on one
+//! still to come.
 
 // The plan puts every `unsafe` block in `src/ffi.rs` (0.3.3) and the
 // technical specification forbids `unsafe` outside FFI code (1.3.2.1).

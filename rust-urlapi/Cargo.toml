@@ -16,8 +16,9 @@
 # it does not replace them. Nothing outside this directory is created,
 # edited, moved or deleted.
 #
-# The two build configurations. GNUmakefile and scripts/ are to use them
-# verbatim once those deliverables land; until then they are invoked by hand:
+# The three build configurations. scripts/build-rust.sh uses them verbatim
+# and GNUmakefile delegates to it, so the command lines below are the ones a
+# build actually issues rather than a description of them:
 #
 #   Mode A, the drop-in and authoritative configuration
 #     cargo build --release --no-default-features --features idn-libidn2
@@ -30,6 +31,13 @@
 #     Links with no libcurl at all, so the crate supplies curl_url_strerror,
 #     curl_free and a built-in scheme table itself, alongside the small C
 #     shims for the curl_mprintf family in harness/shims.c.
+#
+#   Mode C, the shared drop-in
+#     cargo build --release --no-default-features \
+#       --features idn-libidn2,scheme-table
+#     Mode A's eight exports with the scheme table compiled in, so the shared
+#     object imports no libcurl-private name and loads on its own. This is the
+#     cdylib half of G1; see the scheme-table note below for its price.
 
 [package]
 name = "curl-urlapi-rs"
@@ -292,12 +300,29 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # The first three are not conveniences. Each exists because libcurl already
 # supplies what it provides -- curl_url_strerror in lib/strerror.c, curl_free
 # in lib/escape.c, Curl_get_scheme in lib/url.c -- and all three of those
-# files are out of scope and cannot be touched. All three must therefore be
-# OFF in Mode A, the drop-in configuration, and ON in Mode B, the standalone
-# one.
+# files are out of scope and cannot be touched. strerror and cfree must
+# therefore be OFF in Mode A, the drop-in configuration, and ON in Mode B, the
+# standalone one. scheme-table is the one with three settings that all make
+# sense, and the third is a deliverable:
 #
-# They do not fail the same way when set wrongly in Mode A, and the
-# difference decides how much attention each needs.
+#   --no-default-features --features idn-libidn2                Mode A
+#   (the defaults)                                               Mode B
+#   --no-default-features --features idn-libidn2,scheme-table    Mode C
+#
+# The last line is the SHARED drop-in configuration, and it exists because
+# G1 at 0.1.1.1 asks for a shared object as well as an archive. It exports
+# exactly the eight names lib/urlapi.o defines -- strerror and cfree are still
+# off -- and, because the scheme table is compiled in, it has no
+# libcurl-private undefined references, so build.rs proves it closed with
+# -Wl,-z,defs and it loads under dlopen. The top line's shared object exports
+# the same eight and imports the two scheme entry points instead, which is the
+# contract lib/urlapi.o already has, narrowed from seventeen names to two.
+# scripts/check-abi.sh asserts both. docs/KNOWN-DIVERGENCES.md, "Integration
+# limitation: the shared object's contract varies by mode", carries the whole
+# account.
+#
+# The three settings do not fail the same way when set wrongly on a Mode A
+# ARCHIVE link, and the difference decides how much attention each needs.
 #
 #   strerror and cfree fail LOUDLY. The crate really does define
 #   curl_url_strerror() and curl_free() under those features, so leaving
@@ -308,21 +333,29 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 #   never defines Curl_get_scheme outside its own tests, so leaving
 #   scheme-table on in Mode A produces no duplicate symbol and no link error
 #   at all. What it produces is a clean link against the crate's own built-in
-#   33-row table instead of the linked libcurl's real one -- and that table
-#   answers "is this protocol implemented?" with yes for every row, because
-#   in a standalone build there is no protocol implementation for a #ifdef to
-#   have removed. src/scheme.rs:405-425 documents the substitution and its
-#   consequence: curl_url_set(u, CURLUPART_SCHEME, "rtmp", 0) succeeds where
-#   a libcurl built without librtmp answers CURLUE_UNSUPPORTED_SCHEME. The
-#   drop-in backend reads the real h->run pointer and reaches that path
-#   exactly when the linked libcurl does.
+#   33-row table instead of the linked libcurl's real one. That table is not a
+#   permissive stand-in -- src/scheme.rs models ONE build with a `mod
+#   capability` of explicit constants, and each row spells its own C condition
+#   in terms of them -- but the build it models is the reference build the
+#   parity harness compares against, which is not necessarily the libcurl a
+#   Mode A integrator links. Every disagreement between the two is then
+#   accepted silently, in either direction: a protocol the modeled build has
+#   and the linked libcurl disabled is accepted where the real table would
+#   answer CURLUE_UNSUPPORTED_SCHEME, and one the modeled build lacks is
+#   refused where the real table would allow it. The drop-in backend has
+#   neither problem, because it reads the real h->run pointer and therefore
+#   answers for whatever libcurl it was linked against.
 #
 # build.rs cannot detect the link mode -- nothing in a Cargo build knows
-# which archive a later C link line will name -- so this comment, that one,
-# and the entry in docs/KNOWN-DIVERGENCES.md are the only available controls.
-# Mode A is --no-default-features --features idn-libidn2, and a Mode A
-# integrator should read src/scheme.rs:405-425 before assuming a clean link
-# means a correct one.
+# which archive a later C link line will name -- so this comment, the one at
+# [features] below, and the entry in docs/KNOWN-DIVERGENCES.md are the only
+# available controls. Mode A is --no-default-features --features idn-libidn2,
+# and a Mode A
+# integrator linking the ARCHIVE should read the `mod capability` block in
+# src/scheme.rs before assuming a clean link means a correct one. An
+# integrator loading a SHARED object has made the choice deliberately,
+# because the shared drop-in configuration names scheme-table on its own
+# command line.
 #
 # One half of that silent failure IS now caught, and it is worth being precise
 # about which half. `localize_dropin_archive` in build.rs inspects the raw
@@ -360,25 +393,30 @@ cfree = []
 # (lib/url.c:1469-1471), so the real and complete table is used and this
 # crate contributes none of its own.
 #
-# Must be off in Mode A, and leaving it on there is the silent failure
-# described above rather than a link error. The built-in table's protocol
-# markers are compile-time constants describing ONE build -- the reference
-# build the parity run compares against -- so with the feature wrongly left on
-# in Mode A the parser consults that build's capability set instead of the
-# linked libcurl's, and every disagreement between the two is accepted
+# Off for the Mode A ARCHIVE, always. Leaving it on there is the silent
+# failure described above rather than a link error. The built-in table's
+# protocol markers are compile-time constants describing ONE build -- the
+# reference build the parity run compares against -- so with the feature
+# wrongly left on the parser consults that build's capability set instead of
+# the linked libcurl's, and every disagreement between the two is accepted
 # silently. Recorded in docs/KNOWN-DIVERGENCES.md under
 # "Integration limitation: the standalone table models one build".
 #
-# This feature also decides WHICH ARTIFACTS OF A CONFIGURATION ARE
-# DELIVERABLES, for the reason set out under [lib] above: with it off the crate
-# references two libcurl-private symbols that only a static link can resolve,
-# so the shared object that configuration builds is not shippable and build.rs
-# records that in a notice on every release build -- in its captured output and
-# in DROP-IN-CDYLIB-NOTICE.txt in OUT_DIR, not on the warning channel. The
-# build itself succeeds, warning-free, and writes all three artifacts, which is
-# what the plan requires at 0.9.2 A1. With the feature on the crate is self-contained, all three
-# artifacts are valid, and the release cdylib link additionally carries
-# `-Wl,-z,defs` as a standing proof of that.
+# On, deliberately, for the SHARED drop-in object, which is the other half of
+# what G1 asks for. With the feature on the crate is self-contained: the
+# release cdylib link carries `-Wl,-z,defs` as a standing proof of that, the
+# object loads under dlopen, and with strerror and cfree still off it exports
+# exactly the eight names lib/urlapi.o defines. That trade -- a closed link in
+# exchange for the modelled capability set -- is the one an integrator makes
+# knowingly, because the configuration names this feature on its command line.
+#
+# With the feature off, the shared object of that same compilation imports the
+# two libcurl-private scheme entry points instead, and build.rs records that
+# import contract on every release build -- in its captured output and in
+# DROP-IN-CDYLIB-NOTICE.txt in OUT_DIR, not on the warning channel. The build
+# itself succeeds, warning-free, and writes all three artifacts, which is what
+# the plan requires at 0.9.2 A1; scripts/check-abi.sh then asserts that
+# object's export set and its import set.
 scheme-table = []
 
 # The default IDN backend: bind libidn2 directly and replicate the call
@@ -460,7 +498,7 @@ genheader = ["dep:cbindgen"]
 # `curl-urlapi-rs` does not contain this feature: `capi`".
 #
 # The remedy is one line, `capi = []`, and it is deliberately not taken: it
-# would put a seventh feature in a manifest the plan tables with six. The
+# would put a seventh feature in a manifest the plan freezes at six. The
 # constraint is therefore reported rather than closed, which is the same
 # treatment 0.2.4 gives the four constraints it records. What is affected is
 # only the optional path -- 0.5.1 lists cargo-c as a developer tool and not a
@@ -470,6 +508,17 @@ genheader = ["dep:cbindgen"]
 # [package.metadata.capi] sections below stay because 0.8.3 permits the
 # metadata block; they describe the shape the path would install once the
 # constraint is resolved. docs/KNOWN-DIVERGENCES.md carries the full record.
+#
+# What that costs the tooling is spelled out here so that nothing advertises a
+# path it cannot take. The packaging path is NOT available on this manifest,
+# and `scripts/build-rust.sh --capi` therefore FAILS with a non-zero exit
+# status and a diagnostic naming this constraint, rather than reporting a
+# successful run that installed nothing. That is deliberate: an explicit
+# packaging request that produces no package is a failure of the request, and
+# the only honest alternatives are to make the path work -- which needs the
+# seventh feature -- or to refuse the request. The refusal is the one that
+# leaves the manifest as the plan froze it. `--capi` is off by default, so an
+# ordinary run of that script is unaffected and still exits zero.
 
 # The two IDN backends are mutually exclusive in intent, mirroring the
 # #error at lib/curl_setup.h:726-728. Cargo features are additive by
@@ -545,10 +594,12 @@ cbindgen = { version = "0.29.4", optional = true, default-features = false }
 # here either, because this module performs no input or output at all.
 #
 # cargo-c belongs to neither table, and unlike cbindgen it really is a program:
-# scripts/build-rust.sh is to invoke it as `cargo cbuild`. That path is
-# currently blocked, because the tool requires a declared `capi` feature this
-# six-feature manifest does not have; the reported constraint beside [features]
-# above states the measurement and the remedy.
+# `scripts/build-rust.sh --capi` would invoke it as `cargo cbuild`. That path
+# is blocked, because the tool requires a declared `capi` feature this
+# six-feature manifest does not have, so the script reports the constraint and
+# exits non-zero rather than claiming a packaging run it did not perform. The
+# reported constraint beside [features] above states the measurement and the
+# remedy.
 #
 # cbindgen is the one that reads as a contradiction if this note is skimmed, so
 # it is stated plainly: it IS a dependency, declared above under
@@ -573,17 +624,20 @@ cbindgen = { version = "0.29.4", optional = true, default-features = false }
 # `cargo rustc --release --lib --crate-type staticlib`.
 #
 # The difference is large enough to notice rather than academic, and it decides
-# which archive is publishable. Measured locally on this crate in the standalone
-# configuration: three crate types in one unit gives a 22,266,440-byte archive
-# defining 2,416 globals, while the single-crate-type invocation gives
-# 7,613,238 bytes and 625. Those are local measurements and nothing more. The
-# Agent Action Plan's own figure at 0.5.1.2 is 7,526,790 bytes for the default
-# archive and it records no global count, so the two sets of numbers are not the
-# same measurement and neither is a requirement -- the plan sets no size target
-# at 0.8.5. What matters is that the localization pass in build.rs runs over the
-# single-crate-type archive, which is the input it is meant to have, and that
-# nothing hands a consumer the three-type archive as though it were the
-# drop-in. See the [lib] note above for the whole sequence.
+# which archive is publishable. Measured locally on this crate in the
+# standalone configuration, the three-crate-type unit comes out roughly 3x the
+# size of the single-crate-type one and defines thousands of globals where the
+# other defines a few hundred. No literal is quoted, because both figures move
+# with the toolchain and a number here goes stale rather than wrong in any
+# informative way; read them off the artifacts with `stat -c%s` and
+# `nm -g --defined-only`, as docs/KNOWN-DIVERGENCES.md sets out under "What
+# this costs, stated plainly". The Agent Action Plan's own figure at 0.5.1.2 is
+# 7,526,790 bytes for the default archive and it records no global count, so it
+# is not the same measurement either, and neither is a requirement -- the plan
+# sets no size target at 0.8.5. What matters is that the localization pass in
+# build.rs runs over the single-crate-type archive, which is the input it is
+# meant to have, and that nothing hands a consumer the three-type archive as
+# though it were the drop-in. See the [lib] note above for the whole sequence.
 lto = true
 codegen-units = 1
 # Belt and braces rather than the primary defence. Every exported function is

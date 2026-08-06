@@ -409,14 +409,29 @@ mod backend {
     /// it answers for whatever libcurl it was linked against. Standalone mode
     /// has no libcurl and therefore has to *model* a build, and the build it
     /// models is the reference build, because that is what the parity harness
-    /// is to compare against: a libcurl configured with OpenSSL, libidn2,
-    /// OpenLDAP and nghttp2 and with nothing disabled.
-    /// `scripts/build-reference.sh` is to produce exactly that configuration
-    /// and is a later deliverable, so the table below is written against those
-    /// options rather than against a script that can yet be read.
+    /// compares against.
+    ///
+    /// `scripts/build-reference.sh` produces exactly that configuration, and
+    /// the options that decide this table are the ones it passes to CMake:
+    /// `-DCURL_ENABLE_SSL=ON`, `-DCURL_USE_OPENSSL=ON`, `-DUSE_LIBIDN2=ON`,
+    /// `-DCURL_DISABLE_LDAP=OFF` and `-DCURL_DISABLE_LDAPS=OFF`. It passes
+    /// `-DBUILD_STATIC_LIBS=ON` for the archive the drop-in link needs, and
+    /// `-DENABLE_DEBUG=OFF` and `-DCURL_LTO=OFF` for reasons that belong to
+    /// that link rather than to this table. It passes no other
+    /// `CURL_DISABLE_*`, so nothing else is removed, and it leaves the
+    /// remaining backends -- HTTP/2 and the public-suffix list among them -- to
+    /// CMake's own detection, which is why they show up in the features line
+    /// below without appearing among the options.
+    ///
+    /// That script then verifies the result rather than assuming it: before
+    /// capturing anything it asserts that the nine protocols
+    /// `tests/data/test1560` declares -- file, https, http, pop3, smtp, imap,
+    /// ldap, dict and ftp -- are all present in the build it just produced.
     ///
     /// The values below are that configuration, and they are checkable rather
-    /// than asserted: the reference build's own `curl --version` reports
+    /// than asserted: the script reads the reference build's own generated
+    /// `curl-config --protocols` and `--features`, records both in
+    /// `build/reference-build.env`, and gets
     ///
     /// ```text
     /// Protocols: dict file ftp ftps gopher gophers http https imap imaps

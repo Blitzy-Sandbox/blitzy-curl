@@ -43,7 +43,7 @@
    stronger check than any expectation this file could hold: an expectation
    encodes what its author believed, while the diff encodes what curl does.
 
-   Three properties earn their own note because they look like style and
+   Four properties earn their own note because they look like style and
    are not:
 
    - Every retrieved value is printed inside brackets. Several vectors here
@@ -59,7 +59,12 @@
    - Nothing is skipped on an error. Reporting an error code is the parity
      signal, so a failing call prints and the transcript carries on. The
      one exception is an allocation failure, which cannot produce a
-     comparable transcript at all; see oom() below. */
+     comparable transcript at all; see oom() below.
+   - No value is passed to a conversion before it has been shown to exist.
+     curl_url_get() can answer CURLUE_OK and store nothing, and printing a
+     null through %s is undefined behavior, so an oracle that did it would
+     crash on a defect instead of naming it. showpart() prints a fixed
+     marker line and fails the run instead; the reasoning is there. */
 
 #include <stdio.h>
 
@@ -115,6 +120,15 @@ void curl_free(void *p);
 /* The status returned when an allocation failed. Distinct from 0 so that a
    truncated transcript can never be mistaken for a passing run. */
 #define DEMO_ERR_OOM 1
+
+/* The status returned when curl_url_get() answered CURLUE_OK and stored a
+   null pointer. See showpart() for why that shape is reachable and why this
+   program refuses to dereference it.
+
+   A separate bit rather than a separate number: every caller accumulates
+   these statuses with |=, so two different faults in one run both survive
+   into main()'s return value instead of one masking the other. */
+#define DEMO_ERR_NULL_VALUE 2
 
 /* Reports an allocation failure and asks for a non-zero exit.
 
@@ -196,18 +210,43 @@ static int status_of(CURLUcode uc)
    lib/escape.c:L189-L192; in standalone mode it is the crate's cfree-gated
    export. Either is correct because every buffer the crate hands to C comes
    from the C allocator, which is the arrangement AAP 0.6.4 settles on and
-   ../docs/MEMORY-OWNERSHIP.md records end to end. Two configurations are
-   reported there as unsupported rather than worked around: curl's
-   memory-debug build, whose tracking free validates pointers against its
-   own table (AAP 0.2.4.3), and applications that install their own
-   allocators through the alternative-allocator entry point at
-   lib/easy.c:L237 (AAP 0.2.4.4).
+   ../docs/MEMORY-OWNERSHIP.md records end to end.
+
+   Two configurations are reported there as unsupported rather than worked
+   around. The first is a memory-debug build of curl (AAP 0.2.4.3), where
+   curl_free() becomes curl_dbg_free(). That function performs no lookup and
+   rejects nothing: it subtracts the offset of the payload within its own
+   header struct from the pointer it was handed and frees that address
+   unconditionally (lib/memdebug.c:L362-L385), so a C-allocator buffer with
+   no such header in front of it is released at an address that was never the
+   start of an allocation. Heap corruption, not a refusal. The second is an
+   application that installs its own allocators through the
+   alternative-allocator entry point at lib/easy.c:L237 (AAP 0.2.4.4), which
+   would release these buffers with a deallocator that never allocated them.
 
    The handle is const because curl_url_get() takes const CURLU *.
 
-   Returns DEMO_ERR_OOM if the retrieval ran out of memory and 0 otherwise,
-   so that every caller can carry the status out to main(). See status_of()
-   for why that one code is singled out. The buffer, if there was one, is
+   SUCCESS DOES NOT IMPLY A POINTER, and that is why the value is tested
+   before it is printed rather than after. CURLUE_OK alongside a null
+   *partp is a real shape of the C implementation, not a defensive
+   hypothetical: urlget_format() at lib/urlapi.c:L1391-L1398 hands the
+   encoded part over as curlx_dyn_ptr(&enc), which is NULL for a dynamic
+   buffer nothing was ever added to, so an empty part retrieved with
+   CURLU_URLENCODE returns CURLUE_OK with nothing stored.
+   docs/libcurl/curl_url_get.md:L249 leaves the contents undefined on any
+   other code, and lib/urlapi.c:L1552 nulls the slot before every failing
+   return, so a null is the one thing this caller can be handed at any time.
+   None of the vectors below pairs CURLU_URLENCODE with an empty part, so
+   the reference transcript never takes this branch -- but passing a null to
+   %s is undefined behavior, and an oracle that crashes reports nothing. A
+   defective implementation returning CURLUE_OK with no buffer therefore
+   gets a fixed line in the transcript and a non-zero status, which the
+   byte-for-byte diff names, instead of a signal that ends the run.
+
+   Returns DEMO_ERR_OOM if the retrieval ran out of memory,
+   DEMO_ERR_NULL_VALUE for the shape just described, and 0 otherwise, so
+   that every caller can carry the status out to main(). See status_of() for
+   why out of memory is singled out. The buffer, if there was one, is
    released before the status is computed, so no path here can return early
    and leave it behind. */
 static int showpart(const CURLU *u, CURLUPart part, const char *label,
@@ -217,6 +256,15 @@ static int showpart(const CURLU *u, CURLUPart part, const char *label,
   CURLUcode uc = curl_url_get(u, part, &value, flags);
 
   if(!uc) {
+    if(!value) {
+      /* Nothing was handed over, so nothing is released here: free(NULL)
+         would be harmless but there is no block to name. The marker is
+         plain ASCII with no trailing space and no bracket, so it is
+         distinct from both of the other two line shapes this program
+         prints and safe for scripts/spacecheck.pl. */
+      printf("%s: rc=0 with no value\n", label);
+      return DEMO_ERR_NULL_VALUE;
+    }
     printf("%s: [%s]\n", label, value);
     curl_free(value);
   }
@@ -236,10 +284,29 @@ static int showpart(const CURLU *u, CURLUPart part, const char *label,
    the value it is given, per include/curl/urlapi.h:L138-L139.
 
    Returns DEMO_ERR_OOM if the assignment ran out of memory and 0 otherwise,
-   for the reason status_of() gives. An assignment that fails any other way
-   leaves the handle unchanged -- lib/urlapi.c:L1197-L1209 parses into a
-   zeroed temporary and swaps only on success -- so carrying on with it is
-   sound and is what section 11 relies on. */
+   for the reason status_of() gives. A failed assignment still leaves the
+   handle usable, which is what section 11 relies on -- but the guarantee is
+   narrower than "unchanged" and the difference is worth stating rather than
+   rounding off.
+
+   Atomicity belongs to CURLUPART_URL alone. That one goes through set_url()
+   at lib/urlapi.c:L1871-L1872, which parses into a zeroed temporary and swaps
+   into the live handle only on success (L1197-L1209), so no partial mutation
+   is ever observable. An individual part setter has no temporary: it reaches
+   its switch arm, commits whatever that arm commits, and only then encodes
+   and allocates, so a failure after that point leaves the earlier commit in
+   place. Three arms do commit something. CURLUPART_HOST frees the zone
+   identifier at L1848 before anything can fail, so a host assignment that
+   then runs out of memory leaves the zone identifier already cleared.
+   CURLUPART_QUERY sets query_present at L1865 and CURLUPART_FRAGMENT sets
+   fragment_present at L1869, both before the encoding step, so either flag
+   can end up set for a part that was never stored -- which changes what
+   CURLU_GET_EMPTY reports afterwards.
+
+   None of that is a defect of the port. It is the C's behavior, reproduced,
+   and this demo never depends on it: every setpart() call here either
+   succeeds or fails for a reason the transcript prints, and no later section
+   reads a part whose assignment failed. */
 static int setpart(CURLU *u, CURLUPart part, const char *value,
                    const char *label, unsigned int flags)
 {
@@ -729,11 +796,14 @@ static int s08_dup_and_fb1(void)
       libidn2 through the macro at lib/idn.c:L35-L41, which off Windows
       expands to the locale-aware idn2_lookup_ul, so converting a non-ASCII
       host succeeds only while the process codeset is UTF-8 -- AAP 0.6.3
-      measures both outcomes. ../scripts/run-parity.sh is to run this program
-      under LC_ALL=C.UTF-8 and again under LC_ALL=C, which acceptance
-      criterion A9 requires, and one committed transcript could not match a
-      converted host in the first run and CURLUE_BAD_HOSTNAME in the
-      second. IDN coverage therefore belongs to the other oracle, where
+      measures both outcomes, and acceptance criterion A9 requires both to
+      be exercised. One committed transcript could not match a converted
+      host under LC_ALL=C.UTF-8 and CURLUE_BAD_HOSTNAME under LC_ALL=C, so
+      ../scripts/run-parity.sh runs this program once, in the UTF-8
+      environment its golden was captured in, and discharges A9 through the
+      harness instead, which it runs over all four locale and codeset cells
+      against the reference's own capture of each. IDN coverage therefore
+      belongs to that other oracle, where
       tests/libtest/lib1560.c gates exactly those rows on
       CURL_TEST_HAVE_CODESET_UTF8 at its L2036 and checks them at L1446,
       L1548 and L1591. This is a boundary between the two oracles, not a
@@ -1123,13 +1193,20 @@ int main(void)
   int rc = 0;
 
   /* The banner exists so that the licence annotation lands in the golden
-     transcript. ../demo/expected-output.txt is to be a tracked file reuse
-     lint covers, and it will not be able to carry an inline annotation
-     without corrupting the very bytes it asserts, so the program prints one
-     and the golden file legitimately contains it. REUSE.toml:L4-L6 asks that
-     a file be annotated directly unless it cannot carry comments, and this
-     route satisfies that without a sidecar and without touching REUSE.toml,
-     which is out of scope.
+     transcript. ../demo/expected-output.txt is a tracked file that reuse
+     lint covers, and it cannot carry an inline annotation without corrupting
+     the very bytes it asserts, so the program prints one and the golden file
+     legitimately contains it. REUSE.toml:L4-L6 asks that a file be annotated
+     directly unless it cannot carry comments, and this route satisfies that
+     without a sidecar and without touching REUSE.toml, which is out of
+     scope.
+
+     Where those bytes come from: ../scripts/build-reference.sh runs this
+     program linked against an unmodified libcurl, checks the capture against
+     every rule scripts/spacecheck.pl applies to a tracked file, and only then
+     writes it to that path. ../scripts/run-parity.sh reads it and never
+     writes it, so the oracle is captured from the C and compared against the
+     Rust rather than being produced by the thing under test.
 
      Printed unconditionally in both link modes. Anything conditional here
      would make the two modes' transcripts differ, and acceptance criterion

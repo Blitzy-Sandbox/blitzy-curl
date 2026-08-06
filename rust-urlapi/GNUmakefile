@@ -477,13 +477,15 @@ help:
 #
 # R3, THE HARNESS IS BUILT WITHOUT CURL'S MEMORY-DEBUG CONFIGURATION.
 # curl_free is a one-line forward (lib/escape.c lines 189 to 192) to a macro
-# resolved at compile time. Under the memory-debug configuration it becomes a
-# tracking free that validates every pointer against its own allocation table
-# (lib/curl_setup.h line 1461, lib/memdebug.c line 383). This crate allocates
-# the buffers it hands to C with the C allocator directly, so that tracking
-# free would reject them or account for them wrongly; routing through
-# libcurl's internal free hook would mean importing a private symbol and
-# would still not satisfy the table. So the ceiling tests/data/test1560
+# resolved at compile time. Under the memory-debug configuration it becomes
+# curl_dbg_free (lib/curl_setup.h line 1461), which performs no lookup and no
+# validation: it subtracts its own struct memdebug header from the pointer and
+# frees that address instead (lib/memdebug.c lines 362 to 385). This crate
+# allocates the buffers it hands to C with the C allocator directly, so handing
+# one to that free corrupts the heap rather than being refused, and the paired
+# counter never saw the block; routing through libcurl's internal free hook
+# would mean importing a private symbol and would still leave the accounting
+# wrong. So the ceiling tests/data/test1560
 # asserts at line 40, "Allocations: 3000", is honored in spirit -- the port
 # is not materially more allocation-hungry than the original -- but it is not
 # counted by curl's own counter. PARITY_ARGS=--valgrind reports an

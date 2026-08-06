@@ -61,11 +61,25 @@
 //! drop-in mode** because `strerror.c.o` and `escape.c.o` already define
 //! them. That is the whole set, and nothing else in the crate carries
 //! `#[no_mangle]` outside `#[cfg(test)]`, which is what keeps the archive
-//! collision-free. `scripts/check-abi.sh` is to compare the archive's set
-//! against the C object's; it is a later deliverable and does not exist yet,
-//! so for now `nm -g --defined-only` over both artifacts is the check, and it
-//! has to disregard the compiler-builtins and Rust-runtime symbols the
-//! staticlib carries alongside this crate's own.
+//! collision-free.
+//!
+//! `scripts/check-abi.sh` is what verifies that, and it verifies it on the
+//! artifact a link actually consumes. Cargo's own staticlib is not that
+//! artifact: it carries the Rust standard library, so `nm -g --defined-only`
+//! over it reports thousands of globals and a comparison has to filter them.
+//! `build.rs` therefore localizes it -- `ld -r --whole-archive`, then
+//! `objcopy --keep-global-symbol` for the ABI set, then `ar rcs` -- into
+//! `libcurl_urlapi_rs_dropin.a`, which defines the ABI and nothing else and is
+//! compared UNFILTERED. The script asserts set equality in both directions, so
+//! a missing name and an extra one both fail, and it checks the standalone
+//! archive and the shared object too. It runs before any behavioural check,
+//! because a symbol mismatch would make every behavioural result meaningless.
+//!
+//! It reads two archives per configuration rather than one: that canonical
+//! archive, unfiltered, and Cargo's own staticlib narrowed to the `curl_`
+//! and `Curl_` namespaces, because that one carries the compiler-builtins
+//! and Rust-runtime symbols as well. Checking both is what would catch a
+//! fault in the reduction itself, as a disagreement between them.
 //!
 //! Every one of the ten is a thin skin: it validates the pointers, converts
 //! the representations, and delegates. `src/getset.rs` owns the get and set
@@ -1925,17 +1939,26 @@ pub(crate) mod scheme_import {
     /// header is one protocol away from the condition its own comment
     /// describes.
     ///
-    /// Two things guard the assumption, and it is worth being precise about
+    /// Three things guard the assumption, and it is worth being precise about
     /// what each one can do.
     ///
     /// [`LAYOUT_PROOF`] pins *this* structure to the shape the port assumes,
     /// at compile time. It catches an edit here -- a reordered field, a
-    /// widened integer, a `#[repr(C)]` accidentally dropped. It cannot observe
-    /// the C side at all: no assertion written in Rust can read
-    /// `lib/urldata.h`. The 32-bit `curl_prot_t` is therefore a documented
-    /// *precondition* of drop-in mode rather than a checked one, and belongs
-    /// with the other documented limitations of that mode in
-    /// `docs/KNOWN-DIVERGENCES.md`.
+    /// widened integer, a `#[repr(C)]` accidentally dropped. What it cannot do
+    /// is observe the C side, because a `const` assertion has no way to read a
+    /// file.
+    ///
+    /// `build.rs` reads it instead. Whenever `scheme-table` is off -- that is,
+    /// in exactly the configurations that mirror this structure -- it opens
+    /// `../lib/urldata.h`, requires both a `PROTO_TYPE_SMALL` definition and
+    /// the `typedef uint32_t curl_prot_t` beside it, and fails the build
+    /// naming both readings if either is gone. It also registers the header
+    /// with `cargo:rerun-if-changed`, so a later edit to it re-runs the check
+    /// rather than being missed. The precondition is therefore checked, not
+    /// merely documented; `docs/KNOWN-DIVERGENCES.md` records what it rests on,
+    /// and the one case the check downgrades to a warning is a `lib/urldata.h`
+    /// that cannot be read at all, which is what a crate built outside the
+    /// repository sees.
     ///
     /// The live cross-check is the parity run. `tests/libtest/lib1560.c`
     /// asserts default ports directly -- `https://127.0.0.1` with
@@ -2157,9 +2180,12 @@ pub(crate) mod scheme_import {
         ///
         /// It is defined under `cfg(test)` and can therefore never reach the
         /// shipped archive, so `Curl_get_scheme` remains an undefined symbol
-        /// there -- which is what a symbol-set check over the archive, whether
-        /// `nm -u` by hand or `scripts/check-abi.sh` once that script lands,
-        /// has to see.
+        /// there -- which is what `scripts/check-abi.sh` requires. Its export
+        /// check reads `nm -g --defined-only` and holds the artifact to exactly
+        /// the eight names, so a test-only definition leaking in would fail it;
+        /// its import check reads `nm -g --undefined-only` over the drop-in
+        /// shared object and asserts that this name is among the two left to
+        /// the link.
         struct Descriptors([CurlScheme; 4]);
 
         // SAFETY: the array is immutable for the whole program and the only
@@ -2530,9 +2556,9 @@ pub(crate) mod test_locale {
 /// buffer -- a materially stronger contract than anything the public API asks
 /// for, and one the plan records as constraint R2. The user's success criteria
 /// name `lib1560`/`test1560` only. Adding the symbol anyway would break the
-/// property `scripts/check-abi.sh` is to check once it lands, that this
-/// archive's exported set
-/// equals the C object's exactly.
+/// property `scripts/check-abi.sh` asserts on every run: that this archive's
+/// exported set equals the C object's exactly, in both directions, so an extra
+/// name fails just as a missing one does.
 ///
 /// # Why this is a submodule rather than items at file scope
 ///
@@ -3695,6 +3721,217 @@ mod tests {
         buf.unwrap()
     }
 
+    /// A ledger of the addresses this thread handed back to the allocator.
+    ///
+    /// # Why a test needs one
+    ///
+    /// Calling a release function proves nothing about what it did. An export
+    /// whose body did nothing at all would satisfy every call in this module,
+    /// leak every block, and leave both the tests and the parity transcript
+    /// unchanged -- so the release has to be *observed* rather than merely
+    /// performed, and the only party that knows whether a block came back is
+    /// the allocator.
+    ///
+    /// The two shapes that avoid this mechanism are both unsound. Reading the
+    /// buffer back after the release is a use-after-free precisely when the
+    /// release worked. Probing for reuse -- asking for a fresh block and
+    /// checking the address is the old one -- rests on the allocator's
+    /// discretion and turns a missed defect into a double free. Asking the
+    /// allocator costs nothing and touches nothing: the address is taken as an
+    /// integer and never dereferenced, here or in any caller.
+    ///
+    /// # Scope, and why it is narrow
+    ///
+    /// Only `free` is interposed, because "was this block given back" is the
+    /// only question asked. The wrapper forwards every call to `__libc_free`
+    /// unaltered, so it is transparent to the whole test binary, and it records
+    /// nothing unless the calling thread has opened a window with [`watch`].
+    /// `#[no_mangle]` ignores module nesting, so this definition serves the test
+    /// binary as a whole -- and it is inside `#[cfg(test)]`, so no `staticlib`,
+    /// `cdylib` or `rlib` the crate ships can contain it.
+    ///
+    /// `__libc_free` is glibc's own alias for `free`, reached under a name
+    /// nothing interposes, so the whole module is gated on glibc. Elsewhere the
+    /// releases still happen and the callers say plainly that they are
+    /// unobserved.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    mod freed {
+        use core::cell::Cell;
+        use libc::c_void;
+
+        extern "C" {
+            /// glibc's own `free`, reachable under a name nothing interposes.
+            fn __libc_free(block: *mut c_void);
+        }
+
+        /// Addresses one window can record.
+        ///
+        /// A release under test gives back one block, so this is generous. What
+        /// matters is that running out is reported rather than hidden: see
+        /// [`Freed::overflowed`].
+        const CAPACITY: usize = 32;
+
+        thread_local! {
+            /// Whether this thread is inside a window.
+            static WATCHING: Cell<bool> = const { Cell::new(false) };
+            /// The addresses given back inside it.
+            static ADDRESSES: Cell<[usize; CAPACITY]> = const {
+                Cell::new([0; CAPACITY])
+            };
+            /// How many of [`ADDRESSES`] are valid.
+            static LEN: Cell<usize> = const { Cell::new(0) };
+            /// Whether the ledger ran out of room.
+            static OVERFLOWED: Cell<bool> = const { Cell::new(false) };
+        }
+
+        /// What one window saw.
+        ///
+        /// Plain integers copied out of the thread-locals when the window
+        /// closed, so reading it allocates nothing and cannot be disturbed by
+        /// whatever the caller does next.
+        pub(super) struct Freed {
+            /// The recorded addresses.
+            addresses: [usize; CAPACITY],
+            /// How many of them are valid.
+            len: usize,
+            /// Whether the record is incomplete.
+            overflowed: bool,
+        }
+
+        impl Freed {
+            /// Whether `block`'s address was given back inside the window.
+            pub(super) fn contains(&self, block: *const c_void) -> bool {
+                let wanted = block as usize;
+                self.addresses
+                    .iter()
+                    .take(self.len)
+                    .any(|&address| address == wanted)
+            }
+
+            /// How many blocks were given back.
+            pub(super) fn count(&self) -> usize {
+                self.len
+            }
+
+            /// Whether the ledger filled up.
+            ///
+            /// Every caller checks this before reading the rest. A full ledger
+            /// makes an absent address mean "not recorded" as well as "not
+            /// released", and the two must never be confused.
+            pub(super) fn overflowed(&self) -> bool {
+                self.overflowed
+            }
+        }
+
+        /// Opens a window on this thread.
+        pub(super) fn watch() {
+            LEN.with(|cell| cell.set(0));
+            OVERFLOWED.with(|cell| cell.set(false));
+            WATCHING.with(|cell| cell.set(true));
+        }
+
+        /// Closes the window and yields what it saw.
+        pub(super) fn unwatch() -> Freed {
+            WATCHING.with(|cell| cell.set(false));
+            Freed {
+                addresses: ADDRESSES.with(Cell::get),
+                len: LEN.with(Cell::get),
+                overflowed: OVERFLOWED.with(Cell::get),
+            }
+        }
+
+        /// The interposed `free`.
+        ///
+        /// A null pointer is not recorded, because `free(NULL)` gives nothing
+        /// back and counting it would make the tally depend on how often a
+        /// caller passes null. Everything else is forwarded untouched.
+        #[no_mangle]
+        pub extern "C" fn free(block: *mut c_void) {
+            if !block.is_null() && WATCHING.try_with(Cell::get).unwrap_or(false) {
+                let _ = LEN.try_with(|cursor| {
+                    let at = cursor.get();
+                    if at >= CAPACITY {
+                        let _ = OVERFLOWED.try_with(|flag| flag.set(true));
+                        return;
+                    }
+                    let _ = ADDRESSES.try_with(|cell| {
+                        let mut addresses = cell.get();
+                        if let Some(slot) = addresses.get_mut(at) {
+                            *slot = block as usize;
+                            cell.set(addresses);
+                            cursor.set(at.saturating_add(1));
+                        }
+                    });
+                });
+            }
+            // SAFETY: `block` is the caller's, constrained by `free`'s own
+            // contract, and is passed through untouched to the allocator that
+            // would have received it. Nothing above dereferences it.
+            unsafe { __libc_free(block) }
+        }
+    }
+
+    /// Releases `block` through the exported `curl_free()` and proves the
+    /// allocator got it back.
+    ///
+    /// The address is read out first, the window is opened, the release happens,
+    /// the window closes, and only then is anything asserted -- so the
+    /// diagnostics an assertion builds cannot land in the ledger they are about
+    /// to be judged from.
+    ///
+    /// # Safety
+    ///
+    /// `block` must be a live, non-null block from this module's allocator that
+    /// nothing else will release: this is that block's single release.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe fn curl_free_observed(block: *mut c_void, what: &str) {
+        let address: *const c_void = block.cast_const();
+        freed::watch();
+        // SAFETY: forwarded from this function's contract, which is
+        // `curl_free`'s contract for a non-null pointer.
+        unsafe { curl_free(block) };
+        let observed = freed::unwatch();
+
+        assert!(
+            !observed.overflowed(),
+            "the address ledger filled up while releasing {what}, so a missing \
+             address would be indistinguishable from a block that was never \
+             given back"
+        );
+        assert!(
+            observed.contains(address),
+            "curl_free() did not hand {what} back to the allocator. It has to \
+             perform the release lib/escape.c L189-L192 performs, and a body \
+             that did nothing at all would satisfy a test that only called it"
+        );
+        assert_eq!(
+            observed.count(),
+            1,
+            "releasing {what} gave back {} blocks rather than the single one it \
+             was handed",
+            observed.count()
+        );
+    }
+
+    /// The same release where the allocator cannot be watched.
+    ///
+    /// INVOCATION ONLY, and labelled as such rather than left to look like the
+    /// glibc variant. The [`freed`] ledger rests on glibc's `__libc_free`, and
+    /// the two substitutes that need no such alias are both unsound for the
+    /// reasons that module gives. A release that did nothing is caught by the
+    /// glibc build, which is where this crate's parity is established.
+    ///
+    /// # Safety
+    ///
+    /// As [`curl_free_observed`].
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    unsafe fn curl_free_observed(block: *mut c_void, what: &str) {
+        let _ = what;
+        // SAFETY: forwarded from this function's contract, which is
+        // `curl_free`'s contract for a non-null pointer.
+        unsafe { curl_free(block) };
+    }
+
     #[test]
     fn c_malloc_round_trips_and_frees() {
         let p = c_malloc(32);
@@ -3849,10 +4086,12 @@ mod tests {
         assert!(!p.is_null());
         // This is the round trip the whole allocator exists for: a buffer
         // allocated by the adapter and released through the exported free
-        // function, exactly as a caller of curl_url_get() would do.
+        // function, exactly as a caller of curl_url_get() would do. The
+        // release is observed rather than assumed -- see `curl_free_observed`
+        // for why calling the function proves nothing on its own.
         // SAFETY: `p` is a live block from `c_strdup` that nothing else owns,
-        // which is `curl_free`'s precondition.
-        unsafe { curl_free(p.cast::<c_void>()) };
+        // which is `curl_free_observed`'s precondition and so `curl_free`'s.
+        unsafe { curl_free_observed(p.cast::<c_void>(), "a c_strdup block") };
     }
 
     #[test]
@@ -5343,12 +5582,22 @@ mod tests {
             // SAFETY: `u` is a live handle and `out` is a local this frame
             // owns.
             let code = unsafe { exports::curl_url_get(u, CURLUPART_URL, &mut out, 0) };
+            // The code is judged before the pointer is used for anything, and
+            // the release below happens only because `CURLUE_OK` established
+            // that ownership transferred. `lib/urlapi.c` L1552 nulls the
+            // caller's slot ahead of every failing return, so an error path
+            // hands this frame nothing to release.
             assert_eq!(code, CURLUE_OK);
             assert!(!out.is_null());
+            // The release is observed rather than merely performed: an export
+            // that did nothing would otherwise satisfy this test, leak the
+            // block, and leave the parity transcript unchanged.
             // SAFETY: `out` is the block `curl_url_get` just handed over, so
             // it is a live NUL-terminated C-allocator string owned by this
-            // frame and released exactly once, below.
-            unsafe { exports::curl_free(out.cast::<c_void>()) };
+            // frame and released exactly once, here.
+            unsafe {
+                super::curl_free_observed(out.cast::<c_void>(), "a curl_url_get buffer");
+            }
 
             // And a null pointer is a no-op, as `free` guarantees and
             // `lib/escape.c` L191 inherits.

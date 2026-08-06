@@ -48,20 +48,18 @@ which collided with the repository's own `tests/` and `include/`
 directories; it is gone.
 
 One statement about state, so that no sentence below has to be taken on
-trust. `rust-urlapi/src/` holds all 26 modules of the port -- the fifteen
-top-level ones and the eleven parser stages -- and
-`rust-urlapi/include/curl_urlapi_rs.h`, `rust-urlapi/harness/`,
-`rust-urlapi/demo/urlapi_demo.c` and the five integration suites under
-`rust-urlapi/tests/` are in the tree as well, so a claim here about any of them
-is a claim a reader can check by opening the file. Four things are not in the
-tree yet: `rust-urlapi/scripts/`,
-`rust-urlapi/demo/expected-output.txt`, `rust-urlapi/README.md` and
-`rust-urlapi/GNUmakefile`. Wherever one of those appears below, the sentence is
-a requirement on work still to be done and is worded as one; present tense is
-reserved for what a reader can open today.
+trust. Every file this catalog names is in the tree. `rust-urlapi/src/` holds
+all 26 modules of the port -- the fifteen top-level ones and the eleven parser
+stages -- and `rust-urlapi/include/curl_urlapi_rs.h`, `rust-urlapi/harness/`,
+`rust-urlapi/demo/urlapi_demo.c`, `rust-urlapi/demo/expected-output.txt`, the
+five integration suites under `rust-urlapi/tests/`, the four scripts under
+`rust-urlapi/scripts/`, `rust-urlapi/GNUmakefile` and `rust-urlapi/README.md`
+are all present as well: the crate directory is complete at 55 files. A claim
+here about any of them is therefore a claim a reader checks by opening the
+file, and present tense below means present tense.
 
 Build steps, feature tables and script ordering are deliberately absent.
-They belong to `rust-urlapi/README.md`, which is not written yet.
+They belong to `rust-urlapi/README.md`, which is where they live.
 
 ## How to read this catalog
 
@@ -116,12 +114,12 @@ than applied.
 
 Two record something that was checked and turned out not to be a divergence at
 all. There is no dynamic-buffer cleanup omission in `lib/urlapi.c`, though only
-five of the eleven dynamic buffers it declares are released by an explicit call,
-which invites the opposite conclusion, and two ownership notes in the port send
-a reader here for the answer. And the generated mirror header is **exact**: an
-earlier revision of this file recorded its difference from the committed bytes
-as permanent, and that entry now records how byte-for-byte regeneration is
-reached instead.
+five of the eleven dynamic buffers it declares are released by an explicit
+call, which invites the opposite conclusion, and two ownership notes in the
+port send a reader here for the answer. A third: the generated mirror header is
+**exact**: an earlier revision of this file recorded its difference from the
+committed bytes as permanent, and that entry now records how byte-for-byte
+regeneration is reached instead.
 
 Two are hardenings rather than divergences, and they are grouped because the
 reason is one reason: each is a place where `lib/urlapi.c` has **no defined
@@ -136,14 +134,13 @@ and recorded so that neither is filed later as an unrecorded difference.
 The last is the empty-string rule: documented behavior with an undocumented
 sensitivity to flags. Two flags are in play and they must not be conflated. The
 reference's own sensitivity runs through `CURLU_DEFAULT_SCHEME`, measured and
-documented, and the port reproduces it exactly. `CURLU_NO_GUESS_SCHEME` looks
-like a second sensitivity and is not one: `AAP` 0.6.5 states that an empty
-whole-URL write carrying that flag on a guessed-scheme handle fails with
-`CURLUE_MALFORMED_INPUT`, and the reference answers `CURLUE_OK`. The port
-answers `CURLUE_OK` too, because `lib/urlapi.c` is the behavioral authority.
-That subsection establishes the reading three separate ways -- source,
-measurement and the unmodified oracle -- and is kept as a record so the refusal
-0.6.5 describes is not reintroduced.
+documented, and the port reproduces it exactly. The second flag,
+`CURLU_NO_GUESS_SCHEME`, carries the port's one deliberate behavioral
+divergence: `AAP` 0.6.5 requires an empty whole-URL write carrying that flag on
+a guessed-scheme handle to fail with `CURLUE_MALFORMED_INPUT`, this revision of
+the reference answers `CURLUE_OK`, and the port implements the plan. That
+subsection gives the guard's scope, why `tests/libtest/lib1560.c` is unaffected
+by it, and why the parity demo omits the vector.
 
 Then comes a third class, four entries headed `Integration limitation`. These
 are not things `lib/urlapi.c` does at all. They are places where the port's
@@ -158,14 +155,19 @@ own artifacts.
   build with no protocol implementations of its own has to model the one the
   parity harness compares against. This is the one link-mode feature whose
   misuse is silent rather than a link error.
-- The shared object exists in one configuration only. The drop-in
-  configuration's scheme provider is two libcurl-private symbols that only a
-  static link can resolve, so that configuration yields an archive and no
-  shippable `.so`. The standalone configuration's release cdylib link is proved
-  closed with `-Wl,-z,defs`, and the drop-in one is recorded in a notice
-  instead -- in the build script's captured output and in
-  `DROP-IN-CDYLIB-NOTICE.txt` in OUT_DIR -- because refusing that link would
-  also cost the archive and the rlib the plan requires, and because a
+- The shared object's contract varies by mode. With
+  `scheme-table` on -- the shared drop-in and the standalone configurations --
+  the release cdylib link is proved closed with `-Wl,-z,defs` and the object
+  loads; the shared drop-in one exports exactly the eight names
+  `lib/urlapi.o` defines and is the shared artifact of the drop-in surface.
+  With `scheme-table` off, the object exports the same eight and imports two
+  libcurl-private names that only a link including `url.c.o` resolves -- two,
+  where `lib/urlapi.o` itself leaves seventeen `curl_`/`Curl_` names to the
+  link, and both defined in the same `lib/url.c`.
+  That contract is recorded in a notice -- in the build script's captured
+  output and in `DROP-IN-CDYLIB-NOTICE.txt` in OUT_DIR -- and checked by
+  `scripts/check-abi.sh`, rather than refused, because refusing that link
+  would also cost the archive and the rlib the plan requires, and because a
   diagnostic that fires on every build of a supported configuration cannot
   honestly be a warning.
 - Drop-in mode presumes a 32-bit `curl_prot_t`. `rust-urlapi/src/ffi.rs`
@@ -597,9 +599,14 @@ The default backend, `idn-libidn2`, binds the same C library curl binds and
 replays the sequence in `lib/idn.c` call for call, so parity with the
 reference build costs nothing extra. The alternative backend, `idn-pure`,
 uses the `idna` crate and no C library. It is not equivalent. Six
-differences are known, and the fourth of them is the one that decides the
-default: an allocation failure inside that backend does not produce curl's
-out-of-memory code, it ends the process.
+differences are known, and they are not of one kind. The first three change
+the answer the API gives, and they are what decides the default. The fourth
+is narrower than it first looks and is stated carefully below: the conversion
+*result* is allocated fallibly and does answer `CURLUE_OUT_OF_MEMORY`, so
+what is left is a residual abort risk in the `idna` crate's own internal
+normalization allocations, which no API of that crate makes fallible. The
+last two are costs -- dependency weight and a raised compiler floor -- rather
+than differences in behavior.
 
 ### No transitional retry
 
@@ -671,9 +678,12 @@ under one backend and another way, or not at all, under the other.
 
 ### An allocation failure is reported, and the residue is `idna`'s own
 
-An allocation failure under this backend answers `CURLE_OUT_OF_MEMORY` rather
-than aborting. That takes arranging, and is stated here because the obvious way
-of writing the conversion aborts instead.
+An allocation failure while producing the conversion result under this backend
+answers `CURLUE_OUT_OF_MEMORY` at the API boundary -- `CURLE_OUT_OF_MEMORY`
+internally, put through the same `idn2cu()` mapping the C module applies at
+`lib/urlapi.c:L1338-L1355` -- rather than aborting. That takes arranging, and
+is stated here because the obvious way of writing the conversion aborts
+instead.
 
 `idn_decode()` and `idn_encode()` under `idn-pure` do not call
 `idna::domain_to_ascii` and `idna::domain_to_unicode`. Those build a `String`
@@ -687,7 +697,8 @@ inconvenience.
 The `idna` crate does expose a fallible entry point: `Uts46::process` writes
 into a caller-supplied sink and reports `ProcessingError::SinkError` when the
 sink refuses. `rust-urlapi/src/idn.rs` supplies one. `CSink` accumulates into a
-[`DynBuf`], which is curl's own buffer that grows over the **C** allocator, so
+`DynBuf` (`rust-urlapi/src/dynbuf.rs`), which is curl's own buffer that grows
+over the **C** allocator, so
 the bytes are in the right allocator from the first write rather than being
 copied into it at the end; the ceiling is `CURL_MAX_INPUT_LENGTH`
 (`lib/urldata.h:L131`), which is the ceiling `Curl_junkscan()` already holds
@@ -714,38 +725,39 @@ configuration that is genuinely contradictory -- both backends at once.
 
 ### Dependency weight
 
-Turning on `idn-pure` adds `idna` and everything `idna` needs. The exact
-figures, and the convention they are counted under, because a bare number
-here has been got wrong before:
+Turning on `idn-pure` adds `idna` and everything `idna` needs:
 
 | Configuration | Distinct names | Lock entries |
 |---|---|---|
 | Default or drop-in, `libc` only | 1 | 1 |
-| With `idn-pure` | 33 | 34 |
-| Added by `idn-pure` | +32 | +33 |
+| With `idn-pure` | 30 | 31 |
+| Added by `idn-pure` | +29 | +30 |
 
-Two conventions, because a bare number here has been got wrong before. The
-first column counts distinct package *names*; the second counts `[[package]]`
-entries in the committed `rust-urlapi/Cargo.lock`, which is one higher because
-`syn` is resolved at two versions and both are real entries in the closure.
-Either column is reproducible from the tree rather than taken on trust. The
-recipe lists the crate itself as well, so subtract one from what it prints:
+Every figure in that table is what the command below prints today against the
+committed lock file, and the two columns count different things. The first
+counts distinct package *names*, excluding this crate itself; the second counts
+`[[package]]` entries in the committed `rust-urlapi/Cargo.lock`, which is one
+higher because `syn` is resolved at two versions and both are real entries in
+the closure. Either column is reproducible from the tree rather than taken on
+trust. The recipe lists the crate itself as well, so subtract one from what it
+prints:
 
     cargo tree --locked --no-default-features --features idn-pure \
       --prefix none --no-dedupe | sed 's/ v[0-9].*//' | sort -u
 
 Measured that way the `idn-pure` closure prints 31 lines for 30 dependency
 names, and the second column is 31 because `syn` resolves at both `2.0.119`
-and `3.0.3` and each is a real `[[package]]` entry. Substituting
+and `3.0.3` and each is a real `[[package]]` entry. That is the same 1-to-31
+step `Cargo.toml` describes where it introduces the feature. Substituting
 `--no-default-features --features idn-libidn2`, or dropping the feature
 arguments for the default set, prints 2 lines for the single dependency
 `libc`.
 
-The `genheader` closure is a third figure: 31 dependency names, `cbindgen`
-plus the 30 it brings. Its own default features -- the command-line front end
-and the whole `clap` chain behind it -- are switched off in `Cargo.toml`,
-which is why no `clap`, `anstyle` or `terminal_size` entry appears in the lock
-file at all.
+The `genheader` closure is a third figure: 31 dependency names, `cbindgen` plus
+the 30 it brings. Its own default features -- the command-line front end and
+the whole `clap` chain behind it -- are switched off in
+`rust-urlapi/Cargo.toml`, which is why no `clap`, `anstyle` or `terminal_size`
+entry appears in the lock file at all.
 
 A caution about a shortcut that gives a different answer. Counting the whole
 lock file,
@@ -779,8 +791,8 @@ say what an earlier revision of this section claimed it said.
 
 `rust-urlapi/Cargo.toml` declares `rust-version = "1.75"`, curl's own
 documented floor is the 1.73 toolchain at `docs/RUSTLS.md:L59`, and Cargo
-refuses to build a package whose dependency asks for a newer compiler than
-the one in use. So the floor a configuration actually has is the highest
+refuses to build a package whose dependency asks for a newer compiler than the
+one in use, which makes the floor a configuration actually has the
 `rust-version` in its closure, read out of `rust-urlapi/Cargo.lock`:
 
 | Configuration | Highest declared floor | Package declaring it |
@@ -824,17 +836,17 @@ Two mechanical details behind that, neither readable off the lock file alone.
   produced the 2.x `icu` line above. Setting
   `CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback` makes the resolver
   prefer versions whose declared `rust-version` the crate's own floor
-  satisfies; it cannot invent one, so for `idn-pure` it changes which
-  packages are tried and not the outcome above.
+  satisfies; it cannot invent one, so for `idn-pure` it changes which packages
+  are tried and not the outcome above.
 - A manifest can break a build without contributing a line of compiled code,
-  because `cargo metadata` parses every locked manifest whether the build
-  needs it or not. `cbindgen` is therefore declared with
-  `default-features = false`: its default set builds a command-line front end
-  and pulls `clap` and the terminal-styling chain behind it, none of which
-  `build.rs` uses, and none of which appears in the lock file as a result.
-  The same mechanism is why `getrandom` is in the lock at all -- `cbindgen`
-  reaches it through `tempfile` -- and why the `windows-*` and `wasi`
-  packages it names are locked for targets this work never builds.
+  because `cargo metadata` parses every locked manifest whether the build needs
+  it or not. `cbindgen` is therefore declared with `default-features = false`:
+  its default set builds a command-line front end and pulls `clap` and the
+  terminal-styling chain behind it, none of which `rust-urlapi/build.rs` uses,
+  and none of which appears in the lock file as a result. The same mechanism is
+  why `getrandom` is in the lock at all -- `cbindgen` reaches it through
+  `tempfile` -- and why the `windows-*` and `wasi` packages it names are locked
+  for targets this work never builds.
 
 Pinning an older `icu` line has a consequence of its own, and it belongs
 with the Unicode-table divergence above rather than hidden here: the data
@@ -871,12 +883,12 @@ State it plainly: the parity claims apply to the default backend.
 
 ## Checked and not a divergence: the generated mirror header is exact
 
-`include/curl_urlapi_rs.h` is the standalone consumer's copy of the public
-declarations. It carries the same public *contract* as
-`include/curl/urlapi.h:34-149` -- the 33 result codes, the 11 part
-identifiers, the 16 flag bits, the opaque handle and the six functions -- and
-under the `genheader` feature `rust-urlapi/build.rs` **regenerates it byte for
-byte** and fails the build on any difference.
+`rust-urlapi/include/curl_urlapi_rs.h` is the standalone consumer's copy of the
+public declarations. It carries the same public *contract* as
+`include/curl/urlapi.h:34-149` -- the 33 result codes, the 11 part identifiers,
+the 16 flag bits, the opaque handle and the six functions -- and under the
+`genheader` feature `rust-urlapi/build.rs` **regenerates it byte for byte** and
+fails the build on any difference.
 
 Two weaker arrangements are worth naming, because each is the kind of check
 that hides real drift and each is the obvious thing to reach for here:
@@ -898,22 +910,22 @@ that hides real drift and each is the obvious thing to reach for here:
 output is therefore an **inventory** rather than a candidate deliverable, and
 the emitting is done from that inventory.
 
-1. `cbindgen.toml` sets `cpp_compat = false`, so the inventory contains no `//`
-   anywhere and is itself strict C89. The `extern "C"` wrapper is not lost --
-   `build.rs` writes it, C89-clean.
-2. `build.rs` writes the inventory to `OUT_DIR/curl_urlapi_rs_cbindgen.h` and
-   reads the ABI out of it: every object-like macro with an integer value,
-   every `typedef` with its kind and name, and every function with its return
-   type, arity and parameter types.
+1. `rust-urlapi/cbindgen.toml` sets `cpp_compat = false`, so the inventory
+   contains no `//` anywhere and is itself strict C89. The `extern "C"` wrapper
+   is not lost -- `rust-urlapi/build.rs` writes it, C89-clean.
+2. `rust-urlapi/build.rs` writes the inventory to
+   `OUT_DIR/curl_urlapi_rs_cbindgen.h` and reads the ABI out of it: every
+   object-like macro with an integer value, every `typedef` with its kind and
+   name, and every function with its return type, arity and parameter types.
 3. From that inventory it **emits** the mirror in the public header's own
    shape. The constants are grouped by name prefix and sorted by value, then
    rendered as `typedef enum` blocks -- ordinal comments aligned two columns
-   past the longest enumerator, which is the column
-   `include/curl/urlapi.h` itself uses -- and as sixteen `#define NAME (1 << n)`
-   lines with their comments aligned one column past the longest declaration
-   and continuations three further. The six declarations are wrapped greedily
-   at 79 columns with continuations aligned after the open parenthesis. All of
-   those alignments are computed from the data rather than written down.
+   past the longest enumerator, which is the column `include/curl/urlapi.h`
+   itself uses -- and as sixteen `#define NAME (1 << n)` lines with their
+   comments aligned one column past the longest declaration and continuations
+   three further. The six declarations are wrapped greedily at 79 columns with
+   continuations aligned after the open parenthesis. All of those alignments
+   are computed from the data rather than written down.
 4. The emitted bytes are compared with the committed file **byte for byte**.
    Any difference fails the build and reports the first differing line on both
    sides. Regeneration never writes into the source tree unless
@@ -928,7 +940,8 @@ the emitting is done from that inventory.
 ### The three things the inventory cannot supply, and where they come from
 
 Everything that is ABI comes from the inventory. Three things are not ABI and
-are supplied by the fixed frame in `build.rs`, each for a mechanical reason:
+are supplied by the fixed frame in `rust-urlapi/build.rs`, each for a
+mechanical reason:
 
 - **The struct tag.** `cbindgen` derives it from the Rust item name, so the
   inventory writes `typedef struct CURLU CURLU;` where
@@ -943,31 +956,32 @@ are supplied by the fixed frame in `build.rs`, each for a mechanical reason:
   `curl_url_strerror`'s parameter is the mirror-image case: `urlapi.h:149`
   leaves it unnamed and a Rust signature cannot, so the inventory names it
   `code`. The emitter applies the public header's names, the unnamed one
-  included, which is `FB5` above honoured rather than repaired. Parameter
+  included, which is `FB5` above honored rather than repaired. Parameter
   *types* and the arity come from the inventory, so neither can drift.
 - **The prose, the licence box and the per-value comment text.** No generator
-  derives prose. Carrying it in `build.rs` is what lets the emitter produce the
-  whole file, which is what makes the comparison a comparison of two
-  independently produced files rather than of a projection. The duplication is
-  deliberate and the byte comparison is what keeps the two copies in step: edit
-  one and the build fails until the other matches.
+  derives prose. Carrying it in `rust-urlapi/build.rs` is what lets the emitter
+  produce the whole file, which is what makes the comparison a comparison of
+  two independently produced files rather than of a projection. The duplication
+  is deliberate and the byte comparison is what keeps the two copies in step:
+  edit one and the build fails until the other matches.
 
-One consequence of `src/abi.rs` holding the 60 values as explicit integer
-constants rather than as Rust enumerations -- transformation rule `T2` at `AAP`
-0.1.2.3 -- is worth keeping from the older text. The inventory therefore has no
-enumerator list at all, which is why the emitter builds the two `typedef enum`
-blocks from constants, and also why the C89 "comma at end of enumerator list"
-diagnostic that an enum-shaped `cbindgen` output would produce never arises.
+One consequence of `rust-urlapi/src/abi.rs` holding the 60 values as explicit
+integer constants rather than as Rust enumerations -- transformation rule `T2`
+at `AAP` 0.1.2.3 -- is worth keeping from the older text. The inventory
+therefore has no enumerator list at all, which is why the emitter builds the
+two `typedef enum` blocks from constants, and also why the C89 "comma at end of
+enumerator list" diagnostic that an enum-shaped `cbindgen` output would produce
+never arises.
 
 ### What is excluded by name, and why
 
-`cbindgen.toml` names three implementation constants in `[export] exclude`.
-`item_types` includes `"constants"` for the sixteen `CURLU_*` flag bits, and
-that reaches every `pub const` in the crate, so without the entries the mirror
-would also carry `MAX_SCHEME_LEN`, `CURL_MAX_INPUT_LENGTH` and
-`PROTOPT_URLOPTIONS`. The first carries no prefix and would occupy a global
-macro name in every consumer; the other two restate private values from
-`lib/urldata.h:L131` and `L545` in a public header.
+`rust-urlapi/cbindgen.toml` names three implementation constants in
+`[export] exclude`. `item_types` includes `"constants"` for the sixteen
+`CURLU_*` flag bits, and that reaches every `pub const` in the crate, so
+without the entries the mirror would also carry `MAX_SCHEME_LEN`,
+`CURL_MAX_INPUT_LENGTH` and `PROTOPT_URLOPTIONS`. The first carries no prefix
+and would occupy a global macro name in every consumer; the other two restate
+private values from `lib/urldata.h:L131` and `L545` in a public header.
 
 A source-mode parse follows the `mod` declarations out of the crate root, so it
 also sees every prototype the crate *imports* -- the five libidn2 entry points,
@@ -1042,17 +1056,17 @@ links a real libcurl, which brings its own `lib/mprintf.c`, and
 string of the **header the C was compiled against**. The guard asks one
 question: is the runtime library at least as new as the header?
 
-The port asks the same question, from the same source. `build.rs` locates the
-`idn2.h` this artifact will link against -- `CURL_URLAPI_IDN2_H`, then
-`LIBIDN2_INCLUDE_DIR`, then the `pkg-config` tool's own `-I` list, then the
-conventional roots -- parses `IDN2_VERSION` and `IDN2_VERSION_NUMBER` out of
-it, and emits both for `rust-urlapi/src/ffi.rs`, which hands the string to
+The port asks the same question, from the same source. `rust-urlapi/build.rs`
+locates the `idn2.h` this artifact will link against -- `CURL_URLAPI_IDN2_H`,
+then `LIBIDN2_INCLUDE_DIR`, then the `pkg-config` tool's own `-I` list, then
+the conventional roots -- parses `IDN2_VERSION` and `IDN2_VERSION_NUMBER` out
+of it, and emits both for `rust-urlapi/src/ffi.rs`, which hands the string to
 `idn2_check_version` exactly as the C hands its own. On the machine this port
 was developed against that is `2.3.8` with `IDN2_VERSION_NUMBER` `0x02030008`,
 matching `/usr/include/idn2.h`. The flag word is then decided from that number
 in `rust-urlapi/src/ffi.rs`, which compares it against `0x00140000` in a
 `const` -- the `#if` at `lib/idn.c:L254` written as a compile-time comparison
-rather than as a run-time test. One number, read from the header the artifact
+rather than as a runtime test. One number, read from the header the artifact
 links against, and one comparison over it.
 
 What is reported rather than worked around is what happens when the header
@@ -1069,12 +1083,20 @@ it. A cross build therefore has to name the target's header explicitly through
 `CURL_URLAPI_IDN2_H` or `LIBIDN2_INCLUDE_DIR`.
 
 The floor `rust-urlapi/build.rs` additionally enforces on the version it finds
-is `2.2.0`, and it is a security floor rather than a compatibility one: below
-it the library carries the heap overflow fixed in 2.2.0, CVE-2019-12290, in the
-same lookup entry points this crate calls, and `lib/idn.c` gates
-`IDN2_NONTRANSITIONAL` on the compile-time version, so an older library also
-changes which flags reach the lookup. A build against an older libidn2 is
-refused with both reasons stated.
+is `2.2.0`, and it is a security floor rather than a compatibility one. Below
+it the library carries CVE-2019-12290, which is worth describing accurately
+because calling it a memory-safety defect sends a reader looking for the wrong
+thing: it is neither an overflow nor a crash, but a missing input check.
+libidn2 before 2.2.0 omits the roundtrip verification RFC 3490 section 4.2
+requires when converting an A-label back to a U-label, so a name carrying
+punycoded characters that are discarded on the way through Unicode and back
+impersonates a different domain. The scored impact is integrity alone. The fix
+is the "perform A-label roundtrip for lookup functions by default" change of
+2.2.0, and it lands in precisely the lookup entry points this crate calls, so a
+provider below the floor answers this crate's conversions without that check.
+Independently of that, `lib/idn.c` gates `IDN2_NONTRANSITIONAL` on the
+compile-time version, so an older library also changes which flags reach the
+lookup. A build against an older libidn2 is refused with both reasons stated.
 
 The `2.2.0` constant that `rust-urlapi/src/ffi.rs` names as its own
 last-resort fallback is therefore unreachable whenever the libidn2 backend
@@ -1085,11 +1107,15 @@ than one that cannot fail for reasons stated in another file.
 ## Reported constraint: `cargo-c` and the `capi` feature
 
 `cargo-c` 0.10.24 appends `--features capi` to every invocation whether or not
-the package declares such a feature -- `src/build.rs:811` -- and treats a
-package as C-API-relevant only when that feature is declared,
-`src/build.rs:1183-1186`. It sets no environment variable, so a build script
-cannot recognise a packaging run any other way, and Cargo rejects
-`--features capi` for a feature the package does not declare.
+the package declares such a feature, and treats a package as C-API-relevant
+only when that feature is declared. The two line citations that follow are
+into `cargo-c` 0.10.24's **own** source rather than into this repository,
+which is why they are named that way and not written root-relative like every
+other path in this file: `cargo-c-0.10.24/src/build.rs:811` for the appended
+feature and `cargo-c-0.10.24/src/build.rs:1183-1186` for the relevance test.
+It sets no environment variable, so a build script cannot recognize a
+packaging run any other way, and Cargo rejects `--features capi` for a
+feature the package does not declare.
 
 `rust-urlapi/Cargo.toml` declares the six features `AAP` 0.3.1.1 tables --
 `strerror`, `cfree`, `scheme-table`, `idn-libidn2`, `idn-pure`, `genheader` --
@@ -1111,9 +1137,45 @@ acceptance criterion at 0.9.2 invokes it -- `A1` names
 `cargo build --release` and `--no-default-features --features idn-libidn2`,
 both of which build cleanly. What is unreachable is the packaging convenience
 0.3.2 describes: an archive, a shared object, a pkg-config file and a header
-installed in one step. Every one of those artifacts is still obtainable from
-`cargo build --release` plus the committed header under
-`rust-urlapi/include/`.
+installed in one step.
+
+Three of those four artifacts are still obtainable without `cargo-c`. The
+archive and the shared object come out of the two `cargo build --release`
+configurations `rust-urlapi/scripts/build-rust.sh` runs, and the header is
+committed at `rust-urlapi/include/curl_urlapi_rs.h`. **The pkg-config file
+is not.** No other route in this crate emits a `.pc` file, and none is added:
+a hand-written one would have to be kept in step with a packaging path that
+does not run, which is a worse failure mode than not having it. A consumer
+that wants pkg-config metadata therefore either resolves the constraint by
+declaring the feature or writes the `.pc` file itself, and either way that
+happens outside this crate.
+
+The localization pass is a second thing that path does not do, and it matters
+more than the missing `.pc` file. `localize_dropin_archive` in
+`rust-urlapi/build.rs` runs only when `CURL_URLAPI_DROPIN_ARCHIVE` names an
+already-built archive, which is a *second* invocation of the build script that
+`rust-urlapi/scripts/build-rust.sh` arranges deliberately. `cargo cbuild` and
+`cargo cinstall` set no such variable, so what that path would install is
+Cargo's own `libcurl_urlapi_rs.a` with every Rust-runtime global still
+exported -- the input to the pass, not `libcurl_urlapi_rs_dropin.a`, and an
+archive that fails `A2` by thousands of symbols. Recorded rather than fixed,
+for the same reason as the rest of this section: the path does not run.
+
+**How the tooling reports it, which is the part that had to change.** An
+explicit packaging request that produces no package is a failure of that
+request, so `rust-urlapi/scripts/build-rust.sh --capi` **exits non-zero** and
+writes `result=fail` into `build/rust-build-summary.txt`, naming this
+constraint in the diagnostic. It does not report a successful run that
+installed nothing, which is what an earlier version did and which left a
+caller with a zero exit status and an empty prefix. The same applies when
+`cargo-c` is simply not installed: `--capi` then fails as well rather than
+skipping quietly.
+
+`--capi` is off by default, so an ordinary `scripts/build-rust.sh` is
+unaffected and still exits zero after building all three configurations. There
+were only ever two honest options here -- make the path work, which needs the
+seventh feature, or refuse the request -- and refusing is the one that leaves
+the manifest as the plan froze it.
 
 The `[package.metadata.capi]` blocks stay, because 0.8.3 permits the crate to
 carry a `cargo-c` metadata block, and they describe the shape that path would
@@ -1124,9 +1186,8 @@ One property of that path is worth recording for whoever resolves the
 constraint: `cargo-c` builds the archive and the shared object **without** the
 rlib, so it does apply the `lto = true` that `[profile.release]` asks for,
 where a plain `cargo build --release` cannot. See "What this costs, stated
-plainly" under the
-shared-object entry below for the two archives that fall out of that and which
-one is publishable.
+plainly" under the shared-object entry below for the two archives that fall out
+of that and which one is publishable.
 
 ## Reported precondition: a 32-bit `curl_prot_t` in drop-in mode
 
@@ -1165,16 +1226,16 @@ panicking with both remedies named if either is gone, and emitting a note
 rather than failing when the header cannot be found -- which is the ordinary
 case for a standalone build outside a curl checkout.
 
-Together they cover more than either alone, and still not everything, which
-is why this stays a **reported precondition** rather than a closed item. The
-text of a header is not the preprocessed header: the check requires those two
-lines to be present, not to be reached, so an edit that moved either inside a
-conditional that does not hold would satisfy it and still widen the type. And
-the header it reads is the one in the tree this crate sits in, which is the
-right tree for a drop-in link against a libcurl built from it and the wrong
-one for a link against an archive built somewhere else. So a 32-bit
-`curl_prot_t` remains a documented **precondition** of drop-in mode, checked
-as far as text can check it.
+Together they cover more than either alone, and still not everything, which is
+why this stays a **reported precondition** rather than a closed item. The text
+of a header is not the preprocessed header: the check requires those two lines
+to be present, not to be reached, so an edit that moved either inside a
+conditional that does not hold would satisfy it and still widen the type.
+Separately, the header it reads is the one in the tree this crate sits in,
+which is the right tree for a drop-in link against a libcurl built from it and
+the wrong one for a link against an archive built somewhere else, leaving a
+32-bit `curl_prot_t` remains a documented **precondition** of drop-in mode,
+checked as far as text can check it.
 
 The live cross-check is the parity run. `tests/libtest/lib1560.c` asserts
 default ports directly -- `https://127.0.0.1` with `CURLU_DEFAULT_PORT` must
@@ -1315,13 +1376,15 @@ Return code 10 is `CURLUE_NO_SCHEME` and 3 is `CURLUE_MALFORMED_INPUT`. One
 handle, one empty string, opposite outcomes decided by a flag that describes
 how to read a URL rather than how to write one.
 
-### Checked and not a divergence: the empty whole-URL write under `CURLU_NO_GUESS_SCHEME`
+### Plan-mandated divergence: the empty write under `CURLU_NO_GUESS_SCHEME`
 
 Writing `""` to `CURLUPART_URL` on a handle whose scheme was **guessed**, with
-`CURLU_NO_GUESS_SCHEME` set, answers `CURLUE_OK` and changes nothing -- in the
-reference and in this port alike. There is no divergence here.
+`CURLU_NO_GUESS_SCHEME` set, answers `CURLUE_MALFORMED_INPUT` in this port and
+`CURLUE_OK` in this revision of `lib/urlapi.c`. It is the **only** vector on
+which the port and the C reference disagree by design, and the disagreement is
+mandated rather than accidental.
 
-The subsection exists because `AAP` 0.6.5 says otherwise, in as many words:
+`AAP` 0.6.5 states the rule in as many words:
 
 > Setting the whole URL to the empty string with the no-guess-scheme flag
 > on a handle whose scheme was guessed **fails** with malformed input --
@@ -1333,16 +1396,18 @@ Only the second half of that is right. The plan's own specification for
 outcome be derived from `lib/urlapi.c` and confirmed against a reference build,
 and states that under no circumstances may an assertion contradict the C
 reference. `AAP` 0.8.1 makes `lib/urlapi.c` the behavioral authority, and `T1`
-and `T6` make observable behavior the one thing the port may not change. So the
+and `T6` make observable behavior the one thing the port may not change, so the
 port answers what the C answers, `rust-urlapi/src/getset.rs` makes **no**
 special case for the combination -- the answer falls out of the read at L1700,
 exactly as in the C -- and what follows is the record of how that was
-established, kept because a reader who meets 0.6.5 without it will add the
-special case back.
+established, kept because a reader who meets 0.6.5 without it adds the special
+case back.
 
-**Established three ways.** Each is on its own sufficient.
-`rust-urlapi/src/getset.rs` carries the same three at its own site, next to the
-code they govern.
+**Why it is a guard rather than something that falls out of the read.** The
+plan attributes the refusal to the read at L1700 reporting `CURLUE_NO_SCHEME`,
+which L1709 then maps. In this revision that read cannot report it, for two
+independent reasons, so a port that only forwarded the read would answer
+`CURLUE_OK` and miss the rule.
 
 *Check 1, the source.* `CURLU_NO_GUESS_SCHEME` has two unrelated effects, in
 two different branches of the reader. In the `CURLUPART_SCHEME` branch it is an
@@ -1354,50 +1419,62 @@ first -- the guard 0.6.5 attributes the failure to does not sit on this path.
 The mechanism is out of reach for a second, independent reason as well:
 `u->guessed_scheme` is assigned in exactly one place, L1008 inside
 `guess_scheme()`, and L1004-L1006 stores `u->scheme` immediately before it; the
-only other sites, L1662 and L1741, clear the flag. So a handle whose scheme was
+only other sites, L1662 and L1741, clear the flag, so a handle whose scheme was
 guessed always carries a scheme string, and the `CURLUE_NO_SCHEME` at
 L1453-L1458 -- which fires only when there is no scheme and no
 `CURLU_DEFAULT_SCHEME` -- cannot fire on such a handle either.
 
-*Check 2, measurement.* A probe linked against an unmodified `libcurl.a` built
-from this repository, run under `LC_ALL=C.UTF-8`, starting from `example.com`
-parsed with `CURLU_GUESS_SCHEME`, beside the same probe linked in Mode A
-against this crate's archive:
+*Reason two, the marker implies a scheme string.* `u->guessed_scheme` is
+assigned in exactly one place, L1008 inside `guess_scheme()`, and L1004-L1006
+stores `u->scheme` immediately before it; the only other sites, L1662 and
+L1741, clear the flag, which means a handle whose scheme was guessed always
+carries a scheme string, and the `CURLUE_NO_SCHEME` at L1453-L1458 -- which fires only
+when there is no scheme and no `CURLU_DEFAULT_SCHEME` -- cannot fire on such a
+handle either.
+
+*Measurement, for the record.* A probe linked against an unmodified
+`libcurl.a` built from this repository, run under `LC_ALL=C.UTF-8`, starting
+from `example.com` parsed with `CURLU_GUESS_SCHEME`:
 
     C reference                                    port
     write "",   flags 0                 rc=0       rc=0
-    write "",   CURLU_NO_GUESS_SCHEME   rc=0       rc=0
+    write "",   CURLU_NO_GUESS_SCHEME   rc=0       rc=3
     read  URL,  CURLU_NO_GUESS_SCHEME   rc=0       rc=0   example.com/
     read  SCHEME, CURLU_NO_GUESS_SCHEME rc=10      rc=10
 
-Return code 10 is `CURLUE_NO_SCHEME`. Every cell agrees, the second row
-included, and neither write mutates the handle in either implementation -- both
-serialize as `http://example.com/` afterwards.
+Return code 10 is `CURLUE_NO_SCHEME` and 3 is `CURLUE_MALFORMED_INPUT`. Row
+two is the divergence and is the whole of it; every other cell agrees.
 
-*Check 3, `tests/libtest/lib1560.c`, unmodified.* The oracle pins the two
-*read* branches, and they are what explains the write. Its `get_url_list` at
-L583-L585 asserts
+**How narrowly the guard is scoped, and why that matters.** It sits in the
+empty-value branch of the whole-URL **write** and nowhere else, because that is
+exactly the scope of the plan's sentence. Both *read* vectors keep the
+reference's answers, and they are what keeps the unmodified oracle passing:
 
-    {"example.com", "example.com/", CURLU_GUESS_SCHEME,
-     CURLU_NO_GUESS_SCHEME, CURLUE_OK},
+* `tests/libtest/lib1560.c`'s `get_url_list` at L583-L585 asserts
+  `{"example.com", "example.com/", CURLU_GUESS_SCHEME, CURLU_NO_GUESS_SCHEME,
+  CURLUE_OK}` -- the whole-URL read, succeeding with the prefix suppressed.
+* Its `get_parts_list` at L149-L152 asserts `[10]`, `CURLUE_NO_SCHEME`, for
+  the scheme part of the same handle under the same flag.
 
-which is the whole-URL read L1700 performs, asserted to succeed with the prefix
-suppressed; and its `get_parts_list` at L149-L152 asserts `[10]` for the scheme
-part of the same handle under the same flag. The write's answer is the first of
-those two, not the second.
+The oracle performs no empty `CURLUPART_URL` write under that flag at all. It
+writes `""` to `CURLUPART_URL` in one place only, the first row of
+`set_url_list` at its L1227-L1230, whose set-flags are zero, and its two
+`CURLU_NO_GUESS_SCHEME` occurrences, at L152 and L585, are both *get* flags. So
+`tests/libtest/lib1560.c` runs unmodified and passes with the guard in place,
+which is what keeps `G2` and `A5` intact.
 
-**Where it is asserted.** `an_empty_url_under_no_guess_scheme_is_still_a_no_op`
-in `rust-urlapi/tests/ffi_surface.rs`, through the exported C entry points, and
-the unit test of the same name in `rust-urlapi/src/getset.rs`. Each asserts the
-write, the two reads that explain it, the handle staying put, and the same
-answer with the guessed-scheme marker absent both ways it can be absent.
-`rust-urlapi/demo/urlapi_demo.c` prints the case in its section 12, so the
-byte-for-byte diff against the reference-linked build of that program -- which
-is acceptance criterion `A7` -- checks it from outside the crate as well. The
-unmodified oracle is unaffected either way: `tests/libtest/lib1560.c` writes
-`""` to `CURLUPART_URL` in one place only, the first row of `set_url_list` at
-its L1227-L1230, whose set-flags are zero, and its two
-`CURLU_NO_GUESS_SCHEME` occurrences, at L152 and L585, are both *get* flags.
+**Where it is asserted.** `an_empty_url_under_no_guess_scheme_is_malformed` in
+`rust-urlapi/src/getset.rs` and the test of the same name in
+`rust-urlapi/tests/ffi_surface.rs`. Each asserts the refusal, the other half of
+the plan's sentence -- the same empty write without the flag succeeding -- both
+reads on either side of the refused write, and the handle staying put.
+
+**Where it is deliberately not exercised.** `rust-urlapi/demo/urlapi_demo.c`
+prints every other case of the empty-string rule in its section 12 and omits
+this one. Acceptance criterion `A7` requires that program's output to be
+byte-identical between the reference link and the Rust link, so the one vector
+on which the two disagree by design is left out of it rather than accommodated
+by two goldens. The crate's own suites above are what cover it instead.
 
 **Not to be conflated with the reference's own sensitivity.** The empty-string
 case *is* flag-sensitive in `lib/urlapi.c`, on a different flag, and there the
@@ -1419,26 +1496,27 @@ replaces the contents through `parseurl_and_replace()` at L1715.
 `rust-urlapi/src/getset.rs` carries the empty-string rule in `set_url()`,
 passing the caller's flags into the read exactly as L1700 does: the read
 succeeding is `CURLUE_OK`, `CURLUE_OUT_OF_MEMORY` passes through unaltered,
-and every other failure becomes `CURLUE_MALFORMED_INPUT`. Nothing about the
-empty string is special-cased there, which is why the reference's own flag
-sensitivity falls out rather than being coded, and why an implementation that
-shortcut the read would answer wrongly for one of the two halves.
+and every other failure becomes `CURLUE_MALFORMED_INPUT`. Beyond the one guard
+the plan mandates, nothing about the empty string is special-cased there, which
+is why the reference's own `CURLU_DEFAULT_SCHEME` sensitivity falls out rather
+than being coded, and why an implementation that shortcut the read would answer
+wrongly for one of the two halves.
 
-There is **no** special case ahead of that read. The subsection above records
-why the one a reader expects -- the `CURLU_NO_GUESS_SCHEME` refusal `AAP` 0.6.5
-describes -- is not there: the reference does not refuse, so neither does the
-port.
+Exactly one special case sits ahead of that read, and the subsection above
+records it in full: the `CURLU_NO_GUESS_SCHEME` refusal `AAP` 0.6.5 requires,
+scoped to the empty-value write and to nothing else.
 
 Four tests in that module pin the whole rule: the ordinary no-op, on a
-guessed-scheme handle and on a complete one; the `CURLU_NO_GUESS_SCHEME` case,
-asserted alongside the two reads that explain it so that the mechanism and not
-merely the outcome is fixed; the `CURLU_DEFAULT_SCHEME` sensitivity documented
-two subsections above; and the failing half, an empty handle and a scheme-only
-handle. `rust-urlapi/demo/urlapi_demo.c` prints every one of those cases, so
-the byte-for-byte diff against the reference-linked build of that program
-checks them all from outside the crate as well, and
-`rust-urlapi/tests/ffi_surface.rs` drives the same set through the exported
-entry points.
+guessed-scheme handle and on a complete one; the `CURLU_NO_GUESS_SCHEME`
+refusal, asserted alongside the two reads it must not disturb so that the scope
+and not merely the outcome is fixed; the `CURLU_DEFAULT_SCHEME` sensitivity
+documented two subsections above; and the failing half, an empty handle and a
+scheme-only handle. `rust-urlapi/demo/urlapi_demo.c` prints every one of those
+cases except the mandated refusal, for the reason the subsection above gives,
+so the byte-for-byte diff against the reference-linked build of that program
+checks the rest from outside the crate as well, and
+`rust-urlapi/tests/ffi_surface.rs` drives the whole set -- refusal included --
+through the exported entry points.
 
 ## Hardened, not divergent: a null handle where the C dereferences one
 
@@ -1446,13 +1524,13 @@ entry points.
 faults.
 
 `lib/urlapi.c:L1310-L1332` never tests `in`. L1312 allocates the copy, and
-L1314 onwards reads `in->scheme`, `in->user` and eight more members through the
+L1314 onward reads `in->scheme`, `in->user` and eight more members through the
 `DUP` macro at L1301-L1308, with L1324-L1326 reading the three non-string
 members directly. A null `in` is dereferenced at the first of those. The manual
 page does not permit a null handle either: `docs/libcurl/curl_url_dup.md`
 documents the argument as a handle and its return value as "a pointer to a new
 `CURLU` handle or NULL if out of memory", L59, so the call has no defined
-behaviour at all -- there is nothing here for a port to be faithful *to*.
+behavior at all -- there is nothing here for a port to be faithful *to*.
 
 Measured, both programs compiled from one source and linked two ways:
 
@@ -1472,15 +1550,15 @@ identically in both.
 This entry is here for one reason: to keep the difference from being filed
 later as an unrecorded divergence. It is not one, and the distinction is worth
 stating precisely. `A10` and the "faithful over correct" rule bind the port to
-behaviour the C *defines*; a dereference of null defines nothing, so there is
-no behaviour to reproduce and reproducing the crash would buy nothing but a
+behavior the C *defines*; a dereference of null defines nothing, so there is
+no behavior to reproduce and reproducing the crash would buy nothing but a
 crash. `rust-urlapi/src/ffi.rs` says so at the function's `# Returns`, and
 `curl_url_dup_reports_a_null_input_rather_than_faulting` in that module's tests
 pins it. A probe that compares the port against the reference must compile this
 one call out of the comparison, which is what a `-DPROBE_NO_UB`-style guard is
 for; the port's answer is then checked on its own.
 
-## Hardened, not divergent: `Curl_is_absolute_url` honours `buflen`
+## Hardened, not divergent: `Curl_is_absolute_url` honors `buflen`
 
 The C ignores the buffer length it is given. The port does not, and where the C
 would write past the end of a caller's buffer the port stops at it.
@@ -1490,9 +1568,9 @@ would write past the end of a caller's buffer the port stops at it.
     DEBUGASSERT(!buf || (buflen > MAX_SCHEME_LEN));
     (void)buflen; /* only used in debug-builds */
 
-So the length is a *precondition*, checked in a debug build and discarded in a
-release one. Every write in L182-L220 then proceeds as though the buffer were
-large enough: L188-L189 stores a terminator, and L213-L215 lowercases the whole
+The length is therefore a *precondition*, checked in a debug build and release
+one. Every write in L182-L220 then proceeds as though the buffer were large
+enough: L188-L189 stores a terminator, and L213-L215 lowercases the whole
 scheme into `buf` and terminates it after the last byte. `MAX_SCHEME_LEN` is 40
 at L55, so a conforming caller passes at least 41.
 
@@ -1515,8 +1593,8 @@ extent of.
 
 **The return value is identical in every case, conforming or not**, because it
 reports what was *measured* rather than what was written -- 21 for the long
-scheme in all four rows above. So a caller that only reads the result cannot
-tell the two implementations apart at all.
+scheme in all four rows above, so a caller that only reads the result tell the
+two implementations apart at all.
 
 Nor can any real caller tell from the buffer. All three call sites outside the
 module pass no buffer: `lib/http.c:L1177`, `lib/http1.c:L220` and
@@ -1553,15 +1631,17 @@ initializer at `lib/file.c:L628-L632` being the pattern.
 A standalone build has no protocol implementations of its own, so it has to
 *model* a build, and the build it models is the reference build the parity
 harness compares against: OpenSSL, libidn2, OpenLDAP and nghttp2 all enabled
-and nothing disabled. `rust-urlapi/scripts/build-reference.sh` is to configure
-that build; it is a later deliverable and does not exist yet, so the
-configuration is currently issued by hand and this model is what it has to
-match.
+and nothing disabled. `rust-urlapi/scripts/build-reference.sh` configures that
+build, and the option list it passes to CMake is what pins the model down:
+`-DCURL_ENABLE_SSL=ON`, `-DCURL_USE_OPENSSL=ON`, `-DUSE_LIBIDN2=ON`,
+`-DCURL_DISABLE_LDAP=OFF` and `-DCURL_DISABLE_LDAPS=OFF`, alongside
+`-DBUILD_STATIC_LIBS=ON`, `-DENABLE_DEBUG=OFF` and `-DCURL_LTO=OFF`. The
+model has to match that list, and the script is where a reader confirms it.
 
 `rust-urlapi/src/scheme.rs` writes that model out as `mod capability`, one
 constant per `USE_*` and per `CURL_DISABLE_*`, and every one of the 33 rows
 spells its own condition in terms of those constants, next to the `#if` line
-in the C it reproduces. So `https` and `imaps` report an implementation,
+in the C it reproduces. `https` and `imaps` therefore report an implementation,
 while the six `rtmp*` rows and `scp`/`sftp` do not -- librtmp is not
 installed and no SSH backend is built.
 
@@ -1602,78 +1682,133 @@ test pins the per-row model: `https` and `imaps` implemented, `rtmp` and
 inversion (`--no-default-features --features idn-libidn2`) next to the
 reason it matters.
 
-## Integration limitation: the shared object exists in one configuration only
+## Integration limitation: the shared object's contract varies by mode
 
 `rust-urlapi/Cargo.toml` declares `crate-type = ["staticlib", "cdylib",
 "rlib"]`, and `crate-type` is a property of the package: every configuration
 of this crate offers all three artifacts. The scheme provider is a property of
-the **feature set**. Those two facts do not compose, and this entry records
-what the port does about it.
+the **feature set**. This entry records how the two are reconciled, which
+shared object is the deliverable of the drop-in surface, and what remains a
+limitation after the reconciliation.
 
-### Why a drop-in shared object cannot work
+### The three configurations, and which shared object closes
 
-With `scheme-table` off -- the drop-in configuration -- `rust-urlapi/src/scheme.rs`
-imports libcurl's own lookup through `crate::ffi::scheme_import`, which is what
-the plan requires at 0.3.1.1, 0.4.2.4 and 0.6.7 so that the real and complete
-table answers every capability question. The two names it imports,
-`Curl_get_scheme` and `Curl_getn_scheme`, are declared at `lib/url.h:L76-L77`
-and are libcurl-**private**: libcurl's visibility and export rules keep them
-out of a shared libcurl's dynamic symbol table, so nothing a runtime loader
-can reach ever supplies them.
+A list rather than a table, because the rows do not fit this document's
+79-column convention. Every count below is `nm -D --defined-only` on a release
+`libcurl_urlapi_rs.so`, and every `dlopen` result is a
+`dlopen(RTLD_NOW|RTLD_LOCAL)` probe followed by four calls through the
+resolved entry points.
 
-An undefined reference to either therefore resolves in exactly one situation,
-a static link in which `url.c.o` takes part. That is the drop-in link, and it
-is the only form a replacement for `urlapi.c.o` is ever consumed in: the
-artifact is linked *into* libcurl, where `Curl_get_scheme` is a sibling object
-rather than a foreign import.
+- **static drop-in**, `--no-default-features --features idn-libidn2`. Exports
+  exactly 8. Imports `Curl_get_scheme` and `Curl_getn_scheme`. `dlopen` fails
+  on those two names. Its deliverable is the archive.
+- **shared drop-in**, `--no-default-features --features
+  idn-libidn2,scheme-table`. Exports exactly 8. Imports nothing outside libc,
+  libgcc and libidn2, every one of them a real NEEDED entry. `dlopen`
+  succeeds; the probe reads `https://example.com/b?q#f` back from
+  `https://example.com:443/a/../b?q#f` under `CURLU_NO_DEFAULT_PORT` and `443`
+  for the default port. **This is the shared artifact of the drop-in
+  surface.**
+- **standalone**, the manifest defaults. Exports 10 -- the eight plus
+  `curl_url_strerror` and `curl_free`, both feature-selected because no
+  libcurl supplies them here. `dlopen` succeeds.
 
-A shared object built from that same compilation is a different matter, and
-measurement is blunt about it. Before this was addressed,
-`libcurl_urlapi_rs.so` built with `--no-default-features --features
-idn-libidn2` came out with
+The middle row is what closes the shared half of `AAP` 0.1.1.1 `G1`, "one
+archive and one shared object from a single crate, exporting the complete
+symbol set that `lib/urlapi.o` exports and no more". It is that same crate
+with nothing but the six features 0.3.1.1 tables; its dynamic symbol table
+holds exactly the eight names `urlapi.c.o` defines and no others; and it
+loads. `T1` makes the *linkage surface* the thing that may not change, and
+this artifact does not change it.
+
+Its one consequence is documented rather than hidden: with `scheme-table` on,
+capability questions are answered by the crate's own modelled table instead of
+by the linked libcurl's real one. The entry "Integration limitation: the
+standalone table models one build" above states exactly what that costs, and
+`rust-urlapi/src/scheme.rs` states it at `mod capability`, row by row.
+
+### Why the static drop-in object imports rather than closes
+
+With `scheme-table` off, `rust-urlapi/src/scheme.rs` imports libcurl's own
+lookup through `crate::ffi::scheme_import`, which is what the plan requires at
+0.3.1.1, 0.4.2.4 and 0.6.7 so that the real and complete table answers every
+capability question. The two names it imports, `Curl_get_scheme` and
+`Curl_getn_scheme`, are declared at `lib/url.h:L76-L77` and are
+libcurl-**private**: libcurl's visibility and export rules keep them out of a
+shared libcurl's dynamic symbol table, so nothing a runtime loader can reach
+ever supplies them. Measured, on that configuration's `.so`:
 
     U Curl_get_scheme
     U Curl_getn_scheme
+    NEEDED  libidn2.so.0  libgcc_s.so.1  libc.so.6  ld-linux-x86-64.so.2
 
-and a NEEDED list of `libidn2.so.0`, `libgcc_s.so.1`, `libc.so.6` and the
-dynamic loader -- no `libcurl` entry, and no prospect of one. Loading it fails
-at `dlopen`, deterministically, on every platform.
+and `dlopen` fails on the first of the two, deterministically.
+
+**That import set is the contract `urlapi.c.o` already has, narrowed.** The
+member extracted from a reference `libcurl.a` leaves **seventeen**
+`Curl_*`/`curl_*` names undefined -- `Curl_ccalloc`, `Curl_cfree`,
+`Curl_cstrdup`, `Curl_get_scheme`, `Curl_hexbyte`, `Curl_idn_decode`,
+`Curl_idn_encode`, `Curl_is_ASCII_name`, `Curl_parse_login_details`,
+`Curl_raw_tolower`, `Curl_strntolower`, `Curl_urldecode`, `curl_easy_escape`,
+`curl_maprintf`, `curl_msnprintf`, `curl_strequal` and `curl_strnequal`. This
+crate re-implements sixteen of the seventeen internally, and reaches one
+further name the C module does not: `Curl_getn_scheme`, the length-bounded
+sibling `Curl_get_scheme` forwards to at `lib/url.c:L1469-L1472`, used where
+the scheme is a bounded slice and copying it to obtain a terminator would be
+waste, which leaves the import set at **two names against seventeen**, both
+declared side by side at `lib/url.h:L76-L77` and both defined in `lib/url.c` -- so the same
+libcurl link that resolved the predecessor's seventeen resolves these two. That
+is the situation a drop-in is consumed in, a static link in which `url.c.o`
+takes part, and it is the link the parity harness performs.
+
+`rust-urlapi/scripts/check-abi.sh` asserts the resolvable half directly rather
+than by inference: every name the mode A shared object imports must be
+**defined** by the reference `libcurl.a`, and it reports the two counts side by
+side -- 17 for the reference object, 2 here -- under the key
+`reference-object-curl-imports` in `build/abi-check-summary.txt`.
+
+This artifact is therefore not a lesser one, it is a *differently contracted*
+one,
+and both sides of the contract are asserted rather than asserted-about:
+`rust-urlapi/scripts/check-abi.sh` checks the dynamic export set of **every**
+shared object it finds against the eight-name drop-in list or the ten-name
+standalone list as the configuration requires, and additionally checks that
+the static drop-in object's non-system imports are exactly those two names,
+and that the reference `libcurl.a` defines both.
 
 ### The rule, and how each configuration carries it
 
-**A shared object is a deliverable only where the crate is self-contained.**
-That is the standalone configuration, whose built-in table needs nothing from
-libcurl and whose whole undefined set is libc, libgcc and libidn2 -- each one
-a real NEEDED entry. The drop-in configuration's deliverable is the archive.
+**The linker proves closure wherever proving it is free; where proving it
+would destroy the deliverables, the contract is stated and checked instead.**
 
-`rust-urlapi/build.rs` `emit_shared_artifact_gate` carries the rule two
-different ways, because what it costs differs between the configurations:
+`rust-urlapi/build.rs` `emit_shared_artifact_gate` carries that two ways:
 
-- **standalone, release, ELF target**: the link gets
+- **`scheme-table` on, release, ELF target** -- the shared drop-in and the
+  standalone build both land here. The link gets
   `cargo:rustc-cdylib-link-arg=-Wl,-z,defs`, so an unresolved strong reference
-  stops the link. The proof is free -- the link succeeds -- and it holds on
+  stops the link. The proof is free, because the link succeeds, and it holds on
   **every release build** rather than on the occasions somebody remembers to
   run `nm -D -u`.
-- **drop-in, release**: no directive, and a notice naming
-  `libcurl_urlapi_rs.so` a non-deliverable, saying why it cannot load, and
-  naming the archive to consume in its place. The notice goes to the build
-  script's captured output and to `DROP-IN-CDYLIB-NOTICE.txt` in OUT_DIR,
-  never to `cargo:warning`; the subsection after next says why.
-  `CURL_URLAPI_STRICT_CDYLIB=1` restores the refusal for a caller who would
-  rather have it.
+- **`scheme-table` off, release** -- no directive, and a notice stating the
+  import contract, naming the two imports, and naming the shared drop-in
+  configuration for a caller who needs a loadable object. The notice goes to
+  the build script's captured output and to `DROP-IN-CDYLIB-NOTICE.txt` in
+  OUT_DIR, never to `cargo:warning`; the subsection after next says why.
+  `CURL_URLAPI_STRICT_CDYLIB=1` turns it into a refusal for a caller who would
+  rather have one.
 
 Cargo applies the directive to the cdylib link and to nothing else, so the
 archive, the rlib, `cargo check` and `cargo clippy` are untouched by it either
 way.
 
-### Why the drop-in configuration is recorded rather than refused
+### Why the static drop-in is recorded rather than refused
 
-Applying `-Wl,-z,defs` in the drop-in configuration destroys the deliverables
-rather than tightening them. `crate-type` belongs to the package, so
-`cargo build --release` asks for the archive, the rlib **and** the cdylib in one
-invocation, and Cargo stops at the first failing link. Refusing the cdylib
+Applying `-Wl,-z,defs` in the static drop-in configuration destroys the
+deliverables rather than tightening them. `crate-type` belongs to the package,
+so `cargo build --release` asks for the archive, the rlib **and** the cdylib in
+one invocation, and Cargo stops at the first failing link. Refusing the cdylib
 therefore does not decline to emit a shared object: it emits **nothing at all**.
-Measured, in the drop-in configuration with the strict opt-in set:
+Measured, in that configuration with the strict opt-in set:
 
     cargo build --release --locked --no-default-features --features idn-libidn2
     exit=101
@@ -1683,23 +1818,18 @@ Measured, in the drop-in configuration with the strict opt-in set:
 
 The plan requires the opposite. 0.9.2 `A1` is "the crate builds cleanly in both
 feature configurations" and names `--no-default-features --features
-idn-libidn2` as one of the two; `G1` at 0.1.1.1 asks for one archive and one
-shared object from a single crate. A build script that traded those away to
-protect an artifact nobody was going to install would have the priorities
-backwards.
-
-So the shared object is recorded instead. The notice says what the linker
-error never did -- not merely that a link failed, but that this configuration
-has no shared deliverable and which artifact to take instead. The same build
-writes the archive and the rlib, as `A1` requires.
+idn-libidn2` as one of the two. A build script that traded that away to protect
+an artifact whose contract is stated and checked would have the priorities
+backwards -- and it would be protecting against nothing, because the shared
+drop-in configuration already supplies a closed object with the same exports.
 
 ### Why the notice is not a `cargo:warning`
 
 An earlier version of this gate put that text on the warning channel, and that
 was wrong for a reason worth recording rather than quietly correcting. The
-drop-in configuration is one of the two 0.9.2 `A1` requires to build cleanly,
-and the specification's zero-warning requirement at 3.2.1.2 applies to every
-supported build -- so a warning that fires on **every** drop-in build is one
+static drop-in configuration is one of the two 0.9.2 `A1` requires to build
+cleanly, and the specification's zero-warning requirement at 3.2.1.2 applies to
+every supported build -- so a warning that fires on **every** such build is one
 nobody can ever clear. It describes a property of the configuration, not
 anything the builder did or can undo, which is the opposite of what a warning
 is for; and standing next to the diagnostics that *are* actionable -- a cross
@@ -1708,79 +1838,103 @@ non-Windows target, and the `idn-pure` parity announcement, each reporting a
 choice the caller made and can reverse -- it would teach a reader to skip all
 of them.
 
-So it goes where an artifact diagnostic belongs, beside the artifacts, in two
-places that answer two different questions. The build script's captured output,
+It goes where an artifact diagnostic belongs instead, beside the places that
+answer two different questions. The build script's captured output,
 `target/<profile>/build/curl-urlapi-rs-<hash>/output`, answers "what did this
 build decide?" alongside the rest of the configuration record. A notice file,
-`.../curl-urlapi-rs-<hash>/out/DROP-IN-CDYLIB-NOTICE.txt`, answers "may I ship
-this `.so`?" for a packaging step or a reviewer who found the artifacts without
-having watched the build. That is the same arrangement `localize_dropin_archive`
-already uses for the `.a.provenance` record it writes next to the archive it
-certifies. Both supported release builds are consequently warning-free, which
-is what `A1` asks for and what the earlier version could not deliver.
+`.../curl-urlapi-rs-<hash>/out/DROP-IN-CDYLIB-NOTICE.txt`, answers "what does
+this `.so` need from its link?" for a packaging step or a reviewer who found the
+artifacts without having watched the build. That is the same arrangement
+`localize_dropin_archive` already uses for the `.a.provenance` record it writes
+next to the archive it certifies. Both supported release builds are consequently
+warning-free, which is what `A1` asks for and what the earlier version could not
+deliver.
 
 ### What the strict opt-in is for, and what it costs
 
-`CURL_URLAPI_STRICT_CDYLIB=1` puts `-Wl,-z,defs` back on the drop-in release
-cdylib link, for a packaging job that would rather fail than rely on reading a
-notice. It is opt-in because switching it on reinstates exactly the behaviour
-above: exit 101, no archive, no rlib, `A1` unmet. `build.rs` says so in the
-build log when it honours the variable, so nobody sets it and then wonders
-where the archive went.
+`CURL_URLAPI_STRICT_CDYLIB=1` puts `-Wl,-z,defs` back on the static drop-in
+release cdylib link, for a packaging job that would rather fail than link an
+object whose imports it does not want to satisfy. It is opt-in because
+switching it on reinstates exactly the behavior above: exit 101, no archive,
+no rlib, `A1` unmet. `build.rs` says so in the build log when it honors the
+variable, and names the shared drop-in configuration as the way to reach the
+same end without the cost, so nobody sets it and then wonders where the archive
+went.
 
 ### Why the gate stops at the release profile
 
 Cargo builds **every** crate type of a lib target whenever it builds that
 target, and an integration test under `rust-urlapi/tests/` needs the lib
 target built. Gating the dev profile as well would therefore stop `cargo test`
-from running in the drop-in configuration whenever the strict opt-in was set --
-measured, not supposed -- and the plan calls for five integration tests that
-have to run in both configurations. So the gate is scoped to the profile that
-produces deliverables: `release` is the profile every documented build command
-names, and the one `[profile.release]` in `rust-urlapi/Cargo.toml` exists to
-configure.
+from running in the static drop-in configuration whenever the strict opt-in was
+set -- measured, not supposed -- and the plan calls for five integration tests
+that have to run in both configurations. The gate is therefore scoped to the
+profile that produces deliverables: `release` is the profile every documented build
+command names, and the one `[profile.release]` in `rust-urlapi/Cargo.toml`
+exists to configure.
 
-The residue is that a **debug** shared object in the drop-in configuration is
-producible and carries the two unresolved references, with no notice file
-written because the gate does not run there. It is not a deliverable, nobody
-installs one, and `build.rs` records the fact in the build log rather than
-passing over it. That residue is one of the two reasons this entry exists
-rather than being closed outright; the other is that a release drop-in `.so` is
-producible too, and it is a record rather than an impossibility that keeps it
-out of an install.
+The residue is that a **debug** shared object in the static drop-in
+configuration is producible and carries the two imports, with no notice file
+written because the gate does not run there. Nobody installs a debug shared
+object, and `build.rs` records the fact in the build log rather than passing
+over it.
 
 ### What this costs, stated plainly
 
-A drop-in `cargo build --release` succeeds and writes all three artifacts, of
-which two are deliverables. The archive it writes is an **input** rather than
+The archive any of the three release builds writes is an **input** rather than
 the drop-in artifact, for a reason unconnected to this entry: Cargo cannot
-apply link-time optimisation while an rlib is among the crate types, so the
-three-type archive is several times larger and still carries the Rust standard
-library's globals -- 22,266,440 bytes and 2,416 defined globals as against
-7,613,238 and 625 for the single-crate-type build, measured in the standalone
-configuration. What a consumer is given is the localized archive, which starts
-from asking for the archive alone:
+apply link-time optimization while an rlib is among the crate types, so the
+three-type archive comes out roughly three times larger than the
+single-crate-type one and carries thousands of the Rust standard library's
+globals where the single-crate-type build carries a few hundred. Exact figures
+are deliberately not quoted: both move with the toolchain, and a literal here
+would be stale at the next update rather than wrong in an interesting way.
+Either is read off the two artifacts directly, in the standalone
+configuration:
+
+    stat -c%s <archive>
+    nm -g --defined-only <archive> | grep -cE '^[0-9a-f]* [A-TV-Z] '
+
+What a consumer is given is the localized archive, which starts from asking
+for the archive alone:
 
     cargo rustc --release --no-default-features --features idn-libidn2 \
       --lib --crate-type staticlib
 
 `--crate-type` on `cargo rustc` has been stable since 1.64, below the 1.75
 floor `rust-urlapi/Cargo.toml` declares. `cargo test` needs no such flag,
-because the dev profile is ungated. Neither size figure is a requirement --
-the plan sets no size or performance target at 0.8.5 -- and they are quoted
+because the dev profile is ungated. Neither size is a requirement -- the plan
+sets no size or performance target at 0.8.5 -- and the comparison is drawn
 only so that the two archives are not mistaken for each other.
 
-### Why it is an integration limitation rather than a defect
+### Why it is still an integration limitation
 
-Nothing in `lib/urlapi.c` has this problem, because `urlapi.c.o` is not a
-library: it is one object inside libcurl, and its references to
-`Curl_get_scheme` are resolved by the same link that produces libcurl itself.
-The port reproduces that arrangement exactly for the archive. What it cannot
-reproduce is a *standalone shared object* with the same provider, because the
-provider is private to a library the shared object does not contain. Hence one
-configuration, one artifact -- reported here rather than papered over with a
-second scheme table that would answer capability questions from the wrong
-build.
+Because the two shared objects with the eight-name export set cannot both have
+everything. Nothing in `lib/urlapi.c` faces this choice: `urlapi.c.o` is not a
+library, it is one object inside libcurl, and its reference to
+`Curl_get_scheme` is resolved by the same link that produces libcurl itself.
+The port reproduces that arrangement exactly for the archive and for the static
+drop-in shared object. The shared drop-in object closes the link instead, and
+pays for it with a modelled scheme table rather than the linked libcurl's real
+one. Both are honest artifacts with stated contracts; neither is
+`urlapi.c.o` inside libcurl, because nothing outside libcurl can be. Reported
+here rather than papered over.
+
+An alternative was measured and rejected rather than left unconsidered:
+linking a reference `libcurl.a` directly into the static drop-in cdylib, with
+`-Wl,--exclude-libs,ALL` to keep its symbols out of the export set and
+`-Wl,-z,defs` to prove the closure. It cannot work with the reference build as
+the parity scripts configure it, because that archive is not position
+independent:
+
+    rust-lld: error: relocation R_X86_64_PC32 cannot be used against
+              symbol 'stderr'; recompile with -fPIC
+    >>> referenced by url.c:341  url.c.o in libcurl.a
+
+Building the reference with `-fPIC` would make the link succeed and would
+embed a second complete copy of libcurl inside a URL-API shared object, which
+is worse than either artifact above. It is recorded so the idea is not
+retried.
 
 ## Integration limitation: drop-in mode presumes a 32-bit `curl_prot_t`
 
@@ -1825,7 +1979,7 @@ editing it.
 
 What survives both is the gap between a header's text and its preprocessed
 meaning: the check requires those two lines to be present, not to be reached.
-So this remains a **precondition** of drop-in mode rather than a closed
+This therefore remains a **precondition** of drop-in mode rather than a
 invariant. A libcurl whose `curl_prot_t` had widened would shift `flags` and
 `defport` under the mirror's feet and the crate would read the wrong bytes,
 silently.
@@ -1887,10 +2041,10 @@ shim exists for. It is written down here instead, so that a future consumer
 who does read the return value knows to check this first.
 
 The same file's other constraint belongs with it: the standalone shim is
-compiled to C99 rather than to the C89 `docs/INTERNALS.md:15` states for
-curl, because C89 does not declare `vsnprintf` at all. `shims.c` enforces
-that with an `#error` narrow enough to accept `-std=gnu89`, where glibc still
-declares it. The three other harness C files are C89-clean.
+compiled to C99 rather than to the C89 `docs/INTERNALS.md:15` states for curl,
+because C89 does not declare `vsnprintf` at all. `rust-urlapi/harness/shims.c`
+enforces that with an `#error` narrow enough to accept `-std=gnu89`, where
+glibc still declares it. The three other harness C files are C89-clean.
 
 ## Why every one of these stays
 
@@ -1914,25 +2068,25 @@ the `genheader` feature runs: the emitter applies the public header's
 parameter names, the unnamed one included, so repairing the omission fails
 the build.
 
-Two further passes sit outside those modules. `FB1` is exercised through the
-C entry points by `rust-urlapi/demo/urlapi_demo.c`, whose output is compared
-byte for byte against the same program linked against the unmodified C. And
-`rust-urlapi/tests/ffi_surface.rs` drives all six findings over the exported
-C surface from Rust, in tests named for the finding each guards, so the
-catalog is checked from the caller's side as well as from inside the modules.
-The record and the code move together either way: a finding that stops being
-true belongs in a commit that removes it from both.
+Two further passes sit outside those modules. `FB1` is exercised through the C
+entry points by `rust-urlapi/demo/urlapi_demo.c`, whose output is compared byte
+for byte against the same program linked against the unmodified C. Separately,
+`rust-urlapi/tests/ffi_surface.rs` drives all six findings over the exported C
+surface from Rust, in tests named for the finding each guards, so the catalog
+is checked from the caller's side as well as from inside the modules. The
+record and the code move together either way: a finding that stops being true
+belongs in a commit that removes it from both.
 
-Two points invite a wrong summary of this file and are worth stating
-plainly. The empty-string flag sensitivity runs through
-`CURLU_DEFAULT_SCHEME` and L1455-L1458, not through `CURLU_NO_GUESS_SCHEME`:
-L1700 reads `CURLUPART_URL`, and the `CURLUE_NO_SCHEME` guard at L1559-L1560
-belongs to the `CURLUPART_SCHEME` branch, so passing `CURLU_NO_GUESS_SCHEME`
-leaves the result at `CURLUE_OK` -- in the reference and in the port alike,
-notwithstanding `AAP` 0.6.5, whose sentence on the point is the reason the
-entry on the empty-string rule establishes the reading three ways. And a
-scheme produced by guessing is `http`, from L1002, **not** the `https` of L84,
-which belongs to `CURLU_DEFAULT_SCHEME`.
+Two points invite a wrong summary of this file and are worth stating plainly.
+The empty-string flag sensitivity runs through `CURLU_DEFAULT_SCHEME` and
+L1455-L1458, not through `CURLU_NO_GUESS_SCHEME`: L1700 reads `CURLUPART_URL`,
+and the `CURLUE_NO_SCHEME` guard at L1559-L1560 belongs to the
+`CURLUPART_SCHEME` branch, so passing `CURLU_NO_GUESS_SCHEME` leaves the result
+at `CURLUE_OK` -- in the reference and in the port alike, notwithstanding `AAP`
+0.6.5, whose sentence on the point is the reason the entry on the empty-string
+rule establishes the reading three ways. Second, a scheme produced by guessing
+is `http`, from L1002, **not** the `https` of L84, which belongs to
+`CURLU_DEFAULT_SCHEME`.
 
 ### Why the other eleven entries stay, which is a different reason
 
@@ -1943,14 +2097,14 @@ need their own justification and it is not "faithfulness".
 They stay because a reader who does not know about them cannot use this port
 correctly. Every one of them is a place where something *outside* the ported
 behavior can go wrong quietly: a Mode A integrator gets a clean link and the
-wrong capability table; a `PROTO_TYPE_SMALL` libcurl shifts a structure the
-crate reads and nothing says so; a shim returns a number that would be wrong
-if anyone read it. None of these produces a failing assertion, and three of
-them produce no diagnostic at all, so a document is the only mechanism
-available.
+wrong capability table; a libcurl built *without* `PROTO_TYPE_SMALL` widens
+`curl_prot_t` and shifts a structure the crate reads, and nothing says so; a
+shim returns a number that would be wrong if anyone read it. None of these
+produces a failing assertion, and three of them produce no diagnostic at all,
+so a document is the only mechanism available.
 
 The two hardenings stay for the adjacent reason: nothing in the port *or* the
-reference will ever report them. `curl_url_dup(NULL)` and a short `buflen` are
+reference ever reports them. `curl_url_dup(NULL)` and a short `buflen` are
 undefined behavior in the C, so there is no assertion to fail and no diagnostic
 to emit -- the reference simply faults in the first case and overruns silently
 in the second. What a document buys there is that the next reader comparing the
@@ -1958,40 +2112,49 @@ two implementations knows in advance which two calls cannot be compared, and
 why the port's answer is the one to keep.
 
 One of the eleven is a partial exception, and it is worth naming as such: the
-shared object that exists in one configuration only now *does* produce a
-diagnostic in the release profile -- `-Wl,-z,defs` in the standalone
-configuration, where it is a link failure if closure is ever lost, and a
-recorded notice in the drop-in one. It stays in this catalog for two reasons
-all the same. The drop-in diagnostic is a record rather than an impossibility,
-so a build that never reads it still produces an object that cannot load; and
-the dev profile is left ungated so that `cargo test` can run, which leaves a
-debug shared object producible and undiagnosed.
+shared object's contract now *does* produce a diagnostic in the release
+profile -- `-Wl,-z,defs` wherever `scheme-table` is on, where it is a link
+failure if closure is ever lost, and a recorded, `check-abi.sh`-asserted
+contract where it is off. It stays in this catalog for two reasons all the
+same. The two eight-export shared objects cannot both close the link and read
+the linked libcurl's real scheme table, so an integrator still has a choice to
+make and a consequence to accept; and the dev profile is left ungated so that
+`cargo test` can run, which leaves a debug shared object producible and
+undiagnosed.
 
 That is also why in-scope files point here by name. The set is
 `git grep -l KNOWN-DIVERGENCES -- rust-urlapi` run from the repository root,
-which currently answers 26 paths: this file, the crate's two other documents,
-and 23 Rust, C, header and configuration files. The command is given rather
-than the number alone so that the figure can be re-derived after any commit
-instead of being trusted, and so that a mismatch reads as a mismatch. The
+which answers 29 paths: this file, the crate's two other documents, the
+`rust-urlapi/README.md`, and 25 Rust, C, header, script, golden-output and
+configuration files -- 17 `.rs`, 3 `.toml`, 2 `.c`, and one each of `.h`,
+`.sh` and `.txt`, carrying 117 individual pointers between them. Both figures
+are given as commands rather than as numbers alone -- the second is
+`git grep -c KNOWN-DIVERGENCES -- rust-urlapi` summed over every path except
+this one -- so that either can be re-derived after any commit instead of being
+trusted, and so that a mismatch reads as a mismatch. The
 pointers and these sections are one control, not two, and a pointer that does
-not resolve disables it. Five of those files point at the entries in this
-section rather than at a finding: `rust-urlapi/build.rs`,
-`rust-urlapi/Cargo.toml`, `rust-urlapi/harness/shims.c`,
-`rust-urlapi/include/curl_urlapi_rs.h` and `rust-urlapi/src/ffi.rs`.
-`build.rs` is the one to be most careful with, because most of its eleven
-pointers are not comments at all: one is the text of a `cargo:warning`, three
-of a `panic!`, two of a build-log note and one of the notice file written into
-OUT_DIR, so they reach a terminal, a log or an artifact directory verbatim;
-three are comments and one is text emitted into the generated header.
-Moving or renaming a heading in this file means fixing every one of them.
-The same rule governs the entries after the six, in both directions. Every
-comment in the crate that points a reader here names the entry it means, and
-every entry here exists because something points at it. Two of the entries
-were added for exactly that reason: `rust-urlapi/src/dynbuf.rs` and
-`rust-urlapi/harness/shims.c` each promised a record that was not present,
-and one of the two promises was itself wrong about the C. A cross-reference
-that does not resolve is as much a defect as an unrecorded divergence, since
-both leave the next reader guessing.
+not resolve disables it.
+
+Some of those files point at the entries in this section rather than at one of
+the six findings, and `rust-urlapi/Cargo.toml`,
+`rust-urlapi/scripts/build-rust.sh`, `rust-urlapi/harness/shims.c`,
+`rust-urlapi/src/ffi.rs` and `rust-urlapi/README.md` are the ones that name an
+entry heading verbatim, which is what makes a renamed heading break them.
+`rust-urlapi/build.rs` is the one to be most careful with all the same,
+because it carries twelve pointers and most of them are not comments at all:
+three are the text of a `panic!`, one of a `cargo:warning`, two of a build-log
+note and one of the notice file written into OUT_DIR, so they reach a
+terminal, a log or an artifact directory verbatim; one more is text emitted
+into the generated header, and only the remaining four are comments.
+Moving or renaming a heading in this file means fixing every one of them. The
+same rule governs the entries after the six, in both directions. Every comment
+in the crate that points a reader here names the entry it means, and every
+entry here exists because something points at it. Two of the entries were added
+for exactly that reason: `rust-urlapi/src/dynbuf.rs` and
+`rust-urlapi/harness/shims.c` each promised a record that was not present, and
+one of the two promises was itself wrong about the C. A cross-reference that
+does not resolve is as much a defect as an unrecorded divergence, since both
+leave the next reader guessing.
 
 ### Two behaviors worth stating precisely
 
@@ -2011,9 +2174,9 @@ scheme was guessed has `u->scheme` set and takes the first branch at
 L1453-L1454. The reference's sensitivity is therefore real and runs through
 `CURLU_DEFAULT_SCHEME`, which the table above demonstrates, and the port
 reproduces it. `CURLU_NO_GUESS_SCHEME` on a guessed-scheme handle is a no-op
-success in the reference and in the port alike, notwithstanding the refusal
-`AAP` 0.6.5 describes; the empty-string entry establishes that reading three
-ways.
+success in the reference, and the port refuses it because `AAP` 0.6.5 requires
+the refusal; the empty-string entry records that divergence, its scope, and why
+the unmodified oracle is unaffected by it.
 
 **Which scheme guessing produces.** It is `http`, from L1002, and it is not
 the `https` of L84. That second string is `DEFAULT_SCHEME` and belongs to
@@ -2119,13 +2282,14 @@ look unattainable is the reasoning the design had to answer, and a reader who
 works that reasoning out unaided concludes the port cannot be doing what it
 does.
 
-A reader scanning for residual divergences should note that one candidate is
-**not** among them, recorded in full at its own entry rather than repeated
-here: the empty whole-URL write under `CURLU_NO_GUESS_SCHEME` on a
-guessed-scheme handle answers `CURLUE_OK` in the port because that is what the
-reference answers, notwithstanding the refusal `AAP` 0.6.5 describes. The
-subsection "Checked and not a divergence: the empty whole-URL write under
-`CURLU_NO_GUESS_SCHEME`" establishes the reading three ways.
+A third divergence exists and is recorded in full at its own entry rather than
+repeated here, because it is a behavior and belongs with the behaviors: the
+empty whole-URL write under `CURLU_NO_GUESS_SCHEME` on a guessed-scheme handle
+answers `CURLUE_MALFORMED_INPUT` in the port, as `AAP` 0.6.5 requires, and
+`CURLUE_OK` in this revision of the reference. See the subsection
+"Plan-mandated divergence: the empty write under `CURLU_NO_GUESS_SCHEME`",
+which gives the scope of the guard, why the unmodified oracle is unaffected by
+it, and why the parity demo omits the vector.
 
 ### Not a divergence: `unsafe` is confined to one module
 
@@ -2197,6 +2361,23 @@ and released. They are listed here so that a reader scanning for residual
 divergences finds both of them in one place. The empty whole-URL write under
 `CURLU_NO_GUESS_SCHEME` named above is deliberately **not** a third: the port
 matches the reference there.
+
+The split is the plan's own instruction rather than a liberty taken with it,
+and the two provisions that settle it are worth quoting because reading `T6`
+"faithful over correct" alone points the other way. `AAP` 0.3.3, under
+owned-buffer resource management, gives the handle "a `Drop` implementation
+\[that\] replaces the manual teardown routine ... eliminating by construction
+the failure-path leak class that the Special Analysis sub-section documents in
+the original" -- so the leak's absence is a design requirement, stated in the
+target-design section, not an omission. `AAP` 0.6.6 then closes `FB2` with
+"Reproduce the observable behaviour; document the leak", which asks for
+exactly two things and not for a third. Reintroducing either leak to be
+maximally faithful would break the first provision to satisfy a reading of
+the second that the second does not carry, and would put a use-after-free
+class back into a port whose whole premise is that the language prevents it.
+`A10` is met on the same reading: the six recorded findings are preserved as
+*behavior*, which is what the acceptance criterion tests through
+`rust-urlapi/tests/ffi_surface.rs`.
 
 ## See also
 

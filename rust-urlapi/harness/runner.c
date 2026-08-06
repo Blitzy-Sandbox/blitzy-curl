@@ -70,13 +70,23 @@
    C from the C allocator, and curl_free() releases them correctly in both
    supported link modes -- through plain free() standalone, and through
    Curl_cfree at its default free callback (lib/easy.c:L107) in a drop-in
-   link. What must be avoided is curl's tracking free, which validates
-   pointers against its own table and would reject them; leaving
-   CURL_MEMDEBUG and its companions undefined is what avoids it. The whole
+   link.
+
+   What must be avoided is curl's memory-debug free, and the mechanism is
+   worth stating exactly, because the reassuring version of it is wrong.
+   curl_dbg_free() does not look a pointer up in its allocation table before
+   releasing it and does not reject anything: it subtracts the offset of the
+   payload within its own header struct from the pointer it was given and
+   frees that address unconditionally (lib/memdebug.c:L362-L385). A buffer
+   that came from the C allocator carries no such header, so the address
+   handed to the real deallocator is not the start of any allocation. The
+   outcome is heap corruption, not a diagnostic. Leaving CURL_MEMDEBUG and
+   its companions undefined is what keeps that path out of reach. The whole
    resolution chain, the one other unsupported case -- an application that
    substitutes its own allocators -- and the consequence that curl's
    allocation counter does not run here are recorded under "Reported
-   limitation R3" in ../docs/MEMORY-OWNERSHIP.md. */
+   limitation R3" in ../docs/MEMORY-OWNERSHIP.md. The substitute count is
+   ../scripts/run-parity.sh --allocations. */
 
 /* The build also names the staged test source. The arrangement it is built
    for is a staging directory under the ignored rust-urlapi/build/ tree
@@ -94,11 +104,11 @@
    tests/libtest/first.h, which would pull in libcurl's private build
    environment at its L33 and L46. Nothing under tests/ is edited.
 
-   rust-urlapi/scripts/run-parity.sh is the deliverable that is to create
-   that staging directory and issue those compilations. It does not exist
-   yet, so for now the directory is staged and the compiler invoked by hand,
-   and nothing here should be read as a claim that the script has run. The
-   mechanics above are what either caller relies on.
+   rust-urlapi/scripts/build-reference.sh creates that staging directory and
+   records it as HARNESS_STAGE_DIR, and rust-urlapi/scripts/run-parity.sh
+   reuses the same one and issues the two Rust-mode compilations against it,
+   so all three links compile one identical staged source. The mechanics above
+   are what both callers rely on.
 
    Naming the source from the build instead of hard-coding a relative path
    lets one file serve the reference staging directory and the Rust one, and
@@ -124,10 +134,10 @@
    short-circuits at the first failing sub-test and returns a code naming it,
    in an order that is not the numeric one. Passing it through unaltered is
    what lets a caller map the code back to the sub-test and iterate until
-   clean; rust-urlapi/scripts/run-parity.sh is to be that caller and does not
-   exist yet, so today the mapping is read off the table in
-   ../docs/PORTING-NOTES.md by hand. Clamping the code into the range a shell
-   can carry belongs to main.c, mirroring tests/libtest/first.c:L289. */
+   clean; rust-urlapi/scripts/run-parity.sh is that caller, and it prints all
+   eleven rows from the same table ../docs/PORTING-NOTES.md carries. Clamping
+   the code into the range a shell can carry belongs to main.c, mirroring
+   tests/libtest/first.c:L289. */
 CURLcode harness_run_test(const char *URL)
 {
   return test_lib1560(URL);

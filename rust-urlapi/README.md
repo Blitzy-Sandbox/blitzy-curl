@@ -118,8 +118,10 @@ so: `build.rs` fails the build when both are requested, and
 
 ## Building
 
-Two configurations. Which one applies follows from whether a real
-libcurl takes part in the link.
+Two configurations decide behavior, and which one applies follows from
+whether a real libcurl takes part in the link. A third names the shared
+deliverable, and it differs from the first only in that its scheme table
+is its own.
 
 **Mode A, the drop-in and authoritative configuration.** The crate links
 beside a real libcurl, so it must not define a single symbol that
@@ -158,13 +160,30 @@ a build script runs before the crate is compiled, so it cannot
 post-process an archive that does not exist until after it has run. A
 link line names that archive, never the raw one.
 
-A shared object is a deliverable in the standalone configuration only.
-With `scheme-table` off, `src/scheme.rs` imports `Curl_get_scheme` from
-libcurl, and an undefined reference to that resolves in exactly one
-situation: a static link in which `url.c.o` takes part. `build.rs`
-records the reasoning beside the artifact, and it adds `-Wl,-z,defs` to
-the standalone release link so the shared object is proved closed on
-every build rather than on the occasions somebody remembers to check.
+**Mode C, the shared drop-in.** With `scheme-table` off,
+`src/scheme.rs` imports `Curl_get_scheme` and `Curl_getn_scheme` from
+libcurl, and undefined references to those resolve in exactly one
+situation: a static link in which `url.c.o` takes part. A shared object
+built that way therefore cannot load on its own, and `build.rs` records
+that beside the artifact in a notice instead of failing the link, so the
+archive and the `rlib` the same build produces are still delivered.
+`CURL_URLAPI_STRICT_CDYLIB=1` puts `-Wl,-z,defs` back on that link for a
+packaging job that would rather fail than read a notice, at the cost of
+those two artifacts.
+
+    % cargo build --release --no-default-features \
+        --features idn-libidn2,scheme-table
+
+That configuration is the shared deliverable: it exports exactly the
+eight names and imports nothing in the `curl_` or `Curl_` namespaces, so
+`build.rs` proves it closed with `-Wl,-z,defs` and it loads under
+`dlopen`. Together with Mode A's `libcurl_urlapi_rs_dropin.a` it is the
+pair goal G1 asks for -- one archive and one shared object from a single
+crate. `scripts/build-rust.sh` builds all three configurations and
+`scripts/check-abi.sh` holds every archive and every shared object to its
+own export set and, for the shared ones, to its import contract as well.
+The standalone shared object exports ten, the two extra names being
+`curl_url_strerror` and `curl_free`.
 
 The build driver reaches everything else:
 
@@ -383,13 +402,15 @@ of scope, and it is recorded here rather than passed over in silence.
 
 **R3, memory-debug builds are incompatible.** `curl_free` is a one-line
 forward at `lib/escape.c:189-192` to a macro resolved at compile time.
-Under the memory-debug configuration that macro becomes a tracking free
-which validates every pointer against its own allocation table, at
-`lib/curl_setup.h:1461` and `lib/memdebug.c:383`. This crate allocates
-the buffers it hands to C with the C allocator directly, so that
-tracking free rejects them or accounts for them wrongly, and routing
-through libcurl's internal free hook instead means importing a private
-symbol and still does not satisfy the table. The harness is therefore
+Under the memory-debug configuration that macro becomes
+`curl_dbg_free` at `lib/curl_setup.h:1461`. That function performs no
+lookup and no validation: it subtracts its own `struct memdebug` header
+from the pointer and frees that address instead
+(`lib/memdebug.c:362-385`). This crate allocates the buffers it hands to
+C with the C allocator directly, so handing one to that free corrupts
+the heap rather than being refused, and the paired counter never saw the
+block at all. Routing through libcurl's internal free hook instead means
+importing a private symbol and still leaves the accounting wrong. The harness is therefore
 built without memory debugging, and the ceiling `tests/data/test1560`
 asserts at line 40, `Allocations: 3000`, is honored in spirit rather
 than counted by curl's own counter. Passing `--valgrind` to

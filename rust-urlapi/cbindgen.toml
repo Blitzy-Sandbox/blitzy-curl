@@ -48,8 +48,16 @@
 # is reachable by hand with the version Cargo.toml pins, run from this
 # directory:
 #
+#   out="$(mktemp -d)" && trap 'rm -rf "${out}"' EXIT
 #   cbindgen --config cbindgen.toml --lang c \
-#     --output /tmp/curl_urlapi_rs.generated.h
+#     --output "${out}/curl_urlapi_rs.generated.h"
+#
+# The destination is created with mktemp rather than named as a fixed path
+# under the system temporary directory. A predictable shared name is a name
+# another process can already own: writing to it would clobber whatever is
+# there, and in a directory any user can write to it can be a symlink
+# pointing somewhere else entirely. build/ inside this crate is an equally
+# good destination and is covered by ../.gitignore.
 #
 # The check matters more than the artifact. include/curl_urlapi_rs.h is
 # committed and stays authoritative; regenerating it and comparing byte for
@@ -151,9 +159,11 @@
 # with `-std=c89 -pedantic-errors` whenever a C compiler can be found.
 #
 # The same six differences and the exact-generation process they feed are
-# recorded in docs/KNOWN-DIVERGENCES.md, under "How the generated mirror
-# header is made exact". The two records are one control: whichever file a
-# reader arrives at, the other has to agree with it.
+# recorded in docs/KNOWN-DIVERGENCES.md, under the heading "Checked and not a
+# divergence: the generated mirror header is exact" and its subsection "How
+# exactness is reached". The two records are one control: whichever file a
+# reader arrives at, the other has to agree with it, so a heading renamed
+# there has to be renamed here in the same commit.
 
 # Bare keys come first, before the very first [table] header, because in
 # TOML a key written after one belongs to that table. Everything from here
