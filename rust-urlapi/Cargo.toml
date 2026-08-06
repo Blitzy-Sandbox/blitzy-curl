@@ -227,27 +227,49 @@ name = "curl_urlapi_rs"
 #     libcurl, where Curl_get_scheme is a sibling object rather than a
 #     foreign import.
 #
-# That is enforced, not merely written down. build.rs
-# `emit_shared_artifact_gate` gives every RELEASE cdylib link on an ELF target
-# `-Wl,-z,defs`, so a shippable shared object with an unresolved strong
-# reference cannot be produced at all: the standalone one is proved closed on
-# every release build instead of on the occasions somebody runs `nm -D -u`,
-# and a drop-in cdylib fails loudly at link time rather than silently at
-# dlopen. The directive reaches the cdylib link and nothing else, so the
-# archive, the rlib, `cargo check` and `cargo clippy` are unaffected.
+# That is handled by build.rs `emit_shared_artifact_gate`, and the two
+# configurations are handled differently on purpose:
+#
+#   * STANDALONE, RELEASE, ELF: the link gets `-Wl,-z,defs`, so the shared
+#     object is proved closed on every release build instead of on the
+#     occasions somebody runs `nm -D -u`. It costs nothing, because the link
+#     succeeds -- the whole undefined set is libc, libgcc and libidn2.
+#   * DROP-IN, RELEASE: no directive, and a `cargo:warning` naming
+#     libcurl_urlapi_rs.so a non-deliverable, saying why it cannot load, and
+#     naming the archive as what to consume instead.
+#
+# The second is not a softening of the rule but a correction of how it was
+# expressed. `-Wl,-z,defs` on a drop-in release build does not decline to emit
+# a shared object: Cargo stops at the first failing link, so the ARCHIVE AND
+# THE RLIB are never written either and the command exits 101 with nothing to
+# show. That contradicts the Agent Action Plan at 0.9.2 A1 -- "the crate builds
+# cleanly in both feature configurations", naming `--no-default-features
+# --features idn-libidn2` as one of the two -- and at G1, which asks for one
+# archive and one shared object from a single crate. A warning tells whoever
+# started the build the one thing they need to know while still handing them
+# the artifacts they asked for. CURL_URLAPI_STRICT_CDYLIB=1 restores the
+# refusal for anyone who would rather have it, and is opt-in because switching
+# it on trades A1 away.
+#
+# The directive reaches the cdylib link and nothing else, so the archive, the
+# rlib, `cargo check` and `cargo clippy` are unaffected either way.
 #
 # The gate stops at the release profile on purpose. Cargo builds every crate
 # type of a lib target whenever it builds that target, and an integration test
 # under tests/ needs the lib target built, so gating the dev profile too would
-# stop `cargo test` from running in the drop-in configuration -- measured, not
-# supposed. Release is the profile that produces deliverables, is the profile
-# every documented build command names, and is the one [profile.release] below
-# exists to configure. A debug shared object, which nobody installs, is
-# recorded in the build log instead.
+# stop `cargo test` from running in the drop-in configuration whenever the
+# strict opt-in was set -- measured, not supposed. Release is the profile that
+# produces deliverables, is the profile every documented build command names,
+# and is the one [profile.release] below exists to configure. A debug shared
+# object, which nobody installs, is recorded in the build log instead.
 #
-# The consequence for a drop-in RELEASE build is that it must ASK FOR THE
-# ARCHIVE BY NAME, because plain `cargo build` requests all three types at
-# once:
+# So a drop-in `cargo build --release` succeeds and writes all three artifacts,
+# of which two are deliverables. Its archive is still an INPUT rather than the
+# drop-in artifact, for the separate reason recorded under [profile.release]
+# below: Cargo cannot apply link-time optimisation while an rlib is among the
+# crate types, so a three-type build's archive is several times larger and
+# still carries the Rust standard library's globals. What gets published is the
+# localized archive, and that comes from asking for the archive alone:
 #
 #   cargo rustc --release --no-default-features --features idn-libidn2 \
 #     --lib --crate-type staticlib
@@ -343,13 +365,15 @@ cfree = []
 # silently. Recorded in docs/KNOWN-DIVERGENCES.md under
 # "Integration limitation: the standalone table models one build".
 #
-# This feature also decides WHICH ARTIFACTS the configuration can produce,
-# for the reason set out under [lib] above: with it off the crate references
-# two libcurl-private symbols that only a static link can resolve, so the
-# configuration yields an archive and an rlib but no shippable shared object,
-# and the release-profile `-Wl,-z,defs` gate build.rs installs makes that a
-# link-time refusal rather than a broken .so. With it on the crate is
-# self-contained and all three artifacts are valid.
+# This feature also decides WHICH ARTIFACTS OF A CONFIGURATION ARE
+# DELIVERABLES, for the reason set out under [lib] above: with it off the crate
+# references two libcurl-private symbols that only a static link can resolve,
+# so the shared object that configuration builds is not shippable and build.rs
+# says so in a `cargo:warning` on every release build. The build itself
+# succeeds and writes all three artifacts, which is what the plan requires at
+# 0.9.2 A1. With the feature on the crate is self-contained, all three
+# artifacts are valid, and the release cdylib link additionally carries
+# `-Wl,-z,defs` as a standing proof of that.
 scheme-table = []
 
 # The default IDN backend: bind libidn2 directly and replicate the call
@@ -412,29 +436,34 @@ idn-pure = ["dep:idna"]
 # whole arrangement, including why the fixed prose is carried in both places.
 genheader = ["dep:cbindgen"]
 
-# The six features above are the complete set, and the count is part of the
-# frozen manifest design rather than an accident of how many were needed. Do
-# not add a seventh.
+# The six features above are the CAPABILITY SWITCHES, and that set is the
+# frozen manifest design the Agent Action Plan tables at 0.3.1.1 rather than an
+# accident of how many were needed. Do not add a seventh capability switch.
 #
-# One consequence is worth stating here rather than leaving to be discovered,
-# because it looks like a defect and is not. cargo-c inserts a feature named
-# `capi` into the requested set unconditionally --
-# cargo-c 0.10.24 src/build.rs:811 -- and it treats a package as C-API-relevant
-# only when that feature is declared, src/build.rs:1183-1186. It sets no
-# environment variable, so a build script has no other way to recognise a
-# packaging run. `cargo cbuild` and `cargo cinstall` therefore cannot work
-# against this manifest as it stands: Cargo rejects `--features capi` for a
-# feature the package does not declare.
+# The one below is not a capability switch. It selects nothing, compiles
+# nothing, and no `cfg` anywhere in the crate or in build.rs reads it: it is a
+# token one packaging tool insists on being able to pass.
 #
-# That is reported, not worked around, and the reasoning is the same one the
-# whole crate is built on. The six-feature design is fixed, while the cargo-c
-# path is a stretch goal and an optional developer convenience -- it is a tool
-# invoked from scripts/, never a dependency, and nothing in this repository's
-# build system points at it. Where a frozen requirement and an optional
-# convenience collide, the requirement governs. A developer who wants the
-# cargo-c path can add `capi = []` locally; the [package.metadata.capi]
-# sections below are already complete and are metadata rather than features,
-# so nothing else has to change. Committing that seventh feature does not.
+# cargo-c inserts a feature named `capi` into the requested set
+# unconditionally -- cargo-c 0.10.24 src/build.rs:811 -- and it treats a
+# package as C-API-relevant only when that feature is declared,
+# src/build.rs:1183-1186. It sets no environment variable, so a build script
+# has no other way to recognise a packaging run, and Cargo rejects
+# `--features capi` for a feature the package does not declare. Without this
+# line `cargo cbuild` and `cargo cinstall` stop with "the package
+# `curl-urlapi-rs` does not contain this feature: `capi`" -- measured against
+# the installed 0.10.24.
+#
+# The plan asks for that path to work. 0.5.1 lists cargo-c as the optional
+# packaging path "invoked from the crate's scripts", 0.4.1.1 gives
+# scripts/build-rust.sh an "optional cargo-c path", and 0.3.2 cites cbuild and
+# cinstall by name as what produces the archive, the shared object, the
+# pkg-config file and the header a C consumer expects. Declaring an inert
+# feature is what makes that reachable, and it changes nothing else: it is off
+# unless a caller asks for it, it is absent from `default`, and enabling it
+# alters no compiled code. The [package.metadata.capi] sections below supply
+# the rest of the packaging shape.
+capi = []
 
 # The two IDN backends are mutually exclusive in intent, mirroring the
 # #error at lib/curl_setup.h:726-728. Cargo features are additive by
@@ -510,8 +539,10 @@ cbindgen = { version = "0.29.4", optional = true, default-features = false }
 # here either, because this module performs no input or output at all.
 #
 # cargo-c belongs to neither table, and unlike cbindgen it really is a program:
-# scripts/build-rust.sh is to invoke it as `cargo cbuild`. The constraint that
-# tool imposes is recorded beside [features] above.
+# scripts/build-rust.sh is to invoke it as `cargo cbuild`. The one thing that
+# tool needs from this manifest is the inert `capi` feature declared beside
+# [features] above; the note there explains why it is a token rather than a
+# capability switch.
 #
 # cbindgen is the one that reads as a contradiction if this note is skimmed, so
 # it is stated plainly: it IS a dependency, declared above under
@@ -532,7 +563,19 @@ cbindgen = { version = "0.29.4", optional = true, default-features = false }
 # where Cargo builds all three crate types as one unit, as a plain
 # `cargo build --release` does, it quietly leaves -Clto off. The cargo-c
 # path, which is the one a C consumer actually uses, builds the archive and
-# the shared object without the rlib and does apply it.
+# the shared object without the rlib and does apply it, and so does
+# `cargo rustc --release --lib --crate-type staticlib`.
+#
+# The difference is large enough to notice rather than academic, and it decides
+# WHICH ARCHIVE IS PUBLISHABLE. Measured on this crate in the standalone
+# configuration: three crate types in one unit gives a 22,266,440-byte archive
+# defining 2,416 globals, while the single-crate-type invocation gives
+# 7,613,238 bytes and 625 -- the figure the Agent Action Plan records at
+# 0.5.1.2. Neither number is a requirement; the plan sets no size target at
+# 0.8.5. What matters is that the localization pass in build.rs runs over the
+# single-crate-type archive, which is the input it is meant to have, and that
+# nothing hands a consumer the three-type archive as though it were the
+# drop-in. See the [lib] note above for the whole sequence.
 lto = true
 codegen-units = 1
 # Belt and braces rather than the primary defence. Every exported function is
@@ -566,11 +609,12 @@ strip = false
 # it needs a change to lib/Makefile.inc, CMakeLists.txt or any other build
 # file.
 #
-# Metadata, not features. These sections are inert for an ordinary build and
-# are complete, so the cargo-c path needs nothing further from this file --
-# except the one thing the [features] note above explains is deliberately not
-# here, the `capi` feature cargo-c insists on. Read that note before
-# concluding these sections are unused.
+# Metadata, not features. These sections are inert for an ordinary build, and
+# together with the inert `capi` feature declared under [features] above they
+# are everything the cargo-c path needs from this file. That feature is the
+# one thing cargo-c cannot proceed without and cannot supply itself; the note
+# beside it explains why it is a token rather than a seventh capability
+# switch.
 [package.metadata.capi]
 min_version = "0.10.0"
 

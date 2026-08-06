@@ -1010,27 +1010,45 @@ fail at `dlopen` every time.
 
 So the rule is that **a shared object is a deliverable only where the crate is
 self-contained**, which is the standalone configuration, and `build.rs`
-`emit_shared_artifact_gate` enforces it with the linker: every **release**
-cdylib link on an ELF target gets `-Wl,-z,defs`, so an unresolved strong
-reference stops the link instead of shipping. The standalone `.so` is
-therefore proved closed on every release build -- its undefined set is libc,
-libgcc and libidn2, each a real NEEDED entry -- and a drop-in release build
-names the artifact it wants rather than asking for all three:
+`emit_shared_artifact_gate` applies it in the two ways the two configurations
+allow. In the standalone one the **release** cdylib link on an ELF target gets
+`-Wl,-z,defs`, so the object is proved closed on every release build -- its
+undefined set is libc, libgcc and libidn2, each a real NEEDED entry -- and the
+proof costs nothing because the link succeeds. In the drop-in one the same
+directive would cost the deliverables: `crate-type` is a property of the
+package, so `cargo build --release` asks for the archive, the rlib and the
+cdylib together, Cargo stops at the first failing link, and a refused cdylib
+means no archive and no rlib either -- exit 101 with nothing written, against a
+plan that requires that command to succeed at 0.9.2 `A1`. So the drop-in
+release build gets a `cargo:warning` instead, naming
+`libcurl_urlapi_rs.so` a non-deliverable, why it cannot load, and the archive
+to consume in its place. `CURL_URLAPI_STRICT_CDYLIB=1` restores the refusal for
+a caller who would rather have it than a warning.
+
+`cargo check` and `cargo clippy` are unaffected by the directive, which Cargo
+applies to the cdylib link alone.
+
+The archive a drop-in `cargo build --release` writes is an input rather than
+the artifact a consumer is given, for a reason that has nothing to do with the
+gate: Cargo cannot apply link-time optimisation while an rlib is among the
+crate types, so the three-type archive is several times larger and still
+carries the Rust standard library's globals. The publishable static artifact is
+the localized one, and it starts from asking for the archive alone:
 
     cargo rustc --release --no-default-features --features idn-libidn2 \
       --lib --crate-type staticlib
 
 `--crate-type` on `cargo rustc` has been stable since 1.64, below the crate's
-declared 1.75 floor. `cargo check` and `cargo clippy` are unaffected by the
-directive, which Cargo applies to the cdylib link alone.
+declared 1.75 floor. "The canonical static artifact" above carries the
+localization pass that turns that archive into the eight-symbol one.
 
 The gate stops at the release profile deliberately. Cargo builds every crate
 type of a lib target whenever it builds that target, and an integration test
 under `tests/` needs the lib target built, so gating the dev profile as well
-would stop `cargo test` from running in the drop-in configuration. Release is
-the profile that produces deliverables and the profile every documented build
-command names; a debug shared object, which nobody installs, is recorded in
-the build log instead of refused.
+would stop `cargo test` from running in the drop-in configuration whenever the
+strict opt-in was set. Release is the profile that produces deliverables and
+the profile every documented build command names; a debug shared object, which
+nobody installs, is recorded in the build log instead.
 
 ### Two symbols that stay behind a feature
 

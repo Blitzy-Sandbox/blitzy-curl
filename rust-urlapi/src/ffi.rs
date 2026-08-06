@@ -1867,18 +1867,20 @@ pub(crate) mod idn2 {
 /// link in which `url.c.o` takes part. That is the drop-in link, and it is
 /// the only artifact this module belongs to.
 ///
-/// A shared object built from this configuration would come out with both
-/// names undefined, with no `libcurl` NEEDED entry and no prospect of one,
-/// and would fail at `dlopen` every time. It is not a deliverable, and
-/// `build.rs` `emit_shared_artifact_gate` makes that structural rather than
-/// advisory: every **release** cdylib link on an ELF target is given
-/// `-Wl,-z,defs`, so no shippable object of that shape can be produced at
-/// all. The shared artifact belongs to the standalone configuration, whose
-/// built-in table in `src/scheme.rs` needs nothing from libcurl. A drop-in
-/// release build therefore names the artifact it wants -- `cargo rustc
-/// --release --lib --crate-type staticlib` -- rather than asking
-/// `cargo build --release` for all three. The dev profile is left ungated so
-/// that `cargo test` still runs here, and the build log says so.
+/// A shared object built from this configuration comes out with both names
+/// undefined, with no `libcurl` NEEDED entry and no prospect of one, and fails
+/// at `dlopen` every time. It is not a deliverable, and `build.rs`
+/// `emit_shared_artifact_gate` says so on every release build here, in a
+/// `cargo:warning` that names the object, the reason and the archive to use
+/// instead. It announces rather than refuses because `crate-type` belongs to
+/// the package: `cargo build --release` asks for all three artifacts at once,
+/// so failing that link would also cost the archive and the rlib, which the
+/// plan requires at 0.9.2 `A1` to be built. `CURL_URLAPI_STRICT_CDYLIB=1`
+/// restores the refusal for a caller who wants it. The shared artifact belongs
+/// to the standalone configuration, whose built-in table in `src/scheme.rs`
+/// needs nothing from libcurl and whose release cdylib link does carry
+/// `-Wl,-z,defs` as a standing closure proof. The dev profile is ungated so
+/// that `cargo test` runs here regardless, and the build log says so.
 ///
 /// The archive's own two-sided surface is checked by `build.rs`
 /// `localize_dropin_archive` on the way to the canonical drop-in artifact:

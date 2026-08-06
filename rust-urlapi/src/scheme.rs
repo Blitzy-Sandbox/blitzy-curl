@@ -1339,18 +1339,21 @@ mod backend {
 /// configuration instead, where the built-in table above answers every lookup
 /// and the whole undefined set is libc, libgcc and libidn2.
 ///
-/// That split is enforced rather than documented. `build.rs`
-/// `emit_shared_artifact_gate` passes `-Wl,-z,defs` to every **release**
-/// cdylib link on an ELF target, so a shipped shared object carrying an
-/// unresolved reference cannot be produced at all: the standalone one is
-/// proved closed on every release build, and the drop-in one fails loudly at
-/// link time instead of silently at load time. The consequence for a drop-in
-/// release build is that it must name the artifact it wants -- `cargo rustc
-/// --release --lib --crate-type staticlib` -- rather than asking
-/// `cargo build --release` for all three. The gate stops at the release
-/// profile deliberately: Cargo builds every crate type of a lib target
-/// whenever it builds that target, so gating the dev profile as well would
-/// stop `cargo test` from running in this configuration.
+/// That split is announced rather than left to be discovered. `build.rs`
+/// `emit_shared_artifact_gate` passes `-Wl,-z,defs` to the **standalone**
+/// release cdylib link on an ELF target, where the closure proof is free
+/// because the link succeeds, and in this configuration emits a
+/// `cargo:warning` instead: `libcurl_urlapi_rs.so` is named a non-deliverable,
+/// with the reason and the archive to consume in its place. The warning rather
+/// than a refusal is deliberate and is what the plan requires at 0.9.2 `A1`:
+/// `crate-type` belongs to the package, so `cargo build --release` asks for
+/// all three artifacts at once, and failing the cdylib link takes the archive
+/// and the rlib down with it -- exit 101, nothing written.
+/// `CURL_URLAPI_STRICT_CDYLIB=1` restores the refusal for anyone who wants it.
+/// The gate stops at the release profile deliberately: Cargo builds every
+/// crate type of a lib target whenever it builds that target, so gating the
+/// dev profile as well would stop `cargo test` from running in this
+/// configuration under that opt-in.
 ///
 /// The archive's own surface is checked separately, by
 /// `build.rs` `localize_dropin_archive`: `nm -g --defined-only` must report
