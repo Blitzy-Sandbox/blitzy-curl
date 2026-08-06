@@ -135,7 +135,7 @@ RUST_FACTS := $(BUILD)/rust-build-summary.txt
 ABI_FACTS := $(BUILD)/abi-check-summary.txt
 PARITY_FACTS := $(BUILD)/parity-summary.txt
 
-# There is deliberately no BUILD_DIR knob. Three of the four scripts honour
+# There is deliberately no BUILD_DIR knob. Three of the four scripts honor
 # that variable, but scripts/build-rust.sh fixes its own scratch tree at
 # <crate>/build (line 96), so pointing the other three elsewhere would leave
 # check-abi.sh and run-parity.sh reading fact files the rust build never
@@ -209,7 +209,7 @@ PARITY_ARGS ?=
 # through the files named above, so two of them running at once would
 # interleave writers and produce a result that describes neither. Parallelism
 # belongs inside the reference build, which REFERENCE_ARGS='--jobs N'
-# reaches, and inside cargo, which parallelises by itself.
+# reaches, and inside cargo, which parallelizes by itself.
 .NOTPARALLEL:
 
 # Every target here names a step, never a file, so every one of them is
