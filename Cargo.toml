@@ -1,0 +1,455 @@
+# SPDX-License-Identifier: curl
+# SPDX-FileCopyrightText: Daniel Stenberg, <daniel@haxx.se>, et al.
+#
+# Root workspace manifest for the Rust reimplementation of libcurl and the curl
+# command-line tool.
+#
+# Three trees exist at repository root and no others:
+#   original/  vendored upstream curl at the pinned tag; immutable oracle
+#   refactor/  Rust implementation crates and the autotools/CMake build shim
+#   testing/   all project-authored verification code
+#
+# Constraints on this file:
+#   - it is a virtual manifest (no [package] section); Cargo rejects a
+#     [features] table in one, so the five build configurations and the
+#     `default` forward contract are declared under
+#     [workspace.metadata.curl], which the root Makefile, the build shim and
+#     the CI workflows read                                            DL-0026
+#   - every comment here is a label, a mechanical constraint or a DL-####
+#     pointer; rationale belongs only in refactor/docs/DECISION-LOG.md
+#   - this manifest is the authoritative source of third-party dependency
+#     requirements for the workspace: every requirement is an exact `=x.y.z`
+#     pin, so Cargo.lock is reproducible from this file alone and member
+#     crates consume the entries with `<dep>.workspace = true`, never
+#     restating a version
+
+[workspace]
+resolver = "3"                                                        # DL-0025
+
+# Members are appended as each crate lands under refactor/ and testing/. Cargo
+# rejects a declared member whose directory is absent, and rejects a glob that
+# matches nothing, so this list names only directories that exist; the intended
+# inventory is recorded verbatim as `planned-members` under
+# [workspace.metadata.curl] and each crate appends itself here as it lands.
+members = []
+
+# The vendored baseline is C source, not a Cargo package, and is never a
+# workspace member.                                                     [R1]
+exclude = ["original"]
+
+# `testing/fuzz` becomes a workspace member when it lands, never an `exclude`
+# entry: verified to resolve and compile under the pinned stable
+# toolchain.                                                            DL-0027
+
+[workspace.package]
+version = "8.21.0"                                                    # DL-0001
+edition = "2024"                                                      # DL-0025
+rust-version = "1.97.1"
+license = "curl"
+repository = "https://github.com/Blitzy-Sandbox/blitzy-curl"
+homepage = "https://curl.se/"
+authors = [
+  "Daniel Stenberg <daniel@haxx.se>",
+  "curl contributors",
+  "blitzy-curl maintainers",
+]
+publish = false
+
+# ---------------------------------------------------------------------------
+# Lints. Members opt in with `[lints] workspace = true`.
+# ---------------------------------------------------------------------------
+# `unsafe_code` is `deny`, not `forbid`: the allowlisted crate roots opt out
+# with `#![allow(unsafe_code)]`; every other crate root declares
+# `#![forbid(unsafe_code)]`.                                            DL-0011
+[workspace.lints.rust]
+unsafe_code = "deny"                                                  # DL-0011
+unsafe_op_in_unsafe_fn = "deny"                                       # DL-0011
+trivial_casts = "deny"                                                # DL-0023
+trivial_numeric_casts = "deny"                                        # DL-0023
+unused_must_use = "deny"
+non_ascii_idents = "deny"
+unexpected_cfgs = "deny"
+unused_lifetimes = "warn"
+missing_docs = "warn"
+unreachable_pub = "warn"
+# Lint groups require an explicit negative priority or clippy hard-errors.
+nonstandard_style = { level = "deny", priority = -1 }
+future_incompatible = { level = "warn", priority = -1 }
+rust_2024_compatibility = { level = "warn", priority = -1 }             # DL-0025
+
+[workspace.lints.clippy]
+cast_possible_truncation = "deny"                                     # DL-0023
+cast_possible_wrap = "deny"                                           # DL-0023
+cast_sign_loss = "deny"                                               # DL-0023
+cast_lossless = "deny"                                                # DL-0023
+cast_precision_loss = "deny"                                          # DL-0023
+checked_conversions = "warn"                                          # DL-0023
+undocumented_unsafe_blocks = "deny"                                   # DL-0011
+missing_safety_doc = "deny"                                           # DL-0011
+ptr_offset_with_cast = "deny"
+mem_forget = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+# ---------------------------------------------------------------------------
+# Dependency pins. Every requirement is exact (`=x.y.z`); caret, tilde and
+# wildcard requirements are prohibited. Members refer to these with
+# `<crate>.workspace = true`; `optional` is illegal in this table, so a member
+# that gates a dependency behind a feature writes
+# `<crate> = { workspace = true, optional = true }` in its own manifest.
+# Values recorded here are frozen at import: appending is permitted, changing
+# and removing are not.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+
+# -- curl-rt : the runtime facade --------------------------------------------
+tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }   # DL-0002
+tokio-util = "=0.7.19"                                                # DL-0002
+futures-util = "=0.3.33"                                              # DL-0002
+
+# -- shared buffer type ------------------------------------------------------
+bytes = "=1.12.1"
+
+# -- curl-tls : coupled release set, single crypto provider ------------------
+rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }   # DL-0009
+rustls-native-certs = "=0.8.4"
+rustls-pemfile = "=2.2.0"
+webpki-roots = "=1.0.9"
+
+# -- curl-http2 / curl-http3 : reached only through curl-rt ------------------
+h2 = "=0.4.15"
+h3 = "=0.0.8"
+h3-quinn = "=0.0.10"
+quinn = { version = "=0.11.11", default-features = false, features = ["ring", "rustls", "runtime-tokio", "log"] }   # DL-0009
+
+# -- curl-core : content encoding --------------------------------------------
+flate2 = "=1.1.9"
+brotli = "=8.0.4"
+zstd = "=0.13.3"
+
+# -- curl-dns ----------------------------------------------------------------
+hickory-resolver = "=0.26.1"
+c-ares = "=13.0.0"
+
+# -- curl-url ----------------------------------------------------------------
+idna = "=1.1.0"
+percent-encoding = "=2.3.2"
+unicode-normalization = "=0.1.25"
+
+# -- curl-cookies ------------------------------------------------------------
+psl = "=2.1.223"
+publicsuffix = "=2.3.0"
+
+# -- curl-tls : C backend adapters, each on its baseline flag name -----------
+openssl = "=0.10.81"
+openssl-sys = "=0.9.117"
+mbedtls = "=0.13.5"
+wolfssl = "=7.3.0"
+wolfssl-sys = "=4.3.0"
+schannel = "=0.1.29"
+security-framework = "=3.7.0"
+core-foundation = "=0.10.1"
+
+# -- curl-auth ---------------------------------------------------------------
+libgssapi = "=0.11.0"
+# `build_bindgen` must stay off: it runs bindgen against the system headers at
+# build time and fails on current glibc.
+gsasl-sys = { version = "=0.2.4", default-features = false }          # DL-0028
+base64 = "=0.23.1"
+sha2 = "=0.11.0"
+sha1 = "=0.11.0"
+hmac = "=0.13.0"
+md-5 = "=0.11.0"
+md4 = "=0.11.0"
+
+# -- curl-proto-ssh / curl-proto-ldap ----------------------------------------
+libssh2-sys = "=0.3.2"                                                # DL-0019
+libssh-sys = "=0.1.1"                                                 # DL-0019
+# `tls-native` must stay off: it pulls native-tls into every LDAP-enabled build.
+# LDAPS is carried by curl-tls.
+ldap3 = { version = "=0.12.1", default-features = false, features = ["sync"] }   # DL-0009
+
+# -- curl-abi and platform surfaces ------------------------------------------
+libc = "=0.2.189"
+socket2 = "=0.6.5"
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+errno = "=0.3.14"
+
+# -- curl-types and shared infrastructure ------------------------------------
+once_cell = "=1.21.4"
+parking_lot = "=0.12.5"
+memchr = "=2.8.3"
+thiserror = "=2.0.20"
+
+# -- curl-core observability : unconditional, never feature-gated ------------
+tracing = "=0.1.44"
+
+# -- build dependencies ------------------------------------------------------
+cc = "=1.4.2"
+pkg-config = "=0.3.33"
+cbindgen = "=0.29.4"
+# `bindgen` generates the skeletons for the hand-written FFI binding sets; the
+# generated output is committed, so no adapter runs it at build time. DL-0013
+bindgen = "=0.72.1"
+
+# -- testing/ : verification tree only ---------------------------------------
+tracing-subscriber = "=0.3.23"
+metrics = "=0.24.6"
+# `push-gateway` must stay off: it reaches rustls with default features through
+# hyper-rustls, reinstating aws-lc-rs under workspace-wide feature unification.
+metrics-exporter-prometheus = { version = "=0.18.3", default-features = false }   # DL-0009
+axum = "=0.8.9"
+tracing-opentelemetry = "=0.33.0"
+opentelemetry = "=0.32.0"
+criterion = "=0.8.2"
+proptest = "=1.11.0"
+arbitrary = "=1.4.2"
+assert_cmd = "=2.2.2"
+tempfile = "=3.27.0"
+pretty_assertions = "=1.4.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+toml = "=1.1.4"
+hex = "=0.4.3"
+blake3 = "=1.8.6"
+
+# ---------------------------------------------------------------------------
+# Profiles. `panic = "abort"` must never appear in any profile.        DL-0008
+# ---------------------------------------------------------------------------
+[profile.dev]
+opt-level = 0
+debug = 2
+panic = "unwind"                                                      # DL-0008
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"                                                      # DL-0008
+debug = false
+strip = "none"
+incremental = false
+
+# Release code generation plus full debug information; abidiff requires DWARF
+# from both trees built in the same CI run.
+[profile.abi]
+inherits = "release"
+debug = 2                                                             # DL-0021
+strip = "none"
+split-debuginfo = "off"
+
+[profile.bench]
+inherits = "release"
+debug = 1
+
+# ---------------------------------------------------------------------------
+# Project contract. Cargo ignores [workspace.metadata]; the root Makefile, the
+# build shim under refactor/shim/ and the CI workflows read it.
+# ---------------------------------------------------------------------------
+[workspace.metadata.curl]
+baseline-tag = "curl-8_21_0"                                          # DL-0001
+msrv = "1.97.1"
+artifact-packages = ["curl-abi", "curl-cli"]
+
+# The five configuration names are frozen at import and are never renamed or
+# extended; their `cargo` arguments are the
+# [workspace.metadata.curl.configurations.*] tables below.              [R12]
+feature-configurations = ["default", "minimal", "full", "rustls-only", "openssl-only"]
+default-configuration = "default"
+
+# The complete intended member inventory: 34 implementation crates under
+# refactor/ and the 11 verification members under testing/. `members` above
+# stays in step with the directories that exist; this list is the contract the
+# root Makefile, the build shim and the CI workflows check completeness
+# against, and every entry keeps its decision-log pointer.
+planned-members = [
+  # -- refactor/ : ABI surface, core state machine and the shared leaf crates --
+  "refactor/curl-abi",
+  "refactor/curl-core",
+  "refactor/curl-types",                                              # DL-0003
+  "refactor/curl-rt",                                                 # DL-0002
+  "refactor/curl-pingpong",                                           # DL-0004
+
+  # -- refactor/ : subsystem crates --
+  "refactor/curl-url",
+  "refactor/curl-dns",
+  "refactor/curl-tls",
+  "refactor/curl-http1",                                              # DL-0018
+  "refactor/curl-http2",
+  "refactor/curl-http3",
+  "refactor/curl-auth",
+  "refactor/curl-cookies",
+
+  # -- refactor/ : one crate per baseline protocol --
+  "refactor/curl-proto-ftp",
+  "refactor/curl-proto-smtp",
+  "refactor/curl-proto-imap",
+  "refactor/curl-proto-pop3",
+  "refactor/curl-proto-rtsp",
+  "refactor/curl-proto-tftp",
+  "refactor/curl-proto-smb",
+  "refactor/curl-proto-ldap",
+  "refactor/curl-proto-telnet",
+  "refactor/curl-proto-gopher",
+  "refactor/curl-proto-dict",
+  "refactor/curl-proto-mqtt",
+  "refactor/curl-proto-file",
+  "refactor/curl-proto-ws",
+  "refactor/curl-proto-ssh",                                          # DL-0005
+  "refactor/curl-proto-rtmp",                                         # DL-0005
+
+  # -- refactor/ : the command-line tool --
+  "refactor/curl-cli",
+
+  # -- refactor/ : allowlisted unsafe adapter crates --                 DL-0011
+  "refactor/curl-tls-gnutls",                                         # DL-0013
+  "refactor/curl-idn-libidn2",                                        # DL-0013
+  "refactor/curl-idn-winidn",                                         # DL-0013
+  "refactor/curl-idn-apple",                                          # DL-0013
+  "refactor/curl-psl-libpsl",                                         # DL-0013
+  "refactor/curl-rtmp-librtmp",                                       # DL-0013
+  "refactor/curl-ldap-openldap",                                      # DL-0013
+  "refactor/curl-auth-gsasl",
+  "refactor/curl-ssh-libssh2",                                        # DL-0019
+  "refactor/curl-ssh-libssh",                                         # DL-0019
+  "refactor/curl-alloc",                                              # DL-0015
+
+  # -- testing/ : all project-authored verification --
+  "testing/differential",
+  "testing/perf",
+  "testing/upstream-suite",
+  "testing/integration",
+  "testing/equivalence",                                              # DL-0006
+  "testing/fuzz",
+  "testing/corpora",
+  "testing/audit",
+  "testing/audit/traceability",
+  "testing/abi",
+  "testing/observability",
+]
+unsafe-allowlist = [                                                  # DL-0011
+  "curl-abi",
+  "curl-tls-gnutls",
+  "curl-idn-libidn2",
+  "curl-idn-winidn",
+  "curl-idn-apple",
+  "curl-psl-libpsl",
+  "curl-rtmp-librtmp",
+  "curl-ldap-openldap",
+  "curl-auth-gsasl",
+  "curl-ssh-libssh2",
+  "curl-ssh-libssh",
+  "curl-alloc",
+]
+
+# Invariants the resolved graph must satisfy. Asserted in CI against Cargo.lock.
+[workspace.metadata.curl.resolved-invariants]
+distinct-rustls-versions = 1                                          # DL-0010
+crypto-provider = "ring"                                              # DL-0009
+absent-transitives = ["aws-lc-rs", "aws-lc-sys", "native-tls"]        # DL-0009
+
+# The five build configurations. These names are the `make verify CONFIG=<name>`
+# argument set and the CI matrix entries. Each must build warning-clean and
+# clippy-clean. `args` is appended to `cargo build` / `cargo clippy`.
+[workspace.metadata.curl.configurations.default]
+args = []
+[workspace.metadata.curl.configurations.minimal]
+args = ["--no-default-features"]
+[workspace.metadata.curl.configurations.full]
+args = ["--all-features"]
+[workspace.metadata.curl.configurations.rustls-only]
+args = ["--no-default-features", "--features", "curl-abi/rustls-only,curl-cli/rustls-only"]
+[workspace.metadata.curl.configurations.openssl-only]
+args = ["--no-default-features", "--features", "curl-abi/openssl-only,curl-cli/openssl-only"]
+
+# Aggregate features each artifact package must define so the configurations
+# above resolve.
+[workspace.metadata.curl.required-artifact-features]
+curl-abi = ["rustls-only", "openssl-only"]
+curl-cli = ["rustls-only", "openssl-only"]
+
+# Mapping class of every baseline configure flag and CMake option. Only the first
+# two classes become Cargo features; the per-flag table is
+# refactor/docs/FEATURE-MAP.md.
+[workspace.metadata.curl.flag-classes]
+capability = { becomes-cargo-feature = true }                         # DL-0016
+backend-selection = { becomes-cargo-feature = true }                  # DL-0016
+value-or-path = { becomes-cargo-feature = false, consumed-by = "shim" }            # DL-0016
+test-infrastructure = { becomes-cargo-feature = false, consumed-by = "staging-wrapper" }   # DL-0016
+accepted-and-inert = { becomes-cargo-feature = false, consumed-by = "shim" }       # DL-0016
+
+# Torture mode. The shim maps the baseline `--enable-debug` flag onto this
+# feature, which gates allocation-failure injection and leak accounting.
+[workspace.metadata.curl.debug-build]
+baseline-flag = "--enable-debug"
+feature = "debug"                                                     # DL-0014
+owning-crate = "curl-alloc"                                           # DL-0015
+provides = ["alloc-failure-injection", "leak-accounting"]
+
+# The `default` feature set: a forward contract, never renamed or extended.
+# Derived mechanically from `source` below, never from memory. Membership of
+# MQTT, and the exclusion of SCP/SFTP and the RTMP family, are recorded in
+# DECISION-LOG.md and QUIRKS.md.                                        DL-0026
+[workspace.metadata.curl.default-features]
+source = "original/configure.ac"                                      # DL-0026
+features = [                                                          # DL-0026
+  "alt-svc",
+  "aws",
+  "basic-auth",
+  "bearer-auth",
+  "bindlocal",
+  "brotli",
+  "ca-search",
+  "cookies",
+  "dateparse",
+  "dict",
+  "digest-auth",
+  "dnsshuffle",
+  "doh",
+  "file",
+  "form-api",
+  "ftp",
+  "get-easy-options",
+  "gopher",
+  "headers-api",
+  "hsts",
+  "http",
+  "http-auth",
+  "http2",
+  "idn",
+  "imap",
+  "ipfs",
+  "ipv6",
+  "kerberos-auth",
+  "ldap",
+  "ldaps",
+  "libcurl-option",
+  "mime",
+  "mqtt",
+  "negotiate-auth",
+  "netrc",
+  "ntlm",
+  "pop3",
+  "progress-meter",
+  "proxy",
+  "psl",
+  "rtsp",
+  "rustls",
+  "sha512-256",
+  "smb",
+  "smtp",
+  "socketpair",
+  "telnet",
+  "tftp",
+  "threaded-resolver",
+  "tls-srp",
+  "unix-sockets",
+  "verbose",
+  "websockets",
+  "zlib",
+  "zstd",
+]
