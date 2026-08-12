@@ -1,3 +1,23 @@
+SPDX-FileCopyrightText: Daniel Stenberg, <daniel@haxx.se>, et al.
+SPDX-FileCopyrightText: the blitzy-curl project contributors
+SPDX-License-Identifier: curl
+
+blitzy-curl - LICENSE
+
+This is the license of the blitzy-curl project. The repository holds three
+trees: original/ (an unmodified vendored copy of upstream curl), refactor/
+(the Rust implementation of libcurl and the curl command-line tool) and
+testing/ (the project-authored verification code).
+
+Section 1 below reproduces the upstream curl license verbatim. Section 2
+states this project's licensing position. The vendored tree original/ keeps
+its own license files, which this file leaves untouched; see "Preserved
+baseline license" in Section 2.
+
+==============================================================================
+SECTION 1 - UPSTREAM curl LICENSE, REPRODUCED VERBATIM
+==============================================================================
+
 COPYRIGHT AND PERMISSION NOTICE
 
 Copyright (c) 1996 - 2026, Daniel Stenberg, <daniel@haxx.se>, and many
@@ -20,3 +40,73 @@ OR OTHER DEALINGS IN THE SOFTWARE.
 Except as contained in this notice, the name of a copyright holder shall not
 be used in advertising or otherwise to promote the sale, use or other dealings
 in this Software without prior written authorization of the copyright holder.
+
+==============================================================================
+SECTION 2 - blitzy-curl PROJECT LICENSING POSITION
+==============================================================================
+
+Upstream copyright attribution
+------------------------------
+
+curl and libcurl are the work of Daniel Stenberg, <daniel@haxx.se>, and many
+contributors, as recorded in the notice in Section 1 and in the upstream
+THANKS file. Those copyright holders retain their copyright in the material
+this project derives from. That attribution is retained here, in the notice
+reproduced above, and in the project's own files that carry it.
+
+Derivative work
+---------------
+
+The Rust implementation under refactor/ and the verification code under
+testing/ are a derivative work of curl. They were written against curl's
+source, public headers, documentation and tests, and they reproduce curl's
+interfaces and behavior.
+
+This project is NOT a clean-room reimplementation of curl, and it must not be
+presented as one.
+
+License applied to this project's own work
+------------------------------------------
+
+Everything this project authors - the whole of refactor/ and testing/, and
+the root-level build, packaging and CI files - is licensed under the curl
+license reproduced in Section 1. Its SPDX license identifier is curl.
+
+No additional license is applied to this project's own work. Should an
+additional license ever be applied, it is carried alongside the curl license
+and never in place of it, and it is named in this file, in the root LICENSE
+file and in refactor/COPYING.
+
+Preserved baseline license
+--------------------------
+
+original/ is an unmodified vendored copy of upstream curl and is read-only.
+The license files of that tree are preserved there exactly as upstream ships
+them:
+
+  original/COPYING
+  original/LICENSES/curl.txt
+  original/LICENSES/ISC.txt
+  original/LICENSES/BSD-4-Clause-UC.txt
+
+original/COPYING is the license of everything under original/. Nothing in
+this file modifies, supersedes, replaces, reinterprets or restates the terms
+of original/COPYING or of any file under original/LICENSES/, and this file
+grants nothing in respect of that tree.
+
+Companion files
+---------------
+
+The root LICENSE file is a duplicate of this file under the name that tooling
+commonly expects; the two carry one license position and are changed
+together.
+
+refactor/COPYING and refactor/LICENSE state this same position for the Rust
+implementation tree and do not vary it.
+
+Where "why" is recorded
+-----------------------
+
+The rationale for this licensing position is recorded in
+refactor/docs/DECISION-LOG.md, the project's single source of truth for "why"
+decisions. It is not restated here.
