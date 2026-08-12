@@ -526,6 +526,33 @@ delivered = "absorbed-upstream"                                       # DL-0034
 flag-contract = "none"
 decision = "DL-0034"
 
+# The noproxy unit is absorbed into proxy.c at the tag.                DL-0050
+[workspace.metadata.curl.baseline-premise-deltas.noproxy-header]
+plan-premise = "original/lib/noproxy.h and noproxy.c declaring Curl_check_noproxy and two CIDR matchers"
+absent-paths = [
+  "original/lib/noproxy.c",
+  "original/lib/noproxy.h",
+]
+present-paths = [
+  "original/lib/proxy.c",
+  "original/lib/proxy.h",
+  "original/tests/unit/unit1614.c",
+]
+evidence = [
+  { path = "original/lib/proxy.c", line = 197, contains = "UNITTEST bool proxy_check_noproxy(const char *name, const char *no_proxy);" },
+  { path = "original/lib/proxy.c", line = 511, contains = "do_not_proxy = proxy_check_noproxy(data->state.origin->hostname" },
+  { path = "original/lib/proxy.c", line = 53, contains = "UNITTEST bool cidr4_match(" },
+  { path = "original/lib/proxy.c", line = 90, contains = "UNITTEST bool cidr6_match(" },
+  { path = "original/lib/proxy.h", line = 54, contains = "CURLcode Curl_proxy_init_conn(struct Curl_easy *data," },
+  { path = "original/lib/Makefile.inc", line = 253, contains = "  proxy.c " },
+  { path = "original/lib/Makefile.inc", line = 388, contains = "  proxy.h " },
+  { path = "original/tests/unit/unit1614.c", line = 25, contains = "proxy.h" },
+  { path = "original/tests/unit/unit1614.c", line = 159, contains = "cidr4_match(list4[i].a, list4[i].n, list4[i].bits)" },
+]
+delivered = "absorbed-upstream"                                       # DL-0050
+flag-contract = "none"
+decision = "DL-0050"
+
 # Comment discipline in project-authored configuration files.          DL-0032
 # Enforced by testing/audit; the decision log holds every "why".       DL-0023
 [workspace.metadata.curl.comment-discipline]
