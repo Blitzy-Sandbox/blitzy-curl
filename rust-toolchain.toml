@@ -2,44 +2,34 @@
 # SPDX-FileCopyrightText: Daniel Stenberg, <daniel@haxx.se>, et al.
 #
 # Toolchain pin for the Rust reimplementation of libcurl and the curl
-# command-line tool. rustup reads this file for every cargo invocation
-# made anywhere in this repository.
+# command-line tool. rustup reads this file for every cargo invocation made
+# anywhere in this repository.
 #
-# Constraints on this file:
-#   - `channel` is an exact three-component release: never `stable`,
-#     never `nightly`, never a two-component `1.97`. Recorded values and
-#     existing pins are append-only.                                       [R1]
-#   - `channel` is the recorded MSRV. It must equal `rust-version` and
-#     `workspace.metadata.curl.msrv` in the root Cargo.toml, and the MSRV
-#     CI job must select this same version.                             DL-0025
-#   - edition 2024 needs 1.85 or later; this pin is above that floor.   DL-0025
-#   - this stable channel is the build toolchain in every configuration;
-#     nightly is never the build toolchain.                             DL-0007
-#   - MIRI is nightly-only and rustup accepts exactly one [toolchain]
-#     table, so the MIRI toolchain is pinned by the marker block below
-#     and selected explicitly as `cargo +$MIRI_TOOLCHAIN miri`.         DL-0029
-#   - every comment here is a label, a mechanical constraint or a DL-####
-#     pointer; rationale belongs only in refactor/docs/DECISION-LOG.md.
+# Comments are labels or DL-#### pointers only; see refactor/docs/DECISION-LOG.md.
 #
-# The MIRI toolchain. Pinned exact, named nowhere else, and installed in
-# two commands, never one:
-#   rustup toolchain install nightly-2026-08-11 --profile minimal
-#   rustup component add --toolchain nightly-2026-08-11 miri rust-src
-# Read with: sed -n 's/^# MIRI-TOOLCHAIN: //p' rust-toolchain.toml      DL-0029
+# The MIRI toolchain, named here and nowhere else:                       DL-0029
 # MIRI-TOOLCHAIN: nightly-2026-08-11
 # MIRI-COMPONENTS: miri rust-src
+# Read: MIRI_TOOLCHAIN=$(sed -n 's/^# MIRI-TOOLCHAIN: //p' rust-toolchain.toml)
+# Use:  cargo +"$MIRI_TOOLCHAIN" miri test
 
 [toolchain]
-channel = "1.97.1"
+# Exact three-component release: never `stable`, never `nightly`, never a
+# two-component `1.97`; equals `rust-version` and
+# `workspace.metadata.curl.msrv` in the root Cargo.toml and the MSRV CI job.
+# Frozen at import: append-only.                                          [R1]
+# The build toolchain in every configuration; nightly never is.        DL-0007
+# Edition 2024 floor is 1.85; this pin is above it.                    DL-0025
+channel = "1.97.1"                                                    # DL-0025
 profile = "minimal"
 
-# `minimal` omits both. A clippy-clean build across the five feature
-# configurations is required, and `make verify` runs both locally.        [R12]
+# `minimal` omits both; `make verify` runs both across the five feature
+# configurations.                                                         [R12]
 components = ["clippy", "rustfmt"]
 
-# The platform matrix. x86_64-unknown-linux-gnu and
-# aarch64-unknown-linux-gnu are execution-verified; aarch64-apple-darwin
-# and x86_64-pc-windows-msvc are cross-compiled and link-verified only.
+# Platform matrix: x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu
+# execution-verified; aarch64-apple-darwin and x86_64-pc-windows-msvc
+# cross-compiled and link-verified only.
 targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",

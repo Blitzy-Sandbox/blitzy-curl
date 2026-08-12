@@ -81,18 +81,27 @@ Preserved baseline license
 --------------------------
 
 original/ is an unmodified vendored copy of upstream curl and is read-only.
-The license files of that tree are preserved there exactly as upstream ships
-them:
+The license files and license metadata of that tree are preserved there
+exactly as upstream ships them:
 
   original/COPYING
+  original/REUSE.toml
   original/LICENSES/curl.txt
   original/LICENSES/ISC.txt
   original/LICENSES/BSD-4-Clause-UC.txt
 
-original/COPYING is the license of everything under original/. Nothing in
-this file modifies, supersedes, replaces, reinterprets or restates the terms
-of original/COPYING or of any file under original/LICENSES/, and this file
-grants nothing in respect of that tree.
+original/COPYING is upstream's root curl notice for that tree, and it is not
+the license of every file in it. Upstream annotates licensing per file: an
+SPDX-License-Identifier and SPDX-FileCopyrightText in the file itself where
+the format allows one, and an entry in original/REUSE.toml where it does not.
+Those per-file annotations, together with the license texts under
+original/LICENSES/ - which include ISC and BSD-4-Clause-UC as well as curl -
+govern the files they apply to, and they take precedence over the root notice
+wherever the two differ.
+
+Nothing in this file modifies, supersedes, replaces, reinterprets or restates
+the terms of original/COPYING, of original/REUSE.toml, or of any file under
+original/LICENSES/, and this file grants nothing in respect of that tree.
 
 Companion files
 ---------------
