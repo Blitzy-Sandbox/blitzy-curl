@@ -1,35 +1,23 @@
 # SPDX-License-Identifier: curl
 # SPDX-FileCopyrightText: Daniel Stenberg, <daniel@haxx.se>, et al.
 #
-# Toolchain pin for the Rust reimplementation of libcurl and the curl
-# command-line tool. rustup reads this file for every cargo invocation made
-# anywhere in this repository.
+# Toolchain pin.                                                       DL-0025
+# Comments are labels or DL-#### pointers only.                        DL-0023
 #
-# Comments are labels or DL-#### pointers only; see refactor/docs/DECISION-LOG.md.
-#
-# The MIRI toolchain, named here and nowhere else:                       DL-0029
 # MIRI-TOOLCHAIN: nightly-2026-08-11
 # MIRI-COMPONENTS: miri rust-src
-# Read: MIRI_TOOLCHAIN=$(sed -n 's/^# MIRI-TOOLCHAIN: //p' rust-toolchain.toml)
-# Use:  cargo +"$MIRI_TOOLCHAIN" miri test
 
 [toolchain]
-# Exact three-component release: never `stable`, never `nightly`, never a
-# two-component `1.97`; equals `rust-version` and
-# `workspace.metadata.curl.msrv` in the root Cargo.toml and the MSRV CI job.
-# Frozen at import: append-only.                                          [R1]
-# The build toolchain in every configuration; nightly never is.        DL-0007
-# Edition 2024 floor is 1.85; this pin is above it.                    DL-0025
+# Exact three-component release; never `stable`, never `nightly`.      DL-0007
+# Equals `rust-version` and `workspace.metadata.curl.msrv`.               [R1]
 channel = "1.97.1"                                                    # DL-0025
 profile = "minimal"
 
-# `minimal` omits both; `make verify` runs both across the five feature
-# configurations.                                                         [R12]
+# `minimal` omits both.                                                  [R12]
 components = ["clippy", "rustfmt"]
 
-# Platform matrix: x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu
-# execution-verified; aarch64-apple-darwin and x86_64-pc-windows-msvc
-# cross-compiled and link-verified only.
+# Execution-verified: the two linux-gnu targets.                          [R12]
+# Cross-compiled and link-verified: darwin and windows-msvc.              [R12]
 targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",

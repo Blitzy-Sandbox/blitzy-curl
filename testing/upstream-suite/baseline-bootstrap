@@ -1,0 +1,79 @@
+#!/bin/sh
+# SPDX-License-Identifier: curl
+# SPDX-FileCopyrightText: the blitzy-curl project contributors
+#
+# Baseline bootstrap entry point.                                        DL-0033
+# Usage: baseline-bootstrap [staging-root]
+#
+# Default staging root: $BASELINE_STAGE, else <repo>/target/baseline.
+# Honours $AUTORECONF.                                                    DL-0033
+
+set -eu
+unset CDPATH
+
+script_directory=$(cd -- "$(dirname -- "$0")" && pwd)
+repository_root=$(cd -- "$script_directory/../.." && pwd)
+oracle="$repository_root/original"
+staging="${1:-${BASELINE_STAGE:-$repository_root/target/baseline}}"
+
+# The oracle is read-only.                                               [R1]
+if [ ! -f "$oracle/configure.ac" ]; then
+  echo "baseline-bootstrap: no oracle at $oracle" >&2
+  exit 1
+fi
+
+# Staging root: never the oracle, never outside the checkout.            DL-0033
+case "$staging" in
+  "$oracle" | "$oracle"/*)
+    echo "baseline-bootstrap: staging root inside the oracle: $staging" >&2
+    exit 1
+    ;;
+  "$repository_root"/*) ;;
+  *)
+    echo "baseline-bootstrap: staging root outside $repository_root: $staging" >&2
+    exit 1
+    ;;
+esac
+
+# Mode and content of every oracle file, one digest.                     [R1]
+oracle_digest() {
+  if command -v git >/dev/null 2>&1 &&
+    git -C "$repository_root" rev-parse --git-dir >/dev/null 2>&1; then
+    git -C "$repository_root" ls-files -s original | sha256sum | cut -d' ' -f1
+    return 0
+  fi
+  find "$oracle" -type f -exec sha256sum {} + | LC_ALL=C sort |
+    sha256sum | cut -d' ' -f1
+}
+
+oracle_files() {
+  find "$oracle" -type f | wc -l | tr -d ' '
+}
+
+digest_before=$(oracle_digest)
+files_before=$(oracle_files)
+
+# A copy, not a symlink view.                                            DL-0033
+rm -rf -- "$staging"
+mkdir -p -- "$staging"
+cp -a -- "$oracle/." "$staging/"
+
+( cd -- "$staging" && exec ${AUTORECONF:-autoreconf} -fi )
+
+if [ ! -x "$staging/configure" ]; then
+  echo "baseline-bootstrap: no configure in $staging" >&2
+  exit 1
+fi
+
+digest_after=$(oracle_digest)
+files_after=$(oracle_files)
+
+if [ "$digest_before" != "$digest_after" ] || [ "$files_before" != "$files_after" ]; then
+  echo "baseline-bootstrap: the oracle changed during bootstrap" >&2
+  echo "  before: $digest_before ($files_before files)" >&2
+  echo "  after:  $digest_after ($files_after files)" >&2
+  exit 1
+fi
+
+echo "baseline-bootstrap: oracle unchanged, digest $digest_before, $files_before files"
+echo "$staging"

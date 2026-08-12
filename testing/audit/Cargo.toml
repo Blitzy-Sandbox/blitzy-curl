@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: curl
+# SPDX-FileCopyrightText: the blitzy-curl project contributors
+#
+# Configuration-contract audits.                                         DL-0037
+
+[package]
+name = "curl-audit"
+description = "Generated audits over this project's own configuration contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "curl_audit"
+path = "src/lib.rs"
+
+[[bin]]
+name = "curl-audit-config"
+path = "src/bin/config.rs"
+
+[dependencies]
+toml = { workspace = true }
+
+[lints]
+workspace = true

@@ -29,6 +29,7 @@
 /bld/
 /build/
 /stats/
+/target/
 __pycache__
 Debug
 INSTALL

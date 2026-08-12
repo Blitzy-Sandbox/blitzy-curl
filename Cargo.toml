@@ -1,35 +1,24 @@
 # SPDX-License-Identifier: curl
 # SPDX-FileCopyrightText: Daniel Stenberg, <daniel@haxx.se>, et al.
 #
-# Root workspace manifest for the Rust reimplementation of libcurl and the curl
-# command-line tool.
+# Root workspace manifest.                                             DL-0026
+# Comments are labels or DL-#### pointers only.                        DL-0023
 #
-# Three trees exist at repository root and no others:
-#   original/  vendored upstream curl at the pinned tag; immutable oracle
-#   refactor/  Rust implementation crates and the autotools/CMake build shim
-#   testing/   all project-authored verification code
-#
-# Virtual manifest. Build configurations and the `default` forward contract are
-# declared under [workspace.metadata.curl].                              DL-0026
-# Authoritative source of third-party requirements; every one an exact `=x.y.z`
-# pin, consumed by members as `<dep>.workspace = true`.
-# Comments are labels or DL-#### pointers only; see refactor/docs/DECISION-LOG.md.
+# Trees at root: original/, refactor/, testing/.                       DL-0020
+# Virtual manifest; contracts sit in [workspace.metadata.curl].        DL-0026
 
 [workspace]
 resolver = "3"                                                        # DL-0025
 
-# Sole membership mechanism: membership carries the lints, the pins and every
-# cargo-graph gate. Cargo rejects any entry - explicit path or glob - that no
-# existing directory satisfies, so each crate is appended here by the operation
-# that creates its manifest.                                             DL-0026
-members = []
+# Membership carries the lints, the pins and the gates.                DL-0031
+# Appended by the operation that creates each manifest.                DL-0031
+members = ["testing/audit"]
 
 # C source, not a Cargo package; never a member.                        [R1]
 exclude = ["original"]
 
 # `testing/fuzz` is a member, not an `exclude` entry.                   DL-0027
-# Completeness contract for this list: `workspace.metadata.curl.required-members`.
-#                                                                       DL-0026
+# Completeness contract: `required-members`.                           DL-0026
 
 [workspace.package]
 version = "8.21.0"                                                    # DL-0001
@@ -47,9 +36,7 @@ publish = false
 
 # ---------------------------------------------------------------------------
 # Lints. Members opt in with `[lints] workspace = true`.
-# `unsafe_code` is `deny`, not `forbid`: allowlisted roots opt out with
-# `#![allow(unsafe_code)]`, every other root declares
-# `#![forbid(unsafe_code)]`.                                            DL-0011
+# `unsafe_code` is `deny`; roots opt in or out explicitly.             DL-0011
 # ---------------------------------------------------------------------------
 [workspace.lints.rust]
 unsafe_code = "deny"                                                  # DL-0011
@@ -86,11 +73,10 @@ dbg_macro = "deny"
 broken_intra_doc_links = "deny"
 
 # ---------------------------------------------------------------------------
-# Dependency pins. Exact `=x.y.z` only; caret, tilde and wildcard requirements are
-# prohibited. `optional` is illegal in this table; a member gating a dependency
-# behind a feature writes
-# `<crate> = { workspace = true, optional = true }` in its own manifest.
-# Frozen at import: appending permitted, changing and removing not.      [R1]
+# Dependency pins. Exact `=x.y.z` only.                                  [R1]
+# Frozen at import: append only.                                         [R1]
+#
+# `optional` is illegal here; members gate in their own manifest.      DL-0031
 # ---------------------------------------------------------------------------
 [workspace.dependencies]
 
@@ -135,12 +121,11 @@ unicode-normalization = "=0.1.25"
 psl = "=2.1.223"
 publicsuffix = "=2.3.0"
 
-# -- curl-tls : C backend adapters, each on its baseline flag name -----------
+# -- curl-tls : C backend adapters -------------------------------------------
 openssl = "=0.10.81"
 openssl-sys = "=0.9.117"
-# default-features off; `ssl`/`x509` add the TLS module; `custom_time` and
-# `custom_gmtime_r` stay unreachable.                                   DL-0018
-mbedtls = { version = "=0.13.5", default-features = false, features = ["std", "time", "ssl", "x509", "aesni", "padlock"] }   # DL-0018
+# default-features off; six features enabled.                          DL-0038
+mbedtls = { version = "=0.13.5", default-features = false, features = ["std", "time", "ssl", "x509", "aesni", "padlock"] }   # DL-0018 DL-0038
 wolfssl = "=7.3.0"
 wolfssl-sys = "=4.3.0"
 schannel = "=0.1.29"
@@ -161,7 +146,7 @@ md4 = "=0.11.0"
 # -- curl-proto-ssh / curl-proto-ldap ----------------------------------------
 libssh2-sys = "=0.3.2"                                                # DL-0019
 libssh-sys = "=0.1.1"                                                 # DL-0019
-# default-features off: `tls-native` off; LDAPS is carried by curl-tls.  DL-0009
+# default-features off; `tls-native` off.                              DL-0009
 ldap3 = { version = "=0.12.1", default-features = false, features = ["sync"] }   # DL-0009
 
 # -- curl-abi and platform surfaces ------------------------------------------
@@ -183,7 +168,7 @@ tracing = "=0.1.44"
 cc = "=1.4.2"
 pkg-config = "=0.3.33"
 cbindgen = "=0.29.4"
-# Generates the committed FFI binding skeletons; never run at build time. DL-0013
+# Generates the committed binding skeletons.                          DL-0013
 bindgen = "=0.72.1"
 
 # -- testing/ : verification tree only ---------------------------------------
@@ -223,8 +208,7 @@ debug = false
 strip = "none"
 incremental = false
 
-# Release code generation plus full DWARF; consumed by the abidiff driver.
-#                                                                       DL-0021
+# Release code generation plus full DWARF.                             DL-0021
 [profile.abi]
 inherits = "release"
 debug = 2                                                             # DL-0021
@@ -236,26 +220,23 @@ inherits = "release"
 debug = 1
 
 # ---------------------------------------------------------------------------
-# Project contract. Cargo ignores [workspace.metadata]; the root Makefile, the
-# build shim under refactor/shim/ and the CI workflows read it.
+# Project contract; Cargo ignores [workspace.metadata].               DL-0026
+# Read by the root Makefile, the shim and CI.                          DL-0026
 # ---------------------------------------------------------------------------
 [workspace.metadata.curl]
 baseline-tag = "curl-8_21_0"                                          # DL-0001
 msrv = "1.97.1"
 artifact-packages = ["curl-abi", "curl-cli"]
 
-# Frozen at import; never renamed, never extended. Case-sensitive: these are the
-# `make verify CONFIG=<name>` arguments and the CI matrix keys.          [R12]
+# Frozen at import; never renamed, never extended.                       [R12]
+# `make verify CONFIG=<name>` arguments; case-sensitive.                 [R12]
 feature-configurations = ["default", "minimal", "full", "rustls-only", "OpenSSL-only"]
 default-configuration = "default"
 
-# Completeness contract only: every implementation crate under refactor/ and every
-# verification member under testing/, which the root Makefile, the build shim and
-# the CI workflows check [workspace].members against. Confers no membership, no
-# lint inheritance, no pins and no cargo-graph gate. Counts are derived from this
-# list, never restated.                                                  DL-0026
+# Completeness contract only; confers no membership.                   DL-0026
+# Counts are derived from this list, never restated.                   DL-0026
 required-members = [
-  # -- refactor/ : ABI surface, core state machine and the shared leaf crates --
+  # -- refactor/ : ABI, core, shared leaves --
   "refactor/curl-abi",
   "refactor/curl-core",
   "refactor/curl-types",                                              # DL-0003
@@ -334,15 +315,19 @@ unsafe-allowlist = [                                                  # DL-0011
   "curl-alloc",
 ]
 
-# Invariants the resolved graph must satisfy. Asserted in CI against Cargo.lock.
+# Invariants the resolved graph must satisfy.                          DL-0036
+# Asserted by testing/audit; zero matches and empty graphs fail.       DL-0036
 [workspace.metadata.curl.resolved-invariants]
+asserted-by = "testing/audit"                                         # DL-0037
+# Assertion target of the full-set invariants below.                   DL-0036
+full-set-source = "re-derived-resolution-of-workspace-dependencies"   # DL-0036
+single-version-package = "rustls"                                     # DL-0010
 distinct-rustls-versions = 1                                          # DL-0010
 crypto-provider = "ring"                                              # DL-0009
 absent-transitives = ["aws-lc-rs", "aws-lc-sys", "native-tls"]        # DL-0009
-# Recorded transitive release set; asserted name-by-version against Cargo.lock.
+# Recorded transitive release set; asserted name by version.          DL-0009
 recorded-transitives = { ring = "0.17.14", rustls-webpki = "0.103.13", rustls-pki-types = "1.15.1", rustls-platform-verifier = "0.7.0", quinn-proto = "0.11.16", http = "1.5.0", tokio = "1.53.1", tokio-util = "0.7.19", bytes = "1.12.1" }   # DL-0009
-# Asserted per target with `cargo tree -i <crate> --target <target>`, not against
-# Cargo.lock.                                                           DL-0018
+# Asserted per target with `cargo tree -i`.                            DL-0018
 absent-from-target-graph = ["chrono", "time"]                         # DL-0018
 target-graph = [
   "x86_64-unknown-linux-gnu",
@@ -351,9 +336,8 @@ target-graph = [
   "x86_64-pc-windows-msvc",
 ]
 
-# The five build configurations: `make verify CONFIG=<name>` arguments and CI
-# matrix entries, each warning-clean and clippy-clean. `args` is appended to
-# `cargo build` / `cargo clippy`.                                        [R12]
+# The five build configurations, each warning-clean.                     [R12]
+# `args` is appended to `cargo build` and `cargo clippy`.                [R12]
 [workspace.metadata.curl.configurations.default]
 args = []
 [workspace.metadata.curl.configurations.minimal]
@@ -362,19 +346,17 @@ args = ["--no-default-features"]
 args = ["--all-features"]
 [workspace.metadata.curl.configurations.rustls-only]
 args = ["--no-default-features", "--features", "curl-abi/rustls-only,curl-cli/rustls-only"]
-# Configuration name is `OpenSSL-only`; the Cargo feature it selects is lowercase.
+# Name is `OpenSSL-only`; the feature is lowercase.                      [R12]
 [workspace.metadata.curl.configurations.OpenSSL-only]
 args = ["--no-default-features", "--features", "curl-abi/openssl-only,curl-cli/openssl-only"]
 
-# Aggregate features each artifact package must define so the configurations
-# above resolve.
+# Aggregate features the artifact packages must define.                  [R12]
 [workspace.metadata.curl.required-artifact-features]
 curl-abi = ["rustls-only", "openssl-only"]
 curl-cli = ["rustls-only", "openssl-only"]
 
-# Mapping class of every baseline configure flag and CMake option. Only the first
-# two classes become Cargo features; the per-flag table is
-# refactor/docs/FEATURE-MAP.md.
+# Mapping class of every baseline flag and CMake option.               DL-0016
+# Per-flag table: refactor/docs/FEATURE-MAP.md.                        DL-0016
 [workspace.metadata.curl.flag-classes]
 capability = { becomes-cargo-feature = true }                         # DL-0016
 backend-selection = { becomes-cargo-feature = true }                  # DL-0016
@@ -382,20 +364,19 @@ value-or-path = { becomes-cargo-feature = false, consumed-by = "shim" }         
 test-infrastructure = { becomes-cargo-feature = false, consumed-by = "staging-wrapper" }   # DL-0016
 accepted-and-inert = { becomes-cargo-feature = false, consumed-by = "shim" }       # DL-0016
 
-# Torture mode: the shim maps the baseline flag below onto this feature. DL-0014
+# Torture mode; the shim maps the flag below.                          DL-0014
 [workspace.metadata.curl.debug-build]
 baseline-flag = "--enable-debug"
 feature = "debug"                                                     # DL-0014
 owning-crate = "curl-alloc"                                           # DL-0015
 provides = ["alloc-failure-injection", "leak-accounting"]
 
-# The `default` feature set: a forward contract, never renamed or extended.
-# Derived mechanically from `source`, never from memory.                 DL-0026
+# The `default` feature set; a frozen forward contract.                DL-0026
+# Derived mechanically from `source`.                                  DL-0026
 [workspace.metadata.curl.default-features]
 source = "original/configure.ac"                                      # DL-0026
 derivation = "baseline capability defaults with a TLS backend selected and every optional library detected"   # DL-0026
-# The `rustls` entry in `features` is a recorded deviation, not a baseline
-# no-argument outcome.                                                   DL-0030
+# The `rustls` entry is a recorded deviation.                          DL-0030
 tls-selection = { baseline = "explicit-choice-required", baseline-locator = "original/configure.ac:519-523", baseline-default-flag = "OPT_RUSTLS=no@original/configure.ac:299", project-default = "rustls", deviation = "DL-0030" }
 features = [                                                          # DL-0026
   "alt-svc",
@@ -453,4 +434,126 @@ features = [                                                          # DL-0026
   "websockets",
   "zlib",
   "zstd",
+]
+
+# Where a plan premise and the pinned oracle disagree.                 DL-0035
+# Verified by testing/audit; the oracle governs.                       DL-0001
+[workspace.metadata.curl.baseline-premise]
+asserted-by = "testing/audit"                                         # DL-0037
+vocabulary = [                                                        # DL-0035
+  "absorbed-upstream",
+  "constants-and-symbols-only",
+  "project-owned-out-of-tree",
+  "vendored-at-tag-path",
+]
+
+# RTMP left the baseline in 8.20.0.                                    DL-0035
+[workspace.metadata.curl.baseline-premise-deltas.librtmp]
+plan-premise = "librtmp discovery module, --with-librtmp flag and an RTMP translation unit"
+absent-paths = [
+  "original/CMake/FindLibrtmp.cmake",
+  "original/lib/curl_rtmp.c",
+]
+present-paths = [
+  "original/include/curl/curl.h",
+  "original/lib/version.c",
+]
+evidence = [
+  { path = "original/docs/DEPRECATE.md", line = 82, contains = "RTMP (removed in 8.20.0)" },
+  { path = "original/docs/libcurl/symbols-in-versions", line = 977, contains = "CURLPROTO_RTMP                  7.21.0        8.20.0" },
+  { path = "original/include/curl/curl.h", line = 1097, contains = "#define CURLPROTO_RTMP" },
+  { path = "original/lib/version.c", line = 574, contains = "rtmp version" },
+  { path = "original/Makefile.am", line = 29, contains = "CMAKE_DIST =" },
+  { path = "original/Makefile.am", line = 44, contains = "CMake/FindLibssh2.cmake" },
+  { path = "original/lib/Makefile.inc", line = 154, contains = "LIB_CFILES =" },
+  { path = "original/lib/Makefile.inc", line = 147, contains = "vssh/libssh2.c" },
+]
+delivered = "constants-and-symbols-only"                              # DL-0035
+flag-contract = "accepted-and-inert"                                  # DL-0016
+decision = "DL-0035"
+
+# The tag's bootstrap contract is `autoreconf -fi`.                    DL-0033
+[workspace.metadata.curl.baseline-premise-deltas.buildconf]
+plan-premise = "original/buildconf as the baseline bootstrap entry point, mode 100755"
+absent-paths = ["original/buildconf"]
+present-paths = [
+  "original/GIT-INFO.md",
+  "testing/upstream-suite/baseline-bootstrap",
+]
+evidence = [
+  { path = "original/GIT-INFO.md", line = 21, contains = "autoreconf -fi" },
+  { path = "original/tests/testcurl.pl", line = 54, contains = "Do not run autoreconf -fi" },
+]
+delivered = "project-owned-out-of-tree"                               # DL-0033
+flag-contract = "none"
+decision = "DL-0033"
+
+# Upstream moved this tooling to scripts/ before the tag.              DL-0034
+[workspace.metadata.curl.baseline-premise-deltas.badwords-script]
+plan-premise = "original/.github/scripts/badwords.pl and badwords.txt"
+absent-paths = [
+  "original/.github/scripts/badwords.pl",
+  "original/.github/scripts/badwords.txt",
+]
+present-paths = [
+  "original/scripts/badwords",
+  "original/scripts/badwords-all",
+  "original/scripts/badwords.txt",
+]
+evidence = [
+  { path = "original/scripts/badwords-all", line = 13, contains = "exit system('scripts/badwords', ('scripts/badwords.txt'," },
+  { path = "original/Makefile.am", line = 175, contains = "scripts/badwords-all" },
+  { path = "original/CMakeLists.txt", line = 577, contains = "scripts/badwords-all" },
+]
+delivered = "vendored-at-tag-path"                                    # DL-0034
+flag-contract = "none"
+decision = "DL-0034"
+
+# The .ok allowlist now lives inside badwords.txt.                     DL-0034
+[workspace.metadata.curl.baseline-premise-deltas.badwords-allowlist]
+plan-premise = "original/.github/scripts/badwords.ok as a separate allowlist file"
+absent-paths = [
+  "original/.github/scripts/badwords.ok",
+  "original/scripts/badwords.ok",
+]
+present-paths = ["original/scripts/badwords.txt"]
+evidence = [
+  { path = "original/scripts/badwords.txt", line = 8, contains = "# ---[word]" },
+  { path = "original/scripts/badwords", line = 14, contains = "# ---(accepted word)" },
+  { path = "original/scripts/badwords", line = 184, contains = "if(/^---:([^:]*):(.*)/)" },
+]
+delivered = "absorbed-upstream"                                       # DL-0034
+flag-contract = "none"
+decision = "DL-0034"
+
+# Comment discipline in project-authored configuration files.          DL-0032
+# Enforced by testing/audit; the decision log holds every "why".       DL-0023
+[workspace.metadata.curl.comment-discipline]
+decision-log = "refactor/docs/DECISION-LOG.md"                        # DL-0023
+asserted-by = "testing/audit"                                         # DL-0037
+# Every root *.toml, root .gitignore and member manifest.              DL-0032
+files = [
+  ".gitignore",
+  "Cargo.toml",
+  "rust-toolchain.toml",
+  "testing/audit/Cargo.toml",
+  "testing/upstream-suite/baseline-bootstrap",
+]
+max-label-words = 10                                                  # DL-0032
+max-label-chars = 76                                                  # DL-0032
+max-block-lines = 2                                                   # DL-0032
+marker-keys = ["MIRI-TOOLCHAIN", "MIRI-COMPONENTS"]                   # DL-0029
+banned-phrases = [                                                    # DL-0032
+  "as a result",
+  "because",
+  "consequently",
+  "for this reason",
+  "in order to",
+  "instead of",
+  "otherwise",
+  "rather than",
+  "so that",
+  "the reason",
+  "therefore",
+  "which is why",
 ]
