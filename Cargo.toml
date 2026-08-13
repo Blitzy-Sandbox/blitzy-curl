@@ -12,7 +12,7 @@ resolver = "3"                                                        # DL-0025
 
 # Membership carries the lints, the pins and the gates.                DL-0031
 # Appended by the operation that creates each manifest.                DL-0031
-members = ["testing/audit"]
+members = ["testing/audit", "testing/audit/traceability"]
 
 # C source, not a Cargo package; never a member.                        [R1]
 exclude = ["original"]
@@ -453,6 +453,7 @@ plan-premise = "librtmp discovery module, --with-librtmp flag and an RTMP transl
 absent-paths = [
   "original/CMake/FindLibrtmp.cmake",
   "original/lib/curl_rtmp.c",
+  "original/lib/curl_rtmp.h",                                        # DL-0137
 ]
 present-paths = [
   "original/include/curl/curl.h",
@@ -467,6 +468,8 @@ evidence = [
   { path = "original/Makefile.am", line = 44, contains = "CMake/FindLibssh2.cmake" },
   { path = "original/lib/Makefile.inc", line = 154, contains = "LIB_CFILES =" },
   { path = "original/lib/Makefile.inc", line = 147, contains = "vssh/libssh2.c" },
+  { path = "original/lib/Makefile.inc", line = 327, contains = "curl_range.h" },
+  { path = "original/lib/Makefile.inc", line = 328, contains = "curl_sasl.h" },
 ]
 delivered = "constants-and-symbols-only"                              # DL-0035
 flag-contract = "accepted-and-inert"                                  # DL-0016
@@ -553,6 +556,21 @@ delivered = "absorbed-upstream"                                       # DL-0050
 flag-contract = "none"
 decision = "DL-0050"
 
+# Index of the traceability generator; the data lives with it.         DL-0111
+# Hazard verdicts, owners and evidence: data/hazards.toml.             DL-0110
+[workspace.metadata.curl.traceability]
+asserted-by = "testing/audit/traceability"                            # DL-0111
+ownership-data = "testing/audit/traceability/data/ownership.toml"     # DL-0111
+hazard-data = "testing/audit/traceability/data/hazards.toml"          # DL-0110
+decision-log = "refactor/docs/DECISION-LOG.md"                        # DL-0023
+
+# Rendered documents; check mode diffs each one.                       DL-0111
+[workspace.metadata.curl.traceability.outputs]
+provenance = "refactor/docs/PROVENANCE.md"                            # DL-0111
+traceability = "refactor/docs/TRACEABILITY-MATRIX.md"                 # DL-0111
+coverage = "refactor/docs/COVERAGE-MATRIX.md"                         # DL-0111
+quirks = "refactor/docs/QUIRKS.md"                                    # DL-0110
+
 # Comment discipline in project-authored configuration files.          DL-0032
 # Enforced by testing/audit; the decision log holds every "why".       DL-0023
 [workspace.metadata.curl.comment-discipline]
@@ -564,6 +582,7 @@ files = [
   "Cargo.toml",
   "rust-toolchain.toml",
   "testing/audit/Cargo.toml",
+  "testing/audit/traceability/Cargo.toml",
   "testing/upstream-suite/baseline-bootstrap",
 ]
 max-label-words = 10                                                  # DL-0032
@@ -584,3 +603,169 @@ banned-phrases = [                                                    # DL-0032
   "therefore",
   "which is why",
 ]
+
+# Per-path provenance owners of the vendored tree.                    DL-0138
+# Enumerated from the tag; classified by the manifest.                DL-0043
+[workspace.metadata.curl.provenance]
+asserted-by = "testing/audit"                                         # DL-0037
+enumeration-roots = ["original/lib", "original/src"]                  # DL-0043
+manifest = "original/lib/Makefile.inc"                                # DL-0043
+trace-registry = "original/lib/curl_trc.c"                            # DL-0039
+records = ["Cargo.toml", "refactor/docs/DECISION-LOG.md"]             # DL-0138
+kinds = { translation-unit = "c", header = "h" }                      # DL-0138
+
+# Rules the audit runs, never recorded figures.                       DL-0040
+[workspace.metadata.curl.provenance.extraction]
+function-definitions = "open-brace-at-column-zero-after-close-paren"  # DL-0138
+type-definitions = "struct-name-open-brace-at-column-zero"            # DL-0138
+trace-calls = "CURL_TRC_"                                             # DL-0039
+infof-calls = "infof"                                                 # DL-0039
+failf-calls = "failf"                                                 # DL-0039
+filter-definition = "Curl_cft_<name> = {"                             # DL-0039
+filter-registration = "&Curl_cft_<name>,"                             # DL-0039
+
+# One entry per vendored path; owners are planned members.            DL-0138
+# Metrics are re-measured on every run.                               DL-0138
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/cf-dns.c"
+kind = "translation-unit"
+crate = "refactor/curl-core"
+decision = "DL-0139"
+manifest-line = 162
+lines = 596
+function-definitions = 20
+trace-calls = 7
+infof-calls = 7
+failf-calls = 2
+filter = "Curl_cft_dns"
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/cf-dns.h"
+kind = "header"
+crate = "refactor/curl-core"
+decision = "DL-0139"
+manifest-line = 296
+lines = 79
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/cf-recvbuf.c"
+kind = "translation-unit"
+crate = "refactor/curl-core"
+decision = "DL-0141"
+manifest-line = 168
+lines = 157
+function-definitions = 5
+trace-calls = 0
+infof-calls = 0
+failf-calls = 0
+filter = "Curl_cft_recvbuf"
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/cf-recvbuf.h"
+kind = "header"
+crate = "refactor/curl-core"
+decision = "DL-0141"
+manifest-line = 302
+lines = 40
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/cf-setup.c"
+kind = "translation-unit"
+crate = "refactor/curl-core"
+decision = "DL-0140"
+manifest-line = 169
+lines = 476
+function-definitions = 12
+trace-calls = 18
+infof-calls = 0
+failf-calls = 2
+filter = "Curl_cft_setup"
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/cf-setup.h"
+kind = "header"
+crate = "refactor/curl-core"
+decision = "DL-0140"
+manifest-line = 303
+lines = 46
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/creds.c"
+kind = "translation-unit"
+crate = "refactor/curl-types"
+decision = "DL-0142"
+manifest-line = 176
+lines = 189
+function-definitions = 7
+trace-calls = 2
+infof-calls = 0
+failf-calls = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/creds.h"
+kind = "header"
+crate = "refactor/curl-types"
+decision = "DL-0142"
+manifest-line = 311
+lines = 91
+type-definitions = 1
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/dnscache.c"
+kind = "translation-unit"
+crate = "refactor/curl-dns"
+decision = "DL-0105"
+manifest-line = 197
+lines = 859
+function-definitions = 26
+trace-calls = 3
+infof-calls = 6
+failf-calls = 1
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/dnscache.h"
+kind = "header"
+crate = "refactor/curl-dns"
+decision = "DL-0105"
+manifest-line = 339
+lines = 138
+type-definitions = 2
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/ftp-int.h"
+kind = "header"
+crate = "refactor/curl-proto-ftp"
+decision = "DL-0144"
+manifest-line = 351
+lines = 160
+type-definitions = 4
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/peer.h"
+kind = "header"
+crate = "refactor/curl-types"
+decision = "DL-0143"
+manifest-line = 383
+lines = 110
+type-definitions = 1
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/protocol.h"
+kind = "header"
+crate = "refactor/curl-types"
+decision = "DL-0143"
+manifest-line = 387
+lines = 296
+type-definitions = 2
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/proxy.h"
+kind = "header"
+crate = "refactor/curl-types"
+decision = "DL-0143"
+manifest-line = 388
+lines = 59
+type-definitions = 1

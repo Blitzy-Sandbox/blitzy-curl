@@ -1,0 +1,1052 @@
+# SPDX-License-Identifier: curl
+# SPDX-FileCopyrightText: the blitzy-curl project contributors
+#
+# One row per hazard the oracle carries.                                DL-0110
+# Verdict, owner and compensating verification only; no rationale.      DL-0110
+
+schema = 1
+
+[[hazard]]
+id = "HZ-0001"
+path = "original/lib/setup-vms.h"
+lines = [83, 101]
+behaviour = "The non-void path translator can reach the end of the function after a successful translation, so the value it returns is indeterminate."
+verdict = "not-ported"
+owner = "none"
+verification = "Platform matrix excludes OpenVMS; the construct carries a traceability row and no counterpart."
+status = "obligation"
+decision = "DL-0052"
+
+[[hazard]]
+id = "HZ-0002"
+path = "original/lib/fake_addrinfo.c"
+lines = [187, 199]
+behaviour = "An address-conversion allocation failure can return zero with a null result list, reporting a successful resolution that produced nothing."
+verdict = "diverge"
+owner = "curl-dns"
+verification = "Fault-injected conversion failure asserting the deterministic out-of-memory outcome, plus the divergence-allowlist entry."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0003"
+path = "original/lib/curl_memrchr.c"
+lines = [39, 49]
+behaviour = "The fallback search decrements and compares a pointer outside the object it was given."
+verdict = "substitute"
+owner = "curl-types"
+verification = "Caller-shape equivalence test over the reverse search, plus the parser fuzz targets that reach it."
+status = "obligation"
+decision = "DL-0048"
+
+[[hazard]]
+id = "HZ-0004"
+path = "original/lib/cw-pause.c"
+lines = [179, 203]
+behaviour = "The pause-buffer trace total accumulates the requested length rather than the number of bytes actually written, so the running total is wrong whenever a short write occurs."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Differential trace comparison over a transfer paused mid-body."
+status = "obligation"
+decision = "DL-0117"
+
+[[hazard]]
+id = "HZ-0005"
+path = "original/lib/curl_gssapi.c"
+lines = [238, 265]
+behaviour = "The oversized display-name path in the debug stub returns without releasing the target-description buffer."
+verdict = "substitute"
+owner = "curl-auth"
+verification = "Leak accounting under the debug allocator feature over an oversized display name."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0006"
+path = "original/lib/curl_gssapi.c"
+lines = [225, 283]
+behaviour = "Several failure paths release the context while leaving the caller's handle pointing at it."
+verdict = "substitute"
+owner = "curl-auth"
+verification = "ABI round-trip under the interpreter over a context step that fails part way."
+status = "obligation"
+decision = "DL-0129"
+
+[[hazard]]
+id = "HZ-0007"
+path = "original/lib/curl_gssapi.c"
+lines = [312, 384]
+behaviour = "Provider selection re-reads the stub-credentials environment variable on every call, so the provider can change part way through one context."
+verdict = "substitute"
+owner = "curl-auth"
+verification = "Environment-mutation test between two calls on one context, asserting the provider bound at construction."
+status = "obligation"
+decision = "DL-0127"
+
+[[hazard]]
+id = "HZ-0008"
+path = "original/lib/curl_share.c"
+lines = [261, 328]
+behaviour = "Unsharing the connection partition clears the bit without destroying the pool the share object holds."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Share and unshare matrix over all seven partitions asserting the resulting state and return code."
+status = "obligation"
+decision = "DL-0135"
+
+[[hazard]]
+id = "HZ-0009"
+path = "original/lib/curl_share.c"
+lines = [35, 59]
+behaviour = "Unsharing the public-suffix partition answers with the bad-option code although the option is documented as shareable."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "The same matrix, asserting the return code for every partition in both orders."
+status = "obligation"
+decision = "DL-0135"
+
+[[hazard]]
+id = "HZ-0010"
+path = "original/lib/cshutdn.c"
+lines = [228, 263]
+behaviour = "The shutdown deadline minimum starts at zero and the comparison selects a smaller value, so no positive time left is ever chosen and the expiry is set only for a negative one."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Timer-state equivalence test over a connection shutdown that reports a positive time left."
+status = "obligation"
+decision = "DL-0120"
+
+[[hazard]]
+id = "HZ-0011"
+path = "original/lib/file.c"
+lines = [395, 419]
+behaviour = "A failed status call leaves the buffer indeterminate, and the directory test later reads it outside the guard that recorded whether the call succeeded."
+verdict = "diverge"
+owner = "curl-proto-file"
+verification = "Fault-injected status-call failure asserting the deterministic not-a-directory outcome, plus the divergence-allowlist entry."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0012"
+path = "original/lib/file.c"
+lines = [518, 552]
+behaviour = "A negative read is treated exactly as end of data, so a read error ends the body and the transfer reports success."
+verdict = "reproduce"
+owner = "curl-proto-file"
+verification = "Equivalence test asserting a read error yields end of data and a successful transfer."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0013"
+path = "original/lib/file.c"
+lines = [324, 375]
+behaviour = "The shared transfer buffer is released after a borrow that failed, over a release path that clears the borrowed flag unconditionally and so can release a borrow another operation holds."
+verdict = "substitute"
+owner = "curl-proto-file"
+verification = "Two-operation borrow test on one multi handle with the first borrow failing."
+status = "obligation"
+decision = "DL-0120"
+
+[[hazard]]
+id = "HZ-0014"
+path = "original/lib/curl_addrinfo.c"
+lines = [534, 600]
+behaviour = "The deallocator is chosen by re-reading the resolver environment variable at release time, so a value can be released through a different provider than allocated it."
+verdict = "substitute"
+owner = "curl-dns"
+verification = "Environment-mutation test between allocation and release, asserting the provider stored with the value."
+status = "obligation"
+decision = "DL-0127"
+
+[[hazard]]
+id = "HZ-0015"
+path = "original/lib/altsvc.c"
+lines = [231, 263]
+behaviour = "A record-add allocation failure is ignored, so the entry is dropped and the operation reports success."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Fault-injected allocation failure at the record-add step asserting the reported outcome."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0016"
+path = "original/lib/altsvc.c"
+lines = [380, 430]
+behaviour = "Write and close failures on the save path are ignored, so a short write or a full disk reports success."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Short-write, disk-full and close-failure fault tests over the save path."
+status = "obligation"
+decision = "DL-0124"
+
+[[hazard]]
+id = "HZ-0017"
+path = "original/lib/hsts.c"
+lines = [366, 423]
+behaviour = "A record-add allocation failure is ignored, so the entry is dropped and the operation reports success."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Fault-injected allocation failure at the record-add step."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0018"
+path = "original/lib/hsts.c"
+lines = [557, 595]
+behaviour = "Write and close failures on the save path are ignored."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Short-write, disk-full and close-failure fault tests over the save path."
+status = "obligation"
+decision = "DL-0124"
+
+[[hazard]]
+id = "HZ-0019"
+path = "original/lib/hsts.c"
+lines = [557, 595]
+behaviour = "A successful write-callback output can mask a save error recorded earlier in the same call."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Callback-order test with a failing save and a succeeding callback, asserting the reported code."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0020"
+path = "original/lib/cookie.c"
+lines = [1500, 1601]
+behaviour = "Write and close failures on the jar save path can be reported as success."
+verdict = "reproduce"
+owner = "curl-cookies"
+verification = "Short-write and close-failure fault tests over the jar save path."
+status = "obligation"
+decision = "DL-0124"
+
+[[hazard]]
+id = "HZ-0021"
+path = "original/lib/cookie.c"
+lines = [1060, 1065]
+behaviour = "Verbose output prints cookie names and values."
+verdict = "reproduce"
+owner = "curl-cookies"
+verification = "Byte comparison of the verbose stream, plus the observability check that no added span field or metric label carries a cookie value."
+status = "obligation"
+decision = "DL-0116"
+
+[[hazard]]
+id = "HZ-0022"
+path = "original/lib/cookie.c"
+lines = [859, 1083]
+behaviour = "A replacement releases the record being replaced before the replacement has been allocated, so an allocation failure leaves the jar with neither."
+verdict = "substitute"
+owner = "curl-cookies"
+verification = "Fault-injected allocation failure at the replacement point asserting the previous record survives."
+status = "obligation"
+decision = "DL-0124"
+
+[[hazard]]
+id = "HZ-0023"
+path = "original/lib/cookie.c"
+lines = [1209, 1225]
+behaviour = "Callbacks and file operations occur while the application's cookie share lock is held."
+verdict = "reproduce"
+owner = "curl-cookies"
+verification = "Recorded lock-callback sequence over a cookie-enabled transfer compared against the baseline."
+status = "obligation"
+decision = "DL-0133"
+
+[[hazard]]
+id = "HZ-0024"
+path = "original/lib/curl_ntlm_core.c"
+lines = [299, 393]
+behaviour = "Backend cipher errors are discarded and the response construction reports success."
+verdict = "reproduce"
+owner = "curl-auth"
+verification = "Known-answer vectors plus a fault-injected backend failure asserting the reported outcome."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0025"
+path = "original/lib/curl_ntlm_core.c"
+lines = [410, 431]
+behaviour = "Password-derived buffers are released without being cleared."
+verdict = "substitute"
+owner = "curl-auth"
+verification = "A test that inspects the derived buffer immediately before release."
+status = "obligation"
+decision = "DL-0115"
+
+[[hazard]]
+id = "HZ-0026"
+path = "original/lib/getinfo.c"
+lines = [202, 217]
+behaviour = "Invalid debug numeric input is silently substituted with zero."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Boundary test over the accepted and rejected inputs asserting the substituted value."
+status = "obligation"
+decision = "DL-0117"
+
+[[hazard]]
+id = "HZ-0027"
+path = "original/lib/getinfo.c"
+lines = [399, 505]
+behaviour = "Several size-to-long conversions narrow without a check."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Boundary test at each narrowing threshold with the marker in place."
+status = "obligation"
+decision = "DL-0117"
+
+[[hazard]]
+id = "HZ-0028"
+path = "original/lib/asyn-ares.c"
+lines = [257, 323]
+behaviour = "An HTTPS-record duplication failure loses an entry while the operation continues."
+verdict = "reproduce"
+owner = "curl-dns"
+verification = "Fault-injected duplication failure asserting the resulting record set."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0029"
+path = "original/lib/asyn-ares.c"
+lines = [689, 706]
+behaviour = "A query-name allocation failure returns before the common bookkeeping the other paths perform."
+verdict = "reproduce"
+owner = "curl-dns"
+verification = "Fault-injected allocation failure at the query-name step asserting the bookkeeping state."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0030"
+path = "original/lib/asyn-ares.c"
+lines = [257, 323]
+behaviour = "A null guard is applied to the address of an embedded structure member, which can never be null."
+verdict = "substitute"
+owner = "curl-dns"
+verification = "The guard has no representation in the port; the equivalence test covers the path it guarded."
+status = "obligation"
+decision = "DL-0129"
+
+[[hazard]]
+id = "HZ-0031"
+path = "original/lib/asyn-ares.c"
+lines = [279, 305]
+behaviour = "The address conversion records an out-of-memory code in a local and returns only a pointer, so an allocation failure can surface as a successful empty or partial result."
+verdict = "diverge"
+owner = "curl-dns"
+verification = "Torture over the single-family and dual-family conversions, plus the divergence-allowlist entry."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0032"
+path = "original/lib/asyn-thrdd.c"
+lines = [211, 223]
+behaviour = "The HTTPS-record owner name for a port other than 443 is formatted with the underscore after the port rather than before the service label."
+verdict = "reproduce"
+owner = "curl-dns"
+verification = "Query-bytes comparison across providers and ports asserting the emitted owner name."
+status = "obligation"
+decision = "DL-0119"
+
+[[hazard]]
+id = "HZ-0033"
+path = "original/lib/content_encoding.c"
+lines = [259, 347]
+behaviour = "Codec close paths do not require end of stream, so a truncated encoded body completes without error."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Truncated-body corpus case per codec compared against both binaries."
+status = "obligation"
+decision = "DL-0118"
+
+[[hazard]]
+id = "HZ-0034"
+path = "original/lib/content_encoding.c"
+lines = [730, 781]
+behaviour = "Identity detection compares only the first eight bytes of the coding name, so a longer name with that prefix is accepted as identity."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Malformed-coding corpus case over prefix matches."
+status = "obligation"
+decision = "DL-0118"
+
+[[hazard]]
+id = "HZ-0035"
+path = "original/lib/content_encoding.c"
+lines = [764, 781]
+behaviour = "The unsolicited-coding path continues silently for a prefix match while the HTTP layer keeps trusting the content length, which permits response desynchronisation on a reused connection."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Reuse desynchronisation corpus case over two responses on one connection."
+status = "obligation"
+decision = "DL-0118"
+
+[[hazard]]
+id = "HZ-0036"
+path = "original/lib/dynhds.c"
+lines = [29, 49]
+behaviour = "The entry allocation sums two caller-supplied lengths and a constant with no overflow check."
+verdict = "substitute"
+owner = "curl-types"
+verification = "Boundary test at the overflow threshold asserting the out-of-memory outcome the caller already handles."
+status = "obligation"
+decision = "DL-0114"
+
+[[hazard]]
+id = "HZ-0037"
+path = "original/lib/dynhds.c"
+lines = [131, 168]
+behaviour = "The running-size update is unchecked."
+verdict = "substitute"
+owner = "curl-types"
+verification = "Boundary test over the running size at the overflow threshold."
+status = "obligation"
+decision = "DL-0114"
+
+[[hazard]]
+id = "HZ-0038"
+path = "original/lib/dynhds.c"
+lines = [113, 129]
+behaviour = "The case-insensitive lookup returns only the first matching entry, and tunnel authentication uses it as though it were the whole set."
+verdict = "reproduce"
+owner = "curl-types"
+verification = "Differential pair over a response carrying two identically named fields, in both orders."
+status = "obligation"
+decision = "DL-0122"
+
+[[hazard]]
+id = "HZ-0039"
+path = "original/lib/hash.c"
+lines = [100, 118]
+behaviour = "The element allocation sums the structure size and the key length with no overflow check."
+verdict = "substitute"
+owner = "curl-types"
+verification = "Boundary test at the overflow threshold asserting the out-of-memory outcome."
+status = "obligation"
+decision = "DL-0114"
+
+[[hazard]]
+id = "HZ-0040"
+path = "original/lib/easy.c"
+lines = [997, 1079]
+behaviour = "Duplicate-handle failure cleanup releases a typed cookie jar through a plain free."
+verdict = "substitute"
+owner = "curl-core"
+verification = "Fault-injected allocation failure after the jar has been duplicated, exercised under the interpreter."
+status = "obligation"
+decision = "DL-0129"
+
+[[hazard]]
+id = "HZ-0041"
+path = "original/lib/doh.c"
+lines = [1083, 1132]
+behaviour = "A malformed record name can return after the parser buffer has been partly used, without releasing it."
+verdict = "substitute"
+owner = "curl-dns"
+verification = "Malformed and oversized record-name fuzz target."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0042"
+path = "original/lib/doh.c"
+lines = [295, 447]
+behaviour = "A failure to add the probe to the multi handle is ignored and success is returned."
+verdict = "reproduce"
+owner = "curl-dns"
+verification = "Fault-injected multi-add failure asserting the reported code."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0043"
+path = "original/lib/doh.c"
+lines = [509, 532]
+behaviour = "A query-name allocation failure is ignored and success is returned."
+verdict = "reproduce"
+owner = "curl-dns"
+verification = "Fault-injected allocation failure at the query-name step asserting the reported code."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0044"
+path = "original/lib/doh.c"
+lines = [1231, 1315]
+behaviour = "A successful result is added to the cache here and again by the generic front end, so the application's DNS lock callbacks fire twice for one resolution."
+verdict = "reproduce"
+owner = "curl-dns"
+verification = "Recorded lock-callback sequence over one resolution through this path."
+status = "obligation"
+decision = "DL-0119"
+
+[[hazard]]
+id = "HZ-0045"
+path = "original/lib/doh.c"
+lines = [1139, 1192]
+behaviour = "A name-decode failure returns out of memory, because that is the initial value of the result variable rather than the cause."
+verdict = "diverge"
+owner = "curl-dns"
+verification = "Decode-failure fuzz corpus asserting the deterministic code, plus the divergence-allowlist entry."
+status = "obligation"
+decision = "DL-0119"
+
+[[hazard]]
+id = "HZ-0046"
+path = "original/lib/doh.c"
+lines = [1139, 1192]
+behaviour = "A release build accepts one to three trailing bytes that the debug assertion rejects, so the two build types disagree about the same response."
+verdict = "diverge"
+owner = "curl-dns"
+verification = "Residue fuzz over every trailing length asserting the chosen outcome, plus the divergence-allowlist entry."
+status = "obligation"
+decision = "DL-0119"
+
+[[hazard]]
+id = "HZ-0047"
+path = "original/lib/cf-h2-proxy.c"
+lines = [179, 196]
+behaviour = "The peer-shutdown last-stream and error fields are declared and read but never assigned, so the values reported come from initialisation rather than from the frame."
+verdict = "diverge"
+owner = "curl-http2"
+verification = "A proxy shutdown frame with non-zero fields asserting the reported values and an unchanged tunnel outcome, plus the divergence-allowlist and dependency-delta entries."
+status = "obligation"
+decision = "DL-0128"
+
+[[hazard]]
+id = "HZ-0048"
+path = "original/lib/cf-h2-proxy.c"
+lines = [1018, 1032]
+behaviour = "Tunnel completion ignores the request soft-reset result."
+verdict = "reproduce"
+owner = "curl-http2"
+verification = "Proxy retry case whose request reader cannot rewind."
+status = "obligation"
+decision = "DL-0121"
+
+[[hazard]]
+id = "HZ-0049"
+path = "original/lib/cf-socket.c"
+lines = [162, 327]
+behaviour = "The keepalive unit conversion multiplies an int by a thousand in place with no overflow check."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Boundary test at the overflow threshold pinning the resulting option value."
+status = "obligation"
+decision = "DL-0117"
+
+[[hazard]]
+id = "HZ-0050"
+path = "original/lib/cf-socket.c"
+lines = [679, 703]
+behaviour = "A successful bind to a named interface returns immediately, so a local port the caller also requested is never bound."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Option-order test requesting an interface and a local port together, and each separately."
+status = "obligation"
+decision = "DL-0136"
+
+[[hazard]]
+id = "HZ-0051"
+path = "original/lib/cf-socket.c"
+lines = [1422, 1441]
+behaviour = "The peer-closed text is written into the message buffer and then overwritten by a second error-string call, so the text never reaches the message."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Byte comparison of the connect-failure message on a connection the peer closed."
+status = "obligation"
+decision = "DL-0117"
+
+[[hazard]]
+id = "HZ-0052"
+path = "original/lib/cf-socket.c"
+lines = [1625, 1629]
+behaviour = "A zero-length receive is recorded as first-byte receipt, so the start-transfer timestamp is taken at end of data."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Comparison of the start-transfer output variable over a connection closed without data."
+status = "obligation"
+decision = "DL-0117"
+
+[[hazard]]
+id = "HZ-0053"
+path = "original/lib/ftp.c"
+lines = [469, 529]
+behaviour = "The address of a structure member is taken before the guard that decides whether the structure is usable."
+verdict = "substitute"
+owner = "curl-proto-ftp"
+verification = "The construct has no representation in the port; the equivalence test covers the guarded path."
+status = "obligation"
+decision = "DL-0129"
+
+[[hazard]]
+id = "HZ-0054"
+path = "original/lib/ftp.c"
+lines = [643, 657]
+behaviour = "Control-connection errors are discarded on this path."
+verdict = "reproduce"
+owner = "curl-proto-ftp"
+verification = "Fault-injected control-connection failure asserting the reported outcome."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0055"
+path = "original/lib/ftp.c"
+lines = [2663, 2680]
+behaviour = "The response parser reads one byte before the buffer it was given."
+verdict = "substitute"
+owner = "curl-proto-ftp"
+verification = "Index-based parsing plus the FTP response fuzz target over truncated and leading-digit inputs."
+status = "obligation"
+decision = "DL-0129"
+
+[[hazard]]
+id = "HZ-0056"
+path = "original/lib/ftp.c"
+lines = [2663, 2680]
+behaviour = "The transfer-type state is entered before the type command has been confirmed."
+verdict = "reproduce"
+owner = "curl-proto-ftp"
+verification = "State-sequence equivalence test over the type negotiation."
+status = "obligation"
+decision = "DL-0120"
+
+[[hazard]]
+id = "HZ-0057"
+path = "original/lib/ftp.c"
+lines = [3850, 3870]
+behaviour = "Trace output carries credentials."
+verdict = "reproduce"
+owner = "curl-proto-ftp"
+verification = "Byte comparison of the trace stream, plus the observability check that no added field carries a credential."
+status = "obligation"
+decision = "DL-0116"
+
+[[hazard]]
+id = "HZ-0058"
+path = "original/lib/ftp.c"
+lines = [3850, 3870]
+behaviour = "Wildcard callback state is restored incompletely when the connection is reused."
+verdict = "reproduce"
+owner = "curl-proto-ftp"
+verification = "Two-transfer reuse case over one connection with a wildcard pattern on the first transfer only."
+status = "obligation"
+decision = "DL-0130"
+
+[[hazard]]
+id = "HZ-0059"
+path = "original/lib/http.c"
+lines = [1080, 1112]
+behaviour = "The challenge scan advances on any comma, so a comma inside a quoted parameter value splits one challenge into two."
+verdict = "reproduce"
+owner = "curl-http1"
+verification = "Quoted-comma challenge corpus in single-field and multi-field forms asserting the selected mechanism."
+status = "obligation"
+decision = "DL-0131"
+
+[[hazard]]
+id = "HZ-0060"
+path = "original/lib/http.c"
+lines = [1657, 1661]
+behaviour = "The final header-write result is discarded, so a write-callback error on the last header block is dropped."
+verdict = "reproduce"
+owner = "curl-http1"
+verification = "Failing write callback on the last header block asserting the reported exit."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0061"
+path = "original/lib/http.c"
+lines = [2624, 2657]
+behaviour = "A zero or unknown upload length produces a content-range header no specification permits."
+verdict = "reproduce"
+owner = "curl-http1"
+verification = "Request-bytes comparison over zero-length and unknown-length upload resume."
+status = "obligation"
+decision = "DL-0132"
+
+[[hazard]]
+id = "HZ-0062"
+path = "original/lib/http.c"
+lines = [2551, 2584]
+behaviour = "Cookie work, including a reachable write callback, runs while the application's cookie lock is held."
+verdict = "reproduce"
+owner = "curl-http1"
+verification = "Recorded lock-callback sequence over a cookie-enabled transfer."
+status = "obligation"
+decision = "DL-0133"
+
+[[hazard]]
+id = "HZ-0063"
+path = "original/lib/http.c"
+lines = [4265, 4313]
+behaviour = "The status line is read at a fixed offset rather than parsed forward."
+verdict = "reproduce"
+owner = "curl-http1"
+verification = "Status-line corpus with unusual but accepted shapes asserting the parsed status."
+status = "obligation"
+decision = "DL-0131"
+
+[[hazard]]
+id = "HZ-0064"
+path = "original/lib/http.c"
+lines = [4265, 4313]
+behaviour = "Trace output carries credentials and challenge values."
+verdict = "reproduce"
+owner = "curl-http1"
+verification = "Byte comparison of the trace stream, plus the no-new-sink observability check."
+status = "obligation"
+decision = "DL-0116"
+
+[[hazard]]
+id = "HZ-0065"
+path = "original/lib/http.c"
+lines = [3599, 3616]
+behaviour = "An invalid identity-prefix coding leaves the content length trusted."
+verdict = "reproduce"
+owner = "curl-http1"
+verification = "Malformed-coding and content-length corpus compared against both binaries."
+status = "obligation"
+decision = "DL-0118"
+
+[[hazard]]
+id = "HZ-0066"
+path = "original/lib/http.c"
+lines = [3788, 3811]
+behaviour = "The response path can leave queued bytes on a connection that is then reused."
+verdict = "reproduce"
+owner = "curl-http1"
+verification = "Reuse desynchronisation corpus over two responses on one connection."
+status = "obligation"
+decision = "DL-0118"
+
+[[hazard]]
+id = "HZ-0067"
+path = "original/lib/http2.c"
+lines = [699, 708]
+behaviour = "A stream setup allocation failure is ignored."
+verdict = "reproduce"
+owner = "curl-http2"
+verification = "Fault-injected stream setup failure asserting the reported outcome."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0068"
+path = "original/lib/http2.c"
+lines = [777, 886]
+behaviour = "The promise-header store is released on a failure path while callbacks may still be pending against it."
+verdict = "substitute"
+owner = "curl-http2"
+verification = "Callback-lifetime test failing a stream with a promise pending, under the interpreter."
+status = "obligation"
+decision = "DL-0134"
+
+[[hazard]]
+id = "HZ-0069"
+path = "original/lib/http2.c"
+lines = [967, 1007]
+behaviour = "A recorded stream error can be overwritten by a later one, so the first cause is lost."
+verdict = "reproduce"
+owner = "curl-http2"
+verification = "Two-error sequence on one stream asserting the reported code."
+status = "obligation"
+decision = "DL-0134"
+
+[[hazard]]
+id = "HZ-0070"
+path = "original/lib/http2.c"
+lines = [2429, 2452]
+behaviour = "An interim informational response completes the header phase."
+verdict = "reproduce"
+owner = "curl-http2"
+verification = "Response sequence carrying one and then several informational responses before the final one."
+status = "obligation"
+decision = "DL-0134"
+
+[[hazard]]
+id = "HZ-0071"
+path = "original/lib/http2.c"
+lines = [2429, 2452]
+behaviour = "An upgrade-binding failure is ignored."
+verdict = "reproduce"
+owner = "curl-http2"
+verification = "Fault-injected binding failure on the upgrade path asserting the reported outcome."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0072"
+path = "original/lib/http2.c"
+lines = [2429, 2452]
+behaviour = "Trace output carries header values."
+verdict = "reproduce"
+owner = "curl-http2"
+verification = "Byte comparison of the trace stream, plus the no-new-sink observability check."
+status = "obligation"
+decision = "DL-0116"
+
+[[hazard]]
+id = "HZ-0073"
+path = "original/lib/http2.c"
+lines = [1422, 1485]
+behaviour = "The promise store caps the number of header pointers it holds but places no limit on their total size."
+verdict = "diverge"
+owner = "curl-http2"
+verification = "Promises with very many small fields and with very few very large fields, asserting the limit and the resulting stream error, plus the divergence-allowlist and dependency-delta entries."
+status = "obligation"
+decision = "DL-0125"
+
+[[hazard]]
+id = "HZ-0074"
+path = "original/lib/http_aws_sigv4.c"
+lines = [323, 368]
+behaviour = "A duplicate-header merge leaks the merged value when the append fails."
+verdict = "substitute"
+owner = "curl-auth"
+verification = "Fault-injected append failure with leak accounting."
+status = "obligation"
+decision = "DL-0113"
+
+[[hazard]]
+id = "HZ-0075"
+path = "original/lib/http_aws_sigv4.c"
+lines = [1095, 1162]
+behaviour = "The signing secret and the intermediate hashes are released without being cleared."
+verdict = "substitute"
+owner = "curl-auth"
+verification = "Known-answer vectors plus a test that inspects the intermediates immediately before release."
+status = "obligation"
+decision = "DL-0115"
+
+[[hazard]]
+id = "HZ-0076"
+path = "original/lib/headers.c"
+lines = [221, 244]
+behaviour = "The internal push path indexes byte zero and assumes a non-empty input."
+verdict = "substitute"
+owner = "curl-core"
+verification = "The precondition becomes a type the caller cannot violate; the parser boundary test covers empty and blank inputs."
+status = "obligation"
+decision = "DL-0123"
+
+[[hazard]]
+id = "HZ-0077"
+path = "original/lib/headers.c"
+lines = [121, 137]
+behaviour = "The iterating public entry point dereferences its handle unchecked, unlike the indexed one beside it."
+verdict = "reproduce"
+owner = "curl-abi"
+verification = "C-side invalid-handle test in a subprocess, executed on both Linux targets."
+status = "obligation"
+decision = "DL-0123"
+
+[[hazard]]
+id = "HZ-0078"
+path = "original/lib/hostip.c"
+lines = [781, 924]
+behaviour = "The synchronous timeout uses a process-global alarm signal and a non-local jump, with connection-lifetime assumptions that depend on re-entry on the same stack."
+verdict = "reproduce"
+owner = "curl-dns"
+verification = "Configuration-scoped equivalence test that runs only where the guard holds, plus an assertion that the default configuration reaches no signal path."
+status = "obligation"
+decision = "DL-0126"
+
+[[hazard]]
+id = "HZ-0079"
+path = "original/lib/hostip.c"
+lines = [430, 465]
+behaviour = "Asynchronous backend errors collapse into host or proxy resolve errors, losing the backend's own cause."
+verdict = "reproduce"
+owner = "curl-dns"
+verification = "Error-taxonomy test per backend failure class asserting the reported code."
+status = "obligation"
+decision = "DL-0119"
+
+[[hazard]]
+id = "HZ-0080"
+path = "original/lib/hostip.c"
+lines = [1037, 1077]
+behaviour = "A collapsed error is negatively cached."
+verdict = "reproduce"
+owner = "curl-dns"
+verification = "Negative-cache duration test asserting the code the next call reports."
+status = "obligation"
+decision = "DL-0119"
+
+[[hazard]]
+id = "HZ-0081"
+path = "original/lib/hostip.c"
+lines = [1061, 1067]
+behaviour = "The generic front end performs a second cache insertion for a result the resolver path already added."
+verdict = "reproduce"
+owner = "curl-dns"
+verification = "Recorded lock-callback sequence over one resolution asserting the insertion count."
+status = "obligation"
+decision = "DL-0119"
+
+[[hazard]]
+id = "HZ-0082"
+path = "original/lib/curl_sasl.c"
+lines = [846, 908]
+behaviour = "The digest and NTLM built-in booleans are inverted against their siblings, so the explanation line is selected on the opposite condition."
+verdict = "reproduce"
+owner = "curl-auth"
+verification = "Verbose-output comparison in each feature configuration."
+status = "obligation"
+decision = "DL-0117"
+
+[[hazard]]
+id = "HZ-0083"
+path = "original/lib/cf-h1-proxy.c"
+lines = [751, 864]
+behaviour = "The authentication retry and the tunnel completion ignore the request soft-reset and rewind result."
+verdict = "reproduce"
+owner = "curl-http1"
+verification = "Proxy retry case whose request reader cannot rewind."
+status = "obligation"
+decision = "DL-0121"
+
+[[hazard]]
+id = "HZ-0084"
+path = "original/lib/cf-h1-proxy.c"
+lines = [326, 353]
+behaviour = "Numeric content-length prefixes are accepted without full validation."
+verdict = "reproduce"
+owner = "curl-http1"
+verification = "Tunnel framing corpus over numeric content-length prefixes."
+status = "obligation"
+decision = "DL-0118"
+
+[[hazard]]
+id = "HZ-0085"
+path = "original/lib/cf-h1-proxy.c"
+lines = [413, 525]
+behaviour = "Conflicting content-length fields and unknown transfer codings are incompletely validated."
+verdict = "reproduce"
+owner = "curl-http1"
+verification = "Tunnel framing corpus over conflicting lengths and unknown codings."
+status = "obligation"
+decision = "DL-0118"
+
+[[hazard]]
+id = "HZ-0086"
+path = "original/lib/cf-h1-proxy.c"
+lines = [751, 772]
+behaviour = "A proxy connection can be reused with unread response bytes after an authentication retry."
+verdict = "reproduce"
+owner = "curl-http1"
+verification = "Authentication-retry and reconnect matrix over one proxy connection."
+status = "obligation"
+decision = "DL-0118"
+
+[[hazard]]
+id = "HZ-0087"
+path = "original/lib/http_proxy.c"
+lines = [464, 507]
+behaviour = "Tunnel authentication examines only the first matching authenticate field."
+verdict = "reproduce"
+owner = "curl-http1"
+verification = "Differential pair over duplicate authenticate fields in both orders."
+status = "obligation"
+decision = "DL-0122"
+
+[[hazard]]
+id = "HZ-0088"
+path = "original/lib/curl_fopen.c"
+lines = [99, 153]
+behaviour = "The final path is opened and truncated, and a symlink followed, before the protected temporary file is created."
+verdict = "reproduce"
+owner = "curl-types"
+verification = "Filesystem matrix over a regular file, a symlink outside the directory, a named pipe, a device node, an unwritable directory and a truncated write."
+status = "obligation"
+decision = "DL-0124"
+
+[[hazard]]
+id = "HZ-0089"
+path = "original/lib/formdata.c"
+lines = [383, 388]
+behaviour = "A negative name length becomes a very large unsigned size."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "C-side variadic argument-class test over the negative length."
+status = "obligation"
+decision = "DL-0123"
+
+[[hazard]]
+id = "HZ-0090"
+path = "original/lib/formdata.c"
+lines = [553, 560]
+behaviour = "The filename and buffer options measure a pointer the caller may pass as null."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "C-side variadic argument-class test in a subprocess."
+status = "obligation"
+decision = "DL-0123"
+
+[[hazard]]
+id = "HZ-0091"
+path = "original/lib/cf-haproxy.c"
+lines = [84, 97]
+behaviour = "The client-address override is interpolated verbatim into a line-oriented preamble, so a carriage return or line feed injects a field."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Request-bytes comparison over control-bearing values."
+status = "obligation"
+decision = "DL-0132"
+
+[[hazard]]
+id = "HZ-0092"
+path = "original/lib/cf-haproxy.c"
+lines = [84, 97]
+behaviour = "Every override value that is not a dotted-quad literal is labelled as the IPv6 family."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Request-bytes comparison over non-address values."
+status = "obligation"
+decision = "DL-0060"
+
+[[hazard]]
+id = "HZ-0093"
+path = "original/lib/curl_sspi.c"
+lines = [109, 176]
+behaviour = "Plaintext password copies are released without being cleared."
+verdict = "substitute"
+owner = "curl-auth"
+verification = "A test that inspects the copy immediately before release."
+status = "obligation"
+decision = "DL-0115"
+
+[[hazard]]
+id = "HZ-0094"
+path = "original/lib/curl_sspi.c"
+lines = [198, 204]
+behaviour = "The release path frees the plaintext copies without clearing them."
+verdict = "substitute"
+owner = "curl-auth"
+verification = "The same test over the release path."
+status = "obligation"
+decision = "DL-0115"
+
+[[hazard]]
+id = "HZ-0095"
+path = "original/lib/hmac.c"
+lines = [45, 123]
+behaviour = "Key-derived hash states are released without being cleared."
+verdict = "substitute"
+owner = "curl-auth"
+verification = "Known-answer vectors plus a test that inspects the state immediately before release."
+status = "obligation"
+decision = "DL-0115"

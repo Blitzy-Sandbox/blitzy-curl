@@ -15,6 +15,9 @@ pub trait Files {
     /// Whether `path` names an existing file or directory.
     fn exists(&self, path: &str) -> bool;
 
+    /// Whether `path` names a directory.
+    fn is_dir(&self, path: &str) -> bool;
+
     /// Contents of `path`, or `None` when it is absent or unreadable.
     fn read(&self, path: &str) -> Option<String>;
 
@@ -52,6 +55,10 @@ impl RealFiles {
 impl Files for RealFiles {
     fn exists(&self, path: &str) -> bool {
         self.absolute(path).exists()
+    }
+
+    fn is_dir(&self, path: &str) -> bool {
+        self.absolute(path).is_dir()
     }
 
     fn read(&self, path: &str) -> Option<String> {
@@ -102,6 +109,11 @@ impl Files for MapFiles {
         self.entries.contains_key(path)
     }
 
+    fn is_dir(&self, path: &str) -> bool {
+        let prefix = format!("{path}/");
+        self.entries.keys().any(|key| key.starts_with(&prefix))
+    }
+
     fn read(&self, path: &str) -> Option<String> {
         self.entries.get(path).cloned()
     }
@@ -140,6 +152,14 @@ mod tests {
     }
 
     #[test]
+    fn map_files_tell_files_from_directories() {
+        let files = MapFiles::new().with("a/b.txt", "body");
+        assert!(files.is_dir("a"));
+        assert!(!files.is_dir("a/b.txt"));
+        assert!(!files.is_dir("missing"));
+    }
+
+    #[test]
     fn map_files_lists_one_level() {
         let files = MapFiles::new()
             .with("Cargo.toml", "")
@@ -165,6 +185,7 @@ mod tests {
             "/tmp/does-not-exist-curl-audit/x/y"
         );
         assert!(!files.exists("x/y"));
+        assert!(!files.is_dir("x/y"));
         assert_eq!(files.read("x/y"), None);
     }
 }

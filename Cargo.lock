@@ -10,6 +10,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "curl-audit-traceability"
+version = "8.21.0"
+dependencies = [
+ "curl-audit",
+ "toml",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

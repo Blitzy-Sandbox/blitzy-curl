@@ -1,0 +1,835 @@
+# SPDX-License-Identifier: curl
+# SPDX-FileCopyrightText: the blitzy-curl project contributors
+#
+# Declared ownership of every baseline construct.                       DL-0111
+# The generator enumerates; this file only assigns.                     DL-0111
+
+schema = 1
+
+# ---------------------------------------------------------------------------
+# Directory rules. Longest matching prefix wins.
+# ---------------------------------------------------------------------------
+
+[[rule]]
+prefix = "original/lib/curlx/"
+owner = "curl-types"
+decision = "DL-0003"
+
+[[rule]]
+prefix = "original/lib/vauth/"
+owner = "curl-auth"
+decision = "DL-0044"
+
+[[rule]]
+prefix = "original/lib/vtls/"
+owner = "curl-tls"
+decision = "DL-0012"
+
+[[rule]]
+prefix = "original/lib/vquic/"
+owner = "curl-http3"
+decision = "DL-0069"
+
+[[rule]]
+prefix = "original/lib/vssh/"
+owner = "curl-proto-ssh"
+decision = "DL-0019"
+
+[[rule]]
+prefix = "original/src/"
+owner = "curl-cli"
+decision = "DL-0026"
+
+# ---------------------------------------------------------------------------
+# Overrides. Applied before any rule.
+# ---------------------------------------------------------------------------
+
+[[override]]
+path = "original/lib/curlx/multibyte.c"
+owner = "curl-abi"
+decision = "DL-0046"
+
+[[override]]
+path = "original/lib/curlx/multibyte.h"
+owner = "curl-abi"
+decision = "DL-0046"
+
+[[override]]
+path = "original/lib/curlx/version_win32.c"
+owner = "curl-abi"
+decision = "DL-0046"
+
+[[override]]
+path = "original/lib/curlx/version_win32.h"
+owner = "curl-abi"
+decision = "DL-0046"
+
+[[override]]
+path = "original/lib/curlx/winapi.c"
+owner = "curl-abi"
+decision = "DL-0046"
+
+[[override]]
+path = "original/lib/curlx/winapi.h"
+owner = "curl-abi"
+decision = "DL-0046"
+
+[[override]]
+path = "original/lib/peer.h"
+owner = "curl-types"
+decision = "DL-0143"
+
+[[override]]
+path = "original/lib/protocol.h"
+owner = "curl-types"
+decision = "DL-0143"
+
+[[override]]
+path = "original/lib/proxy.h"
+owner = "curl-types"
+decision = "DL-0143"
+
+# ---------------------------------------------------------------------------
+# Translation units under original/lib. One owner each.
+# ---------------------------------------------------------------------------
+
+[unit]
+"altsvc.c" = "curl-core"
+"asyn-ares.c" = "curl-dns"
+"asyn-base.c" = "curl-dns"
+"asyn-thrdd.c" = "curl-dns"
+"bufq.c" = "curl-types"
+"bufref.c" = "curl-types"
+"cf-dns.c" = "curl-core"
+"cf-h1-proxy.c" = "curl-http1"
+"cf-h2-proxy.c" = "curl-http2"
+"cf-haproxy.c" = "curl-core"
+"cf-https-connect.c" = "curl-core"
+"cf-ip-happy.c" = "curl-core"
+"cf-recvbuf.c" = "curl-core"
+"cf-setup.c" = "curl-core"
+"cf-socket.c" = "curl-core"
+"cfilters.c" = "curl-core"
+"conncache.c" = "curl-core"
+"connect.c" = "curl-core"
+"content_encoding.c" = "curl-core"
+"cookie.c" = "curl-cookies"
+"creds.c" = "curl-types"
+"cshutdn.c" = "curl-core"
+"curl_addrinfo.c" = "curl-dns"
+"curl_endian.c" = "curl-types"
+"curl_fnmatch.c" = "curl-proto-ftp"
+"curl_fopen.c" = "curl-types"
+"curl_get_line.c" = "curl-types"
+"curl_gethostname.c" = "curl-dns"
+"curl_gssapi.c" = "curl-auth"
+"curl_memrchr.c" = "curl-types"
+"curl_ntlm_core.c" = "curl-auth"
+"curl_range.c" = "curl-types"
+"curl_sasl.c" = "curl-auth"
+"curl_sha512_256.c" = "curl-auth"
+"curl_share.c" = "curl-core"
+"curl_sspi.c" = "curl-auth"
+"curl_threads.c" = "curl-types"
+"curl_trc.c" = "curl-core"
+"cw-out.c" = "curl-core"
+"cw-pause.c" = "curl-core"
+"dict.c" = "curl-proto-dict"
+"dllmain.c" = "curl-abi"
+"dnscache.c" = "curl-dns"
+"doh.c" = "curl-dns"
+"dynhds.c" = "curl-types"
+"easy.c" = "curl-core"
+"easygetopt.c" = "curl-core"
+"easyoptions.c" = "curl-core"
+"escape.c" = "curl-url"
+"fake_addrinfo.c" = "curl-dns"
+"file.c" = "curl-proto-file"
+"fileinfo.c" = "curl-proto-ftp"
+"formdata.c" = "curl-core"
+"ftp.c" = "curl-proto-ftp"
+"ftplistparser.c" = "curl-proto-ftp"
+"getenv.c" = "curl-types"
+"getinfo.c" = "curl-core"
+"gopher.c" = "curl-proto-gopher"
+"hash.c" = "curl-types"
+"headers.c" = "curl-core"
+"hmac.c" = "curl-auth"
+"hostip.c" = "curl-dns"
+"hostip4.c" = "curl-dns"
+"hostip6.c" = "curl-dns"
+"hsts.c" = "curl-core"
+"http.c" = "curl-http1"
+"http1.c" = "curl-http1"
+"http2.c" = "curl-http2"
+"http_aws_sigv4.c" = "curl-auth"
+"http_chunks.c" = "curl-http1"
+"http_digest.c" = "curl-auth"
+"http_negotiate.c" = "curl-auth"
+"http_ntlm.c" = "curl-auth"
+"http_proxy.c" = "curl-http1"
+"httpsrr.c" = "curl-dns"
+"idn.c" = "curl-url"
+"if2ip.c" = "curl-dns"
+"imap.c" = "curl-proto-imap"
+"ldap.c" = "curl-proto-ldap"
+"llist.c" = "curl-types"
+"macos.c" = "curl-abi"
+"md4.c" = "curl-auth"
+"md5.c" = "curl-auth"
+"memdebug.c" = "curl-core"
+"mime.c" = "curl-core"
+"mprintf.c" = "curl-types"
+"mqtt.c" = "curl-proto-mqtt"
+"multi.c" = "curl-core"
+"multi_ev.c" = "curl-core"
+"multi_ntfy.c" = "curl-core"
+"netrc.c" = "curl-auth"
+"openldap.c" = "curl-proto-ldap"
+"parsedate.c" = "curl-types"
+"peer.c" = "curl-core"
+"pingpong.c" = "curl-pingpong"
+"pop3.c" = "curl-proto-pop3"
+"progress.c" = "curl-core"
+"protocol.c" = "curl-core"
+"proxy.c" = "curl-core"
+"psl.c" = "curl-cookies"
+"rand.c" = "curl-types"
+"ratelimit.c" = "curl-core"
+"request.c" = "curl-core"
+"rtsp.c" = "curl-proto-rtsp"
+"select.c" = "curl-core"
+"sendf.c" = "curl-core"
+"setopt.c" = "curl-core"
+"sha256.c" = "curl-auth"
+"slist.c" = "curl-types"
+"smb.c" = "curl-proto-smb"
+"smtp.c" = "curl-proto-smtp"
+"socketpair.c" = "curl-core"
+"socks.c" = "curl-core"
+"socks_gssapi.c" = "curl-auth"
+"socks_sspi.c" = "curl-auth"
+"splay.c" = "curl-types"
+"strcase.c" = "curl-types"
+"strequal.c" = "curl-types"
+"strerror.c" = "curl-core"
+"system_win32.c" = "curl-abi"
+"telnet.c" = "curl-proto-telnet"
+"tftp.c" = "curl-proto-tftp"
+"thrdpool.c" = "curl-types"
+"thrdqueue.c" = "curl-types"
+"transfer.c" = "curl-core"
+"uint-bset.c" = "curl-types"
+"uint-hash.c" = "curl-types"
+"uint-spbset.c" = "curl-types"
+"uint-table.c" = "curl-types"
+"url.c" = "curl-core"
+"urlapi.c" = "curl-url"
+"version.c" = "curl-core"
+"ws.c" = "curl-proto-ws"
+
+# ---------------------------------------------------------------------------
+# Headers under original/lib with no same-stem source. The rest inherit.
+# ---------------------------------------------------------------------------
+
+[header]
+"arpa_telnet.h" = "curl-proto-telnet"
+"asyn.h" = "curl-dns"
+"curl_ctype.h" = "curl-types"
+"curl_hmac.h" = "curl-auth"
+"curl_ldap.h" = "curl-proto-ldap"
+"curl_md4.h" = "curl-auth"
+"curl_md5.h" = "curl-auth"
+"curl_printf.h" = "curl-types"
+"curl_sha256.h" = "curl-auth"
+"easy_lock.h" = "curl-core"
+"easyif.h" = "curl-core"
+"ftp-int.h" = "curl-proto-ftp"
+"functypes.h" = "curl-abi"
+"multihandle.h" = "curl-core"
+"multiif.h" = "curl-core"
+"setup-win32.h" = "curl-abi"
+"sigpipe.h" = "curl-core"
+"sockaddr.h" = "curl-types"
+"urlapi-int.h" = "curl-url"
+"urldata.h" = "curl-core"
+
+# ---------------------------------------------------------------------------
+# Paths carrying no Rust module. Each names its disposition.
+# ---------------------------------------------------------------------------
+
+[[exclusion]]
+path = "original/lib/amigaos.c"
+disposition = "platform-outside-matrix"
+reason = "AmigaOS platform shim; the matrix covers Linux by execution and macOS and Windows by cross-compilation"
+decision = "DL-0043"
+
+[[exclusion]]
+path = "original/lib/amigaos.h"
+disposition = "platform-outside-matrix"
+reason = "Declarations of the AmigaOS platform shim excluded beside it"
+decision = "DL-0043"
+
+[[exclusion]]
+path = "original/src/tool_vms.c"
+disposition = "platform-outside-matrix"
+reason = "OpenVMS command-line shim, paired with original/projects/vms"
+decision = "DL-0043"
+
+[[exclusion]]
+path = "original/src/tool_vms.h"
+disposition = "platform-outside-matrix"
+reason = "Declarations of the OpenVMS command-line shim excluded beside it"
+decision = "DL-0043"
+
+[[exclusion]]
+path = "original/lib/setup-vms.h"
+disposition = "platform-outside-matrix"
+reason = "OpenVMS build selector; traceability row only"
+decision = "DL-0052"
+
+[[exclusion]]
+path = "original/lib/setup-os400.h"
+disposition = "platform-outside-matrix"
+reason = "OS/400 build selector; the platform is outside the matrix"
+decision = "DL-0043"
+
+[[exclusion]]
+path = "original/lib/config-mac.h"
+disposition = "build-configuration"
+reason = "Hand-maintained platform configuration header reached only by the selector; maps into the Cargo feature and cfg space"
+decision = "DL-0043"
+
+[[exclusion]]
+path = "original/lib/config-os400.h"
+disposition = "build-configuration"
+reason = "Hand-maintained platform configuration header reached only by the selector; maps into the Cargo feature and cfg space"
+decision = "DL-0043"
+
+[[exclusion]]
+path = "original/lib/config-riscos.h"
+disposition = "build-configuration"
+reason = "Hand-maintained platform configuration header reached only by the selector; maps into the Cargo feature and cfg space"
+decision = "DL-0043"
+
+[[exclusion]]
+path = "original/lib/config-win32.h"
+disposition = "build-configuration"
+reason = "Hand-maintained platform configuration header reached only by the selector; maps into the Cargo feature and cfg space"
+decision = "DL-0043"
+
+[[exclusion]]
+path = "original/lib/curl_setup.h"
+disposition = "build-configuration"
+reason = "Build configuration selector; its content is the Cargo feature and cfg space rather than a module"
+decision = "DL-0043"
+
+# ---------------------------------------------------------------------------
+# Internal declarations with no definition and no caller.
+# ---------------------------------------------------------------------------
+
+[[orphan]]
+path = "original/lib/request.h"
+line = 249
+symbol = "Curl_req_set_upload_done"
+local-definition = "original/lib/request.c:268"
+decision = "DL-0112"
+
+# ---------------------------------------------------------------------------
+# Internal-surface cases that include no internal header.
+# ---------------------------------------------------------------------------
+
+[case]
+"unit1323.c" = "curl-types"
+"unit1330.c" = "curl-alloc"
+"unit1395.c" = "curl-url"
+"unit1396.c" = "curl-url"
+"unit1398.c" = "curl-types"
+"unit1636.c" = "curl-core"
+"unit1664.c" = "curl-types"
+"unit1668.c" = "curl-proto-ftp"
+
+# ---------------------------------------------------------------------------
+# Symbol-register families. Longest matching prefix wins.
+# ---------------------------------------------------------------------------
+
+[[family]]
+prefix = "CURLOPT_"
+owner = "curl-core"
+kind = "option"
+
+[[family]]
+prefix = "CURLMOPT_"
+owner = "curl-core"
+kind = "option"
+
+[[family]]
+prefix = "CURLSHOPT_"
+owner = "curl-core"
+kind = "option"
+
+[[family]]
+prefix = "CURLINFO_"
+owner = "curl-core"
+kind = "info"
+
+[[family]]
+prefix = "CURLE_"
+owner = "curl-abi"
+kind = "error-code"
+
+[[family]]
+prefix = "CURLM_"
+owner = "curl-abi"
+kind = "error-code"
+
+[[family]]
+prefix = "CURLSHE_"
+owner = "curl-abi"
+kind = "error-code"
+
+[[family]]
+prefix = "CURLUE_"
+owner = "curl-abi"
+kind = "error-code"
+
+[[family]]
+prefix = "CURLHE_"
+owner = "curl-abi"
+kind = "error-code"
+
+[[family]]
+prefix = "CURLPX_"
+owner = "curl-abi"
+kind = "error-code"
+
+[[family]]
+prefix = "CURLSSLSET_"
+owner = "curl-tls"
+kind = "error-code"
+
+[[family]]
+prefix = "CURLSSLBACKEND_"
+owner = "curl-tls"
+kind = "constant"
+
+[[family]]
+prefix = "CURLPROTO_"
+owner = "curl-abi"
+kind = "constant"
+
+[[family]]
+prefix = "CURLAUTH_"
+owner = "curl-auth"
+kind = "constant"
+
+[[family]]
+prefix = "CURLU_"
+owner = "curl-url"
+kind = "constant"
+
+[[family]]
+prefix = "CURLFTP"
+owner = "curl-proto-ftp"
+kind = "constant"
+
+[[family]]
+prefix = "CURLKH"
+owner = "curl-proto-ssh"
+kind = "constant"
+
+[[family]]
+prefix = "CURLWS_"
+owner = "curl-proto-ws"
+kind = "constant"
+
+[[family]]
+prefix = "CURLH_"
+owner = "curl-core"
+kind = "constant"
+
+[[family]]
+prefix = "CURLALTSVC_"
+owner = "curl-core"
+kind = "constant"
+
+[[family]]
+prefix = "CURLHSTS_"
+owner = "curl-core"
+kind = "constant"
+
+[[family]]
+prefix = "CURL_VERSION_"
+owner = "curl-abi"
+kind = "capability-bit"
+
+[[family]]
+prefix = "CURLCLOSEPOLICY_"
+owner = "curl-core"
+kind = "option-value"
+
+[[family]]
+prefix = "CURLFILETYPE_"
+owner = "curl-proto-ftp"
+kind = "option-value"
+
+[[family]]
+prefix = "CURLFINFOFLAG_"
+owner = "curl-proto-ftp"
+kind = "option-value"
+
+[[family]]
+prefix = "CURLFOLLOW_"
+owner = "curl-core"
+kind = "option-value"
+
+[[family]]
+prefix = "CURLFORM_"
+owner = "curl-core"
+kind = "option-value"
+
+[[family]]
+prefix = "CURLGSSAPI_"
+owner = "curl-auth"
+kind = "option-value"
+
+[[family]]
+prefix = "CURLHEADER_"
+owner = "curl-http1"
+kind = "option-value"
+
+[[family]]
+prefix = "CURLIOCMD_"
+owner = "curl-core"
+kind = "callback-value"
+
+[[family]]
+prefix = "CURLIOE_"
+owner = "curl-core"
+kind = "callback-value"
+
+[[family]]
+prefix = "CURLMIMEOPT_"
+owner = "curl-core"
+kind = "option-value"
+
+[[family]]
+prefix = "CURLMINFO_"
+owner = "curl-core"
+kind = "info"
+
+[[family]]
+prefix = "CURLMNOTIFY_"
+owner = "curl-core"
+kind = "callback-value"
+
+[[family]]
+prefix = "CURLMNWC_"
+owner = "curl-core"
+kind = "option-value"
+
+[[family]]
+prefix = "CURLMSG_"
+owner = "curl-core"
+kind = "constant"
+
+[[family]]
+prefix = "CURLOPTDEPRECATED"
+owner = "curl-abi"
+kind = "declaration-macro"
+
+[[family]]
+prefix = "CURLOPTTYPE_"
+owner = "curl-abi"
+kind = "abi-type-tag"
+
+[[family]]
+prefix = "CURLOPT"
+owner = "curl-abi"
+kind = "declaration-macro"
+
+[[family]]
+prefix = "CURLOT_"
+owner = "curl-core"
+kind = "option-type-tag"
+
+[[family]]
+prefix = "CURLPAUSE_"
+owner = "curl-core"
+kind = "constant"
+
+[[family]]
+prefix = "CURLPIPE_"
+owner = "curl-core"
+kind = "option-value"
+
+[[family]]
+prefix = "CURLPROXY_"
+owner = "curl-core"
+kind = "option-value"
+
+[[family]]
+prefix = "CURLSOCKTYPE_"
+owner = "curl-core"
+kind = "callback-value"
+
+[[family]]
+prefix = "CURLSSH_AUTH_"
+owner = "curl-proto-ssh"
+kind = "option-value"
+
+[[family]]
+prefix = "CURLSSLOPT_"
+owner = "curl-tls"
+kind = "option-value"
+
+[[family]]
+prefix = "CURLSTS_"
+owner = "curl-core"
+kind = "callback-value"
+
+[[family]]
+prefix = "CURLULFLAG_"
+owner = "curl-proto-imap"
+kind = "option-value"
+
+[[family]]
+prefix = "CURLUPART_"
+owner = "curl-url"
+kind = "constant"
+
+[[family]]
+prefix = "CURLUSESSL_"
+owner = "curl-core"
+kind = "option-value"
+
+[[family]]
+prefix = "CURLVERSION_"
+owner = "curl-abi"
+kind = "constant"
+
+[[family]]
+prefix = "CURLWARNING"
+owner = "curl-abi"
+kind = "declaration-macro"
+
+[[family]]
+prefix = "CURL_"
+owner = "curl-abi"
+kind = "constant"
+
+[[family]]
+prefix = "LIBCURL_"
+owner = "curl-abi"
+kind = "constant"
+
+[[family]]
+prefix = "curl_"
+owner = "curl-abi"
+kind = "public-item"
+
+# ---------------------------------------------------------------------------
+# Targets of the families the generator resolves without a per-row entry.
+# ---------------------------------------------------------------------------
+
+[target]
+public-header = "curl-abi"
+exported-symbol = "curl-abi"
+cli-option = "curl-cli"
+writeout-variable = "curl-cli"
+build-flag = "refactor/shim"
+
+[decision]
+public-header = "DL-0111"
+exported-symbol = "DL-0007"
+cli-option = "DL-0026"
+writeout-variable = "DL-0026"
+build-flag = "DL-0016"
+
+# ---------------------------------------------------------------------------
+# Reverse direction. One entry per project-authored file outside original/.
+# ---------------------------------------------------------------------------
+
+[[reverse]]
+path = ".gitignore"
+derives-from = ["original/.gitignore"]
+
+[[reverse]]
+path = "COPYING"
+derives-from = ["original/COPYING"]
+
+[[reverse]]
+path = "Cargo.lock"
+project-owned = true
+decision = "DL-0009"
+
+[[reverse]]
+path = "Cargo.toml"
+derives-from = ["original/Makefile.am", "original/configure.ac"]
+
+[[reverse]]
+path = "README.md"
+derives-from = ["original/README.md"]
+
+[[reverse]]
+path = "catalog-info.yaml"
+project-owned = true
+decision = "DL-0025"
+
+[[reverse]]
+path = "mkdocs.yml"
+project-owned = true
+decision = "DL-0020"
+
+[[reverse]]
+path = "renovate.json"
+derives-from = ["original/renovate.json"]
+
+[[reverse]]
+path = "rust-toolchain.toml"
+project-owned = true
+decision = "DL-0029"
+
+[[reverse]]
+path = "refactor/docs/DECISION-LOG.md"
+project-owned = true
+decision = "DL-0023"
+
+[[reverse]]
+path = "refactor/docs/PROVENANCE.md"
+derives-from = ["original/lib/Makefile.inc", "original/src/Makefile.inc"]
+
+[[reverse]]
+path = "refactor/docs/TRACEABILITY-MATRIX.md"
+derives-from = ["original/docs/libcurl/symbols-in-versions", "original/lib/libcurl.def"]
+
+[[reverse]]
+path = "refactor/docs/COVERAGE-MATRIX.md"
+derives-from = ["original/include/curl/curl.h", "original/docs/libcurl/symbols-in-versions"]
+
+[[reverse]]
+path = "refactor/docs/QUIRKS.md"
+derives-from = ["original/docs/KNOWN_BUGS.md"]
+
+[[reverse]]
+path = "refactor/docs/history/index.md"
+project-owned = true
+decision = "DL-0020"
+
+[[reverse]]
+path = "refactor/docs/history/project-guide.md"
+project-owned = true
+decision = "DL-0020"
+
+[[reverse]]
+path = "refactor/docs/history/technical-specifications.md"
+project-owned = true
+decision = "DL-0020"
+
+[[reverse]]
+path = "testing/audit/Cargo.toml"
+project-owned = true
+decision = "DL-0037"
+
+[[reverse]]
+path = "testing/audit/src/bin/config.rs"
+project-owned = true
+decision = "DL-0037"
+
+[[reverse]]
+path = "testing/audit/src/comments.rs"
+project-owned = true
+decision = "DL-0032"
+
+[[reverse]]
+path = "testing/audit/src/fs.rs"
+project-owned = true
+decision = "DL-0037"
+
+[[reverse]]
+path = "testing/audit/src/lib.rs"
+project-owned = true
+decision = "DL-0037"
+
+[[reverse]]
+path = "testing/audit/src/lockfile.rs"
+project-owned = true
+decision = "DL-0036"
+
+[[reverse]]
+path = "testing/audit/src/premise.rs"
+project-owned = true
+decision = "DL-0035"
+
+[[reverse]]
+path = "testing/audit/src/provenance.rs"
+project-owned = true
+decision = "DL-0138"
+
+[[reverse]]
+path = "testing/audit/src/report.rs"
+project-owned = true
+decision = "DL-0037"
+
+[[reverse]]
+path = "testing/audit/src/workspace.rs"
+project-owned = true
+decision = "DL-0037"
+
+[[reverse]]
+path = "testing/audit/traceability/Cargo.toml"
+project-owned = true
+decision = "DL-0111"
+
+[[reverse]]
+path = "testing/audit/traceability/data/hazards.toml"
+project-owned = true
+decision = "DL-0110"
+
+[[reverse]]
+path = "testing/audit/traceability/data/ownership.toml"
+project-owned = true
+decision = "DL-0111"
+
+[[reverse]]
+path = "testing/audit/traceability/src/bin/traceability.rs"
+project-owned = true
+decision = "DL-0111"
+
+[[reverse]]
+path = "testing/audit/traceability/src/contract.rs"
+project-owned = true
+decision = "DL-0111"
+
+[[reverse]]
+path = "testing/audit/traceability/src/forward.rs"
+derives-from = ["original/lib/Makefile.inc", "original/docs/libcurl/symbols-in-versions"]
+
+[[reverse]]
+path = "testing/audit/traceability/src/hazards.rs"
+project-owned = true
+decision = "DL-0110"
+
+[[reverse]]
+path = "testing/audit/traceability/src/lib.rs"
+project-owned = true
+decision = "DL-0111"
+
+[[reverse]]
+path = "testing/audit/traceability/src/oracle.rs"
+derives-from = ["original/lib/libcurl.def", "original/src/tool_getparam.c", "original/src/tool_writeout.c"]
+
+[[reverse]]
+path = "testing/audit/traceability/src/render.rs"
+project-owned = true
+decision = "DL-0111"
+
+[[reverse]]
+path = "testing/audit/traceability/src/reverse.rs"
+project-owned = true
+decision = "DL-0111"
+
+[[reverse]]
+path = "testing/upstream-suite/baseline-bootstrap"
+project-owned = true
+decision = "DL-0033"
