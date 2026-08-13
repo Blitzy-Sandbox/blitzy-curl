@@ -3,22 +3,103 @@
 # SPDX-FileCopyrightText: the blitzy-curl project contributors
 #
 # Baseline bootstrap entry point.                                        DL-0033
-# Usage: baseline-bootstrap [staging-root]
+# Usage: baseline-bootstrap [staging-root] [-- command ...]
 #
 # Default staging root: $BASELINE_STAGE, else <repo>/target/baseline.
 # Honours $AUTORECONF.                                                    DL-0033
 #
 # Compares the oracle against BASELINE.toml.                            DL-0220
 # Never writes under the oracle root.                                      [R1]
+#
+# $CURL_CI_REPORTING selects off or isolated; default off.              DL-0282
+# Off clears every provider variable.                                   DL-0282
 
 set -eu
 unset CDPATH
+
+staging_argument=""
+run_command=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --)
+      shift
+      run_command=1
+      break
+      ;;
+    *)
+      if [ -z "$staging_argument" ]; then
+        staging_argument="$1"
+      fi
+      shift
+      ;;
+  esac
+done
 
 script_directory=$(cd -- "$(dirname -- "$0")" && pwd)
 repository_root=$(cd -- "$script_directory/../.." && pwd)
 oracle="$repository_root/original"
 record="$repository_root/BASELINE.toml"
-staging="${1:-${BASELINE_STAGE:-$repository_root/target/baseline}}"
+staging="${staging_argument:-${BASELINE_STAGE:-$repository_root/target/baseline}}"
+
+# Variables the vendored harness reports results through.              DL-0282
+provider_variables="AZURE_ACCESS_TOKEN AGENT_JOBNAME BUILD_BUILDID"
+provider_variables="$provider_variables SYSTEM_TEAMFOUNDATIONCOLLECTIONURI"
+provider_variables="$provider_variables SYSTEM_TEAMPROJECTID APPVEYOR_API_URL"
+
+# Accepted isolated-mode values, per variable.                         DL-0282
+# A token has no accepted value.                                       DL-0282
+provider_value_accepted() {
+  case "$1" in
+    SYSTEM_TEAMFOUNDATIONCOLLECTIONURI | APPVEYOR_API_URL)
+      case "$2" in
+        http://127.0.0.1:*) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    BUILD_BUILDID | SYSTEM_TEAMPROJECTID)
+      case "$2" in
+        '' | *[!0-9]*) return 1 ;;
+        *) return 0 ;;
+      esac
+      ;;
+    AGENT_JOBNAME)
+      case "$2" in
+        '' | *[!A-Za-z0-9._-]*) return 1 ;;
+        *) return 0 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+case "${CURL_CI_REPORTING:-off}" in
+  off)
+    provider_cleared=0
+    for provider_name in $provider_variables; do
+      if eval "[ \"\${$provider_name+set}\" = set ]"; then
+        unset "$provider_name"
+        provider_cleared=$((provider_cleared + 1))
+      fi
+    done
+    echo "baseline-bootstrap: provider reporting off," \
+      "$provider_cleared variable(s) cleared"
+    ;;
+  isolated)
+    for provider_name in $provider_variables; do
+      eval "provider_value=\${$provider_name-}"
+      if [ -n "$provider_value" ] &&
+        ! provider_value_accepted "$provider_name" "$provider_value"; then
+        echo "baseline-bootstrap: $provider_name value not accepted" >&2
+        exit 1
+      fi
+    done
+    echo "baseline-bootstrap: provider reporting isolated, values accepted"
+    ;;
+  *)
+    echo "baseline-bootstrap: CURL_CI_REPORTING is off or isolated" >&2
+    exit 1
+    ;;
+esac
 
 # The oracle is read-only.                                               [R1]
 if [ ! -f "$oracle/configure.ac" ]; then
@@ -143,3 +224,8 @@ verify_oracle "after staging"
 
 echo "baseline-bootstrap: oracle matches $frozen_tag record, digest $frozen_digest, $frozen_files files"
 echo "$staging"
+
+# A trailing command runs in the environment settled above.            DL-0282
+if [ "$run_command" = "1" ] && [ "$#" -gt 0 ]; then
+  exec "$@"
+fi

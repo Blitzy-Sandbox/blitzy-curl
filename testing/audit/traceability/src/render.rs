@@ -186,6 +186,10 @@ fn traceability(
         ("writeout-variable", "Output-format variables"),
         ("build-flag", "Build flags and build-system options"),
         ("internal-surface-case", "Internal-surface cases"),
+        (
+            "harness-asset",
+            "Generators, harness and configuration assets",
+        ),
         ("orphan-declaration", "Orphan declarations"),
         ("orphan-definition", "Orphan definitions"),
     ];

@@ -21,6 +21,7 @@ and **11** path(s) are excluded with a written justification.
 | `build-flag` | 232 |
 | `cli-option` | 283 |
 | `exported-symbol` | 100 |
+| `harness-asset` | 78 |
 | `internal-header` | 232 |
 | `internal-surface-case` | 83 |
 | `public-header` | 12 |

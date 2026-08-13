@@ -350,6 +350,557 @@ decision = "DL-0112"
 "unit1668.c" = "curl-proto-ftp"
 
 # ---------------------------------------------------------------------------
+# Generators, harness and configuration assets.                         DL-0273
+# Enumerated from the tree; this table only disposes.                   DL-0273
+# ---------------------------------------------------------------------------
+
+[[harness]]
+path = "original/lib/.gitignore"
+role = "repository metadata of the library folder"
+disposition = "no-counterpart"
+target = "none"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/lib/CMakeLists.txt"
+role = "CMake build of the library"
+disposition = "build-input"
+target = "refactor/shim"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/lib/Makefile.am"
+role = "automake build of the library"
+disposition = "build-input"
+target = "refactor/shim"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/lib/Makefile.inc"
+role = "source registration manifest of both build systems"
+disposition = "build-input"
+target = "refactor/shim"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/lib/Makefile.soname"
+role = "shared-object version arithmetic behind SONAME 4"
+disposition = "build-input"
+target = "refactor/shim"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/lib/curl_config-cmake.h.in"
+role = "CMake configuration-header template"
+disposition = "build-input"
+target = "refactor/shim"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/lib/libcurl.def"
+role = "Windows export definition of the library"
+disposition = "build-input"
+target = "refactor/shim"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/lib/libcurl.rc"
+role = "Windows resource script of the library"
+disposition = "build-input"
+target = "refactor/shim"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/lib/libcurl.vers.in"
+role = "symbol version-map template"
+disposition = "build-input"
+target = "refactor/shim"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/lib/optiontable.pl"
+role = "option-table generator over the public header"
+disposition = "replaced"
+target = "curl-core"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/src/.checksrc"
+role = "source-check configuration of the tool folder"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/src/.gitignore"
+role = "repository metadata of the tool folder"
+disposition = "no-counterpart"
+target = "none"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/src/CMakeLists.txt"
+role = "CMake build of the tool"
+disposition = "build-input"
+target = "refactor/shim"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/src/Makefile.am"
+role = "automake build of the tool"
+disposition = "build-input"
+target = "refactor/shim"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/src/Makefile.inc"
+role = "source registration manifest of both build systems"
+disposition = "build-input"
+target = "refactor/shim"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/src/curl.rc"
+role = "Windows resource script of the tool"
+disposition = "build-input"
+target = "refactor/shim"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/src/mk-file-embed.pl"
+role = "certificate-bundle embedding generator"
+disposition = "replaced"
+target = "curl-cli"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/src/mkhelp.pl"
+role = "built-in manual generator over the option manual page"
+disposition = "replaced"
+target = "curl-cli"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/.gitignore"
+role = "repository metadata of the test folder"
+disposition = "no-counterpart"
+target = "none"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/CMakeLists.txt"
+role = "CMake build of the test tree"
+disposition = "build-input"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/Makefile.am"
+role = "automake build of the test tree"
+disposition = "build-input"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/allversions.pm"
+role = "version-matrix helper of the driver"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/appveyor.pm"
+role = "AppVeyor result reporting of the driver"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0282"
+
+[[harness]]
+path = "original/tests/azure.pm"
+role = "Azure Pipelines result reporting of the driver"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0282"
+
+[[harness]]
+path = "original/tests/config.in"
+role = "driver configuration template the configure step substitutes"
+disposition = "build-input"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/configurehelp.pm.in"
+role = "build-configuration module the configure step substitutes"
+disposition = "build-input"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/devtest.pl"
+role = "harness-internals probe for developers"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/dictserver.py"
+role = "DICT test server"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/directories.pm"
+role = "directory-listing helper of the FTP server"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/ech_combos.py"
+role = "ECH configuration combination generator"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/ech_tests.sh"
+role = "ECH test runner over the driver"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/ftpserver.pl"
+role = "FTP, IMAP, POP3 and SMTP test server"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/getpart.pm"
+role = "test-descriptor parser of the driver"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/globalconfig.pm"
+role = "global configuration of the driver"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/http-server.pl"
+role = "HTTP test server front end"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/http2-server.pl"
+role = "HTTP/2 test server front end"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/http3-server.pl"
+role = "HTTP/3 test server front end"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/memanalyze.pl"
+role = "allocation-accounting report of the driver"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/memanalyzer.pm"
+role = "allocation-accounting module of the driver"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/negtelnetserver.py"
+role = "Telnet negotiation test server"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/nghttpx.conf"
+role = "HTTP/2 proxy configuration of the test servers"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/pathhelp.pm"
+role = "path-translation helper of the driver"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/processhelp.pm"
+role = "process-control helper of the driver"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/requirements.txt"
+role = "python requirements of the driver helpers"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/rtspserver.pl"
+role = "RTSP test server front end"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/runner.pm"
+role = "per-runner execution module of the driver"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/runtests.pl"
+role = "the upstream test driver, invoked unmodified"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/secureserver.pl"
+role = "TLS tunnel front end of the test servers"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/serverhelp.pm"
+role = "server naming and logging helper"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/servers.pm"
+role = "test-server lifecycle module of the driver"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/smbserver.py"
+role = "SMB test server"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/sshhelp.pm"
+role = "SSH server configuration helper"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/sshserver.pl"
+role = "SSH test server front end"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test1119.pl"
+role = "case helper comparing symbols-in-versions against the public headers"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test1135.pl"
+role = "case helper comparing the export list against the public headers"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test1139.pl"
+role = "case helper comparing the documented option set against the manual pages"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test1140.pl"
+role = "case helper comparing manual-page formatting of the option pages"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test1165.pl"
+role = "case helper comparing the disable-flag surface across both build systems"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0262"
+
+[[harness]]
+path = "original/tests/test1167.pl"
+role = "case helper comparing the global-symbol prefix rule over the library sources"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test1173.pl"
+role = "case helper comparing manual-page syntax over the whole documentation set"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test1175.pl"
+role = "case helper comparing symbols-in-versions against the documented error set"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0280"
+
+[[harness]]
+path = "original/tests/test1177.pl"
+role = "case helper comparing the feature-macro list against the public header"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test1222.pl"
+role = "case helper comparing option-page consistency against the option list"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test1275.pl"
+role = "case helper comparing markdown link syntax across the documentation set"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test1276.pl"
+role = "case helper comparing the manual-page reference set across the documentation"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test1477.pl"
+role = "case helper comparing the error-code set against the documented list"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test1486.pl"
+role = "case helper comparing source-code style over the whole tree"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test1488.pl"
+role = "case helper comparing the option-page cross-reference set"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test1544.pl"
+role = "case helper comparing the header-guard convention over the public headers"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test1707.pl"
+role = "case helper comparing the documented option set against the alias table"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test745.pl"
+role = "case helper comparing the manual-page option sections against the tool"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/test971.pl"
+role = "case helper comparing the option manual pages against the alias table"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/testcurl.pl"
+role = "autobuild build-and-test cycle, reference material only"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0270"
+
+[[harness]]
+path = "original/tests/testutil.pm"
+role = "shared utility module of the driver"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/tftpserver.pl"
+role = "TFTP test server front end"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/util.py"
+role = "shared helper of the python test servers"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/valgrind.pm"
+role = "valgrind report parser of the driver"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+[[harness]]
+path = "original/tests/valgrind.supp"
+role = "valgrind suppression set of the test tree"
+disposition = "source-reference"
+target = "upstream-suite"
+decision = "DL-0273"
+
+# ---------------------------------------------------------------------------
 # Symbol-register families. Longest matching prefix wins.
 # ---------------------------------------------------------------------------
 
@@ -824,6 +1375,10 @@ decision = "DL-0111"
 path = "testing/audit/traceability/src/contract.rs"
 project-owned = true
 decision = "DL-0111"
+
+[[reverse]]
+path = "testing/audit/traceability/src/errordocs.rs"
+derives-from = ["original/tests/test1175.pl", "original/docs/libcurl/symbols-in-versions", "original/docs/libcurl/libcurl-errors.md"]
 
 [[reverse]]
 path = "testing/audit/traceability/src/forward.rs"

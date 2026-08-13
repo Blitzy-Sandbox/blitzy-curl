@@ -21,8 +21,13 @@ sensitive-fields = [
   "passwd",
   "password",
   "payload",
+  "peer_key",
+  "sdata",
   "secret",
   "session_id",
+  "session_key",
+  "shmac",
+  "ticket",
   "token",
   "user",
   "username",
@@ -371,6 +376,32 @@ line = 147
 evidence = "azure_update_test_run"
 decision = "DL-0245"
 
+# The harness's second provider, loaded beside the first. DL-0274.
+# Neither provider is exercised by the local check. DL-0274.
+[[reused]]
+element = "CI result reporting"
+surface = "AppVeyor environment detection; not exercised by the local check"
+path = "original/tests/appveyor.pm"
+line = 43
+evidence = "appveyor_check_environment"
+decision = "DL-0274"
+
+[[reused]]
+element = "CI result reporting"
+surface = "per-case result creation on that provider; not exercised locally"
+path = "original/tests/appveyor.pm"
+line = 50
+evidence = "appveyor_create_test_result"
+decision = "DL-0274"
+
+[[reused]]
+element = "CI result reporting"
+surface = "per-case outcome, timing and build message; not exercised locally"
+path = "original/tests/appveyor.pm"
+line = 71
+evidence = "appveyor_update_test_result"
+decision = "DL-0274"
+
 [[reused]]
 element = "log surface"
 surface = "single diagnostic sink"
@@ -427,6 +458,363 @@ path = "original/tests/testcurl.pl"
 line = 348
 evidence = "version = $version"
 decision = "DL-0272"
+
+# The second CI provider the driver reports to, reused unchanged. DL-0284.
+[[reused]]
+element = "CI result reporting"
+surface = "API base the environment supplies to that provider"
+path = "original/tests/appveyor.pm"
+line = 44
+evidence = "APPVEYOR_API_URL"
+decision = "DL-0284"
+
+[[reused]]
+element = "CI result reporting"
+surface = "reporting call the module runs through the shell"
+path = "original/tests/appveyor.pm"
+line = 56
+evidence = "qx($curl --silent"
+decision = "DL-0284"
+
+[[reused]]
+element = "CI result reporting"
+surface = "per-case duration in milliseconds"
+path = "original/tests/appveyor.pm"
+line = 80
+evidence = "appveyor_duration"
+decision = "DL-0284"
+
+[[reused]]
+element = "CI result reporting"
+surface = "build message raised for a failing case"
+path = "original/tests/appveyor.pm"
+line = 124
+evidence = "api/build/messages"
+decision = "DL-0284"
+
+[[reused]]
+element = "CI result reporting"
+surface = "provider the driver selects when Azure is absent"
+path = "original/tests/runtests.pl"
+line = 993
+evidence = "appveyor_check_environment"
+decision = "DL-0284"
+
+[[reused]]
+element = "CI result reporting"
+surface = "case outcome the driver submits to that provider"
+path = "original/tests/runtests.pl"
+line = 1007
+evidence = "appveyor_update_test_result"
+decision = "DL-0284"
+
+# The driver's own report of the build under test. DL-0284.
+[[reused]]
+element = "build reporting"
+surface = "build information report flag of the driver"
+path = "original/tests/runtests.pl"
+line = 2531
+evidence = "--buildinfo"
+decision = "DL-0284"
+
+[[reused]]
+element = "build reporting"
+surface = "build information lines written to the harness log"
+path = "original/tests/runtests.pl"
+line = 2776
+evidence = "$buildinfo"
+decision = "DL-0284"
+
+# The Python servers' own file logging, reused unchanged. DL-0285.
+[[reused]]
+element = "harness structured logging"
+surface = "module logger of the shared Python helper"
+path = "original/tests/util.py"
+line = 30
+evidence = "logging.getLogger(__name__)"
+decision = "DL-0285"
+
+[[reused]]
+element = "harness structured logging"
+surface = "per-record file handler the servers install"
+path = "original/tests/util.py"
+line = 35
+evidence = "class ClosingFileHandler"
+decision = "DL-0285"
+
+[[reused]]
+element = "harness structured logging"
+surface = "reopen and append on every record"
+path = "original/tests/util.py"
+line = 42
+evidence = "open(self.filename, \"a\")"
+decision = "DL-0285"
+
+[[reused]]
+element = "harness structured logging"
+surface = "stream rebinding the handler falls back to"
+path = "original/tests/util.py"
+line = 47
+evidence = "def setStream"
+decision = "DL-0285"
+
+[[reused]]
+element = "harness structured logging"
+surface = "descriptor-parse record that logger emits"
+path = "original/tests/util.py"
+line = 73
+evidence = "log.debug"
+decision = "DL-0285"
+
+[[reused]]
+element = "harness structured logging"
+surface = "record format: timestamp, level, message"
+path = "original/tests/dictserver.py"
+line = 134
+evidence = "%(asctime)s %(levelname)-5.5s %(message)s"
+decision = "DL-0285"
+
+[[reused]]
+element = "harness structured logging"
+surface = "DICT server log file"
+path = "original/tests/dictserver.py"
+line = 138
+evidence = "ClosingFileHandler(options.logfile)"
+decision = "DL-0285"
+
+[[reused]]
+element = "harness structured logging"
+surface = "SMB server log file"
+path = "original/tests/smbserver.py"
+line = 401
+evidence = "ClosingFileHandler(options.logfile)"
+decision = "DL-0285"
+
+[[reused]]
+element = "harness structured logging"
+surface = "negotiating Telnet server log file"
+path = "original/tests/negtelnetserver.py"
+line = 320
+evidence = "ClosingFileHandler(options.logfile)"
+decision = "DL-0285"
+
+# The harness's own valgrind verdict, reused unchanged. DL-0286.
+[[reused]]
+element = "valgrind diagnostics"
+surface = "leak-check invocation the driver wraps a case in"
+path = "original/tests/runner.pm"
+line = 986
+evidence = "--leak-check=yes"
+decision = "DL-0286"
+
+[[reused]]
+element = "valgrind diagnostics"
+surface = "suppression set that invocation applies"
+path = "original/tests/runner.pm"
+line = 987
+evidence = "--suppressions=$srcdir/valgrind.supp"
+decision = "DL-0286"
+
+[[reused]]
+element = "valgrind diagnostics"
+surface = "valgrind log reader"
+path = "original/tests/valgrind.pm"
+line = 40
+evidence = "sub valgrindparse"
+decision = "DL-0286"
+
+[[reused]]
+element = "valgrind diagnostics"
+surface = "per-case log that reader opens"
+path = "original/tests/valgrind.pm"
+line = 43
+evidence = "open(my $val, \"<\", $file)"
+decision = "DL-0286"
+
+[[reused]]
+element = "valgrind diagnostics"
+surface = "suppression frame naming an internal library symbol"
+path = "original/tests/valgrind.supp"
+line = 8
+evidence = "fun:Curl_sendrecv"
+decision = "DL-0286"
+
+[[reused]]
+element = "valgrind diagnostics"
+surface = "per-case verdict in the driver"
+path = "original/tests/runtests.pl"
+line = 1913
+evidence = "valgrindparse"
+decision = "DL-0286"
+
+[[reused]]
+element = "valgrind diagnostics"
+surface = "per-iteration verdict on the torture path"
+path = "original/tests/runner.pm"
+line = 538
+evidence = "valgrindparse"
+decision = "DL-0286"
+
+# Allocation accounting, leaks, and the torture diagnosis. DL-0287.
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "allocation-accounting entry point"
+path = "original/tests/memanalyzer.pm"
+line = 57
+evidence = "sub memanalyze"
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "limit-only selection of that entry point"
+path = "original/tests/memanalyzer.pm"
+line = 73
+evidence = "if($showlimit)"
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "injected-limit line the analyser extracts"
+path = "original/tests/memanalyzer.pm"
+line = 75
+evidence = "memlimit"
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "leak verdict over the paired allocations"
+path = "original/tests/memanalyzer.pm"
+line = 390
+evidence = "Leak detected: memory still allocated"
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "descriptor left open at its allocation site"
+path = "original/tests/memanalyzer.pm"
+line = 405
+evidence = "Open file descriptor created at"
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "allocation count of the run"
+path = "original/tests/memanalyzer.pm"
+line = 437
+evidence = "Allocations: "
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "operation count the torture loop reads"
+path = "original/tests/memanalyzer.pm"
+line = 438
+evidence = "Operations: "
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "high-water mark of the run"
+path = "original/tests/memanalyzer.pm"
+line = 439
+evidence = "Maximum allocated"
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "executable interface over the analyser"
+path = "original/tests/memanalyze.pl"
+line = 29
+evidence = "use memanalyzer;"
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "limit-only switch of that interface"
+path = "original/tests/memanalyze.pl"
+line = 44
+evidence = "\"-l\""
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "call that interface makes"
+path = "original/tests/memanalyze.pl"
+line = 56
+evidence = "memanalyze($file, $verbose, $trace, $showlimit)"
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "how the driver names that executable interface"
+path = "original/tests/globalconfig.pm"
+line = 129
+evidence = "memanalyze.pl"
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "injection count the torture loop derives"
+path = "original/tests/runner.pm"
+line = 458
+evidence = "memanalyze(\"$LOGDIR/$MEMDUMP\", 1, 0, 0)"
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "diagnosis of the allocation that tripped the limit"
+path = "original/tests/runner.pm"
+line = 570
+evidence = "memanalyze(\"$LOGDIR/$MEMDUMP\", 0, 0, 1)"
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "feature the driver requires before torture runs"
+path = "original/tests/runtests.pl"
+line = 865
+evidence = "$torture && !$feature{\"TrackMemory\"}"
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "per-case memory-tracking gate"
+path = "original/tests/runtests.pl"
+line = 1790
+evidence = "$feature{\"TrackMemory\"}"
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "per-case leak check"
+path = "original/tests/runtests.pl"
+line = 1801
+evidence = "memanalyze(\"$logdir/$MEMDUMP\", 0, 0, 0)"
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "per-case counters compared against the case's limits"
+path = "original/tests/runtests.pl"
+line = 1821
+evidence = "memanalyze(\"$logdir/$MEMDUMP\", 1, 0, 0)"
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "limit line the oracle writes for that analyser"
+path = "original/lib/memdebug.c"
+line = 193
+evidence = "LIMIT %s:%d %s reached memlimit"
+decision = "DL-0287"
+
+[[reused]]
+element = "memory and torture diagnostics"
+surface = "allocation line the oracle writes for that analyser"
+path = "original/lib/memdebug.c"
+line = 230
+evidence = "MEM %s:%d malloc(%zu) = %p"
+decision = "DL-0287"
 
 # What this project adds. Nothing here changes a byte of the reused surfaces.
 [[added]]
@@ -648,6 +1036,29 @@ discloses = "handshake detail the backend writes as text"
 shared = false
 verdict = "reproduce"
 decision = "DL-0116"
+
+# The tool's own session-persistence diagnostics. DL-0275.
+[[sink]]
+id = "SK-0017"
+path = "original/src/tool_ssls.c"
+line = 105
+emitter = "warnf"
+kind = "diagnostic"
+discloses = "the rejected second field of a session record, which is the base64 text of a packed session ticket bounded only by the record bound"
+shared = false
+verdict = "reproduce"
+decision = "DL-0275"
+
+[[sink]]
+id = "SK-0018"
+path = "original/src/tool_ssls.c"
+line = 181
+emitter = "warnf"
+kind = "diagnostic"
+discloses = "the peer key the export callback receives, which is the plaintext host and port with the transport, TLS version, TLS options and cipher lists, and the client certificate, key, issuer certificate, certificate authority and TLS-SRP username wherever set"
+shared = false
+verdict = "reproduce"
+decision = "DL-0275"
 
 # Frozen call-site counts of the shared sink's wrappers, per consumer. DL-0232.
 # A new call site anywhere in these files changes a count and fails the run.

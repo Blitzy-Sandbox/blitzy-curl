@@ -1011,6 +1011,57 @@ decision = "DL-0116"
     }
 
     #[test]
+    fn session_material_is_rejected_in_every_shape_the_gate_reads() {
+        // The vocabulary of the committed contract, not of the fixture: a span
+        // field, a format placeholder and a query placeholder are the three
+        // shapes the gate reads, and each of the five session names has to be
+        // caught in all three. DL-0275.
+        let vocabulary = concat!(
+            "schema = 1\nsensitive-fields = [\"peer_key\", \"sdata\", \"session_key\", ",
+            "\"shmac\", \"ticket\"]\ninstrumentation-macros = [\"trace!\", \"counter!\"]\n"
+        );
+        let text = GOOD.replace(
+            "schema = 1\nsensitive-fields = [\"password\", \"user\"]\ninstrumentation-macros = [\"trace!\", \"counter!\"]\n",
+            vocabulary,
+        );
+        for field in ["peer_key", "sdata", "session_key", "shmac", "ticket"] {
+            for body in [
+                format!("fn f() {{ trace!(target: \"tls\", {field} = value, \"saved\"); }}\n"),
+                format!("fn f() {{ trace!(\"saved %{field}\"); }}\n"),
+                format!("fn f() {{ counter!(\"saved\", \"at\" => \"?{field}\"); }}\n"),
+            ] {
+                let files = tree()
+                    .with("data/observability.toml", &text)
+                    .with("refactor/curl-core/src/trc.rs", &body);
+                let contract = Contract::load(&files, "data/observability.toml").expect("loads");
+                let mut report = Report::new("test");
+                let _ = contract.audit(&files, &decisions(), &mut report);
+                let rendered = report.render();
+                assert!(
+                    rendered.contains("FAIL observability/added-fields-clean"),
+                    "{field} accepted in {body}: {rendered}"
+                );
+                assert!(rendered.contains(field));
+            }
+        }
+
+        // The same instrumentation carrying no session material passes, so the
+        // fixtures above fail on the field rather than on the macro.
+        let files = tree().with("data/observability.toml", &text).with(
+            "refactor/curl-core/src/trc.rs",
+            "fn f() { trace!(target: \"tls\", xfer_id = id, \"saved\"); }\n",
+        );
+        let contract = Contract::load(&files, "data/observability.toml").expect("loads");
+        let mut report = Report::new("test");
+        let _ = contract.audit(&files, &decisions(), &mut report);
+        assert!(
+            report
+                .render()
+                .contains("PASS observability/added-fields-clean")
+        );
+    }
+
+    #[test]
     fn an_endpoint_outside_the_verification_tree_fails() {
         let text = GOOD.replace(
             "in-verification-tree = true",

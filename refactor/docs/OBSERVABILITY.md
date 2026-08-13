@@ -12,8 +12,8 @@ edit this file by hand. Rationale lives in `refactor/docs/DECISION-LOG.md`.
 
 What the vendored oracle already provides and the port reuses, what this project
 adds on top of it, and every place a value the oracle writes to a diagnostic
-surface is a credential. **41 reused surface(s)** across **8 element(s)**,
-**5 added element(s)**, **16 sink(s)** and **17 declared disclosure(s)**.
+surface is a credential. **88 reused surface(s)** across **11 element(s)**,
+**5 added element(s)**, **18 sink(s)** and **17 declared disclosure(s)**.
 
 Reuse is verified rather than claimed: every reused surface is read at the tag
 and must still carry the token that names it, so a stale line number fails the
@@ -71,6 +71,9 @@ endpoint means anything.
 | CI result reporting | per-case result record | `original/tests/azure.pm:75` | `azure_create_test_result` | DL-0245 |
 | CI result reporting | per-case outcome and timings | `original/tests/azure.pm:104` | `azure_update_test_result` | DL-0245 |
 | CI result reporting | test run completion | `original/tests/azure.pm:147` | `azure_update_test_run` | DL-0245 |
+| CI result reporting | AppVeyor environment detection; not exercised by the local check | `original/tests/appveyor.pm:43` | `appveyor_check_environment` | DL-0274 |
+| CI result reporting | per-case result creation on that provider; not exercised locally | `original/tests/appveyor.pm:50` | `appveyor_create_test_result` | DL-0274 |
+| CI result reporting | per-case outcome, timing and build message; not exercised locally | `original/tests/appveyor.pm:71` | `appveyor_update_test_result` | DL-0274 |
 | log surface | single diagnostic sink | `original/src/tool_stderr.c:29` | `FILE *tool_stderr;` | DL-0254 |
 | log surface | whole-sink redirection | `original/src/tool_stderr.c:37` | `tool_set_stderr_file` | DL-0254 |
 | log surface | sink redirection flag | `original/src/tool_getparam.c:325` | `C_STDERR` | DL-0254 |
@@ -78,6 +81,50 @@ endpoint means anything.
 | build reporting | report begin sentinel a consumer triggers on; not executed here | `original/tests/testcurl.pl:325` | `STARTING HERE` | DL-0272 |
 | build reporting | report end sentinel closing the same report; not executed here | `original/tests/testcurl.pl:231` | `ENDING HERE` | DL-0272 |
 | build reporting | environment and version banner of that report; not executed here | `original/tests/testcurl.pl:348` | `version = $version` | DL-0272 |
+| CI result reporting | API base the environment supplies to that provider | `original/tests/appveyor.pm:44` | `APPVEYOR_API_URL` | DL-0284 |
+| CI result reporting | reporting call the module runs through the shell | `original/tests/appveyor.pm:56` | `qx($curl --silent` | DL-0284 |
+| CI result reporting | per-case duration in milliseconds | `original/tests/appveyor.pm:80` | `appveyor_duration` | DL-0284 |
+| CI result reporting | build message raised for a failing case | `original/tests/appveyor.pm:124` | `api/build/messages` | DL-0284 |
+| CI result reporting | provider the driver selects when Azure is absent | `original/tests/runtests.pl:993` | `appveyor_check_environment` | DL-0284 |
+| CI result reporting | case outcome the driver submits to that provider | `original/tests/runtests.pl:1007` | `appveyor_update_test_result` | DL-0284 |
+| build reporting | build information report flag of the driver | `original/tests/runtests.pl:2531` | `--buildinfo` | DL-0284 |
+| build reporting | build information lines written to the harness log | `original/tests/runtests.pl:2776` | `$buildinfo` | DL-0284 |
+| harness structured logging | module logger of the shared Python helper | `original/tests/util.py:30` | `logging.getLogger(__name__)` | DL-0285 |
+| harness structured logging | per-record file handler the servers install | `original/tests/util.py:35` | `class ClosingFileHandler` | DL-0285 |
+| harness structured logging | reopen and append on every record | `original/tests/util.py:42` | `open(self.filename, "a")` | DL-0285 |
+| harness structured logging | stream rebinding the handler falls back to | `original/tests/util.py:47` | `def setStream` | DL-0285 |
+| harness structured logging | descriptor-parse record that logger emits | `original/tests/util.py:73` | `log.debug` | DL-0285 |
+| harness structured logging | record format: timestamp, level, message | `original/tests/dictserver.py:134` | `%(asctime)s %(levelname)-5.5s %(message)s` | DL-0285 |
+| harness structured logging | DICT server log file | `original/tests/dictserver.py:138` | `ClosingFileHandler(options.logfile)` | DL-0285 |
+| harness structured logging | SMB server log file | `original/tests/smbserver.py:401` | `ClosingFileHandler(options.logfile)` | DL-0285 |
+| harness structured logging | negotiating Telnet server log file | `original/tests/negtelnetserver.py:320` | `ClosingFileHandler(options.logfile)` | DL-0285 |
+| valgrind diagnostics | leak-check invocation the driver wraps a case in | `original/tests/runner.pm:986` | `--leak-check=yes` | DL-0286 |
+| valgrind diagnostics | suppression set that invocation applies | `original/tests/runner.pm:987` | `--suppressions=$srcdir/valgrind.supp` | DL-0286 |
+| valgrind diagnostics | valgrind log reader | `original/tests/valgrind.pm:40` | `sub valgrindparse` | DL-0286 |
+| valgrind diagnostics | per-case log that reader opens | `original/tests/valgrind.pm:43` | `open(my $val, "<", $file)` | DL-0286 |
+| valgrind diagnostics | suppression frame naming an internal library symbol | `original/tests/valgrind.supp:8` | `fun:Curl_sendrecv` | DL-0286 |
+| valgrind diagnostics | per-case verdict in the driver | `original/tests/runtests.pl:1913` | `valgrindparse` | DL-0286 |
+| valgrind diagnostics | per-iteration verdict on the torture path | `original/tests/runner.pm:538` | `valgrindparse` | DL-0286 |
+| memory and torture diagnostics | allocation-accounting entry point | `original/tests/memanalyzer.pm:57` | `sub memanalyze` | DL-0287 |
+| memory and torture diagnostics | limit-only selection of that entry point | `original/tests/memanalyzer.pm:73` | `if($showlimit)` | DL-0287 |
+| memory and torture diagnostics | injected-limit line the analyser extracts | `original/tests/memanalyzer.pm:75` | `memlimit` | DL-0287 |
+| memory and torture diagnostics | leak verdict over the paired allocations | `original/tests/memanalyzer.pm:390` | `Leak detected: memory still allocated` | DL-0287 |
+| memory and torture diagnostics | descriptor left open at its allocation site | `original/tests/memanalyzer.pm:405` | `Open file descriptor created at` | DL-0287 |
+| memory and torture diagnostics | allocation count of the run | `original/tests/memanalyzer.pm:437` | `Allocations: ` | DL-0287 |
+| memory and torture diagnostics | operation count the torture loop reads | `original/tests/memanalyzer.pm:438` | `Operations: ` | DL-0287 |
+| memory and torture diagnostics | high-water mark of the run | `original/tests/memanalyzer.pm:439` | `Maximum allocated` | DL-0287 |
+| memory and torture diagnostics | executable interface over the analyser | `original/tests/memanalyze.pl:29` | `use memanalyzer;` | DL-0287 |
+| memory and torture diagnostics | limit-only switch of that interface | `original/tests/memanalyze.pl:44` | `"-l"` | DL-0287 |
+| memory and torture diagnostics | call that interface makes | `original/tests/memanalyze.pl:56` | `memanalyze($file, $verbose, $trace, $showlimit)` | DL-0287 |
+| memory and torture diagnostics | how the driver names that executable interface | `original/tests/globalconfig.pm:129` | `memanalyze.pl` | DL-0287 |
+| memory and torture diagnostics | injection count the torture loop derives | `original/tests/runner.pm:458` | `memanalyze("$LOGDIR/$MEMDUMP", 1, 0, 0)` | DL-0287 |
+| memory and torture diagnostics | diagnosis of the allocation that tripped the limit | `original/tests/runner.pm:570` | `memanalyze("$LOGDIR/$MEMDUMP", 0, 0, 1)` | DL-0287 |
+| memory and torture diagnostics | feature the driver requires before torture runs | `original/tests/runtests.pl:865` | `$torture && !$feature{"TrackMemory"}` | DL-0287 |
+| memory and torture diagnostics | per-case memory-tracking gate | `original/tests/runtests.pl:1790` | `$feature{"TrackMemory"}` | DL-0287 |
+| memory and torture diagnostics | per-case leak check | `original/tests/runtests.pl:1801` | `memanalyze("$logdir/$MEMDUMP", 0, 0, 0)` | DL-0287 |
+| memory and torture diagnostics | per-case counters compared against the case's limits | `original/tests/runtests.pl:1821` | `memanalyze("$logdir/$MEMDUMP", 1, 0, 0)` | DL-0287 |
+| memory and torture diagnostics | limit line the oracle writes for that analyser | `original/lib/memdebug.c:193` | `LIMIT %s:%d %s reached memlimit` | DL-0287 |
+| memory and torture diagnostics | allocation line the oracle writes for that analyser | `original/lib/memdebug.c:230` | `MEM %s:%d malloc(%zu) = %p` | DL-0287 |
 
 ## Added
 
@@ -109,6 +156,8 @@ endpoint means anything.
 | SK-0014 | `original/lib/vssh/libssh.c:1483` | `Curl_debug` | CURLINFO_HEADER_OUT | the synthetic command line of the SSH session | _called in place_ | reproduce | DL-0116 |
 | SK-0015 | `original/lib/vssh/libssh2.c:788` | `Curl_debug` | CURLINFO_HEADER_OUT | the synthetic command line of the SSH session | _called in place_ | reproduce | DL-0116 |
 | SK-0016 | `original/lib/vtls/openssl.c:2556` | `Curl_debug` | CURLINFO_TEXT | handshake detail the backend writes as text | _called in place_ | reproduce | DL-0116 |
+| SK-0017 | `original/src/tool_ssls.c:105` | `warnf` | diagnostic | the rejected second field of a session record, which is the base64 text of a packed session ticket bounded only by the record bound | _called in place_ | reproduce | DL-0275 |
+| SK-0018 | `original/src/tool_ssls.c:181` | `warnf` | diagnostic | the peer key the export callback receives, which is the plaintext host and port with the transport, TLS version, TLS options and cipher lists, and the client certificate, key, issuer certificate, certificate authority and TLS-SRP username wherever set | _called in place_ | reproduce | DL-0275 |
 
 ## Disclosure shapes
 
@@ -175,8 +224,13 @@ project-authored Rust file against 16 instrumentation call shape(s).
 - `passwd`
 - `password`
 - `payload`
+- `peer_key`
+- `sdata`
 - `secret`
 - `session_id`
+- `session_key`
+- `shmac`
+- `ticket`
 - `token`
 - `user`
 - `username`

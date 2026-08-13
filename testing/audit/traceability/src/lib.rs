@@ -23,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 pub mod contract;
+pub mod errordocs;
 pub mod forward;
 pub mod hazards;
 pub mod observability;
@@ -69,6 +70,7 @@ pub fn generate(workspace: &Workspace, files: &dyn Files) -> AuditResult<Generat
     let hazard_rows = register.resolve(files, &planned, &decisions, &mut report);
     let coverage = register.coverage(files);
     let flow = observability.audit(files, &decisions, &mut report);
+    errordocs::audit(files, &mut report);
 
     let documents = render::documents(
         &index,

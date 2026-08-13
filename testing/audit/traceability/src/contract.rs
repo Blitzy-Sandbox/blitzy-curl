@@ -163,6 +163,31 @@ pub struct SilentOption {
     pub decision: String,
 }
 
+/// Dispositions a generator, harness or configuration asset may carry.
+///
+/// `DL-0273` records what each one means and why the vocabulary is closed.
+pub const HARNESS_DISPOSITIONS: [&str; 4] = [
+    "build-input",
+    "no-counterpart",
+    "replaced",
+    "source-reference",
+];
+
+/// One generator, harness or configuration asset and what answers for it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Harness {
+    /// Repository-relative path inside the oracle.
+    pub path: String,
+    /// What the asset is, in the oracle's own terms.
+    pub role: String,
+    /// How the project accounts for it, from [`HARNESS_DISPOSITIONS`].
+    pub disposition: String,
+    /// Target that answers for it, or `none` when nothing does.
+    pub target: String,
+    /// Decision the disposition rests on.
+    pub decision: String,
+}
+
 /// A symbol-register family and the crate that must define it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Family {
@@ -208,6 +233,8 @@ pub struct Ownership {
     pub silent_options: Vec<SilentOption>,
     /// Owner of each internal-surface case that includes no internal header.
     pub cases: BTreeMap<String, String>,
+    /// Generator, harness and configuration assets.
+    pub harness: Vec<Harness>,
     /// Symbol-register families.
     pub families: Vec<Family>,
     /// Target of each family the generator resolves without a per-row entry.
@@ -325,6 +352,18 @@ impl Ownership {
             });
         }
 
+        let mut harness = Vec::new();
+        for entry in array(value.get("harness"), "harness")? {
+            let at = field(entry, "path", "harness")?;
+            harness.push(Harness {
+                path: at.to_owned(),
+                role: field(entry, "role", at)?.to_owned(),
+                disposition: field(entry, "disposition", at)?.to_owned(),
+                target: field(entry, "target", at)?.to_owned(),
+                decision: field(entry, "decision", at)?.to_owned(),
+            });
+        }
+
         let mut families = Vec::new();
         for entry in array(value.get("family"), "family")? {
             families.push(Family {
@@ -375,14 +414,19 @@ impl Ownership {
             orphan_definitions,
             silent_options,
             cases: string_map(value.get("case"), "case")?,
+            harness,
             families,
             targets: string_map(value.get("target"), "target")?,
             decisions: string_map(value.get("decision"), "decision")?,
             reverse,
         };
-        if owned.units.is_empty() || owned.families.is_empty() || owned.reverse.is_empty() {
+        if owned.units.is_empty()
+            || owned.families.is_empty()
+            || owned.reverse.is_empty()
+            || owned.harness.is_empty()
+        {
             return Err(AuditError::new(format!(
-                "{path}: declares no unit, no family or no reverse entry"
+                "{path}: declares no unit, family, harness or reverse entry"
             )));
         }
         Ok(owned)
@@ -553,6 +597,12 @@ kind = "option"
 cli-option = "curl-cli"
 [decision]
 cli-option = "DL-0026"
+[[harness]]
+path = "original/src/mkhelp.pl"
+role = "help-text generator"
+disposition = "replaced"
+target = "curl-cli"
+decision = "DL-0273"
 [[reverse]]
 path = "Cargo.toml"
 derives-from = ["original/configure.ac"]
@@ -606,6 +656,30 @@ derives-from = ["original/configure.ac"]
             Some("curl-types")
         );
         assert_eq!(owned.owner_of("original/lib/nothing.c", &siblings), None);
+    }
+
+    #[test]
+    fn harness_declarations_load_whole_or_not_at_all() {
+        let owned = ownership();
+        assert_eq!(owned.harness.len(), 1);
+        let entry = &owned.harness[0];
+        assert_eq!(entry.path, "original/src/mkhelp.pl");
+        assert_eq!(entry.disposition, "replaced");
+        assert_eq!(entry.target, "curl-cli");
+        assert_eq!(entry.decision, "DL-0273");
+        // A declaration missing any field is an error rather than a default.
+        for field in ["role", "disposition", "target", "decision"] {
+            let text = OWNERSHIP.replace(&format!("\n{field} = "), "\nunread = ");
+            let files = MapFiles::new().with("data/ownership.toml", &text);
+            assert!(
+                Ownership::load(&files, "data/ownership.toml").is_err(),
+                "{field} is required"
+            );
+        }
+        // A map with no harness declaration at all is an error.
+        let text = OWNERSHIP.replace("[[harness]]", "[[unread]]");
+        let files = MapFiles::new().with("data/ownership.toml", &text);
+        assert!(Ownership::load(&files, "data/ownership.toml").is_err());
     }
 
     #[test]

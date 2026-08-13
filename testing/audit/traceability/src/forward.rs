@@ -159,6 +159,159 @@ fn count_reach(files: &dyn Files, whitelist: &BTreeSet<String>, reach: &str) -> 
         .count()
 }
 
+/// Resolves the generator, harness and configuration assets.
+///
+/// Both directions are gates: an enumerated asset with no declaration is a gap,
+/// and a declaration naming nothing enumerated is stale. `DL-0273` records the
+/// family.
+fn resolve_harness(
+    survey: &Survey,
+    ownership: &Ownership,
+    planned: &BTreeSet<String>,
+    decisions: &BTreeSet<String>,
+    forward: &mut Forward,
+    report: &mut Report,
+) {
+    report.assert(
+        !survey.harness.is_empty(),
+        "harness-asset/enumerated",
+        format!(
+            "{} asset(s) across {} root(s), {} registered by a build manifest",
+            survey.harness.len(),
+            crate::oracle::HARNESS_ROOTS.len(),
+            survey
+                .harness
+                .iter()
+                .filter(|asset| !asset.registration.is_empty())
+                .count()
+        ),
+    );
+
+    // A distribution word that names no file is recorded rather than dropped: it
+    // is a build product the vendored build writes, not an import that failed.
+    report.pass(
+        "harness-asset/manifest-words-without-a-file",
+        if survey.harness_absent.is_empty() {
+            "every distribution word names a file".to_owned()
+        } else {
+            format!(
+                "{} word(s) naming no file: {}",
+                survey.harness_absent.len(),
+                survey.harness_absent.join(", ")
+            )
+        },
+    );
+
+    let declared: BTreeMap<&str, &crate::contract::Harness> = ownership
+        .harness
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
+    report.assert(
+        declared.len() == ownership.harness.len(),
+        "harness-asset/declarations-unique",
+        format!(
+            "{} declaration(s) for {} distinct path(s)",
+            ownership.harness.len(),
+            declared.len()
+        ),
+    );
+
+    // A target is `none`, a planned member or a target the map already declares
+    // for a whole family, which is what admits the compatibility front end.
+    let known: BTreeSet<&str> = ownership
+        .targets
+        .values()
+        .map(String::as_str)
+        .chain(planned.iter().map(String::as_str))
+        .collect();
+    let mut undeclared = Vec::new();
+    let mut unaccountable = Vec::new();
+    for asset in &survey.harness {
+        let Some(entry) = declared.get(asset.path.as_str()) else {
+            undeclared.push(asset.path.clone());
+            continue;
+        };
+        if !crate::contract::HARNESS_DISPOSITIONS.contains(&entry.disposition.as_str())
+            || entry.role.trim().is_empty()
+            || !decisions.contains(&entry.decision)
+            || (entry.target != "none" && !known.contains(entry.target.as_str()))
+        {
+            unaccountable.push(asset.path.clone());
+        }
+        forward.rows.push(Row {
+            family: "harness-asset",
+            source: asset.path.clone(),
+            detail: format!(
+                "{}; registered {}",
+                entry.role,
+                if asset.registration.is_empty() {
+                    "nowhere".to_owned()
+                } else {
+                    format!("`{}`", asset.registration)
+                }
+            ),
+            target: entry.target.clone(),
+            disposition: entry.disposition.clone(),
+            decision: entry.decision.clone(),
+        });
+    }
+    report.assert(
+        undeclared.is_empty(),
+        "harness-asset/declared",
+        if undeclared.is_empty() {
+            format!(
+                "every enumerated asset carries a declaration, {} of them with no counterpart",
+                ownership
+                    .harness
+                    .iter()
+                    .filter(|entry| entry.target == "none")
+                    .count()
+            )
+        } else {
+            format!("no declaration: {}", undeclared.join(", "))
+        },
+    );
+    forward.gaps.extend(undeclared);
+
+    report.assert(
+        unaccountable.is_empty(),
+        "harness-asset/declarations-accountable",
+        if unaccountable.is_empty() {
+            format!(
+                "every declaration names a role, one of {} disposition(s), a known target and a resolving pointer",
+                crate::contract::HARNESS_DISPOSITIONS.len()
+            )
+        } else {
+            format!("incomplete: {}", unaccountable.join(", "))
+        },
+    );
+    forward.gaps.extend(unaccountable);
+
+    let enumerated: BTreeSet<&str> = survey
+        .harness
+        .iter()
+        .map(|asset| asset.path.as_str())
+        .collect();
+    let stale: Vec<&str> = declared
+        .keys()
+        .filter(|path| !enumerated.contains(*path))
+        .copied()
+        .collect();
+    report.assert(
+        stale.is_empty(),
+        "harness-asset/declarations-enumerated",
+        if stale.is_empty() {
+            "every declaration names an enumerated asset".to_owned()
+        } else {
+            format!("declared and not enumerated: {}", stale.join(", "))
+        },
+    );
+    forward
+        .gaps
+        .extend(stale.into_iter().map(|path| format!("{path}: stale")));
+}
+
 /// Resolves every family and records a check per gate.
 #[allow(clippy::too_many_lines)] // One gate per family; splitting hides the set. DL-0111
 pub fn resolve(
@@ -643,6 +796,10 @@ pub fn resolve(
     );
     forward.gaps.extend(unresolved_cases);
 
+    // Generators, harness and configuration assets: the class that carries no
+    // symbol, option or case number, so nothing else can enumerate it.
+    resolve_harness(survey, ownership, planned, decisions, &mut forward, report);
+
     // Orphan declarations: declared, defined nowhere, called nowhere.
     report.assert(
         !ownership.orphans.is_empty(),
@@ -832,6 +989,30 @@ exported-symbol = "DL-0007"
 cli-option = "DL-0026"
 writeout-variable = "DL-0026"
 build-flag = "DL-0016"
+[[harness]]
+path = "original/src/mkhelp.pl"
+role = "help-text generator"
+disposition = "replaced"
+target = "curl-cli"
+decision = "DL-0026"
+[[harness]]
+path = "original/src/Makefile.am"
+role = "build manifest"
+disposition = "build-input"
+target = "refactor/shim"
+decision = "DL-0016"
+[[harness]]
+path = "original/src/.gitignore"
+role = "repository metadata"
+disposition = "no-counterpart"
+target = "none"
+decision = "DL-0026"
+[[harness]]
+path = "original/lib/libcurl.def"
+role = "export list"
+disposition = "build-input"
+target = "refactor/shim"
+decision = "DL-0016"
 [[reverse]]
 path = "Cargo.toml"
 project-owned = true
@@ -879,6 +1060,9 @@ decision = "DL-0026"
                 "void Curl_reached(int a)\n{\n}\nvoid Curl_lonely(int a)\n{\n}\nvoid caller(void)\n{\n  Curl_reached(1);\n}\n",
             )
             .with("original/lib/sendf.h", "void Curl_reached(int a);\nvoid Curl_lonely(int a);\n")
+            .with("original/src/Makefile.am", "EXTRA_DIST = mkhelp.pl\n")
+            .with("original/src/mkhelp.pl", "")
+            .with("original/src/.gitignore", "")
     }
 
     fn ownership(text: &str, key: &str) -> Ownership {
@@ -933,6 +1117,106 @@ decision = "DL-0026"
         assert_eq!(forward.family("exported-symbol")[0].disposition, "c-thunk");
         assert_eq!(forward.family("internal-surface-case").len(), 1);
         assert_eq!(forward.family("orphan-declaration").len(), 1);
+        assert!(
+            rendered.contains("PASS harness-asset/declared"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("PASS harness-asset/declarations-enumerated"));
+        assert_eq!(forward.family("harness-asset").len(), 4);
+        let asset = forward.family("harness-asset")[3];
+        assert_eq!(asset.source, "original/src/mkhelp.pl");
+        assert_eq!(asset.disposition, "replaced");
+        assert_eq!(
+            asset.detail,
+            "help-text generator; registered `original/src/Makefile.am:1`"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_asset_is_a_gap_and_a_stale_declaration_fails() {
+        let files = oracle().with("original/tests/runtests.pl", "");
+        let survey = Survey::collect(&files);
+        let owned = ownership(OWNERSHIP, "asset");
+        let mut report = Report::new("test");
+        let forward = resolve(
+            &files,
+            &survey,
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
+        let rendered = report.render();
+        assert!(
+            rendered.contains("FAIL harness-asset/declared"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("runtests.pl"));
+        assert!(
+            forward
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("original/tests/runtests.pl"))
+        );
+
+        // The other direction: a declaration naming nothing enumerated.
+        let text = OWNERSHIP.replace("original/src/mkhelp.pl", "original/src/gone.pl");
+        let owned = ownership(&text, "stale-asset");
+        let mut report = Report::new("test");
+        let forward = resolve(
+            &oracle(),
+            &Survey::collect(&oracle()),
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
+        let rendered = report.render();
+        assert!(
+            rendered.contains("FAIL harness-asset/declarations-enumerated"),
+            "{rendered}"
+        );
+        assert!(forward.gaps.iter().any(|gap| gap.contains("gone.pl")));
+    }
+
+    #[test]
+    fn a_declaration_outside_the_disposition_vocabulary_fails() {
+        let text = OWNERSHIP.replace("disposition = \"replaced\"", "disposition = \"invented\"");
+        let files = oracle();
+        let survey = Survey::collect(&files);
+        let owned = ownership(&text, "vocabulary");
+        let mut report = Report::new("test");
+        let _ = resolve(
+            &files,
+            &survey,
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
+        let rendered = report.render();
+        assert!(
+            rendered.contains("FAIL harness-asset/declarations-accountable"),
+            "{rendered}"
+        );
+
+        // An unknown target is the same defect seen from the other field.
+        let text = OWNERSHIP.replace("target = \"curl-cli\"", "target = \"curl-nowhere\"");
+        let owned = ownership(&text, "target");
+        let mut report = Report::new("test");
+        let _ = resolve(
+            &files,
+            &survey,
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
+        assert!(
+            report
+                .render()
+                .contains("FAIL harness-asset/declarations-accountable")
+        );
     }
 
     #[test]

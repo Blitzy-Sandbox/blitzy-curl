@@ -11,10 +11,10 @@ direction, an unresolved locator or a dangling pointer fails the run. Do not
 edit this file by hand. Rationale lives in `refactor/docs/DECISION-LOG.md`.
 
 Bidirectional. The forward direction maps every construct the oracle carries to
-the target that owns it: **2439 row(s)** across **11 families**, with **0
+the target that owns it: **2517 row(s)** across **12 families**, with **0
 gap(s)**. The reverse direction maps every project-authored file back to the
 oracle construct it derives from, or to the decision that owns it outright:
-**45 row(s)**, with **0 gap(s)**. Both directions are gates, so a non-empty
+**46 row(s)**, with **0 gap(s)**. Both directions are gates, so a non-empty
 gap column cannot be committed.
 
 | Family | Enumerated from the oracle |
@@ -22,6 +22,7 @@ gap column cannot be committed.
 | `build-flag` | 232 |
 | `cli-option` | 283 |
 | `exported-symbol` | 100 |
+| `harness-asset` | 78 |
 | `internal-header` | 232 |
 | `internal-surface-case` | 83 |
 | `public-header` | 12 |
@@ -2502,6 +2503,89 @@ gap column cannot be committed.
 | 82 | `original/tests/unit/unit3304.c` | urldata.h, peer.h, vtls/vtls.h, vtls/vtls_scache.h | `curl-core, curl-tls, curl-types` | owned | planned | - |
 | 83 | `original/tests/unit/unit3400.c` | bufq.h, vquic/capsule.h | `curl-http3, curl-types` | owned | planned | - |
 
+### Generators, harness and configuration assets (`harness-asset`, 78 row(s))
+
+| # | Baseline construct | Detail | Target | Disposition | Status | Decision |
+|---:|---|---|---|---|---|---|
+| 1 | `original/lib/.gitignore` | repository metadata of the library folder; registered nowhere | _none_ | no-counterpart | - | DL-0273 |
+| 2 | `original/lib/CMakeLists.txt` | CMake build of the library; registered `original/lib/Makefile.am:29` | `refactor/shim` | build-input | planned | DL-0273 |
+| 3 | `original/lib/Makefile.am` | automake build of the library; registered `original/configure.ac:5482` | `refactor/shim` | build-input | planned | DL-0273 |
+| 4 | `original/lib/Makefile.inc` | source registration manifest of both build systems; registered `original/lib/Makefile.am:27` | `refactor/shim` | build-input | planned | DL-0273 |
+| 5 | `original/lib/Makefile.soname` | shared-object version arithmetic behind SONAME 4; registered `original/lib/Makefile.am:32` | `refactor/shim` | build-input | planned | DL-0273 |
+| 6 | `original/lib/curl_config-cmake.h.in` | CMake configuration-header template; registered `original/lib/Makefile.am:29` | `refactor/shim` | build-input | planned | DL-0273 |
+| 7 | `original/lib/libcurl.def` | Windows export definition of the library; registered `original/lib/Makefile.am:32` | `refactor/shim` | build-input | planned | DL-0273 |
+| 8 | `original/lib/libcurl.rc` | Windows resource script of the library; registered `original/lib/Makefile.inc:425` | `refactor/shim` | build-input | planned | DL-0273 |
+| 9 | `original/lib/libcurl.vers.in` | symbol version-map template; registered `original/configure.ac:5484` | `refactor/shim` | build-input | planned | DL-0273 |
+| 10 | `original/lib/optiontable.pl` | option-table generator over the public header; registered `original/lib/Makefile.am:33` | `curl-core` | replaced | planned | DL-0273 |
+| 11 | `original/src/.checksrc` | source-check configuration of the tool folder; registered `original/src/Makefile.am:32` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 12 | `original/src/.gitignore` | repository metadata of the tool folder; registered nowhere | _none_ | no-counterpart | - | DL-0273 |
+| 13 | `original/src/CMakeLists.txt` | CMake build of the tool; registered `original/src/Makefile.am:32` | `refactor/shim` | build-input | planned | DL-0273 |
+| 14 | `original/src/Makefile.am` | automake build of the tool; registered `original/configure.ac:5481` | `refactor/shim` | build-input | planned | DL-0273 |
+| 15 | `original/src/Makefile.inc` | source registration manifest of both build systems; registered `original/src/Makefile.am:30` | `refactor/shim` | build-input | planned | DL-0273 |
+| 16 | `original/src/curl.rc` | Windows resource script of the tool; registered `original/src/Makefile.inc:168` | `refactor/shim` | build-input | planned | DL-0273 |
+| 17 | `original/src/mk-file-embed.pl` | certificate-bundle embedding generator; registered `original/src/Makefile.am:32` | `curl-cli` | replaced | planned | DL-0273 |
+| 18 | `original/src/mkhelp.pl` | built-in manual generator over the option manual page; registered `original/src/Makefile.am:32` | `curl-cli` | replaced | planned | DL-0273 |
+| 19 | `original/tests/.gitignore` | repository metadata of the test folder; registered nowhere | _none_ | no-counterpart | - | DL-0273 |
+| 20 | `original/tests/CMakeLists.txt` | CMake build of the test tree; registered `original/tests/Makefile.am:48` | `upstream-suite` | build-input | planned | DL-0273 |
+| 21 | `original/tests/Makefile.am` | automake build of the test tree; registered `original/configure.ac:5485` | `upstream-suite` | build-input | planned | DL-0273 |
+| 22 | `original/tests/allversions.pm` | version-matrix helper of the driver; registered `original/tests/Makefile.am:49` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 23 | `original/tests/appveyor.pm` | AppVeyor result reporting of the driver; registered `original/tests/Makefile.am:50` | `upstream-suite` | source-reference | planned | DL-0282 |
+| 24 | `original/tests/azure.pm` | Azure Pipelines result reporting of the driver; registered `original/tests/Makefile.am:51` | `upstream-suite` | source-reference | planned | DL-0282 |
+| 25 | `original/tests/config.in` | driver configuration template the configure step substitutes; registered `original/configure.ac:5486` | `upstream-suite` | build-input | planned | DL-0273 |
+| 26 | `original/tests/configurehelp.pm.in` | build-configuration module the configure step substitutes; registered `original/configure.ac:5487` | `upstream-suite` | build-input | planned | DL-0273 |
+| 27 | `original/tests/devtest.pl` | harness-internals probe for developers; registered `original/tests/Makefile.am:52` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 28 | `original/tests/dictserver.py` | DICT test server; registered `original/tests/Makefile.am:53` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 29 | `original/tests/directories.pm` | directory-listing helper of the FTP server; registered `original/tests/Makefile.am:54` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 30 | `original/tests/ech_combos.py` | ECH configuration combination generator; registered `original/tests/Makefile.am:55` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 31 | `original/tests/ech_tests.sh` | ECH test runner over the driver; registered `original/tests/Makefile.am:56` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 32 | `original/tests/ftpserver.pl` | FTP, IMAP, POP3 and SMTP test server; registered `original/tests/Makefile.am:57` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 33 | `original/tests/getpart.pm` | test-descriptor parser of the driver; registered `original/tests/Makefile.am:58` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 34 | `original/tests/globalconfig.pm` | global configuration of the driver; registered `original/tests/Makefile.am:59` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 35 | `original/tests/http-server.pl` | HTTP test server front end; registered `original/tests/Makefile.am:60` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 36 | `original/tests/http2-server.pl` | HTTP/2 test server front end; registered `original/tests/Makefile.am:61` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 37 | `original/tests/http3-server.pl` | HTTP/3 test server front end; registered `original/tests/Makefile.am:62` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 38 | `original/tests/memanalyze.pl` | allocation-accounting report of the driver; registered `original/tests/Makefile.am:63` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 39 | `original/tests/memanalyzer.pm` | allocation-accounting module of the driver; registered `original/tests/Makefile.am:64` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 40 | `original/tests/negtelnetserver.py` | Telnet negotiation test server; registered `original/tests/Makefile.am:65` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 41 | `original/tests/nghttpx.conf` | HTTP/2 proxy configuration of the test servers; registered `original/tests/Makefile.am:66` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 42 | `original/tests/pathhelp.pm` | path-translation helper of the driver; registered `original/tests/Makefile.am:67` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 43 | `original/tests/processhelp.pm` | process-control helper of the driver; registered `original/tests/Makefile.am:68` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 44 | `original/tests/requirements.txt` | python requirements of the driver helpers; registered `original/tests/Makefile.am:69` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 45 | `original/tests/rtspserver.pl` | RTSP test server front end; registered `original/tests/Makefile.am:70` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 46 | `original/tests/runner.pm` | per-runner execution module of the driver; registered `original/tests/Makefile.am:71` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 47 | `original/tests/runtests.pl` | the upstream test driver, invoked unmodified; registered `original/tests/Makefile.am:72` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 48 | `original/tests/secureserver.pl` | TLS tunnel front end of the test servers; registered `original/tests/Makefile.am:73` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 49 | `original/tests/serverhelp.pm` | server naming and logging helper; registered `original/tests/Makefile.am:74` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 50 | `original/tests/servers.pm` | test-server lifecycle module of the driver; registered `original/tests/Makefile.am:75` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 51 | `original/tests/smbserver.py` | SMB test server; registered `original/tests/Makefile.am:76` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 52 | `original/tests/sshhelp.pm` | SSH server configuration helper; registered `original/tests/Makefile.am:77` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 53 | `original/tests/sshserver.pl` | SSH test server front end; registered `original/tests/Makefile.am:78` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 54 | `original/tests/test1119.pl` | case helper comparing symbols-in-versions against the public headers; registered `original/tests/Makefile.am:27` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 55 | `original/tests/test1135.pl` | case helper comparing the export list against the public headers; registered `original/tests/Makefile.am:28` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 56 | `original/tests/test1139.pl` | case helper comparing the documented option set against the manual pages; registered `original/tests/Makefile.am:29` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 57 | `original/tests/test1140.pl` | case helper comparing manual-page formatting of the option pages; registered `original/tests/Makefile.am:30` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 58 | `original/tests/test1165.pl` | case helper comparing the disable-flag surface across both build systems; registered `original/tests/Makefile.am:31` | `upstream-suite` | source-reference | planned | DL-0262 |
+| 59 | `original/tests/test1167.pl` | case helper comparing the global-symbol prefix rule over the library sources; registered `original/tests/Makefile.am:32` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 60 | `original/tests/test1173.pl` | case helper comparing manual-page syntax over the whole documentation set; registered `original/tests/Makefile.am:33` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 61 | `original/tests/test1175.pl` | case helper comparing symbols-in-versions against the documented error set; registered `original/tests/Makefile.am:34` | `upstream-suite` | source-reference | planned | DL-0280 |
+| 62 | `original/tests/test1177.pl` | case helper comparing the feature-macro list against the public header; registered `original/tests/Makefile.am:35` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 63 | `original/tests/test1222.pl` | case helper comparing option-page consistency against the option list; registered `original/tests/Makefile.am:36` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 64 | `original/tests/test1275.pl` | case helper comparing markdown link syntax across the documentation set; registered `original/tests/Makefile.am:37` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 65 | `original/tests/test1276.pl` | case helper comparing the manual-page reference set across the documentation; registered `original/tests/Makefile.am:38` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 66 | `original/tests/test1477.pl` | case helper comparing the error-code set against the documented list; registered `original/tests/Makefile.am:39` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 67 | `original/tests/test1486.pl` | case helper comparing source-code style over the whole tree; registered `original/tests/Makefile.am:40` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 68 | `original/tests/test1488.pl` | case helper comparing the option-page cross-reference set; registered `original/tests/Makefile.am:41` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 69 | `original/tests/test1544.pl` | case helper comparing the header-guard convention over the public headers; registered `original/tests/Makefile.am:42` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 70 | `original/tests/test1707.pl` | case helper comparing the documented option set against the alias table; registered `original/tests/Makefile.am:43` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 71 | `original/tests/test745.pl` | case helper comparing the manual-page option sections against the tool; registered `original/tests/Makefile.am:44` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 72 | `original/tests/test971.pl` | case helper comparing the option manual pages against the alias table; registered `original/tests/Makefile.am:45` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 73 | `original/tests/testcurl.pl` | autobuild build-and-test cycle, reference material only; registered `original/tests/Makefile.am:79` | `upstream-suite` | source-reference | planned | DL-0270 |
+| 74 | `original/tests/testutil.pm` | shared utility module of the driver; registered `original/tests/Makefile.am:80` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 75 | `original/tests/tftpserver.pl` | TFTP test server front end; registered `original/tests/Makefile.am:81` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 76 | `original/tests/util.py` | shared helper of the python test servers; registered `original/tests/Makefile.am:82` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 77 | `original/tests/valgrind.pm` | valgrind report parser of the driver; registered `original/tests/Makefile.am:83` | `upstream-suite` | source-reference | planned | DL-0273 |
+| 78 | `original/tests/valgrind.supp` | valgrind suppression set of the test tree; registered `original/tests/Makefile.am:84` | `upstream-suite` | source-reference | planned | DL-0273 |
+
 ### Orphan declarations (`orphan-declaration`, 1 row(s))
 
 | # | Baseline construct | Detail | Target | Disposition | Status | Decision |
@@ -2566,14 +2650,15 @@ gap column cannot be committed.
 | 35 | `testing/audit/traceability/data/ownership.toml` | no oracle counterpart | project-owned | DL-0111 |
 | 36 | `testing/audit/traceability/src/bin/traceability.rs` | no oracle counterpart | project-owned | DL-0111 |
 | 37 | `testing/audit/traceability/src/contract.rs` | no oracle counterpart | project-owned | DL-0111 |
-| 38 | `testing/audit/traceability/src/forward.rs` | original/lib/Makefile.inc, original/docs/libcurl/symbols-in-versions | derived | - |
-| 39 | `testing/audit/traceability/src/hazards.rs` | no oracle counterpart | project-owned | DL-0110 |
-| 40 | `testing/audit/traceability/src/lib.rs` | no oracle counterpart | project-owned | DL-0111 |
-| 41 | `testing/audit/traceability/src/observability.rs` | no oracle counterpart | project-owned | DL-0232 |
-| 42 | `testing/audit/traceability/src/oracle.rs` | original/lib/libcurl.def, original/src/tool_getparam.c, original/src/tool_writeout.c | derived | - |
-| 43 | `testing/audit/traceability/src/render.rs` | no oracle counterpart | project-owned | DL-0111 |
-| 44 | `testing/audit/traceability/src/reverse.rs` | no oracle counterpart | project-owned | DL-0111 |
-| 45 | `testing/upstream-suite/baseline-bootstrap` | no oracle counterpart | project-owned | DL-0033 |
+| 38 | `testing/audit/traceability/src/errordocs.rs` | original/tests/test1175.pl, original/docs/libcurl/symbols-in-versions, original/docs/libcurl/libcurl-errors.md | derived | - |
+| 39 | `testing/audit/traceability/src/forward.rs` | original/lib/Makefile.inc, original/docs/libcurl/symbols-in-versions | derived | - |
+| 40 | `testing/audit/traceability/src/hazards.rs` | no oracle counterpart | project-owned | DL-0110 |
+| 41 | `testing/audit/traceability/src/lib.rs` | no oracle counterpart | project-owned | DL-0111 |
+| 42 | `testing/audit/traceability/src/observability.rs` | no oracle counterpart | project-owned | DL-0232 |
+| 43 | `testing/audit/traceability/src/oracle.rs` | original/lib/libcurl.def, original/src/tool_getparam.c, original/src/tool_writeout.c | derived | - |
+| 44 | `testing/audit/traceability/src/render.rs` | no oracle counterpart | project-owned | DL-0111 |
+| 45 | `testing/audit/traceability/src/reverse.rs` | no oracle counterpart | project-owned | DL-0111 |
+| 46 | `testing/upstream-suite/baseline-bootstrap` | no oracle counterpart | project-owned | DL-0033 |
 
 ## Gaps
 

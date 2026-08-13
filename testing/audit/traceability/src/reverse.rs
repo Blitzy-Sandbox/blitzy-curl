@@ -223,6 +223,12 @@ schema = 1
 prefix = "CURL_"
 owner = "curl-abi"
 kind = "constant"
+[[harness]]
+path = "original/src/mkhelp.pl"
+role = "help-text generator"
+disposition = "replaced"
+target = "curl-cli"
+decision = "DL-0273"
 "#;
 
     fn ownership(reverse: &str) -> Ownership {
