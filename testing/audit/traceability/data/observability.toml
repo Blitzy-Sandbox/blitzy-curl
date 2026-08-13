@@ -816,6 +816,78 @@ line = 230
 evidence = "MEM %s:%d malloc(%zu) = %p"
 decision = "DL-0287"
 
+[[reused]]
+element = "build reporting"
+surface = "documentation link check report-only mode; the only flag it takes"
+path = "original/scripts/mdlinkcheck"
+line = 87
+evidence = "$ARGV[0] eq \"--dry-run\""
+decision = "DL-0288"
+
+[[reused]]
+element = "build reporting"
+surface = "per-link reachable result of that checker; vendored, not executed here"
+path = "original/scripts/mdlinkcheck"
+line = 201
+evidence = "print \"OK: $url\\n\""
+decision = "DL-0288"
+
+[[reused]]
+element = "build reporting"
+surface = "per-link unreachable result of that checker; not executed here"
+path = "original/scripts/mdlinkcheck"
+line = 198
+evidence = "print \"FAIL: $url\\n\""
+decision = "DL-0288"
+
+[[reused]]
+element = "build reporting"
+surface = "stale-allowlist warning that checker writes to standard error"
+path = "original/scripts/mdlinkcheck"
+line = 214
+evidence = "warning: unused whitelist entry"
+decision = "DL-0288"
+
+[[reused]]
+element = "build reporting"
+surface = "checked-link count closing that report"
+path = "original/scripts/mdlinkcheck"
+line = 247
+evidence = "Checked %d URLs"
+decision = "DL-0288"
+
+[[reused]]
+element = "build reporting"
+surface = "finding naming the file and line that links to a missing URL"
+path = "original/scripts/mdlinkcheck"
+line = 232
+evidence = "ERROR links to missing URL"
+decision = "DL-0288"
+
+[[reused]]
+element = "build reporting"
+surface = "finding naming the file and line that links to a missing file"
+path = "original/scripts/mdlinkcheck"
+line = 241
+evidence = "ERROR links to missing file"
+decision = "DL-0288"
+
+[[reused]]
+element = "build reporting"
+surface = "probe identity that checker presents when it reaches the network"
+path = "original/scripts/mdlinkcheck"
+line = 193
+evidence = "Mozilla/curl.se link-probe"
+decision = "DL-0288"
+
+[[reused]]
+element = "build reporting"
+surface = "exit status a consumer of that report reads"
+path = "original/scripts/mdlinkcheck"
+line = 254
+evidence = "exit 1 if($error);"
+decision = "DL-0288"
+
 # What this project adds. Nothing here changes a byte of the reused surfaces.
 [[added]]
 element = "distributed tracing"

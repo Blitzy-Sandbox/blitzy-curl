@@ -12,7 +12,7 @@ edit this file by hand. Rationale lives in `refactor/docs/DECISION-LOG.md`.
 
 What the vendored oracle already provides and the port reuses, what this project
 adds on top of it, and every place a value the oracle writes to a diagnostic
-surface is a credential. **88 reused surface(s)** across **11 element(s)**,
+surface is a credential. **97 reused surface(s)** across **11 element(s)**,
 **5 added element(s)**, **18 sink(s)** and **17 declared disclosure(s)**.
 
 Reuse is verified rather than claimed: every reused surface is read at the tag
@@ -125,6 +125,15 @@ endpoint means anything.
 | memory and torture diagnostics | per-case counters compared against the case's limits | `original/tests/runtests.pl:1821` | `memanalyze("$logdir/$MEMDUMP", 1, 0, 0)` | DL-0287 |
 | memory and torture diagnostics | limit line the oracle writes for that analyser | `original/lib/memdebug.c:193` | `LIMIT %s:%d %s reached memlimit` | DL-0287 |
 | memory and torture diagnostics | allocation line the oracle writes for that analyser | `original/lib/memdebug.c:230` | `MEM %s:%d malloc(%zu) = %p` | DL-0287 |
+| build reporting | documentation link check report-only mode; the only flag it takes | `original/scripts/mdlinkcheck:87` | `$ARGV[0] eq "--dry-run"` | DL-0288 |
+| build reporting | per-link reachable result of that checker; vendored, not executed here | `original/scripts/mdlinkcheck:201` | `print "OK: $url\n"` | DL-0288 |
+| build reporting | per-link unreachable result of that checker; not executed here | `original/scripts/mdlinkcheck:198` | `print "FAIL: $url\n"` | DL-0288 |
+| build reporting | stale-allowlist warning that checker writes to standard error | `original/scripts/mdlinkcheck:214` | `warning: unused whitelist entry` | DL-0288 |
+| build reporting | checked-link count closing that report | `original/scripts/mdlinkcheck:247` | `Checked %d URLs` | DL-0288 |
+| build reporting | finding naming the file and line that links to a missing URL | `original/scripts/mdlinkcheck:232` | `ERROR links to missing URL` | DL-0288 |
+| build reporting | finding naming the file and line that links to a missing file | `original/scripts/mdlinkcheck:241` | `ERROR links to missing file` | DL-0288 |
+| build reporting | probe identity that checker presents when it reaches the network | `original/scripts/mdlinkcheck:193` | `Mozilla/curl.se link-probe` | DL-0288 |
+| build reporting | exit status a consumer of that report reads | `original/scripts/mdlinkcheck:254` | `exit 1 if($error);` | DL-0288 |
 
 ## Added
 

@@ -622,6 +622,34 @@ delivered = "vendored-at-tag-path"                                    # DL-0271
 flag-contract = "none"
 decision = "DL-0271"
 
+# The tag's link checker differs from the plan's copy.                 DL-0288
+# One flag only; no usage text at the tag.                             DL-0288
+[workspace.metadata.curl.baseline-premise-deltas.mdlinkcheck]
+plan-premise = "scripts/mdlinkcheck as a 7368-byte pre-restructure worktree copy carrying one trailing-whitespace line and a usage-printing help flag"
+absent-paths = ["scripts/mdlinkcheck"]
+present-paths = [
+  "original/scripts/mdlinkcheck",
+  "original/scripts/Makefile.am",
+  "original/.github/workflows/checkurls.yml",
+  "original/.github/labeler.yml",
+]
+evidence = [
+  { path = "original/scripts/mdlinkcheck", line = 1, contains = "#!/usr/bin/env perl" },
+  { path = "original/scripts/mdlinkcheck", line = 22, contains = "SPDX-License-Identifier: curl" },
+  { path = "original/scripts/mdlinkcheck", line = 43, contains = "'https://curl.se/docs/caextract.html' => 1," },
+  { path = "original/scripts/mdlinkcheck", line = 87, contains = 'if(defined $ARGV[0] && $ARGV[0] eq "--dry-run") {' },
+  { path = "original/scripts/mdlinkcheck", line = 93, contains = "my @files = qx(git ls-files docs include lib scripts src);" },
+  { path = "original/scripts/mdlinkcheck", line = 157, contains = 'open(F, "<:crlf", $f) or' },
+  { path = "original/scripts/mdlinkcheck", line = 254, contains = "exit 1 if($error);" },
+  { path = "original/scripts/Makefile.am", line = 28, contains = "cmakelint.sh mdlinkcheck CMakeLists.txt" },
+  { path = "original/.github/workflows/checkurls.yml", line = 39, contains = "run: ./scripts/mdlinkcheck --dry-run" },
+  { path = "original/.github/workflows/checkurls.yml", line = 43, contains = "run: ./scripts/mdlinkcheck" },
+  { path = "original/.github/labeler.yml", line = 213, contains = "scripts/mdlinkcheck," },
+]
+delivered = "vendored-at-tag-path"                                    # DL-0288
+flag-contract = "none"
+decision = "DL-0288"
+
 # Index of the traceability generator; the data lives with it.         DL-0111
 # Hazard verdicts, owners and evidence: data/hazards.toml.             DL-0110
 [workspace.metadata.curl.traceability]
