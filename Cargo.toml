@@ -556,6 +556,41 @@ delivered = "absorbed-upstream"                                       # DL-0050
 flag-contract = "none"
 decision = "DL-0050"
 
+# Umbrella curlx include and tool ftruncate shim predate the tag.      DL-0172
+[workspace.metadata.curl.baseline-premise-deltas.tool-setup-header]
+plan-premise = "original/src/tool_setup.h including <curlx/curlx.h> and defining tool_ftruncate64, ftruncate, HAVE_FTRUNCATE and USE_TOOL_FTRUNCATE"
+absent-paths = ["original/lib/curlx/curlx.h"]
+present-paths = [
+  "original/src/tool_setup.h",
+  "original/src/tool_util.c",
+  "original/lib/curlx/base64.h",
+  "original/lib/curlx/dynbuf.h",
+  "original/lib/curlx/fopen.h",
+  "original/lib/curlx/multibyte.h",
+  "original/lib/curlx/strcopy.h",
+  "original/lib/curlx/strdup.h",
+  "original/lib/curlx/strerr.h",
+  "original/lib/curlx/strparse.h",
+  "original/lib/curlx/timediff.h",
+  "original/lib/curlx/timeval.h",
+  "original/lib/curlx/wait.h",
+]
+evidence = [
+  { path = "original/src/tool_setup.h", line = 40, contains = '#include "curl_setup.h" /* from the lib directory */' },
+  { path = "original/src/tool_setup.h", line = 48, contains = '#include "curlx/base64.h"' },
+  { path = "original/src/tool_setup.h", line = 58, contains = '#include "curlx/wait.h"' },
+  { path = "original/src/tool_setup.h", line = 73, contains = "#define UNPRINTABLE_CHAR '.'" },
+  { path = "original/src/tool_setup.h", line = 100, contains = "int toolx_ftruncate_win32(int fd, curl_off_t where);" },
+  { path = "original/src/tool_setup.h", line = 108, contains = "#define toolx_ftruncate ftruncate" },
+  { path = "original/src/tool_util.c", line = 85, contains = "int toolx_ftruncate_win32(int fd, curl_off_t where)" },
+  { path = "original/src/tool_cb_dbg.c", line = 108, contains = "UNPRINTABLE_CHAR" },
+  { path = "original/src/Makefile.inc", line = 155, contains = "tool_setup.h" },
+  { path = "original/lib/Makefile.inc", line = 48, contains = "curlx/base64.h" },
+]
+delivered = "absorbed-upstream"                                       # DL-0172
+flag-contract = "none"
+decision = "DL-0172"
+
 # Index of the traceability generator; the data lives with it.         DL-0111
 # Hazard verdicts, owners and evidence: data/hazards.toml.             DL-0110
 [workspace.metadata.curl.traceability]
@@ -626,6 +661,7 @@ filter-registration = "&Curl_cft_<name>,"                             # DL-0039
 
 # One entry per vendored path; owners are planned members.            DL-0138
 # Metrics are re-measured on every run.                               DL-0138
+
 [[workspace.metadata.curl.provenance.owners]]
 path = "original/lib/cf-dns.c"
 kind = "translation-unit"
@@ -753,6 +789,27 @@ lines = 110
 type-definitions = 1
 
 [[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/pop3.c"
+kind = "translation-unit"
+crate = "refactor/curl-proto-pop3"
+decision = "DL-0176"
+manifest-line = 250
+lines = 1717
+function-definitions = 42
+trace-calls = 0
+infof-calls = 6
+failf-calls = 7
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/pop3.h"
+kind = "header"
+crate = "refactor/curl-proto-pop3"
+decision = "DL-0176"
+manifest-line = 385
+lines = 30
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
 path = "original/lib/protocol.h"
 kind = "header"
 crate = "refactor/curl-types"
@@ -769,3 +826,154 @@ decision = "DL-0143"
 manifest-line = 388
 lines = 59
 type-definitions = 1
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/rand.c"
+kind = "translation-unit"
+crate = "refactor/curl-types"
+decision = "DL-0159"
+manifest-line = 255
+lines = 246
+function-definitions = 5
+trace-calls = 0
+infof-calls = 2
+failf-calls = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/rand.h"
+kind = "header"
+crate = "refactor/curl-types"
+decision = "DL-0161"
+manifest-line = 390
+lines = 58
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/rtsp.c"
+kind = "translation-unit"
+crate = "refactor/curl-proto-rtsp"
+decision = "DL-0180"
+manifest-line = 258
+lines = 1057
+function-definitions = 16
+trace-calls = 0
+infof-calls = 10
+failf-calls = 15
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/rtsp.h"
+kind = "header"
+crate = "refactor/curl-proto-rtsp"
+decision = "DL-0051"
+manifest-line = 393
+lines = 33
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/setopt.c"
+kind = "translation-unit"
+crate = "refactor/curl-core"
+decision = "DL-0173"
+manifest-line = 261
+lines = 2952
+function-definitions = 43
+trace-calls = 0
+infof-calls = 2
+failf-calls = 1
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/setopt.h"
+kind = "header"
+crate = "refactor/curl-core"
+decision = "DL-0173"
+manifest-line = 396
+lines = 40
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/socketpair.c"
+kind = "translation-unit"
+crate = "refactor/curl-core"
+decision = "DL-0157"
+manifest-line = 266
+lines = 364
+function-definitions = 8
+trace-calls = 0
+infof-calls = 0
+failf-calls = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/socketpair.h"
+kind = "header"
+crate = "refactor/curl-core"
+decision = "DL-0157"
+manifest-line = 405
+lines = 43
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/socks.c"
+kind = "translation-unit"
+crate = "refactor/curl-core"
+decision = "DL-0152"
+manifest-line = 267
+lines = 1391
+function-definitions = 23
+trace-calls = 11
+infof-calls = 3
+failf-calls = 39
+filter = "Curl_cft_socks_proxy"
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/socks.h"
+kind = "header"
+crate = "refactor/curl-core"
+decision = "DL-0152"
+manifest-line = 406
+lines = 69
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/socks_sspi.c"
+kind = "translation-unit"
+crate = "refactor/curl-auth"
+decision = "DL-0155"
+manifest-line = 269
+lines = 537
+function-definitions = 7
+trace-calls = 0
+infof-calls = 3
+failf-calls = 22
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/strequal.c"
+kind = "translation-unit"
+crate = "refactor/curl-types"
+decision = "DL-0153"
+manifest-line = 272
+lines = 95
+function-definitions = 4
+trace-calls = 0
+infof-calls = 0
+failf-calls = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/uint-spbset.c"
+kind = "translation-unit"
+crate = "refactor/curl-types"
+decision = "DL-0145"
+manifest-line = 282
+lines = 253
+function-definitions = 12
+trace-calls = 0
+infof-calls = 0
+failf-calls = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/lib/uint-spbset.h"
+kind = "header"
+crate = "refactor/curl-types"
+decision = "DL-0145"
+manifest-line = 418
+lines = 91
+type-definitions = 2

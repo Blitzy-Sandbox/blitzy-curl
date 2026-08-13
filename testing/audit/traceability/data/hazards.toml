@@ -1050,3 +1050,696 @@ owner = "curl-auth"
 verification = "Known-answer vectors plus a test that inspects the state immediately before release."
 status = "obligation"
 decision = "DL-0115"
+
+[[hazard]]
+id = "HZ-0096"
+path = "original/lib/uint-spbset.c"
+lines = [223, 253]
+behaviour = "Ordered iteration increments the caller's value before it searches, so a set holding UINT32_MAX keeps answering UINT32_MAX and the walk never terminates, and a call carrying the exhaustion sentinel back in restarts at the smallest member instead of reporting the set exhausted."
+verdict = "reproduce"
+owner = "curl-types"
+verification = "Rust-native equivalence test over ordered iteration with UINT32_MAX stored and with the exhaustion sentinel passed back in, asserting the oracle's own measured answers under a bounded guard."
+status = "obligation"
+decision = "DL-0145"
+
+[[hazard]]
+id = "HZ-0097"
+path = "original/lib/tftp.c"
+lines = [347, 383]
+behaviour = "The block number wraps at an unsigned 16-bit boundary, and the transmit path additionally accepts an acknowledgement for 65535 while it is expecting block 0, a workaround for a third-party server that the receive path does not carry."
+verdict = "reproduce"
+owner = "curl-proto-tftp"
+verification = "Differential transfer crossing the 65535-block boundary, asserting the acknowledgement is accepted rather than retried, plus a receive-side test asserting an unexpected data block is logged and retried rather than accepted."
+status = "obligation"
+decision = "DL-0147"
+
+[[hazard]]
+id = "HZ-0098"
+path = "original/lib/transfer.c"
+lines = [258, 267]
+behaviour = "The rate-limited receive comment describes breaking out once the loop already has data and less than 16k of allowance is left, but the code breaks only when the allowance is exhausted and otherwise clamps the read length to it, so the described stutter threshold does not exist."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Differential comparison of read lengths, write-callback counts and elapsed pacing over a --limit-rate download."
+status = "obligation"
+decision = "DL-0148"
+
+[[hazard]]
+id = "HZ-0099"
+path = "original/lib/transfer.c"
+lines = [228, 313]
+behaviour = "The receive loop counter is initialised to ten and tested by post-decrement in a do-while, so the body runs eleven times per invocation rather than ten before the loop yields."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Counting receive attempts and write-callback batches per curl_multi_socket_action call against the oracle."
+status = "obligation"
+decision = "DL-0148"
+
+[[hazard]]
+id = "HZ-0100"
+path = "original/lib/mqtt.c"
+lines = [605, 627]
+behaviour = "The remaining-length decoder rejects a fifth continuation byte and a field whose last byte still carries the continuation bit, and rejects an empty field through that same predicate; the decoded value is bounded only by the four-byte cap."
+verdict = "reproduce"
+owner = "curl-proto-mqtt"
+verification = "Varint boundary test over the one to four byte encodings, the five-byte encoding, a field truncated after each byte and an empty field, asserting the reject decision and the decoded value."
+status = "obligation"
+decision = "DL-0150"
+
+[[hazard]]
+id = "HZ-0101"
+path = "original/lib/mqtt.c"
+lines = [876, 893]
+behaviour = "An end of stream part way through the remaining-length field leaves a partial field that the decoder then rejects, so a truncated fixed header is reported as a weird server reply rather than as a receive or partial-file error."
+verdict = "reproduce"
+owner = "curl-proto-mqtt"
+verification = "Broker-side truncation test cutting the connection after the first byte and after each remaining-length byte, asserting the reported code against both trees."
+status = "obligation"
+decision = "DL-0150"
+
+[[hazard]]
+id = "HZ-0102"
+path = "original/lib/mqtt.c"
+lines = [172, 186]
+behaviour = "The remaining-length encoder emits no byte at all for a zero length and returns a zero count, and it silently drops the high bits of a value needing a fifth byte; the callers bound the value instead, and the publish path bounds it only after the encoder has run."
+verdict = "reproduce"
+owner = "curl-proto-mqtt"
+verification = "Direct encoder test over zero, each byte-count boundary and a value past the four-byte cap, since no caller reaches the zero case."
+status = "obligation"
+decision = "DL-0150"
+
+[[hazard]]
+id = "HZ-0103"
+path = "original/lib/mqtt.c"
+lines = [296, 344]
+behaviour = "Four faults of the client's own making are reported as a weird server reply: an over-large connect packet, a client-identifier length mismatch, an over-long username and an over-long password."
+verdict = "reproduce"
+owner = "curl-proto-mqtt"
+verification = "Error-code table test driving each of the four faults and asserting the code, the message and the exit status against both binaries."
+status = "obligation"
+decision = "DL-0151"
+
+[[hazard]]
+id = "HZ-0104"
+path = "original/lib/mqtt.c"
+lines = [308, 316]
+behaviour = "The random draw that fills the client identifier has its result stored and then not consulted, so a failed draw is overwritten and reported as a client-identifier length mismatch instead of as the random-source failure."
+verdict = "reproduce"
+owner = "curl-proto-mqtt"
+verification = "Fault-injected random-source failure asserting the reported code and message, plus a connect-bytes comparison under the deterministic entropy override."
+status = "obligation"
+decision = "DL-0151"
+
+[[hazard]]
+id = "HZ-0105"
+path = "original/lib/mqtt.c"
+lines = [247, 264]
+behaviour = "The connect packet always advertises a sixty-second keep-alive although the comment above the two bytes says the value disables it, and no option changes it; ping requests are driven by the upkeep interval instead."
+verdict = "reproduce"
+owner = "curl-proto-mqtt"
+verification = "Byte comparison of the emitted connect packet across both trees, and a ping-cadence test driven by the upkeep interval."
+status = "obligation"
+decision = "DL-0151"
+
+[[hazard]]
+id = "HZ-0106"
+path = "original/lib/mqtt.c"
+lines = [401, 433]
+behaviour = "A connect acknowledgement whose remaining length is not two is rejected before its bytes are read, and any non-zero broker return code then collapses to a weird server reply with the two bytes printed and no reason mapped."
+verdict = "reproduce"
+owner = "curl-proto-mqtt"
+verification = "Broker-side test returning each defined acknowledgement return code and a wrong remaining length, asserting one code and the printed bytes."
+status = "obligation"
+decision = "DL-0151"
+
+[[hazard]]
+id = "HZ-0107"
+path = "original/lib/mqtt.c"
+lines = [505, 541]
+behaviour = "A subscribe acknowledgement whose remaining length is not three is rejected with a message, while a packet-identifier or return-code mismatch is rejected with the same code and no message at all."
+verdict = "reproduce"
+owner = "curl-proto-mqtt"
+verification = "Broker-side test returning a mismatched packet identifier, a failure return code and a wrong remaining length, asserting the code and the presence or absence of the message."
+status = "obligation"
+decision = "DL-0151"
+
+[[hazard]]
+id = "HZ-0108"
+path = "original/lib/mqtt.c"
+lines = [435, 451]
+behaviour = "The topic is URL-decoded with the do-nothing reject setting and bounded only by length, so a percent-encoded zero byte or control byte reaches the wire verbatim while the topic is also handed to a C string length call."
+verdict = "reproduce"
+owner = "curl-proto-mqtt"
+verification = "Subscribe and publish byte comparison over topics carrying a percent-encoded zero byte, control bytes and non-ASCII bytes, plus the over-long topic boundary."
+status = "obligation"
+decision = "DL-0150"
+
+[[hazard]]
+id = "HZ-0109"
+path = "original/lib/mqtt.c"
+lines = [545, 567]
+behaviour = "Publishing takes its payload only from the post-fields option and has no read-callback path, and a missing payload is reported with a bad-argument code whose only message is inside a debug-build macro."
+verdict = "reproduce"
+owner = "curl-proto-mqtt"
+verification = "Publish test with the payload absent and with an upload requested through the read callback, asserting the code and the message in both a debug and a release configuration."
+status = "obligation"
+decision = "DL-0151"
+
+[[hazard]]
+id = "HZ-0110"
+path = "original/lib/mqtt.c"
+lines = [709, 753]
+behaviour = "Each published message resets the download size, the byte counter and the request size, and the raw packet remainder is written to the client, so a subscription delivers the two-byte topic length, then the topic, then the payload for every message rather than payload bytes only."
+verdict = "reproduce"
+owner = "curl-proto-mqtt"
+verification = "Multi-message subscription test comparing the delivered bytes, the progress meter and the download-size output variable against both binaries."
+status = "obligation"
+decision = "DL-0151"
+
+[[hazard]]
+id = "HZ-0111"
+path = "original/lib/mqtt.c"
+lines = [729, 734]
+behaviour = "A read that would block inside a published message emits the literal verbose line EEEE AAAAGAIN."
+verdict = "reproduce"
+owner = "curl-proto-mqtt"
+verification = "Verbose byte comparison over a subscription whose payload arrives split so the read blocks part way through."
+status = "obligation"
+decision = "DL-0151"
+
+[[hazard]]
+id = "HZ-0112"
+path = "original/lib/mqtt.c"
+lines = [1007, 1028]
+behaviour = "The protocol descriptor fills the doing slots and no performing-state slot, so the whole transfer runs in the doing state and never reaches the state that applies the transfer-rate limit."
+verdict = "reproduce"
+owner = "curl-proto-mqtt"
+verification = "Rate-limited subscription test asserting the limit has no effect, compared against both binaries."
+status = "obligation"
+decision = "DL-0151"
+
+[[hazard]]
+id = "HZ-0113"
+path = "original/lib/mqtt.c"
+lines = [143, 148]
+behaviour = "Every outgoing packet is written to the trace stream as header data, so the connect packet's username and password and the published payload appear there in plaintext."
+verdict = "reproduce"
+owner = "curl-proto-mqtt"
+verification = "Byte comparison of the trace stream over an authenticated publish, plus the observability check that no added span field or metric label carries a credential or a payload."
+status = "obligation"
+decision = "DL-0151"
+
+[[hazard]]
+id = "HZ-0114"
+path = "original/lib/socks.c"
+lines = [937, 1016]
+behaviour = "The SOCKS5 reply read demands eight bytes before parsing while a domain-name reply carrying a zero-length name is seven, so the handshake consumes one byte of the stream that follows and drops it with the filter's buffer."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Stub-proxy differential case replying with address type 3, a zero-length name and trailing application bytes, asserting both trees lose the same byte."
+status = "obligation"
+decision = "DL-0152"
+
+[[hazard]]
+id = "HZ-0115"
+path = "original/lib/socks.c"
+lines = [1075, 1084]
+behaviour = "The GSS-API leg is entered from a non-blocking connect filter and described as non-blocking, while the negotiation it calls blocks on socket reads, bounded by the transfer deadline where one is set and unbounded where none is."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Socket-callback and timeout equivalence test over a SOCKS5 GSS-API handshake, asserting the event loop is not re-entered mid-context."
+status = "obligation"
+decision = "DL-0152"
+
+[[hazard]]
+id = "HZ-0116"
+path = "original/lib/socks.c"
+lines = [678, 728]
+behaviour = "A proxy selecting username and password authentication it was never offered, with no credentials configured, is answered with a sub-negotiation frame carrying a zero-length username and a zero-length password, which the one-to-255 fields of that sub-negotiation do not allow."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Byte comparison over a stub proxy that selects the username and password method unsolicited with no credentials set."
+status = "obligation"
+decision = "DL-0152"
+
+[[hazard]]
+id = "HZ-0117"
+path = "original/lib/strequal.c"
+lines = [51, 64]
+behaviour = "The length-bounded case-insensitive compare treats its bound as a ceiling rather than a byte count: it stops at the first NUL of the left argument, so two buffers that differ only after an embedded NUL answer equal at a bound that spans the difference."
+verdict = "reproduce"
+owner = "curl-types"
+verification = "Rust-native equivalence test over embedded-NUL inputs at bounds below, at and beyond the terminator, plus the ABI round-trip through the exported pair."
+status = "obligation"
+decision = "DL-0154"
+
+[[hazard]]
+id = "HZ-0118"
+path = "original/lib/strequal.c"
+lines = [86, 95]
+behaviour = "The zero-length answer turns on pointer nullness: a non-null pair answers equal at a bound of zero while two null pointers answer not equal at that same bound and equal at every non-zero bound."
+verdict = "reproduce"
+owner = "curl-types"
+verification = "Rust-native equivalence test over the null and zero-bound combinations, plus the ABI round-trip asserting the returned code for each."
+status = "obligation"
+decision = "DL-0154"
+
+[[hazard]]
+id = "HZ-0119"
+path = "original/lib/socks_sspi.c"
+lines = [460, 465]
+behaviour = "The negotiated protection level is recorded on the connection and then never applied, so no subsequent proxy message is wrapped and the trace says so."
+verdict = "reproduce"
+owner = "curl-auth"
+verification = "A test that drives the subnegotiation to a granted protection level and asserts the bytes that follow are unwrapped."
+status = "obligation"
+decision = "DL-0155"
+
+[[hazard]]
+id = "HZ-0120"
+path = "original/lib/socks_sspi.c"
+lines = [140, 529]
+behaviour = "The socket is forced blocking for the whole subnegotiation and read back with blocking reads, so the calling thread blocks even under the multi interface."
+verdict = "reproduce"
+owner = "curl-auth"
+verification = "A test that asserts the subnegotiation blocks and that non-blocking mode is restored on both the success and the failure exit."
+status = "obligation"
+decision = "DL-0155"
+
+[[hazard]]
+id = "HZ-0121"
+path = "original/lib/socketpair.c"
+lines = [38, 47]
+behaviour = "The eventfd implementation assigns one descriptor to both halves of the pair, so the read half and the write half are the same descriptor and the counter it carries collapses any number of signals into one readable event."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Wakeup-channel equivalence test asserting one readable event after repeated signals and a single close at teardown on the eventfd rung."
+status = "obligation"
+decision = "DL-0157"
+
+[[hazard]]
+id = "HZ-0122"
+path = "original/lib/socketpair.c"
+lines = [55, 127]
+behaviour = "The pipe and socketpair implementations return failure from their creating call without writing the pair, leaving the caller's two descriptors at whatever value they already held, while every other failure path in the unit sets both to the invalid value."
+verdict = "substitute"
+owner = "curl-core"
+verification = "Fault-injected creation failure asserting an invalid pair on return, plus the multi-handle creation-failure test that reaches it."
+status = "obligation"
+decision = "DL-0157"
+
+[[hazard]]
+id = "HZ-0123"
+path = "original/lib/socketpair.c"
+lines = [215, 243]
+behaviour = "The loopback fallback discards the result of the handshake write, so a write that sends nothing leaves the verification read polling until the sixty-second deadline before the pair is reported as failed."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Loopback-fallback handshake test built on the rung with no eventfd, pipe or socketpair, asserting the deadline-bounded failure; the rung is selected on no platform in the matrix, so the result is recorded as deferred."
+status = "obligation"
+decision = "DL-0157"
+
+[[hazard]]
+id = "HZ-0124"
+path = "original/lib/rand.c"
+lines = [106, 130]
+behaviour = "The debug entropy override seeds a function-local static counter once per process and advances it on every later draw with no synchronisation, so two handles drawing from two threads race on it and the value a transfer sees follows from how many draws preceded it."
+verdict = "substitute"
+owner = "curl-types"
+verification = "Two-thread draw test under the debug feature asserting one distinct value per draw, plus the ten upstream cases that set the variable."
+status = "obligation"
+decision = "DL-0160"
+
+[[hazard]]
+id = "HZ-0125"
+path = "original/lib/rand.c"
+lines = [77, 97]
+behaviour = "The fallback draw seeds a static from the wall clock and advances it with a linear congruential step, so a build carrying neither a TLS generator nor arc4random produces predictable boundaries, nonces and masking keys from unsynchronised shared statics."
+verdict = "substitute"
+owner = "curl-types"
+verification = "No-TLS configuration test asserting the platform generator backs the draw and the weak-seed warning line is byte-unchanged."
+status = "obligation"
+decision = "DL-0158"
+
+[[hazard]]
+id = "HZ-0126"
+path = "original/src/config2setopts.c"
+lines = [1042, 1091]
+behaviour = "A benign option outcome the unit itself tolerates, being not-built-in or unknown-option left in the result variable by the string-option macro, survives every later option call because none of them assigns that variable, and is returned to the caller, which fails the whole transfer on any non-zero value."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential exit-code and stderr comparison over a configuration whose capability is absent, asserting both trees abandon the transfer with the same code rather than continuing."
+status = "obligation"
+decision = "DL-0162"
+
+[[hazard]]
+id = "HZ-0127"
+path = "original/src/config2setopts.c"
+lines = [712, 889]
+behaviour = "The progress switch is set from the global quiet flags and then overridden by the callback group invoked immediately afterwards, so a standard-input upload re-enables progress reporting only because the later call wins; the source comment states the dependency and nothing enforces it."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of a standard-input upload over both trees, asserting the read-busy callback is reached and that stdout, stderr and the emitted option list match byte for byte."
+status = "obligation"
+decision = "DL-0162"
+
+[[hazard]]
+id = "HZ-0128"
+path = "original/src/config2setopts.c"
+lines = [74, 98]
+behaviour = "The type-of-service switch has arms for IPv4 and IPv6 only and leaves its result at zero for any other address family, so a requested type of service is silently not applied and no warning is printed; the IPv4 arm is likewise empty on a platform without the IPv4 option macro."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential stderr and applied-socket-option comparison for a requested type of service on a unix-socket transfer, asserting neither tree warns and neither applies the option."
+status = "obligation"
+decision = "DL-0162"
+
+[[hazard]]
+id = "HZ-0129"
+path = "original/src/config2setopts.c"
+lines = [340, 352]
+behaviour = "The embedded-CA note for proxies is printed on every verbose transfer whose proxy CA options are unset, including transfers that configure no proxy at all and transfers that supplied their own CA file, and the blob is installed on the handle in those cases too."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential stderr comparison of a verbose secure transfer with and without an explicit CA file, asserting two notes in the first case and only the proxy note in the second."
+status = "obligation"
+decision = "DL-0162"
+
+[[hazard]]
+id = "HZ-0130"
+path = "original/src/config2setopts.c"
+lines = [838, 847]
+behaviour = "In a debug build an unparsable buffer-size environment value makes the helper return without setting the buffer size at all, so the transfer runs on the library default instead of the tool's own hundred-kilobyte value, and nothing is reported."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Debug-feature test setting that environment value to a non-number and asserting the emitted option list carries no buffer-size entry in either tree."
+status = "obligation"
+decision = "DL-0162"
+
+[[hazard]]
+id = "HZ-0131"
+path = "original/src/config2setopts.c"
+lines = [251, 296]
+behaviour = "An unset minimum TLS version becomes 1.2 unless the requested maximum is lower, in which case the minimum is lowered to that maximum, and any version value above the highest known one falls through to 1.3 rather than being rejected."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of the emitted TLS version option across every minimum and maximum version combination the tool accepts, including values above the highest known one."
+status = "obligation"
+decision = "DL-0162"
+
+[[hazard]]
+id = "HZ-0132"
+path = "original/lib/strcase.c"
+lines = [72, 84]
+behaviour = "The ASCII case converters return a char of implementation-defined signedness, and two callers widen that return into an unsigned integer used as a hash, so for any byte at or above 0x80 the bucket selected differs between the signed-char and unsigned-char targets of the platform matrix."
+verdict = "substitute"
+owner = "curl-types"
+verification = "Converted-value equivalence over all 256 inputs, plus a differential cookie-jar and request-header comparison over a non-ASCII cookie domain and a scheme-lookup comparison over a non-ASCII scheme, run on both execution-verified platforms."
+status = "obligation"
+decision = "DL-0164"
+
+[[hazard]]
+id = "HZ-0133"
+path = "original/lib/md5.c"
+lines = [26, 27]
+behaviour = "MD5 is compiled in and reachable whenever Digest authentication or the built-in NTLM core is, gated on nothing else, so a transfer puts MD5-derived authentication material on the wire by default with no strength check, no opt-out and no warning."
+verdict = "reproduce"
+owner = "curl-auth"
+verification = "The upstream MD5 unit case with the Digest and CRAM-MD5 protocol cases against both trees, plus known-answer vectors over the one-shot and staged interfaces asserting one digest across every feature configuration."
+status = "obligation"
+decision = "DL-0165"
+
+[[hazard]]
+id = "HZ-0134"
+path = "original/lib/md5.c"
+lines = [602, 610]
+behaviour = "Finalising releases both the hash context and the context structure while returning success, so the caller holds a freed pointer and a second finalise or update on the same context reads freed memory."
+verdict = "substitute"
+owner = "curl-auth"
+verification = "Leak accounting under the debug allocator over init, update and finalise, plus a single-use equivalence test asserting the context cannot be reused after finalising."
+status = "obligation"
+decision = "DL-0165"
+
+[[hazard]]
+id = "HZ-0135"
+path = "original/lib/netrc.c"
+lines = [272, 308]
+behaviour = "A carriage return run that is not followed by a newline leaves the lexer positioned on a blank, so the token that follows measures zero bytes: in keyword position that is a syntax error which fails the transfer, while in value position the very next statement overwrites the error and the value becomes the empty string."
+verdict = "reproduce"
+owner = "curl-auth"
+verification = "The netrc parser fuzz target plus a differential pair over the same bytes in both positions, asserting the syntax error and the empty value."
+status = "obligation"
+decision = "DL-0167"
+
+[[hazard]]
+id = "HZ-0136"
+path = "original/lib/netrc.c"
+lines = [76, 85]
+behaviour = "A file, a line or a token over its size cap makes the dynamic buffer answer too-large, which the error translation folds into a syntax error, so an oversized but grammatical netrc is reported as malformed and is tolerated when the netrc level is optional."
+verdict = "reproduce"
+owner = "curl-auth"
+verification = "Differential cases at each of the three caps against both netrc levels, asserting the syntax-error code rather than an allocation failure."
+status = "obligation"
+decision = "DL-0167"
+
+[[hazard]]
+id = "HZ-0137"
+path = "original/lib/netrc.c"
+lines = [521, 524]
+behaviour = "Comment removal happens while the file is loaded, before any token is read, so a line whose first non-blank byte is a hash is deleted from inside a multi-line quoted value and no netrc can express such a line."
+verdict = "reproduce"
+owner = "curl-auth"
+verification = "Differential pair over a quoted value spanning a hash line and the same value without it, asserting the shortened value."
+status = "obligation"
+decision = "DL-0167"
+
+[[hazard]]
+id = "HZ-0138"
+path = "original/lib/proxy.c"
+lines = [236, 269]
+behaviour = "Only the first entry of a blank-separated no-proxy list is compared: the token scan stops at a space or a tab, and the loop then ends on any following character that is not a comma, so every later entry is never tested."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Rust-native replacement of upstream case 1614 carrying its blank-separated row, plus the --noproxy invocation of the one-per-option differential corpus."
+status = "obligation"
+decision = "DL-0171"
+
+[[hazard]]
+id = "HZ-0139"
+path = "original/lib/proxy.c"
+lines = [217, 218]
+behaviour = "The asterisk override is an exact equality against the whole value, so an asterisk beside other entries, or one padded with blanks, is treated as a host pattern and matches nothing."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Rust-native replacement of upstream case 1614 extended with the asterisk-in-a-list and blank-padded-asterisk rows."
+status = "obligation"
+decision = "DL-0171"
+
+[[hazard]]
+id = "HZ-0140"
+path = "original/lib/proxy.c"
+lines = [72, 86]
+behaviour = "An IPv4 prefix length of zero is not a match-everything: the masked comparison is skipped for zero and for thirty-two and the code falls through to an exact address equality, so 0.0.0.0/0 matches only 0.0.0.0."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Rust-native replacement of upstream case 1614, whose IPv4 table carries the zero-bit rows for an equal and an unequal address, plus a zero-prefix entry in the --noproxy corpus."
+status = "obligation"
+decision = "DL-0171"
+
+[[hazard]]
+id = "HZ-0141"
+path = "original/lib/proxy.c"
+lines = [73, 82]
+behaviour = "The masked IPv4 comparison converts both network-order addresses with the host-to-network helper and not with its inverse, which is the same byte swap on every platform in the matrix."
+verdict = "substitute"
+owner = "curl-core"
+verification = "Rust-native replacement of upstream case 1614, asserting the same accept and reject decisions from big-endian reads of both addresses."
+status = "obligation"
+decision = "DL-0171"
+
+[[hazard]]
+id = "HZ-0142"
+path = "original/lib/proxy.c"
+lines = [101, 107]
+behaviour = "An IPv6 prefix length of zero is rewritten to a full-length prefix, and a length covering more than the address is rejected before either address is parsed, so ::/0 matches only :: and an over-long prefix is indistinguishable from an unparsable address."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Rust-native replacement of upstream case 1614, whose IPv6 table carries the zero, full-length and over-length prefix rows."
+status = "obligation"
+decision = "DL-0171"
+
+[[hazard]]
+id = "HZ-0143"
+path = "original/lib/proxy.c"
+lines = [167, 173]
+behaviour = "A no-proxy entry of 128 bytes or more can never match an address host: the cap is on the whole token and not on the address inside it, and the entry is rejected before any parse is attempted."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Rust-native replacement of upstream case 1614, whose table carries the 127-byte and 128-byte entry rows."
+status = "obligation"
+decision = "DL-0171"
+
+[[hazard]]
+id = "HZ-0144"
+path = "original/lib/proxy.c"
+lines = [175, 189]
+behaviour = "Everything before the first slash of an address entry must parse as a bare address, so a port-qualified entry and a bracketed IPv6 entry never match; the prefix length is bounded at 128 by the parse and again by the address family, and leading zeroes in it are accepted."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Rust-native replacement of upstream case 1614 extended with the port-qualified, bracketed-literal and out-of-range prefix rows for both families."
+status = "obligation"
+decision = "DL-0171"
+
+[[hazard]]
+id = "HZ-0145"
+path = "original/lib/proxy.c"
+lines = [137, 157]
+behaviour = "The trailing-dot trim reads the entry's last byte before the entry is tested for emptiness, and an entry of one dot becomes empty and then tail-matches through a zero-length comparison, so it matches a host ending in two dots and the host that is a single dot."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Rust-native replacement of upstream case 1614 extended with the single-dot entry rows, and the URL corpus rows whose host ends in a dot."
+status = "obligation"
+decision = "DL-0171"
+
+[[hazard]]
+id = "HZ-0146"
+path = "original/lib/proxy.c"
+lines = [152, 156]
+behaviour = "Host comparison folds only the twenty-six ASCII letters, so bytes above the ASCII range compare literally and two spellings differing only by a non-ASCII case pair do not match."
+verdict = "reproduce"
+owner = "curl-core"
+verification = "Rust-native replacement of upstream case 1614 extended with a non-ASCII case-pair row, asserted over bytes with no Unicode case API on the path."
+status = "obligation"
+decision = "DL-0171"
+
+[[hazard]]
+id = "HZ-0147"
+path = "original/lib/smtp.c"
+lines = [374, 375]
+behaviour = "The dot-escaping reader adjusts the configured input size, and only when that size is already positive, after the MAIL FROM size parameter at :1031 and the progress upload total at :1475 have both read it, so the announced and reported sizes exclude every stuffed dot and the terminating sequence."
+verdict = "reproduce"
+owner = "curl-proto-smtp"
+verification = "Upstream tests 912 and 913 fix the announced size bytes; a Rust-native test asserts the announced value for a body whose first line begins with a dot."
+status = "obligation"
+decision = "DL-0178"
+
+[[hazard]]
+id = "HZ-0148"
+path = "original/lib/smtp.c"
+lines = [402, 415]
+behaviour = "The end-of-body trace line reports CRLF-dot-CRLF unconditionally, while the bytes appended are dot-CRLF for a body already ending in CRLF and dot-CRLF-dot-CRLF for one ending in CRLF-dot."
+verdict = "reproduce"
+owner = "curl-proto-smtp"
+verification = "Trace output compared byte for byte against the oracle with the SMTP trace feature enabled, over all three body endings."
+status = "obligation"
+decision = "DL-0178"
+
+[[hazard]]
+id = "HZ-0149"
+path = "original/lib/smtp.c"
+lines = [1784, 1787]
+behaviour = "The per-transfer fields eob at :132 and trailing_crlf at :136 are written here and are then never read anywhere in the unit, the reader context counter n_eob at :304 being what actually tracks the end-of-body match."
+verdict = "substitute"
+owner = "curl-proto-smtp"
+verification = "The field-propagation audit carries both as reserved with a write-site and no read-site, and the port omits them; upstream SMTP upload cases pass unchanged."
+status = "obligation"
+decision = "DL-0178"
+
+[[hazard]]
+id = "HZ-0150"
+path = "original/lib/smtp.c"
+lines = [305, 306]
+behaviour = "The reader context field eob is declared and is never written or read, the counter actually used being n_eob at :304."
+verdict = "substitute"
+owner = "curl-proto-smtp"
+verification = "The field-propagation audit carries it as reserved with neither a write-site nor a read-site, and the port declares only the counter; the dot-escaping cases pass unchanged."
+status = "obligation"
+decision = "DL-0178"
+
+[[hazard]]
+id = "HZ-0151"
+path = "original/lib/smtp.c"
+lines = [552, 559]
+behaviour = "The reply-message extractor relies on unsigned wraparound: the trailing-blank scan leaves the length at the maximum of its type once every trailing byte is blank or newline, so the pre-incremented store addresses offset zero and the extracted message is zero length."
+verdict = "reproduce"
+owner = "curl-proto-smtp"
+verification = "A Rust-native test drives the extractor with an all-blank remainder and asserts a zero-length message rather than a panic."
+status = "obligation"
+decision = "DL-0178"
+
+[[hazard]]
+id = "HZ-0152"
+path = "original/lib/rtsp.c"
+lines = [362, 370]
+behaviour = "The refusal of a request that carries no session identifier tests the request type as a bitmask over sequential enumerators, so it fires only for GET_PARAMETER, SET_PARAMETER and RECORD and issues ANNOUNCE, PLAY, PAUSE and TEARDOWN with no session identifier at all."
+verdict = "reproduce"
+owner = "curl-proto-rtsp"
+verification = "Per-method matrix asserting for which request types the refusal fires, anchored on upstream case 568, which issues two ANNOUNCE requests with no session identifier and expects them on the wire."
+status = "obligation"
+decision = "DL-0180"
+
+[[hazard]]
+id = "HZ-0153"
+path = "original/lib/rtsp.c"
+lines = [463, 473]
+behaviour = "The range guard tests the request type as a bitmask over sequential enumerators, so a Range header is emitted for every request type that reaches it and not only for PLAY, PAUSE and RECORD."
+verdict = "reproduce"
+owner = "curl-proto-rtsp"
+verification = "Per-method matrix asserting the Range header appears for every request type when CURLOPT_RANGE is set; no upstream case sets a range over RTSP, so the matrix is project-authored."
+status = "obligation"
+decision = "DL-0180"
+
+[[hazard]]
+id = "HZ-0154"
+path = "original/lib/smb.c"
+lines = [685, 688]
+behaviour = "Session setup ignores both hash-construction results, so an allocation failure inside the NT hash leaves its 21-byte buffer indeterminate and those bytes become three DES keys and 24 bytes of the setup body."
+verdict = "diverge"
+owner = "curl-proto-smb"
+verification = "Fault-injected hash-construction failure asserting the deterministic out-of-memory outcome, plus the divergence-allowlist entry."
+status = "obligation"
+decision = "DL-0181"
+
+[[hazard]]
+id = "HZ-0155"
+path = "original/lib/smb.c"
+lines = [532, 566]
+behaviour = "A response frame is length-checked but its four-byte signature is never compared, so a reply carrying a foreign signature is processed as a valid message and the transfer completes."
+verdict = "reproduce"
+owner = "curl-proto-smb"
+verification = "Differential test over a negotiate reply carrying a foreign signature, asserting the same body, exit code and stderr."
+status = "obligation"
+decision = "DL-0181"
+
+[[hazard]]
+id = "HZ-0156"
+path = "original/lib/smb.c"
+lines = [1090, 1117]
+behaviour = "The download stays in its read state while a chunk is 0x8000 or larger, and the body reaches the write callback in maximum-write-size pieces rather than in the sizes the peer sent."
+verdict = "reproduce"
+owner = "curl-proto-smb"
+verification = "Differential harness comparing the read request count and the write-callback invocation sizes for a body larger than one payload."
+status = "obligation"
+decision = "DL-0181"
+
+[[hazard]]
+id = "HZ-0157"
+path = "original/lib/smb.c"
+lines = [829, 848]
+behaviour = "The upload clamps the remaining size to one byte below the maximum payload before narrowing it to sixteen bits, and the byte count it declares is that length plus one byte of padding."
+verdict = "reproduce"
+owner = "curl-proto-smb"
+verification = "Differential test over an upload larger than one payload asserting the wire data-length and byte-count sequence."
+status = "obligation"
+decision = "DL-0181"
+
+[[hazard]]
+id = "HZ-0158"
+path = "original/lib/smb.c"
+lines = [936, 951]
+behaviour = "The challenge is copied eight bytes at a time out of a one-byte trailing member, and the size test subtracts that member's byte to admit a frame the declared structure does not cover."
+verdict = "substitute"
+owner = "curl-proto-smb"
+verification = "Equivalence test over negotiate replies at the minimum challenge length and one byte below it, asserting the boundary decision."
+status = "obligation"
+decision = "DL-0181"
