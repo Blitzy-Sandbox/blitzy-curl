@@ -12,7 +12,7 @@ edit this file by hand. Rationale lives in `refactor/docs/DECISION-LOG.md`.
 
 What the vendored oracle already provides and the port reuses, what this project
 adds on top of it, and every place a value the oracle writes to a diagnostic
-surface is a credential. **97 reused surface(s)** across **11 element(s)**,
+surface is a credential. **125 reused surface(s)** across **11 element(s)**,
 **5 added element(s)**, **18 sink(s)** and **17 declared disclosure(s)**.
 
 Reuse is verified rather than claimed: every reused surface is read at the tag
@@ -134,6 +134,34 @@ endpoint means anything.
 | build reporting | finding naming the file and line that links to a missing file | `original/scripts/mdlinkcheck:241` | `ERROR links to missing file` | DL-0288 |
 | build reporting | probe identity that checker presents when it reaches the network | `original/scripts/mdlinkcheck:193` | `Mozilla/curl.se link-probe` | DL-0288 |
 | build reporting | exit status a consumer of that report reads | `original/scripts/mdlinkcheck:254` | `exit 1 if($error);` | DL-0288 |
+| build reporting | parallelism width the Perl parse checker reports before it runs | `original/scripts/perlcheck.sh:37` | `echo "parallel: ${procs}"` | DL-0299 |
+| build reporting | probe that sizes that parse checker's parallelism | `original/scripts/perlcheck.sh:36` | `command -v nproc` | DL-0299 |
+| build reporting | default parallelism that parse checker falls back to without that probe | `original/scripts/perlcheck.sh:35` | `procs=6` | DL-0299 |
+| build reporting | per-file Perl syntax diagnostic stream that parse checker produces | `original/scripts/perlcheck.sh:48` | `perl -c -Itests --` | DL-0299 |
+| build reporting | fail-fast discipline that makes that parse checker's exit status meaningful | `original/scripts/perlcheck.sh:31` | `set -eu` | DL-0299 |
+| build reporting | tracked-Perl subject set that parse checker reports on | `original/scripts/perlcheck.sh:43` | `git ls-files '*.pl' '*.pm'` | DL-0299 |
+| build reporting | shebang-discovered Perl subject set that parse checker also reports on | `original/scripts/perlcheck.sh:44` | `git grep -l '^#!/usr/bin/env perl'` | DL-0299 |
+| build reporting | upstream workflow step that consumes that parse checker's exit status | `original/.github/workflows/checksrc.yml:89` | `scripts/perlcheck.sh` | DL-0299 |
+| build reporting | source-quality finding line carrying file, line, column, severity and rule name | `original/scripts/checksrc.pl:322` | `$file:$num:$col: $w: $msg ($name)` | DL-0300 |
+| build reporting | offending source line echoed under each finding of that lint | `original/scripts/checksrc.pl:323` | `print " $line` | DL-0300 |
+| build reporting | column caret closing a finding that starts inside 80 columns | `original/scripts/checksrc.pl:327` | `print "${pref}^` | DL-0300 |
+| build reporting | finding for a per-file suppression that never triggered | `original/scripts/checksrc.pl:450` | `checkwarn("UNUSEDIGNORE", $ignore_set{$_},` | DL-0300 |
+| build reporting | finding for a directive re-enabling a rule nothing had inhibited | `original/scripts/checksrc.pl:463` | `checkwarn("UNUSEDIGNORE",` | DL-0300 |
+| build reporting | per-file progress line the verbose flag of that lint adds | `original/scripts/checksrc.pl:541` | `Checking file: $file` | DL-0300 |
+| build reporting | run summary counting errors and warnings of that lint | `original/scripts/checksrc.pl:1267` | `checksrc: %d errors and %d warnings` | DL-0300 |
+| build reporting | suppressed-finding summary the directive vocabulary produces | `original/scripts/checksrc.pl:1269` | `%d errors and %d warnings suppressed` | DL-0300 |
+| build reporting | failure status the build target and upstream workflow read | `original/scripts/checksrc.pl:1274` | `exit 5; # return failure` | DL-0300 |
+| build reporting | rejection of an unknown rule name in a per-directory .checksrc | `original/scripts/checksrc.pl:252` | `invalid warning specified in .checksrc` | DL-0300 |
+| build reporting | malformed per-directory .checksrc line aborting that lint | `original/scripts/checksrc.pl:272` | `Invalid format in $dir/.checksrc on line $i` | DL-0300 |
+| build reporting | build entry point running that lint over every folder of the oracle | `original/Makefile.am:166` | `checksrc:` | DL-0300 |
+| build reporting | aggregate lint target pairing that report with the badwords report | `original/Makefile.am:177` | `lint: badwords checksrc` | DL-0300 |
+| build reporting | cmake fragment lint report the oracle wraps; vendored, not executed here | `original/scripts/cmakelint.sh:55` | `cmake-lint` | DL-0305 |
+| build reporting | undecorated finding format that lint report uses | `original/scripts/cmakelint.sh:56` | `--suppress-decorations` | DL-0305 |
+| build reporting | finding class that lint report omits | `original/scripts/cmakelint.sh:61` | `--disabled-codes C0113` | DL-0305 |
+| build reporting | file set that lint report covers in a git checkout | `original/scripts/cmakelint.sh:50` | `git ls-files` | DL-0305 |
+| build reporting | file set that lint report covers outside a checkout | `original/scripts/cmakelint.sh:52` | `find . -type f` | DL-0305 |
+| build reporting | exit status a consumer of that lint report reads | `original/scripts/cmakelint.sh:42` | `set -eu` | DL-0305 |
+| CI result reporting | upstream job that runs that lint wrapper; not executed here | `original/.github/workflows/checksrc.yml:85` | `scripts/cmakelint.sh` | DL-0305 |
 
 ## Added
 

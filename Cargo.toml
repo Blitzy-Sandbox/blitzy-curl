@@ -650,6 +650,93 @@ delivered = "vendored-at-tag-path"                                    # DL-0288
 flag-contract = "none"
 decision = "DL-0288"
 
+# Upstream retired the CI job inventory before the tag.               DL-0301
+# Its consumer ciconfig.pl left with it.                              DL-0301
+[workspace.metadata.curl.baseline-premise-deltas.cijobs]
+plan-premise = "scripts/cijobs.pl as a 14713-byte mode-100755 pre-restructure worktree copy vendored to original/scripts/cijobs.pl, parsing GitHub Actions, Azure Pipelines, AppVeyor, CircleCI, Cirrus and Zuul definitions for scripts/ciconfig.pl and .github/scripts/distfiles.sh"
+absent-paths = [
+  "scripts/cijobs.pl",
+  "original/scripts/cijobs.pl",
+  "original/scripts/ciconfig.pl",
+]
+present-paths = [
+  "original/scripts/Makefile.am",
+  "original/.github/scripts/distfiles.sh",
+  "original/.github/workflows/linux.yml",
+  "original/.circleci/config.yml",
+  "original/appveyor.yml",
+]
+evidence = [
+  { path = "original/scripts/Makefile.am", line = 25, contains = "EXTRA_DIST = coverage.sh completion.pl firefox-db2pem.sh checksrc.pl" },
+  { path = "original/scripts/Makefile.am", line = 30, contains = ".checksrc badwords badwords-all badwords.txt top-length" },
+  { path = "original/.github/workflows/linux.yml", line = 5, contains = "name: 'Linux'" },
+  { path = "original/.circleci/config.yml", line = 28, contains = "version: 2.1" },
+  { path = "original/appveyor.yml", line = 31, contains = "version: 7.50.0.{build}" },
+]
+delivered = "absorbed-upstream"                                       # DL-0301
+flag-contract = "none"
+decision = "DL-0301"
+
+# Upstream deleted both CI scripts before the tag.                     DL-0304
+# The flag-coverage role is owned out of tree.                         DL-0016
+[workspace.metadata.curl.baseline-premise-deltas.ciconfig-script]
+plan-premise = "original/scripts/ciconfig.pl as a vendored 4597-byte configure-flag coverage auditor, mode 100755, reading scripts/cijobs.pl output"
+absent-paths = [
+  "original/scripts/ciconfig.pl",
+  "original/scripts/cijobs.pl",
+]
+present-paths = [
+  "original/.github/scripts/distfiles.sh",
+  "original/scripts/Makefile.am",
+  "original/configure.ac",
+  "original/CMakeLists.txt",
+]
+evidence = [
+  { path = "original/.github/scripts/distfiles.sh", line = 23, contains = "^projects/Windows/*" },
+  { path = "original/.github/scripts/distfiles.sh", line = 24, contains = "^scripts/contributors.sh" },
+  { path = "original/scripts/Makefile.am", line = 25, contains = "EXTRA_DIST =" },
+  { path = "original/scripts/Makefile.am", line = 30, contains = "top-length" },
+  { path = "original/configure.ac", line = 29, contains = "AC_INIT([curl]" },
+  { path = "original/CMakeLists.txt", line = 64, contains = "project(CURL" },
+]
+delivered = "project-owned-out-of-tree"                               # DL-0304
+flag-contract = "none"
+decision = "DL-0304"
+
+# The tag's cmake-lint wrapper differs from the plan's copy.           DL-0305
+# Relaxed complexity limits; no trailing whitespace.                   DL-0305
+[workspace.metadata.curl.baseline-premise-deltas.cmakelint]
+plan-premise = "scripts/cmakelint.sh as a 3153-byte pre-restructure worktree copy carrying 26 trailing-whitespace lines, --max-branches 12 and --max-statements 65"
+absent-paths = ["scripts/cmakelint.sh"]
+present-paths = [
+  "original/scripts/cmakelint.sh",
+  "original/scripts/Makefile.am",
+  "original/.github/workflows/checksrc.yml",
+  "original/.editorconfig",
+  "original/.gitattributes",
+]
+evidence = [
+  { path = "original/scripts/cmakelint.sh", line = 1, contains = "#!/bin/sh" },
+  { path = "original/scripts/cmakelint.sh", line = 9, contains = "Dan Fandrich, <dan@coneharvesters.com>, Viktor Szakats, et al." },
+  { path = "original/scripts/cmakelint.sh", line = 22, contains = "SPDX-License-Identifier: curl" },
+  { path = "original/scripts/cmakelint.sh", line = 30, contains = "It checks all files given on the" },
+  { path = "original/scripts/cmakelint.sh", line = 39, contains = "the xargs arguments (which calls" },
+  { path = "original/scripts/cmakelint.sh", line = 42, contains = "set -eu" },
+  { path = "original/scripts/cmakelint.sh", line = 50, contains = "git ls-files '**CMakeLists.txt' '*.cmake'" },
+  { path = "original/scripts/cmakelint.sh", line = 52, contains = "find . -type f" },
+  { path = "original/scripts/cmakelint.sh", line = 56, contains = "--suppress-decorations" },
+  { path = "original/scripts/cmakelint.sh", line = 61, contains = "--disabled-codes C0113" },
+  { path = "original/scripts/cmakelint.sh", line = 75, contains = "--max-branches 20" },
+  { path = "original/scripts/cmakelint.sh", line = 78, contains = "--max-statements 95" },
+  { path = "original/scripts/Makefile.am", line = 28, contains = "cmakelint.sh mdlinkcheck CMakeLists.txt" },
+  { path = "original/.github/workflows/checksrc.yml", line = 85, contains = "scripts/cmakelint.sh" },
+  { path = "original/.editorconfig", line = 11, contains = "trim_trailing_whitespace = true" },
+  { path = "original/.gitattributes", line = 9, contains = "*.sh eol=lf" },
+]
+delivered = "vendored-at-tag-path"                                    # DL-0305
+flag-contract = "none"
+decision = "DL-0305"
+
 # Index of the traceability generator; the data lives with it.         DL-0111
 # Hazard verdicts, owners and evidence: data/hazards.toml.             DL-0110
 [workspace.metadata.curl.traceability]

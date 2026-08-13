@@ -888,6 +888,232 @@ line = 254
 evidence = "exit 1 if($error);"
 decision = "DL-0288"
 
+[[reused]]
+element = "build reporting"
+surface = "parallelism width the Perl parse checker reports before it runs"
+path = "original/scripts/perlcheck.sh"
+line = 37
+evidence = "echo \"parallel: ${procs}\""
+decision = "DL-0299"
+
+[[reused]]
+element = "build reporting"
+surface = "probe that sizes that parse checker's parallelism"
+path = "original/scripts/perlcheck.sh"
+line = 36
+evidence = "command -v nproc"
+decision = "DL-0299"
+
+[[reused]]
+element = "build reporting"
+surface = "default parallelism that parse checker falls back to without that probe"
+path = "original/scripts/perlcheck.sh"
+line = 35
+evidence = "procs=6"
+decision = "DL-0299"
+
+[[reused]]
+element = "build reporting"
+surface = "per-file Perl syntax diagnostic stream that parse checker produces"
+path = "original/scripts/perlcheck.sh"
+line = 48
+evidence = "perl -c -Itests --"
+decision = "DL-0299"
+
+[[reused]]
+element = "build reporting"
+surface = "fail-fast discipline that makes that parse checker's exit status meaningful"
+path = "original/scripts/perlcheck.sh"
+line = 31
+evidence = "set -eu"
+decision = "DL-0299"
+
+[[reused]]
+element = "build reporting"
+surface = "tracked-Perl subject set that parse checker reports on"
+path = "original/scripts/perlcheck.sh"
+line = 43
+evidence = "git ls-files '*.pl' '*.pm'"
+decision = "DL-0299"
+
+[[reused]]
+element = "build reporting"
+surface = "shebang-discovered Perl subject set that parse checker also reports on"
+path = "original/scripts/perlcheck.sh"
+line = 44
+evidence = "git grep -l '^#!/usr/bin/env perl'"
+decision = "DL-0299"
+
+[[reused]]
+element = "build reporting"
+surface = "upstream workflow step that consumes that parse checker's exit status"
+path = "original/.github/workflows/checksrc.yml"
+line = 89
+evidence = "scripts/perlcheck.sh"
+decision = "DL-0299"
+
+
+# Source-quality findings the build's checksrc target writes.           DL-0300
+[[reused]]
+element = "build reporting"
+surface = "source-quality finding line carrying file, line, column, severity and rule name"
+path = "original/scripts/checksrc.pl"
+line = 322
+evidence = "$file:$num:$col: $w: $msg ($name)"
+decision = "DL-0300"
+
+[[reused]]
+element = "build reporting"
+surface = "offending source line echoed under each finding of that lint"
+path = "original/scripts/checksrc.pl"
+line = 323
+evidence = "print \" $line"
+decision = "DL-0300"
+
+[[reused]]
+element = "build reporting"
+surface = "column caret closing a finding that starts inside 80 columns"
+path = "original/scripts/checksrc.pl"
+line = 327
+evidence = "print \"${pref}^"
+decision = "DL-0300"
+
+[[reused]]
+element = "build reporting"
+surface = "finding for a per-file suppression that never triggered"
+path = "original/scripts/checksrc.pl"
+line = 450
+evidence = "checkwarn(\"UNUSEDIGNORE\", $ignore_set{$_},"
+decision = "DL-0300"
+
+[[reused]]
+element = "build reporting"
+surface = "finding for a directive re-enabling a rule nothing had inhibited"
+path = "original/scripts/checksrc.pl"
+line = 463
+evidence = "checkwarn(\"UNUSEDIGNORE\","
+decision = "DL-0300"
+
+[[reused]]
+element = "build reporting"
+surface = "per-file progress line the verbose flag of that lint adds"
+path = "original/scripts/checksrc.pl"
+line = 541
+evidence = "Checking file: $file"
+decision = "DL-0300"
+
+[[reused]]
+element = "build reporting"
+surface = "run summary counting errors and warnings of that lint"
+path = "original/scripts/checksrc.pl"
+line = 1267
+evidence = "checksrc: %d errors and %d warnings"
+decision = "DL-0300"
+
+[[reused]]
+element = "build reporting"
+surface = "suppressed-finding summary the directive vocabulary produces"
+path = "original/scripts/checksrc.pl"
+line = 1269
+evidence = "%d errors and %d warnings suppressed"
+decision = "DL-0300"
+
+[[reused]]
+element = "build reporting"
+surface = "failure status the build target and upstream workflow read"
+path = "original/scripts/checksrc.pl"
+line = 1274
+evidence = "exit 5; # return failure"
+decision = "DL-0300"
+
+[[reused]]
+element = "build reporting"
+surface = "rejection of an unknown rule name in a per-directory .checksrc"
+path = "original/scripts/checksrc.pl"
+line = 252
+evidence = "invalid warning specified in .checksrc"
+decision = "DL-0300"
+
+[[reused]]
+element = "build reporting"
+surface = "malformed per-directory .checksrc line aborting that lint"
+path = "original/scripts/checksrc.pl"
+line = 272
+evidence = "Invalid format in $dir/.checksrc on line $i"
+decision = "DL-0300"
+
+[[reused]]
+element = "build reporting"
+surface = "build entry point running that lint over every folder of the oracle"
+path = "original/Makefile.am"
+line = 166
+evidence = "checksrc:"
+decision = "DL-0300"
+
+[[reused]]
+element = "build reporting"
+surface = "aggregate lint target pairing that report with the badwords report"
+path = "original/Makefile.am"
+line = 177
+evidence = "lint: badwords checksrc"
+decision = "DL-0300"
+
+[[reused]]
+element = "build reporting"
+surface = "cmake fragment lint report the oracle wraps; vendored, not executed here"
+path = "original/scripts/cmakelint.sh"
+line = 55
+evidence = "cmake-lint"
+decision = "DL-0305"
+
+[[reused]]
+element = "build reporting"
+surface = "undecorated finding format that lint report uses"
+path = "original/scripts/cmakelint.sh"
+line = 56
+evidence = "--suppress-decorations"
+decision = "DL-0305"
+
+[[reused]]
+element = "build reporting"
+surface = "finding class that lint report omits"
+path = "original/scripts/cmakelint.sh"
+line = 61
+evidence = "--disabled-codes C0113"
+decision = "DL-0305"
+
+[[reused]]
+element = "build reporting"
+surface = "file set that lint report covers in a git checkout"
+path = "original/scripts/cmakelint.sh"
+line = 50
+evidence = "git ls-files"
+decision = "DL-0305"
+
+[[reused]]
+element = "build reporting"
+surface = "file set that lint report covers outside a checkout"
+path = "original/scripts/cmakelint.sh"
+line = 52
+evidence = "find . -type f"
+decision = "DL-0305"
+
+[[reused]]
+element = "build reporting"
+surface = "exit status a consumer of that lint report reads"
+path = "original/scripts/cmakelint.sh"
+line = 42
+evidence = "set -eu"
+decision = "DL-0305"
+
+[[reused]]
+element = "CI result reporting"
+surface = "upstream job that runs that lint wrapper; not executed here"
+path = "original/.github/workflows/checksrc.yml"
+line = 85
+evidence = "scripts/cmakelint.sh"
+decision = "DL-0305"
+
 # What this project adds. Nothing here changes a byte of the reused surfaces.
 [[added]]
 element = "distributed tracing"
