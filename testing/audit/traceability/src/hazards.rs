@@ -61,6 +61,19 @@ pub const ANNOTATION_PHRASES: [&str; 7] = [
     "silently",
 ];
 
+/// Oracle directory holding upstream's maintenance tooling.
+///
+/// A hazard row under this root can be answered by refusing the script, so it is
+/// the domain of the guard gate below; a row anywhere else in the oracle names a
+/// construct the wrapper cannot refuse by name.
+pub const TOOLING_ROOT: &str = "original/scripts/";
+
+/// Shell variable the guarded-tooling inventory is assigned to.
+///
+/// The wrapper builds the inventory over one or more assignments, so the parse
+/// reads every line that assigns this name and drops the accumulating reference.
+pub const GUARD_VARIABLE: &str = "guarded_tooling";
+
 /// Dispositions an annotation site may carry when no hazard row covers it.
 pub const ANNOTATION_CLASSES: [&str; 4] = [
     "behaviour-elsewhere",
@@ -153,6 +166,40 @@ pub fn is_annotated(line: &str) -> bool {
             boundary(before) && boundary(after)
         })
     })
+}
+
+/// The guarded-tooling inventory a staging wrapper declares.
+///
+/// The wrapper names the oracle scripts it refuses to run in one shell variable,
+/// built over as many assignments as it needs; the parse takes the words between
+/// the first and last quote of each assignment and drops the accumulating
+/// reference to the variable itself. Names come back sorted and unique, so the
+/// gates below read as set comparisons.
+#[must_use]
+pub fn guarded_inventory(files: &dyn Files, path: &str) -> Vec<String> {
+    let assignment = format!("{GUARD_VARIABLE}=");
+    let mut names = BTreeSet::new();
+    for line in files.read(path).unwrap_or_default().lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with(&assignment) {
+            continue;
+        }
+        let Some(opening) = trimmed.find('"') else {
+            continue;
+        };
+        let Some(closing) = trimmed.rfind('"') else {
+            continue;
+        };
+        if closing <= opening {
+            continue;
+        }
+        for word in trimmed[opening + 1..closing].split_whitespace() {
+            if !word.starts_with('$') {
+                names.insert(word.to_owned());
+            }
+        }
+    }
+    names.into_iter().collect()
 }
 
 /// Every annotated line of `path`, one-based, in order.
@@ -686,6 +733,76 @@ impl Register {
         }
     }
 
+    /// Gates the staging wrapper's guarded-tooling inventory against the
+    /// register, in both directions.
+    ///
+    /// A row that names the wrapper as its verification claims the wrapper keeps
+    /// that oracle script off the project's invocation surface, so the inventory
+    /// must carry the script the row names; and an entry the inventory carries
+    /// that answers no row is a guard nobody accounted for. Rows outside the
+    /// oracle's tooling directory are not in the domain: the guard matches a
+    /// script by name and cannot refuse a translation unit or a harness module.
+    /// `DL-0306` records the arrangement.
+    pub fn guard(&self, files: &dyn Files, guard: &str, report: &mut Report) {
+        let inventory = guarded_inventory(files, guard);
+        report.assert(
+            !inventory.is_empty(),
+            "hazard/guarded-tooling-declared",
+            if inventory.is_empty() {
+                format!("{guard} declares no guarded entry")
+            } else {
+                format!(
+                    "{} guarded entry/entries declared by {guard}",
+                    inventory.len()
+                )
+            },
+        );
+        let declared: BTreeSet<&str> = inventory.iter().map(String::as_str).collect();
+
+        let mut answered: BTreeSet<&str> = BTreeSet::new();
+        let mut unguarded = Vec::new();
+        let mut rows = 0_usize;
+        for hazard in &self.hazards {
+            if hazard.verification != guard || !hazard.path.starts_with(TOOLING_ROOT) {
+                continue;
+            }
+            rows += 1;
+            let script = hazard.path.rsplit('/').next().unwrap_or_default();
+            if declared.contains(script) {
+                answered.insert(script);
+            } else {
+                unguarded.push(format!("{}: {}", hazard.id, hazard.path));
+            }
+        }
+        report.assert(
+            unguarded.is_empty(),
+            "hazard/guarded-tooling-covers-rows",
+            if unguarded.is_empty() {
+                format!("{rows} row(s) verified by the guard name a declared entry")
+            } else {
+                format!("not guarded: {}", unguarded.join(", "))
+            },
+        );
+
+        let dead: Vec<&str> = declared
+            .iter()
+            .copied()
+            .filter(|script| !answered.contains(script))
+            .collect();
+        report.assert(
+            dead.is_empty(),
+            "hazard/guarded-tooling-answered",
+            if dead.is_empty() {
+                format!(
+                    "every one of {} guarded entry/entries answers a row",
+                    declared.len()
+                )
+            } else {
+                format!("answers no row: {}", dead.join(", "))
+            },
+        );
+    }
+
     /// Runs the completeness gates: the reviewed set, the frozen per-path counts
     /// and the annotation inventory.
     ///
@@ -891,7 +1008,7 @@ mod tests {
     use curl_audit::fs::MapFiles;
     use curl_audit::report::Report;
 
-    use super::{Register, annotated_lines, is_annotated};
+    use super::{Register, annotated_lines, guarded_inventory, is_annotated};
 
     const GOOD: &str = r#"
 schema = 1
@@ -978,6 +1095,81 @@ decision = "DL-0113"
             .into_iter()
             .map(str::to_owned)
             .collect()
+    }
+
+    /// Path the guarded-tooling fixtures use for the staging wrapper.
+    const GUARD: &str = "testing/upstream-suite/baseline-bootstrap";
+
+    /// A wrapper whose inventory is built over two assignments.
+    const WRAPPER: &str =
+        "#!/bin/sh\nguarded_tooling=\"tool.sh\"\nguarded_tooling=\"$guarded_tooling helper.pl\"\n";
+
+    /// Two guarded oracle-tooling rows, and a wrapper carrying `inventory`.
+    fn guarded_tree(inventory: &str) -> MapFiles {
+        let rows = format!(
+            "[[hazard]]
+id = \"HZ-0004\"
+path = \"original/scripts/tool.sh\"
+lines = [1, 1]
+behaviour = \"A caller-supplied name reaches a shell.\"
+verdict = \"substitute\"
+owner = \"upstream-suite\"
+verification = \"{GUARD}\"
+status = \"verified\"
+decision = \"DL-0306\"
+
+[[hazard]]
+id = \"HZ-0005\"
+path = \"original/scripts/helper.pl\"
+lines = [1, 1]
+behaviour = \"A temporary name is predictable.\"
+verdict = \"substitute\"
+owner = \"upstream-suite\"
+verification = \"{GUARD}\"
+status = \"verified\"
+decision = \"DL-0306\"
+
+[[reviewed]]
+path = \"original/scripts/tool.sh\"
+hazards = 1
+decision = \"DL-0306\"
+
+[[reviewed]]
+path = \"original/scripts/helper.pl\"
+hazards = 1
+decision = \"DL-0306\"
+
+"
+        );
+        let text = GOOD.replace("[[divergence]]", &format!("{rows}[[divergence]]"));
+        tree()
+            .with("data/hazards.toml", &text)
+            .with("original/scripts/tool.sh", "#!/bin/sh\n")
+            .with("original/scripts/helper.pl", "use strict;\n")
+            .with(GUARD, inventory)
+    }
+
+    fn guarded_planned() -> BTreeSet<String> {
+        ["curl-proto-file", "upstream-suite"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn guarded_decisions() -> BTreeSet<String> {
+        ["DL-0052", "DL-0113", "DL-0225", "DL-0306"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Runs both the per-row gates and the guard gate over one fixture.
+    fn guarded_report(files: &MapFiles) -> String {
+        let register = Register::load(files, "data/hazards.toml").expect("loads");
+        let mut report = Report::new("test");
+        let _ = register.resolve(files, &guarded_planned(), &guarded_decisions(), &mut report);
+        register.guard(files, GUARD, &mut report);
+        report.render()
     }
 
     #[test]
@@ -1301,5 +1493,80 @@ decision = "DL-0113"
         let mut report = Report::new("test");
         let _ = register.resolve(&files, &planned(), &decisions(), &mut report);
         assert!(report.render().contains("FAIL hazard/identifiers-unique"));
+    }
+
+    #[test]
+    fn a_guarded_row_and_its_inventory_entry_pass_together() {
+        let files = guarded_tree(WRAPPER);
+        let rendered = guarded_report(&files);
+        assert!(
+            rendered.contains("PASS hazard/guarded-tooling-declared"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("PASS hazard/guarded-tooling-covers-rows"));
+        assert!(rendered.contains("PASS hazard/guarded-tooling-answered"));
+        assert!(!rendered.contains("FAIL"), "{rendered}");
+        assert_eq!(
+            guarded_inventory(&files, GUARD),
+            vec!["helper.pl".to_owned(), "tool.sh".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_row_the_inventory_forgets_fails() {
+        let files = guarded_tree("#!/bin/sh\nguarded_tooling=\"tool.sh\"\n");
+        let rendered = guarded_report(&files);
+        assert!(
+            rendered.contains("FAIL hazard/guarded-tooling-covers-rows"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("original/scripts/helper.pl"));
+        assert!(rendered.contains("PASS hazard/guarded-tooling-answered"));
+    }
+
+    #[test]
+    fn an_inventory_entry_no_row_answers_fails() {
+        let files = guarded_tree("#!/bin/sh\nguarded_tooling=\"tool.sh helper.pl spare.sh\"\n");
+        let rendered = guarded_report(&files);
+        assert!(
+            rendered.contains("FAIL hazard/guarded-tooling-answered"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("spare.sh"));
+        assert!(rendered.contains("PASS hazard/guarded-tooling-covers-rows"));
+    }
+
+    #[test]
+    fn an_empty_or_absent_inventory_fails() {
+        let files = guarded_tree("#!/bin/sh\n");
+        let rendered = guarded_report(&files);
+        assert!(
+            rendered.contains("FAIL hazard/guarded-tooling-declared"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("FAIL hazard/guarded-tooling-covers-rows"));
+        assert!(guarded_inventory(&MapFiles::new(), GUARD).is_empty());
+    }
+
+    #[test]
+    fn a_row_outside_the_tooling_directory_is_not_in_the_guard_domain() {
+        let text = GOOD.replace(
+            "verification = \"Platform matrix excludes OpenVMS.\"",
+            &format!("verification = \"{GUARD}\""),
+        );
+        let files = tree()
+            .with("data/hazards.toml", &text)
+            .with(GUARD, WRAPPER)
+            .with("original/scripts/tool.sh", "#!/bin/sh\n");
+        let register = Register::load(&files, "data/hazards.toml").expect("loads");
+        let mut report = Report::new("test");
+        register.guard(&files, GUARD, &mut report);
+        let rendered = report.render();
+        assert!(
+            rendered.contains("FAIL hazard/guarded-tooling-answered"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("PASS hazard/guarded-tooling-covers-rows"));
+        assert!(rendered.contains("0 row(s) verified by the guard"));
     }
 }

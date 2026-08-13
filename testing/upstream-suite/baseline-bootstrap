@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: the blitzy-curl project contributors
 #
 # Baseline bootstrap entry point.                                        DL-0033
-# Usage: baseline-bootstrap [staging-root] [-- command ...]
+# Usage: baseline-bootstrap [staging-root] [--preflight] [-- command ...]
 #
 # Default staging root: $BASELINE_STAGE, else <repo>/target/baseline.
 # Honours $AUTORECONF.                                                    DL-0033
@@ -13,18 +13,26 @@
 #
 # $CURL_CI_REPORTING selects off or isolated; default off.              DL-0282
 # Off clears every provider variable.                                   DL-0282
+#
+# The command surface refuses guarded oracle tooling.                   DL-0306
+# --preflight lists that inventory and its prerequisites.               DL-0306
 
 set -eu
 unset CDPATH
 
 staging_argument=""
 run_command=0
+preflight=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --)
       shift
       run_command=1
       break
+      ;;
+    --preflight)
+      preflight=1
+      shift
       ;;
     *)
       if [ -z "$staging_argument" ]; then
@@ -34,6 +42,71 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+# Oracle tooling this wrapper refuses to run.                           DL-0306
+guarded_tooling="mk-ca-bundle.pl dmaketgz verify-release checksrc.pl"
+guarded_tooling="$guarded_tooling checksrc-all.pl contrithanks.sh"
+guarded_tooling="$guarded_tooling randdisable schemetable.c coverage.sh"
+
+# Reason code and decision of one guarded entry.                        DL-0306
+guarded_reason() {
+  case "$1" in
+    mk-ca-bundle.pl) echo "SHELL-INTERPOLATION DL-0307" ;;
+    dmaketgz) echo "SHELL-INTERPOLATION DL-0308" ;;
+    verify-release) echo "ARCHIVE-CODE-EXECUTION DL-0309" ;;
+    checksrc.pl | checksrc-all.pl) echo "SHELL-INTERPOLATION DL-0310" ;;
+    contrithanks.sh) echo "PREDICTABLE-TEMPORARY DL-0311" ;;
+    randdisable) echo "NON-PORTABLE-PATH DL-0312" ;;
+    schemetable.c) echo "WARNING-DEBT DL-0313" ;;
+    coverage.sh) echo "PREREQUISITE-ABSENT DL-0314" ;;
+    *) echo "UNREGISTERED DL-0306" ;;
+  esac
+}
+
+# External programs one guarded entry needs.                            DL-0314
+guarded_prerequisites() {
+  case "$1" in
+    coverage.sh) echo "lcov genhtml" ;;
+    *) echo "" ;;
+  esac
+}
+
+# First guarded entry named anywhere in a command vector.               DL-0306
+guarded_named() {
+  for word in "$@"; do
+    for entry in $guarded_tooling; do
+      if [ "${word##*/}" = "$entry" ]; then
+        echo "$entry"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+# The command surface never reaches guarded tooling.                    DL-0306
+if [ "$run_command" = "1" ] && [ "$#" -gt 0 ] && entry=$(guarded_named "$@"); then
+  echo "baseline-bootstrap: refusing guarded original/scripts/$entry" >&2
+  echo "baseline-bootstrap: reason $(guarded_reason "$entry")" >&2
+  exit 1
+fi
+
+# Declared inventory, with prerequisite availability.                   DL-0306
+if [ "$preflight" = "1" ]; then
+  for entry in $guarded_tooling; do
+    echo "baseline-bootstrap: guarded original/scripts/$entry," \
+      "reason $(guarded_reason "$entry")"
+    for tool in $(guarded_prerequisites "$entry"); do
+      if command -v "$tool" >/dev/null 2>&1; then
+        echo "baseline-bootstrap:   prerequisite $tool available"
+      else
+        echo "baseline-bootstrap:   prerequisite $tool unavailable," \
+          "PREREQUISITE-ABSENT DL-0314"
+      fi
+    done
+  done
+  exit 0
+fi
 
 script_directory=$(cd -- "$(dirname -- "$0")" && pwd)
 repository_root=$(cd -- "$script_directory/../.." && pwd)

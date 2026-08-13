@@ -745,6 +745,8 @@ ownership-data = "testing/audit/traceability/data/ownership.toml"     # DL-0111
 hazard-data = "testing/audit/traceability/data/hazards.toml"          # DL-0110
 observability-data = "testing/audit/traceability/data/observability.toml" # DL-0232
 decision-log = "refactor/docs/DECISION-LOG.md"                        # DL-0023
+# Guarded oracle tooling; read against the register.                  DL-0306
+tooling-guard = "testing/upstream-suite/baseline-bootstrap"           # DL-0306
 
 # Rendered documents; check mode diffs each one.                       DL-0111
 [workspace.metadata.curl.traceability.outputs]

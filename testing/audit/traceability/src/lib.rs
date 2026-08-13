@@ -68,6 +68,7 @@ pub fn generate(workspace: &Workspace, files: &dyn Files) -> AuditResult<Generat
     );
     let back = reverse::resolve(files, &ownership, &decisions, &mut report);
     let hazard_rows = register.resolve(files, &planned, &decisions, &mut report);
+    register.guard(files, index.tooling_guard(), &mut report);
     let coverage = register.coverage(files);
     let flow = observability.audit(files, &decisions, &mut report);
     errordocs::audit(files, &mut report);

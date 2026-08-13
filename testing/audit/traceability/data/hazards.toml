@@ -4160,6 +4160,589 @@ verification = "Filesystem matrix over a target replaced by a symlink between th
 status = "obligation"
 decision = "DL-0283"
 
+[[hazard]]
+id = "HZ-0377"
+path = "original/scripts/mk-ca-bundle.pl"
+lines = [241, 255]
+behaviour = "The digest helper opens the name it is handed with the two-argument form of open, which with no mode runs a name beginning with a pipe character as a command to write to and a name ending with one as a command to read from. The name is not a literal: a certificate source given on the command line as a custom URL never reaches the HTTPS test that guards the predefined sources, and the local download name derived from it keeps whatever the caller wrote whenever that text carries neither a slash nor a question mark. That derived name is what the helper receives when the run digests the freshly downloaded source. The shell-reaching path is taken only while a SHA digest module is loaded; with none loaded the helper runs the OpenSSL program through a list-form process instead, and that path reaches no shell."
+verdict = "substitute"
+owner = "upstream-suite"
+verification = "testing/upstream-suite/baseline-bootstrap"
+status = "verified"
+decision = "DL-0307"
+
+[[hazard]]
+id = "HZ-0378"
+path = "original/scripts/mk-ca-bundle.pl"
+lines = [627, 650]
+behaviour = "With plain-text output requested, every certificate is fingerprinted by building the program text as one string beginning with a pipe character and opening that string with the two-argument form of open, so a shell runs it. The output path taken from the first positional argument is appended to the same string as an append redirection with no quoting, so a path carrying shell syntax is read as syntax rather than as a file name and a path carrying whitespace splits into words. The signature algorithms interpolated beside it are validated against a fixed list and the OpenSSL program name is a literal, so that output path is the only text in the string a caller writes freely."
+verdict = "substitute"
+owner = "upstream-suite"
+verification = "testing/upstream-suite/baseline-bootstrap"
+status = "verified"
+decision = "DL-0307"
+
+[[hazard]]
+id = "HZ-0379"
+path = "original/scripts/dmaketgz"
+lines = [30, 55]
+behaviour = "The version text arrives as the first positional argument, is tested for emptiness alone, and is then interpolated into the program text of the shell the container runs, so a version carrying shell syntax is executed as syntax. The container runs with the invoking directory mounted read-write at the build path and with that directory as its working directory, and the mount is the invoking directory rather than a fixed one, so the injected text executes with write access to the very checkout the release is being cut from. The timestamp argument is handed to the image build as a build argument and is interpolated into no program text."
+verdict = "substitute"
+owner = "upstream-suite"
+verification = "testing/upstream-suite/baseline-bootstrap"
+status = "verified"
+decision = "DL-0308"
+
+[[hazard]]
+id = "HZ-0380"
+path = "original/scripts/verify-release"
+lines = [38, 97]
+behaviour = "The archive name arrives as the first positional argument and is tested for emptiness alone; the release version and the reproducible timestamp are then read out of that same archive. When no git checkout is detected the archive is extracted and its own configure script and its own release-tarball script are run, so code carried by the artifact under test executes before anything has established where that artifact came from. The script performs no signature or authenticity check anywhere in the file, and the only comparison it makes is a digest comparison between the rebuilt tarball and the supplied one, written as the last statement of the file, so what it can report is that a rebuild reproduced the bytes it was given. The git path differs and is the narrower exposure: it rebuilds from a tag in the surrounding clone rather than from the archive."
+verdict = "substitute"
+owner = "upstream-suite"
+verification = "testing/upstream-suite/baseline-bootstrap"
+status = "verified"
+decision = "DL-0309"
+
+[[hazard]]
+id = "HZ-0381"
+path = "original/scripts/checksrc.pl"
+lines = [1213, 1246]
+behaviour = "With the copyright-year warning enabled, the checker asks git twice about the file it is scanning by interpolating that file name into a command line it hands to a shell, quoted with double quotes alone, so a name carrying a double quote closes the quoting and the remainder is read as shell syntax. The warning is an extended one and is off by default: it becomes enabled only from the tree being scanned, either by an enable line in that tree's checksrc control file or by an enable comment inside a scanned source file, so reachability is a property of the scanned content rather than of the invocation. No control file inside the oracle enables it and the name appears only in the checker itself and in the checker's own documentation, so the path is unreachable while the tree stays frozen."
+verdict = "substitute"
+owner = "upstream-suite"
+verification = "testing/upstream-suite/baseline-bootstrap"
+status = "verified"
+decision = "DL-0310"
+
+[[hazard]]
+id = "HZ-0382"
+path = "original/scripts/checksrc-all.pl"
+lines = [13, 43]
+behaviour = "The batch driver collects the names to scan, from the git index inside a checkout and from a filesystem walk outside one, and forwards them to the checker one directory at a time. It reaches no shell of its own: both git listings are opened as list-form processes and the checker is run with its arguments as a list, so what the driver contributes to the copyright-year path is the file name it forwards rather than any interpolation. Every tracked C source and header of the scanned tree is forwarded, with the CMake work directory and the generated test data excluded."
+verdict = "substitute"
+owner = "upstream-suite"
+verification = "testing/upstream-suite/baseline-bootstrap"
+status = "verified"
+decision = "DL-0310"
+
+[[hazard]]
+id = "HZ-0383"
+path = "original/scripts/contrithanks.sh"
+lines = [52, 105]
+behaviour = "The script composes its temporary name from a fixed path inside the documentation directory and the process identifier, writes it with a plain truncating redirection, appends to it, reads it twice and removes it, with the name unquoted at every one of those uses. Nothing asks for an exclusive create and nothing refuses to follow a symbolic link, so in a checkout another user can write to, a symbolic link placed at that name beforehand sends the write wherever it points, and a name carrying whitespace would split into words. The script also rewrites the contributor list in place in the same directory, so a run mutates the tree it is invoked in."
+verdict = "substitute"
+owner = "upstream-suite"
+verification = "testing/upstream-suite/baseline-bootstrap"
+status = "verified"
+decision = "DL-0311"
+
+[[hazard]]
+id = "HZ-0384"
+path = "original/scripts/randdisable"
+lines = [44, 48]
+behaviour = "The list of TLS options the randomised configure driver picks one from carries an absolute path into an upstream developer's home directory as the value of the wolfSSL option. On any other machine that option either fails configuration outright or selects whatever unrelated artifact sits at that path, so a sweep driven by this list can report a result for a backend nobody chose. The other three entries of the list carry no path."
+verdict = "substitute"
+owner = "upstream-suite"
+verification = "testing/upstream-suite/baseline-bootstrap"
+status = "verified"
+decision = "DL-0312"
+
+[[hazard]]
+id = "HZ-0385"
+path = "original/scripts/schemetable.c"
+lines = [70, 112]
+behaviour = "The scheme-table generator parses cleanly but is not warning-clean: it declares a copy of its input pointer that nothing reads, keeps a count of consecutive empty slots that nothing reads after the loop, and compares an unsigned table index against a signed loop counter. Measured with this environment's compiler under all, extra and pedantic warnings against the oracle's own headers, that is three diagnostics, at the unused copy, at the unused count and at the signed comparison inside the table printer. The file is maintainer tooling rather than a translation unit of the library or the tool, and the table it prints is already present in the oracle."
+verdict = "substitute"
+owner = "upstream-suite"
+verification = "testing/upstream-suite/baseline-bootstrap"
+status = "verified"
+decision = "DL-0313"
+
+[[hazard]]
+id = "HZ-0386"
+path = "original/scripts/coverage.sh"
+lines = [39, 40]
+behaviour = "The coverage wrapper bootstraps, configures a debug build with coverage instrumentation, builds it, runs the regular and the event-based test pass, and only then calls the coverage collector and the report generator. It tests for neither program first and carries no note about installing them, and neither program exists in the prepared environment, so a run performs the whole build and both test passes and then fails at the collector call. The torture pass the wrapper would otherwise drive is commented out upstream."
+verdict = "substitute"
+owner = "upstream-suite"
+verification = "testing/upstream-suite/baseline-bootstrap"
+status = "verified"
+decision = "DL-0314"
+
+[[hazard]]
+id = "HZ-0387"
+path = "original/docs/CURLDOWN.md"
+lines = [89, 104]
+behaviour = "The format guide states that a section-3 page's protocol list may be `*` when the option is virtually for everything, and gives the TLS backend names as `GnuTLS`, `mbedTLS`, `OpenSSL`, `rustls`, `Schannel`, `wolfSSL` and `All`. The generator that reads those keys accepts neither spelling: the protocol table at `original/scripts/cd2nroff:159-190` carries an `All` key and no `*` key, the backend table at `:192-201` carries `Rustls` and not `rustls`, and both are case-sensitive hash lookups, so a page written to this guide exits 2 with the invalid-protocol diagnostic at `:343` or the invalid-backend diagnostic at `:355`. Measured by running the generator over one page carrying each documented spelling."
+verdict = "not-ported"
+owner = "none"
+verification = "No project-authored file carries curldown metadata and no generator of this project emits it, so the rejected spellings reach nothing this project builds; the enumeration the port takes from this folder is the option inventory, derived from `original/src/tool_getparam.c` and the pages under `original/docs/cmdline-opts/`."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0388"
+path = "original/docs/ECH.md"
+lines = [283, 290]
+behaviour = "The limitations section points a reader at `./tests/ech_test.sh` for the script that attempts ECH against test servers. The tracked path is `original/tests/ech_tests.sh` and no `ech_test.sh` exists anywhere in the oracle, so the command as written finds nothing. The same sentence reads `has find issues` at `:287`."
+verdict = "not-ported"
+owner = "none"
+verification = "The upstream cases the staging wrapper runs are enumerated from the oracle's own test directory rather than from this prose, and the ECH surface the port owes is the option and its documented values, derived from `original/src/tool_getparam.c` and `original/docs/cmdline-opts/ech.md`."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0389"
+path = "original/docs/EXPERIMENTAL.md"
+lines = [84, 88]
+behaviour = "The experimental-feature list names the session import and export option as `--ssl-session <filename>`. The option the tool defines is `ssl-sessions` at `original/src/tool_getparam.c:322`, documented at `original/docs/cmdline-opts/ssl-sessions.md`, and the singular spelling is not an alias, so the documented invocation is refused as an unknown option."
+verdict = "not-ported"
+owner = "none"
+verification = "The CLI option table is enumerated mechanically from `original/src/tool_getparam.c` and reconciled against `original/docs/options-in-versions` in `refactor/docs/COVERAGE-MATRIX.md`, and `testing/corpora` carries one invocation per baseline option name, so no option name reaches the port from prose."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0390"
+path = "original/docs/FEATURES.md"
+lines = [28, 28]
+behaviour = "The summary states that curl has run on 101 operating systems and 28 CPU architectures. Three other files in the same folder disagree: `original/docs/INSTALL.md:663` heads an enumeration of 108, `original/docs/FAQ.md:33` says more than 110 and `original/docs/HISTORY.md:480` says 110, so the folder carries four figures for one fact and this is the lowest of them."
+verdict = "not-ported"
+owner = "none"
+verification = "No figure in this prose is a port contract: the platform matrix is the recorded one and is asserted by the per-target build jobs, and every count the project's own registers carry is re-derived from the oracle on each run rather than quoted."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0391"
+path = "original/docs/FEATURES.md"
+lines = [87, 87]
+behaviour = "The HTTP feature list reads `NTLM (9)`. That marker is the only parenthesised digit in the file and no footnote 9 is defined anywhere in it, so it points at nothing."
+verdict = "not-ported"
+owner = "none"
+verification = "The authentication mechanism set the port owes is enumerated from `original/lib/vauth/` and the public bitmask in `original/include/curl/curl.h`, not from this list."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0392"
+path = "original/docs/HTTP3.md"
+lines = [309, 315]
+behaviour = "The prerequisite section's example ends `curl localhost/8GB -o dev/null`, which names a relative path rather than the null device, so the invocation writes the whole transfer into a `dev` directory of the working directory where one exists and fails with a write error where it does not."
+verdict = "not-ported"
+owner = "none"
+verification = "No project-authored script or corpus copies an invocation from this prose; the CLI corpus is generated from the option table, and the differential harness compares written output bytes as well as stdout, stderr and exit status for every invocation it runs."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0393"
+path = "original/docs/INSTALL-CMAKE.md"
+lines = [184, 228]
+behaviour = "The build-options inventory lists the project's CMake options, advanced ones among them such as `CURL_CLANG_TIDY` and `CURL_HIDDEN_SYMBOLS`, and carries no entry for `CURL_DEBUG_GLOBAL_MEM`, which `original/CMakeLists.txt:513-514` declares and marks advanced and `:516-519` turns into a directory-wide compile definition. The section states no bound on its own coverage, so the omission reads as the option not existing."
+verdict = "not-ported"
+owner = "none"
+verification = "The flag and option inventory the build shim must accept is enumerated mechanically from `original/configure.ac` and `original/CMakeLists.txt` under the five mapping classes of DL-0016 and recorded in `refactor/docs/FEATURE-MAP.md`, so no option is taken from this list."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0394"
+path = "original/docs/KNOWN_BUGS.md"
+lines = [247, 254]
+behaviour = "The proxy-authentication entry names the option `--proxy-any` three times, in its heading and twice in its body. The tool defines `proxy-anyauth` at `original/src/tool_getparam.c:240` and no `proxy-any` alias exists, so the invocation the entry describes is refused as an unknown option while the defect it reports is real."
+verdict = "not-ported"
+owner = "none"
+verification = "The option spelling the port implements is re-derived from `original/src/tool_getparam.c` and asserted by the one-invocation-per-option CLI corpus; the any-auth behaviour this entry reports is a library behaviour answered under its own locator in `original/lib/`, and the reproduced-quirk register cross-references this file rather than restating it."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0395"
+path = "original/docs/MANUAL.md"
+lines = [723, 723]
+behaviour = "The TLS-version section's example invokes `curl --tlv1.0 https://secure.example.com/`. The tool defines `tlsv1.0` at `original/src/tool_getparam.c:345` and no `tlv1.0` alias exists, so the example exits with an unknown-option diagnostic instead of selecting a TLS version."
+verdict = "not-ported"
+owner = "none"
+verification = "The CLI option table is enumerated from `original/src/tool_getparam.c` and the one-invocation-per-option corpus covers every name in it, so an option name that exists only in prose is never implemented."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0396"
+path = "original/docs/ROADMAP.md"
+lines = [17, 17]
+behaviour = "The file's last line is a bare `##`, which renders as an empty second-level heading carrying neither a title nor a body."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree renders this file: the documentation site is scoped to `refactor/docs/` with the oracle excluded, so the empty heading reaches no rendered output of this project and its bytes are held by the frozen tree digest."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0397"
+path = "original/docs/SECURITY-ADVISORY.md"
+lines = [11, 11]
+behaviour = "The opening paragraph reads `reported to the project and and it has been confirmed`, duplicating the conjunction."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree renders this file, and the private reporting route it describes is followed rather than reproduced; its bytes are held by the frozen tree digest."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0398"
+path = "original/docs/TheArtOfHttpScripting.md"
+lines = [103, 107]
+behaviour = "The name-resolution example maps port 80 with `--resolve www.example.org:80:127.0.0.1` and then requests `https://www.example.org/`, whose implicit port is 443, so the mapping the example teaches does not apply to the request it makes and the name resolves normally."
+verdict = "not-ported"
+owner = "none"
+verification = "The option's semantics - one entry per host and port pair, matched against the port the URL selects - are derived from `original/lib/dnscache.c:664` and its caller at `original/lib/transfer.c:536`, and the CLI corpus carries the option with a matching and a non-matching port."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0399"
+path = "original/docs/TheArtOfHttpScripting.md"
+lines = [437, 439]
+behaviour = "The referer example reads `curl --referer https://www.example.come https://www.example.com`, whose referer value names a host ending in `come` rather than the example domain the rest of the page uses."
+verdict = "not-ported"
+owner = "none"
+verification = "The referer header the port sends is the option's argument verbatim, taken from `original/src/tool_getparam.c:280` and the request builder in `original/lib/http.c`; nothing reads the example, which renders in no output of this project."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0400"
+path = "original/docs/TheArtOfHttpScripting.md"
+lines = [690, 694]
+behaviour = "The checklist item for the referer header says to set it with `-E`. `-E` is the short form of `--cert` at `original/src/tool_getparam.c:88` while the referer short form is the lowercase `-e` at `:280`, so a reader following the checklist supplies a client-certificate path where a referer was meant."
+verdict = "not-ported"
+owner = "none"
+verification = "Short forms are read from the alias table in `original/src/tool_getparam.c` and reconciled in `refactor/docs/COVERAGE-MATRIX.md`, and the CLI corpus carries every short form the table defines, so no short form is taken from prose."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0401"
+path = "original/docs/URL-SYNTAX.md"
+lines = [401, 405]
+behaviour = "The SMB section states that a username embedded in the URL must contain the domain name and that the backslash must therefore be URL encoded as `%2f`. `%2F` encodes the forward slash and the backslash is `%5C`, so a URL built to this instruction carries a slash where the domain separator belongs."
+verdict = "not-ported"
+owner = "none"
+verification = "Percent-encoding and the reserved set are first-party in the URL crate, derived from `original/lib/escape.c` and `original/lib/urlapi.c`, and the URL corpus of at least 100,000 inputs compares the accept-or-reject decision and every parsed component against the baseline, so no encoding is taken from this prose."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0402"
+path = "original/docs/URL-SYNTAX.md"
+lines = [407, 408]
+behaviour = "The SMB section states that the size of an upload has to be known ahead of time, meaning that a file passed to curl over a pipe like standard input can be uploaded. The constraint it states is the reason such an upload cannot be made, and the sentence omits the negation, so it asserts the opposite of what it explains."
+verdict = "not-ported"
+owner = "none"
+verification = "The upload path's own requirement is read from `original/lib/smb.c`, and the differential harness compares the exit status, stderr bytes and written output of a piped SMB upload in both trees."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0403"
+path = "original/docs/URL-SYNTAX.md"
+lines = [140, 145]
+behaviour = "The transfer-scheme list names 22 schemes and omits five the oracle implements: `mqtts` at `original/lib/protocol.c:230`, `sftp` at `:284`, `scp` at `:298`, `ws` at `:437` and `wss` at `:451`. The default-port table at `:241-246` of this file is short in a different way - it carries SCP and SFTP at 22 and omits MQTTS, whose port is 8883 at `original/lib/protocol.h:56`, and WS and WSS, which take the HTTP and HTTPS ports through `original/lib/protocol.c:447` and `:462`."
+verdict = "not-ported"
+owner = "none"
+verification = "The scheme set and its default ports are enumerated mechanically from `original/lib/protocol.c` and `original/lib/protocol.h` for `refactor/docs/COVERAGE-MATRIX.md`, and the URL corpus exercises every scheme the oracle accepts, so neither the scheme list nor a port is read from this prose."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0404"
+path = "original/docs/mk-ca-bundle.md"
+lines = [34, 114]
+behaviour = "The options section documents fourteen options and omits `-w`, which `original/scripts/mk-ca-bundle.pl:113` accepts, `:65` defaults to 76 and `:190` documents in the script's own help as the base64 line-wrap width. Its `-s` entry at `:102-108` offers `ALL`, `NONE`, `MD5` as the default, `SHA1`, `SHA256`, `SHA384` and `SHA512`, while the script's accepted set at `:105-109` is `SHA256`, `SHA384` and `SHA512` with `ALL` as its only keyword and its default at `:103` is `SHA256`, so three of the seven values the page offers are refused and the default it names is not the script's."
+verdict = "not-ported"
+owner = "none"
+verification = "Neither the tool nor its page is ported: the CA-bundle discovery order the port owes comes from `original/lib/vtls/` and `original/docs/SSLCERTS.md`, and this page is a reference input whose bytes are held by the frozen tree digest."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0405"
+path = "original/docs/options-in-versions"
+lines = [86, 87]
+behaviour = "The register states at `:9` that its entries are sorted alphabetically on the long name and then inverts that order four times: `--haproxy-protocol` before `--haproxy-clientip` at `:86-87`, `--ipfs-gateway` before `--insecure` at `:103-104`, `--raw` before `--follow` at `:204-205`, and `--silent` before `--sigalgs` at `:225-226`. The 274 names and versions themselves are correct, so only the ordering claim is false."
+verdict = "not-ported"
+owner = "none"
+verification = "The register is consumed as a set rather than as a sequence: `refactor/docs/COVERAGE-MATRIX.md` reconciles its 274 entries against the option table in `original/src/tool_getparam.c` and the pages under `original/docs/cmdline-opts/`, and no generator of this project depends on its line order."
+status = "obligation"
+decision = "DL-0318"
+
+[[hazard]]
+id = "HZ-0406"
+path = "original/scripts/cd2cd"
+lines = [215, 218]
+behaviour = "The in-place writer opens its output through Perl's two-argument form as `open(O, \">$f\")`, with the file name arriving from the command line, so a name whose text begins or ends with a pipe is taken as a command to run rather than as a path to write, and a leading redirection or whitespace is interpreted rather than treated as part of the name. The same file also reads its input through the two-argument form at `:157`."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes this generator: its only in-repository references are the distribution list at `original/scripts/Makefile.am` and read-only citations in this project's registers, and the ordered verification sequence adds no invocation of it. The port's own file handling opens paths through the platform interface with no shell interpretation."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0407"
+path = "original/scripts/cd2nroff"
+lines = [556, 570]
+behaviour = "The output path is built as `\"$dir/$title.$section\"` from the page's own `Title` and `Section` metadata, read at `:242-249` with no grammar beyond the end of line, and the result is opened for writing with no basename containment and no check that the canonical path stays under the requested directory, so metadata carrying path separators or parent references writes outside it. The keep-filename mode at `:557-560` derives the name from the file instead and is the only path that does not depend on metadata."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes this generator and no project-authored file carries curldown metadata for it to read; the man pages the port installs are the oracle's own, and their generation stays in the vendored tree."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0408"
+path = "original/scripts/checksrc.pl"
+lines = [1213, 1245]
+behaviour = "With the extended copyright-year rule enabled, the name of the file being linted is interpolated into two shell commands run through `qx` - `git status -s -- \"$file\"` at `:1236` and a `git rev-list` invocation at `:1241` - so a name containing shell syntax is executed rather than passed as an argument. The rule is off by default and turns on per directory through a `.checksrc` file, which is what decides whether the interpolation is reached at all."
+verdict = "not-ported"
+owner = "none"
+verification = "This lint governs the immutable C tree alone and is never run by this project: its build entry points are `original/Makefile.am:166` and `:177` inside the oracle, its findings are registered as a reused diagnostic surface rather than consumed, and the port's own warning gate is the clippy and Cargo gate over the five named configurations."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0409"
+path = "original/scripts/contrithanks.sh"
+lines = [52, 105]
+behaviour = "The staging file is a predictable path in the tracked documentation directory, `./docs/THANKS.$$`, created by an ordinary truncating redirection at `:55` rather than by an exclusive create, so an existing name at that path is followed and written through, and `:105` removes it with no trap, leaving it behind whenever the run is interrupted. The script sets only `set -u` at `:30`, so a failure in any of the git, sed or grep stages that feed the file is not fatal and the rewrite of the tracked list at `:89-98` proceeds on partial input."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes this script and the file it rewrites is inside the frozen oracle, whose recursive digest fails on any change; the contributor list is not a port artifact."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0410"
+path = "original/scripts/contrithanks.sh"
+lines = [96, 101]
+behaviour = "Both output paths pipe the filtered names into `sort -f $rand`, which sorts the named file and discards the piped input, so the `grep -v \"^ \"` stage before it has no effect on what is written and the header-line filter it applies is silently dropped from the result."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes this script; the list it produces is upstream's own and the vendored copy is held byte-exact by the frozen tree digest."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0411"
+path = "original/scripts/dmaketgz"
+lines = [30, 35]
+behaviour = "A missing version argument prints `Specify a version number!` and then runs a bare `exit`, which exits with the status of the preceding successful command, so the failure is reported on standard output while the process reports success to its caller."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree invokes this script and no release of this project is produced through it; the exit-status contract the port owes is the tool's own, enumerated from `original/docs/cmdline-opts/` and compared for every corpus invocation."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0412"
+path = "original/scripts/dmaketgz"
+lines = [49, 55]
+behaviour = "The version argument is interpolated into the text of a shell command passed to `sh -c` inside a container run at `:49-55`, so its content is executed rather than passed as an argument, and that container runs as the calling user's identity with the working tree bind-mounted read-write at `:50`. Nothing between `:30` and the interpolation constrains the argument's grammar."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree invokes this script, no project workflow exists that could, and the release-archive production it drives is outside this work; the port builds through Cargo and the build shim, neither of which composes shell command text from an argument."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0413"
+path = "original/scripts/extract-unit-protos"
+lines = [38, 38]
+behaviour = "The scanner opens each file it was given through Perl's two-argument form as `open(F, \"<$file\")`, with the names arriving from the caller, so a name whose text ends in a pipe is run as a command whose output is read instead of being opened as a file."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes this generator: the prototype header it produces exists only for the oracle's internal-linkage unit tests, whose coverage the port carries as Rust-native equivalence tests that link against nothing internal."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0414"
+path = "original/scripts/firefox-db2pem.sh"
+lines = [48, 64]
+behaviour = "The bundle is written by a five-stage pipeline whose exit status is the last stage's, and the shell runs with `set -eu` at `:33` and no pipeline-failure propagation, so a failure in the certificate tool or in either filter leaves the header written at `:48-55` and whatever the loop managed to append, and the script still exits successfully. The output file is also truncated at `:48` before any stage has produced a certificate."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes this script; the CA sources the port reads are the platform trust store and the bundle path resolved by the TLS crate, and the discovery order is compared against the baseline rather than produced by this tool."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0415"
+path = "original/scripts/installcheck.sh"
+lines = [33, 50]
+behaviour = "The script runs with `set -eu` at `:26`, so each `diff` at `:38` and `:45` aborts the run on a difference and the two `if test \"$?\" -ne \"0\"` branches at `:40-43` and `:47-50` that would name which comparison failed and exit 2 or 1 are unreachable; the diagnostic a caller sees is the diff output and the status is the shell's. A missing prefix argument prints the usage line at `:34` and runs a bare `exit`, reporting success."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes this script; the installed-artifact contract the port owes is the byte-equivalent `curl-config` and `libcurl.pc` output plus the exported-symbol assertion, which are checked by the verification tree rather than by this comparison."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0416"
+path = "original/scripts/maketgz"
+lines = [34, 67]
+behaviour = "Two invalid-input paths report and then exit successfully: a missing version argument prints `Specify a version number!` at `:38` and runs a bare `exit`, and a version whose third field yields no digits prints `invalid version number?` at `:65` and does the same. The digit extraction at `:60-62` strips non-digits rather than refusing them, so a version of an unexpected shape reaches the rest of the run with fields silently rewritten."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree invokes this script and no release of this project is produced through it; the version identity the port reports is read from `original/include/curl/curlver.h` and asserted against the frozen baseline record."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0417"
+path = "original/scripts/maketgz"
+lines = [96, 106]
+behaviour = "The version fields are interpolated into the text of two `sed -i` programs that rewrite the public version header and the tool version header, so an argument containing a sed metacharacter or a program separator alters the substitutions rather than supplying a value to them. The same string is later interpolated into artifact names and the archive-generation paths at `:172` and `:231`, and the `res=$?` check at `:174-179` is unreachable because `set -eu` at `:29` aborts on the failing `make` before it."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree invokes this script; the port's own version-header agreement is verified with `cbindgen --verify` against the immutable headers, which are inputs no build step of this project writes."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0418"
+path = "original/scripts/managen"
+lines = [1047, 1051]
+behaviour = "The category reader opens `\"<$dir/../../src/tool_help.h\"` through Perl's two-argument form with the directory arriving from the command line, and the version reader at `:1368` opens `\"<$include/curl/curlver.h\"` the same way, so a root whose text carries pipe or redirection syntax is interpreted rather than opened."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes this generator: the manual pages and the built-in help text it renders are the oracle's own, and the option inventory the port implements is enumerated from `original/src/tool_getparam.c` instead."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0419"
+path = "original/scripts/mdlinkcheck"
+lines = [205, 215]
+behaviour = "The whitelist entry `https://github.com/curl/curl/wcurl` declared at `:79` is matched by no tracked document - its only occurrence in the oracle is the declaration itself, and `:207` excludes this file from the scan - so its counter never advances and the unused-entry loop at `:212-215` reports `warning: unused whitelist entry` for it on every run. The generic rule at `:123-124` already ignores every link under the project's own repository, so the entry would be redundant even if a document carried the link."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes this checker; its nine diagnostic sites are registered as a reused surface rather than consumed, and no gate of this project reads its exit status."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0420"
+path = "original/scripts/mk-ca-bundle.pl"
+lines = [627, 651]
+behaviour = "In plain-text mode the certificate text is written by opening a shell pipeline built as one string, `\"|$openssl x509 ... >> $crt.~\"` at `:629-631` and `:641-643`, with the output path interpolated into the command text, so a path carrying shell syntax is executed as part of the pipeline. The staging file itself is the predictable `$crt.~` opened by truncating and appending redirections at `:406`, `:638` and `:650` rather than by an exclusive create, and the backup sequence at `:663-671` walks predictable `$crt.~N~` names before renaming, so an existing name at any of them is followed and written through."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes this script and no CA bundle of this project is produced by it; the trust material the port reads is the platform store or a bundle path supplied by option, and its discovery order is compared against the baseline."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0421"
+path = "original/scripts/mk-ca-bundle.pl"
+lines = [215, 234]
+behaviour = "An invalid trust purpose, trust level or signature algorithm prints an error naming the rejected values at `:232` and then calls the help renderer, which ends in a bare `exit` at `:191`, so the run reports the rejection on standard output and exits successfully. The missing-colon check at `:272-275` reports and exits by the same path."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes this script; the exit-status contract the port owes is the tool's own documented status set, compared for every corpus invocation."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0422"
+path = "original/scripts/nroff2cd"
+lines = [28, 30]
+behaviour = "The script's own usage comment converts an nroff page to curldown and then gives the example as `cd2nroff [options] <file.md> > <file.3>`, which names the opposite tool and the opposite direction, so a reader following the comment runs the other generator with this one's arguments."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes either generator and no project-authored file is written in curldown; the comment reaches no rendered output of this project."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0423"
+path = "original/scripts/randdisable"
+lines = [44, 48]
+behaviour = "The TLS-backend list hard-codes one developer's absolute build prefix, `--with-wolfssl=/home/daniel/build-wolfssl`, so the wolfSSL configuration this randomised build helper selects fails on any host without that directory while the other three entries carry no path at all."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes this helper; the configuration set the port builds is the five named feature configurations, declared in the root manifest and driven by the build shim."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0424"
+path = "original/scripts/release-notes.pl"
+lines = [264, 277]
+behaviour = "The output file is opened at `:264` with the return value of `open` unchecked and the writes and close that follow are unchecked as well, so a failure to open, write or close leaves the release notes truncated or unchanged with no diagnostic and a successful exit. The debug block at `:272-277` that would report unused references sits after the unconditional `exit` at `:270` and can never run."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes this script, and the file it rewrites is inside the frozen oracle whose recursive digest fails on any change; the release notes are not a port artifact."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0425"
+path = "original/scripts/schemetable.c"
+lines = [140, 156]
+behaviour = "Two preprocessor-disabled blocks survive in the generator: the duplicate report at `:140-143` and the table dump at `:152-156`, the second of which indexes `scheme[i].n` while `scheme` is an array of string pointers declared at `:32`, so the block would not compile if it were enabled. The file comment at `:27-30` names its output as a table for a `Curl_getn_scheme_handler` function in `url.c`; at the pinned tag no such name exists anywhere in the oracle and the lookup the table serves is `Curl_getn_scheme` at `original/lib/protocol.c:468`, declared at `original/lib/protocol.h:260`."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree compiles, links or runs this generator: it sits outside the provenance enumeration roots, no build manifest of this project names it, and the scheme table the port carries is enumerated from `original/lib/protocol.c` directly."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0426"
+path = "original/scripts/schemetable.c"
+lines = [68, 109]
+behaviour = "Compiled with the picky set the oracle's own build uses, `-Wall -Wextra -Wpedantic`, the file emits three warnings and no error: the unused `so` at `:70`, the set-but-unused `nulls` at `:85`, and a signed-against-unsigned comparison at `:109` where `ix[j]` is `unsigned int` and the loop bound `i` is `int`. Measured with a syntax-only compile of a copy taken outside the oracle."
+verdict = "not-ported"
+owner = "none"
+verification = "No build of this project compiles this file - it is outside the provenance roots and named in no manifest of either mutable tree - and the project's own zero-warning obligation is a Cargo and clippy gate over the five named configurations, which shares no diagnostic set with a C compiler."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0427"
+path = "original/scripts/verify-release"
+lines = [38, 50]
+behaviour = "Two invalid-state paths report and then exit successfully: a missing tarball argument prints `Provide a curl release tarball name as argument` at `:41` and runs a bare `exit`, and more than one candidate directory prints `multiple curl-* entries found` at `:48` and does the same, so a caller that checks the status reads a verified release where nothing was verified."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes this script and no release archive exists anywhere under the oracle; its only consumers are upstream's own vendored workflow and the distribution list, neither of which this project runs."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0428"
+path = "original/scripts/verify-release"
+lines = [60, 117]
+behaviour = "The script acts on the contents of the archive it is meant to verify before any authenticity check exists: it reads the version and the timestamp out of it at `:72-79`, extracts it at `:85` and then runs the archive's own `configure` and its own `dmaketgz` at `:92-93`, so code from the artifact under test executes with the caller's privileges, and the checksum comparison that would justify trusting it happens last at `:121`. The staging directory is the fixed relative `_tarballs` created at `:62` and emptied with `rm -rf` at `:63`, which follows an existing name at that path, and the git branch of the full-verification path is switched with `git checkout -f` at `:107` and restored at `:112` by a plain statement rather than a trap, so an interruption or a failure in between leaves the checkout on the release tag."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes this script, no archive is present under the oracle for it to act on, and the release-verification cycle it performs is outside this work; the baseline this project verifies is compared read-only against the frozen record instead."
+status = "obligation"
+decision = "DL-0319"
+
+[[hazard]]
+id = "HZ-0429"
+path = "original/scripts/wcurl"
+lines = [254, 265]
+behaviour = "Every value the wrapper treats as a URL is appended to one space-separated string at `:332` for post-separator values and `:345` otherwise, and that string is split again by the shell at `:238` and `:255` with no glob suppression, so a value containing whitespace after the space-to-percent-encoding at `:331` and `:344`, or a glob character, is re-split or expanded against the working directory before it is used. Each resulting word is then passed to curl as a bare argument at `:263` rather than through `--url`, so a value beginning with a dash is consumed as an option: the wrapper's own per-URL set, the derived `--output` path and the user's extra options surround it, and an option that reads or writes a local file changes what the invocation does."
+verdict = "not-ported"
+owner = "none"
+verification = "Nothing in either mutable tree executes this wrapper, and it is not part of the command-line surface the port implements: the tool's own argument grammar is enumerated from `original/src/tool_getparam.c` and every option name is exercised by the CLI corpus, which compares exit status, stdout, stderr and written bytes against the baseline."
+status = "obligation"
+decision = "DL-0319"
+
 [[reviewed]]
 path = "original/lib/altsvc.c"
 hazards = 2
@@ -4620,6 +5203,176 @@ path = "original/src/tool_stderr.c"
 hazards = 1
 decision = "DL-0283"
 
+[[reviewed]]
+path = "original/scripts/mk-ca-bundle.pl"
+hazards = 4
+decision = "DL-0307"
+
+[[reviewed]]
+path = "original/scripts/dmaketgz"
+hazards = 3
+decision = "DL-0308"
+
+[[reviewed]]
+path = "original/scripts/verify-release"
+hazards = 3
+decision = "DL-0309"
+
+[[reviewed]]
+path = "original/scripts/checksrc.pl"
+hazards = 2
+decision = "DL-0310"
+
+[[reviewed]]
+path = "original/scripts/checksrc-all.pl"
+hazards = 1
+decision = "DL-0310"
+
+[[reviewed]]
+path = "original/scripts/contrithanks.sh"
+hazards = 3
+decision = "DL-0311"
+
+[[reviewed]]
+path = "original/scripts/randdisable"
+hazards = 2
+decision = "DL-0312"
+
+[[reviewed]]
+path = "original/scripts/schemetable.c"
+hazards = 3
+decision = "DL-0313"
+
+[[reviewed]]
+path = "original/scripts/coverage.sh"
+hazards = 1
+decision = "DL-0314"
+
+[[reviewed]]
+path = "original/docs/CURLDOWN.md"
+hazards = 1
+decision = "DL-0318"
+
+[[reviewed]]
+path = "original/docs/ECH.md"
+hazards = 1
+decision = "DL-0318"
+
+[[reviewed]]
+path = "original/docs/EXPERIMENTAL.md"
+hazards = 1
+decision = "DL-0318"
+
+[[reviewed]]
+path = "original/docs/FEATURES.md"
+hazards = 2
+decision = "DL-0318"
+
+[[reviewed]]
+path = "original/docs/HTTP3.md"
+hazards = 1
+decision = "DL-0318"
+
+[[reviewed]]
+path = "original/docs/INSTALL-CMAKE.md"
+hazards = 1
+decision = "DL-0318"
+
+[[reviewed]]
+path = "original/docs/KNOWN_BUGS.md"
+hazards = 1
+decision = "DL-0318"
+
+[[reviewed]]
+path = "original/docs/MANUAL.md"
+hazards = 1
+decision = "DL-0318"
+
+[[reviewed]]
+path = "original/docs/ROADMAP.md"
+hazards = 1
+decision = "DL-0318"
+
+[[reviewed]]
+path = "original/docs/SECURITY-ADVISORY.md"
+hazards = 1
+decision = "DL-0318"
+
+[[reviewed]]
+path = "original/docs/TheArtOfHttpScripting.md"
+hazards = 3
+decision = "DL-0318"
+
+[[reviewed]]
+path = "original/docs/URL-SYNTAX.md"
+hazards = 3
+decision = "DL-0318"
+
+[[reviewed]]
+path = "original/docs/mk-ca-bundle.md"
+hazards = 1
+decision = "DL-0318"
+
+[[reviewed]]
+path = "original/docs/options-in-versions"
+hazards = 1
+decision = "DL-0318"
+
+[[reviewed]]
+path = "original/scripts/cd2cd"
+hazards = 1
+decision = "DL-0319"
+
+[[reviewed]]
+path = "original/scripts/cd2nroff"
+hazards = 1
+decision = "DL-0319"
+
+[[reviewed]]
+path = "original/scripts/extract-unit-protos"
+hazards = 1
+decision = "DL-0319"
+
+[[reviewed]]
+path = "original/scripts/firefox-db2pem.sh"
+hazards = 1
+decision = "DL-0319"
+
+[[reviewed]]
+path = "original/scripts/installcheck.sh"
+hazards = 1
+decision = "DL-0319"
+
+[[reviewed]]
+path = "original/scripts/maketgz"
+hazards = 2
+decision = "DL-0319"
+
+[[reviewed]]
+path = "original/scripts/managen"
+hazards = 1
+decision = "DL-0319"
+
+[[reviewed]]
+path = "original/scripts/mdlinkcheck"
+hazards = 1
+decision = "DL-0319"
+
+[[reviewed]]
+path = "original/scripts/nroff2cd"
+hazards = 1
+decision = "DL-0319"
+
+[[reviewed]]
+path = "original/scripts/release-notes.pl"
+hazards = 1
+decision = "DL-0319"
+
+[[reviewed]]
+path = "original/scripts/wcurl"
+hazards = 1
+decision = "DL-0319"
+
 [[annotation]]
 path = "original/tests/runtests.pl"
 line = 889
@@ -4808,6 +5561,62 @@ line = 2050
 class = "defensive-invariant"
 reason = "Maps any multi code other than out-of-memory to the bad-argument code; the multi interface returns no other code to this caller."
 decision = "DL-0225"
+
+[[annotation]]
+path = "original/scripts/checksrc.pl"
+line = 171
+class = "diagnosed-outcome"
+reason = "Names the warning this checker reports for a FIXME or TODO comment in a scanned file and gives its message; the word is the identifier of a finding the checker emits rather than a mark on the checker's own behaviour."
+decision = "DL-0310"
+
+[[annotation]]
+path = "original/scripts/checksrc.pl"
+line = 623
+class = "diagnosed-outcome"
+reason = "Matches a FIXME or TODO comment in the scanned line and reaches the report below it, so what follows the match is a named finding rather than a silent outcome."
+decision = "DL-0310"
+
+[[annotation]]
+path = "original/scripts/checksrc.pl"
+line = 624
+class = "diagnosed-outcome"
+reason = "Reports that finding by name with the scanned file, its line and its column, so the outcome is defined and non-silent."
+decision = "DL-0310"
+
+[[annotation]]
+path = "original/docs/ECH.md"
+line = 156
+class = "no-observable-outcome"
+reason = "Marks which builds carry the retry described above it, as upstream's own statement of where the feature stands; the paragraph is prose about backend availability and no outcome of the port turns on it."
+decision = "DL-0318"
+
+[[annotation]]
+path = "original/docs/ECH.md"
+line = 207
+class = "no-observable-outcome"
+reason = "Marks upstream's judgement that the hard-failing option value is not yet a good default; the option and both of its values are defined in the tool's own option table and neither is changed by the judgement."
+decision = "DL-0318"
+
+[[annotation]]
+path = "original/docs/ECH.md"
+line = 269
+class = "no-observable-outcome"
+reason = "Marks an open design question about address hints in an HTTPS resource record; the paragraph prescribes no behaviour and the record's handling has its own locator in the library."
+decision = "DL-0318"
+
+[[annotation]]
+path = "original/docs/ECH.md"
+line = 439
+class = "no-observable-outcome"
+reason = "Marks that upstream defers a decision about resolver behaviour until it has experience with the alternative; nothing in the port reads this paragraph and no behaviour is stated in it."
+decision = "DL-0318"
+
+[[annotation]]
+path = "original/docs/SECURITY-ADVISORY.md"
+line = 126
+class = "no-observable-outcome"
+reason = "The acronym is a version placeholder inside the advisory template's own wording for a remediation line, not an annotation about behaviour; the sentence is guidance to an advisory author."
+decision = "DL-0318"
 
 # ---------------------------------------------------------------------------
 # Divergence allowlist entries, one per diverge verdict.               DL-0231

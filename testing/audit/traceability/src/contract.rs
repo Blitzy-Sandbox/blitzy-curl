@@ -20,6 +20,7 @@ pub struct Index {
     hazards: String,
     observability: String,
     decision_log: String,
+    tooling_guard: String,
     outputs: BTreeMap<String, String>,
 }
 
@@ -54,6 +55,7 @@ impl Index {
             hazards: text("hazard-data")?,
             observability: text("observability-data")?,
             decision_log: text("decision-log")?,
+            tooling_guard: text("tooling-guard")?,
             outputs: rendered,
         })
     }
@@ -80,6 +82,15 @@ impl Index {
     #[must_use]
     pub fn decision_log(&self) -> &str {
         &self.decision_log
+    }
+
+    /// Path of the wrapper that guards the oracle's maintenance tooling.
+    ///
+    /// The hazard register names this path as the verification of every oracle
+    /// script the wrapper refuses, and `DL-0306` records the arrangement.
+    #[must_use]
+    pub fn tooling_guard(&self) -> &str {
+        &self.tooling_guard
     }
 
     /// Declared outputs, keyed by document name.
