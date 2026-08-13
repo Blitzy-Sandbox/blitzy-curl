@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: curl
+# SPDX-FileCopyrightText: the blitzy-curl project contributors
+#
+# Frozen baseline identity.                                            DL-0220
+# Recorded once at import; read, never re-resolved.                      [R1]
+#
+# Consumers: testing/audit, testing/upstream-suite/baseline-bootstrap.
+# Every value here is append-only.                                       [R1]
+
+schema = 1
+
+# ---------------------------------------------------------------------------
+# Upstream identity of the vendored oracle.
+# ---------------------------------------------------------------------------
+[tag]
+name = "curl-8_21_0"                                                  # DL-0001
+version = "8.21.0"
+released = "2026-06-24"
+# Annotated tag object, and the commit it peels to.                    DL-0220
+object = "3f00a2f6fa97f7721b65606954aac979dcb6caac"                   # DL-0220
+commit = "68720b4837284335b2d63cb358f8f6ce65f5bc55"                   # DL-0220
+archive = "curl-8.21.0.tar.xz"
+archive-sha256 = "aa1b66a70eace83dc624508745646c08ae561de512ab403adffb93ac87fc72e6"
+
+# ---------------------------------------------------------------------------
+# The import that placed the oracle in this repository.
+# ---------------------------------------------------------------------------
+[import]
+commit = "972192ded6bc909246dcf9f3852f30060e71e2cc"                   # DL-0220
+root = "original"
+
+# ---------------------------------------------------------------------------
+# Frozen worktree state of the oracle. Recomputed on every run.        DL-0220
+# ---------------------------------------------------------------------------
+[worktree]
+# One line per file: mode, content digest, path.                       DL-0221
+# Byte-wise ascending path order, C collation.                         DL-0221
+digest = "420e72e17c94661bbaec517b07065a69ae8c5306a3353645caab9c6072379dc1"
+digest-algorithm = "sha256-mode-content-path-lines"                   # DL-0221
+files = 4369
+executable-files = 109
+symlinks = 0
+modes = ["100644", "100755"]
+
+# Git index digest over the same tree, second oracle.                  DL-0220
+index-digest = "9132ac7957eb7f62c87372521b54bb29d76b91c690434d8692730f623a01ee9b"
+index-digest-algorithm = "sha256-of-git-ls-files-s"                   # DL-0221
+
+# ---------------------------------------------------------------------------
+# How the oracle is verified. Read-only; scratch only.                 DL-0222
+# ---------------------------------------------------------------------------
+[verification]
+method = "read-only-compare-in-scratch"                               # DL-0222
+scratch-root = "target"
+# No project-authored script may write under the oracle root.            [R1]
+write-targets = []
+asserted-by = "testing/audit"                                         # DL-0037
+bootstrap = "testing/upstream-suite/baseline-bootstrap"               # DL-0033

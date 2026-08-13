@@ -34,6 +34,12 @@ pub struct CliOption {
     pub name: String,
     /// Identifier the table maps it to.
     pub identifier: String,
+    /// Argument-type descriptor as the table spells it, flags included.
+    pub descriptor: String,
+    /// Whether a dispatch arm anywhere in the tool names the identifier.
+    pub dispatched: bool,
+    /// Whether the descriptor marks it deprecated.
+    pub deprecated: bool,
 }
 
 /// One build flag or build-system option.
@@ -259,9 +265,14 @@ pub fn cli_options(files: &dyn Files) -> Vec<CliOption> {
     let Some(text) = files.read("original/src/tool_getparam.c") else {
         return Vec::new();
     };
+    let dispatched = dispatch_labels(&text);
     let mut options = Vec::new();
     let mut inside = false;
-    for line in text.lines() {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        index += 1;
         if line.contains("aliases[]") {
             inside = true;
             continue;
@@ -276,23 +287,56 @@ pub fn cli_options(files: &dyn Files) -> Vec<CliOption> {
         if !trimmed.starts_with('{') {
             continue;
         }
-        let Some(name) = quoted(trimmed) else {
+        // A row may wrap: accumulate to its closing brace before reading it,
+        // because the identifier is the last field and a wrapped row puts it on
+        // the following line.
+        let mut row = trimmed.to_owned();
+        while !row.contains('}') && index < lines.len() {
+            row.push(' ');
+            row.push_str(lines[index].trim());
+            index += 1;
+        }
+        let Some(name) = quoted(&row) else {
             continue;
         };
-        let identifier = trimmed
+        let identifier = row
+            .split_once('}')
+            .map_or(row.as_str(), |(head, _)| head)
             .trim_end_matches(|c: char| c == ',' || c.is_whitespace())
-            .trim_end_matches('}')
             .rsplit(',')
             .next()
             .unwrap_or_default()
             .trim()
             .to_owned();
+        let descriptor = row.split(',').nth(1).unwrap_or_default().trim().to_owned();
         options.push(CliOption {
             name: name.to_owned(),
+            deprecated: descriptor.contains("ARG_DEPR"),
+            descriptor,
+            dispatched: dispatched.contains(&identifier),
             identifier,
         });
     }
     options
+}
+
+/// Identifiers a dispatch arm of the tool names.
+///
+/// The alias table and the dispatch arms are two separate lists in one file, and
+/// nothing in the oracle checks that they agree - which is why an option can be
+/// accepted, have its argument consumed and then be discarded with no
+/// diagnostic. Reading both is the only way to see that.
+fn dispatch_labels(text: &str) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("case C_")
+            && let Some(name) = rest.split(':').next()
+        {
+            found.insert(format!("C_{name}"));
+        }
+    }
+    found
 }
 
 /// Output-format variables, from the tool's variable table.

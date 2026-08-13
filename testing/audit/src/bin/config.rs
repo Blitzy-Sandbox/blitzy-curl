@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: curl
 // SPDX-FileCopyrightText: the blitzy-curl project contributors
 
-//! Runs the four configuration-contract audits and exits non-zero on any
+//! Runs the five configuration-contract audits and exits non-zero on any
 //! failing check.
 //!
 //! Invoked from the repository root, or with the root as the single argument.
@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use curl_audit::fs::RealFiles;
 use curl_audit::report::Report;
 use curl_audit::workspace::{AuditError, Workspace};
-use curl_audit::{comments, lockfile, premise, provenance};
+use curl_audit::{baseline, comments, lockfile, premise, provenance};
 
 /// Absorbs one audit's report, or records the contract failure that stopped it.
 ///
@@ -39,6 +39,11 @@ fn run() -> Result<Report, AuditError> {
         "configuration contracts of {}",
         workspace.root().display()
     ));
+    absorb(
+        &mut report,
+        "baseline-identity",
+        baseline::audit(&workspace, &files),
+    );
     absorb(
         &mut report,
         "dependency-graph",

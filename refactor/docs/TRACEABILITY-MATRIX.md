@@ -11,10 +11,10 @@ direction, an unresolved locator or a dangling pointer fails the run. Do not
 edit this file by hand. Rationale lives in `refactor/docs/DECISION-LOG.md`.
 
 Bidirectional. The forward direction maps every construct the oracle carries to
-the target that owns it: **2427 row(s)** across **10 families**, with **0
+the target that owns it: **2439 row(s)** across **11 families**, with **0
 gap(s)**. The reverse direction maps every project-authored file back to the
 oracle construct it derives from, or to the decision that owns it outright:
-**39 row(s)**, with **0 gap(s)**. Both directions are gates, so a non-empty
+**45 row(s)**, with **0 gap(s)**. Both directions are gates, so a non-empty
 gap column cannot be committed.
 
 | Family | Enumerated from the oracle |
@@ -1815,289 +1815,289 @@ gap column cannot be committed.
 
 | # | Baseline construct | Detail | Target | Disposition | Status | Decision |
 |---:|---|---|---|---|---|---|
-| 1 | `--abstract-unix-socket` | C_ABSTRACT_UNIX_SOCKET | `curl-cli` | owned | planned | DL-0026 |
-| 2 | `--alpn` | C_ALPN | `curl-cli` | owned | planned | DL-0026 |
-| 3 | `--alt-svc` | C_ALT_SVC | `curl-cli` | owned | planned | DL-0026 |
-| 4 | `--anyauth` | C_ANYAUTH | `curl-cli` | owned | planned | DL-0026 |
-| 5 | `--append` | C_APPEND | `curl-cli` | owned | planned | DL-0026 |
-| 6 | `--aws-sigv4` | C_AWS_SIGV4 | `curl-cli` | owned | planned | DL-0026 |
-| 7 | `--basic` | C_BASIC | `curl-cli` | owned | planned | DL-0026 |
-| 8 | `--buffer` | C_BUFFER | `curl-cli` | owned | planned | DL-0026 |
-| 9 | `--ca-native` | C_CA_NATIVE | `curl-cli` | owned | planned | DL-0026 |
-| 10 | `--cacert` | C_CACERT | `curl-cli` | owned | planned | DL-0026 |
-| 11 | `--capath` | C_CAPATH | `curl-cli` | owned | planned | DL-0026 |
-| 12 | `--cert` | C_CERT | `curl-cli` | owned | planned | DL-0026 |
-| 13 | `--cert-status` | C_CERT_STATUS | `curl-cli` | owned | planned | DL-0026 |
-| 14 | `--cert-type` | C_CERT_TYPE | `curl-cli` | owned | planned | DL-0026 |
-| 15 | `--ciphers` | C_CIPHERS | `curl-cli` | owned | planned | DL-0026 |
-| 16 | `--clobber` | C_CLOBBER | `curl-cli` | owned | planned | DL-0026 |
-| 17 | `--compressed` | C_COMPRESSED | `curl-cli` | owned | planned | DL-0026 |
-| 18 | `--compressed-ssh` | C_COMPRESSED_SSH | `curl-cli` | owned | planned | DL-0026 |
-| 19 | `--config` | C_CONFIG | `curl-cli` | owned | planned | DL-0026 |
-| 20 | `--connect-timeout` | C_CONNECT_TIMEOUT | `curl-cli` | owned | planned | DL-0026 |
-| 21 | `--connect-to` | C_CONNECT_TO | `curl-cli` | owned | planned | DL-0026 |
-| 22 | `--continue-at` | C_CONTINUE_AT | `curl-cli` | owned | planned | DL-0026 |
-| 23 | `--cookie` | C_COOKIE | `curl-cli` | owned | planned | DL-0026 |
-| 24 | `--cookie-jar` | C_COOKIE_JAR | `curl-cli` | owned | planned | DL-0026 |
-| 25 | `--create-dirs` | C_CREATE_DIRS | `curl-cli` | owned | planned | DL-0026 |
-| 26 | `--create-file-mode` | C_CREATE_FILE_MODE | `curl-cli` | owned | planned | DL-0026 |
-| 27 | `--crlf` | C_CRLF | `curl-cli` | owned | planned | DL-0026 |
-| 28 | `--crlfile` | C_CRLFILE | `curl-cli` | owned | planned | DL-0026 |
-| 29 | `--curves` | C_CURVES | `curl-cli` | owned | planned | DL-0026 |
-| 30 | `--data` | C_DATA | `curl-cli` | owned | planned | DL-0026 |
-| 31 | `--data-ascii` | C_DATA_ASCII | `curl-cli` | owned | planned | DL-0026 |
-| 32 | `--data-binary` | C_DATA_BINARY | `curl-cli` | owned | planned | DL-0026 |
-| 33 | `--data-raw` | C_DATA_RAW | `curl-cli` | owned | planned | DL-0026 |
-| 34 | `--data-urlencode` | C_DATA_URLENCODE | `curl-cli` | owned | planned | DL-0026 |
-| 35 | `--delegation` | C_DELEGATION | `curl-cli` | owned | planned | DL-0026 |
-| 36 | `--digest` | C_DIGEST | `curl-cli` | owned | planned | DL-0026 |
-| 37 | `--disable` | C_DISABLE | `curl-cli` | owned | planned | DL-0026 |
-| 38 | `--disable-eprt` | C_DISABLE_EPRT | `curl-cli` | owned | planned | DL-0026 |
-| 39 | `--disable-epsv` | C_DISABLE_EPSV | `curl-cli` | owned | planned | DL-0026 |
-| 40 | `--disallow-username-in-url` | C_DISALLOW_USERNAME_IN_URL | `curl-cli` | owned | planned | DL-0026 |
-| 41 | `--dns-interface` | C_DNS_INTERFACE | `curl-cli` | owned | planned | DL-0026 |
-| 42 | `--dns-ipv4-addr` | C_DNS_IPV4_ADDR | `curl-cli` | owned | planned | DL-0026 |
-| 43 | `--dns-ipv6-addr` | C_DNS_IPV6_ADDR | `curl-cli` | owned | planned | DL-0026 |
-| 44 | `--dns-servers` | C_DNS_SERVERS | `curl-cli` | owned | planned | DL-0026 |
-| 45 | `--doh-cert-status` | C_DOH_CERT_STATUS | `curl-cli` | owned | planned | DL-0026 |
-| 46 | `--doh-insecure` | C_DOH_INSECURE | `curl-cli` | owned | planned | DL-0026 |
-| 47 | `--doh-url` | C_DOH_URL | `curl-cli` | owned | planned | DL-0026 |
-| 48 | `--dump-ca-embed` | C_DUMP_CA_EMBED | `curl-cli` | owned | planned | DL-0026 |
-| 49 | `--dump-header` | C_DUMP_HEADER | `curl-cli` | owned | planned | DL-0026 |
-| 50 | `--ech` | C_ECH | `curl-cli` | owned | planned | DL-0026 |
-| 51 | `--egd-file` | C_EGD_FILE | `curl-cli` | owned | planned | DL-0026 |
-| 52 | `--engine` | C_ENGINE | `curl-cli` | owned | planned | DL-0026 |
-| 53 | `--eprt` | C_EPRT | `curl-cli` | owned | planned | DL-0026 |
-| 54 | `--epsv` | C_EPSV | `curl-cli` | owned | planned | DL-0026 |
-| 55 | `--etag-compare` | C_ETAG_COMPARE | `curl-cli` | owned | planned | DL-0026 |
-| 56 | `--etag-save` | C_ETAG_SAVE | `curl-cli` | owned | planned | DL-0026 |
-| 57 | `--expect100-timeout` | C_EXPECT100_TIMEOUT | `curl-cli` | owned | planned | DL-0026 |
-| 58 | `--fail` | C_FAIL | `curl-cli` | owned | planned | DL-0026 |
-| 59 | `--fail-early` | C_FAIL_EARLY | `curl-cli` | owned | planned | DL-0026 |
-| 60 | `--fail-with-body` | C_FAIL_WITH_BODY | `curl-cli` | owned | planned | DL-0026 |
-| 61 | `--false-start` | C_FALSE_START | `curl-cli` | owned | planned | DL-0026 |
-| 62 | `--follow` | C_FOLLOW | `curl-cli` | owned | planned | DL-0026 |
-| 63 | `--form` | C_FORM | `curl-cli` | owned | planned | DL-0026 |
-| 64 | `--form-escape` | C_FORM_ESCAPE | `curl-cli` | owned | planned | DL-0026 |
-| 65 | `--form-string` | C_FORM_STRING | `curl-cli` | owned | planned | DL-0026 |
-| 66 | `--ftp-account` | C_FTP_ACCOUNT | `curl-cli` | owned | planned | DL-0026 |
-| 67 | `--ftp-alternative-to-user` | C_FTP_ALTERNATIVE_TO_USER | `curl-cli` | owned | planned | DL-0026 |
-| 68 | `--ftp-create-dirs` | C_FTP_CREATE_DIRS | `curl-cli` | owned | planned | DL-0026 |
-| 69 | `--ftp-method` | C_FTP_METHOD | `curl-cli` | owned | planned | DL-0026 |
-| 70 | `--ftp-pasv` | C_FTP_PASV | `curl-cli` | owned | planned | DL-0026 |
-| 71 | `--ftp-port` | C_FTP_PORT | `curl-cli` | owned | planned | DL-0026 |
-| 72 | `--ftp-pret` | C_FTP_PRET | `curl-cli` | owned | planned | DL-0026 |
-| 73 | `--ftp-skip-pasv-ip` | C_FTP_SKIP_PASV_IP | `curl-cli` | owned | planned | DL-0026 |
-| 74 | `--ftp-ssl` | C_FTP_SSL | `curl-cli` | owned | planned | DL-0026 |
-| 75 | `--ftp-ssl-ccc` | C_FTP_SSL_CCC | `curl-cli` | owned | planned | DL-0026 |
-| 76 | `--ftp-ssl-ccc-mode` | C_FTP_SSL_CCC_MODE | `curl-cli` | owned | planned | DL-0026 |
-| 77 | `--ftp-ssl-control` | C_FTP_SSL_CONTROL | `curl-cli` | owned | planned | DL-0026 |
-| 78 | `--ftp-ssl-reqd` | C_FTP_SSL_REQD | `curl-cli` | owned | planned | DL-0026 |
-| 79 | `--get` | C_GET | `curl-cli` | owned | planned | DL-0026 |
-| 80 | `--globoff` | C_GLOBOFF | `curl-cli` | owned | planned | DL-0026 |
-| 81 | `--happy-eyeballs-timeout-ms` | C_HAPPY_EYEBALLS_TIMEOUT_MS | `curl-cli` | owned | planned | DL-0026 |
-| 82 | `--haproxy-clientip` | C_HAPROXY_CLIENTIP | `curl-cli` | owned | planned | DL-0026 |
-| 83 | `--haproxy-protocol` | C_HAPROXY_PROTOCOL | `curl-cli` | owned | planned | DL-0026 |
-| 84 | `--head` | C_HEAD | `curl-cli` | owned | planned | DL-0026 |
-| 85 | `--header` | C_HEADER | `curl-cli` | owned | planned | DL-0026 |
-| 86 | `--help` | C_HELP | `curl-cli` | owned | planned | DL-0026 |
-| 87 | `--hostpubmd5` | C_HOSTPUBMD5 | `curl-cli` | owned | planned | DL-0026 |
-| 88 | `--hostpubsha256` | C_HOSTPUBSHA256 | `curl-cli` | owned | planned | DL-0026 |
-| 89 | `--hsts` | C_HSTS | `curl-cli` | owned | planned | DL-0026 |
-| 90 | `--http0.9` | C_HTTP0_9 | `curl-cli` | owned | planned | DL-0026 |
-| 91 | `--http1.0` | C_HTTP1_0 | `curl-cli` | owned | planned | DL-0026 |
-| 92 | `--http1.1` | C_HTTP1_1 | `curl-cli` | owned | planned | DL-0026 |
-| 93 | `--http2` | C_HTTP2 | `curl-cli` | owned | planned | DL-0026 |
-| 94 | `--http2-prior-knowledge` | C_HTTP2_PRIOR_KNOWLEDGE | `curl-cli` | owned | planned | DL-0026 |
-| 95 | `--http3` | C_HTTP3 | `curl-cli` | owned | planned | DL-0026 |
-| 96 | `--http3-only` | C_HTTP3_ONLY | `curl-cli` | owned | planned | DL-0026 |
-| 97 | `--ignore-content-length` | C_IGNORE_CONTENT_LENGTH | `curl-cli` | owned | planned | DL-0026 |
-| 98 | `--include` | C_INCLUDE | `curl-cli` | owned | planned | DL-0026 |
-| 99 | `--insecure` | C_INSECURE | `curl-cli` | owned | planned | DL-0026 |
-| 100 | `--interface` | C_INTERFACE | `curl-cli` | owned | planned | DL-0026 |
-| 101 | `--ip-tos` | C_IP_TOS | `curl-cli` | owned | planned | DL-0026 |
-| 102 | `--ipfs-gateway` | C_IPFS_GATEWAY | `curl-cli` | owned | planned | DL-0026 |
-| 103 | `--ipv4` | C_IPV4 | `curl-cli` | owned | planned | DL-0026 |
-| 104 | `--ipv6` | C_IPV6 | `curl-cli` | owned | planned | DL-0026 |
-| 105 | `--json` | C_JSON | `curl-cli` | owned | planned | DL-0026 |
-| 106 | `--junk-session-cookies` | C_JUNK_SESSION_COOKIES | `curl-cli` | owned | planned | DL-0026 |
-| 107 | `--keepalive` | C_KEEPALIVE | `curl-cli` | owned | planned | DL-0026 |
-| 108 | `--keepalive-cnt` | C_KEEPALIVE_CNT | `curl-cli` | owned | planned | DL-0026 |
-| 109 | `--keepalive-time` | C_KEEPALIVE_TIME | `curl-cli` | owned | planned | DL-0026 |
-| 110 | `--key` | C_KEY | `curl-cli` | owned | planned | DL-0026 |
-| 111 | `--key-type` | C_KEY_TYPE | `curl-cli` | owned | planned | DL-0026 |
-| 112 | `--knownhosts` | C_KNOWNHOSTS | `curl-cli` | owned | planned | DL-0026 |
-| 113 | `--krb` | C_KRB | `curl-cli` | owned | planned | DL-0026 |
-| 114 | `--krb4` | C_KRB4 | `curl-cli` | owned | planned | DL-0026 |
-| 115 | `--libcurl` | C_LIBCURL | `curl-cli` | owned | planned | DL-0026 |
-| 116 | `--limit-rate` | C_LIMIT_RATE | `curl-cli` | owned | planned | DL-0026 |
-| 117 | `--list-only` | C_LIST_ONLY | `curl-cli` | owned | planned | DL-0026 |
-| 118 | `--local-port` | C_LOCAL_PORT | `curl-cli` | owned | planned | DL-0026 |
-| 119 | `--location` | C_LOCATION | `curl-cli` | owned | planned | DL-0026 |
-| 120 | `--location-trusted` | C_LOCATION_TRUSTED | `curl-cli` | owned | planned | DL-0026 |
-| 121 | `--login-options` | C_LOGIN_OPTIONS | `curl-cli` | owned | planned | DL-0026 |
-| 122 | `--mail-auth` | C_MAIL_AUTH | `curl-cli` | owned | planned | DL-0026 |
-| 123 | `--mail-from` | C_MAIL_FROM | `curl-cli` | owned | planned | DL-0026 |
-| 124 | `--mail-rcpt` | C_MAIL_RCPT | `curl-cli` | owned | planned | DL-0026 |
-| 125 | `--mail-rcpt-allowfails` | C_MAIL_RCPT_ALLOWFAILS | `curl-cli` | owned | planned | DL-0026 |
-| 126 | `--manual` | C_MANUAL | `curl-cli` | owned | planned | DL-0026 |
-| 127 | `--max-filesize` | C_MAX_FILESIZE | `curl-cli` | owned | planned | DL-0026 |
-| 128 | `--max-redirs` | C_MAX_REDIRS | `curl-cli` | owned | planned | DL-0026 |
-| 129 | `--max-time` | C_MAX_TIME | `curl-cli` | owned | planned | DL-0026 |
-| 130 | `--metalink` | C_METALINK | `curl-cli` | owned | planned | DL-0026 |
-| 131 | `--mptcp` | C_MPTCP | `curl-cli` | owned | planned | DL-0026 |
-| 132 | `--negotiate` | C_NEGOTIATE | `curl-cli` | owned | planned | DL-0026 |
-| 133 | `--netrc` | C_NETRC | `curl-cli` | owned | planned | DL-0026 |
-| 134 | `--netrc-file` | C_NETRC_FILE | `curl-cli` | owned | planned | DL-0026 |
-| 135 | `--netrc-optional` | C_NETRC_OPTIONAL | `curl-cli` | owned | planned | DL-0026 |
-| 136 | `--next` | C_NEXT | `curl-cli` | owned | planned | DL-0026 |
-| 137 | `--noproxy` | C_NOPROXY | `curl-cli` | owned | planned | DL-0026 |
-| 138 | `--npn` | C_NPN | `curl-cli` | owned | planned | DL-0026 |
-| 139 | `--ntlm` | C_NTLM | `curl-cli` | owned | planned | DL-0026 |
-| 140 | `--ntlm-wb` | C_NTLM_WB | `curl-cli` | owned | planned | DL-0026 |
-| 141 | `--oauth2-bearer` | C_OAUTH2_BEARER | `curl-cli` | owned | planned | DL-0026 |
-| 142 | `--out-null` | C_OUT_NULL | `curl-cli` | owned | planned | DL-0026 |
-| 143 | `--output` | C_OUTPUT | `curl-cli` | owned | planned | DL-0026 |
-| 144 | `--output-dir` | C_OUTPUT_DIR | `curl-cli` | owned | planned | DL-0026 |
-| 145 | `--parallel` | C_PARALLEL | `curl-cli` | owned | planned | DL-0026 |
-| 146 | `--parallel-immediate` | C_PARALLEL_IMMEDIATE | `curl-cli` | owned | planned | DL-0026 |
-| 147 | `--parallel-max` | C_PARALLEL_MAX | `curl-cli` | owned | planned | DL-0026 |
-| 148 | `--parallel-max-host` | C_PARALLEL_HOST | `curl-cli` | owned | planned | DL-0026 |
-| 149 | `--pass` | C_PASS | `curl-cli` | owned | planned | DL-0026 |
-| 150 | `--path-as-is` | C_PATH_AS_IS | `curl-cli` | owned | planned | DL-0026 |
-| 151 | `--pinnedpubkey` | C_PINNEDPUBKEY | `curl-cli` | owned | planned | DL-0026 |
-| 152 | `--post301` | C_POST301 | `curl-cli` | owned | planned | DL-0026 |
-| 153 | `--post302` | C_POST302 | `curl-cli` | owned | planned | DL-0026 |
-| 154 | `--post303` | C_POST303 | `curl-cli` | owned | planned | DL-0026 |
-| 155 | `--preproxy` | C_PREPROXY | `curl-cli` | owned | planned | DL-0026 |
-| 156 | `--progress-bar` | C_PROGRESS_BAR | `curl-cli` | owned | planned | DL-0026 |
-| 157 | `--progress-meter` | C_PROGRESS_METER | `curl-cli` | owned | planned | DL-0026 |
-| 158 | `--proto` | C_PROTO | `curl-cli` | owned | planned | DL-0026 |
-| 159 | `--proto-default` | C_PROTO_DEFAULT | `curl-cli` | owned | planned | DL-0026 |
-| 160 | `--proto-redir` | C_PROTO_REDIR | `curl-cli` | owned | planned | DL-0026 |
-| 161 | `--proxy` | C_PROXY | `curl-cli` | owned | planned | DL-0026 |
-| 162 | `--proxy-anyauth` | C_PROXY_ANYAUTH | `curl-cli` | owned | planned | DL-0026 |
-| 163 | `--proxy-basic` | C_PROXY_BASIC | `curl-cli` | owned | planned | DL-0026 |
-| 164 | `--proxy-ca-native` | C_PROXY_CA_NATIVE | `curl-cli` | owned | planned | DL-0026 |
-| 165 | `--proxy-cacert` | C_PROXY_CACERT | `curl-cli` | owned | planned | DL-0026 |
-| 166 | `--proxy-capath` | C_PROXY_CAPATH | `curl-cli` | owned | planned | DL-0026 |
-| 167 | `--proxy-cert` | ' ' | `curl-cli` | owned | planned | DL-0026 |
-| 168 | `--proxy-cert-type` | C_PROXY_CERT_TYPE | `curl-cli` | owned | planned | DL-0026 |
-| 169 | `--proxy-ciphers` | C_PROXY_CIPHERS | `curl-cli` | owned | planned | DL-0026 |
-| 170 | `--proxy-crlfile` | C_PROXY_CRLFILE | `curl-cli` | owned | planned | DL-0026 |
-| 171 | `--proxy-digest` | C_PROXY_DIGEST | `curl-cli` | owned | planned | DL-0026 |
-| 172 | `--proxy-header` | C_PROXY_HEADER | `curl-cli` | owned | planned | DL-0026 |
-| 173 | `--proxy-http2` | C_PROXY_HTTP2 | `curl-cli` | owned | planned | DL-0026 |
-| 174 | `--proxy-http3` | C_PROXY_HTTP3 | `curl-cli` | owned | planned | DL-0026 |
-| 175 | `--proxy-insecure` | C_PROXY_INSECURE | `curl-cli` | owned | planned | DL-0026 |
-| 176 | `--proxy-key` | C_PROXY_KEY | `curl-cli` | owned | planned | DL-0026 |
-| 177 | `--proxy-key-type` | C_PROXY_KEY_TYPE | `curl-cli` | owned | planned | DL-0026 |
-| 178 | `--proxy-negotiate` | C_PROXY_NEGOTIATE | `curl-cli` | owned | planned | DL-0026 |
-| 179 | `--proxy-ntlm` | C_PROXY_NTLM | `curl-cli` | owned | planned | DL-0026 |
-| 180 | `--proxy-pass` | C_PROXY_PASS | `curl-cli` | owned | planned | DL-0026 |
-| 181 | `--proxy-pinnedpubkey` | C_PROXY_PINNEDPUBKEY | `curl-cli` | owned | planned | DL-0026 |
-| 182 | `--proxy-service-name` | C_PROXY_SERVICE_NAME | `curl-cli` | owned | planned | DL-0026 |
-| 183 | `--proxy-ssl-allow-beast` | ' ' | `curl-cli` | owned | planned | DL-0026 |
-| 184 | `--proxy-ssl-auto-client-cert` | ' ' | `curl-cli` | owned | planned | DL-0026 |
-| 185 | `--proxy-tls13-ciphers` | C_PROXY_TLS13_CIPHERS | `curl-cli` | owned | planned | DL-0026 |
-| 186 | `--proxy-tlsauthtype` | C_PROXY_TLSAUTHTYPE | `curl-cli` | owned | planned | DL-0026 |
-| 187 | `--proxy-tlspassword` | C_PROXY_TLSPASSWORD | `curl-cli` | owned | planned | DL-0026 |
-| 188 | `--proxy-tlsuser` | C_PROXY_TLSUSER | `curl-cli` | owned | planned | DL-0026 |
-| 189 | `--proxy-tlsv1` | C_PROXY_TLSV1 | `curl-cli` | owned | planned | DL-0026 |
-| 190 | `--proxy-user` | C_PROXY_USER | `curl-cli` | owned | planned | DL-0026 |
-| 191 | `--proxy1.0` | C_PROXY1_0 | `curl-cli` | owned | planned | DL-0026 |
-| 192 | `--proxytunnel` | C_PROXYTUNNEL | `curl-cli` | owned | planned | DL-0026 |
-| 193 | `--pubkey` | C_PUBKEY | `curl-cli` | owned | planned | DL-0026 |
-| 194 | `--quote` | C_QUOTE | `curl-cli` | owned | planned | DL-0026 |
-| 195 | `--random-file` | C_RANDOM_FILE | `curl-cli` | owned | planned | DL-0026 |
-| 196 | `--range` | C_RANGE | `curl-cli` | owned | planned | DL-0026 |
-| 197 | `--rate` | C_RATE | `curl-cli` | owned | planned | DL-0026 |
-| 198 | `--raw` | C_RAW | `curl-cli` | owned | planned | DL-0026 |
-| 199 | `--referer` | C_REFERER | `curl-cli` | owned | planned | DL-0026 |
-| 200 | `--remote-header-name` | C_REMOTE_HEADER_NAME | `curl-cli` | owned | planned | DL-0026 |
-| 201 | `--remote-name` | C_REMOTE_NAME | `curl-cli` | owned | planned | DL-0026 |
-| 202 | `--remote-name-all` | C_REMOTE_NAME_ALL | `curl-cli` | owned | planned | DL-0026 |
-| 203 | `--remote-time` | C_REMOTE_TIME | `curl-cli` | owned | planned | DL-0026 |
-| 204 | `--remove-on-error` | C_REMOVE_ON_ERROR | `curl-cli` | owned | planned | DL-0026 |
-| 205 | `--request` | C_REQUEST | `curl-cli` | owned | planned | DL-0026 |
-| 206 | `--request-target` | C_REQUEST_TARGET | `curl-cli` | owned | planned | DL-0026 |
-| 207 | `--resolve` | C_RESOLVE | `curl-cli` | owned | planned | DL-0026 |
-| 208 | `--retry` | C_RETRY | `curl-cli` | owned | planned | DL-0026 |
-| 209 | `--retry-all-errors` | C_RETRY_ALL_ERRORS | `curl-cli` | owned | planned | DL-0026 |
-| 210 | `--retry-connrefused` | C_RETRY_CONNREFUSED | `curl-cli` | owned | planned | DL-0026 |
-| 211 | `--retry-delay` | C_RETRY_DELAY | `curl-cli` | owned | planned | DL-0026 |
-| 212 | `--retry-max-time` | C_RETRY_MAX_TIME | `curl-cli` | owned | planned | DL-0026 |
-| 213 | `--sasl-authzid` | C_SASL_AUTHZID | `curl-cli` | owned | planned | DL-0026 |
-| 214 | `--sasl-ir` | C_SASL_IR | `curl-cli` | owned | planned | DL-0026 |
-| 215 | `--service-name` | C_SERVICE_NAME | `curl-cli` | owned | planned | DL-0026 |
-| 216 | `--sessionid` | C_SESSIONID | `curl-cli` | owned | planned | DL-0026 |
-| 217 | `--show-error` | C_SHOW_ERROR | `curl-cli` | owned | planned | DL-0026 |
-| 218 | `--show-headers` | C_SHOW_HEADERS | `curl-cli` | owned | planned | DL-0026 |
-| 219 | `--sigalgs` | ' ' | `curl-cli` | owned | planned | DL-0026 |
-| 220 | `--silent` | C_SILENT | `curl-cli` | owned | planned | DL-0026 |
-| 221 | `--skip-existing` | C_SKIP_EXISTING | `curl-cli` | owned | planned | DL-0026 |
-| 222 | `--socks4` | C_SOCKS4 | `curl-cli` | owned | planned | DL-0026 |
-| 223 | `--socks4a` | C_SOCKS4A | `curl-cli` | owned | planned | DL-0026 |
-| 224 | `--socks5` | C_SOCKS5 | `curl-cli` | owned | planned | DL-0026 |
-| 225 | `--socks5-basic` | C_SOCKS5_BASIC | `curl-cli` | owned | planned | DL-0026 |
-| 226 | `--socks5-gssapi` | C_SOCKS5_GSSAPI | `curl-cli` | owned | planned | DL-0026 |
-| 227 | `--socks5-gssapi-nec` | C_SOCKS5_GSSAPI_NEC | `curl-cli` | owned | planned | DL-0026 |
-| 228 | `--socks5-gssapi-service` | C_SOCKS5_GSSAPI_SERVICE | `curl-cli` | owned | planned | DL-0026 |
-| 229 | `--socks5-hostname` | C_SOCKS5_HOSTNAME | `curl-cli` | owned | planned | DL-0026 |
-| 230 | `--speed-limit` | C_SPEED_LIMIT | `curl-cli` | owned | planned | DL-0026 |
-| 231 | `--speed-time` | C_SPEED_TIME | `curl-cli` | owned | planned | DL-0026 |
-| 232 | `--ssl` | C_SSL | `curl-cli` | owned | planned | DL-0026 |
-| 233 | `--ssl-allow-beast` | C_SSL_ALLOW_BEAST | `curl-cli` | owned | planned | DL-0026 |
-| 234 | `--ssl-auto-client-cert` | ' ' | `curl-cli` | owned | planned | DL-0026 |
-| 235 | `--ssl-no-revoke` | C_SSL_NO_REVOKE | `curl-cli` | owned | planned | DL-0026 |
-| 236 | `--ssl-reqd` | C_SSL_REQD | `curl-cli` | owned | planned | DL-0026 |
-| 237 | `--ssl-revoke-best-effort` | ' ' | `curl-cli` | owned | planned | DL-0026 |
-| 238 | `--ssl-sessions` | C_SSL_SESSIONS | `curl-cli` | owned | planned | DL-0026 |
-| 239 | `--sslv2` | C_SSLV2 | `curl-cli` | owned | planned | DL-0026 |
-| 240 | `--sslv3` | C_SSLV3 | `curl-cli` | owned | planned | DL-0026 |
-| 241 | `--stderr` | C_STDERR | `curl-cli` | owned | planned | DL-0026 |
-| 242 | `--styled-output` | C_STYLED_OUTPUT | `curl-cli` | owned | planned | DL-0026 |
-| 243 | `--suppress-connect-headers` | C_SUPPRESS_CONNECT_HEADERS | `curl-cli` | owned | planned | DL-0026 |
-| 244 | `--tcp-fastopen` | C_TCP_FASTOPEN | `curl-cli` | owned | planned | DL-0026 |
-| 245 | `--tcp-nodelay` | C_TCP_NODELAY | `curl-cli` | owned | planned | DL-0026 |
-| 246 | `--telnet-option` | C_TELNET_OPTION | `curl-cli` | owned | planned | DL-0026 |
-| 247 | `--test-duphandle` | C_TEST_DUPHANDLE | `curl-cli` | owned | planned | DL-0026 |
-| 248 | `--test-event` | C_TEST_EVENT | `curl-cli` | owned | planned | DL-0026 |
-| 249 | `--tftp-blksize` | C_TFTP_BLKSIZE | `curl-cli` | owned | planned | DL-0026 |
-| 250 | `--tftp-no-options` | C_TFTP_NO_OPTIONS | `curl-cli` | owned | planned | DL-0026 |
-| 251 | `--time-cond` | C_TIME_COND | `curl-cli` | owned | planned | DL-0026 |
-| 252 | `--tls-earlydata` | C_TLS_EARLYDATA | `curl-cli` | owned | planned | DL-0026 |
-| 253 | `--tls-max` | C_TLS_MAX | `curl-cli` | owned | planned | DL-0026 |
-| 254 | `--tls13-ciphers` | C_TLS13_CIPHERS | `curl-cli` | owned | planned | DL-0026 |
-| 255 | `--tlsauthtype` | C_TLSAUTHTYPE | `curl-cli` | owned | planned | DL-0026 |
-| 256 | `--tlspassword` | C_TLSPASSWORD | `curl-cli` | owned | planned | DL-0026 |
-| 257 | `--tlsuser` | C_TLSUSER | `curl-cli` | owned | planned | DL-0026 |
-| 258 | `--tlsv1` | C_TLSV1 | `curl-cli` | owned | planned | DL-0026 |
-| 259 | `--tlsv1.0` | C_TLSV1_0 | `curl-cli` | owned | planned | DL-0026 |
-| 260 | `--tlsv1.1` | C_TLSV1_1 | `curl-cli` | owned | planned | DL-0026 |
-| 261 | `--tlsv1.2` | C_TLSV1_2 | `curl-cli` | owned | planned | DL-0026 |
-| 262 | `--tlsv1.3` | C_TLSV1_3 | `curl-cli` | owned | planned | DL-0026 |
-| 263 | `--tr-encoding` | C_TR_ENCODING | `curl-cli` | owned | planned | DL-0026 |
-| 264 | `--trace` | C_TRACE | `curl-cli` | owned | planned | DL-0026 |
-| 265 | `--trace-ascii` | C_TRACE_ASCII | `curl-cli` | owned | planned | DL-0026 |
-| 266 | `--trace-config` | C_TRACE_CONFIG | `curl-cli` | owned | planned | DL-0026 |
-| 267 | `--trace-ids` | C_TRACE_IDS | `curl-cli` | owned | planned | DL-0026 |
-| 268 | `--trace-time` | C_TRACE_TIME | `curl-cli` | owned | planned | DL-0026 |
-| 269 | `--unix-socket` | C_UNIX_SOCKET | `curl-cli` | owned | planned | DL-0026 |
-| 270 | `--upload-file` | C_UPLOAD_FILE | `curl-cli` | owned | planned | DL-0026 |
-| 271 | `--upload-flags` | C_UPLOAD_FLAGS | `curl-cli` | owned | planned | DL-0026 |
-| 272 | `--url` | C_URL | `curl-cli` | owned | planned | DL-0026 |
-| 273 | `--url-query` | C_URL_QUERY | `curl-cli` | owned | planned | DL-0026 |
-| 274 | `--use-ascii` | C_USE_ASCII | `curl-cli` | owned | planned | DL-0026 |
-| 275 | `--user` | C_USER | `curl-cli` | owned | planned | DL-0026 |
-| 276 | `--user-agent` | C_USER_AGENT | `curl-cli` | owned | planned | DL-0026 |
-| 277 | `--variable` | C_VARIABLE | `curl-cli` | owned | planned | DL-0026 |
-| 278 | `--verbose` | C_VERBOSE | `curl-cli` | owned | planned | DL-0026 |
-| 279 | `--version` | C_VERSION | `curl-cli` | owned | planned | DL-0026 |
-| 280 | `--vlan-priority` | C_VLAN_PRIORITY | `curl-cli` | owned | planned | DL-0026 |
-| 281 | `--wdebug` | C_WDEBUG | `curl-cli` | owned | planned | DL-0026 |
-| 282 | `--write-out` | C_WRITE_OUT | `curl-cli` | owned | planned | DL-0026 |
-| 283 | `--xattr` | C_XATTR | `curl-cli` | owned | planned | DL-0026 |
+| 1 | `--abstract-unix-socket` | C_ABSTRACT_UNIX_SOCKET · ARG_FILE | `curl-cli` | dispatched | planned | DL-0026 |
+| 2 | `--alpn` | C_ALPN · ARG_BOOL\|ARG_NO\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 3 | `--alt-svc` | C_ALT_SVC · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 4 | `--anyauth` | C_ANYAUTH · ARG_NONE | `curl-cli` | dispatched | planned | DL-0026 |
+| 5 | `--append` | C_APPEND · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 6 | `--aws-sigv4` | C_AWS_SIGV4 · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 7 | `--basic` | C_BASIC · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 8 | `--buffer` | C_BUFFER · ARG_BOOL\|ARG_NO | `curl-cli` | dispatched | planned | DL-0026 |
+| 9 | `--ca-native` | C_CA_NATIVE · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 10 | `--cacert` | C_CACERT · ARG_FILE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 11 | `--capath` | C_CAPATH · ARG_FILE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 12 | `--cert` | C_CERT · ARG_FILE\|ARG_TLS\|ARG_CLEAR | `curl-cli` | dispatched | planned | DL-0026 |
+| 13 | `--cert-status` | C_CERT_STATUS · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 14 | `--cert-type` | C_CERT_TYPE · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 15 | `--ciphers` | C_CIPHERS · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 16 | `--clobber` | C_CLOBBER · ARG_BOOL\|ARG_NO | `curl-cli` | dispatched | planned | DL-0026 |
+| 17 | `--compressed` | C_COMPRESSED · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 18 | `--compressed-ssh` | C_COMPRESSED_SSH · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 19 | `--config` | C_CONFIG · ARG_FILE | `curl-cli` | dispatched | planned | DL-0026 |
+| 20 | `--connect-timeout` | C_CONNECT_TIMEOUT · ARG_SECS | `curl-cli` | dispatched | planned | DL-0026 |
+| 21 | `--connect-to` | C_CONNECT_TO · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 22 | `--continue-at` | C_CONTINUE_AT · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 23 | `--cookie` | C_COOKIE · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 24 | `--cookie-jar` | C_COOKIE_JAR · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 25 | `--create-dirs` | C_CREATE_DIRS · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 26 | `--create-file-mode` | C_CREATE_FILE_MODE · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 27 | `--crlf` | C_CRLF · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 28 | `--crlfile` | C_CRLFILE · ARG_FILE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 29 | `--curves` | C_CURVES · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 30 | `--data` | C_DATA · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 31 | `--data-ascii` | C_DATA_ASCII · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 32 | `--data-binary` | C_DATA_BINARY · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 33 | `--data-raw` | C_DATA_RAW · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 34 | `--data-urlencode` | C_DATA_URLENCODE · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 35 | `--delegation` | C_DELEGATION · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 36 | `--digest` | C_DIGEST · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 37 | `--disable` | C_DISABLE · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 38 | `--disable-eprt` | C_DISABLE_EPRT · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 39 | `--disable-epsv` | C_DISABLE_EPSV · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 40 | `--disallow-username-in-url` | C_DISALLOW_USERNAME_IN_URL · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 41 | `--dns-interface` | C_DNS_INTERFACE · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 42 | `--dns-ipv4-addr` | C_DNS_IPV4_ADDR · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 43 | `--dns-ipv6-addr` | C_DNS_IPV6_ADDR · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 44 | `--dns-servers` | C_DNS_SERVERS · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 45 | `--doh-cert-status` | C_DOH_CERT_STATUS · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 46 | `--doh-insecure` | C_DOH_INSECURE · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 47 | `--doh-url` | C_DOH_URL · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 48 | `--dump-ca-embed` | C_DUMP_CA_EMBED · ARG_NONE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 49 | `--dump-header` | C_DUMP_HEADER · ARG_FILE | `curl-cli` | dispatched | planned | DL-0026 |
+| 50 | `--ech` | C_ECH · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 51 | `--egd-file` | C_EGD_FILE · ARG_STRG\|ARG_DEPR | `curl-cli` | deprecated: warns and does nothing | planned | DL-0026 |
+| 52 | `--engine` | C_ENGINE · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 53 | `--eprt` | C_EPRT · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 54 | `--epsv` | C_EPSV · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 55 | `--etag-compare` | C_ETAG_COMPARE · ARG_FILE | `curl-cli` | dispatched | planned | DL-0026 |
+| 56 | `--etag-save` | C_ETAG_SAVE · ARG_FILE | `curl-cli` | dispatched | planned | DL-0026 |
+| 57 | `--expect100-timeout` | C_EXPECT100_TIMEOUT · ARG_SECS | `curl-cli` | dispatched | planned | DL-0026 |
+| 58 | `--fail` | C_FAIL · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 59 | `--fail-early` | C_FAIL_EARLY · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 60 | `--fail-with-body` | C_FAIL_WITH_BODY · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 61 | `--false-start` | C_FALSE_START · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 62 | `--follow` | C_FOLLOW · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 63 | `--form` | C_FORM · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 64 | `--form-escape` | C_FORM_ESCAPE · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 65 | `--form-string` | C_FORM_STRING · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 66 | `--ftp-account` | C_FTP_ACCOUNT · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 67 | `--ftp-alternative-to-user` | C_FTP_ALTERNATIVE_TO_USER · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 68 | `--ftp-create-dirs` | C_FTP_CREATE_DIRS · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 69 | `--ftp-method` | C_FTP_METHOD · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 70 | `--ftp-pasv` | C_FTP_PASV · ARG_NONE | `curl-cli` | dispatched | planned | DL-0026 |
+| 71 | `--ftp-port` | C_FTP_PORT · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 72 | `--ftp-pret` | C_FTP_PRET · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 73 | `--ftp-skip-pasv-ip` | C_FTP_SKIP_PASV_IP · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 74 | `--ftp-ssl` | C_FTP_SSL · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 75 | `--ftp-ssl-ccc` | C_FTP_SSL_CCC · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 76 | `--ftp-ssl-ccc-mode` | C_FTP_SSL_CCC_MODE · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 77 | `--ftp-ssl-control` | C_FTP_SSL_CONTROL · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 78 | `--ftp-ssl-reqd` | C_FTP_SSL_REQD · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 79 | `--get` | C_GET · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 80 | `--globoff` | C_GLOBOFF · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 81 | `--happy-eyeballs-timeout-ms` | C_HAPPY_EYEBALLS_TIMEOUT_MS · ARG_UNUM | `curl-cli` | dispatched | planned | DL-0026 |
+| 82 | `--haproxy-clientip` | C_HAPROXY_CLIENTIP · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 83 | `--haproxy-protocol` | C_HAPROXY_PROTOCOL · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 84 | `--head` | C_HEAD · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 85 | `--header` | C_HEADER · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 86 | `--help` | C_HELP · ARG_STRG | `curl-cli` | dispatched ahead of the switch: prints help and stops parsing | planned | DL-0234 |
+| 87 | `--hostpubmd5` | C_HOSTPUBMD5 · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 88 | `--hostpubsha256` | C_HOSTPUBSHA256 · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 89 | `--hsts` | C_HSTS · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 90 | `--http0.9` | C_HTTP0_9 · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 91 | `--http1.0` | C_HTTP1_0 · ARG_NONE | `curl-cli` | dispatched | planned | DL-0026 |
+| 92 | `--http1.1` | C_HTTP1_1 · ARG_NONE | `curl-cli` | dispatched | planned | DL-0026 |
+| 93 | `--http2` | C_HTTP2 · ARG_NONE | `curl-cli` | dispatched | planned | DL-0026 |
+| 94 | `--http2-prior-knowledge` | C_HTTP2_PRIOR_KNOWLEDGE · ARG_NONE | `curl-cli` | dispatched | planned | DL-0026 |
+| 95 | `--http3` | C_HTTP3 · ARG_NONE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 96 | `--http3-only` | C_HTTP3_ONLY · ARG_NONE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 97 | `--ignore-content-length` | C_IGNORE_CONTENT_LENGTH · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 98 | `--include` | C_INCLUDE · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 99 | `--insecure` | C_INSECURE · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 100 | `--interface` | C_INTERFACE · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 101 | `--ip-tos` | C_IP_TOS · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 102 | `--ipfs-gateway` | C_IPFS_GATEWAY · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 103 | `--ipv4` | C_IPV4 · ARG_NONE | `curl-cli` | dispatched | planned | DL-0026 |
+| 104 | `--ipv6` | C_IPV6 · ARG_NONE | `curl-cli` | dispatched | planned | DL-0026 |
+| 105 | `--json` | C_JSON · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 106 | `--junk-session-cookies` | C_JUNK_SESSION_COOKIES · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 107 | `--keepalive` | C_KEEPALIVE · ARG_BOOL\|ARG_NO | `curl-cli` | dispatched | planned | DL-0026 |
+| 108 | `--keepalive-cnt` | C_KEEPALIVE_CNT · ARG_UNUM | `curl-cli` | dispatched | planned | DL-0026 |
+| 109 | `--keepalive-time` | C_KEEPALIVE_TIME · ARG_UNUM | `curl-cli` | dispatched | planned | DL-0026 |
+| 110 | `--key` | C_KEY · ARG_FILE | `curl-cli` | dispatched | planned | DL-0026 |
+| 111 | `--key-type` | C_KEY_TYPE · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 112 | `--knownhosts` | C_KNOWNHOSTS · ARG_FILE | `curl-cli` | dispatched | planned | DL-0026 |
+| 113 | `--krb` | C_KRB · ARG_STRG\|ARG_DEPR | `curl-cli` | deprecated: warns and does nothing | planned | DL-0026 |
+| 114 | `--krb4` | C_KRB4 · ARG_STRG\|ARG_DEPR | `curl-cli` | deprecated: warns and does nothing | planned | DL-0026 |
+| 115 | `--libcurl` | C_LIBCURL · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 116 | `--limit-rate` | C_LIMIT_RATE · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 117 | `--list-only` | C_LIST_ONLY · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 118 | `--local-port` | C_LOCAL_PORT · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 119 | `--location` | C_LOCATION · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 120 | `--location-trusted` | C_LOCATION_TRUSTED · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 121 | `--login-options` | C_LOGIN_OPTIONS · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 122 | `--mail-auth` | C_MAIL_AUTH · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 123 | `--mail-from` | C_MAIL_FROM · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 124 | `--mail-rcpt` | C_MAIL_RCPT · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 125 | `--mail-rcpt-allowfails` | C_MAIL_RCPT_ALLOWFAILS · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 126 | `--manual` | C_MANUAL · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 127 | `--max-filesize` | C_MAX_FILESIZE · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 128 | `--max-redirs` | C_MAX_REDIRS · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 129 | `--max-time` | C_MAX_TIME · ARG_SECS | `curl-cli` | dispatched | planned | DL-0026 |
+| 130 | `--metalink` | C_METALINK · ARG_BOOL\|ARG_DEPR | `curl-cli` | deprecated: warns and does nothing | planned | DL-0026 |
+| 131 | `--mptcp` | C_MPTCP · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 132 | `--negotiate` | C_NEGOTIATE · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 133 | `--netrc` | C_NETRC · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 134 | `--netrc-file` | C_NETRC_FILE · ARG_FILE | `curl-cli` | dispatched | planned | DL-0026 |
+| 135 | `--netrc-optional` | C_NETRC_OPTIONAL · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 136 | `--next` | C_NEXT · ARG_NONE | `curl-cli` | dispatched | planned | DL-0026 |
+| 137 | `--noproxy` | C_NOPROXY · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 138 | `--npn` | C_NPN · ARG_BOOL\|ARG_DEPR | `curl-cli` | deprecated: warns and does nothing | planned | DL-0026 |
+| 139 | `--ntlm` | C_NTLM · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 140 | `--ntlm-wb` | C_NTLM_WB · ARG_BOOL\|ARG_DEPR | `curl-cli` | deprecated: warns and does nothing | planned | DL-0026 |
+| 141 | `--oauth2-bearer` | C_OAUTH2_BEARER · ARG_STRG\|ARG_CLEAR | `curl-cli` | dispatched | planned | DL-0026 |
+| 142 | `--out-null` | C_OUT_NULL · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 143 | `--output` | C_OUTPUT · ARG_FILE | `curl-cli` | dispatched | planned | DL-0026 |
+| 144 | `--output-dir` | C_OUTPUT_DIR · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 145 | `--parallel` | C_PARALLEL · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 146 | `--parallel-immediate` | C_PARALLEL_IMMEDIATE · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 147 | `--parallel-max` | C_PARALLEL_MAX · ARG_UNUM | `curl-cli` | dispatched | planned | DL-0026 |
+| 148 | `--parallel-max-host` | C_PARALLEL_HOST · ARG_UNUM | `curl-cli` | dispatched | planned | DL-0026 |
+| 149 | `--pass` | C_PASS · ARG_STRG\|ARG_CLEAR | `curl-cli` | dispatched | planned | DL-0026 |
+| 150 | `--path-as-is` | C_PATH_AS_IS · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 151 | `--pinnedpubkey` | C_PINNEDPUBKEY · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 152 | `--post301` | C_POST301 · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 153 | `--post302` | C_POST302 · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 154 | `--post303` | C_POST303 · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 155 | `--preproxy` | C_PREPROXY · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 156 | `--progress-bar` | C_PROGRESS_BAR · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 157 | `--progress-meter` | C_PROGRESS_METER · ARG_BOOL\|ARG_NO | `curl-cli` | dispatched | planned | DL-0026 |
+| 158 | `--proto` | C_PROTO · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 159 | `--proto-default` | C_PROTO_DEFAULT · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 160 | `--proto-redir` | C_PROTO_REDIR · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 161 | `--proxy` | C_PROXY · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 162 | `--proxy-anyauth` | C_PROXY_ANYAUTH · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 163 | `--proxy-basic` | C_PROXY_BASIC · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 164 | `--proxy-ca-native` | C_PROXY_CA_NATIVE · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 165 | `--proxy-cacert` | C_PROXY_CACERT · ARG_FILE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 166 | `--proxy-capath` | C_PROXY_CAPATH · ARG_FILE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 167 | `--proxy-cert` | C_PROXY_CERT · ARG_FILE\|ARG_TLS\|ARG_CLEAR | `curl-cli` | dispatched | planned | DL-0026 |
+| 168 | `--proxy-cert-type` | C_PROXY_CERT_TYPE · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 169 | `--proxy-ciphers` | C_PROXY_CIPHERS · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 170 | `--proxy-crlfile` | C_PROXY_CRLFILE · ARG_FILE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 171 | `--proxy-digest` | C_PROXY_DIGEST · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 172 | `--proxy-header` | C_PROXY_HEADER · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 173 | `--proxy-http2` | C_PROXY_HTTP2 · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 174 | `--proxy-http3` | C_PROXY_HTTP3 · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 175 | `--proxy-insecure` | C_PROXY_INSECURE · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 176 | `--proxy-key` | C_PROXY_KEY · ARG_FILE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 177 | `--proxy-key-type` | C_PROXY_KEY_TYPE · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 178 | `--proxy-negotiate` | C_PROXY_NEGOTIATE · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 179 | `--proxy-ntlm` | C_PROXY_NTLM · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 180 | `--proxy-pass` | C_PROXY_PASS · ARG_STRG\|ARG_CLEAR | `curl-cli` | dispatched | planned | DL-0026 |
+| 181 | `--proxy-pinnedpubkey` | C_PROXY_PINNEDPUBKEY · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 182 | `--proxy-service-name` | C_PROXY_SERVICE_NAME · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 183 | `--proxy-ssl-allow-beast` | C_PROXY_SSL_ALLOW_BEAST · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 184 | `--proxy-ssl-auto-client-cert` | C_PROXY_SSL_AUTO_CLIENT_CERT · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 185 | `--proxy-tls13-ciphers` | C_PROXY_TLS13_CIPHERS · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 186 | `--proxy-tlsauthtype` | C_PROXY_TLSAUTHTYPE · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 187 | `--proxy-tlspassword` | C_PROXY_TLSPASSWORD · ARG_STRG\|ARG_TLS\|ARG_CLEAR | `curl-cli` | dispatched | planned | DL-0026 |
+| 188 | `--proxy-tlsuser` | C_PROXY_TLSUSER · ARG_STRG\|ARG_TLS\|ARG_CLEAR | `curl-cli` | dispatched | planned | DL-0026 |
+| 189 | `--proxy-tlsv1` | C_PROXY_TLSV1 · ARG_NONE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 190 | `--proxy-user` | C_PROXY_USER · ARG_STRG\|ARG_CLEAR | `curl-cli` | dispatched | planned | DL-0026 |
+| 191 | `--proxy1.0` | C_PROXY1_0 · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 192 | `--proxytunnel` | C_PROXYTUNNEL · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 193 | `--pubkey` | C_PUBKEY · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 194 | `--quote` | C_QUOTE · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 195 | `--random-file` | C_RANDOM_FILE · ARG_FILE\|ARG_DEPR | `curl-cli` | deprecated: warns and does nothing | planned | DL-0026 |
+| 196 | `--range` | C_RANGE · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 197 | `--rate` | C_RATE · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 198 | `--raw` | C_RAW · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 199 | `--referer` | C_REFERER · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 200 | `--remote-header-name` | C_REMOTE_HEADER_NAME · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 201 | `--remote-name` | C_REMOTE_NAME · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 202 | `--remote-name-all` | C_REMOTE_NAME_ALL · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 203 | `--remote-time` | C_REMOTE_TIME · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 204 | `--remove-on-error` | C_REMOVE_ON_ERROR · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 205 | `--request` | C_REQUEST · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 206 | `--request-target` | C_REQUEST_TARGET · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 207 | `--resolve` | C_RESOLVE · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 208 | `--retry` | C_RETRY · ARG_UNUM | `curl-cli` | dispatched | planned | DL-0026 |
+| 209 | `--retry-all-errors` | C_RETRY_ALL_ERRORS · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 210 | `--retry-connrefused` | C_RETRY_CONNREFUSED · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 211 | `--retry-delay` | C_RETRY_DELAY · ARG_SECS | `curl-cli` | dispatched | planned | DL-0026 |
+| 212 | `--retry-max-time` | C_RETRY_MAX_TIME · ARG_SECS | `curl-cli` | dispatched | planned | DL-0026 |
+| 213 | `--sasl-authzid` | C_SASL_AUTHZID · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 214 | `--sasl-ir` | C_SASL_IR · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 215 | `--service-name` | C_SERVICE_NAME · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 216 | `--sessionid` | C_SESSIONID · ARG_BOOL\|ARG_NO | `curl-cli` | dispatched | planned | DL-0026 |
+| 217 | `--show-error` | C_SHOW_ERROR · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 218 | `--show-headers` | C_SHOW_HEADERS · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 219 | `--sigalgs` | C_SIGNATURE_ALGORITHMS · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 220 | `--silent` | C_SILENT · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 221 | `--skip-existing` | C_SKIP_EXISTING · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 222 | `--socks4` | C_SOCKS4 · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 223 | `--socks4a` | C_SOCKS4A · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 224 | `--socks5` | C_SOCKS5 · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 225 | `--socks5-basic` | C_SOCKS5_BASIC · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 226 | `--socks5-gssapi` | C_SOCKS5_GSSAPI · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 227 | `--socks5-gssapi-nec` | C_SOCKS5_GSSAPI_NEC · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 228 | `--socks5-gssapi-service` | C_SOCKS5_GSSAPI_SERVICE · ARG_STRG | `curl-cli` | reproduce: accept, consume the argument, warn nothing, do nothing | planned | DL-0234 |
+| 229 | `--socks5-hostname` | C_SOCKS5_HOSTNAME · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 230 | `--speed-limit` | C_SPEED_LIMIT · ARG_UNUM | `curl-cli` | dispatched | planned | DL-0026 |
+| 231 | `--speed-time` | C_SPEED_TIME · ARG_UNUM | `curl-cli` | dispatched | planned | DL-0026 |
+| 232 | `--ssl` | C_SSL · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 233 | `--ssl-allow-beast` | C_SSL_ALLOW_BEAST · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 234 | `--ssl-auto-client-cert` | C_SSL_AUTO_CLIENT_CERT · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 235 | `--ssl-no-revoke` | C_SSL_NO_REVOKE · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 236 | `--ssl-reqd` | C_SSL_REQD · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 237 | `--ssl-revoke-best-effort` | C_SSL_REVOKE_BEST_EFFORT · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 238 | `--ssl-sessions` | C_SSL_SESSIONS · ARG_FILE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 239 | `--sslv2` | C_SSLV2 · ARG_NONE\|ARG_DEPR | `curl-cli` | deprecated: warns and does nothing | planned | DL-0026 |
+| 240 | `--sslv3` | C_SSLV3 · ARG_NONE\|ARG_DEPR | `curl-cli` | deprecated: warns and does nothing | planned | DL-0026 |
+| 241 | `--stderr` | C_STDERR · ARG_FILE | `curl-cli` | dispatched | planned | DL-0026 |
+| 242 | `--styled-output` | C_STYLED_OUTPUT · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 243 | `--suppress-connect-headers` | C_SUPPRESS_CONNECT_HEADERS · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 244 | `--tcp-fastopen` | C_TCP_FASTOPEN · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 245 | `--tcp-nodelay` | C_TCP_NODELAY · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 246 | `--telnet-option` | C_TELNET_OPTION · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 247 | `--test-duphandle` | C_TEST_DUPHANDLE · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 248 | `--test-event` | C_TEST_EVENT · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 249 | `--tftp-blksize` | C_TFTP_BLKSIZE · ARG_UNUM | `curl-cli` | dispatched | planned | DL-0026 |
+| 250 | `--tftp-no-options` | C_TFTP_NO_OPTIONS · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 251 | `--time-cond` | C_TIME_COND · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 252 | `--tls-earlydata` | C_TLS_EARLYDATA · ARG_BOOL\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 253 | `--tls-max` | C_TLS_MAX · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 254 | `--tls13-ciphers` | C_TLS13_CIPHERS · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 255 | `--tlsauthtype` | C_TLSAUTHTYPE · ARG_STRG\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 256 | `--tlspassword` | C_TLSPASSWORD · ARG_STRG\|ARG_TLS\|ARG_CLEAR | `curl-cli` | dispatched | planned | DL-0026 |
+| 257 | `--tlsuser` | C_TLSUSER · ARG_STRG\|ARG_TLS\|ARG_CLEAR | `curl-cli` | dispatched | planned | DL-0026 |
+| 258 | `--tlsv1` | C_TLSV1 · ARG_NONE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 259 | `--tlsv1.0` | C_TLSV1_0 · ARG_NONE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 260 | `--tlsv1.1` | C_TLSV1_1 · ARG_NONE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 261 | `--tlsv1.2` | C_TLSV1_2 · ARG_NONE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 262 | `--tlsv1.3` | C_TLSV1_3 · ARG_NONE\|ARG_TLS | `curl-cli` | dispatched | planned | DL-0026 |
+| 263 | `--tr-encoding` | C_TR_ENCODING · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 264 | `--trace` | C_TRACE · ARG_FILE | `curl-cli` | dispatched | planned | DL-0026 |
+| 265 | `--trace-ascii` | C_TRACE_ASCII · ARG_FILE | `curl-cli` | dispatched | planned | DL-0026 |
+| 266 | `--trace-config` | C_TRACE_CONFIG · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 267 | `--trace-ids` | C_TRACE_IDS · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 268 | `--trace-time` | C_TRACE_TIME · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 269 | `--unix-socket` | C_UNIX_SOCKET · ARG_FILE | `curl-cli` | dispatched | planned | DL-0026 |
+| 270 | `--upload-file` | C_UPLOAD_FILE · ARG_FILE | `curl-cli` | dispatched | planned | DL-0026 |
+| 271 | `--upload-flags` | C_UPLOAD_FLAGS · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 272 | `--url` | C_URL · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 273 | `--url-query` | C_URL_QUERY · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 274 | `--use-ascii` | C_USE_ASCII · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 275 | `--user` | C_USER · ARG_STRG\|ARG_CLEAR | `curl-cli` | dispatched | planned | DL-0026 |
+| 276 | `--user-agent` | C_USER_AGENT · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 277 | `--variable` | C_VARIABLE · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 278 | `--verbose` | C_VERBOSE · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 279 | `--version` | C_VERSION · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 280 | `--vlan-priority` | C_VLAN_PRIORITY · ARG_UNUM | `curl-cli` | dispatched | planned | DL-0026 |
+| 281 | `--wdebug` | C_WDEBUG · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
+| 282 | `--write-out` | C_WRITE_OUT · ARG_STRG | `curl-cli` | dispatched | planned | DL-0026 |
+| 283 | `--xattr` | C_XATTR · ARG_BOOL | `curl-cli` | dispatched | planned | DL-0026 |
 
 ### Output-format variables (`writeout-variable`, 73 row(s))
 
@@ -2508,49 +2508,72 @@ gap column cannot be committed.
 |---:|---|---|---|---|---|---|
 | 1 | `original/lib/request.h:249` | Curl_req_set_upload_done declared; file-local original/lib/request.c:268 exists instead | _none_ | orphan | - | DL-0112 |
 
+### Orphan definitions (`orphan-definition`, 12 row(s))
+
+| # | Baseline construct | Detail | Target | Disposition | Status | Decision |
+|---:|---|---|---|---|---|---|
+| 1 | `Curl_creader_def_close` | reach: called | _none_ | Ported as the default close of the reader trait, reached through the same table of function pointers. | - | DL-0233 |
+| 2 | `Curl_creader_def_init` | reach: called | _none_ | Ported as the default init of the reader trait, reached through the same table of function pointers. | - | DL-0233 |
+| 3 | `Curl_creader_def_read` | reach: unreachable | _none_ | Not ported. It is the reader trait's default read, and no table names it: an implementation that omitted read would have to be reachable for it to matter, and in the port a trait without a default forces every reader to supply one, so the unreachable fall-back has nothing to express. | - | DL-0233 |
+| 4 | `Curl_creader_def_total_length` | reach: called | _none_ | Ported as the default length answer of the reader trait, reached through the same table. | - | DL-0233 |
+| 5 | `Curl_meta_reset` | reach: called | _none_ | Ported as the handle-reset path, called from the reuse path of the same unit. | - | DL-0233 |
+| 6 | `Curl_multi_clear_dirty` | reach: called | _none_ | Ported as the dirty-set clear of the multi state machine, called from the same unit. | - | DL-0233 |
+| 7 | `Curl_thread_destroy` | reach: called | _none_ | Ported as the thread-handle drop, with the two platform-conditional definitions collapsed into one implementation. | - | DL-0233 |
+| 8 | `Curl_trc_dns` | reach: macro | _none_ | Ported as the resolver trace target of the reused feature registry, reached the same way: the emission macro expands to it and four resolver units use that macro. | - | DL-0233 |
+| 9 | `Curl_xfer_write_resp` | reach: called | _none_ | Ported as the response-write entry of the transfer loop, called from the transfer and HTTP/2 paths. | - | DL-0233 |
+| 10 | `curlx_base64_decode` | reach: called | _none_ | Ported as the base64 decoder of the leaf types crate, called from the authentication mechanisms. | - | DL-0233 |
+| 11 | `curlx_base64_encode` | reach: called | _none_ | Ported as the base64 encoder of the leaf types crate, called from the authentication and directory paths. | - | DL-0233 |
+| 12 | `curlx_base64url_encode` | reach: called | _none_ | Ported as the URL-safe base64 encoder, called from the HTTP/2 upgrade path. | - | DL-0233 |
+
 ## Reverse: project-authored file to baseline construct
 
 | # | Project file | Derives from | Disposition | Decision |
 |---:|---|---|---|---|
 | 1 | `.gitignore` | original/.gitignore | derived | - |
-| 2 | `COPYING` | original/COPYING | derived | - |
-| 3 | `Cargo.lock` | no oracle counterpart | project-owned | DL-0009 |
-| 4 | `Cargo.toml` | original/Makefile.am, original/configure.ac | derived | - |
-| 5 | `README.md` | original/README.md | derived | - |
-| 6 | `catalog-info.yaml` | no oracle counterpart | project-owned | DL-0025 |
-| 7 | `mkdocs.yml` | no oracle counterpart | project-owned | DL-0020 |
-| 8 | `refactor/docs/COVERAGE-MATRIX.md` | original/include/curl/curl.h, original/docs/libcurl/symbols-in-versions | derived | - |
-| 9 | `refactor/docs/DECISION-LOG.md` | no oracle counterpart | project-owned | DL-0023 |
-| 10 | `refactor/docs/PROVENANCE.md` | original/lib/Makefile.inc, original/src/Makefile.inc | derived | - |
-| 11 | `refactor/docs/QUIRKS.md` | original/docs/KNOWN_BUGS.md | derived | - |
-| 12 | `refactor/docs/TRACEABILITY-MATRIX.md` | original/docs/libcurl/symbols-in-versions, original/lib/libcurl.def | derived | - |
-| 13 | `refactor/docs/history/index.md` | no oracle counterpart | project-owned | DL-0020 |
-| 14 | `refactor/docs/history/project-guide.md` | no oracle counterpart | project-owned | DL-0020 |
-| 15 | `refactor/docs/history/technical-specifications.md` | no oracle counterpart | project-owned | DL-0020 |
-| 16 | `renovate.json` | original/renovate.json | derived | - |
-| 17 | `rust-toolchain.toml` | no oracle counterpart | project-owned | DL-0029 |
-| 18 | `testing/audit/Cargo.toml` | no oracle counterpart | project-owned | DL-0037 |
-| 19 | `testing/audit/src/bin/config.rs` | no oracle counterpart | project-owned | DL-0037 |
-| 20 | `testing/audit/src/comments.rs` | no oracle counterpart | project-owned | DL-0032 |
-| 21 | `testing/audit/src/fs.rs` | no oracle counterpart | project-owned | DL-0037 |
-| 22 | `testing/audit/src/lib.rs` | no oracle counterpart | project-owned | DL-0037 |
-| 23 | `testing/audit/src/lockfile.rs` | no oracle counterpart | project-owned | DL-0036 |
-| 24 | `testing/audit/src/premise.rs` | no oracle counterpart | project-owned | DL-0035 |
-| 25 | `testing/audit/src/provenance.rs` | no oracle counterpart | project-owned | DL-0138 |
-| 26 | `testing/audit/src/report.rs` | no oracle counterpart | project-owned | DL-0037 |
-| 27 | `testing/audit/src/workspace.rs` | no oracle counterpart | project-owned | DL-0037 |
-| 28 | `testing/audit/traceability/Cargo.toml` | no oracle counterpart | project-owned | DL-0111 |
-| 29 | `testing/audit/traceability/data/hazards.toml` | no oracle counterpart | project-owned | DL-0110 |
-| 30 | `testing/audit/traceability/data/ownership.toml` | no oracle counterpart | project-owned | DL-0111 |
-| 31 | `testing/audit/traceability/src/bin/traceability.rs` | no oracle counterpart | project-owned | DL-0111 |
-| 32 | `testing/audit/traceability/src/contract.rs` | no oracle counterpart | project-owned | DL-0111 |
-| 33 | `testing/audit/traceability/src/forward.rs` | original/lib/Makefile.inc, original/docs/libcurl/symbols-in-versions | derived | - |
-| 34 | `testing/audit/traceability/src/hazards.rs` | no oracle counterpart | project-owned | DL-0110 |
-| 35 | `testing/audit/traceability/src/lib.rs` | no oracle counterpart | project-owned | DL-0111 |
-| 36 | `testing/audit/traceability/src/oracle.rs` | original/lib/libcurl.def, original/src/tool_getparam.c, original/src/tool_writeout.c | derived | - |
-| 37 | `testing/audit/traceability/src/render.rs` | no oracle counterpart | project-owned | DL-0111 |
-| 38 | `testing/audit/traceability/src/reverse.rs` | no oracle counterpart | project-owned | DL-0111 |
-| 39 | `testing/upstream-suite/baseline-bootstrap` | no oracle counterpart | project-owned | DL-0033 |
+| 2 | `BASELINE.toml` | no oracle counterpart | project-owned | DL-0220 |
+| 3 | `COPYING` | original/COPYING | derived | - |
+| 4 | `Cargo.lock` | no oracle counterpart | project-owned | DL-0009 |
+| 5 | `Cargo.toml` | original/Makefile.am, original/configure.ac | derived | - |
+| 6 | `README.md` | original/README.md | derived | - |
+| 7 | `catalog-info.yaml` | no oracle counterpart | project-owned | DL-0025 |
+| 8 | `mkdocs.yml` | no oracle counterpart | project-owned | DL-0020 |
+| 9 | `refactor/docs/COVERAGE-MATRIX.md` | original/include/curl/curl.h, original/docs/libcurl/symbols-in-versions | derived | - |
+| 10 | `refactor/docs/DECISION-LOG.md` | no oracle counterpart | project-owned | DL-0023 |
+| 11 | `refactor/docs/DIVERGENCE-ALLOWLIST.md` | no oracle counterpart | project-owned | DL-0231 |
+| 12 | `refactor/docs/OBSERVABILITY.md` | original/lib/curl_trc.h, original/src/tool_cb_dbg.c | derived | - |
+| 13 | `refactor/docs/PROVENANCE.md` | original/lib/Makefile.inc, original/src/Makefile.inc | derived | - |
+| 14 | `refactor/docs/QUIRKS.md` | original/docs/KNOWN_BUGS.md | derived | - |
+| 15 | `refactor/docs/TRACEABILITY-MATRIX.md` | original/docs/libcurl/symbols-in-versions, original/lib/libcurl.def | derived | - |
+| 16 | `refactor/docs/history/index.md` | no oracle counterpart | project-owned | DL-0020 |
+| 17 | `refactor/docs/history/project-guide.md` | no oracle counterpart | project-owned | DL-0020 |
+| 18 | `refactor/docs/history/technical-specifications.md` | no oracle counterpart | project-owned | DL-0020 |
+| 19 | `renovate.json` | original/renovate.json | derived | - |
+| 20 | `rust-toolchain.toml` | no oracle counterpart | project-owned | DL-0029 |
+| 21 | `testing/audit/Cargo.toml` | no oracle counterpart | project-owned | DL-0037 |
+| 22 | `testing/audit/src/baseline.rs` | no oracle counterpart | project-owned | DL-0220 |
+| 23 | `testing/audit/src/bin/config.rs` | no oracle counterpart | project-owned | DL-0037 |
+| 24 | `testing/audit/src/comments.rs` | no oracle counterpart | project-owned | DL-0032 |
+| 25 | `testing/audit/src/fs.rs` | no oracle counterpart | project-owned | DL-0037 |
+| 26 | `testing/audit/src/lib.rs` | no oracle counterpart | project-owned | DL-0037 |
+| 27 | `testing/audit/src/lockfile.rs` | no oracle counterpart | project-owned | DL-0036 |
+| 28 | `testing/audit/src/premise.rs` | no oracle counterpart | project-owned | DL-0035 |
+| 29 | `testing/audit/src/provenance.rs` | no oracle counterpart | project-owned | DL-0138 |
+| 30 | `testing/audit/src/report.rs` | no oracle counterpart | project-owned | DL-0037 |
+| 31 | `testing/audit/src/workspace.rs` | no oracle counterpart | project-owned | DL-0037 |
+| 32 | `testing/audit/traceability/Cargo.toml` | no oracle counterpart | project-owned | DL-0111 |
+| 33 | `testing/audit/traceability/data/hazards.toml` | no oracle counterpart | project-owned | DL-0110 |
+| 34 | `testing/audit/traceability/data/observability.toml` | no oracle counterpart | project-owned | DL-0232 |
+| 35 | `testing/audit/traceability/data/ownership.toml` | no oracle counterpart | project-owned | DL-0111 |
+| 36 | `testing/audit/traceability/src/bin/traceability.rs` | no oracle counterpart | project-owned | DL-0111 |
+| 37 | `testing/audit/traceability/src/contract.rs` | no oracle counterpart | project-owned | DL-0111 |
+| 38 | `testing/audit/traceability/src/forward.rs` | original/lib/Makefile.inc, original/docs/libcurl/symbols-in-versions | derived | - |
+| 39 | `testing/audit/traceability/src/hazards.rs` | no oracle counterpart | project-owned | DL-0110 |
+| 40 | `testing/audit/traceability/src/lib.rs` | no oracle counterpart | project-owned | DL-0111 |
+| 41 | `testing/audit/traceability/src/observability.rs` | no oracle counterpart | project-owned | DL-0232 |
+| 42 | `testing/audit/traceability/src/oracle.rs` | original/lib/libcurl.def, original/src/tool_getparam.c, original/src/tool_writeout.c | derived | - |
+| 43 | `testing/audit/traceability/src/render.rs` | no oracle counterpart | project-owned | DL-0111 |
+| 44 | `testing/audit/traceability/src/reverse.rs` | no oracle counterpart | project-owned | DL-0111 |
+| 45 | `testing/upstream-suite/baseline-bootstrap` | no oracle counterpart | project-owned | DL-0033 |
 
 ## Gaps
 

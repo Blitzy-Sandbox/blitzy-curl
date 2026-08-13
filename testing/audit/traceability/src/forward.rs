@@ -6,8 +6,9 @@
 //!
 //! A construct with neither is a gap, and a gap is a failing check.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use curl_audit::fs::Files;
 use curl_audit::report::Report;
 
 use crate::contract::Ownership;
@@ -59,9 +60,109 @@ impl Forward {
     }
 }
 
+/// Symbols upstream's own single-use checker whitelists.
+///
+/// The whitelist is the mechanical denominator for the inverse orphan shape: it
+/// is upstream's own record of definitions its checker would otherwise flag, so
+/// it cannot drift from a list of ours because it is not a list of ours.
+#[must_use]
+pub fn single_use_whitelist(files: &dyn Files) -> BTreeSet<String> {
+    let Some(text) = files.read("original/scripts/singleuse.pl") else {
+        return BTreeSet::new();
+    };
+    let mut found = BTreeSet::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("my %wl") {
+            inside = true;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if trimmed == ");" {
+            break;
+        }
+        if let Some(name) = trimmed.strip_prefix('\'')
+            && let Some(symbol) = name.split('\'').next()
+        {
+            found.insert(symbol.to_owned());
+        }
+    }
+    found
+}
+
+/// How the oracle reaches one whitelisted definition.
+///
+/// Measured over the library sources rather than declared: a reference that is
+/// neither the definition nor a prototype makes it `called`, a macro that
+/// expands to it makes it `macro`, and neither makes it `unreachable`.
+#[must_use]
+pub fn reachability(files: &dyn Files, symbol: &str) -> String {
+    let sources = crate::oracle::walk(files, "original/lib", ".c");
+    let headers = crate::oracle::walk(files, "original/lib", ".h");
+    let mut called = false;
+    let mut macro_reached = false;
+    for path in sources.iter().chain(headers.iter()) {
+        let Some(text) = files.read(path) else {
+            continue;
+        };
+        let source = path.ends_with(".c");
+        for line in text.lines() {
+            if !line.contains(symbol) {
+                continue;
+            }
+            let trimmed = line.trim();
+            if trimmed.starts_with("#define") {
+                macro_reached = true;
+                continue;
+            }
+            if !source {
+                // A prototype is not a use.
+                continue;
+            }
+            // A definition's signature line does not end in a semicolon and
+            // carries only declarator tokens before the name. Everything else
+            // that names the symbol is a use: a call, or an entry in a table of
+            // function pointers.
+            let head = trimmed
+                .split_once(symbol)
+                .map_or("", |(head, _)| head)
+                .trim();
+            let declarator = !trimmed.ends_with(';')
+                && trimmed.contains(&format!("{symbol}("))
+                && !head.is_empty()
+                && head
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '*' || c == ' ' || c == '\t');
+            if declarator {
+                continue;
+            }
+            called = true;
+        }
+    }
+    if called {
+        "called".to_owned()
+    } else if macro_reached {
+        "macro".to_owned()
+    } else {
+        "unreachable".to_owned()
+    }
+}
+
+/// How many whitelisted symbols have one measured reach.
+fn count_reach(files: &dyn Files, whitelist: &BTreeSet<String>, reach: &str) -> usize {
+    whitelist
+        .iter()
+        .filter(|symbol| reachability(files, symbol) == reach)
+        .count()
+}
+
 /// Resolves every family and records a check per gate.
 #[allow(clippy::too_many_lines)] // One gate per family; splitting hides the set. DL-0111
 pub fn resolve(
+    files: &dyn Files,
     survey: &Survey,
     ownership: &Ownership,
     planned: &BTreeSet<String>,
@@ -356,16 +457,99 @@ pub fn resolve(
             format!("no identifier: {}", unidentified.join(", "))
         },
     );
+    // A behavioural verdict per option, not a bare marker: the alias table and
+    // the dispatch arms are separate lists and nothing upstream checks that they
+    // agree, so an option can be accepted, have its argument consumed and then be
+    // discarded with no diagnostic. Each undispatched option must be declared.
+    let silent: BTreeMap<&str, &crate::contract::SilentOption> = ownership
+        .silent_options
+        .iter()
+        .map(|entry| (entry.identifier.as_str(), entry))
+        .collect();
+    let mut undeclared = Vec::new();
     for option in &survey.cli_options {
+        let (verdict, decision) = if option.dispatched {
+            ("dispatched".to_owned(), cli_decision.to_owned())
+        } else if option.deprecated {
+            (
+                "deprecated: warns and does nothing".to_owned(),
+                cli_decision.to_owned(),
+            )
+        } else if let Some(entry) = silent.get(option.identifier.as_str()) {
+            (entry.disposition.clone(), entry.decision.clone())
+        } else {
+            undeclared.push(format!("--{}", option.name));
+            ("undeclared".to_owned(), cli_decision.to_owned())
+        };
         forward.rows.push(Row {
             family: "cli-option",
             source: format!("--{}", option.name),
-            detail: option.identifier.clone(),
+            detail: format!("{} · {}", option.identifier, option.descriptor),
             target: cli_target.to_owned(),
-            disposition: "owned".to_owned(),
-            decision: cli_decision.to_owned(),
+            disposition: verdict,
+            decision,
         });
     }
+    report.assert(
+        undeclared.is_empty(),
+        "cli-option/dispatch-accounted",
+        if undeclared.is_empty() {
+            format!(
+                "{} dispatched, {} deprecated, {} declared without a dispatch arm",
+                survey
+                    .cli_options
+                    .iter()
+                    .filter(|option| option.dispatched)
+                    .count(),
+                survey
+                    .cli_options
+                    .iter()
+                    .filter(|option| !option.dispatched && option.deprecated)
+                    .count(),
+                survey
+                    .cli_options
+                    .iter()
+                    .filter(|option| {
+                        !option.dispatched
+                            && !option.deprecated
+                            && silent.contains_key(option.identifier.as_str())
+                    })
+                    .count()
+            )
+        } else {
+            format!(
+                "no dispatch arm and no declaration: {}",
+                undeclared.join(", ")
+            )
+        },
+    );
+    forward.gaps.extend(undeclared);
+
+    let phantom: Vec<&str> = ownership
+        .silent_options
+        .iter()
+        .filter(|entry| {
+            !survey.cli_options.iter().any(|option| {
+                option.identifier == entry.identifier && !option.dispatched && !option.deprecated
+            })
+        })
+        .map(|entry| entry.identifier.as_str())
+        .collect();
+    report.assert(
+        phantom.is_empty(),
+        "cli-option/declarations-needed",
+        if phantom.is_empty() {
+            format!(
+                "{} declaration(s), each answering an option with no dispatch arm",
+                ownership.silent_options.len()
+            )
+        } else {
+            format!(
+                "declared and dispatched or deprecated: {}",
+                phantom.join(", ")
+            )
+        },
+    );
 
     let (var_target, var_decision) = ownership.target_of("writeout-variable").unwrap_or(("", ""));
     report.assert(
@@ -479,6 +663,100 @@ pub fn resolve(
         });
     }
 
+    // Orphan definitions: the inverse shape, taken from upstream's own single-use
+    // whitelist rather than from a list of ours, and reachability measured rather
+    // than assumed.
+    let whitelist = single_use_whitelist(files);
+    report.assert(
+        !whitelist.is_empty(),
+        "orphan-definition/whitelist-read",
+        format!(
+            "{} whitelisted symbol(s) from original/scripts/singleuse.pl",
+            whitelist.len()
+        ),
+    );
+    let declared: BTreeMap<&str, &crate::contract::OrphanDefinition> = ownership
+        .orphan_definitions
+        .iter()
+        .map(|entry| (entry.symbol.as_str(), entry))
+        .collect();
+    let mut unaccounted = Vec::new();
+    for symbol in &whitelist {
+        let reach = reachability(files, symbol);
+        match declared.get(symbol.as_str()) {
+            Some(entry) => {
+                forward.rows.push(Row {
+                    family: "orphan-definition",
+                    source: symbol.clone(),
+                    detail: format!("reach: {reach}"),
+                    target: "none".to_owned(),
+                    disposition: entry.disposition.clone(),
+                    decision: entry.decision.clone(),
+                });
+            }
+            None => unaccounted.push(symbol.clone()),
+        }
+    }
+    report.assert(
+        unaccounted.is_empty(),
+        "orphan-definition/whitelist-accounted",
+        if unaccounted.is_empty() {
+            format!(
+                "{} whitelisted symbol(s), each carrying a disposition",
+                whitelist.len()
+            )
+        } else {
+            format!("no disposition: {}", unaccounted.join(", "))
+        },
+    );
+    forward.gaps.extend(unaccounted);
+
+    let stray: Vec<&str> = ownership
+        .orphan_definitions
+        .iter()
+        .filter(|entry| !whitelist.contains(&entry.symbol))
+        .map(|entry| entry.symbol.as_str())
+        .collect();
+    report.assert(
+        stray.is_empty(),
+        "orphan-definition/whitelist-sourced",
+        if stray.is_empty() {
+            "every disposition names a whitelisted symbol".to_owned()
+        } else {
+            format!("not in the upstream whitelist: {}", stray.join(", "))
+        },
+    );
+
+    let misread: Vec<String> = ownership
+        .orphan_definitions
+        .iter()
+        .filter(|entry| {
+            whitelist.contains(&entry.symbol) && reachability(files, &entry.symbol) != entry.reach
+        })
+        .map(|entry| {
+            format!(
+                "{}: declared {}, measured {}",
+                entry.symbol,
+                entry.reach,
+                reachability(files, &entry.symbol)
+            )
+        })
+        .collect();
+    report.assert(
+        misread.is_empty(),
+        "orphan-definition/reach-measured",
+        if misread.is_empty() {
+            format!(
+                "{} unreachable, {} macro-reached, {} called",
+                count_reach(files, &whitelist, "unreachable"),
+                count_reach(files, &whitelist, "macro"),
+                count_reach(files, &whitelist, "called")
+            )
+        } else {
+            format!("reach disagrees: {}", misread.join("; "))
+        },
+    );
+
     report.assert(
         forward.gaps.is_empty(),
         "forward/no-gap",
@@ -501,7 +779,7 @@ mod tests {
     use curl_audit::fs::MapFiles;
     use curl_audit::report::Report;
 
-    use super::resolve;
+    use super::{reachability, resolve, single_use_whitelist};
     use crate::contract::Ownership;
     use crate::oracle::Survey;
 
@@ -514,6 +792,7 @@ decision = "DL-0026"
 [unit]
 "http.c" = "curl-http1"
 "request.c" = "curl-core"
+"sendf.c" = "curl-core"
 [header]
 "urldata.h" = "curl-core"
 [[exclusion]]
@@ -526,6 +805,16 @@ path = "original/lib/request.h"
 line = 1
 symbol = "Curl_req_set_upload_done"
 local-definition = "original/lib/request.c:268"
+decision = "DL-0112"
+[[orphan-definition]]
+symbol = "Curl_reached"
+reach = "called"
+disposition = "ported and called the same way"
+decision = "DL-0112"
+[[orphan-definition]]
+symbol = "Curl_lonely"
+reach = "unreachable"
+disposition = "not ported: nothing can enter it"
 decision = "DL-0112"
 [[family]]
 prefix = "CURLOPT_"
@@ -570,7 +859,7 @@ decision = "DL-0026"
             )
             .with(
                 "original/src/tool_getparam.c",
-                "static const struct LongShort aliases[]= {\n  {\"alpn\", ARG_BOOL, ' ', C_ALPN},\n};\n",
+                "static const struct LongShort aliases[]= {\n  {\"alpn\", ARG_BOOL, ' ', C_ALPN},\n};\n  case C_ALPN:\n",
             )
             .with(
                 "original/src/tool_writeout.c",
@@ -581,6 +870,15 @@ decision = "DL-0026"
                 "original/tests/unit/unit1300.c",
                 "#include \"unitcheck.h\"\n#include \"urldata.h\"\n",
             )
+            .with(
+                "original/scripts/singleuse.pl",
+                "my %wl = (\n    'Curl_reached' => 'internal api',\n    'Curl_lonely' => 'internal api',\n);\n",
+            )
+            .with(
+                "original/lib/sendf.c",
+                "void Curl_reached(int a)\n{\n}\nvoid Curl_lonely(int a)\n{\n}\nvoid caller(void)\n{\n  Curl_reached(1);\n}\n",
+            )
+            .with("original/lib/sendf.h", "void Curl_reached(int a);\nvoid Curl_lonely(int a);\n")
     }
 
     fn ownership(text: &str, key: &str) -> Ownership {
@@ -617,7 +915,14 @@ decision = "DL-0026"
         let survey = Survey::collect(&files);
         let owned = ownership(OWNERSHIP, "complete");
         let mut report = Report::new("test");
-        let forward = resolve(&survey, &owned, &planned(), &decisions(), &mut report);
+        let forward = resolve(
+            &files,
+            &survey,
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
         let rendered = report.render();
         assert!(rendered.contains("PASS forward/no-gap"), "{rendered}");
         assert!(rendered.contains("PASS exported-symbol/declared"));
@@ -636,7 +941,14 @@ decision = "DL-0026"
         let survey = Survey::collect(&files);
         let owned = ownership(OWNERSHIP, "gap");
         let mut report = Report::new("test");
-        let forward = resolve(&survey, &owned, &planned(), &decisions(), &mut report);
+        let forward = resolve(
+            &files,
+            &survey,
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
         assert!(!forward.gaps.is_empty());
         let rendered = report.render();
         assert!(rendered.contains("FAIL forward/no-gap"));
@@ -650,7 +962,14 @@ decision = "DL-0026"
         let survey = Survey::collect(&files);
         let owned = ownership(&text, "unplanned");
         let mut report = Report::new("test");
-        let _ = resolve(&survey, &owned, &planned(), &decisions(), &mut report);
+        let _ = resolve(
+            &files,
+            &survey,
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
         let rendered = report.render();
         assert!(rendered.contains("FAIL owners-planned"), "{rendered}");
     }
@@ -665,7 +984,14 @@ decision = "DL-0026"
         let survey = Survey::collect(&files);
         let owned = ownership(&text, "stale");
         let mut report = Report::new("test");
-        let _ = resolve(&survey, &owned, &planned(), &decisions(), &mut report);
+        let _ = resolve(
+            &files,
+            &survey,
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
         let rendered = report.render();
         assert!(
             rendered.contains("FAIL declared-entries-exist"),
@@ -676,10 +1002,18 @@ decision = "DL-0026"
 
     #[test]
     fn an_empty_oracle_fails_every_enumeration() {
-        let survey = Survey::collect(&MapFiles::new());
+        let files = MapFiles::new();
+        let survey = Survey::collect(&files);
         let owned = ownership(OWNERSHIP, "empty");
         let mut report = Report::new("test");
-        let _ = resolve(&survey, &owned, &planned(), &decisions(), &mut report);
+        let _ = resolve(
+            &files,
+            &survey,
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
         let rendered = report.render();
         assert!(rendered.contains("FAIL translation-unit/enumerated"));
         assert!(rendered.contains("FAIL symbol-register/enumerated"));
@@ -697,7 +1031,14 @@ decision = "DL-0026"
         let survey = Survey::collect(&files);
         let owned = ownership(&text, "contradiction");
         let mut report = Report::new("test");
-        let forward = resolve(&survey, &owned, &planned(), &decisions(), &mut report);
+        let forward = resolve(
+            &files,
+            &survey,
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
         assert!(forward.excluded().is_empty());
         let rendered = report.render();
         assert!(rendered.contains("FAIL forward/no-gap"), "{rendered}");
@@ -711,7 +1052,204 @@ decision = "DL-0026"
         let survey = Survey::collect(&files);
         let owned = ownership(&text, "pointer");
         let mut report = Report::new("test");
-        let _ = resolve(&survey, &owned, &planned(), &decisions(), &mut report);
+        let _ = resolve(
+            &files,
+            &survey,
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
         assert!(report.render().contains("FAIL exclusions-justified"));
+    }
+
+    #[test]
+    fn the_whitelist_is_read_from_upstreams_own_script() {
+        let found = single_use_whitelist(&oracle());
+        assert_eq!(found.len(), 2);
+        assert!(found.contains("Curl_reached"));
+        assert!(found.contains("Curl_lonely"));
+        assert!(single_use_whitelist(&MapFiles::new()).is_empty());
+    }
+
+    #[test]
+    fn reach_is_measured_rather_than_declared() {
+        let files = oracle();
+        assert_eq!(reachability(&files, "Curl_reached"), "called");
+        assert_eq!(reachability(&files, "Curl_lonely"), "unreachable");
+        let with_macro = files.clone().with(
+            "original/lib/curl_trc.h",
+            "#define CURL_TRC_LONELY Curl_lonely\n",
+        );
+        assert_eq!(reachability(&with_macro, "Curl_lonely"), "macro");
+    }
+
+    #[test]
+    fn a_whitelisted_symbol_with_no_disposition_is_a_gap() {
+        let text = OWNERSHIP.replace(
+            "[[orphan-definition]]\nsymbol = \"Curl_lonely\"\nreach = \"unreachable\"\ndisposition = \"not ported: nothing can enter it\"\ndecision = \"DL-0112\"\n",
+            "",
+        );
+        let files = oracle();
+        let survey = Survey::collect(&files);
+        let owned = ownership(&text, "no disposition");
+        let mut report = Report::new("test");
+        let forward = resolve(
+            &files,
+            &survey,
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
+        let rendered = report.render();
+        assert!(
+            rendered.contains("FAIL orphan-definition/whitelist-accounted"),
+            "{rendered}"
+        );
+        assert!(forward.gaps.iter().any(|gap| gap == "Curl_lonely"));
+    }
+
+    #[test]
+    fn a_disposition_outside_the_whitelist_fails() {
+        let text = OWNERSHIP.replace("symbol = \"Curl_reached\"", "symbol = \"Curl_invented\"");
+        let files = oracle();
+        let survey = Survey::collect(&files);
+        let owned = ownership(&text, "stray");
+        let mut report = Report::new("test");
+        let _ = resolve(
+            &files,
+            &survey,
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
+        assert!(
+            report
+                .render()
+                .contains("FAIL orphan-definition/whitelist-sourced")
+        );
+    }
+
+    #[test]
+    fn a_declared_reach_that_disagrees_with_the_tree_fails() {
+        let text = OWNERSHIP.replace(
+            "symbol = \"Curl_lonely\"\nreach = \"unreachable\"",
+            "symbol = \"Curl_lonely\"\nreach = \"called\"",
+        );
+        let files = oracle();
+        let survey = Survey::collect(&files);
+        let owned = ownership(&text, "wrong reach");
+        let mut report = Report::new("test");
+        let _ = resolve(
+            &files,
+            &survey,
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
+        assert!(
+            report
+                .render()
+                .contains("FAIL orphan-definition/reach-measured")
+        );
+    }
+
+    #[test]
+    fn an_option_with_no_dispatch_arm_needs_a_declaration() {
+        let files = oracle().with(
+            "original/src/tool_getparam.c",
+            "static const struct LongShort aliases[]= {\n  {\"alpn\", ARG_BOOL, ' ', C_ALPN},\n  {\"ghost\", ARG_STRG, ' ', C_GHOST},\n};\n  case C_ALPN:\n",
+        );
+        let survey = Survey::collect(&files);
+        let owned = ownership(OWNERSHIP, "silent");
+        let mut report = Report::new("test");
+        let forward = resolve(
+            &files,
+            &survey,
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
+        let rendered = report.render();
+        assert!(
+            rendered.contains("FAIL cli-option/dispatch-accounted"),
+            "{rendered}"
+        );
+        assert!(forward.gaps.iter().any(|gap| gap == "--ghost"));
+    }
+
+    #[test]
+    fn a_declared_silent_option_that_is_dispatched_fails() {
+        let text = format!(
+            "{OWNERSHIP}\n[[silent-option]]\nidentifier = \"C_ALPN\"\noutcome = \"nothing\"\ndisposition = \"reproduce\"\ndecision = \"DL-0026\"\n"
+        );
+        let files = oracle();
+        let survey = Survey::collect(&files);
+        let owned = ownership(&text, "phantom");
+        let mut report = Report::new("test");
+        let _ = resolve(
+            &files,
+            &survey,
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
+        assert!(
+            report
+                .render()
+                .contains("FAIL cli-option/declarations-needed")
+        );
+    }
+
+    #[test]
+    fn a_deprecated_option_carries_its_own_verdict() {
+        let files = oracle().with(
+            "original/src/tool_getparam.c",
+            "static const struct LongShort aliases[]= {\n  {\"alpn\", ARG_BOOL, ' ', C_ALPN},\n  {\"sslv2\", ARG_NONE|ARG_DEPR, '2', C_SSLV2},\n};\n  case C_ALPN:\n",
+        );
+        let survey = Survey::collect(&files);
+        let owned = ownership(OWNERSHIP, "deprecated");
+        let mut report = Report::new("test");
+        let forward = resolve(
+            &files,
+            &survey,
+            &owned,
+            &planned(),
+            &decisions(),
+            &mut report,
+        );
+        assert!(
+            report
+                .render()
+                .contains("PASS cli-option/dispatch-accounted")
+        );
+        let row = forward
+            .family("cli-option")
+            .into_iter()
+            .find(|row| row.source == "--sslv2")
+            .expect("row");
+        assert_eq!(row.disposition, "deprecated: warns and does nothing");
+    }
+
+    #[test]
+    fn a_wrapped_alias_row_still_yields_its_identifier() {
+        let files = oracle().with(
+            "original/src/tool_getparam.c",
+            "static const struct LongShort aliases[]= {\n  {\"alpn\", ARG_BOOL, ' ', C_ALPN},\n  {\"proxy-cert\", ARG_FILE|ARG_TLS|ARG_CLEAR, ' ',\n   C_PROXY_CERT},\n};\n  case C_ALPN:\n  case C_PROXY_CERT:\n",
+        );
+        let survey = Survey::collect(&files);
+        let wrapped = survey
+            .cli_options
+            .iter()
+            .find(|option| option.name == "proxy-cert")
+            .expect("option");
+        assert_eq!(wrapped.identifier, "C_PROXY_CERT");
+        assert!(wrapped.dispatched);
+        assert!(!wrapped.deprecated);
     }
 }

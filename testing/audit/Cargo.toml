@@ -24,6 +24,8 @@ name = "curl-audit-config"
 path = "src/bin/config.rs"
 
 [dependencies]
+hex = { workspace = true }                                            # DL-0221
+sha2 = { workspace = true }                                           # DL-0221
 toml = { workspace = true }
 
 [lints]

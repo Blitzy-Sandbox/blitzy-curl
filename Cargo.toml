@@ -225,6 +225,8 @@ debug = 1
 # ---------------------------------------------------------------------------
 [workspace.metadata.curl]
 baseline-tag = "curl-8_21_0"                                          # DL-0001
+# Frozen identity of the oracle; this manifest carries no copy.        DL-0220
+baseline-manifest = "BASELINE.toml"                                   # DL-0220
 msrv = "1.97.1"
 artifact-packages = ["curl-abi", "curl-cli"]
 
@@ -597,6 +599,7 @@ decision = "DL-0172"
 asserted-by = "testing/audit/traceability"                            # DL-0111
 ownership-data = "testing/audit/traceability/data/ownership.toml"     # DL-0111
 hazard-data = "testing/audit/traceability/data/hazards.toml"          # DL-0110
+observability-data = "testing/audit/traceability/data/observability.toml" # DL-0232
 decision-log = "refactor/docs/DECISION-LOG.md"                        # DL-0023
 
 # Rendered documents; check mode diffs each one.                       DL-0111
@@ -605,6 +608,8 @@ provenance = "refactor/docs/PROVENANCE.md"                            # DL-0111
 traceability = "refactor/docs/TRACEABILITY-MATRIX.md"                 # DL-0111
 coverage = "refactor/docs/COVERAGE-MATRIX.md"                         # DL-0111
 quirks = "refactor/docs/QUIRKS.md"                                    # DL-0110
+divergence-allowlist = "refactor/docs/DIVERGENCE-ALLOWLIST.md"        # DL-0231
+observability = "refactor/docs/OBSERVABILITY.md"                      # DL-0232
 
 # Comment discipline in project-authored configuration files.          DL-0032
 # Enforced by testing/audit; the decision log holds every "why".       DL-0023
@@ -614,6 +619,7 @@ asserted-by = "testing/audit"                                         # DL-0037
 # Every root *.toml, root .gitignore and member manifest.              DL-0032
 files = [
   ".gitignore",
+  "BASELINE.toml",                                                    # DL-0220
   "Cargo.toml",
   "rust-toolchain.toml",
   "testing/audit/Cargo.toml",
@@ -644,10 +650,19 @@ banned-phrases = [                                                    # DL-0032
 [workspace.metadata.curl.provenance]
 asserted-by = "testing/audit"                                         # DL-0037
 enumeration-roots = ["original/lib", "original/src"]                  # DL-0043
-manifest = "original/lib/Makefile.inc"                                # DL-0043
 trace-registry = "original/lib/curl_trc.c"                            # DL-0039
 records = ["Cargo.toml", "refactor/docs/DECISION-LOG.md"]             # DL-0138
 kinds = { translation-unit = "c", header = "h" }                      # DL-0138
+
+# One build manifest per enumeration root.                            DL-0235
+[workspace.metadata.curl.provenance.manifests]
+"original/lib" = "original/lib/Makefile.inc"                          # DL-0043
+"original/src" = "original/src/Makefile.inc"                          # DL-0235
+
+# Paths catalogued per root; the count is frozen.                     DL-0235
+[workspace.metadata.curl.provenance.catalogued]
+"original/lib" = 30                                                   # DL-0235
+"original/src" = 8                                                    # DL-0235
 
 # Rules the audit runs, never recorded figures.                       DL-0040
 [workspace.metadata.curl.provenance.extraction]
@@ -659,8 +674,8 @@ failf-calls = "failf"                                                 # DL-0039
 filter-definition = "Curl_cft_<name> = {"                             # DL-0039
 filter-registration = "&Curl_cft_<name>,"                             # DL-0039
 
-# One entry per vendored path; owners are planned members.            DL-0138
-# Metrics are re-measured on every run.                               DL-0138
+# The established subset, not every enumerated path.                  DL-0235
+# Owners are planned members; metrics are re-measured.                DL-0138
 
 [[workspace.metadata.curl.provenance.owners]]
 path = "original/lib/cf-dns.c"
@@ -976,4 +991,85 @@ crate = "refactor/curl-types"
 decision = "DL-0145"
 manifest-line = 418
 lines = 91
+type-definitions = 2
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_cb_rea.c"
+kind = "translation-unit"
+crate = "refactor/curl-cli"
+decision = "DL-0191"
+manifest-line = 85
+lines = 188
+function-definitions = 3
+trace-calls = 0
+infof-calls = 0
+failf-calls = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_cb_rea.h"
+kind = "header"
+crate = "refactor/curl-cli"
+decision = "DL-0191"
+manifest-line = 129
+lines = 42
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_formparse.h"
+kind = "header"
+crate = "refactor/curl-cli"
+decision = "DL-0196"
+manifest-line = 139
+lines = 67
+type-definitions = 1
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_operhlp.h"
+kind = "header"
+crate = "refactor/curl-cli"
+decision = "DL-0218"
+manifest-line = 149
+lines = 37
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_parsecfg.c"
+kind = "translation-unit"
+crate = "refactor/curl-cli"
+decision = "DL-0214"
+manifest-line = 108
+lines = 400
+function-definitions = 7
+trace-calls = 0
+infof-calls = 0
+failf-calls = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_parsecfg.h"
+kind = "header"
+crate = "refactor/curl-cli"
+decision = "DL-0214"
+manifest-line = 151
+lines = 34
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_urlglob.c"
+kind = "translation-unit"
+crate = "refactor/curl-cli"
+decision = "DL-0204"
+manifest-line = 113
+lines = 806
+function-definitions = 15
+trace-calls = 0
+infof-calls = 0
+failf-calls = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_urlglob.h"
+kind = "header"
+crate = "refactor/curl-cli"
+decision = "DL-0204"
+manifest-line = 158
+lines = 87
 type-definitions = 2

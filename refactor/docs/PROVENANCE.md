@@ -525,6 +525,29 @@ declared.
 | 10 | `original/lib/amigaos.c` | platform-outside-matrix | AmigaOS platform shim; the matrix covers Linux by execution and macOS and Windows by cross-compilation | DL-0043 |
 | 11 | `original/src/tool_vms.c` | platform-outside-matrix | OpenVMS command-line shim, paired with original/projects/vms | DL-0043 |
 
+## Orphan definitions
+
+The mirror image, taken from upstream's own single-use whitelist at
+`original/scripts/singleuse.pl` rather than from a list of ours. `Reach` is
+re-measured over the library sources on every run and a disagreement with the
+declared value fails, so a symbol that gains or loses its last caller upstream
+cannot pass unnoticed.
+
+| # | Symbol | Reach | Disposition | Decision |
+|---:|---|---|---|---|
+| 1 | `Curl_creader_def_close` | reach: called | Ported as the default close of the reader trait, reached through the same table of function pointers. | DL-0233 |
+| 2 | `Curl_creader_def_init` | reach: called | Ported as the default init of the reader trait, reached through the same table of function pointers. | DL-0233 |
+| 3 | `Curl_creader_def_read` | reach: unreachable | Not ported. It is the reader trait's default read, and no table names it: an implementation that omitted read would have to be reachable for it to matter, and in the port a trait without a default forces every reader to supply one, so the unreachable fall-back has nothing to express. | DL-0233 |
+| 4 | `Curl_creader_def_total_length` | reach: called | Ported as the default length answer of the reader trait, reached through the same table. | DL-0233 |
+| 5 | `Curl_meta_reset` | reach: called | Ported as the handle-reset path, called from the reuse path of the same unit. | DL-0233 |
+| 6 | `Curl_multi_clear_dirty` | reach: called | Ported as the dirty-set clear of the multi state machine, called from the same unit. | DL-0233 |
+| 7 | `Curl_thread_destroy` | reach: called | Ported as the thread-handle drop, with the two platform-conditional definitions collapsed into one implementation. | DL-0233 |
+| 8 | `Curl_trc_dns` | reach: macro | Ported as the resolver trace target of the reused feature registry, reached the same way: the emission macro expands to it and four resolver units use that macro. | DL-0233 |
+| 9 | `Curl_xfer_write_resp` | reach: called | Ported as the response-write entry of the transfer loop, called from the transfer and HTTP/2 paths. | DL-0233 |
+| 10 | `curlx_base64_decode` | reach: called | Ported as the base64 decoder of the leaf types crate, called from the authentication mechanisms. | DL-0233 |
+| 11 | `curlx_base64_encode` | reach: called | Ported as the base64 encoder of the leaf types crate, called from the authentication and directory paths. | DL-0233 |
+| 12 | `curlx_base64url_encode` | reach: called | Ported as the URL-safe base64 encoder, called from the HTTP/2 upgrade path. | DL-0233 |
+
 ## Orphan declarations
 
 A declaration with no definition and no caller takes a row here and no Rust

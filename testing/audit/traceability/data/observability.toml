@@ -1,0 +1,634 @@
+# SPDX-FileCopyrightText: the blitzy-curl project contributors
+# SPDX-License-Identifier: curl
+#
+# The observability contract: what the oracle already provides and the port
+# reuses, what this project adds, and every place a value the oracle traces is
+# a credential. Read by testing/audit/traceability; rationale lives in
+# refactor/docs/DECISION-LOG.md. Every locator here is verified against the
+# vendored oracle on each run, so a stale line number fails rather than misleads.
+
+schema = 1
+
+# Field names no added instrumentation may carry. DL-0232.
+sensitive-fields = [
+  "authorization",
+  "challenge",
+  "cookie",
+  "credential",
+  "header",
+  "netrc",
+  "passphrase",
+  "passwd",
+  "password",
+  "payload",
+  "secret",
+  "session_id",
+  "token",
+  "user",
+  "username",
+]
+
+# Instrumentation call shapes the sensitive-field gate scans for. DL-0232.
+instrumentation-macros = [
+  "counter!",
+  "debug!",
+  "debug_span!",
+  "error!",
+  "error_span!",
+  "event!",
+  "gauge!",
+  "histogram!",
+  "info!",
+  "info_span!",
+  "instrument",
+  "span!",
+  "trace!",
+  "trace_span!",
+  "warn!",
+  "warn_span!",
+]
+
+# Format-string shapes that make a shared-sink call site a disclosure. DL-0232.
+# A shape matches when the call's first string literal equals `format` and,
+# where `argument` is given, the text after that literal contains it.
+[[shape]]
+format = "USER %s"
+class = "credential"
+discloses = "the account name"
+
+[[shape]]
+format = "PASS %s"
+class = "credential"
+discloses = "the password in the clear"
+
+[[shape]]
+format = "APOP %s %s"
+class = "credential"
+discloses = "the account name and the MD5 digest derived from the password"
+
+[[shape]]
+format = "LOGIN %s %s"
+class = "credential"
+discloses = "the account name and the password in the clear"
+
+[[shape]]
+format = "AUTH %s %s"
+class = "credential"
+discloses = "the mechanism and the base64 initial response"
+
+[[shape]]
+format = "AUTHENTICATE %s %s"
+class = "credential"
+discloses = "the mechanism and the base64 initial response"
+
+[[shape]]
+format = "%s"
+argument = "Curl_bufref_ptr(resp)"
+class = "credential"
+discloses = "one base64 continuation of the mechanism exchange"
+
+[[shape]]
+format = "AUTH %s"
+class = "mechanism"
+discloses = "the mechanism the client selected, carrying no secret"
+
+[[shape]]
+format = "AUTHENTICATE %s"
+class = "mechanism"
+discloses = "the mechanism the client selected, carrying no secret"
+
+# Surfaces the oracle already provides. The port reuses each unchanged. DL-0232.
+[[reused]]
+element = "structured logging"
+surface = "per-feature trace registry"
+path = "original/lib/curl_trc.h"
+line = 99
+evidence = "struct curl_trc_feat"
+decision = "DL-0232"
+
+[[reused]]
+element = "structured logging"
+surface = "named subsystem features"
+path = "original/lib/curl_trc.h"
+line = 109
+evidence = "Curl_trc_feat_ftp"
+decision = "DL-0232"
+
+[[reused]]
+element = "structured logging"
+surface = "per-feature verbosity predicate"
+path = "original/lib/curl_trc.h"
+line = 134
+evidence = "CURL_TRC_M_is_verbose"
+decision = "DL-0232"
+
+[[reused]]
+element = "structured logging"
+surface = "gated emission"
+path = "original/lib/curl_trc.c"
+line = 294
+evidence = "Curl_trc_ft_is_verbose"
+decision = "DL-0232"
+
+[[reused]]
+element = "log configuration"
+surface = "public trace configuration entry point"
+path = "original/include/curl/curl.h"
+line = 2794
+evidence = "curl_global_trace"
+decision = "DL-0232"
+
+[[reused]]
+element = "log configuration"
+surface = "trace configuration parser"
+path = "original/lib/curl_trc.c"
+line = 669
+evidence = "Curl_trc_opt"
+decision = "DL-0232"
+
+[[reused]]
+element = "correlation identifiers"
+surface = "transfer identifier read for every traced line"
+path = "original/src/tool_cb_dbg.c"
+line = 156
+evidence = "CURLINFO_XFER_ID"
+decision = "DL-0232"
+
+[[reused]]
+element = "correlation identifiers"
+surface = "connection identifier read for every traced line"
+path = "original/src/tool_cb_dbg.c"
+line = 157
+evidence = "CURLINFO_CONN_ID"
+decision = "DL-0232"
+
+[[reused]]
+element = "correlation identifiers"
+surface = "connection identifier as an output variable"
+path = "original/src/tool_writeout.c"
+line = 433
+evidence = "conn_id"
+decision = "DL-0232"
+
+[[reused]]
+element = "correlation identifiers"
+surface = "transfer identifier as an output variable"
+path = "original/src/tool_writeout.c"
+line = 517
+evidence = "xfer_id"
+decision = "DL-0232"
+
+[[reused]]
+element = "correlation identifiers"
+surface = "identifier prefix on the traced line"
+path = "original/src/tool_cb_dbg.c"
+line = 63
+evidence = "idsbuf"
+decision = "DL-0232"
+
+[[reused]]
+element = "log surface"
+surface = "identifier prefix flag"
+path = "original/src/tool_getparam.c"
+line = 353
+evidence = "trace-ids"
+decision = "DL-0232"
+
+[[reused]]
+element = "log surface"
+surface = "per-feature configuration flag"
+path = "original/src/tool_getparam.c"
+line = 352
+evidence = "trace-config"
+decision = "DL-0232"
+
+[[reused]]
+element = "log surface"
+surface = "verbose flag"
+path = "original/src/tool_getparam.c"
+line = 364
+evidence = "verbose"
+decision = "DL-0232"
+
+[[reused]]
+element = "log surface"
+surface = "byte-frozen trace formatter"
+path = "original/src/tool_cb_dbg.c"
+line = 128
+evidence = "tool_debug_cb"
+decision = "DL-0232"
+
+[[reused]]
+element = "log surface"
+surface = "diagnostic message path"
+path = "original/src/tool_msgs.c"
+line = 34
+evidence = "voutf"
+decision = "DL-0232"
+
+[[reused]]
+element = "progress reporting"
+surface = "transfer progress callback"
+path = "original/src/tool_progress.c"
+line = 67
+evidence = "xferinfo_cb"
+decision = "DL-0232"
+
+[[reused]]
+element = "progress reporting"
+surface = "progress meter"
+path = "original/src/tool_progress.c"
+line = 158
+evidence = "progress_meter"
+decision = "DL-0232"
+
+[[reused]]
+element = "library observability options"
+surface = "verbosity option"
+path = "original/include/curl/curl.h"
+line = 1291
+evidence = "CURLOPT_VERBOSE"
+decision = "DL-0232"
+
+[[reused]]
+element = "library observability options"
+surface = "application trace callback"
+path = "original/include/curl/curl.h"
+line = 1475
+evidence = "CURLOPT_DEBUGFUNCTION"
+decision = "DL-0232"
+
+[[reused]]
+element = "library observability options"
+surface = "application progress callback"
+path = "original/include/curl/curl.h"
+line = 1919
+evidence = "CURLOPT_XFERINFOFUNCTION"
+decision = "DL-0232"
+
+# What this project adds. Nothing here changes a byte of the reused surfaces.
+[[added]]
+element = "distributed tracing"
+detail = "spans whose targets are the reused feature names and whose fields are the reused correlation identifiers"
+at = "refactor/curl-core/src/trc.rs"
+inert-without-subscriber = true
+in-verification-tree = false
+decision = "DL-0232"
+
+[[added]]
+element = "metrics endpoint"
+detail = "Prometheus-format /metrics over the harness runners"
+at = "testing/observability"
+inert-without-subscriber = true
+in-verification-tree = true
+decision = "DL-0232"
+
+[[added]]
+element = "health and readiness checks"
+detail = "/healthz and /readyz over the harness runners"
+at = "testing/observability"
+inert-without-subscriber = true
+in-verification-tree = true
+decision = "DL-0232"
+
+[[added]]
+element = "dashboard template"
+detail = "the span and series set the local check asserts"
+at = "testing/observability/dashboards"
+inert-without-subscriber = true
+in-verification-tree = true
+decision = "DL-0232"
+
+[[added]]
+element = "local exercise"
+detail = "installs a subscriber, drives a real transfer, asserts the spans and series appear"
+at = "Makefile"
+inert-without-subscriber = true
+in-verification-tree = true
+decision = "DL-0232"
+
+# Every place the oracle writes a value to a diagnostic surface. DL-0116.
+# `shared` marks a sink reached through an exported wrapper rather than called
+# in place, whose call sites are discovered mechanically rather than listed.
+[[sink]]
+id = "SK-0001"
+path = "original/lib/pingpong.c"
+line = 183
+emitter = "Curl_debug"
+kind = "CURLINFO_HEADER_OUT"
+discloses = "every command line of the four line protocols, credentials included"
+shared = true
+reached-through = ["Curl_pp_sendf", "Curl_pp_vsendf", "imap_sendf"]
+verdict = "reproduce"
+decision = "DL-0116"
+
+[[sink]]
+id = "SK-0002"
+path = "original/lib/pingpong.c"
+line = 303
+emitter = "Curl_debug"
+kind = "CURLINFO_HEADER_IN"
+discloses = "every response line of the four line protocols, server challenges included"
+shared = false
+verdict = "reproduce"
+decision = "DL-0116"
+
+[[sink]]
+id = "SK-0003"
+path = "original/lib/request.c"
+line = 231
+emitter = "Curl_debug"
+kind = "CURLINFO_HEADER_OUT"
+discloses = "the whole request head, its authorization and cookie headers included"
+shared = false
+verdict = "reproduce"
+decision = "DL-0116"
+
+[[sink]]
+id = "SK-0004"
+path = "original/lib/http.c"
+line = 1623
+emitter = "Curl_debug"
+kind = "CURLINFO_HEADER_IN"
+discloses = "a response header line, a challenge or a set-cookie value included"
+shared = false
+verdict = "reproduce"
+decision = "DL-0116"
+
+[[sink]]
+id = "SK-0005"
+path = "original/lib/http.c"
+line = 4376
+emitter = "Curl_debug"
+kind = "CURLINFO_HEADER_IN"
+discloses = "a response header line on the second read path"
+shared = false
+verdict = "reproduce"
+decision = "DL-0116"
+
+[[sink]]
+id = "SK-0006"
+path = "original/lib/http2.c"
+line = 1730
+emitter = "Curl_debug"
+kind = "CURLINFO_HEADER_IN"
+discloses = "a decoded header field, so a cookie or a challenge in a header frame"
+shared = false
+verdict = "reproduce"
+decision = "DL-0116"
+
+[[sink]]
+id = "SK-0007"
+path = "original/lib/cf-h1-proxy.c"
+line = 293
+emitter = "Curl_debug"
+kind = "CURLINFO_HEADER_OUT"
+discloses = "the tunnel request, its proxy authorization header included"
+shared = false
+verdict = "reproduce"
+decision = "DL-0116"
+
+[[sink]]
+id = "SK-0008"
+path = "original/lib/cf-h1-proxy.c"
+line = 477
+emitter = "Curl_debug"
+kind = "CURLINFO_HEADER_IN"
+discloses = "the tunnel response, the proxy challenge included"
+shared = false
+verdict = "reproduce"
+decision = "DL-0116"
+
+[[sink]]
+id = "SK-0009"
+path = "original/lib/cookie.c"
+line = 1062
+emitter = "infof"
+kind = "informational"
+discloses = "a cookie name and its value, with the domain and the path"
+shared = false
+verdict = "reproduce"
+decision = "DL-0116"
+
+[[sink]]
+id = "SK-0010"
+path = "original/lib/url.c"
+line = 1491
+emitter = "CURL_TRC_M"
+kind = "trace"
+discloses = "the host a netrc credential was found for and the account name"
+shared = false
+verdict = "reproduce"
+decision = "DL-0116"
+
+[[sink]]
+id = "SK-0011"
+path = "original/lib/netrc.c"
+line = 584
+emitter = "CURL_TRC_M"
+kind = "trace"
+discloses = "the credentials file path, the host and the account name being matched"
+shared = false
+verdict = "reproduce"
+decision = "DL-0116"
+
+[[sink]]
+id = "SK-0012"
+path = "original/lib/mqtt.c"
+line = 147
+emitter = "Curl_debug"
+kind = "CURLINFO_HEADER_OUT"
+discloses = "a control packet, so the connect packet's account name and password"
+shared = false
+verdict = "reproduce"
+decision = "DL-0116"
+
+[[sink]]
+id = "SK-0013"
+path = "original/lib/dict.c"
+line = 119
+emitter = "Curl_debug"
+kind = "CURLINFO_DATA_OUT"
+discloses = "the command line sent to the server"
+shared = false
+verdict = "reproduce"
+decision = "DL-0116"
+
+[[sink]]
+id = "SK-0014"
+path = "original/lib/vssh/libssh.c"
+line = 1483
+emitter = "Curl_debug"
+kind = "CURLINFO_HEADER_OUT"
+discloses = "the synthetic command line of the SSH session"
+shared = false
+verdict = "reproduce"
+decision = "DL-0116"
+
+[[sink]]
+id = "SK-0015"
+path = "original/lib/vssh/libssh2.c"
+line = 788
+emitter = "Curl_debug"
+kind = "CURLINFO_HEADER_OUT"
+discloses = "the synthetic command line of the SSH session"
+shared = false
+verdict = "reproduce"
+decision = "DL-0116"
+
+[[sink]]
+id = "SK-0016"
+path = "original/lib/vtls/openssl.c"
+line = 2556
+emitter = "Curl_debug"
+kind = "CURLINFO_TEXT"
+discloses = "handshake detail the backend writes as text"
+shared = false
+verdict = "reproduce"
+decision = "DL-0116"
+
+# Frozen call-site counts of the shared sink's wrappers, per consumer. DL-0232.
+# A new call site anywhere in these files changes a count and fails the run.
+[[caller]]
+sink = "SK-0001"
+path = "original/lib/ftp.c"
+sites = 40
+decision = "DL-0232"
+
+[[caller]]
+sink = "SK-0001"
+path = "original/lib/pop3.c"
+sites = 12
+decision = "DL-0232"
+
+[[caller]]
+sink = "SK-0001"
+path = "original/lib/imap.c"
+sites = 22
+decision = "DL-0232"
+
+[[caller]]
+sink = "SK-0001"
+path = "original/lib/smtp.c"
+sites = 15
+decision = "DL-0232"
+
+# Every discovered call site whose shape is in the vocabulary above. DL-0116.
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/ftp.c"
+line = 744
+class = "credential"
+decision = "DL-0116"
+
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/ftp.c"
+line = 2940
+class = "credential"
+decision = "DL-0116"
+
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/ftp.c"
+line = 3146
+class = "mechanism"
+decision = "DL-0116"
+
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/ftp.c"
+line = 3215
+class = "mechanism"
+decision = "DL-0116"
+
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/pop3.c"
+line = 538
+class = "credential"
+decision = "DL-0116"
+
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/pop3.c"
+line = 592
+class = "credential"
+decision = "DL-0116"
+
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/pop3.c"
+line = 623
+class = "credential"
+decision = "DL-0116"
+
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/pop3.c"
+line = 627
+class = "mechanism"
+decision = "DL-0116"
+
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/pop3.c"
+line = 650
+class = "credential"
+decision = "DL-0116"
+
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/pop3.c"
+line = 1043
+class = "credential"
+decision = "DL-0116"
+
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/imap.c"
+line = 612
+class = "credential"
+decision = "DL-0116"
+
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/imap.c"
+line = 644
+class = "credential"
+decision = "DL-0116"
+
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/imap.c"
+line = 648
+class = "mechanism"
+decision = "DL-0116"
+
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/imap.c"
+line = 670
+class = "credential"
+decision = "DL-0116"
+
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/smtp.c"
+line = 739
+class = "credential"
+decision = "DL-0116"
+
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/smtp.c"
+line = 743
+class = "mechanism"
+decision = "DL-0116"
+
+[[disclosure]]
+sink = "SK-0001"
+path = "original/lib/smtp.c"
+line = 765
+class = "credential"
+decision = "DL-0116"

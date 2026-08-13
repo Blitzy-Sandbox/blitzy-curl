@@ -6,8 +6,21 @@
 //!
 //! The register carries no rationale. Each row points at the decision row that
 //! holds the reasoning, and a pointer that does not resolve is a failing check.
+//!
+//! Completeness is a gate rather than a claim, and it rests on two declarations
+//! and one mechanical pass. Every path a row names must be declared reviewed,
+//! and a reviewed path declares how many rows it carries, so a row that is
+//! dropped fails instead of shrinking the register in silence. Over every
+//! reviewed path the discovery pass then scans for the annotations upstream
+//! itself writes where it knows a behaviour is sharp - `FIXME`, `TODO`, `XXX`,
+//! `HACK`, `KLUDGE`, `WORKAROUND`, and the prose it uses for the same purpose -
+//! and requires each site to fall inside a hazard row's line range or to carry
+//! a written disposition. A disposition that names a line no longer carrying an
+//! annotation fails too, so the inventory cannot go stale in either direction.
+//!
+//! `DL-0110` records the register, `DL-0225` the discovery gate.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use curl_audit::fs::Files;
 use curl_audit::report::Report;
@@ -26,6 +39,133 @@ pub const STATUSES: [&str; 2] = ["obligation", "verified"];
 
 /// Owner value a `not-ported` hazard carries.
 pub const NO_OWNER: &str = "none";
+
+/// Annotation acronyms the discovery pass scans for.
+///
+/// These match whole words and match case, which is what keeps a URL query of
+/// `xxx`, a header value of `XXXX` and the word "hack" in ordinary prose from
+/// reading as an upstream annotation.
+pub const ANNOTATION_MARKERS: [&str; 6] = ["FIXME", "HACK", "KLUDGE", "TODO", "WORKAROUND", "XXX"];
+
+/// Annotation phrases the discovery pass scans for, ignoring case.
+///
+/// Upstream writes these where it knows a behaviour is sharp but has no acronym
+/// for it, so they carry as much of the inventory as the acronyms do.
+pub const ANNOTATION_PHRASES: [&str; 7] = [
+    "cannot happen",
+    "deliberate",
+    "for now",
+    "never happen",
+    "on purpose",
+    "should not happen",
+    "silently",
+];
+
+/// Dispositions an annotation site may carry when no hazard row covers it.
+pub const ANNOTATION_CLASSES: [&str; 4] = [
+    "behaviour-elsewhere",
+    "defensive-invariant",
+    "diagnosed-outcome",
+    "no-observable-outcome",
+];
+
+/// One oracle path whose hazard review is complete.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Reviewed {
+    /// Repository-relative path inside the oracle.
+    pub path: String,
+    /// Number of hazard rows the path carries.
+    pub hazards: usize,
+    /// Decision the review rests on.
+    pub decision: String,
+}
+
+/// One divergence-allowlist entry.
+///
+/// The locator, the behaviour and the owner of the divergence itself live in the
+/// hazard row this entry answers, so an entry carries only what the allowlist
+/// adds: the deterministic outcome the port holds instead, why that is accepted,
+/// and who is accountable for it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Divergence {
+    /// Entry identifier, unique across the allowlist.
+    pub id: String,
+    /// Hazard whose `diverge` verdict this entry answers.
+    pub hazard: String,
+    /// Deterministic outcome the port holds instead of the oracle's.
+    pub outcome: String,
+    /// Why the divergence is accepted.
+    pub rationale: String,
+    /// Planned member accountable for it.
+    pub owner: String,
+    /// Decision the divergence rests on.
+    pub decision: String,
+}
+
+/// One discovered annotation site that carries no hazard row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Annotation {
+    /// Oracle path the site is in.
+    pub path: String,
+    /// One-based line of the annotated statement or comment.
+    pub line: usize,
+    /// Why no hazard row covers it.
+    pub class: String,
+    /// Written disposition.
+    pub reason: String,
+    /// Decision the disposition rests on.
+    pub decision: String,
+}
+
+/// What the completeness gate observed, for the rendered register.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Coverage {
+    /// Oracle paths declared reviewed.
+    pub reviewed: usize,
+    /// Annotation sites discovered over those paths.
+    pub sites: usize,
+    /// Sites a hazard row's line range already covers.
+    pub covered: usize,
+    /// Dispositions, in path then line order.
+    pub dispositions: Vec<Annotation>,
+}
+
+/// Whether a line carries an upstream annotation.
+///
+/// An acronym matches only as a whole uppercase word; a phrase matches anywhere,
+/// ignoring case.
+#[must_use]
+pub fn is_annotated(line: &str) -> bool {
+    let lowered = line.to_lowercase();
+    if ANNOTATION_PHRASES
+        .iter()
+        .any(|phrase| lowered.contains(phrase))
+    {
+        return true;
+    }
+    ANNOTATION_MARKERS.iter().any(|marker| {
+        line.match_indices(marker).any(|(offset, _)| {
+            let before = line[..offset].chars().next_back();
+            let after = line[offset + marker.len()..].chars().next();
+            let boundary = |character: Option<char>| {
+                character.is_none_or(|value| !value.is_ascii_alphanumeric() && value != '_')
+            };
+            boundary(before) && boundary(after)
+        })
+    })
+}
+
+/// Every annotated line of `path`, one-based, in order.
+#[must_use]
+pub fn annotated_lines(files: &dyn Files, path: &str) -> Vec<usize> {
+    files.read(path).map_or_else(Vec::new, |body| {
+        body.lines()
+            .enumerate()
+            .filter(|(_, line)| is_annotated(line))
+            .map(|(index, _)| index + 1)
+            .collect()
+    })
+}
 
 /// One hazard as declared.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,6 +195,16 @@ pub struct Hazard {
 pub struct Register {
     /// Hazards in declaration order.
     pub hazards: Vec<Hazard>,
+    /// Oracle paths whose hazard review is complete.
+    pub reviewed: Vec<Reviewed>,
+    /// Dispositioned annotation sites.
+    pub annotations: Vec<Annotation>,
+    /// Divergence-allowlist entries.
+    pub divergences: Vec<Divergence>,
+    /// Annotation acronyms the register declares.
+    pub markers: Vec<String>,
+    /// Annotation phrases the register declares.
+    pub phrases: Vec<String>,
 }
 
 fn text<'a>(entry: &'a Value, key: &str, id: &str) -> AuditResult<&'a str> {
@@ -108,7 +258,100 @@ impl Register {
         if hazards.is_empty() {
             return Err(AuditError::new(format!("{path} declares no hazard")));
         }
-        Ok(Self { hazards })
+
+        let list = |key: &str| -> AuditResult<Vec<String>> {
+            value
+                .get(key)
+                .and_then(Value::as_array)
+                .ok_or_else(|| AuditError::new(format!("{path}: {key} missing")))?
+                .iter()
+                .map(|entry| {
+                    entry
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| AuditError::new(format!("{path}: {key} holds a non-string")))
+                })
+                .collect()
+        };
+        let markers = list("annotation-markers")?;
+        let phrases = list("annotation-phrases")?;
+
+        let mut reviewed = Vec::new();
+        for entry in value
+            .get("reviewed")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AuditError::new(format!("{path} declares no reviewed path")))?
+        {
+            let reviewed_path = entry
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AuditError::new(format!("{path}: a reviewed row has no path")))?;
+            let hazards = entry
+                .get("hazards")
+                .and_then(Value::as_integer)
+                .and_then(|count| usize::try_from(count).ok())
+                .ok_or_else(|| {
+                    AuditError::new(format!("{reviewed_path}: reviewed count missing"))
+                })?;
+            reviewed.push(Reviewed {
+                path: reviewed_path.to_owned(),
+                hazards,
+                decision: text(entry, "decision", reviewed_path)?.to_owned(),
+            });
+        }
+
+        let mut annotations = Vec::new();
+        for entry in value
+            .get("annotation")
+            .and_then(Value::as_array)
+            .map_or_else(Vec::new, |array| array.iter().collect())
+        {
+            let annotated = entry
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AuditError::new(format!("{path}: an annotation has no path")))?;
+            let line = entry
+                .get("line")
+                .and_then(Value::as_integer)
+                .and_then(|line| usize::try_from(line).ok())
+                .ok_or_else(|| AuditError::new(format!("{annotated}: annotation line missing")))?;
+            annotations.push(Annotation {
+                path: annotated.to_owned(),
+                line,
+                class: text(entry, "class", annotated)?.to_owned(),
+                reason: text(entry, "reason", annotated)?.to_owned(),
+                decision: text(entry, "decision", annotated)?.to_owned(),
+            });
+        }
+
+        let mut divergences = Vec::new();
+        for entry in value
+            .get("divergence")
+            .and_then(Value::as_array)
+            .map_or_else(Vec::new, |array| array.iter().collect())
+        {
+            let id = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AuditError::new(format!("{path}: a divergence has no id")))?;
+            divergences.push(Divergence {
+                id: id.to_owned(),
+                hazard: text(entry, "hazard", id)?.to_owned(),
+                outcome: text(entry, "outcome", id)?.to_owned(),
+                rationale: text(entry, "rationale", id)?.to_owned(),
+                owner: text(entry, "owner", id)?.to_owned(),
+                decision: text(entry, "decision", id)?.to_owned(),
+            });
+        }
+
+        Ok(Self {
+            hazards,
+            reviewed,
+            annotations,
+            divergences,
+            markers,
+            phrases,
+        })
     }
 
     /// Runs every register gate and returns the rows that passed them.
@@ -285,31 +528,359 @@ impl Register {
             },
         );
 
-        let unlisted: Vec<String> = self
+        self.allowlist(planned, decisions, report);
+
+        self.complete(files, decisions, report);
+        self.hazards.clone()
+    }
+
+    /// Runs the divergence-allowlist gates in both directions.
+    ///
+    /// A `diverge` verdict without an entry and an entry without a `diverge`
+    /// verdict are the same defect seen from two sides, and the earlier free-text
+    /// search for the word "allowlist" could see neither.
+    fn allowlist(
+        &self,
+        planned: &BTreeSet<String>,
+        decisions: &BTreeSet<String>,
+        report: &mut Report,
+    ) {
+        let diverging: BTreeMap<&str, &Hazard> = self
             .hazards
             .iter()
-            .filter(|hazard| {
-                hazard.verdict == "diverge" && !hazard.verification.contains("allowlist")
-            })
-            .map(|hazard| hazard.id.clone())
+            .filter(|hazard| hazard.verdict == "diverge")
+            .map(|hazard| (hazard.id.as_str(), hazard))
+            .collect();
+
+        let identifiers: BTreeSet<&str> = self
+            .divergences
+            .iter()
+            .map(|entry| entry.id.as_str())
             .collect();
         report.assert(
-            unlisted.is_empty(),
-            "hazard/divergences-name-the-allowlist",
+            identifiers.len() == self.divergences.len() && !self.divergences.is_empty(),
+            "divergence/identifiers-unique",
+            format!(
+                "{} entry/entries, {} distinct identifier(s)",
+                self.divergences.len(),
+                identifiers.len()
+            ),
+        );
+
+        let mut answered: BTreeMap<&str, usize> = BTreeMap::new();
+        for entry in &self.divergences {
+            *answered.entry(entry.hazard.as_str()).or_default() += 1;
+        }
+        let unlisted: Vec<&str> = diverging
+            .keys()
+            .filter(|id| answered.get(*id).copied().unwrap_or(0) != 1)
+            .copied()
+            .collect();
+        report.assert(
+            unlisted.is_empty() && !diverging.is_empty(),
+            "divergence/every-verdict-listed",
             if unlisted.is_empty() {
                 format!(
-                    "{} divergence(s), each naming its allowlist entry",
-                    self.hazards
-                        .iter()
-                        .filter(|hazard| hazard.verdict == "diverge")
-                        .count()
+                    "{} divergence(s), each carrying exactly one allowlist entry",
+                    diverging.len()
                 )
             } else {
-                format!("no allowlist entry named: {}", unlisted.join(", "))
+                format!("no single entry answers: {}", unlisted.join(", "))
             },
         );
 
-        self.hazards.clone()
+        let orphaned: Vec<String> = self
+            .divergences
+            .iter()
+            .filter(|entry| !diverging.contains_key(entry.hazard.as_str()))
+            .map(|entry| format!("{}: {}", entry.id, entry.hazard))
+            .collect();
+        report.assert(
+            orphaned.is_empty(),
+            "divergence/every-entry-answers-a-verdict",
+            if orphaned.is_empty() {
+                "every entry answers a hazard whose verdict is diverge".to_owned()
+            } else {
+                format!("answers no divergence: {}", orphaned.join(", "))
+            },
+        );
+
+        let mismatched: Vec<String> = self
+            .divergences
+            .iter()
+            .filter(|entry| {
+                diverging
+                    .get(entry.hazard.as_str())
+                    .is_some_and(|hazard| hazard.owner != entry.owner)
+            })
+            .map(|entry| format!("{}: {}", entry.id, entry.owner))
+            .collect();
+        report.assert(
+            mismatched.is_empty(),
+            "divergence/owners-agree",
+            if mismatched.is_empty() {
+                "every entry names the owner its hazard row names".to_owned()
+            } else {
+                format!("owner disagrees with the row: {}", mismatched.join(", "))
+            },
+        );
+
+        let unaccountable: Vec<String> = self
+            .divergences
+            .iter()
+            .filter(|entry| {
+                !planned.contains(&entry.owner)
+                    || entry.outcome.trim().is_empty()
+                    || entry.rationale.trim().is_empty()
+                    || !decisions.contains(&entry.decision)
+            })
+            .map(|entry| entry.id.clone())
+            .collect();
+        report.assert(
+            unaccountable.is_empty(),
+            "divergence/entries-accountable",
+            if unaccountable.is_empty() {
+                "every entry names an outcome, a rationale, a planned owner and a decision"
+                    .to_owned()
+            } else {
+                format!("incomplete: {}", unaccountable.join(", "))
+            },
+        );
+    }
+
+    /// What the discovery pass observed over the reviewed set.
+    ///
+    /// The rendered register carries these figures so a reader sees the
+    /// denominator the gate used rather than a claim of completeness.
+    #[must_use]
+    pub fn coverage(&self, files: &dyn Files) -> Coverage {
+        let mut ranges: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
+        for hazard in &self.hazards {
+            ranges
+                .entry(hazard.path.as_str())
+                .or_default()
+                .push(hazard.lines);
+        }
+        let mut sites = 0_usize;
+        let mut covered = 0_usize;
+        for entry in &self.reviewed {
+            let spans = ranges.get(entry.path.as_str());
+            for line in annotated_lines(files, &entry.path) {
+                sites += 1;
+                if spans.is_some_and(|spans| {
+                    spans
+                        .iter()
+                        .any(|(low, high)| *low <= line && line <= *high)
+                }) {
+                    covered += 1;
+                }
+            }
+        }
+        let mut dispositions = self.annotations.clone();
+        dispositions.sort_by(|left, right| (&left.path, left.line).cmp(&(&right.path, right.line)));
+        Coverage {
+            reviewed: self.reviewed.len(),
+            sites,
+            covered,
+            dispositions,
+        }
+    }
+
+    /// Runs the completeness gates: the reviewed set, the frozen per-path counts
+    /// and the annotation inventory.
+    ///
+    /// Kept apart from [`Register::resolve`] so the discovery pass reads as the
+    /// one gate it is rather than as another per-row check.
+    fn complete(&self, files: &dyn Files, decisions: &BTreeSet<String>, report: &mut Report) {
+        report.assert(
+            self.markers == ANNOTATION_MARKERS && self.phrases == ANNOTATION_PHRASES,
+            "hazard/annotation-vocabulary-declared",
+            format!(
+                "{} acronym(s) and {} phrase(s) declared and implemented",
+                self.markers.len(),
+                self.phrases.len()
+            ),
+        );
+
+        let reviewed: BTreeMap<&str, &Reviewed> = self
+            .reviewed
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect();
+        report.assert(
+            reviewed.len() == self.reviewed.len() && !reviewed.is_empty(),
+            "hazard/reviewed-paths-unique",
+            format!("{} reviewed path(s)", self.reviewed.len()),
+        );
+
+        let missing: Vec<&str> = self
+            .reviewed
+            .iter()
+            .filter(|entry| !files.exists(&entry.path))
+            .map(|entry| entry.path.as_str())
+            .collect();
+        report.assert(
+            missing.is_empty(),
+            "hazard/reviewed-paths-exist",
+            if missing.is_empty() {
+                "every reviewed path is in the oracle".to_owned()
+            } else {
+                format!("absent: {}", missing.join(", "))
+            },
+        );
+
+        let dangling: Vec<String> = self
+            .reviewed
+            .iter()
+            .filter(|entry| !decisions.contains(&entry.decision))
+            .map(|entry| format!("{}: {}", entry.path, entry.decision))
+            .collect();
+        report.assert(
+            dangling.is_empty(),
+            "hazard/reviewed-decisions-resolve",
+            if dangling.is_empty() {
+                "every reviewed path points at a decision row that exists".to_owned()
+            } else {
+                format!("dangling: {}", dangling.join(", "))
+            },
+        );
+
+        let mut observed: BTreeMap<&str, usize> = BTreeMap::new();
+        for hazard in &self.hazards {
+            *observed.entry(hazard.path.as_str()).or_default() += 1;
+        }
+        let unreviewed: Vec<&str> = observed
+            .keys()
+            .filter(|path| !reviewed.contains_key(*path))
+            .copied()
+            .collect();
+        report.assert(
+            unreviewed.is_empty(),
+            "hazard/paths-reviewed",
+            if unreviewed.is_empty() {
+                format!("every row names one of {} reviewed path(s)", reviewed.len())
+            } else {
+                format!("not declared reviewed: {}", unreviewed.join(", "))
+            },
+        );
+
+        let drifted: Vec<String> = self
+            .reviewed
+            .iter()
+            .filter(|entry| {
+                observed.get(entry.path.as_str()).copied().unwrap_or(0) != entry.hazards
+            })
+            .map(|entry| {
+                format!(
+                    "{}: {} declared, {} present",
+                    entry.path,
+                    entry.hazards,
+                    observed.get(entry.path.as_str()).copied().unwrap_or(0)
+                )
+            })
+            .collect();
+        report.assert(
+            drifted.is_empty(),
+            "hazard/reviewed-counts-frozen",
+            if drifted.is_empty() {
+                format!("{} row(s) across the reviewed set", self.hazards.len())
+            } else {
+                format!("count drift: {}", drifted.join("; "))
+            },
+        );
+
+        let mut ranges: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
+        for hazard in &self.hazards {
+            ranges
+                .entry(hazard.path.as_str())
+                .or_default()
+                .push(hazard.lines);
+        }
+        let mut dispositioned: BTreeSet<(&str, usize)> = BTreeSet::new();
+        for annotation in &self.annotations {
+            dispositioned.insert((annotation.path.as_str(), annotation.line));
+        }
+
+        let mut sites = 0_usize;
+        let mut uncovered = Vec::new();
+        for entry in &self.reviewed {
+            let covered = ranges.get(entry.path.as_str());
+            for line in annotated_lines(files, &entry.path) {
+                sites += 1;
+                let inside = covered.is_some_and(|spans| {
+                    spans
+                        .iter()
+                        .any(|(low, high)| *low <= line && line <= *high)
+                });
+                if !inside && !dispositioned.contains(&(entry.path.as_str(), line)) {
+                    uncovered.push(format!("{}:{line}", entry.path));
+                }
+            }
+        }
+        report.assert(
+            uncovered.is_empty() && sites > 0,
+            "hazard/annotations-accounted",
+            if uncovered.is_empty() {
+                format!(
+                    "{sites} annotation site(s) over {} reviewed path(s), {} dispositioned",
+                    self.reviewed.len(),
+                    self.annotations.len()
+                )
+            } else {
+                format!(
+                    "{} site(s) with neither a row nor a disposition: {}",
+                    uncovered.len(),
+                    uncovered.join(", ")
+                )
+            },
+        );
+
+        let stale: Vec<String> = self
+            .annotations
+            .iter()
+            .filter(|annotation| {
+                !reviewed.contains_key(annotation.path.as_str())
+                    || !annotated_lines(files, &annotation.path).contains(&annotation.line)
+                    || ranges.get(annotation.path.as_str()).is_some_and(|spans| {
+                        spans
+                            .iter()
+                            .any(|(low, high)| *low <= annotation.line && annotation.line <= *high)
+                    })
+            })
+            .map(|annotation| format!("{}:{}", annotation.path, annotation.line))
+            .collect();
+        report.assert(
+            stale.is_empty(),
+            "hazard/dispositions-resolve",
+            if stale.is_empty() {
+                format!("{} disposition(s) name a live site", self.annotations.len())
+            } else {
+                format!("stale or redundant: {}", stale.join(", "))
+            },
+        );
+
+        let malformed: Vec<String> = self
+            .annotations
+            .iter()
+            .filter(|annotation| {
+                !ANNOTATION_CLASSES.contains(&annotation.class.as_str())
+                    || annotation.reason.trim().is_empty()
+                    || !decisions.contains(&annotation.decision)
+            })
+            .map(|annotation| format!("{}:{}", annotation.path, annotation.line))
+            .collect();
+        report.assert(
+            malformed.is_empty(),
+            "hazard/dispositions-well-formed",
+            if malformed.is_empty() {
+                format!(
+                    "every disposition carries one of {} class(es), a reason and a decision",
+                    ANNOTATION_CLASSES.len()
+                )
+            } else {
+                format!("malformed: {}", malformed.join(", "))
+            },
+        );
     }
 }
 
@@ -320,10 +891,20 @@ mod tests {
     use curl_audit::fs::MapFiles;
     use curl_audit::report::Report;
 
-    use super::Register;
+    use super::{Register, annotated_lines, is_annotated};
 
     const GOOD: &str = r#"
 schema = 1
+annotation-markers = ["FIXME", "HACK", "KLUDGE", "TODO", "WORKAROUND", "XXX"]
+annotation-phrases = [
+  "cannot happen",
+  "deliberate",
+  "for now",
+  "never happen",
+  "on purpose",
+  "should not happen",
+  "silently",
+]
 [[hazard]]
 id = "HZ-0001"
 path = "original/lib/file.c"
@@ -354,12 +935,37 @@ owner = "none"
 verification = "Platform matrix excludes OpenVMS."
 status = "obligation"
 decision = "DL-0052"
+
+[[reviewed]]
+path = "original/lib/file.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/setup-vms.h"
+hazards = 1
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/file.c"
+line = 4
+class = "defensive-invariant"
+reason = "Guards a state the caller excludes."
+decision = "DL-0225"
+
+[[divergence]]
+id = "DV-0001"
+hazard = "HZ-0002"
+outcome = "The guard answers not-a-directory rather than reading the buffer."
+rationale = "Safe Rust cannot read an indeterminate value."
+owner = "curl-proto-file"
+decision = "DL-0113"
 "#;
 
     fn tree() -> MapFiles {
         MapFiles::new()
             .with("data/hazards.toml", GOOD)
-            .with("original/lib/file.c", "a\nb\nc\n")
+            .with("original/lib/file.c", "a\nb\nc\n/* should not happen */\n")
             .with("original/lib/setup-vms.h", "a\n")
     }
 
@@ -368,7 +974,7 @@ decision = "DL-0052"
     }
 
     fn decisions() -> BTreeSet<String> {
-        ["DL-0052", "DL-0113"]
+        ["DL-0052", "DL-0113", "DL-0225"]
             .into_iter()
             .map(str::to_owned)
             .collect()
@@ -391,7 +997,11 @@ decision = "DL-0052"
         assert_eq!(rows.len(), 3);
         assert!(report.passed(), "{rendered}");
         assert!(rendered.contains("PASS hazard/locators-resolve"));
-        assert!(rendered.contains("PASS hazard/divergences-name-the-allowlist"));
+        assert!(rendered.contains("PASS divergence/every-verdict-listed"));
+        assert!(rendered.contains("PASS divergence/every-entry-answers-a-verdict"));
+        assert!(rendered.contains("PASS divergence/owners-agree"));
+        assert!(rendered.contains("PASS divergence/entries-accountable"));
+        assert!(rendered.contains("PASS divergence/identifiers-unique"));
     }
 
     #[test]
@@ -420,19 +1030,124 @@ decision = "DL-0052"
 
     #[test]
     fn a_divergence_with_no_allowlist_entry_fails() {
-        let text = GOOD.replace(
-            "verification = \"Fault-injected failure plus the divergence-allowlist entry.\"",
-            "verification = \"Fault-injected failure.\"",
+        let text = GOOD
+            .replace("id = \"DV-0001\"", "id = \"DV-0009\"")
+            .replace("hazard = \"HZ-0002\"", "hazard = \"HZ-0001\"");
+        let files = tree().with("data/hazards.toml", &text);
+        let register = Register::load(&files, "data/hazards.toml").expect("loads");
+        let mut report = Report::new("test");
+        let _ = register.resolve(&files, &planned(), &decisions(), &mut report);
+        let rendered = report.render();
+        assert!(
+            rendered.contains("FAIL divergence/every-verdict-listed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("FAIL divergence/every-entry-answers-a-verdict"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_row_that_merely_says_allowlist_no_longer_satisfies_the_gate() {
+        let text = GOOD
+            .replace(
+                "[[divergence]]\nid = \"DV-0001\"\nhazard = \"HZ-0002\"\noutcome = \"The guard answers not-a-directory rather than reading the buffer.\"\nrationale = \"Safe Rust cannot read an indeterminate value.\"\nowner = \"curl-proto-file\"\ndecision = \"DL-0113\"\n",
+                "",
+            );
+        let files = tree().with("data/hazards.toml", &text);
+        let register = Register::load(&files, "data/hazards.toml").expect("loads");
+        let mut report = Report::new("test");
+        let _ = register.resolve(&files, &planned(), &decisions(), &mut report);
+        let rendered = report.render();
+        assert!(
+            rendered.contains("FAIL divergence/every-verdict-listed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("FAIL divergence/identifiers-unique"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_duplicated_entry_identifier_fails() {
+        let text = format!(
+            "{GOOD}\n[[divergence]]\nid = \"DV-0001\"\nhazard = \"HZ-0002\"\noutcome = \"A second answer.\"\nrationale = \"Duplicated on purpose.\"\nowner = \"curl-proto-file\"\ndecision = \"DL-0113\"\n"
         );
         let files = tree().with("data/hazards.toml", &text);
+        let register = Register::load(&files, "data/hazards.toml").expect("loads");
+        let mut report = Report::new("test");
+        let _ = register.resolve(&files, &planned(), &decisions(), &mut report);
+        let rendered = report.render();
+        assert!(
+            rendered.contains("FAIL divergence/identifiers-unique"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("FAIL divergence/every-verdict-listed"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_entry_disagreeing_with_its_row_about_the_owner_fails() {
+        let text = GOOD.replace(
+            "rationale = \"Safe Rust cannot read an indeterminate value.\"\nowner = \"curl-proto-file\"\ndecision = \"DL-0113\"",
+            "rationale = \"Safe Rust cannot read an indeterminate value.\"\nowner = \"curl-dns\"\ndecision = \"DL-0113\"",
+        );
+        let files = tree().with("data/hazards.toml", &text);
+        let register = Register::load(&files, "data/hazards.toml").expect("loads");
+        let mut report = Report::new("test");
+        let _ = register.resolve(&files, &planned(), &decisions(), &mut report);
+        let rendered = report.render();
+        assert!(
+            rendered.contains("FAIL divergence/owners-agree"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_entry_with_no_rationale_or_a_dangling_decision_fails() {
+        let blank = GOOD.replace(
+            "rationale = \"Safe Rust cannot read an indeterminate value.\"",
+            "rationale = \"   \"",
+        );
+        let files = tree().with("data/hazards.toml", &blank);
         let register = Register::load(&files, "data/hazards.toml").expect("loads");
         let mut report = Report::new("test");
         let _ = register.resolve(&files, &planned(), &decisions(), &mut report);
         assert!(
             report
                 .render()
-                .contains("FAIL hazard/divergences-name-the-allowlist")
+                .contains("FAIL divergence/entries-accountable"),
+            "a blank rationale must fail"
         );
+
+        let dangling = GOOD.replace(
+            "rationale = \"Safe Rust cannot read an indeterminate value.\"\nowner = \"curl-proto-file\"\ndecision = \"DL-0113\"",
+            "rationale = \"Safe Rust cannot read an indeterminate value.\"\nowner = \"curl-proto-file\"\ndecision = \"DL-9999\"",
+        );
+        let files = tree().with("data/hazards.toml", &dangling);
+        let register = Register::load(&files, "data/hazards.toml").expect("loads");
+        let mut report = Report::new("test");
+        let _ = register.resolve(&files, &planned(), &decisions(), &mut report);
+        assert!(
+            report
+                .render()
+                .contains("FAIL divergence/entries-accountable"),
+            "a dangling decision must fail"
+        );
+    }
+
+    #[test]
+    fn an_entry_missing_a_field_is_a_load_error() {
+        let text = GOOD.replace(
+            "outcome = \"The guard answers not-a-directory rather than reading the buffer.\"\n",
+            "",
+        );
+        let files = tree().with("data/hazards.toml", &text);
+        assert!(Register::load(&files, "data/hazards.toml").is_err());
     }
 
     #[test]
@@ -452,6 +1167,130 @@ decision = "DL-0052"
         );
         assert!(rendered.contains("FAIL hazard/decisions-resolve"));
         assert!(rendered.contains("FAIL hazard/no-unproven-pass"));
+    }
+
+    #[test]
+    fn the_annotation_inventory_accounts_for_every_discovered_site() {
+        let files = tree();
+        let register = Register::load(&files, "data/hazards.toml").expect("loads");
+        let mut report = Report::new("test");
+        let _ = register.resolve(&files, &planned(), &decisions(), &mut report);
+        let rendered = report.render();
+        assert!(report.passed(), "{rendered}");
+        assert!(rendered.contains("PASS hazard/annotation-vocabulary-declared"));
+        assert!(rendered.contains("PASS hazard/reviewed-counts-frozen"));
+        assert!(
+            rendered.contains("PASS hazard/annotations-accounted"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_undispositioned_annotation_site_fails() {
+        let files = tree().with("original/lib/setup-vms.h", "a\n/* HACK for the linker */\n");
+        let register = Register::load(&files, "data/hazards.toml").expect("loads");
+        let mut report = Report::new("test");
+        let _ = register.resolve(&files, &planned(), &decisions(), &mut report);
+        let rendered = report.render();
+        assert!(
+            rendered.contains("FAIL hazard/annotations-accounted"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("original/lib/setup-vms.h:2"));
+    }
+
+    #[test]
+    fn a_hazard_on_an_undeclared_path_fails() {
+        let text = GOOD.replace(
+            "[[reviewed]]\npath = \"original/lib/setup-vms.h\"\nhazards = 1\ndecision = \"DL-0225\"\n",
+            "",
+        );
+        let files = tree().with("data/hazards.toml", &text);
+        let register = Register::load(&files, "data/hazards.toml").expect("loads");
+        let mut report = Report::new("test");
+        let _ = register.resolve(&files, &planned(), &decisions(), &mut report);
+        let rendered = report.render();
+        assert!(
+            rendered.contains("FAIL hazard/paths-reviewed"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_dropped_row_fails_the_frozen_count() {
+        let text = GOOD.replace("hazards = 2", "hazards = 3");
+        let files = tree().with("data/hazards.toml", &text);
+        let register = Register::load(&files, "data/hazards.toml").expect("loads");
+        let mut report = Report::new("test");
+        let _ = register.resolve(&files, &planned(), &decisions(), &mut report);
+        let rendered = report.render();
+        assert!(
+            rendered.contains("FAIL hazard/reviewed-counts-frozen"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("3 declared, 2 present"));
+    }
+
+    #[test]
+    fn a_stale_or_malformed_disposition_fails() {
+        let stale = GOOD.replace("line = 4", "line = 2");
+        let files = tree().with("data/hazards.toml", &stale);
+        let register = Register::load(&files, "data/hazards.toml").expect("loads");
+        let mut report = Report::new("test");
+        let _ = register.resolve(&files, &planned(), &decisions(), &mut report);
+        assert!(report.render().contains("FAIL hazard/dispositions-resolve"));
+
+        let malformed = GOOD
+            .replace("class = \"defensive-invariant\"", "class = \"looks-fine\"")
+            .replace(
+                "reason = \"Guards a state the caller excludes.\"",
+                "reason = \" \"",
+            );
+        let files = tree().with("data/hazards.toml", &malformed);
+        let register = Register::load(&files, "data/hazards.toml").expect("loads");
+        let mut report = Report::new("test");
+        let _ = register.resolve(&files, &planned(), &decisions(), &mut report);
+        assert!(
+            report
+                .render()
+                .contains("FAIL hazard/dispositions-well-formed")
+        );
+    }
+
+    #[test]
+    fn a_declared_vocabulary_that_is_not_the_implemented_one_fails() {
+        let text = GOOD.replace("\"WORKAROUND\", ", "");
+        let files = tree().with("data/hazards.toml", &text);
+        let register = Register::load(&files, "data/hazards.toml").expect("loads");
+        let mut report = Report::new("test");
+        let _ = register.resolve(&files, &planned(), &decisions(), &mut report);
+        assert!(
+            report
+                .render()
+                .contains("FAIL hazard/annotation-vocabulary-declared")
+        );
+    }
+
+    #[test]
+    fn annotation_matching_reads_words_and_phrases() {
+        assert!(is_annotated("  /* FIXME: later */"));
+        assert!(is_annotated("if(x) /* should NOT Happen */"));
+        assert!(is_annotated("/* silently ignore the rest */"));
+        assert!(!is_annotated("url = \"/hoge?fuga=xxx\""));
+        assert!(!is_annotated("Authorization: XXXX header"));
+        assert!(!is_annotated("/* workaround icc 9.1 */"));
+        assert!(!is_annotated("plain code;"));
+        assert!(annotated_lines(&MapFiles::new(), "missing").is_empty());
+    }
+
+    #[test]
+    fn a_register_with_no_reviewed_path_is_an_error() {
+        let text = GOOD.replace("[[reviewed]]", "[[unused]]");
+        let files = tree().with("data/hazards.toml", &text);
+        assert!(Register::load(&files, "data/hazards.toml").is_err());
+        let text = GOOD.replace("annotation-markers", "markers");
+        let files = tree().with("data/hazards.toml", &text);
+        assert!(Register::load(&files, "data/hazards.toml").is_err());
     }
 
     #[test]

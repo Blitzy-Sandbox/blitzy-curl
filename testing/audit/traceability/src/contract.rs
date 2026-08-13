@@ -18,6 +18,7 @@ use toml::Value;
 pub struct Index {
     ownership: String,
     hazards: String,
+    observability: String,
     decision_log: String,
     outputs: BTreeMap<String, String>,
 }
@@ -51,6 +52,7 @@ impl Index {
         Ok(Self {
             ownership: text("ownership-data")?,
             hazards: text("hazard-data")?,
+            observability: text("observability-data")?,
             decision_log: text("decision-log")?,
             outputs: rendered,
         })
@@ -66,6 +68,12 @@ impl Index {
     #[must_use]
     pub fn hazard_data(&self) -> &str {
         &self.hazards
+    }
+
+    /// Path of the observability contract.
+    #[must_use]
+    pub fn observability_data(&self) -> &str {
+        &self.observability
     }
 
     /// Path of the decision log every pointer resolves in.
@@ -126,6 +134,35 @@ pub struct Orphan {
     pub decision: String,
 }
 
+/// A definition upstream's own single-use whitelist names.
+///
+/// The inverse of an orphan declaration: the symbol is defined, and whether
+/// anything can reach it is a measured property rather than a declared one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrphanDefinition {
+    /// Whitelisted name.
+    pub symbol: String,
+    /// How the oracle reaches it, as declared.
+    pub reach: String,
+    /// What the port does about it.
+    pub disposition: String,
+    /// Decision that classifies it.
+    pub decision: String,
+}
+
+/// A command-line option no dispatch arm names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SilentOption {
+    /// Identifier the alias table maps the option to.
+    pub identifier: String,
+    /// What the tool does with the argument instead.
+    pub outcome: String,
+    /// What the port does about it.
+    pub disposition: String,
+    /// Decision that classifies it.
+    pub decision: String,
+}
+
 /// A symbol-register family and the crate that must define it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Family {
@@ -165,6 +202,10 @@ pub struct Ownership {
     pub exclusions: Vec<Exclusion>,
     /// Declarations with no definition and no caller.
     pub orphans: Vec<Orphan>,
+    /// Definitions upstream's own single-use whitelist names.
+    pub orphan_definitions: Vec<OrphanDefinition>,
+    /// Options no dispatch arm names.
+    pub silent_options: Vec<SilentOption>,
     /// Owner of each internal-surface case that includes no internal header.
     pub cases: BTreeMap<String, String>,
     /// Symbol-register families.
@@ -248,6 +289,26 @@ impl Ownership {
             });
         }
 
+        let mut orphan_definitions = Vec::new();
+        for entry in array(value.get("orphan-definition"), "orphan-definition")? {
+            orphan_definitions.push(OrphanDefinition {
+                symbol: field(entry, "symbol", "orphan-definition")?.to_owned(),
+                reach: field(entry, "reach", "orphan-definition")?.to_owned(),
+                disposition: field(entry, "disposition", "orphan-definition")?.to_owned(),
+                decision: field(entry, "decision", "orphan-definition")?.to_owned(),
+            });
+        }
+
+        let mut silent_options = Vec::new();
+        for entry in array(value.get("silent-option"), "silent-option")? {
+            silent_options.push(SilentOption {
+                identifier: field(entry, "identifier", "silent-option")?.to_owned(),
+                outcome: field(entry, "outcome", "silent-option")?.to_owned(),
+                disposition: field(entry, "disposition", "silent-option")?.to_owned(),
+                decision: field(entry, "decision", "silent-option")?.to_owned(),
+            });
+        }
+
         let mut orphans = Vec::new();
         for entry in array(value.get("orphan"), "orphan")? {
             let line = entry
@@ -311,6 +372,8 @@ impl Ownership {
             headers: string_map(value.get("header"), "header")?,
             exclusions,
             orphans,
+            orphan_definitions,
+            silent_options,
             cases: string_map(value.get("case"), "case")?,
             families,
             targets: string_map(value.get("target"), "target")?,

@@ -7,6 +7,28 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+/// The two modes a tracked file carries.
+///
+/// Git records one permission bit and no more, so a mode is the executable one
+/// or the plain one. A recorded mode is part of the frozen baseline state, which
+/// is why it is a value the digest covers rather than a detail left to the
+/// filesystem.
+pub const EXECUTABLE_MODE: &str = "100755";
+
+/// Mode of a tracked file that carries no executable bit.
+pub const PLAIN_MODE: &str = "100644";
+
+/// One regular file of a tree, with the state a content digest covers.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Entry {
+    /// Repository-relative path, separated by forward slashes.
+    pub path: String,
+    /// Recorded mode: [`EXECUTABLE_MODE`] or [`PLAIN_MODE`].
+    pub mode: &'static str,
+    /// Raw bytes of the file.
+    pub bytes: Vec<u8>,
+}
+
 /// Read-only view of repository-relative paths.
 ///
 /// Every path an audit names is relative to the repository root, so an audit
@@ -24,6 +46,14 @@ pub trait Files {
     /// Names of the entries directly inside the repository-relative directory
     /// `path`, sorted. An absent or unreadable directory lists as empty.
     fn list(&self, path: &str) -> Vec<String>;
+
+    /// Every regular file under `root`, recursively, in path order.
+    ///
+    /// A symlink is not a regular file and is not returned, so a view that
+    /// carries one reports a count the digest cannot account for. An absent
+    /// root walks as empty, which the caller reports as a failing check rather
+    /// than as an empty tree.
+    fn walk(&self, root: &str) -> Vec<Entry>;
 }
 
 /// [`Files`] over a real repository checkout.
@@ -81,12 +111,65 @@ impl Files for RealFiles {
         names.sort();
         names
     }
+
+    fn walk(&self, root: &str) -> Vec<Entry> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_owned()];
+        while let Some(current) = pending.pop() {
+            for name in self.list(&current) {
+                let path = if current.is_empty() {
+                    name
+                } else {
+                    format!("{current}/{name}")
+                };
+                let absolute = self.absolute(&path);
+                let Ok(metadata) = std::fs::symlink_metadata(&absolute) else {
+                    continue;
+                };
+                if metadata.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if !metadata.is_file() {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&absolute) else {
+                    continue;
+                };
+                found.push(Entry {
+                    path,
+                    mode: mode_of(&metadata),
+                    bytes,
+                });
+            }
+        }
+        found.sort();
+        found
+    }
+}
+
+/// The recorded mode of a file's metadata.
+#[cfg(unix)]
+fn mode_of(metadata: &std::fs::Metadata) -> &'static str {
+    use std::os::unix::fs::PermissionsExt as _;
+    if metadata.permissions().mode() & 0o111 == 0 {
+        PLAIN_MODE
+    } else {
+        EXECUTABLE_MODE
+    }
+}
+
+/// The recorded mode of a file's metadata.
+#[cfg(not(unix))]
+fn mode_of(_metadata: &std::fs::Metadata) -> &'static str {
+    PLAIN_MODE
 }
 
 /// [`Files`] over an in-memory map, for tests.
 #[derive(Clone, Debug, Default)]
 pub struct MapFiles {
     entries: BTreeMap<String, String>,
+    executable: BTreeSet<String>,
 }
 
 impl MapFiles {
@@ -101,6 +184,13 @@ impl MapFiles {
     pub fn with(mut self, path: &str, contents: &str) -> Self {
         self.entries.insert(path.to_owned(), contents.to_owned());
         self
+    }
+
+    /// Adds a file whose recorded mode carries the executable bit.
+    #[must_use]
+    pub fn with_executable(mut self, path: &str, contents: &str) -> Self {
+        self.executable.insert(path.to_owned());
+        self.with(path, contents)
     }
 }
 
@@ -135,6 +225,30 @@ impl Files for MapFiles {
             }
         }
         names.into_iter().collect()
+    }
+
+    fn walk(&self, root: &str) -> Vec<Entry> {
+        let prefix = if root.is_empty() {
+            String::new()
+        } else {
+            format!("{root}/")
+        };
+        let mut found: Vec<Entry> = self
+            .entries
+            .iter()
+            .filter(|(path, _)| path.starts_with(prefix.as_str()))
+            .map(|(path, contents)| Entry {
+                path: path.clone(),
+                mode: if self.executable.contains(path) {
+                    EXECUTABLE_MODE
+                } else {
+                    PLAIN_MODE
+                },
+                bytes: contents.as_bytes().to_vec(),
+            })
+            .collect();
+        found.sort();
+        found
     }
 }
 

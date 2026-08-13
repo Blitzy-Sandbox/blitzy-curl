@@ -6,6 +6,19 @@
 
 schema = 1
 
+# Annotation markers the discovery pass scans for.                     DL-0225
+# Acronyms match whole words and case; phrases ignore case.            DL-0225
+annotation-markers = ["FIXME", "HACK", "KLUDGE", "TODO", "WORKAROUND", "XXX"]
+annotation-phrases = [
+  "cannot happen",
+  "deliberate",
+  "for now",
+  "never happen",
+  "on purpose",
+  "should not happen",
+  "silently",
+]
+
 [[hazard]]
 id = "HZ-0001"
 path = "original/lib/setup-vms.h"
@@ -625,11 +638,11 @@ decision = "DL-0120"
 [[hazard]]
 id = "HZ-0057"
 path = "original/lib/ftp.c"
-lines = [3850, 3870]
-behaviour = "Trace output carries credentials."
+lines = [2934, 2945]
+behaviour = "The password is written to the trace surface in the clear: the login continuation hands it to the shared command writer, which prints the whole command line under the header-out surface before it reaches the socket."
 verdict = "reproduce"
 owner = "curl-proto-ftp"
-verification = "Byte comparison of the trace stream, plus the observability check that no added field carries a credential."
+verification = "Differential trace comparison over a login with a password, asserting both trees print the same line; the disclosure itself is registered in the sink inventory of refactor/docs/OBSERVABILITY.md."
 status = "obligation"
 decision = "DL-0116"
 
@@ -702,11 +715,11 @@ decision = "DL-0131"
 [[hazard]]
 id = "HZ-0064"
 path = "original/lib/http.c"
-lines = [4265, 4313]
-behaviour = "Trace output carries credentials and challenge values."
+lines = [1615, 1626]
+behaviour = "Every response header line is written to the trace surface before the writer sees it, so an authentication challenge and a cookie-setting value are both printed verbatim."
 verdict = "reproduce"
 owner = "curl-http1"
-verification = "Byte comparison of the trace stream, plus the no-new-sink observability check."
+verification = "Differential trace comparison over a response carrying a challenge and a cookie-setting header, asserting both trees print the same bytes; the disclosure is registered in the sink inventory of refactor/docs/OBSERVABILITY.md."
 status = "obligation"
 decision = "DL-0116"
 
@@ -790,11 +803,11 @@ decision = "DL-0113"
 [[hazard]]
 id = "HZ-0072"
 path = "original/lib/http2.c"
-lines = [2429, 2452]
-behaviour = "Trace output carries header values."
+lines = [1722, 1736]
+behaviour = "A decoded trailer field is reassembled into a header line and written to the trace surface, so a value carried in a trailer rather than a header block is printed the same way."
 verdict = "reproduce"
 owner = "curl-http2"
-verification = "Byte comparison of the trace stream, plus the no-new-sink observability check."
+verification = "Differential trace comparison over a response whose trailer carries a value, asserting both trees print the same reassembled line; the disclosure is registered in the sink inventory of refactor/docs/OBSERVABILITY.md."
 status = "obligation"
 decision = "DL-0116"
 
@@ -1187,10 +1200,10 @@ decision = "DL-0151"
 id = "HZ-0108"
 path = "original/lib/mqtt.c"
 lines = [435, 451]
-behaviour = "The topic is URL-decoded with the do-nothing reject setting and bounded only by length, so a percent-encoded zero byte or control byte reaches the wire verbatim while the topic is also handed to a C string length call."
+behaviour = "The topic is URL-decoded with the do-nothing reject setting and bounded only by length, so a percent-encoded zero byte or control byte reaches the wire verbatim; the emptiness test that guards the decode measures the still-encoded URL path with a C string length call, so a path of only a percent-encoded zero byte passes it and yields a one-byte topic."
 verdict = "reproduce"
 owner = "curl-proto-mqtt"
-verification = "Subscribe and publish byte comparison over topics carrying a percent-encoded zero byte, control bytes and non-ASCII bytes, plus the over-long topic boundary."
+verification = "Subscribe and publish byte comparison over topics carrying a percent-encoded zero byte, control bytes and non-ASCII bytes, plus the over-long topic boundary and a path that is a single percent-encoded zero byte."
 status = "obligation"
 decision = "DL-0150"
 
@@ -1443,9 +1456,9 @@ lines = [251, 296]
 behaviour = "An unset minimum TLS version becomes 1.2 unless the requested maximum is lower, in which case the minimum is lowered to that maximum, and any version value above the highest known one falls through to 1.3 rather than being rejected."
 verdict = "reproduce"
 owner = "curl-cli"
-verification = "Differential comparison of the emitted TLS version option across every minimum and maximum version combination the tool accepts, including values above the highest known one."
+verification = "Differential comparison of the emitted TLS version option across all twenty-five minimum and maximum combinations the tool accepts, plus a direct equivalence test over the ported helper for the out-of-range arms no CLI input can reach."
 status = "obligation"
-decision = "DL-0162"
+decision = "DL-0223"
 
 [[hazard]]
 id = "HZ-0132"
@@ -1462,10 +1475,10 @@ decision = "DL-0164"
 id = "HZ-0133"
 path = "original/lib/md5.c"
 lines = [26, 27]
-behaviour = "MD5 is compiled in and reachable whenever Digest authentication or the built-in NTLM core is, gated on nothing else, so a transfer puts MD5-derived authentication material on the wire by default with no strength check, no opt-out and no warning."
+behaviour = "MD5 is compiled in whenever Digest authentication or the built-in NTLM core is, gated on nothing about strength, so once Digest, CRAM-MD5 or built-in NTLM is selected or negotiated the transfer puts MD5-derived authentication material on the wire with no strength check, no opt-out and no warning. HTTP and proxy authentication default to Basic, so a default transfer reaches none of those three."
 verdict = "reproduce"
 owner = "curl-auth"
-verification = "The upstream MD5 unit case with the Digest and CRAM-MD5 protocol cases against both trees, plus known-answer vectors over the one-shot and staged interfaces asserting one digest across every feature configuration."
+verification = "The upstream MD5 unit case with the Digest and CRAM-MD5 protocol cases against both trees, plus known-answer vectors over the one-shot and staged interfaces asserting one digest across every feature configuration, and a differential capture of a default transfer asserting neither tree emits MD5-derived material."
 status = "obligation"
 decision = "DL-0165"
 
@@ -2705,10 +2718,10 @@ decision = "DL-0215"
 id = "HZ-0246"
 path = "original/src/tool_parsecfg.c"
 lines = [287, 295]
-behaviour = "A dashed option cannot carry a double-quoted value: the option-token scan swallows the opening quote into the option name, the text after the space becomes a parameter the option parser never consumes, and the run is abandoned for an unused parameter."
+behaviour = "A dashed option cannot carry a double-quoted value joined to its own token: the option-token scan runs to the first blank, so an equals sign or a quote joined to the option folds into the option name and the run ends with an unknown-option error. The spaced form of the same value is unaffected and is parsed as a quoted parameter."
 verdict = "reproduce"
 owner = "curl-cli"
-verification = "Differential comparison of a dashed option given a double-quoted value, asserting the exit code and the option error text in both trees."
+verification = "Differential comparison over the joined spellings of a dashed option given a double-quoted value, asserting the exit code and the option error text, beside a positive control over the spaced form asserting both trees accept it and use the value."
 status = "obligation"
 decision = "DL-0215"
 
@@ -2854,3 +2867,852 @@ owner = "curl-cli"
 verification = "Equivalence test over the width selector and the frame fill across the whole range the terminal lookup can return, asserting an explicit checked conversion at each site and no sign change at either bound."
 status = "obligation"
 decision = "DL-0219"
+
+[[hazard]]
+id = "HZ-0260"
+path = "original/lib/md4.c"
+lines = [26, 30]
+behaviour = "MD4 is compiled in whenever the built-in NTLM core is, gated on nothing about strength, and the one-shot interface it exposes is unsalted and uniterated, so the NT hash of a password is a bare MD4 digest of its little-endian UTF-16 form with no work factor, no salt and no warning."
+verdict = "reproduce"
+owner = "curl-auth"
+verification = "Known-answer vectors over the one-shot interface across every provider branch the tag carries, plus a feature-configuration matrix asserting the interface exists exactly where the built-in NTLM core does and nowhere else."
+status = "obligation"
+decision = "DL-0224"
+
+[[hazard]]
+id = "HZ-0261"
+path = "original/lib/curl_ntlm_core.c"
+lines = [348, 394]
+behaviour = "The LanManager hash folds the password to upper case, truncates it at fourteen bytes, splits those into two seven-byte DES keys and encrypts a fixed eight-byte constant with each, so the digest is case-insensitive, unsalted, length-capped and independently attackable in two halves, and a password longer than fourteen bytes contributes nothing past that point."
+verdict = "reproduce"
+owner = "curl-auth"
+verification = "Known-answer vectors over the hash for a short password, a fourteen-byte password, a longer password and a mixed-case password, asserting one digest across every DES provider branch, plus the protocol capture of the version-one exchange that carries it."
+status = "obligation"
+decision = "DL-0224"
+
+[[hazard]]
+id = "HZ-0262"
+path = "original/lib/curl_ntlm_core.c"
+lines = [410, 432]
+behaviour = "The NT hash is a bare MD4 over the password widened to little-endian UTF-16 with no salt and no iteration, and the twenty-one-byte buffer it fills is zero-padded past the sixteen digest bytes, so the two trailing DES keys derived from it are known constants."
+verdict = "reproduce"
+owner = "curl-auth"
+verification = "Known-answer vectors over the hash for an empty, an ASCII and a non-ASCII password, asserting the digest bytes and the zero padding, plus the response construction that consumes all three key slots."
+status = "obligation"
+decision = "DL-0224"
+
+[[hazard]]
+id = "HZ-0263"
+path = "original/lib/vauth/ntlm.c"
+lines = [644, 667]
+behaviour = "When the server does not offer extended security the version-one branch puts both responses on the wire - the NT response derived from the MD4 NT hash and the LanManager response derived from the truncated case-folded LM hash - and clears the extended-security flag it was not given, so the weaker of the two responses is sent for compatibility even though upstream's own comment beside it names the safer alternative it declines."
+verdict = "reproduce"
+owner = "curl-auth"
+verification = "Protocol capture against a server that omits the extended-security flag, asserting both response fields byte for byte and the cleared flag, beside a capture against a server that offers it asserting the version-two responses instead."
+status = "obligation"
+decision = "DL-0224"
+
+[[hazard]]
+id = "HZ-0264"
+path = "original/lib/telnet.c"
+lines = [60, 72]
+behaviour = "The sub-negotiation accumulator drops every byte past its five-hundred-and-twelve-byte buffer with no error, no wrap and no diagnostic, so an over-long sub-negotiation is processed as its truncated prefix."
+verdict = "reproduce"
+owner = "curl-proto-telnet"
+verification = "Server-side test sending a sub-negotiation longer than the buffer, asserting the truncated prefix reaches the option handler and the transfer completes with the same code in both trees."
+status = "obligation"
+decision = "DL-0156"
+
+[[hazard]]
+id = "HZ-0265"
+path = "original/lib/telnet.c"
+lines = [1026, 1043]
+behaviour = "An environment variable that does not fit the remaining space of the fixed sub-negotiation buffer is skipped in silence: the fit test has no failing arm, so the variable is absent from the bytes sent and nothing is reported."
+verdict = "reproduce"
+owner = "curl-proto-telnet"
+verification = "Byte comparison of the environment sub-negotiation with enough variables to overrun the buffer, asserting the same variables present and absent in both trees."
+status = "obligation"
+decision = "DL-0156"
+
+[[hazard]]
+id = "HZ-0266"
+path = "original/lib/telnet.c"
+lines = [1047, 1053]
+behaviour = "A failed send of the environment sub-negotiation is reported only through a diagnostic line while the function still answers success, so the negotiation continues as though the bytes had been written."
+verdict = "reproduce"
+owner = "curl-proto-telnet"
+verification = "Fault-injected send failure on the environment sub-negotiation asserting the diagnostic text, the success return and the state the negotiation continues in."
+status = "obligation"
+decision = "DL-0156"
+
+[[hazard]]
+id = "HZ-0267"
+path = "original/lib/telnet.c"
+lines = [860, 941]
+behaviour = "Option handling answers three different ways for three shapes of a wrong key: a value carrying a non-ASCII byte skips the whole option in silence, a key of a recognised length but a wrong spelling answers the unknown-option code with no message, and a key of any other length answers the same code after a diagnostic naming it."
+verdict = "reproduce"
+owner = "curl-proto-telnet"
+verification = "Option-list matrix over a non-ASCII value, a right-length wrong-spelling key and a wrong-length key, asserting the return code and the presence or absence of the diagnostic for each."
+status = "obligation"
+decision = "DL-0156"
+
+[[hazard]]
+id = "HZ-0268"
+path = "original/src/tool_getparam.c"
+lines = [2273, 2281]
+behaviour = "The config-file recursion budget is a by-value counter decremented once per nested inclusion, so it bounds depth rather than distinct files: a file that includes itself is stopped after five levels with a usage error naming the constant, and two sibling inclusions each receive the full budget rather than sharing one."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison over a self-including config file, a five-deep chain, a six-deep chain and two sibling inclusions at depth five, asserting the exit code and the error text in both trees."
+status = "obligation"
+decision = "DL-0227"
+
+[[hazard]]
+id = "HZ-0269"
+path = "original/src/tool_parsecfg.c"
+lines = [378, 400]
+behaviour = "The line reader every file-reading option shares skips blank lines and lines whose first non-blank byte is a hash, so no consumer can carry either: a header file cannot send an empty line or a header whose name begins with a hash, a URL file cannot carry such a URL, and each consumer additionally inherits whatever line ceiling it initialised its own buffer with."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison over a header file, a URL file and a form file each carrying a blank line, a hash-prefixed line and a line at the consumer's own ceiling, asserting the requests emitted and the exit code in both trees."
+status = "obligation"
+decision = "DL-0227"
+
+[[hazard]]
+id = "HZ-0270"
+path = "original/src/tool_getparam.c"
+lines = [2235, 2246]
+behaviour = "Options naming a security file are validated by a status call at parse time and only the name is stored, so the file the library later opens need not be the file that was checked, and a name that becomes unreadable or is replaced between the two is reported by the library rather than by the parser."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison over a security-file option whose target is replaced after parsing and before the transfer, asserting the same exit code and the same diagnostic in both trees."
+status = "obligation"
+decision = "DL-0226"
+
+[[hazard]]
+id = "HZ-0271"
+path = "original/src/tool_operate.c"
+lines = [703, 711]
+behaviour = "Removing a partial download tests the output path with a status call and then unlinks it by name, so the file removed need not be the file tested, and a path that became a symlink between the two is followed while the regular-file test that guarded it has already passed."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Filesystem matrix over a regular file, a directory and a path replaced by a symlink between the test and the removal, asserting which path each tree removes and the diagnostic it emits."
+status = "obligation"
+decision = "DL-0226"
+
+[[hazard]]
+id = "HZ-0272"
+path = "original/src/tool_cb_wrt.c"
+lines = [47, 51]
+behaviour = "The overwrite modes open the output name for writing through the ordinary file interface, which follows a symlink and truncates whatever it resolves to, while the no-clobber mode opens with create-and-exclusive and cannot be redirected that way."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Filesystem matrix over an output name that is a symlink to a file outside the working directory, asserting which file each tree truncates in the default, always-clobber and never-clobber modes."
+status = "obligation"
+decision = "DL-0226"
+
+[[hazard]]
+id = "HZ-0273"
+path = "original/lib/netrc.c"
+lines = [501, 510]
+behaviour = "The credentials file is opened and read with no check of its permissions or its ownership - the only status test rejects a directory - so a world-readable or group-writable netrc is used exactly as a private one is, with no warning."
+verdict = "reproduce"
+owner = "curl-auth"
+verification = "Differential comparison over a netrc that is world-readable, one that is group-writable and one owned by another user, asserting both trees use the credentials and emit no additional diagnostic."
+status = "obligation"
+decision = "DL-0228"
+
+[[hazard]]
+id = "HZ-0274"
+path = "original/lib/doh.c"
+lines = [578, 612]
+behaviour = "Addresses and service records past the answer's per-kind limit are dropped in silence: the store helpers test the count and return without recording, so an answer carrying more than the limit resolves to its first entries and reports success."
+verdict = "reproduce"
+owner = "curl-dns"
+verification = "Server-side test answering with more addresses and more service records than the limits, asserting the resolved set, the success return and the absence of any diagnostic in both trees."
+status = "obligation"
+decision = "DL-0229"
+
+[[hazard]]
+id = "HZ-0275"
+path = "original/lib/http2.c"
+lines = [1269, 1279]
+behaviour = "A data frame naming a stream the session does not know is consumed explicitly and ignored, and the callback answers success, so flow control advances for a transfer that no longer exists and nothing is reported beyond a trace line."
+verdict = "reproduce"
+owner = "curl-http2"
+verification = "Server-side test sending a data frame for an aborted stream, asserting the connection survives, the window advances and both trees complete the remaining transfer identically."
+status = "obligation"
+decision = "DL-0229"
+
+[[hazard]]
+id = "HZ-0276"
+path = "original/lib/http2.c"
+lines = [2024, 2036]
+behaviour = "Request-body bytes offered after the peer closed the stream with a complete response are discarded and counted as written, so the caller is told the whole chunk went out while none of it reached the wire."
+verdict = "reproduce"
+owner = "curl-http2"
+verification = "Server-side test answering a request body with an early final response, asserting the written count, the end-of-stream flag and the exit code in both trees."
+status = "obligation"
+decision = "DL-0229"
+
+[[hazard]]
+id = "HZ-0277"
+path = "original/lib/http.c"
+lines = [3925, 3937]
+behaviour = "A switching-protocols response the client never asked to upgrade to is accepted as the final response: header parsing simply ends and the transfer completes, rather than the response being refused as unsolicited."
+verdict = "reproduce"
+owner = "curl-http1"
+verification = "Server-side test answering a plain request with a switching-protocols response carrying an unrequested upgrade, asserting the exit code, the reported status and the written bytes in both trees."
+status = "obligation"
+decision = "DL-0229"
+
+[[hazard]]
+id = "HZ-0278"
+path = "original/lib/http_proxy.c"
+lines = [97, 128]
+behaviour = "Two shapes of a custom proxy header are dropped in silence: a name followed by a semicolon and then content, and a name with neither a colon nor a semicolon, both skip the header with no diagnostic, while a name followed only by a semicolon sends the empty header the quirk exists for."
+verdict = "reproduce"
+owner = "curl-http1"
+verification = "Byte comparison of the tunnel request over all four header shapes, asserting which headers appear and that no diagnostic is emitted for the dropped ones."
+status = "obligation"
+decision = "DL-0229"
+
+[[hazard]]
+id = "HZ-0279"
+path = "original/src/tool_getparam.c"
+lines = [1565, 1575]
+behaviour = "The verbosity ladder has four rungs and a fall-through arm that does nothing, so a fourth and any later repetition of the verbose flag has no further effect and is neither reported nor refused."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of the emitted trace configuration and stderr across one, two, three, four and five repetitions of the verbose flag."
+status = "obligation"
+decision = "DL-0229"
+
+[[hazard]]
+id = "HZ-0280"
+path = "original/lib/ftp.c"
+lines = [3194, 3200]
+behaviour = "The security-mechanism acceptance path installs the TLS filter and drives the handshake to completion inside the state machine, so this one step blocks the caller's loop rather than returning to it, and upstream's own note beside it records that the blocking is deliberate."
+verdict = "reproduce"
+owner = "curl-proto-ftp"
+verification = "Multi-interface test over a secured control connection asserting the same socket-action sequence and the same blocking step in both trees, driven by an application loop that records where control is not returned."
+status = "obligation"
+decision = "DL-0230"
+
+# ---------------------------------------------------------------------------
+# Oracle paths whose hazard review is complete.                        DL-0225
+# The count is frozen; a dropped row fails the gate.                   DL-0225
+# ---------------------------------------------------------------------------
+
+[[hazard]]
+id = "HZ-0281"
+path = "original/lib/pingpong.c"
+lines = [160, 196]
+behaviour = "One shared command writer prints every command line of FTP, POP3, IMAP and SMTP to the header-out surface before it reaches the socket, so all four protocols disclose their authentication commands - account names, plaintext passwords, the password-derived digest and every base64 mechanism continuation - through a writer none of them contains. The four files call the exported wrappers rather than the emitter, so a per-file count of emissions reports all four as having no trace surface at all."
+verdict = "reproduce"
+owner = "curl-pingpong"
+verification = "Differential trace comparison over an authenticated transfer on each of the four protocols, asserting both trees print the same lines; the 89 call sites and the 17 authentication lines among them are discovered mechanically and registered in refactor/docs/OBSERVABILITY.md, whose frozen counts fail on drift."
+status = "obligation"
+decision = "DL-0116"
+
+[[hazard]]
+id = "HZ-0282"
+path = "original/src/tool_getparam.c"
+lines = [305, 315]
+behaviour = "One documented option is accepted and then discarded in silence: the alias table maps it to an identifier that no dispatch arm names, and because its descriptor carries no deprecation flag the deprecation path never runs, so the argument is consumed and marked used, no diagnostic is written, the exit status is unchanged and the value has no effect on the transfer. The string-option dispatch it falls into has 102 arms and no default, so nothing catches the omission. It is 1 of 283 alias rows and the only one in that state, the other undispatched identifiers being 9 that warn through the deprecation path and the help option, which is answered before the dispatch."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison asserting both trees accept the option with an argument, write nothing to either stream, exit zero, and produce a transfer identical to one run without it, with the exit code, standard output, standard error, written bytes and generated libcurl source all identical to omitting the option; a blank value accepted where a handled sibling refuses it; the following argument consumed; and a generated assertion that the option's identifier still has no dispatch arm at the tag, so the day upstream implements it the row fails rather than silently diverging."
+status = "obligation"
+decision = "DL-0234"
+
+[[hazard]]
+id = "HZ-0283"
+path = "original/src/tool_getparam.c"
+lines = [3076, 3099]
+behaviour = "Every string argument whose first bytes match the leading-Unicode detector is printed to standard error verbatim, wrapped at the terminal width with each line prefixed, before the wipe that the same loop performs for the arguments marked as needing clearing, so a password, bearer token or user string given to one of those options is disclosed in full while the wipe goes on to hide the identical bytes from the process list; the warning is suppressed only when the silent flag was already parsed, so whether the disclosure happens depends on the order the options were written in."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of standard error, exit code and written bytes over one command-line and one configuration-file invocation of each credential-bearing clearing option with a value beginning U+201C or U+201D, at the width the upstream driver pins and at a width that does not wrap, with the silent flag before and after the option, asserting the port emits those bytes and no other sink receives the value."
+status = "obligation"
+decision = "DL-0236"
+
+[[hazard]]
+id = "HZ-0284"
+path = "original/src/tool_progress.c"
+lines = [218, 228]
+behaviour = "Both aggregate percentage branches avoid multiplying an extreme counter by one hundred by dividing instead by the total scaled down by one hundred, guarding only on the counter, so once the counter reaches a hundredth of the maximum offset value a non-zero total below one hundred makes that divisor zero and the division is undefined; the aggregate download and upload percentages are affected alike, and the library's own copy of the same expression guards on the total instead and so divides by zero never but wraps a signed multiplication instead."
+verdict = "substitute"
+owner = "curl-cli"
+verification = "Direct equivalence test over both aggregate percentages across totals of 1, 99 and 100 with counters immediately below, at and above a hundredth of the maximum offset value, asserting the rendered field the oracle produces for every defined input, including the truncation to three characters, and a defined non-panicking answer for the inputs the oracle leaves undefined."
+status = "obligation"
+decision = "DL-0237"
+
+[[reviewed]]
+path = "original/lib/altsvc.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/asyn-ares.c"
+hazards = 4
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/asyn-thrdd.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/cf-h1-proxy.c"
+hazards = 4
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/cf-h2-proxy.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/cf-haproxy.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/cf-socket.c"
+hazards = 4
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/content_encoding.c"
+hazards = 3
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/cookie.c"
+hazards = 4
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/cshutdn.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/curl_addrinfo.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/curl_fopen.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/curl_gssapi.c"
+hazards = 3
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/curl_memrchr.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/curl_ntlm_core.c"
+hazards = 4
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/curl_sasl.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/curl_share.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/curl_sspi.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/cw-pause.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/doh.c"
+hazards = 7
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/dynhds.c"
+hazards = 3
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/easy.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/fake_addrinfo.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/file.c"
+hazards = 3
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/formdata.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/ftp.c"
+hazards = 7
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/getinfo.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/hash.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/headers.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/hmac.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/hostip.c"
+hazards = 4
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/hsts.c"
+hazards = 3
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/http.c"
+hazards = 9
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/http2.c"
+hazards = 9
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/http_aws_sigv4.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/http_proxy.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/md4.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/md5.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/mqtt.c"
+hazards = 14
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/netrc.c"
+hazards = 4
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/proxy.c"
+hazards = 9
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/rand.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/rtsp.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/setup-vms.h"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/smb.c"
+hazards = 5
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/smtp.c"
+hazards = 5
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/socketpair.c"
+hazards = 3
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/socks.c"
+hazards = 3
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/socks_sspi.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/strcase.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/strequal.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/telnet.c"
+hazards = 4
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/tftp.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/transfer.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/uint-spbset.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/lib/vauth/ntlm.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/config2setopts.c"
+hazards = 6
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_cb_prg.c"
+hazards = 8
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_cb_rea.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_cb_see.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_cb_soc.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_cb_wrt.c"
+hazards = 14
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_formparse.c"
+hazards = 22
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_getparam.c"
+hazards = 5
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_operate.c"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_operhlp.c"
+hazards = 11
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_parsecfg.c"
+hazards = 13
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_progress.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_urlglob.c"
+hazards = 28
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_urlglob.h"
+hazards = 1
+decision = "DL-0225"
+
+# ---------------------------------------------------------------------------
+# Discovered annotation sites that carry no hazard row.                 DL-0225
+# Every site is dispositioned; a stale entry fails the gate.           DL-0225
+# ---------------------------------------------------------------------------
+
+[[reviewed]]
+path = "original/lib/pingpong.c"
+hazards = 1
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/cf-h2-proxy.c"
+line = 332
+class = "defensive-invariant"
+reason = "Guards a tunnel state the filter's own progression cannot produce; the arm answers the same code the reachable one does."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/curl_sasl.c"
+line = 783
+class = "defensive-invariant"
+reason = "Answers the unsupported-protocol code for a mechanism value the negotiation cannot select, since the caller has already matched it against the enabled set."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/curl_sasl.c"
+line = 831
+class = "defensive-invariant"
+reason = "Guards a null mechanism name for a mechanism bit the table always names, so the branch depends on the table and not on any input."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/doh.c"
+line = 465
+class = "defensive-invariant"
+reason = "A debug assertion over a probe slot the caller has already bounded; a release build takes the same path with no assertion."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/easy.c"
+line = 479
+class = "defensive-invariant"
+reason = "Guards a handle state the easy interface's own sequencing excludes, and the comment records that the arm costs nothing when taken."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/easy.c"
+line = 710
+class = "defensive-invariant"
+reason = "Maps any multi code other than out-of-memory to the bad-argument code; the multi interface returns no other code to this caller, and the mapping is recorded so a port cannot invent a third."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/ftp.c"
+line = 4443
+class = "no-observable-outcome"
+reason = "Resets the cached file size to its unknown sentinel between transfers; no observable outcome depends on the reset itself."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/getinfo.c"
+line = 110
+class = "defensive-invariant"
+reason = "The fall-through arm shares the body of the GET case, so an unenumerated request kind reports GET; the request kind is set only to enumerated values."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/headers.c"
+line = 110
+class = "defensive-invariant"
+reason = "Guards an empty header list the caller has already tested, and answers the same code the empty case does."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/hostip.c"
+line = 944
+class = "diagnosed-outcome"
+reason = "An over-long unix socket path is refused with a named diagnostic and the resolution failure code, so the outcome is defined and non-silent."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/http.c"
+line = 239
+class = "defensive-invariant"
+reason = "Guards a header length the caller computed, and the arm answers before any byte is written."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/http.c"
+line = 1968
+class = "defensive-invariant"
+reason = "The fall-through arm shares the body of the GET case, so an unenumerated request kind sends GET; the request kind is set only to enumerated values."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/http.c"
+line = 3836
+class = "defensive-invariant"
+reason = "Records that a folded continuation cannot be the second line of a response, which the status-line parse before it already excludes."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/http2.c"
+line = 1412
+class = "defensive-invariant"
+reason = "Answers the callback-failure code for a stream identifier the session did not issue, which tears the connection down rather than ignoring the frame; the ignoring shape is HZ-0275."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/http2.c"
+line = 1595
+class = "defensive-invariant"
+reason = "Answers the callback-failure code for a stream identifier the session did not issue, which tears the connection down rather than ignoring the frame; the ignoring shape is HZ-0275."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/lib/http_aws_sigv4.c"
+line = 1053
+class = "no-observable-outcome"
+reason = "Upstream's own note that only the keyed-hash signature family is implemented; the implemented family is the contract rather than a sharp edge."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/src/tool_getparam.c"
+line = 1513
+class = "no-observable-outcome"
+reason = "Records that the single dash is stored verbatim and interpreted as standard input downstream; the interpretation is where the observable outcome is."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/src/tool_operate.c"
+line = 1206
+class = "diagnosed-outcome"
+reason = "A Windows-only identifier above the signed maximum is refused with a named warning and the blocking fallback, so the outcome is defined and non-silent."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/src/tool_operate.c"
+line = 1853
+class = "defensive-invariant"
+reason = "Maps any multi code other than out-of-memory to the bad-argument code; the multi interface returns no other code to this caller."
+decision = "DL-0225"
+
+[[annotation]]
+path = "original/src/tool_operate.c"
+line = 2050
+class = "defensive-invariant"
+reason = "Maps any multi code other than out-of-memory to the bad-argument code; the multi interface returns no other code to this caller."
+decision = "DL-0225"
+
+# ---------------------------------------------------------------------------
+# Divergence allowlist entries, one per diverge verdict.               DL-0231
+# Locator and behaviour come from the hazard row.                      DL-0231
+# ---------------------------------------------------------------------------
+
+[[divergence]]
+id = "DV-0001"
+hazard = "HZ-0002"
+outcome = "The conversion answers the out-of-memory code and no address list; a caller never sees a successful resolution that produced nothing."
+rationale = "Safe Rust cannot express a successful return beside an absent result: the conversion answers a result type, so the empty-success state has no representation to reproduce. The chosen code is the one the allocation failure would have produced had it been carried, so every caller path already handles it."
+owner = "curl-dns"
+decision = "DL-0113"
+
+[[divergence]]
+id = "DV-0002"
+hazard = "HZ-0011"
+outcome = "A failed status call answers not-a-directory, the outcome the zeroed buffer produces on the platforms in the matrix, and the buffer is never read outside the guard."
+rationale = "Reading an indeterminate buffer is undefined behaviour that safe Rust cannot perform, so the value the oracle reads cannot be reproduced. Not-a-directory is the deterministic choice: it keeps the transfer on the path the oracle takes whenever the buffer happens to be zeroed, which is what the upstream cases exercise."
+owner = "curl-proto-file"
+decision = "DL-0113"
+
+[[divergence]]
+id = "DV-0003"
+hazard = "HZ-0031"
+outcome = "The conversion answers the out-of-memory code, and a partial list is discarded rather than returned."
+rationale = "The oracle records the failure in a local it then discards, which safe Rust cannot mirror without inventing a second channel. Answering the code the oracle computed and dropped is the only outcome that is both deterministic and consistent with the code it wrote down."
+owner = "curl-dns"
+decision = "DL-0113"
+
+[[divergence]]
+id = "DV-0004"
+hazard = "HZ-0045"
+outcome = "A name-decode failure answers the decode error the parser produced rather than the out-of-memory code the oracle's uninitialised result variable carries."
+rationale = "Reproducing the oracle here would mean seeding a result variable with a code unrelated to the failure and letting it survive, which is the shape safe Rust removes by construction: the decode answers a result and the caller propagates it. The divergence is visible only in which error a malformed answer reports, never in whether the transfer fails."
+owner = "curl-dns"
+decision = "DL-0119"
+
+[[divergence]]
+id = "DV-0005"
+hazard = "HZ-0046"
+outcome = "Trailing bytes after a complete answer are rejected in every build, which is the debug build's behaviour, so one build type answers for both."
+rationale = "A port whose behaviour depends on whether assertions are compiled in would have to carry the release acceptance and the debug rejection as two contracts, and the harness runs debug builds, so the stricter of the two is the one every upstream case already asserts. Choosing the looser one would leave the assertion unreachable and the strictness untested."
+owner = "curl-dns"
+decision = "DL-0119"
+
+[[divergence]]
+id = "DV-0006"
+hazard = "HZ-0047"
+outcome = "The peer's shutdown last-stream and error values are taken from the frame the substitute library reports, so a non-zero field is reported as sent rather than as the initialisation value."
+rationale = "The replacement HTTP/2 implementation surfaces those fields through its own event, and discarding them to reproduce the oracle's unassigned locals would mean deliberately dropping data the substitute gives us. The tunnel outcome is unchanged either way, and the boundary difference is enumerated in the dependency-delta deliverable."
+owner = "curl-http2"
+decision = "DL-0128"
+
+[[divergence]]
+id = "DV-0007"
+hazard = "HZ-0073"
+outcome = "The promise store bounds the total byte size of the headers it holds as well as their count, and answers the stream error the count limit already answers when either bound is exceeded."
+rationale = "An unbounded aggregate is a memory-exhaustion surface a peer controls, and the substitute library gives no equivalent cap, so reproducing the absence would import a denial of service the replacement cannot mitigate. The added bound is reported through the error the count limit already uses, so no new outcome appears; the difference is which promises are refused."
+owner = "curl-http2"
+decision = "DL-0125"
+
+[[divergence]]
+id = "DV-0008"
+hazard = "HZ-0154"
+outcome = "A hash-construction failure answers the out-of-memory code and no session-setup message is sent; no key material is derived from an unwritten buffer."
+rationale = "The oracle turns an allocation failure into twenty-four bytes of indeterminate memory on the wire, derived from three DES keys built out of an unwritten buffer. Safe Rust cannot read an uninitialised buffer, and sending key material derived from one is a disclosure the port must not reproduce even bug for bug. Answering the failure is the only deterministic outcome that keeps the wire silent."
+owner = "curl-proto-smb"
+decision = "DL-0181"

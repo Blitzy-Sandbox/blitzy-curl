@@ -655,6 +655,11 @@ path = ".gitignore"
 derives-from = ["original/.gitignore"]
 
 [[reverse]]
+path = "BASELINE.toml"
+project-owned = true
+decision = "DL-0220"
+
+[[reverse]]
 path = "COPYING"
 derives-from = ["original/COPYING"]
 
@@ -712,6 +717,15 @@ path = "refactor/docs/QUIRKS.md"
 derives-from = ["original/docs/KNOWN_BUGS.md"]
 
 [[reverse]]
+path = "refactor/docs/DIVERGENCE-ALLOWLIST.md"
+project-owned = true
+decision = "DL-0231"
+
+[[reverse]]
+path = "refactor/docs/OBSERVABILITY.md"
+derives-from = ["original/lib/curl_trc.h", "original/src/tool_cb_dbg.c"]
+
+[[reverse]]
 path = "refactor/docs/history/index.md"
 project-owned = true
 decision = "DL-0020"
@@ -735,6 +749,11 @@ decision = "DL-0037"
 path = "testing/audit/src/bin/config.rs"
 project-owned = true
 decision = "DL-0037"
+
+[[reverse]]
+path = "testing/audit/src/baseline.rs"
+project-owned = true
+decision = "DL-0220"
 
 [[reverse]]
 path = "testing/audit/src/comments.rs"
@@ -782,6 +801,11 @@ project-owned = true
 decision = "DL-0111"
 
 [[reverse]]
+path = "testing/audit/traceability/data/observability.toml"
+project-owned = true
+decision = "DL-0232"
+
+[[reverse]]
 path = "testing/audit/traceability/data/hazards.toml"
 project-owned = true
 decision = "DL-0110"
@@ -811,6 +835,11 @@ project-owned = true
 decision = "DL-0110"
 
 [[reverse]]
+path = "testing/audit/traceability/src/observability.rs"
+project-owned = true
+decision = "DL-0232"
+
+[[reverse]]
 path = "testing/audit/traceability/src/lib.rs"
 project-owned = true
 decision = "DL-0111"
@@ -833,3 +862,91 @@ decision = "DL-0111"
 path = "testing/upstream-suite/baseline-bootstrap"
 project-owned = true
 decision = "DL-0033"
+
+# Definitions upstream's own single-use whitelist names. DL-0233.
+# The reach column is re-measured on every run; a disagreement fails.
+
+[[orphan-definition]]
+symbol = "Curl_creader_def_close"
+reach = "called"
+disposition = "Ported as the default close of the reader trait, reached through the same table of function pointers."
+decision = "DL-0233"
+
+[[orphan-definition]]
+symbol = "Curl_creader_def_init"
+reach = "called"
+disposition = "Ported as the default init of the reader trait, reached through the same table of function pointers."
+decision = "DL-0233"
+
+[[orphan-definition]]
+symbol = "Curl_creader_def_read"
+reach = "unreachable"
+disposition = "Not ported. It is the reader trait's default read, and no table names it: an implementation that omitted read would have to be reachable for it to matter, and in the port a trait without a default forces every reader to supply one, so the unreachable fall-back has nothing to express."
+decision = "DL-0233"
+
+[[orphan-definition]]
+symbol = "Curl_creader_def_total_length"
+reach = "called"
+disposition = "Ported as the default length answer of the reader trait, reached through the same table."
+decision = "DL-0233"
+
+[[orphan-definition]]
+symbol = "Curl_meta_reset"
+reach = "called"
+disposition = "Ported as the handle-reset path, called from the reuse path of the same unit."
+decision = "DL-0233"
+
+[[orphan-definition]]
+symbol = "Curl_multi_clear_dirty"
+reach = "called"
+disposition = "Ported as the dirty-set clear of the multi state machine, called from the same unit."
+decision = "DL-0233"
+
+[[orphan-definition]]
+symbol = "Curl_thread_destroy"
+reach = "called"
+disposition = "Ported as the thread-handle drop, with the two platform-conditional definitions collapsed into one implementation."
+decision = "DL-0233"
+
+[[orphan-definition]]
+symbol = "Curl_trc_dns"
+reach = "macro"
+disposition = "Ported as the resolver trace target of the reused feature registry, reached the same way: the emission macro expands to it and four resolver units use that macro."
+decision = "DL-0233"
+
+[[orphan-definition]]
+symbol = "Curl_xfer_write_resp"
+reach = "called"
+disposition = "Ported as the response-write entry of the transfer loop, called from the transfer and HTTP/2 paths."
+decision = "DL-0233"
+
+[[orphan-definition]]
+symbol = "curlx_base64_decode"
+reach = "called"
+disposition = "Ported as the base64 decoder of the leaf types crate, called from the authentication mechanisms."
+decision = "DL-0233"
+
+[[orphan-definition]]
+symbol = "curlx_base64_encode"
+reach = "called"
+disposition = "Ported as the base64 encoder of the leaf types crate, called from the authentication and directory paths."
+decision = "DL-0233"
+
+[[orphan-definition]]
+symbol = "curlx_base64url_encode"
+reach = "called"
+disposition = "Ported as the URL-safe base64 encoder, called from the HTTP/2 upgrade path."
+decision = "DL-0233"
+
+# Options the alias table accepts that no dispatch arm names. DL-0234.
+[[silent-option]]
+identifier = "C_HELP"
+outcome = "The help text is printed and parsing stops before the dispatch, so the option never reaches an arm."
+disposition = "dispatched ahead of the switch: prints help and stops parsing"
+decision = "DL-0234"
+
+[[silent-option]]
+identifier = "C_SOCKS5_GSSAPI_SERVICE"
+outcome = "The argument is consumed and marked used, no deprecation warning is emitted, and no arm reads it, so the value is discarded and the exit status is unchanged."
+disposition = "reproduce: accept, consume the argument, warn nothing, do nothing"
+decision = "DL-0234"

@@ -25,6 +25,7 @@
 pub mod contract;
 pub mod forward;
 pub mod hazards;
+pub mod observability;
 pub mod oracle;
 pub mod render;
 pub mod reverse;
@@ -49,17 +50,39 @@ pub fn generate(workspace: &Workspace, files: &dyn Files) -> AuditResult<Generat
     let index = contract::Index::from_workspace(workspace)?;
     let ownership = contract::Ownership::load(files, index.ownership_data())?;
     let register = hazards::Register::load(files, index.hazard_data())?;
+    let observability = observability::Contract::load(files, index.observability_data())?;
     let planned = contract::planned_crates(workspace)?;
     let present = contract::crates_present(workspace, files)?;
     let decisions = contract::decision_ids(files, index.decision_log())?;
 
     let mut report = Report::new("traceability");
     let survey = oracle::Survey::collect(files);
-    let forward = forward::resolve(&survey, &ownership, &planned, &decisions, &mut report);
+    let forward = forward::resolve(
+        files,
+        &survey,
+        &ownership,
+        &planned,
+        &decisions,
+        &mut report,
+    );
     let back = reverse::resolve(files, &ownership, &decisions, &mut report);
     let hazard_rows = register.resolve(files, &planned, &decisions, &mut report);
+    let coverage = register.coverage(files);
+    let flow = observability.audit(files, &decisions, &mut report);
 
-    let documents = render::documents(&index, &survey, &forward, &back, &hazard_rows, &present);
+    let documents = render::documents(
+        &index,
+        &survey,
+        &forward,
+        &back,
+        render::Hazards {
+            rows: &hazard_rows,
+            accounting: &coverage,
+            divergences: &register.divergences,
+        },
+        (&observability, &flow),
+        &present,
+    );
     report.assert(
         documents.len() == index.outputs().len(),
         "outputs-rendered",

@@ -148,8 +148,10 @@ pub struct Catalog {
     pub decision_log: String,
     /// Directories the vendored enumeration walks.
     pub enumeration_roots: Vec<String>,
-    /// Build manifest that registers the vendored sources.
-    pub manifest: String,
+    /// Build manifest of each enumeration root.
+    pub manifests: BTreeMap<String, String>,
+    /// Paths the catalog covers under each enumeration root.
+    pub catalogued: BTreeMap<String, usize>,
     /// Translation unit holding the trace registry.
     pub trace_registry: String,
     /// Project-authored records reconciled against the tree.
@@ -196,6 +198,39 @@ fn string_map(
                 .ok_or_else(|| AuditError::new(format!("provenance.{key}.{name} is not a string")))
         })
         .collect()
+}
+
+/// Reads a root-keyed table of paths.
+fn path_map(workspace: &Workspace, key: &str) -> AuditResult<BTreeMap<String, String>> {
+    let table = workspace.table(&["workspace", "metadata", "curl", "provenance", key])?;
+    let mut found = BTreeMap::new();
+    for (root, value) in table {
+        let path = value
+            .as_str()
+            .ok_or_else(|| AuditError::new(format!("provenance.{key}.{root} is not a path")))?;
+        found.insert(root.clone(), path.to_owned());
+    }
+    if found.is_empty() {
+        return Err(AuditError::new(format!("provenance.{key} is empty")));
+    }
+    Ok(found)
+}
+
+/// Reads a root-keyed table of counts.
+fn count_map(workspace: &Workspace, key: &str) -> AuditResult<BTreeMap<String, usize>> {
+    let table = workspace.table(&["workspace", "metadata", "curl", "provenance", key])?;
+    let mut found = BTreeMap::new();
+    for (root, value) in table {
+        let count = value
+            .as_integer()
+            .and_then(|found| usize::try_from(found).ok())
+            .ok_or_else(|| AuditError::new(format!("provenance.{key}.{root} is not a count")))?;
+        found.insert(root.clone(), count);
+    }
+    if found.is_empty() {
+        return Err(AuditError::new(format!("provenance.{key} is empty")));
+    }
+    Ok(found)
 }
 
 impl Catalog {
@@ -270,7 +305,8 @@ impl Catalog {
         Ok(Self {
             decision_log,
             enumeration_roots,
-            manifest: string_at(table, "manifest")?,
+            manifests: path_map(workspace, "manifests")?,
+            catalogued: count_map(workspace, "catalogued")?,
             trace_registry: string_at(table, "trace-registry")?,
             records,
             kinds: string_map(table, "kinds")?,
@@ -568,11 +604,124 @@ pub fn audit(workspace: &Workspace, files: &dyn Files) -> AuditResult<Report> {
         },
     );
 
-    let manifest = files.read(&catalog.manifest);
+    // One build manifest per enumeration root. A single manifest belonging to the
+    // first root leaves every path under the second uncatalogable, because no
+    // line of it registers a basename from the other tree.
+    let roots: BTreeSet<&str> = catalog
+        .enumeration_roots
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let declared: BTreeSet<&str> = catalog.manifests.keys().map(String::as_str).collect();
     report.assert(
-        manifest.is_some(),
-        "manifest-readable",
-        catalog.manifest.clone(),
+        roots == declared,
+        "manifests-cover-every-root",
+        if roots == declared {
+            format!("{} root(s), each with its own build manifest", roots.len())
+        } else {
+            format!(
+                "roots {} declare manifests {}",
+                catalog.enumeration_roots.join(", "),
+                catalog
+                    .manifests
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            )
+        },
+    );
+
+    let mut manifests: BTreeMap<&str, String> = BTreeMap::new();
+    let mut unreadable_manifests = Vec::new();
+    for (root, path) in &catalog.manifests {
+        match files.read(path) {
+            Some(body) => {
+                manifests.insert(root.as_str(), body);
+            }
+            None => unreadable_manifests.push(path.clone()),
+        }
+    }
+    report.assert(
+        unreadable_manifests.is_empty(),
+        "manifests-readable",
+        if unreadable_manifests.is_empty() {
+            catalog
+                .manifests
+                .values()
+                .cloned()
+                .collect::<Vec<String>>()
+                .join(", ")
+        } else {
+            format!("unreadable: {}", unreadable_manifests.join(", "))
+        },
+    );
+
+    // The catalog covers the subset whose provenance is established, not every
+    // enumerated path, and the size of that subset per root is frozen so growth
+    // is a deliberate edit rather than a silent drift.
+    let covered: BTreeSet<&str> = catalog.catalogued.keys().map(String::as_str).collect();
+    report.assert(
+        roots == covered,
+        "coverage-declared",
+        if roots == covered {
+            format!(
+                "{} root(s), each declaring its catalogued count",
+                roots.len()
+            )
+        } else {
+            format!(
+                "roots {} declare coverage {}",
+                catalog.enumeration_roots.join(", "),
+                catalog
+                    .catalogued
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            )
+        },
+    );
+
+    let mut measured: BTreeMap<&str, usize> = BTreeMap::new();
+    for owner in &catalog.owners {
+        if let Some(root) = catalog
+            .enumeration_roots
+            .iter()
+            .find(|root| owner.path.starts_with(&format!("{root}/")))
+        {
+            *measured.entry(root.as_str()).or_default() += 1;
+        }
+    }
+    let drift: Vec<String> = catalog
+        .catalogued
+        .iter()
+        .filter(|(root, count)| measured.get(root.as_str()).copied().unwrap_or(0) != **count)
+        .map(|(root, count)| {
+            format!(
+                "{root}: {count} declared, {} catalogued",
+                measured.get(root.as_str()).copied().unwrap_or(0)
+            )
+        })
+        .collect();
+    report.assert(
+        drift.is_empty(),
+        "coverage-denominator",
+        if drift.is_empty() {
+            format!(
+                "{} of {} enumerated path(s) catalogued: {}",
+                catalog.owners.len(),
+                enumerated.len(),
+                catalog
+                    .catalogued
+                    .iter()
+                    .map(|(root, count)| format!("{root} {count}"))
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            )
+        } else {
+            format!("count drift: {}", drift.join(", "))
+        },
     );
     let registry = files.read(&catalog.trace_registry);
     report.assert(
@@ -589,7 +738,12 @@ pub fn audit(workspace: &Workspace, files: &dyn Files) -> AuditResult<Report> {
                 files,
                 planned: &planned,
                 defined: &defined,
-                manifest: manifest.as_deref(),
+                manifest: catalog
+                    .enumeration_roots
+                    .iter()
+                    .find(|root| owner.path.starts_with(&format!("{root}/")))
+                    .and_then(|root| manifests.get(root.as_str()))
+                    .map(String::as_str),
                 registry: registry.as_deref(),
                 catalogued: &unique,
             },
@@ -790,10 +944,15 @@ absent-paths = ["original/lib/curl_rtmp.h"]
 
 [workspace.metadata.curl.provenance]
 enumeration-roots = ["original/lib"]
-manifest = "original/lib/Makefile.inc"
 trace-registry = "original/lib/curl_trc.c"
 records = ["refactor/docs/DECISION-LOG.md"]
 kinds = { translation-unit = "c", header = "h" }
+
+[workspace.metadata.curl.provenance.manifests]
+"original/lib" = "original/lib/Makefile.inc"
+
+[workspace.metadata.curl.provenance.catalogued]
+"original/lib" = 3
 
 [workspace.metadata.curl.provenance.extraction]
 failf-calls = "failf"
@@ -1064,5 +1223,77 @@ type-definitions = 2
             "empty",
         );
         assert!(Catalog::from_workspace(&empty).is_err());
+    }
+
+    #[test]
+    fn every_enumeration_root_needs_its_own_manifest() {
+        let manifest = ROOT_MANIFEST.replace(
+            "enumeration-roots = [\"original/lib\"]",
+            "enumeration-roots = [\"original/lib\", \"original/src\"]",
+        );
+        let workspace = workspace(&manifest, "root without a manifest");
+        let report = audit(&workspace, &clean_files()).expect("audits");
+        let rendered = report.render();
+        assert!(
+            rendered.contains("FAIL manifests-cover-every-root"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("FAIL coverage-declared"), "{rendered}");
+    }
+
+    #[test]
+    fn an_unreadable_manifest_fails() {
+        let manifest = ROOT_MANIFEST.replace(
+            "\"original/lib\" = \"original/lib/Makefile.inc\"",
+            "\"original/lib\" = \"original/lib/Makefile.absent\"",
+        );
+        let workspace = workspace(&manifest, "unreadable manifest");
+        let report = audit(&workspace, &clean_files()).expect("audits");
+        assert!(report.render().contains("FAIL manifests-readable"));
+    }
+
+    #[test]
+    fn the_catalogued_count_is_frozen_per_root() {
+        let manifest = ROOT_MANIFEST.replace("\"original/lib\" = 3", "\"original/lib\" = 9");
+        let workspace = workspace(&manifest, "count drift");
+        let report = audit(&workspace, &clean_files()).expect("audits");
+        let rendered = report.render();
+        assert!(rendered.contains("FAIL coverage-denominator"), "{rendered}");
+        assert!(rendered.contains("9 declared"), "{rendered}");
+    }
+
+    #[test]
+    fn a_declared_coverage_root_outside_the_enumeration_fails() {
+        let manifest = ROOT_MANIFEST.replace(
+            "[workspace.metadata.curl.provenance.catalogued]\n\"original/lib\" = 3",
+            "[workspace.metadata.curl.provenance.catalogued]\n\"original/lib\" = 3\n\"original/docs\" = 0",
+        );
+        let workspace = workspace(&manifest, "stray coverage root");
+        let report = audit(&workspace, &clean_files()).expect("audits");
+        assert!(report.render().contains("FAIL coverage-declared"));
+    }
+
+    #[test]
+    fn a_missing_manifest_table_is_a_load_error() {
+        let manifest = ROOT_MANIFEST.replace(
+            "[workspace.metadata.curl.provenance.manifests]\n\"original/lib\" = \"original/lib/Makefile.inc\"\n",
+            "",
+        );
+        let workspace = workspace(&manifest, "no manifest table");
+        assert!(audit(&workspace, &clean_files()).is_err());
+    }
+
+    #[test]
+    fn a_complete_catalogue_passes_the_new_gates() {
+        let workspace = workspace(ROOT_MANIFEST, "complete provenance");
+        let report = audit(&workspace, &clean_files()).expect("audits");
+        let rendered = report.render();
+        assert!(
+            rendered.contains("PASS manifests-cover-every-root"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("PASS manifests-readable"), "{rendered}");
+        assert!(rendered.contains("PASS coverage-declared"), "{rendered}");
+        assert!(rendered.contains("PASS coverage-denominator"), "{rendered}");
     }
 }

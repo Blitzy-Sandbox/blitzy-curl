@@ -12,7 +12,8 @@ use std::fmt::Write as _;
 
 use crate::contract::Index;
 use crate::forward::Forward;
-use crate::hazards::Hazard;
+use crate::hazards::{Coverage, Divergence, Hazard};
+use crate::observability::{Contract, Flow};
 use crate::oracle::Survey;
 use crate::reverse::Reverse;
 
@@ -24,6 +25,10 @@ pub const TRACEABILITY: &str = "traceability";
 pub const COVERAGE: &str = "coverage";
 /// Document name of the hazard register.
 pub const QUIRKS: &str = "quirks";
+/// Document name of the divergence allowlist.
+pub const DIVERGENCE: &str = "divergence-allowlist";
+/// Document name of the observability contract.
+pub const OBSERVABILITY: &str = "observability";
 
 const HEADER: &str = "<!--\nSPDX-FileCopyrightText: the blitzy-curl project contributors\nSPDX-License-Identifier: curl\n-->\n";
 
@@ -137,6 +142,19 @@ fn provenance(survey: &Survey, forward: &Forward, present: &BTreeMap<String, boo
     }
 
     let orphans = forward.family("orphan-declaration");
+    out.push_str("\n## Orphan definitions\n\nThe mirror image, taken from upstream's own single-use whitelist at\n`original/scripts/singleuse.pl` rather than from a list of ours. `Reach` is\nre-measured over the library sources on every run and a disagreement with the\ndeclared value fails, so a symbol that gains or loses its last caller upstream\ncannot pass unnoticed.\n\n| # | Symbol | Reach | Disposition | Decision |\n|---:|---|---|---|---|\n");
+    for (index, row) in forward.family("orphan-definition").iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "| {} | `{}` | {} | {} | {} |",
+            index + 1,
+            cell(&row.source),
+            cell(&row.detail),
+            cell(&row.disposition),
+            cell(&row.decision)
+        );
+    }
+
     out.push_str("\n## Orphan declarations\n\nA declaration with no definition and no caller takes a row here and no Rust\ncounterpart.\n\n| # | Locator | What exists instead | Decision |\n|---:|---|---|---|\n");
     for (index, row) in orphans.iter().enumerate() {
         let _ = writeln!(
@@ -169,6 +187,7 @@ fn traceability(
         ("build-flag", "Build flags and build-system options"),
         ("internal-surface-case", "Internal-surface cases"),
         ("orphan-declaration", "Orphan declarations"),
+        ("orphan-definition", "Orphan definitions"),
     ];
     let mut out = String::new();
     preamble(
@@ -367,19 +386,23 @@ fn coverage(survey: &Survey, forward: &Forward, present: &BTreeMap<String, bool>
 }
 
 /// Renders `refactor/docs/QUIRKS.md`.
-fn quirks(hazards: &[Hazard], present: &BTreeMap<String, bool>) -> String {
+fn quirks(hazards: &[Hazard], accounting: &Coverage, present: &BTreeMap<String, bool>) -> String {
     let count = |verdict: &str| hazards.iter().filter(|h| h.verdict == verdict).count();
     let mut out = String::new();
     preamble(
         &mut out,
         "Quirks and Hazards",
         &format!(
-            "Every hazard the vendored oracle carries that the port has to answer for, with\nthe verdict the project holds, the crate that owns it and the verification that\nproves the verdict. **{} hazard(s)**: **{}** reproduced bug for bug, **{}**\nsubstituted with an identical observable outcome, **{}** diverging and therefore\ncarrying a divergence-allowlist entry, and **{}** belonging to a platform the\nmatrix excludes. `Status` is `obligation` where the named verification is not\nyet written and `verified` only where an artifact exists. Upstream's own record\nof known issues is `original/docs/KNOWN_BUGS.md`; this file records what the\nport does about the hazards, not a second copy of that record.",
+            "Every hazard the vendored oracle carries that the port has to answer for, with\nthe verdict the project holds, the crate that owns it and the verification that\nproves the verdict. **{} hazard(s)**: **{}** reproduced bug for bug, **{}**\nsubstituted with an identical observable outcome, **{}** diverging and therefore\ncarrying a divergence-allowlist entry, and **{}** belonging to a platform the\nmatrix excludes. `Status` is `obligation` where the named verification is not\nyet written and `verified` only where an artifact exists. Upstream's own record\nof known issues is `original/docs/KNOWN_BUGS.md`; this file records what the\nport does about the hazards, not a second copy of that record.\n\nCompleteness is a gate rather than a claim. **{} oracle path(s)** are declared\nreviewed, each with a frozen row count, and the discovery pass finds **{}\nannotation site(s)** across them - the markers upstream writes where it knows a\nbehaviour is sharp. **{}** of those sites fall inside a row above; the remaining\n**{}** carry a written disposition below. A site with neither, a disposition\nnaming a line that no longer carries an annotation, and a row whose path is not\ndeclared reviewed each fail the run.",
             hazards.len(),
             count("reproduce"),
             count("substitute"),
             count("diverge"),
-            count("not-ported")
+            count("not-ported"),
+            accounting.reviewed,
+            accounting.sites,
+            accounting.covered,
+            accounting.dispositions.len()
         ),
     );
 
@@ -406,6 +429,20 @@ fn quirks(hazards: &[Hazard], present: &BTreeMap<String, bool>) -> String {
             cell(&hazard.verification),
             cell(&hazard.status),
             cell(&hazard.decision)
+        );
+    }
+
+    out.push_str("\n## Annotation accounting\n\nEvery discovered site that no row covers, with why it needs none.\n\n| # | Site | Class | Disposition | Decision |\n|---:|---|---|---|---|\n");
+    for (index, disposition) in accounting.dispositions.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "| {} | `{}:{}` | {} | {} | {} |",
+            index + 1,
+            cell(&disposition.path),
+            disposition.line,
+            cell(&disposition.class),
+            cell(&disposition.reason),
+            cell(&disposition.decision)
         );
     }
 
@@ -436,6 +473,246 @@ fn quirks(hazards: &[Hazard], present: &BTreeMap<String, bool>) -> String {
     out
 }
 
+/// Renders `refactor/docs/OBSERVABILITY.md`.
+///
+/// The reused-versus-added split the observability rule requires by name, plus
+/// the inventory of every place the oracle writes a value to a diagnostic
+/// surface. The sensitive half is the part worth reading: the four line
+/// protocols reach their emitter through an exported wrapper, so a count of
+/// direct emissions reports them as having no trace surface at all while every
+/// one of their authentication commands is written out in full.
+fn observability(contract: &Contract, flow: &Flow) -> String {
+    let mut out = String::new();
+    let elements: BTreeMap<&str, Vec<&str>> =
+        contract
+            .reused
+            .iter()
+            .fold(BTreeMap::new(), |mut found, entry| {
+                found
+                    .entry(entry.element.as_str())
+                    .or_default()
+                    .push(entry.surface.as_str());
+                found
+            });
+    preamble(
+        &mut out,
+        "Observability",
+        &format!(
+            "What the vendored oracle already provides and the port reuses, what this project\nadds on top of it, and every place a value the oracle writes to a diagnostic\nsurface is a credential. **{} reused surface(s)** across **{} element(s)**,\n**{} added element(s)**, **{} sink(s)** and **{} declared disclosure(s)**.\n\nReuse is verified rather than claimed: every reused surface is read at the tag\nand must still carry the token that names it, so a stale line number fails the\nrun. The sensitive inventory follows data flow rather than counting emitters,\nwhich is the only way it can be complete - the four line protocols never call\nthe emitter themselves, they call an exported wrapper, and **{} call site(s)**\nof that wrapper are discovered mechanically across their four files. **{}** of\nthose match a declared disclosure shape and each one is declared below; a call\nsite added upstream changes a frozen count and fails the run whether or not\nanyone remembered to write it down.\n\nNothing added here changes a byte of the reused surfaces. No new command-line\nflag, no new library option, no change to the default feature set: the added\ninstrumentation is compiled in unconditionally and is a complete no-op with no\nsubscriber installed, which is what keeps the differential byte comparison\nhonest. Every network-exposed element lives in the verification tree, whose\nharness runners are the only long-running processes here for which such an\nendpoint means anything.",
+            contract.reused.len(),
+            elements.len(),
+            contract.added.len(),
+            contract.sinks.len(),
+            contract.disclosures.len(),
+            flow.sites.len(),
+            flow.matched
+        ),
+    );
+
+    out.push_str("\n## Reused\n\n| Element | Surface | Locator | Evidence | Decision |\n|---|---|---|---|---|\n");
+    for entry in &contract.reused {
+        let _ = writeln!(
+            out,
+            "| {} | {} | `{}:{}` | `{}` | {} |",
+            cell(&entry.element),
+            cell(&entry.surface),
+            cell(&entry.path),
+            entry.line,
+            cell(&entry.evidence),
+            cell(&entry.decision)
+        );
+    }
+
+    out.push_str("\n## Added\n\n| Element | What it is | Where | Inert without a subscriber | Tree | Decision |\n|---|---|---|---|---|---|\n");
+    for entry in &contract.added {
+        let _ = writeln!(
+            out,
+            "| {} | {} | `{}` | {} | {} | {} |",
+            cell(&entry.element),
+            cell(&entry.detail),
+            cell(&entry.at),
+            if entry.inert { "yes" } else { "no" },
+            if entry.in_verification_tree {
+                "verification"
+            } else {
+                "implementation"
+            },
+            cell(&entry.decision)
+        );
+    }
+
+    out.push_str("\n## Diagnostic sinks\n\n| ID | Locator | Emitter | Surface | What a reader learns | Reached through | Verdict | Decision |\n|---|---|---|---|---|---|---|---|\n");
+    for sink in &contract.sinks {
+        let _ = writeln!(
+            out,
+            "| {} | `{}:{}` | `{}` | {} | {} | {} | {} | {} |",
+            cell(&sink.id),
+            cell(&sink.path),
+            sink.line,
+            cell(&sink.emitter),
+            cell(&sink.kind),
+            cell(&sink.discloses),
+            if sink.reached_through.is_empty() {
+                "_called in place_".to_owned()
+            } else {
+                sink.reached_through
+                    .iter()
+                    .map(|wrapper| format!("`{}`", cell(wrapper)))
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            },
+            cell(&sink.verdict),
+            cell(&sink.decision)
+        );
+    }
+
+    out.push_str("\n## Disclosure shapes\n\nWhat makes a discovered call site a disclosure. Matching is on the call's first\nstring literal, with the argument text where the literal alone is ambiguous.\n\n| Format | Argument | Class | What a reader learns |\n|---|---|---|---|\n");
+    for shape in &contract.shapes {
+        let _ = writeln!(
+            out,
+            "| `{}` | {} | {} | {} |",
+            cell(&shape.format),
+            shape.argument.as_ref().map_or_else(
+                || "_any_".to_owned(),
+                |argument| format!("`{}`", cell(argument))
+            ),
+            cell(&shape.class),
+            cell(&shape.discloses)
+        );
+    }
+
+    out.push_str("\n## Shared-sink consumers\n\nCall sites are discovered rather than listed; the count is frozen so drift fails.\n\n| Sink | Consumer | Call sites | Disclosures | Decision |\n|---|---|---:|---:|---|\n");
+    for caller in &contract.callers {
+        let _ = writeln!(
+            out,
+            "| {} | `{}` | {} | {} | {} |",
+            cell(&caller.sink),
+            cell(&caller.path),
+            caller.sites,
+            contract
+                .disclosures
+                .iter()
+                .filter(|entry| entry.path == caller.path)
+                .count(),
+            cell(&caller.decision)
+        );
+    }
+
+    out.push_str("\n## Declared disclosures\n\n| # | Sink | Call site | Class | Decision |\n|---:|---|---|---|---|\n");
+    for (index, entry) in contract.disclosures.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "| {} | {} | `{}:{}` | {} | {} |",
+            index + 1,
+            cell(&entry.sink),
+            cell(&entry.path),
+            entry.line,
+            cell(&entry.class),
+            cell(&entry.decision)
+        );
+    }
+
+    let _ = write!(
+        out,
+        "\n## Sensitive fields\n\nField names no added instrumentation may carry, checked over every\nproject-authored Rust file against {} instrumentation call shape(s).\n\n",
+        contract.instrumentation.len()
+    );
+    for field in &contract.sensitive {
+        let _ = writeln!(out, "- `{}`", cell(field));
+    }
+    out
+}
+
+/// The hazard-side inputs the register produces in one pass.
+///
+/// The register is read once and yields three related views - the resolved rows,
+/// what the discovery pass observed, and the divergence allowlist - which travel
+/// together because two of the documents render more than one of them.
+#[derive(Clone, Copy, Debug)]
+pub struct Hazards<'a> {
+    /// Resolved hazard rows.
+    pub rows: &'a [Hazard],
+    /// What the discovery pass observed over the reviewed set.
+    pub accounting: &'a Coverage,
+    /// Divergence-allowlist entries.
+    pub divergences: &'a [Divergence],
+}
+
+/// Renders `refactor/docs/DIVERGENCE-ALLOWLIST.md`.
+///
+/// One row per hazard whose verdict is `diverge`. The allowlist is the shortest
+/// document the project generates on purpose: it is the list that is supposed to
+/// stay short, and a growing one is the signal that the rewrite is drifting.
+fn divergence(
+    entries: &[Divergence],
+    hazards: &[Hazard],
+    present: &BTreeMap<String, bool>,
+) -> String {
+    let rows: BTreeMap<&str, &Hazard> = hazards
+        .iter()
+        .map(|hazard| (hazard.id.as_str(), hazard))
+        .collect();
+    let mut out = String::new();
+    preamble(
+        &mut out,
+        "Divergence Allowlist",
+        &format!(
+            "Every behaviour where the port does not match the vendored oracle, with the
+deterministic outcome it holds instead, why that is accepted and who is
+accountable for it. **{} entry/entries**, one for each hazard in
+`refactor/docs/QUIRKS.md` whose verdict is `diverge`.
+
+The list is a gate in both directions: a `diverge` verdict with no entry here
+and an entry here answering no `diverge` verdict each fail the run, as does an
+entry whose owner disagrees with its hazard row or whose decision does not
+resolve. Every `abidiff` suppression is an entry in this file rather than
+tool configuration, so no suppression can hide a real difference. An empty
+allowlist is the target; a growing one is the signal that the rewrite is
+drifting and is what makes this file worth reading rather than filing.",
+            entries.len()
+        ),
+    );
+
+    out.push_str("\n## Entries\n\n| ID | Hazard | Locator | Oracle behaviour | Outcome the port holds | Rationale | Owner | Decision |\n|---|---|---|---|---|---|---|---|\n");
+    for entry in entries {
+        let row = rows.get(entry.hazard.as_str());
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} | `{}` ({}) | {} |",
+            cell(&entry.id),
+            cell(&entry.hazard),
+            row.map_or_else(
+                || "_unresolved_".to_owned(),
+                |hazard| format!(
+                    "`{}:{}-{}`",
+                    cell(&hazard.path),
+                    hazard.lines.0,
+                    hazard.lines.1
+                )
+            ),
+            row.map_or_else(
+                || "_unresolved_".to_owned(),
+                |hazard| cell(&hazard.behaviour)
+            ),
+            cell(&entry.outcome),
+            cell(&entry.rationale),
+            cell(&entry.owner),
+            status(present, &entry.owner),
+            cell(&entry.decision)
+        );
+    }
+
+    out.push_str("\n## Entries by owner\n\n| Owner | Entries |\n|---|---:|\n");
+    let mut owners: BTreeMap<&str, usize> = BTreeMap::new();
+    for entry in entries {
+        *owners.entry(entry.owner.as_str()).or_default() += 1;
+    }
+    for (owner, tally) in owners {
+        let _ = writeln!(out, "| `{}` | {} |", cell(owner), tally);
+    }
+    out
+}
+
 /// Renders every declared document, keyed by its output path.
 #[must_use]
 pub fn documents(
@@ -443,7 +720,8 @@ pub fn documents(
     survey: &Survey,
     forward: &Forward,
     reverse: &Reverse,
-    hazards: &[Hazard],
+    hazards: Hazards<'_>,
+    observed: (&Contract, &Flow),
     present: &BTreeMap<String, bool>,
 ) -> Vec<(String, String)> {
     let mut rendered = Vec::new();
@@ -458,7 +736,12 @@ pub fn documents(
         traceability(survey, forward, reverse, present),
     );
     add(COVERAGE, coverage(survey, forward, present));
-    add(QUIRKS, quirks(hazards, present));
+    add(QUIRKS, quirks(hazards.rows, hazards.accounting, present));
+    add(
+        DIVERGENCE,
+        divergence(hazards.divergences, hazards.rows, present),
+    );
+    add(OBSERVABILITY, observability(observed.0, observed.1));
     rendered.sort_by(|left, right| left.0.cmp(&right.0));
     rendered
 }
