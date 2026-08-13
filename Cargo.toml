@@ -593,6 +593,35 @@ delivered = "absorbed-upstream"                                       # DL-0172
 flag-contract = "none"
 decision = "DL-0172"
 
+# No man page for the two test scripts.                               DL-0271
+# Page sources live under original/docs at the tag's paths.            DL-0271
+[workspace.metadata.curl.baseline-premise-deltas.testcurl-manpage]
+plan-premise = "original/tests/.gitignore excluding the generated testcurl.1 and runtests.1 man pages built beside the scripts"
+absent-paths = [
+  "original/tests/runtests.1",
+  "original/tests/testcurl.1",
+]
+present-paths = [
+  "original/tests/testcurl.pl",
+  "original/tests/.gitignore",
+  "original/docs/testcurl.md",
+  "original/docs/runtests.md",
+  "original/docs/.gitignore",
+]
+evidence = [
+  { path = "original/tests/Makefile.am", line = 79, contains = "testcurl.pl" },
+  { path = "original/tests/.gitignore", line = 23, contains = "second-hsts.txt" },
+  { path = "original/docs/Makefile.am", line = 31, contains = "man_MANS = curl-config.1 wcurl.1" },
+  { path = "original/docs/Makefile.am", line = 34, contains = "runtests.md testcurl.md" },
+  { path = "original/docs/Makefile.am", line = 40, contains = "CLEANFILES = $(MK_CA_DOCS) $(man_MANS)" },
+  { path = "original/docs/Makefile.am", line = 79, contains = "$(CURLPAGES)" },
+  { path = "original/docs/.gitignore", line = 5, contains = "*.1" },
+  { path = "original/docs/testcurl.md", line = 4, contains = "Title: testcurl.pl" },
+]
+delivered = "vendored-at-tag-path"                                    # DL-0271
+flag-contract = "none"
+decision = "DL-0271"
+
 # Index of the traceability generator; the data lives with it.         DL-0111
 # Hazard verdicts, owners and evidence: data/hazards.toml.             DL-0110
 [workspace.metadata.curl.traceability]
@@ -662,7 +691,7 @@ kinds = { translation-unit = "c", header = "h" }                      # DL-0138
 # Paths catalogued per root; the count is frozen.                     DL-0235
 [workspace.metadata.curl.provenance.catalogued]
 "original/lib" = 30                                                   # DL-0235
-"original/src" = 8                                                    # DL-0235
+"original/src" = 20                                                   # DL-0235
 
 # Rules the audit runs, never recorded figures.                       DL-0040
 [workspace.metadata.curl.provenance.extraction]
@@ -994,6 +1023,36 @@ lines = 91
 type-definitions = 2
 
 [[workspace.metadata.curl.provenance.owners]]
+path = "original/src/slist_wc.c"
+kind = "translation-unit"
+crate = "refactor/curl-cli"
+decision = "DL-0269"
+manifest-line = 80
+lines = 69
+function-definitions = 2
+trace-calls = 0
+infof-calls = 0
+failf-calls = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/slist_wc.h"
+kind = "header"
+crate = "refactor/curl-cli"
+decision = "DL-0269"
+manifest-line = 124
+lines = 57
+type-definitions = 1
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/terminal.h"
+kind = "header"
+crate = "refactor/curl-cli"
+decision = "DL-0263"
+manifest-line = 125
+lines = 30
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
 path = "original/src/tool_cb_rea.c"
 kind = "translation-unit"
 crate = "refactor/curl-cli"
@@ -1015,6 +1074,66 @@ lines = 42
 type-definitions = 0
 
 [[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_dirhie.c"
+kind = "translation-unit"
+crate = "refactor/curl-cli"
+decision = "DL-0247"
+manifest-line = 90
+lines = 154
+function-definitions = 4
+trace-calls = 0
+infof-calls = 0
+failf-calls = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_dirhie.h"
+kind = "header"
+crate = "refactor/curl-cli"
+decision = "DL-0247"
+manifest-line = 134
+lines = 34
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_doswin.h"
+kind = "header"
+crate = "refactor/curl-cli"
+decision = "DL-0253"
+manifest-line = 135
+lines = 58
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_easysrc.c"
+kind = "translation-unit"
+crate = "refactor/curl-cli"
+decision = "DL-0267"
+manifest-line = 92
+lines = 234
+function-definitions = 7
+trace-calls = 0
+infof-calls = 0
+failf-calls = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_easysrc.h"
+kind = "header"
+crate = "refactor/curl-cli"
+decision = "DL-0241"
+manifest-line = 136
+lines = 58
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_filetime.h"
+kind = "header"
+crate = "refactor/curl-cli"
+decision = "DL-0260"
+manifest-line = 137
+lines = 37
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
 path = "original/src/tool_formparse.h"
 kind = "header"
 crate = "refactor/curl-cli"
@@ -1022,6 +1141,27 @@ decision = "DL-0196"
 manifest-line = 139
 lines = 67
 type-definitions = 1
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_libinfo.c"
+kind = "translation-unit"
+crate = "refactor/curl-cli"
+decision = "DL-0252"
+manifest-line = 101
+lines = 205
+function-definitions = 2
+trace-calls = 0
+infof-calls = 0
+failf-calls = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_libinfo.h"
+kind = "header"
+crate = "refactor/curl-cli"
+decision = "DL-0252"
+manifest-line = 145
+lines = 69
+type-definitions = 0
 
 [[workspace.metadata.curl.provenance.owners]]
 path = "original/src/tool_operhlp.h"
@@ -1051,6 +1191,15 @@ crate = "refactor/curl-cli"
 decision = "DL-0214"
 manifest-line = 151
 lines = 34
+type-definitions = 0
+
+[[workspace.metadata.curl.provenance.owners]]
+path = "original/src/tool_stderr.h"
+kind = "header"
+crate = "refactor/curl-cli"
+decision = "DL-0238"
+manifest-line = 157
+lines = 33
 type-definitions = 0
 
 [[workspace.metadata.curl.provenance.owners]]

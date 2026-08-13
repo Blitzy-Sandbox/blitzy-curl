@@ -12,7 +12,7 @@ edit this file by hand. Rationale lives in `refactor/docs/DECISION-LOG.md`.
 
 What the vendored oracle already provides and the port reuses, what this project
 adds on top of it, and every place a value the oracle writes to a diagnostic
-surface is a credential. **21 reused surface(s)** across **6 element(s)**,
+surface is a credential. **41 reused surface(s)** across **8 element(s)**,
 **5 added element(s)**, **16 sink(s)** and **17 declared disclosure(s)**.
 
 Reuse is verified rather than claimed: every reused surface is read at the tag
@@ -52,12 +52,32 @@ endpoint means anything.
 | log surface | per-feature configuration flag | `original/src/tool_getparam.c:352` | `trace-config` | DL-0232 |
 | log surface | verbose flag | `original/src/tool_getparam.c:364` | `verbose` | DL-0232 |
 | log surface | byte-frozen trace formatter | `original/src/tool_cb_dbg.c:128` | `tool_debug_cb` | DL-0232 |
+| log surface | trace timestamp clock | `original/src/tool_util.c:51` | `tvrealnow` | DL-0266 |
+| log surface | timestamp on the traced line | `original/src/tool_cb_dbg.c:148` | `tvrealnow` | DL-0266 |
 | log surface | diagnostic message path | `original/src/tool_msgs.c:34` | `voutf` | DL-0232 |
+| log surface | redirectable diagnostic stream every tool message is written to | `original/src/tool_setup.h:42` | `extern FILE *tool_stderr;` | DL-0239 |
+| log surface | diagnostic stream initialisation | `original/src/tool_stderr.h:30` | `tool_init_stderr` | DL-0239 |
+| log surface | diagnostic stream redirection entry point | `original/src/tool_stderr.h:31` | `tool_set_stderr_file` | DL-0239 |
+| log surface | diagnostic stream redirection flag | `original/src/tool_getparam.c:325` | `stderr` | DL-0239 |
 | progress reporting | transfer progress callback | `original/src/tool_progress.c:67` | `xferinfo_cb` | DL-0232 |
 | progress reporting | progress meter | `original/src/tool_progress.c:158` | `progress_meter` | DL-0232 |
 | library observability options | verbosity option | `original/include/curl/curl.h:1291` | `CURLOPT_VERBOSE` | DL-0232 |
 | library observability options | application trace callback | `original/include/curl/curl.h:1475` | `CURLOPT_DEBUGFUNCTION` | DL-0232 |
 | library observability options | application progress callback | `original/include/curl/curl.h:1919` | `CURLOPT_XFERINFOFUNCTION` | DL-0232 |
+| library observability options | diagnostic stream option | `original/include/curl/curl.h:1281` | `CURLOPT_STDERR` | DL-0239 |
+| library observability options | tool diagnostic stream handed to the library | `original/src/config2setopts.c:990` | `CURLOPT_STDERR, tool_stderr` | DL-0239 |
+| CI result reporting | Azure Pipelines environment detection | `original/tests/azure.pm:45` | `azure_check_environment` | DL-0245 |
+| CI result reporting | test run opened for the harness job | `original/tests/azure.pm:55` | `azure_create_test_run` | DL-0245 |
+| CI result reporting | per-case result record | `original/tests/azure.pm:75` | `azure_create_test_result` | DL-0245 |
+| CI result reporting | per-case outcome and timings | `original/tests/azure.pm:104` | `azure_update_test_result` | DL-0245 |
+| CI result reporting | test run completion | `original/tests/azure.pm:147` | `azure_update_test_run` | DL-0245 |
+| log surface | single diagnostic sink | `original/src/tool_stderr.c:29` | `FILE *tool_stderr;` | DL-0254 |
+| log surface | whole-sink redirection | `original/src/tool_stderr.c:37` | `tool_set_stderr_file` | DL-0254 |
+| log surface | sink redirection flag | `original/src/tool_getparam.c:325` | `C_STDERR` | DL-0254 |
+| build reporting | autobuild report line prefix; vendored, not executed by this project | `original/tests/testcurl.pl:205` | `testcurl: ` | DL-0272 |
+| build reporting | report begin sentinel a consumer triggers on; not executed here | `original/tests/testcurl.pl:325` | `STARTING HERE` | DL-0272 |
+| build reporting | report end sentinel closing the same report; not executed here | `original/tests/testcurl.pl:231` | `ENDING HERE` | DL-0272 |
+| build reporting | environment and version banner of that report; not executed here | `original/tests/testcurl.pl:348` | `version = $version` | DL-0272 |
 
 ## Added
 

@@ -220,11 +220,59 @@ decision = "DL-0232"
 
 [[reused]]
 element = "log surface"
+surface = "trace timestamp clock"
+path = "original/src/tool_util.c"
+line = 51
+evidence = "tvrealnow"
+decision = "DL-0266"
+
+[[reused]]
+element = "log surface"
+surface = "timestamp on the traced line"
+path = "original/src/tool_cb_dbg.c"
+line = 148
+evidence = "tvrealnow"
+decision = "DL-0266"
+
+[[reused]]
+element = "log surface"
 surface = "diagnostic message path"
 path = "original/src/tool_msgs.c"
 line = 34
 evidence = "voutf"
 decision = "DL-0232"
+
+[[reused]]
+element = "log surface"
+surface = "redirectable diagnostic stream every tool message is written to"
+path = "original/src/tool_setup.h"
+line = 42
+evidence = "extern FILE *tool_stderr;"
+decision = "DL-0239"
+
+[[reused]]
+element = "log surface"
+surface = "diagnostic stream initialisation"
+path = "original/src/tool_stderr.h"
+line = 30
+evidence = "tool_init_stderr"
+decision = "DL-0239"
+
+[[reused]]
+element = "log surface"
+surface = "diagnostic stream redirection entry point"
+path = "original/src/tool_stderr.h"
+line = 31
+evidence = "tool_set_stderr_file"
+decision = "DL-0239"
+
+[[reused]]
+element = "log surface"
+surface = "diagnostic stream redirection flag"
+path = "original/src/tool_getparam.c"
+line = 325
+evidence = "stderr"
+decision = "DL-0239"
 
 [[reused]]
 element = "progress reporting"
@@ -265,6 +313,120 @@ path = "original/include/curl/curl.h"
 line = 1919
 evidence = "CURLOPT_XFERINFOFUNCTION"
 decision = "DL-0232"
+
+[[reused]]
+element = "library observability options"
+surface = "diagnostic stream option"
+path = "original/include/curl/curl.h"
+line = 1281
+evidence = "CURLOPT_STDERR"
+decision = "DL-0239"
+
+[[reused]]
+element = "library observability options"
+surface = "tool diagnostic stream handed to the library"
+path = "original/src/config2setopts.c"
+line = 990
+evidence = "CURLOPT_STDERR, tool_stderr"
+decision = "DL-0239"
+
+# The harness's own CI result reporting, reused unchanged. DL-0245.
+[[reused]]
+element = "CI result reporting"
+surface = "Azure Pipelines environment detection"
+path = "original/tests/azure.pm"
+line = 45
+evidence = "azure_check_environment"
+decision = "DL-0245"
+
+[[reused]]
+element = "CI result reporting"
+surface = "test run opened for the harness job"
+path = "original/tests/azure.pm"
+line = 55
+evidence = "azure_create_test_run"
+decision = "DL-0245"
+
+[[reused]]
+element = "CI result reporting"
+surface = "per-case result record"
+path = "original/tests/azure.pm"
+line = 75
+evidence = "azure_create_test_result"
+decision = "DL-0245"
+
+[[reused]]
+element = "CI result reporting"
+surface = "per-case outcome and timings"
+path = "original/tests/azure.pm"
+line = 104
+evidence = "azure_update_test_result"
+decision = "DL-0245"
+
+[[reused]]
+element = "CI result reporting"
+surface = "test run completion"
+path = "original/tests/azure.pm"
+line = 147
+evidence = "azure_update_test_run"
+decision = "DL-0245"
+
+[[reused]]
+element = "log surface"
+surface = "single diagnostic sink"
+path = "original/src/tool_stderr.c"
+line = 29
+evidence = "FILE *tool_stderr;"
+decision = "DL-0254"
+
+[[reused]]
+element = "log surface"
+surface = "whole-sink redirection"
+path = "original/src/tool_stderr.c"
+line = 37
+evidence = "tool_set_stderr_file"
+decision = "DL-0254"
+
+[[reused]]
+element = "log surface"
+surface = "sink redirection flag"
+path = "original/src/tool_getparam.c"
+line = 325
+evidence = "C_STDERR"
+decision = "DL-0254"
+
+# The autobuild report of the vendored driver. Not executed here. DL-0272.
+[[reused]]
+element = "build reporting"
+surface = "autobuild report line prefix; vendored, not executed by this project"
+path = "original/tests/testcurl.pl"
+line = 205
+evidence = "testcurl: "
+decision = "DL-0272"
+
+[[reused]]
+element = "build reporting"
+surface = "report begin sentinel a consumer triggers on; not executed here"
+path = "original/tests/testcurl.pl"
+line = 325
+evidence = "STARTING HERE"
+decision = "DL-0272"
+
+[[reused]]
+element = "build reporting"
+surface = "report end sentinel closing the same report; not executed here"
+path = "original/tests/testcurl.pl"
+line = 231
+evidence = "ENDING HERE"
+decision = "DL-0272"
+
+[[reused]]
+element = "build reporting"
+surface = "environment and version banner of that report; not executed here"
+path = "original/tests/testcurl.pl"
+line = 348
+evidence = "version = $version"
+decision = "DL-0272"
 
 # What this project adds. Nothing here changes a byte of the reused surfaces.
 [[added]]

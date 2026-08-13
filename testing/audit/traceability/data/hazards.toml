@@ -3148,6 +3148,853 @@ verification = "Direct equivalence test over both aggregate percentages across t
 status = "obligation"
 decision = "DL-0237"
 
+[[hazard]]
+id = "HZ-0285"
+path = "original/src/tool_doswin.c"
+lines = [335, 344]
+behaviour = "The reserved-device-name test matches case-insensitively on a prefix rather than on a whole name: CON, PRN, AUX and NUL match at three bytes, CLOCK$ at six, and COM or LPT at four bytes only when the fourth byte is an ASCII 1 through 9 and at three bytes otherwise. A name that is exactly COM or exactly LPT therefore matches with nothing following it and is renamed, although Windows reserves only COM1 through COM9 and LPT1 through LPT9, while COM0, LPT0, a longer form such as COM56 and the console aliases CONIN$ and CONOUT$ each match a prefix arm and are then dropped by the trailing-byte test at line 363, so they pass through untouched. The index test reads one byte, so no wide or non-ASCII digit form is recognised at all."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Rust-native equivalence test over the 37-row table original/tests/tunit/tool1604.c freezes, whose com1 and COM56 rows already pin both sides of the digit test, extended with the derived names COM, LPT, COM0, LPT0, CLOCK$, CONIN$ and CONOUT$ under each of the four flag combinations, asserting the same output string and the same SANITIZEcode for every row; plus differential comparison of the written filename on the Windows target once that target is execution-verified rather than link-verified."
+status = "obligation"
+decision = "DL-0240"
+
+[[hazard]]
+id = "HZ-0286"
+path = "original/src/tool_doswin.c"
+lines = [304, 313]
+behaviour = "With paths allowed, a name whose first two bytes are both backslashes is duplicated and returned before the basename is even computed, so the reserved-device rename never runs on it: the network form, the literal-path form and the device-namespace form all reach the caller unchanged, and tool1604 freezes that outcome for two of the three. A single leading backslash does not take the bypass and its basename is still renamed. The bypass is compiled out for MS-DOS, where the same input reaches the rename instead."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Rust-native equivalence test asserting the bypass for the two forms tool1604 freezes and for the device-namespace form, the absence of the bypass for a single leading backslash, and that the bypass is reachable only with the path flag set; plus a caller-matrix assertion that no server-influenced name is ever sanitised with that flag, the Content-Disposition name at original/src/tool_cb_hdr.c:222 and the URL-derived name at original/src/tool_operhlp.c:235 both passing no flags while only the user-typed glob output at original/src/tool_urlglob.c:794 passes both bypasses."
+status = "obligation"
+decision = "DL-0240"
+
+[[hazard]]
+id = "HZ-0287"
+path = "original/src/tool_doswin.c"
+lines = [346, 364]
+behaviour = "Once a device-name prefix matches, the scan skips any run of spaces and then decides on the next byte: a dot is overwritten with an underscore and the position abandoned with no rename at all, so con.air becomes con_air and con . air becomes con _ air; a colon is overwritten the same way when paths are not allowed and merely stepped over when they are; any other non-terminating byte abandons the position; and only a terminator, reached directly or across the skipped spaces, reaches the rename, so a device name followed by nothing but spaces is renamed with those spaces intact. With no flags the colon arm is unreachable, the caller's own replacement pass at line 470 having already turned every colon into an underscore."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Rust-native equivalence test over the con.air, con . air and con:/x rows tool1604 freezes, which together pin that the dot arm rewrites rather than renames, extended with a device name followed only by spaces under both path settings and with a colon-suffixed device name under the path flag, asserting the output string and the SANITIZEcode for every row."
+status = "obligation"
+decision = "DL-0240"
+
+[[hazard]]
+id = "HZ-0288"
+path = "original/src/tool_doswin.c"
+lines = [485, 499]
+behaviour = "Trailing spaces and dots are removed only when paths are not allowed, and the backward walk starts at the whole length and may reach the first byte, so a name made of nothing but spaces and dots is truncated to the empty string and returned with the success code, leaving the caller to open a file whose name has no bytes; the identical walk leaves a trailing dot or space untouched whenever paths are allowed. The empty result is indistinguishable from the empty input the table's first row freezes."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Rust-native equivalence test over the two trailing-run rows tool1604 freezes, extended with names of one, two and three dots, of spaces alone and of a mixed run of both, asserting the empty output with the success code and, under the path flag, the untouched name; plus a differential assertion that both trees report the same failure once the caller is handed that empty name."
+status = "obligation"
+decision = "DL-0240"
+
+[[hazard]]
+id = "HZ-0289"
+path = "original/src/tool_doswin.c"
+lines = [867, 896]
+behaviour = "The failure path of the standard-input reader cannot run its own recovery. Ownership of the thread data passes to the thread at line 836 and the reader socket is created only at line 839, so the guard that requires a live socket and live thread data together never holds: the standard-input restore, the socket close and the reset of the file-scope socket to the bad value are all unreachable. A failure at connect, at shutdown or at the standard-handle swap therefore answers the bad socket while leaving that file-scope socket holding a live descriptor, and clears the thread handle after terminating the thread, whose own cleanup never runs. The next call in the same process takes the cached early return at lines 772 through 775, where the assertion on the thread handle fails in a build with assertions enabled while a release build hands back a descriptor whose writer thread is gone."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Fault-injected failure of the connect, the shutdown and the standard-handle step on the Windows target, asserting the bad socket on the first call, the warning and the blocking-mode fallback the caller at original/src/tool_operate.c:1199 emits, and the same cached descriptor on a second upload from standard input in one process; recorded as deferred while that target is link-verified only."
+status = "obligation"
+decision = "DL-0240"
+
+[[hazard]]
+id = "HZ-0290"
+path = "original/src/tool_doswin.c"
+lines = [589, 591]
+behaviour = "The module snapshot is retried with no bound and no delay for as long as the system reports a bad length, so a persistent bad-length failure spins in place instead of answering the empty list the function documents for every other failure. Its only caller is the undocumented pre-init diagnostic at original/src/tool_main.c:153, which the option parser never sees, which no manual page and no alias row carries, and which exits zero when the list is non-empty and one when it is empty."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Rust-native test over the retry contract, driving a fault sequence that reports a bad length a fixed number of times and then succeeds, asserting the same retry-until-not-bad-length outcome and the documented empty list for every other failure; plus a differential comparison of the undocumented diagnostic's standard output and exit status on the Windows target, deferred while that target is link-verified only, and an option-surface assertion that the diagnostic is answered before parsing and is absent from the alias table."
+status = "obligation"
+decision = "DL-0240"
+
+[[hazard]]
+id = "HZ-0291"
+path = "original/src/tool_doswin.c"
+lines = [172, 178]
+behaviour = "The MS-DOS drive-letter test accepts every byte from A to z inclusive, so the six ASCII characters that sit between Z and a - the two square brackets, the backslash, the caret, the underscore and the backtick - are read as drive letters whenever a colon follows, and the branch copies that byte through and then writes either a colon or an underscore over the colon according to the path flag."
+verdict = "not-ported"
+owner = "none"
+verification = "The platform matrix excludes MS-DOS and DJGPP, so the arm compiles away on every target in it, which the empty preprocessed translation unit on a matrix host demonstrates; the unit that carries the arm holds a traceability row against curl-cli and the arm itself has no counterpart."
+status = "obligation"
+decision = "DL-0240"
+
+[[hazard]]
+id = "HZ-0292"
+path = "original/src/tool_doswin.c"
+lines = [714, 734]
+behaviour = "The Windows standard-input relay binds a loopback listener on an ephemeral port at lines 791 through 816 and the thread then accepts the first connection that arrives and forwards the whole of standard input to it, with no authentication and no peer validation of any kind, while the tool's own connect at line 848 races that accept. A local process that reaches the port first receives the upload body instead of curl, or disrupts the transfer. Upstream records this as a known security defect at original/docs/KNOWN_BUGS.md:108-121 and names the remedy in the same entry, a random-number check like the one the library's socketpair emulation performs at original/lib/socketpair.c:210-220, while noting that the source address cannot be verified on Windows."
+verdict = "diverge"
+owner = "curl-cli"
+verification = "Loopback race test on the Windows target driving a foreign connection to the relay's port ahead of the tool's own connect, asserting that the foreign peer receives no byte of standard input and that a legitimate upload is byte-identical to one taken through the blocking fallback, plus the divergence-allowlist entry; deferred while that target is link-verified only."
+status = "obligation"
+decision = "DL-0240"
+
+[[hazard]]
+id = "HZ-0293"
+path = "original/src/tool_easysrc.h"
+lines = [36, 36]
+behaviour = "The cleanup section is documented as being emitted in reverse order and it is not: the append helper links each new node at the tail and the dump walks the section from its first member, so the generated program frees in the order the resources were created, lists and mime handles interleaved exactly as the setopt surface produced them."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Byte comparison of the generated program against the two upstream reference programs that pin this order, plus a differential run over one command line creating three lists and two creating a list and a mime in each relative order, asserting the cleanup block the oracle emits line for line."
+status = "obligation"
+decision = "DL-0242"
+
+[[hazard]]
+id = "HZ-0294"
+path = "original/src/tool_easysrc.h"
+lines = [49, 56]
+behaviour = "The disabled branch stubs four of the thirteen declared names and no more, and two of those four do not match the prototype they replace: the cleanup stub expands to nothing although its prototype returns a result code, so consuming that value compiles only with the option, and the dump stub declares one parameter although its prototype declares none, so passing an argument compiles only without it; the nine unstubbed names, eight of them imported by the other consumer, are what force that unit to guard its whole body."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Configuration-pair test with the feature and without it, asserting that a consumer using only the four stubbed names builds in both, that a consumer touching any unstubbed name builds only with the feature, and that without it the option alias is still recognised, warns that it was disabled at build time, reports the option unknown, and is reported off by the version block."
+status = "obligation"
+decision = "DL-0243"
+
+[[hazard]]
+id = "HZ-0295"
+path = "original/src/tool_ssls.c"
+lines = [97, 102]
+behaviour = "The loop that trims the second field of a session record tests whether the field's first byte is blank instead of its last, so a payload beginning with a space or a tab is truncated to that single byte and then fails to decode, while a trailing blank is never removed at all when the first byte is not blank; the loop's bound also stops before the first byte, so a one-byte field is never trimmed."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison over session records whose second field carries a leading blank, a trailing blank and a single byte, asserting the sessions both trees import and the diagnostics both write."
+status = "obligation"
+decision = "DL-0244"
+
+[[hazard]]
+id = "HZ-0296"
+path = "original/src/tool_ssls.c"
+lines = [92, 96]
+behaviour = "The diagnostic for a rejected first field names that field with a misspelling, while the same field is spelled correctly in the local variable, in the public function's parameter and in the record the file writes; the misspelling is part of the standard-error bytes the differential comparison asserts."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of standard error for a session record whose first field is not valid base64, asserting the diagnostic byte for byte."
+status = "obligation"
+decision = "DL-0244"
+
+[[hazard]]
+id = "HZ-0297"
+path = "original/src/tool_ssls.c"
+lines = [92, 120]
+behaviour = "Every rejected record leaves its failure code in the result variable and continues, and after the loop that variable is overwritten unconditionally, so a session file in which every record is rejected still answers success and only the line reader's own error flag can make the load fail."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of exit code and standard error for a session file whose every record is rejected, asserting success is answered in both trees."
+status = "obligation"
+decision = "DL-0244"
+
+[[hazard]]
+id = "HZ-0298"
+path = "original/src/tool_ssls.c"
+lines = [65, 115]
+behaviour = "The count of imported sessions is initialised and incremented but never read, so the number of sessions a load brought in is reported nowhere and the counter has no observable effect."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of standard output and standard error for a session file whose records all import, asserting neither tree reports a count."
+status = "obligation"
+decision = "DL-0244"
+
+[[hazard]]
+id = "HZ-0299"
+path = "original/src/tool_ssls.c"
+lines = [181, 197]
+behaviour = "Both save diagnostics spell a warning prefix inside their own format although the warning writer already prefixes one, so standard error carries that prefix twice on each of those two messages."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of standard error for an uncreatable session file and for a session whose write fails, asserting the doubled prefix byte for byte."
+status = "obligation"
+decision = "DL-0244"
+
+[[hazard]]
+id = "HZ-0300"
+path = "original/src/tool_ssls.c"
+lines = [195, 199]
+behaviour = "Failing to create the session file warns and then returns the success code the result variable was initialised with, so neither the exit status nor the caller ever reflects it, although the option's own documentation states that an uncreatable file is reported as an error."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of exit code and standard error for a session file path that cannot be created, asserting success is answered in both trees."
+status = "obligation"
+decision = "DL-0244"
+
+[[hazard]]
+id = "HZ-0301"
+path = "original/src/tool_ssls.c"
+lines = [155, 158]
+behaviour = "The two comment lines are written from inside the first callback invocation only, while the file itself is opened truncating, so a run that exports no session leaves a zero-byte file: a previously populated session file is destroyed and not even the header survives."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of the written file after a run that exports no session over a pre-existing populated session file, asserting both trees leave the same bytes."
+status = "obligation"
+decision = "DL-0244"
+
+[[hazard]]
+id = "HZ-0302"
+path = "original/src/tool_ssls.c"
+lines = [156, 158]
+behaviour = "The header write is the only write in the export callback whose result is not examined, so a failure to write it is silent and the payload is written after it regardless, while every payload write is checked and answers a write error."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Fault-injected header write failure asserting the code the callback answers and the bytes it leaves, against the oracle under the same injection."
+status = "obligation"
+decision = "DL-0244"
+
+[[hazard]]
+id = "HZ-0303"
+path = "original/src/tool_ssls.c"
+lines = [45, 51]
+behaviour = "The share option is set through the library call rather than through the tool's reporting wrapper, and the verbose option's result is discarded, so only two of the four option failures the helper can encounter are able to reach its caller."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Equivalence test over each of the helper's four option failures, asserting which of them the caller observes and what each writes."
+status = "obligation"
+decision = "DL-0244"
+
+[[hazard]]
+id = "HZ-0304"
+path = "original/src/tool_ssls.c"
+lines = [68, 118]
+behaviour = "The record bound is the line buffer's maximum, and the shared line reader reports an over-long record or an allocation failure as a terminal read error rather than a per-record one, so the first record past the bound ends the whole load with every later record unread, and the only report is the returned failure code, which names no record."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison over a session file whose first record exceeds the bound followed by valid records, asserting the sessions imported, the exit code and the diagnostics."
+status = "obligation"
+decision = "DL-0244"
+
+[[hazard]]
+id = "HZ-0305"
+path = "original/src/tool_ssls.c"
+lines = [179, 183]
+behaviour = "The save diagnostic prints the peer key the export callback is handed, which is the plaintext host and port with the transport, the TLS version, the TLS options and the cipher lists appended, and the client certificate, key, issuer certificate, certificate authority and TLS-SRP username values wherever those are set - the very identification the file itself stores only as a salted hash, and which the option's own documentation says is hashed so that the hosts contacted cannot easily be seen."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of standard error for a session whose write fails, asserting the diagnostic byte for byte, plus the observability check that no added span field and no metric label carries the peer key."
+status = "obligation"
+decision = "DL-0244"
+
+[[hazard]]
+id = "HZ-0306"
+path = "original/src/tool_ssls.c"
+lines = [103, 107]
+behaviour = "The diagnostic for a rejected second field echoes that field into standard error, and the field is the base64 text of a packed session ticket bounded only by the record bound, so a rejected record discloses as much of its ticket text as the message writer admits."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of standard error for records whose second field is invalid base64 at one byte, at a short length and at the record bound, asserting the echoed text and its truncation, plus the observability check that no added span field and no metric label carries ticket bytes."
+status = "obligation"
+decision = "DL-0244"
+
+[[hazard]]
+id = "HZ-0307"
+path = "original/src/tool_setopt.h"
+lines = [48, 76]
+behaviour = "Three of the thirteen name tables the header declares and three of its fourteen option-to-table mappings are reached by nothing at the tag, so the recording arm prints a decimal literal where a symbolic name already exists: the redirect-following table is declared and defined yet never consulted, because that option is applied through the plain long setter, which resolves its text from the static default table instead; the strict-transport table is unreachable because the tool sets only the file-name option and never the control option its mapping names; the subset proxy table repeats four names of the reachable proxy table and is read nowhere; and the two transport-version mappings never expand, because that option goes through a dedicated setter whose expansion passes no table at all."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of generated-source output over the redirect-following option in both of its spellings and over the strict-transport file option, asserting a decimal argument and no control-option line at all, against the symbolic argument the reachable tables produce for the time-condition, netrc and proxy-type options in the same run."
+status = "obligation"
+decision = "DL-0246"
+
+[[hazard]]
+id = "HZ-0308"
+path = "original/src/tool_dirhie.c"
+lines = [115, 122]
+behaviour = "The component walk stops as soon as the byte after the current separator run and component is the terminator, so the last component is always taken to be the file name and is never created: a path with no separator creates nothing at all, while a trailing separator promotes the component before it to a directory, and the tool-unit case pins both. A run of separators is measured and carried into the accumulated path verbatim rather than collapsed, so a doubled separator is handed to the create call and appears in any diagnostic, and no empty component is ever created between two of them."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Rust-native equivalence test over the tool-unit vectors at original/tests/tunit/tool1720.c:32-41, which pin the created set for an empty path, a bare file name, a trailing separator and a two-component path, plus a differential --create-dirs corpus over absent, trailing and doubled separators asserting the created directory set, the exit code and both streams."
+status = "obligation"
+decision = "DL-0248"
+
+[[hazard]]
+id = "HZ-0309"
+path = "original/src/tool_dirhie.c"
+lines = [117, 136]
+behaviour = "A leading separator run is absorbed into the first component instead of being treated as a root of its own, so an absolute output path has its first create attempted at the filesystem root - the tool-unit case pins '/foo' for '/foo/bar/filename' - and because the access-denied error is ignored the walk then proceeds to every deeper component with no diagnostic, so a refused root create is indistinguishable from a successful one."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Rust-native equivalence test over the absolute-path vector at original/tests/tunit/tool1720.c:40-41, plus a differential --create-dirs corpus over absolute output paths run unprivileged, asserting the attempted first component, that the refused root create emits nothing, and that the created set, exit code and both streams agree between the trees."
+status = "obligation"
+decision = "DL-0248"
+
+[[hazard]]
+id = "HZ-0310"
+path = "original/src/tool_dirhie.c"
+lines = [140, 147]
+behaviour = "The already-exists error is ignored without testing what exists, so a component that is a regular file, a symlink to one, a dangling symlink, a device node or any other non-directory is accepted exactly as a created directory is. Where that component is the last directory component the walk ends in silence and the failure surfaces at the output open, which reports that the path is not a directory; where a further component follows, the create of that next component fails with an error the ignore set does not cover and the default diagnostic arm names the accumulated path instead. Both answer the write error, so the two cases differ in which stream carries the message and in where the failure happens rather than in the exit status."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Filesystem matrix over a component that is a regular file, a symlink to a file outside the working directory and a dangling symlink, each in the last directory position and again with a further component behind it, asserting the exit status, which message each tree emits and on which stream, and the byte content of both."
+status = "obligation"
+decision = "DL-0248"
+
+[[hazard]]
+id = "HZ-0311"
+path = "original/src/tool_dirhie.c"
+lines = [59, 64]
+behaviour = "The loop filters the access-denied error before reporting, so that a hierarchy can be traversed through a directory the process may not create in: an unwritable component yields no diagnostic and every deeper component is still attempted. The consequence is that the access-denied arm of the diagnostic helper is unreachable, because the helper has exactly one caller and that caller has already excluded the error the arm answers."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Filesystem matrix over a hierarchy whose first component exists but is not writable and one whose first component cannot be created, asserting both trees emit nothing from the walk and report the same exit code, plus a generated assertion that the arm still has no reachable caller at the tag so that the day upstream stops filtering the error the row fails rather than silently diverging."
+status = "obligation"
+decision = "DL-0248"
+
+[[hazard]]
+id = "HZ-0312"
+path = "original/src/tool_dirhie.c"
+lines = [29, 38]
+behaviour = "The create call passes a directory mode of 0750, which only the POSIX branch receives and which the process umask then masks, so a created hierarchy is enterable by the owner's group and by nobody else there. The Windows, MS-DOS and unit-test shims take the path alone and discard the mode, so on those branches the permissions are whatever the platform default gives and the mode the call names has no effect at all."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Permission assertion over a created two-component hierarchy on both execution-verified platforms under umask 022 and umask 077, comparing the resulting mode bits between the trees rather than against a literal; the Windows behaviour is recorded as deferred because that target is cross-compiled and link-verified only."
+status = "obligation"
+decision = "DL-0248"
+
+[[hazard]]
+id = "HZ-0313"
+path = "original/src/tool_dirhie.c"
+lines = [136, 138]
+behaviour = "An allocation failure while appending the separator run and component answers the code the append itself produced rather than the write error every other failure answers, and answers it without calling the diagnostic helper, so this is the walk's one silent failure: the callers that rely on this unit for the message - two of them say so in their own comments - print nothing and the tool exits on the allocation code. Nothing leaks on that path even though the release call at the end of the walk is skipped, because the append releases the buffer itself before answering, and the too-large arm of that same append is unreachable from here because the accumulated path is always at least one byte shorter than the bound the walk sets from the output path's own length."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Fault-injected allocation failure at the first and at a later component, asserting the port answers the allocation code rather than the write error, emits nothing from the walk, and holds no buffer afterwards; torture mode over the multi-component --create-dirs case 693 is the oracle-side measurement, and a generated assertion that the append still releases on failure keeps the no-leak reading honest if that contract ever changes."
+status = "obligation"
+decision = "DL-0248"
+
+[[hazard]]
+id = "HZ-0314"
+path = "original/src/tool_dirhie.c"
+lines = [100, 105]
+behaviour = "The delimiter set is selected for Windows and DJGPP while the drive-letter skip is compiled for Windows and MS-DOS, and the shared setup header gives every non-Windows platform the forward slash as its directory character, so on MS-DOS without DJGPP the backslash is not a delimiter even though the drive-letter guard is active and the tool-unit case's backslash vectors are compiled in and expect it to be. A backslash-only path is then a single component, the walk ends on its first test and nothing is created."
+verdict = "not-ported"
+owner = "none"
+verification = "Platform matrix excludes MS-DOS; the construct carries a traceability row and no counterpart. Windows MSVC, which the matrix does cover, defines both guards and is internally consistent."
+status = "obligation"
+decision = "DL-0248"
+
+[[hazard]]
+id = "HZ-0315"
+path = "original/src/tool_dirhie.c"
+lines = [124, 133]
+behaviour = "On Windows and MS-DOS a first component of exactly two characters whose second is a colon is appended to the accumulated path but has its create skipped, so a standalone drive letter is never created while a drive-relative first component such as 'C:foo' is created as a literal directory of that name. The test is positional and character-based rather than a drive check, so unsupported spellings such as '1:' and '!:' are skipped alike, and it applies only while the accumulated path is still empty, which is why a two-character component deeper in the path is created normally."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Rust-native equivalence test over the Windows and MS-DOS vectors at original/tests/tunit/tool1720.c:43-54, which pin the created set for the drive-absolute, drive-relative and backslash forms, extended with the unsupported drive spellings and a two-character component deeper in the path; execution is recorded as deferred because that target is cross-compiled and link-verified only."
+status = "obligation"
+decision = "DL-0248"
+
+[[hazard]]
+id = "HZ-0316"
+path = "original/src/tool_libinfo.c"
+lines = [136, 158]
+behaviour = "The result variable is written once at entry and never assigned again, so the protocol loop's leading guard on it is always true and the value is never returned; the function answers a fixed success code at its end and reports failure only from the version-info call itself."
+verdict = "substitute"
+owner = "curl-cli"
+verification = "Equivalence test over the initialisation entry point asserting the success answer for every protocol list the oracle accepts, including the empty list, and the failure answer only when version info is unavailable."
+status = "obligation"
+decision = "DL-0249"
+
+[[hazard]]
+id = "HZ-0317"
+path = "original/src/tool_libinfo.c"
+lines = [124, 185]
+behaviour = "The feature counter is a zero-initialised global that the naming loop only ever increments, with no reset at entry, so a second initialisation call leaves it at twice the number of names; the counter is what sizes the allocation and the pointer copy that render the feature line, so an inflated value makes that copy read past the end of the name array."
+verdict = "substitute"
+owner = "curl-cli"
+verification = "Equivalence test invoking the initialisation entry point twice and asserting the reported count equals the number of names after each call, plus a rendering test asserting the feature line is identical across both calls."
+status = "obligation"
+decision = "DL-0250"
+
+[[hazard]]
+id = "HZ-0318"
+path = "original/src/tool_libinfo.c"
+lines = [94, 113]
+behaviour = "Two rows of the feature table carry a zero bitmask, so the fallback that builds the name list from the returned bit mask can never report either of them however the library is built; both are reportable only when the library supplies its own name list."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Equivalence test driving the fallback with every bit of the mask set and asserting the produced list omits exactly those two names, and driving the supplied-name path and asserting both are then honoured."
+status = "obligation"
+decision = "DL-0251"
+
+[[hazard]]
+id = "HZ-0319"
+path = "original/src/tool_libinfo.c"
+lines = [88, 119]
+behaviour = "The feature table's own comment requires alphabetical order and the table breaks it: the row for integrated security support precedes the row for session-ticket export, which sorts before it under the case-insensitive comparison the tool uses elsewhere, so the order the fallback emits names in is not the order the comment promises."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Equivalence test over the fallback list asserting the emitted order is the table order rather than a sorted order, pinned at the two rows that break the comment's promise."
+status = "obligation"
+decision = "DL-0251"
+
+[[hazard]]
+id = "HZ-0320"
+path = "original/src/tool_libinfo.c"
+lines = [30, 33]
+behaviour = "Before initialisation the protocol list points at a file-local single-element array holding a null pointer rather than at a null pointer, which is what lets the tokeniser and every caller that walks the list run before initialisation and answer nothing instead of dereferencing a null pointer."
+verdict = "substitute"
+owner = "curl-cli"
+verification = "Equivalence test calling the tokeniser and the list walk before initialisation, asserting no answer and no fault, and asserting the version line suppresses its protocol row when the list is empty."
+status = "obligation"
+decision = "DL-0250"
+
+[[hazard]]
+id = "HZ-0321"
+path = "original/src/tool_libinfo.c"
+lines = [144, 158]
+behaviour = "The protocol count is the pointer difference the walk leaves behind rather than a counter, and it is assigned only inside the branch taken when the library reports a list, so a library reporting none leaves the count at zero beside the single-element sentinel; the count is the exact element total that another unit copies with one added for the terminator, and a separate ceiling of thirty-four in that unit rejects a longer list rather than truncating it."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Equivalence test over lists of length zero, one, thirty-four and thirty-five asserting the recorded count, the terminator's position after the copy, and the rejection answer at the ceiling."
+status = "obligation"
+decision = "DL-0250"
+
+[[hazard]]
+id = "HZ-0322"
+path = "original/src/tool_libinfo.c"
+lines = [149, 183]
+behaviour = "Both the protocol match and the feature match use the case-insensitive comparison, so a library reporting a name in any casing sets the same flag and resolves to the same token, and the token the tokeniser hands back is the library's own spelling rather than the table's."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Equivalence test supplying each name in lower, upper and mixed case, asserting the same flag is set and that the token returned is the supplied spelling rather than the table's."
+status = "obligation"
+decision = "DL-0251"
+
+[[hazard]]
+id = "HZ-0323"
+path = "original/src/tool_libinfo.c"
+lines = [46, 49]
+behaviour = "The two distributed-filesystem scheme tokens are file-local string literals set at compile time rather than resolved from the library's protocol list, and they are defined only when that support is compiled in; callers compare scheme pointers against them by identity, so the tokens must be the same addresses for the whole run and must not appear in the protocol list the library reports."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Equivalence test asserting both tokens are stable addresses across the run, are absent from the reported protocol list, and are what the scheme rewrite short-circuits on, plus the build without that support asserting neither token exists."
+status = "obligation"
+decision = "DL-0251"
+
+[[hazard]]
+id = "HZ-0324"
+path = "original/src/tool_libinfo.c"
+lines = [122, 124]
+behaviour = "The fallback name array is sized from the feature table including its terminator row, and the fallback writes at most one name per non-terminator row followed by a null pointer, so the array fits exactly with no slack; a row added to the table without its terminator being counted would overflow it."
+verdict = "substitute"
+owner = "curl-cli"
+verification = "Equivalence test asserting the fallback list is terminated for a mask that selects every row the table can report, plus a length assertion tying the array's capacity to the table's row count."
+status = "obligation"
+decision = "DL-0251"
+
+[[hazard]]
+id = "HZ-0325"
+path = "original/src/tool_libinfo.c"
+lines = [140, 142]
+behaviour = "The cached version string is whatever the library reports rather than what the tool was compiled against, and another unit prints a mismatch warning when the two differ; at the pinned tag the library's string carries a development suffix that the release archive's does not, because the archive script rewrites the version macros while building the archive."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Equivalence test asserting the cached string is the library's own and that the mismatch warning fires exactly when the compiled-in string differs from it, driven with both the suffixed and the unsuffixed spelling."
+status = "obligation"
+decision = "DL-0251"
+
+[[hazard]]
+id = "HZ-0326"
+path = "original/src/tool_libinfo.h"
+lines = [47, 48]
+behaviour = "The two distributed-filesystem scheme tokens are declared unconditionally while the unit defines them only when that support is compiled in, so the declarations name objects that need not exist; the build holds together only because the single reader is itself compiled out with them."
+verdict = "substitute"
+owner = "curl-cli"
+verification = "Build of the configuration without that support asserting the port exposes neither token and that the scheme rewrite is absent with them, so no declaration outlives its definition."
+status = "obligation"
+decision = "DL-0251"
+
+[[hazard]]
+id = "HZ-0327"
+path = "original/src/tool_libinfo.h"
+lines = [47, 48]
+behaviour = "The two IPFS scheme tokens are declared beside the nine tokens the library fills in, but they never join them: they are defined only inside the IPFS guard, they are absent from the name table the initialiser matches against the library's protocol list, and they hold tool-side literals rather than entries of that list. The printed protocol list carries them anyway, injected after the last library name that sorts before ipfs, while the protocol vocabulary does not, so a plain --proto ipfs answers the warning 'unrecognized protocol' and exits 0 with the set left at the library's own list, the set form --proto =ipfs empties the set first and exits 2 reporting that the option is badly used here, and --proto-default ipfs exits 1 reporting a protocol unsupported by libcurl. The same three answers apply to every name the linked library does not report, so a build without SSH refuses --proto =scp identically."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of the printed protocol list and of --proto ipfs, --proto =ipfs, --proto ipns,file and --proto-default ipfs across both trees, asserting exit code, standard output and standard error, together with the same comparison over --proto =scp in a build whose library reports no SCP so that the vocabulary is proven to follow the library rather than the tool."
+status = "obligation"
+decision = "DL-0255"
+
+[[hazard]]
+id = "HZ-0328"
+path = "original/src/tool_libinfo.h"
+lines = [58, 58]
+behaviour = "One of the fifteen capability flags this header declares is dead at the pinned tag. It is written only through the feature-table row keyed to the deprecated NTLM_WB version bit, and no consumer reads it: of the 33 external names this header declares, 32 are undefined in at least one other tool object and this one in none. The library cannot raise it either, since that name occurs nowhere under the library tree, so the printed feature list can never carry NTLM_WB, while the deprecated alias keeps warning that it has no function anymore and exits 0 without consulting the flag. The version bit is deprecated rather than removed, so the flag stays declared, stays writable by an older library that still reports the name, and stays unread."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of the printed feature list and of the deprecated alias's warning text and exit code across both trees, plus a symbol-level assertion over the ported capability state that the flag is carried and that no consumer reads it."
+status = "obligation"
+decision = "DL-0255"
+
+[[hazard]]
+id = "HZ-0329"
+path = "original/src/tool_setopt.c"
+lines = [189, 233]
+behaviour = "Every string the generator emits is capped at 2000 bytes and three dots are appended inside the string literal, with no diagnostic and no effect on the option the transfer actually used, so the emitted program carries a value the transfer never had. The post body is the sharp case, because its length is emitted as a separate size option that keeps the original length: a 3000-byte body emits a 2003-byte literal beside a declared size of 3000, and the emitted program reads 997 bytes past the literal."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Byte comparison of the generated program over a header, a user agent and a post body at 1999, 2000, 2001 and 3000 bytes, asserting the same cap, the same three dots inside the literal, the same absent diagnostic and the same declared size beside the truncated body."
+status = "obligation"
+decision = "DL-0257"
+
+[[hazard]]
+id = "HZ-0330"
+path = "original/src/tool_setopt.c"
+lines = [199, 223]
+behaviour = "The escape pass emits its own dialect rather than a general C escape: tab, carriage return, newline, question mark, double quote and backslash become two-character escapes, the question mark among them so that a sequence the emitted program would read as a trigraph cannot form; any other byte the printable predicate rejects becomes a three-digit octal escape when the byte after it is a hexadecimal digit and a two-digit hexadecimal escape otherwise, so one byte value has two spellings depending on its neighbour."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Byte comparison of the generated program over a header value carrying each of the six named characters, a byte of 0x01 followed by a hexadecimal digit and by a non-hexadecimal one, and the delete byte at the end of the value."
+status = "obligation"
+decision = "DL-0257"
+
+[[hazard]]
+id = "HZ-0331"
+path = "original/src/tool_setopt.c"
+lines = [240, 264]
+behaviour = "The enum recorder applies the value and then decides separately whether to emit it: a zero value is applied to the handle and omitted from the emitted program, and a value no table entry names is emitted as a decimal long rather than as the symbol, so whether the emitted program names a constant depends on how current the table is. Two options reach that fallback at this tag, the proxy type for an HTTPS proxy attempting HTTP/2 and the HTTP version for prior knowledge, which emit 3 and 5 as decimals."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Byte comparison of the generated program over one invocation per value of every option the enum recorder serves, including the two values no entry names and one zero value, asserting the same symbol, the same decimal and the same omission."
+status = "obligation"
+decision = "DL-0257"
+
+[[hazard]]
+id = "HZ-0332"
+path = "original/src/tool_setopt.c"
+lines = [278, 315]
+behaviour = "The TLS version recorder splits the value at sixteen bits and treats the two halves unequally. An unrecognised low half falls back to a decimal long, while an unrecognised high half is dropped from the emitted program in silence and the low half is emitted alone, so the emitted program can request a floor without the ceiling the transfer used. The zero ceiling is tabled under an empty name, which is what suppresses its term without a lookup failure."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Byte comparison of the generated program over every floor and ceiling pair the command line can express, plus a synthesised value whose high half no entry names, asserting the same combined term, the same suppression of the zero ceiling and the same silent drop."
+status = "obligation"
+decision = "DL-0257"
+
+[[hazard]]
+id = "HZ-0333"
+path = "original/src/tool_setopt.c"
+lines = [330, 359]
+behaviour = "The bitmask recorder walks its table once, taking the first entry whose bits are all present and clearing them, so the combination entries win over the single bits that make them up and the order of the table is the order of the emitted terms. The zero-valued entry matches any remainder without clearing anything, which emits a term contributing no bits, and whatever remains afterwards is emitted as an unsigned decimal: a bearer token emits that entry followed by 64, an SigV4 signature by 128, and early data alone by 64 on the TLS option. Continuation lines are padded to the width of a preamble held in eighty bytes, which truncates without a diagnostic if an option name ever outgrows it."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Byte comparison of the generated program over each single flag, each documented combination and the three bit values no entry names, asserting the same term order, the same zero-valued term, the same decimal remainder and the same continuation padding."
+status = "obligation"
+decision = "DL-0257"
+
+[[hazard]]
+id = "HZ-0334"
+path = "original/src/tool_setopt.c"
+lines = [612, 631]
+behaviour = "The long recorder suppresses emission when the value equals a non-zero default, and it finds that default by comparing the stringified option name against a table of names rather than by comparing the option identifier, so the emitted program omits an option the user asked for whenever the request matches the library default. Upload flags at their seen-only default and no-delay at one are omitted; the same options at any other value are emitted, and a zero is emitted whenever the default is non-zero."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Byte comparison of the generated program over each option in the non-zero-default table at its default, at zero and at another value, asserting the same omissions and the same emissions, with the option identifiers held to the names the table carries."
+status = "obligation"
+decision = "DL-0257"
+
+[[hazard]]
+id = "HZ-0335"
+path = "original/src/tool_setopt.c"
+lines = [154, 160]
+behaviour = "The redirect-following table is named for the enum recorder's macro yet nothing selects it, because the option is set through the long recorder, so the value is emitted as a bare decimal and the three symbols the table holds never reach the emitted program. Its first entry names the literal zero, which the enum recorder would skip in any case."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Byte comparison of the generated program with redirect following on, off and restricted to the first hop, asserting a decimal in each and no symbol from the table, plus an assertion that the option still reaches the long recorder at the pinned tag."
+status = "obligation"
+decision = "DL-0257"
+
+[[hazard]]
+id = "HZ-0336"
+path = "original/src/tool_setopt.c"
+lines = [55, 66]
+behaviour = "Two tables are defined with external linkage and declared in the tool header, and no call site selects either: the SOCKS proxy table is named nowhere but its own declaration, and the strict-transport table is reachable only through an option alias the tool never sets. The proxy types they hold are emitted from other tables or not at all, so both are dead weight that a reader takes for the source of a symbol the emitted program never carries."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Byte comparison of the generated program over every SOCKS proxy form and over the strict-transport option, asserting the symbols come from the proxy-type table and the strict-transport store is emitted as a string, plus a generated assertion that neither table has a call site at the pinned tag."
+status = "obligation"
+decision = "DL-0257"
+
+[[hazard]]
+id = "HZ-0337"
+path = "original/src/tool_setopt.c"
+lines = [652, 679]
+behaviour = "Object and function pointers are applied to the handle and then recorded as one line of prose in a trailing comment block of the emitted program rather than as code, so the emitted program silently drops every callback and every callback datum the transfer used: eleven such lines for a plain upload, the write, read, seek and header callbacks among them. A null pointer is applied and recorded nowhere, so the block is not a complete list of the pointer options the transfer set."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Byte comparison of the generated program's comment block over a transfer that sets every pointer option the tool registers, asserting the same lines in the same order with the same object and function wording, and that a null-valued pointer option adds none."
+status = "obligation"
+decision = "DL-0257"
+
+[[hazard]]
+id = "HZ-0338"
+path = "original/src/tool_setopt.c"
+lines = [366, 395]
+behaviour = "The list generator emits the declaration, the initialisation and both cleanup lines before appending a single element, and it returns out of memory from inside the append loop, so an escape failure part way through leaves the emitted sections holding a declared and half-populated list. Each element carries the same 2000-byte cap as any other string, applied per element rather than to the list."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Byte comparison of the generated program over a transfer carrying several headers and a header list whose elements straddle the cap, asserting the same declaration, initialisation, append and cleanup lines in the same sections and the same per-element truncation."
+status = "obligation"
+decision = "DL-0257"
+
+[[hazard]]
+id = "HZ-0339"
+path = "original/src/tool_setopt.c"
+lines = [467, 482]
+behaviour = "A form part read from standard input is emitted as a data callback over the standard input stream with a size of minus one, so the emitted program reads whatever standard input holds when it runs rather than the bytes the transfer sent, and the named-file case reaches that arm through a fall-through that first substitutes a dash for the missing part name. A part of any other kind is emitted as a part with no data source at all and no diagnostic."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Byte comparison of the generated program over a form with a file part, a data part, a standard-input part with and without a name, an encoder, a content type and per-part headers, asserting the same callback line, the same size and the same dash substitution."
+status = "obligation"
+decision = "DL-0257"
+
+[[hazard]]
+id = "HZ-0340"
+path = "original/src/tool_filetime.h"
+lines = [30, 35]
+behaviour = "The time-setting entry point is declared only where the build detects utime or utimes, or targets Windows with an offset type of at least eight bytes, and is otherwise replaced by a two-parameter macro expanding to the empty statement, so a build selecting the macro accepts the remote-time option, asks the library for the remote time, discards it and leaves the written file carrying its own timestamp with no diagnostic. The sibling unit guards the definition on Windows alone, without the offset-width term, and includes this header before it, so a Windows build with a narrower offset type would macro-replace the definition's own declarator; the library's setup header ends any such build with a too-small-offset-type error first and the Windows configuration header fixes that size at eight, so every Windows build that compiles takes the declaring arm and the macro arm is reachable only off Windows with neither function detected."
+verdict = "substitute"
+owner = "curl-cli"
+verification = "Equivalence test over the tool's timestamp path with no capability gate, asserting the retrieved time is written to both the access and the modification time and that a time the library reports as absent writes neither, executed on both Linux targets, together with the differential comparison of exit code, stdout, stderr and the resulting timestamp for the remote-time option and upstream cases 762, 1443, 1444, 1445, 1446 and 3012."
+status = "obligation"
+decision = "DL-0260"
+
+[[hazard]]
+id = "HZ-0341"
+path = "original/src/tool_vms.h"
+lines = [43, 48]
+behaviour = "The status-code composer shifts three of its four fields into place and compares the fourth, so the message-number field is never placed: the sub-expression yields one for a message number below three and zero for every other, and that value lands in the severity bits instead. The one instantiation the oracle carries passes zero for it, so the hidden-status constant is 0x10000001 where the implied shift gives 0x10000000, and its severity field reads as success rather than as the warning the zero would have left; a compiler warns about none of it."
+verdict = "not-ported"
+owner = "none"
+verification = "Platform matrix excludes OpenVMS; the macro carries a traceability row and no counterpart, and both values are measured from the oracle's own bytes in scratch."
+status = "obligation"
+decision = "DL-0261"
+
+[[hazard]]
+id = "HZ-0342"
+path = "original/src/tool_getpass.c"
+lines = [177, 179]
+behaviour = "The credential is one read of up to the caller's buffer length rather than a line read, and the byte the read ended on is replaced by a terminator without any test that it is a line delimiter, so an input with no trailing newline loses its last character and an input that reaches the bound loses the byte at the bound with no diagnostic and no indication to the caller. With the caller's buffer at 2048 bytes, three characters and no newline yield a two-character credential, 2047 characters and a newline yield 2047, and 2048, 2100 and 3000 characters all yield the same 2047, so a 2047-character and a 2048-character password authenticate as the identical value."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of the transmitted credential and of both streams over a prompted password supplied without a trailing newline, at one byte below the buffer length, exactly at it and beyond it, asserting the same discarded final byte, the same 2047-byte result at and above the bound and the absence of any truncation diagnostic in either tree."
+status = "obligation"
+decision = "DL-0264"
+
+[[hazard]]
+id = "HZ-0343"
+path = "original/src/tool_getpass.c"
+lines = [168, 192]
+behaviour = "No path returns a null pointer although the declaration at original/src/tool_getpass.h:32-35 defines that as the signal that aborts the operation, so a read that fails and a stream already at end of data are both answered with an empty credential and a successful return, and the interrupted read is not retried. The caller at original/src/tool_paramhlp.c:586 does not inspect the result and composes the user string with whatever the buffer holds at :590. An empty standard input yields a request whose Basic credential is the user name followed by an empty password, with exit status zero and no diagnostic on either stream."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison over a prompt answered by immediate end of data and by a read that fails, asserting both trees transmit an empty password, exit zero, write no diagnostic and make no second attempt at the read."
+status = "obligation"
+decision = "DL-0264"
+
+[[hazard]]
+id = "HZ-0344"
+path = "original/src/tool_getpass.c"
+lines = [170, 177]
+behaviour = "The prompt is written to standard error while the credential is read from the controlling terminal, and a failure to open it falls back to descriptor zero, so with no controlling terminal the credential becomes whatever one read of the redirected stream returns, embedded newlines included, and the tail that read did not consume stays in the stream for the next reader. The byte sequence for two lines typed at a terminal yields the first line alone, the line discipline delivering one line per read, while the same bytes on a pipe yield both lines joined by their newline, and a 2100-character line on a redirected stream leaves 52 of its characters to be read by the next consumer of the same stream."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of the transmitted credential for identical input delivered three ways - a controlling terminal, a pipe and a redirected file - asserting the terminal case stops at the first line, the redirected cases carry embedded newlines, and the same unconsumed tail is left for a following reader in both trees."
+status = "obligation"
+decision = "DL-0264"
+
+[[hazard]]
+id = "HZ-0345"
+path = "original/src/tool_getpass.c"
+lines = [132, 151]
+behaviour = "The echo-disabling helper reports that echo was disabled on any build carrying either terminal header, without testing the result of either terminal call it makes, so a descriptor that is not a terminal is reported as having had echo disabled and the caller's newline and restore both run for it. With standard input a pipe, standard error is 38 bytes for a 37-byte prompt, the extra byte being that newline, although nothing was disabled. On a build with neither terminal header the same helper returns the opposite and no newline is written, so the byte length of the diagnostic stream is a function of the build's terminal headers rather than of whether echo was actually disabled."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Byte comparison of standard error for a prompt whose input is a terminal, a pipe and a redirected file, and across the configurations of the terminal-header condition, asserting the trailing newline is present wherever either header is configured and absent where neither is."
+status = "obligation"
+decision = "DL-0264"
+
+[[hazard]]
+id = "HZ-0346"
+path = "original/src/tool_getpass.c"
+lines = [152, 161]
+behaviour = "Echo is restored by applying the saved terminal state with the flushing action, so any input still queued on the terminal when the read returned is discarded rather than left for the next reader, which is why an over-long typed line leaves nothing behind on a terminal while the same overflow survives on the descriptor-zero fallback that never reaches this call. The saved and modified states are two function-scope statics rather than per-call values, and the call that reads the current state does not check whether it succeeded, so the state applied here is whatever the most recent disabling call left in that static."
+verdict = "substitute"
+owner = "curl-cli"
+verification = "Terminal-state equivalence test asserting the queue is empty after a prompt whose line exceeded the buffer, that the restored state equals the state read at disable time, and that two prompts in one process each restore the state their own disable call observed."
+status = "obligation"
+decision = "DL-0264"
+
+[[hazard]]
+id = "HZ-0347"
+path = "original/src/tool_getpass.c"
+lines = [174, 190]
+behaviour = "Echo is disabled across a blocking read with no signal disposition installed for anything but the broken-pipe signal, which original/src/tool_main.c:174-179 sets to be ignored, so an interrupt delivered while the prompt is up terminates the process at its default action, before the restore, and leaves the terminal with echo disabled for whatever runs next. On a controlling terminal the process dies at the default action of the interrupt signal with the terminal's echo bit still cleared."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Terminal-state test that raises the prompt on a controlling terminal, delivers the interrupt, and asserts both trees terminate at the default action with the echo bit still cleared and no restore performed."
+status = "obligation"
+decision = "DL-0264"
+
+[[hazard]]
+id = "HZ-0348"
+path = "original/src/tool_getpass.c"
+lines = [94, 109]
+behaviour = "The console variant stores the console read narrowed to a character before examining it, and tests it only against carriage return, newline and backspace, so any value whose low byte is zero is stored and terminates the credential the caller composes at original/src/tool_paramhlp.c:590 while the loop keeps reading, and no path distinguishes a failed console read from a typed character. The read is taken from the console rather than from standard input, so a credential supplied on a redirected standard input is not read at all on this platform, unlike the descriptor-zero fallback the other variant has. A run of characters filling the buffer without a carriage return leaves the loop with the index equal to the buffer length and the last stored character replaced by a terminator."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Equivalence test over the console editing loop driven by a recorded key sequence, asserting the credential for a value carrying a zero low byte, for a buffer-filling run with no carriage return, and for a redirected standard input that the loop must not read, executed where the platform is executed and recorded as compiled and linked only elsewhere."
+status = "obligation"
+decision = "DL-0264"
+
+[[hazard]]
+id = "HZ-0349"
+path = "original/src/tool_getpass.c"
+lines = [100, 103]
+behaviour = "Backspace editing in the console variant is expressed through unsigned wraparound rather than a bounds test: at the first position the index of zero has one subtracted from it and the loop's own increment returns it to zero, and at any later position two are subtracted so the increment leaves it one back, and the backspace character itself is stored in the buffer before either subtraction happens."
+verdict = "substitute"
+owner = "curl-cli"
+verification = "Equivalence test over the same recorded key sequences asserting the identical edited credential for a backspace at the first position, a backspace after one character and a run of backspaces exceeding the characters typed, with an index representation that cannot wrap."
+status = "obligation"
+decision = "DL-0264"
+
+[[hazard]]
+id = "HZ-0350"
+path = "original/src/tool_getpass.c"
+lines = [70, 83]
+behaviour = "The OpenVMS variant writes its terminator at the byte count the input-output status block reports, so a read that fills the caller's buffer writes that terminator one byte past the end of it, and a failed channel assignment returns the buffer as it was on entry with a successful return, reporting an empty credential as success."
+verdict = "not-ported"
+owner = "none"
+verification = "Platform matrix excludes OpenVMS, so the variant has no counterpart; the translation unit carries a traceability row through its other variants and this one is recorded as unported."
+status = "obligation"
+decision = "DL-0264"
+
+[[hazard]]
+id = "HZ-0351"
+path = "original/src/tool_easysrc.c"
+lines = [139, 142]
+behaviour = "The unconvertible-option iteration hands the append function a node of the very list that function frees when an allocation fails, and the loop's own increment then reads that freed node: the append clears all five section lists and nulls the globals, control returns to the loop, the increment dereferences the node's next pointer, and only then does the condition see the failure and stop. The preceding guard re-tests the list precisely because an earlier append may already have freed it, so an early failure is safe and an in-loop failure is not; the subsequent release is a null call and there is no double free, and the value read is discarded, so the emitted bytes and the returned code are the same either way."
+verdict = "substitute"
+owner = "curl-cli"
+verification = "Torture replay of the generating cases at the injections that reach this loop - measured at case 1400 injection 132 and case 1404 injection 315, both reporting the same invalid read at the same line - run against both trees in the same session, asserting the port completes with no invalid access while emitting the same bytes and the same out-of-memory code as the oracle's run produces before its own read."
+status = "obligation"
+decision = "DL-0268"
+
+[[hazard]]
+id = "HZ-0352"
+path = "original/src/tool_easysrc.c"
+lines = [91, 102]
+behaviour = "A single failed append discards every accumulated section rather than the one being written, and because the globals are then null a later append starts a fresh list instead of failing, so the dump still runs and writes a complete-looking fifteen-line skeleton of the opening table, two blank lines and the closing table - a program that compiles, reads an uninitialised result variable, leaves the handle variable unused and says nothing about what was discarded. Because seven of the tool's producer sites drop the returned code, that skeleton is reachable with a successful exit status as well as with the out-of-memory one: sweeping the debug allocator's failure counter over one invocation, injections 190 to 196 answer 27 and write the skeleton, 197 to 200 write the skeleton and answer 0, and 201 upward write the whole program."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Allocation-failure sweep over a single generating invocation against both trees, asserting the same written bytes and the same exit code at every injection point, plus the torture pass over the cases that compare the emitted program."
+status = "obligation"
+decision = "DL-0268"
+
+[[hazard]]
+id = "HZ-0353"
+path = "original/src/tool_easysrc.c"
+lines = [176, 186]
+behaviour = "Failing to open the requested output is a warning and never an error: the exit status stays whatever the transfer produced, measured as 0 for a successful transfer and 37 for a failed one with the same unwritable target, and under the silent flag the warning is suppressed altogether so nothing at all indicates the program was not written. A directory named as the target takes the same path as an unopenable one. The accumulated sections are released either way, so a second dump in the same process would emit an empty skeleton."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison over an unopenable path and a directory target, each with a succeeding and a failing transfer and each with and without the silent flag, asserting stderr bytes and exit code in all eight combinations."
+status = "obligation"
+decision = "DL-0267"
+
+[[hazard]]
+id = "HZ-0354"
+path = "original/src/tool_easysrc.c"
+lines = [199, 217]
+behaviour = "The dump's whitespace is asymmetric in two ways that a uniform writer gets wrong. An empty code line is printed as a bare newline while every non-empty code line and every declaration, data and clean-up line is printed with a two-space prefix, so a writer that indented uniformly would emit two trailing spaces on each blank line. The blank line before the data section is conditional on that section existing while the blank line before the code section is emitted unconditionally, so a program with no data section still carries exactly one blank line before its first statement."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Byte comparison of the emitted program across the four section combinations - neither declaration nor data, declaration only, both, and clean-up present - against the frozen expectations of upstream cases 1400 and 1404."
+status = "obligation"
+decision = "DL-0267"
+
+[[hazard]]
+id = "HZ-0355"
+path = "original/src/tool_easysrc.c"
+lines = [219, 222]
+behaviour = "The clean-up section is emitted in the order it was appended although the header that declares the list calls it reverse order, so the first resource created is released first: measured over two transfers each carrying one mime part and two headers, the emitted order is the first mime free, its null assignment, the first list free, its null assignment, then the same four for the second pair, all of it after the handle cleanup that the code section carries."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Byte comparison over an invocation with two mime transfers and two header lists against the frozen expectation of upstream case 1404, asserting the emitted release order and its position after the handle cleanup."
+status = "obligation"
+decision = "DL-0267"
+
+[[hazard]]
+id = "HZ-0356"
+path = "original/src/tool_easysrc.c"
+lines = [41, 42]
+behaviour = "The two variable counters are never reset - not between transfers and not when a failed append clears the five lists - so a second transfer renumbers its mime, part and list variables while re-emitting identical initialising data under the new names, and a discard leaves the numbering where it stopped while the declarations restart from nothing. Measured over one invocation with two URLs, one mime part and two headers each, the emitted program declares the first and second of each and initialises both."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential comparison of the emitted variable names and initialising data over a two-URL invocation, and an allocation-failure run asserting the numbering continues across the discard."
+status = "obligation"
+decision = "DL-0268"
+
+[[hazard]]
+id = "HZ-0357"
+path = "original/src/tool_easysrc.c"
+lines = [44, 56]
+behaviour = "The opening table declares the generated program's entry point with an argument count and vector that no emitted statement ever uses, so every generated program - including the well-formed ones - compiles with two unused-parameter diagnostics under the developer warning set, and the fifteen-line skeleton a discard produces adds an unused-variable and an uninitialised-read diagnostic on top."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Compilation of the emitted program from every generating row of the command-line corpus under the same warning set the oracle build uses, asserting exactly the two unused-parameter diagnostics for a complete program and the same diagnostics the oracle's own output produces for a discarded one."
+status = "obligation"
+decision = "DL-0267"
+
+[[hazard]]
+id = "HZ-0358"
+path = "original/src/tool_easysrc.c"
+lines = [171, 232]
+behaviour = "The dump writes the declaration, data, code and clean-up sections and never the unconvertible-option list, which only the per-transfer flush moves into the code section, and the closing table returns the result variable unconditionally. An invocation whose transfers all run through the parallel path is therefore emitted without any perform statement, without any record of the options that could not be generated, and with a return of an uninitialised variable: measured for two URLs under the parallel flag, the program sets both transfers' options on one handle, cleans it up and returns, and its compilation reports the uninitialised read."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Differential byte comparison of the emitted program for a parallel invocation carrying unconvertible options, asserting the absent perform statement and absent comment block, plus a compilation of that output asserting the same uninitialised-read diagnostic the oracle's output produces."
+status = "obligation"
+decision = "DL-0267"
+
+[[hazard]]
+id = "HZ-0359"
+path = "original/src/slist_wc.c"
+lines = [34, 56]
+behaviour = "A failed append answers with a null pointer and releases only the node it just created, so the list it was handed stays alive while the return value no longer names it, and a caller that writes the result over its own pointer loses the whole chain; the one caller keeps its pointer, releases all five accumulators and answers out of memory, so one failed line discards the entire generated program rather than truncating it, and that code travels out through the setopt wrappers and ends the invocation before the transfer it was configuring ever runs."
+verdict = "reproduce"
+owner = "curl-cli"
+verification = "Allocation-failure injection at the node allocation and at the container allocation over a generated-source run, asserting the port releases all five accumulators, writes no partial program, performs no transfer and ends the invocation with the oracle's code, plus a differential byte comparison of the generated program for the same invocation with no injected failure."
+status = "obligation"
+decision = "DL-0269"
+
+[[hazard]]
+id = "HZ-0360"
+path = "original/src/slist_wc.c"
+lines = [42, 66]
+behaviour = "One structure is served by two allocators: the container is taken and released by the tool's own allocator macros, which resolve to plain malloc and free in the tool, while every node is taken and released inside the library, where the same macros resolve to the function pointers the global memory hook installs over, so an application that installs its own allocator is handed every line of the accumulator and never its container, and a memory-debug build routes both halves through the debug wrappers instead and so accounts for both."
+verdict = "substitute"
+owner = "curl-cli"
+verification = "Recorded allocation trace over a generated-source run with an application-installed allocator, asserting the port requests no line storage through the hook, plus leak accounting under the debug allocator feature asserting the run releases everything it takes."
+status = "obligation"
+decision = "DL-0269"
+
+[[hazard]]
+id = "HZ-0361"
+path = "original/src/slist_wc.c"
+lines = [54, 55]
+behaviour = "The append writes through the cached last node with no check that it is still the chain's last, while the library's own append walks to the real last node, so a node added to the same chain through the public list interface is unlinked by the next wrapper append and leaked with everything behind it, and no diagnostic is written; no site at the tag adds to a wrapper-owned chain that way, so the cache holds only as long as the wrapper stays the single writer."
+verdict = "substitute"
+owner = "curl-cli"
+verification = "Direct equivalence test over the accumulator asserting the rendered order and the released count for the line counts the generator emits, plus a generated assertion over the tag that no site appends to a wrapper-owned chain through the public list interface."
+status = "obligation"
+decision = "DL-0269"
+
 [[reviewed]]
 path = "original/lib/altsvc.c"
 hazards = 2
@@ -3459,6 +4306,11 @@ hazards = 14
 decision = "DL-0225"
 
 [[reviewed]]
+path = "original/src/tool_doswin.c"
+hazards = 8
+decision = "DL-0240"
+
+[[reviewed]]
 path = "original/src/tool_formparse.c"
 hazards = 22
 decision = "DL-0225"
@@ -3498,14 +4350,74 @@ path = "original/src/tool_urlglob.h"
 hazards = 1
 decision = "DL-0225"
 
+[[reviewed]]
+path = "original/lib/pingpong.c"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_easysrc.h"
+hazards = 2
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_ssls.c"
+hazards = 12
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_setopt.h"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_dirhie.c"
+hazards = 8
+decision = "DL-0248"
+
+[[reviewed]]
+path = "original/src/tool_libinfo.c"
+hazards = 10
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_libinfo.h"
+hazards = 3
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_setopt.c"
+hazards = 11
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_filetime.h"
+hazards = 1
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_vms.h"
+hazards = 1
+decision = "DL-0225"
+
 # ---------------------------------------------------------------------------
 # Discovered annotation sites that carry no hazard row.                 DL-0225
 # Every site is dispositioned; a stale entry fails the gate.           DL-0225
 # ---------------------------------------------------------------------------
 
 [[reviewed]]
-path = "original/lib/pingpong.c"
-hazards = 1
+path = "original/src/tool_getpass.c"
+hazards = 9
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/tool_easysrc.c"
+hazards = 8
+decision = "DL-0225"
+
+[[reviewed]]
+path = "original/src/slist_wc.c"
+hazards = 3
 decision = "DL-0225"
 
 [[annotation]]
@@ -3716,3 +4628,11 @@ outcome = "A hash-construction failure answers the out-of-memory code and no ses
 rationale = "The oracle turns an allocation failure into twenty-four bytes of indeterminate memory on the wire, derived from three DES keys built out of an unwritten buffer. Safe Rust cannot read an uninitialised buffer, and sending key material derived from one is a disclosure the port must not reproduce even bug for bug. Answering the failure is the only deterministic outcome that keeps the wire silent."
 owner = "curl-proto-smb"
 decision = "DL-0181"
+
+[[divergence]]
+id = "DV-0009"
+hazard = "HZ-0292"
+outcome = "The relay proves the peer before it forwards anything: the tool writes random bytes over the connection it made and the thread forwards standard input only to a peer that presents them, closing any other, which is the check original/docs/KNOWN_BUGS.md:108-121 names and the one original/lib/socketpair.c:210-220 already performs. A legitimate upload is byte for byte what the oracle produces, on standard output, on standard error, in the exit status and in the bytes the server receives."
+rationale = "The oracle hands the whole upload body to whichever local process reaches an ephemeral loopback port first, which is a disclosure of user data the port must not reproduce even bug for bug, the same ground on which DV-0008 refuses to put key material from an unwritten buffer on the wire. Upstream has recorded the defect and prescribed this exact remedy, so the divergence adopts the oracle's own stated intent rather than inventing a policy; the relay is an internal transport for standard input, not part of the command-line contract or the ABI, so nothing a legitimate run can observe changes, and the difference is visible only to a racing local attacker, which no upstream case, corpus or gate exercises."
+owner = "curl-cli"
+decision = "DL-0240"
